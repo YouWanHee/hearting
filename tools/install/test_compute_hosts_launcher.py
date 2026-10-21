@@ -220,18 +220,22 @@ class ComputeHostsLauncherTest(unittest.TestCase):
              mock.patch.object(installer.codex_launcher, "uninstall", return_value={"status": "not-installed"}), \
              mock.patch.object(installer.manifest, "_manifest_path", return_value=self.root / "none"), \
              mock.patch.object(installer.manifest, "_load_manifest", return_value=None), \
+             mock.patch.object(installer.herdr_integration, "restore_history_key", return_value={"status": "planned"}) as restore_key, \
              mock.patch.object(installer.bootstrap, "uninstall_compute_hosts", return_value={"status": "planned-remove"}) as remove:
             result = installer.cmd_uninstall(type("Args", (), base)())
         remove.assert_called_once_with(dry_run=True)
+        restore_key.assert_called_once_with(dry_run=True)
         self.assertTrue(any(c["id"] == "bootstrap.launcher.compute-hosts" for c in result["checks"]))
 
         with mock.patch("installer.resolve_runtimes", return_value=["claude"]), \
              mock.patch.object(installer.runtime_activation, "deactivate", return_value=None), \
              mock.patch.object(installer.manifest, "_manifest_path", return_value=self.root / "none"), \
              mock.patch.object(installer.manifest, "_load_manifest", return_value=None), \
+             mock.patch.object(installer.herdr_integration, "restore_history_key") as restore_key, \
              mock.patch.object(installer.bootstrap, "uninstall_compute_hosts") as remove:
             installer.cmd_uninstall(type("Args", (), {**base, "runtimes": ["claude"]})())
         remove.assert_not_called()
+        restore_key.assert_not_called()
 
 
 if __name__ == "__main__":

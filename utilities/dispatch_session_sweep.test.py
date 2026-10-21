@@ -1077,7 +1077,7 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         with mock.patch.object(bridge, "load_payload", return_value={"session_id": "sess-owner",
                 "source": "resume"}), mock.patch.object(bridge, "is_worker_session", return_value=False), \
                 mock.patch.object(bridge, "forget_shown_candidates"), \
-                mock.patch.object(bridge, "card_context", return_value=""), \
+                mock.patch.object(bridge, "card_context", return_value=("", "")), \
                 mock.patch.object(bridge, "local_evidence_context", return_value=""), \
                 mock.patch.object(dispatch_contract, "dispatch_state_roots", return_value=[self.root]), \
                 mock.patch.object(dispatch_contract, "resolve_agent_home", return_value=ROOT), \
@@ -2316,7 +2316,7 @@ class AdapterRecoveryRequestTest(IsolatedRootMixin, unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(bridge, "load_payload", return_value={"session_id": "codex-root-error"}), \
              mock.patch.object(bridge, "is_worker_session", return_value=False), \
-             mock.patch.object(bridge, "card_context", return_value="fixture context"), \
+             mock.patch.object(bridge, "card_context", return_value=("fixture context", "")), \
              mock.patch.object(bridge, "local_evidence_context", return_value=""), \
              mock.patch.object(dispatch_contract, "resolve_agent_home", return_value=ROOT), \
              mock.patch.object(dispatch_contract, "dispatch_state_roots",

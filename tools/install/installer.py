@@ -37,12 +37,26 @@ import report_bundle_config
 import memory_sync_config
 import compute_hosts_config
 import fleet_config
+import herdr_integration
 import user_config
 import host_probes
 import node_runtime
 import safe_fs
 import model_settings
 from drivers import get_driver, RUNTIMES
+
+
+def _ensure_herdr_history_key(launcher_results, *, dry_run=False):
+    row = next((item for item in launcher_results if item.get("name") == "hearting"), None)
+    allowed = {"created", "unchanged", "migrated-legacy"}
+    if dry_run:
+        allowed |= {"planned", "planned-migration"}
+    if not row or row.get("status") not in allowed:
+        return {"status": "skipped-launcher", "changed": False}
+    target = Path(row.get("target") or (Path.home() / ".local/bin/hearting"))
+    if not dry_run and (not target.is_symlink() or not target.exists()):
+        return {"status": "skipped-launcher", "changed": False}
+    return herdr_integration.ensure_history_key(str(target), dry_run=dry_run)
 
 # Exit codes map one-to-one to the PRD CLI table.
 EXIT_OK = 0
@@ -450,6 +464,8 @@ def cmd_install(args):
         })
         if args.dry_run:
             launcher_results = bootstrap.install_launchers(dry_run=True)
+            history_key = _ensure_herdr_history_key(launcher_results, dry_run=True)
+            lines.append(f"herdr history key: {history_key['status']}")
             lines.append("bootstrap: mem-import skipped (dry-run — no dry-run mode for restore_memory)")
             for lr in launcher_results:
                 lines.append(f"bootstrap: launcher {lr['name']} -> {lr['status']} (dry-run)")
@@ -476,6 +492,8 @@ def cmd_install(args):
             bootstrap_failed = mem_result["action"] == "failed"
 
             launcher_results = bootstrap.install_launchers(dry_run=False)
+            history_key = _ensure_herdr_history_key(launcher_results)
+            lines.append(f"herdr history key: {history_key['status']}")
             for lr in launcher_results:
                 lines.append(f"bootstrap: launcher {lr['name']} -> {lr['status']}")
                 checks.append(
@@ -724,6 +742,8 @@ def cmd_update(args):
             checks.append({"id": "update.drift", "ok": True, "detail": "no drift"})
             exit_code = EXIT_OK
         launcher_results = bootstrap.install_launchers(dry_run=args.dry_run)
+        history_key = _ensure_herdr_history_key(launcher_results, dry_run=args.dry_run)
+        lines.append(f"herdr history key: {history_key['status']}")
         for launcher in launcher_results:
             if launcher["name"] != "compute-hosts":
                 continue
@@ -1128,6 +1148,8 @@ def cmd_uninstall(args):
         )
     )
     if full and args.scope == "global":
+        history_restore = herdr_integration.restore_history_key(dry_run=args.dry_run)
+        lines.append("uninstall: herdr history key — " + history_restore["status"])
         launcher_result = bootstrap.uninstall_compute_hosts(dry_run=args.dry_run)
         lines.append("uninstall: common compute-hosts launcher — " + launcher_result["status"])
         checks.append({
@@ -1136,6 +1158,7 @@ def cmd_uninstall(args):
             "detail": launcher_result["status"],
         })
     else:
+        lines.append("uninstall: herdr history key — retained for other runtimes")
         lines.append("uninstall: common compute-hosts launcher — retained for other runtimes")
         checks.append({
             "id": "bootstrap.launcher.compute-hosts",
@@ -1334,6 +1357,9 @@ def cmd_runtime(args):
                 if report.get("runtime") == "codex":
                     report["managed_launcher"] = launcher_result
         if args.runtime_command in {"activate", "refresh"}:
+            shared_launchers = bootstrap.install_launchers(dry_run=True)
+            history_key = _ensure_herdr_history_key(shared_launchers)
+            lines.append(f"herdr history key: {history_key['status']}")
             routing = routing_config.ensure(targets)
             lines.append(
                 "routing-config: " + routing["status"] + " " + routing["path"]

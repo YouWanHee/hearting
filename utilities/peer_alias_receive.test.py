@@ -282,7 +282,7 @@ class AliasReceive(unittest.TestCase):
 
                 with mock.patch.object(hook.subprocess, "run", side_effect=confirmed_start):
                     self.assertEqual(hook.card_context(
-                        {"session_id": b, "source": "clear"}, str(ROOT)), "")
+                        {"session_id": b, "source": "clear"}, str(ROOT)), ("", ""))
                 self.assertEqual(len(commands), 1)
                 rows = handover.handover_rows(seat)
                 self.assertEqual([(row["from"], row["sid"]) for row in rows], [(a, b)])

@@ -70,6 +70,7 @@ const turnContextBySession = new Map()
 //     candidate probe) and the kept text is re-emitted on every model call of
 //     that turn, so a tool-loop continuation never consumes a second card.
 const cardBySession = new Map()
+const historyNoticeSettledBySession = new Set()
 const peerGuidanceBySession = new Map()
 // One threshold notice per native session, retained for the triggering turn so
 // an auxiliary title call cannot consume the answering model's system context.
@@ -1585,6 +1586,33 @@ function collectCard(event, sid, cwd, prompt = "") {
   return (result.stdout || "").trim()
 }
 
+function collectCardPayload(event, sid, cwd, prompt = "") {
+  if (!sid || isWorkerSession()) return { additionalContext: "", humanNotice: "" }
+  const result = spawnSync("python3", [sessionTidy, "hook", "--harness", "opencode",
+    "--event", event, "--session-id", sid, "--cwd", cwd, "--format", "json", "--human-only"], {
+    cwd: root, env: { ...process.env, AGENT_HOME: root }, input: JSON.stringify({ prompt }),
+    encoding: "utf8", timeout: 4000, killSignal: "SIGKILL",
+  })
+  if (result.error || result.status !== 0) return { additionalContext: "", humanNotice: "" }
+  try {
+    const value = JSON.parse(result.stdout || "{}")
+    return { additionalContext: String(value.additionalContext || ""), humanNotice: String(value.humanNotice || "") }
+  } catch { return { additionalContext: "", humanNotice: "" } }
+}
+
+function showHistoryNotice(ctx, sid, notice) {
+  if (!notice || !sid || historyNoticeSettledBySession.has(sid)) return
+  historyNoticeSettledBySession.add(sid)
+  showContextAlert(ctx, notice)
+}
+
+function collectHistoryNotice(ctx, sid, cwd, prompt = "", settleEmpty = false) {
+  if (!sid || isWorkerSession() || historyNoticeSettledBySession.has(sid)) return
+  const payload = collectCardPayload("start", sid, cwd, prompt)
+  showHistoryNotice(ctx, sid, payload.humanNotice)
+  if (settleEmpty) historyNoticeSettledBySession.add(sid)
+}
+
 function appendContext(output, text) {
   if (!text) return
   if (!Array.isArray(output.system)) output.system = []
@@ -2287,6 +2315,9 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
       const info = event.properties?.info
       const createdID = info?.id || event.properties?.sessionID || ""
       if (createdID && info && typeof info === "object") sessionInfoById.set(createdID, info)
+      if (createdID && !isWorkerSession()) {
+        collectHistoryNotice(ctx, createdID, baseDir(ctx))
+      }
     }
     if (event && event.type === "session.created") {
       const sid = event.properties?.info?.id || event.properties?.sessionID || ""
@@ -2369,6 +2400,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
         localEvidenceBySession.delete(sid)
         turnContextBySession.delete(sid)
         cardBySession.delete(sid)
+        historyNoticeSettledBySession.delete(sid)
         peerGuidanceBySession.delete(sid)
         contextAlertBySession.delete(sid)
         paneProjectionRetryAt.delete(sid)
@@ -2414,7 +2446,9 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
     }
     const cardTurn = turn || prompt
     if (eventSid && (!cardTurn || cardBySession.get(sid)?.turn !== cardTurn)) {
-      cardBySession.set(sid, { turn: cardTurn, text: collectCard("prompt", eventSid, baseDir(ctx), prompt) })
+      const cardText = collectCard("prompt", eventSid, baseDir(ctx), prompt)
+      collectHistoryNotice(ctx, eventSid, baseDir(ctx), prompt, true)
+      cardBySession.set(sid, { turn: cardTurn, text: cardText })
     }
   },
   "experimental.chat.messages.transform": async (_input, output) => {

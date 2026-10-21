@@ -1957,6 +1957,78 @@ class MemoryLayerTest(TidyCase):
         self.assertEqual(projected[2]["card"]["status"], "none")
         self.assertEqual(projected[3]["transcript"]["status"], "available")
 
+    def test_tidy_clear_start_records_idempotent_succession_after_reservation_observation(self):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            st.record_event(seat, "claude", "sid-old", "start", source="startup",
+                            cwd=str(self.cwd), now=100)
+            clear._write_reservation({"schema": 1, "nonce": "clear-nonce", "status": "reserved",
+                                      "created": 150, "seat": seat.as_dict(), "harness": "claude",
+                                      "sid": "sid-old"})
+            st.run_hook("claude", "start", "sid-new", source="clear", cwd=str(self.cwd), now=200)
+            booking = clear.read_reservation(seat.key)
+            rows = st._read_ledger_lines(seat)
+            st.run_hook("claude", "start", "sid-new", source="clear", cwd=str(self.cwd), now=201)
+            lineage = st._project_seat_lineage(st._read_ledger_lines(seat), {}, {}, sid="sid-new")
+            notice = st.build_human_history_notice(seat, "claude", "sid-new")
+        self.assertEqual(booking["observed"]["sid"], "sid-new")
+        succession = [row for row in rows if row.get("event") == "succession"]
+        self.assertEqual(len(succession), 1)
+        self.assertFalse(any(row.get("event") == "handover" for row in rows))
+        self.assertEqual((succession[0]["from"], succession[0]["sid"], succession[0]["source"]),
+                         ("sid-old", "sid-new", "tidy-clear"))
+        self.assertEqual(lineage[0]["relation"], "confirmed")
+        self.assertEqual(lineage[0]["predecessor"], {"harness": "claude", "sid": "sid-old"})
+        self.assertIn("이전 대화 열기", notice)
+
+    def test_history_notice_loads_managed_key_with_only_utilities_on_subprocess_path(self):
+        import subprocess
+        import sys
+
+        install_dir = ROOT / "tools" / "install"
+        sys.path.insert(0, str(install_dir))
+        try:
+            import herdr_integration
+            block, _ = herdr_integration._history_block("hearting", {"original_absent": True})
+        finally:
+            sys.path.remove(str(install_dir))
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / ".config" / "herdr" / "config.toml"
+            config.parent.mkdir(parents=True)
+            config.write_bytes(block)
+            code = (
+                f"import sys; sys.path.insert(0, {str(ROOT / 'utilities')!r}); "
+                "import session_tidy as st; "
+                "st.seat_lineage=lambda *a, **k: [{"
+                "'harness':'claude','sid':'current','relation':'confirmed',"
+                "'predecessor':{'harness':'claude','sid':'previous'},'transcript':{}}, "
+                "{'harness':'claude','sid':'previous','transcript':{'status':'available'}}]; "
+                "seat=st.Seat('pane','seat-key','pane-id','claude'); "
+                "print(st.build_human_history_notice(seat,'claude','current',env={"
+                "'HERDR_ACTIVE_PANE_ID':'workspace:pane','HERDR_SOCKET_PATH':'/tmp/socket',"
+                f"'HOME':{str(home)!r}}}))"
+            )
+            proc = subprocess.run([sys.executable, "-c", code], cwd=home,
+                                  env={"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+                                  capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Ctrl-b Shift-H", proc.stdout)
+
+    def test_manual_clear_without_booking_stays_an_unconfirmed_neighbor(self):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            st.record_event(seat, "claude", "sid-old", "start", source="startup",
+                            cwd=str(self.cwd), now=100)
+            st.run_hook("claude", "start", "sid-new", source="clear", cwd=str(self.cwd), now=200)
+            rows = st._read_ledger_lines(seat)
+            lineage = st._project_seat_lineage(rows, {}, {}, sid="sid-new")
+            notice = st.build_human_history_notice(seat, "claude", "sid-new")
+        self.assertFalse(any(row.get("event") == "succession" for row in rows))
+        self.assertEqual(lineage[0]["relation"], "chronological")
+        self.assertIsNone(st._confirmed_predecessor(lineage, "claude", "sid-new"))
+        self.assertEqual(notice, "")
+
     def test_lineage_history_expired_missing_and_unreadable_are_distinct(self):
         rows = [{"event": "summary", "harness": "claude", "sid": name, "ts": i,
                  "first_seen": i} for i, name in enumerate(("expired", "missing", "unreadable"), 1)]
@@ -2686,12 +2758,14 @@ class ClearHelperTest(TidyCase):
         req = {"schema": clear.SCHEMA, "nonce": "0123456789abcdef", "status": "reserved",
                "seat": seat.as_dict(), "harness": "codex", "sid": "thread-A",
                "herdr_transport": {"socket_path": seat.socket_path}}
-        clear._write_reservation(req)
         process = mock.Mock(pid=4321)
-        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/run/herdr/foreign.sock",
-                                          "AGENT_HERDR_SESSION": "foreign"}), \
-                mock.patch.object(clear.subprocess, "Popen", return_value=process) as popen:
-            self.assertEqual(clear._start_helper(seat.key, req["nonce"]), 4321)
+        # The reservation is written and read back under the same isolated state root.
+        with self.iso.patched_environ(self.extra):
+            clear._write_reservation(req)
+            with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/run/herdr/foreign.sock",
+                                              "AGENT_HERDR_SESSION": "foreign"}), \
+                    mock.patch.object(clear.subprocess, "Popen", return_value=process) as popen:
+                self.assertEqual(clear._start_helper(seat.key, req["nonce"]), 4321)
         child_env = popen.call_args.kwargs["env"]
         self.assertEqual(child_env.get("HERDR_SOCKET_PATH"), seat.socket_path)
         self.assertNotIn("AGENT_HERDR_SESSION", child_env)

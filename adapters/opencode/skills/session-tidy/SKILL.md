@@ -113,6 +113,22 @@ a merely adjacent session; the complete hook output, including guidance,
 notices, resume data and memory references, remains within the existing 2,400
 UTF-8 byte limit.
 
+When a new session starts from a clear or confirmed handover and has a
+predecessor, show the person a short, non-blocking way to open that predecessor
+read-only. Keep this human notice separate from model context and from the
+2,400-byte injection budget. In herdr, use the managed `prefix+shift+h` command
+when that exact command is installed and available; elsewhere show
+`hearting run session_history`. Identify the predecessor and state whether its
+original transcript is available, missing or unreadable. Never present a card
+or generated summary as the original conversation. The viewer starts with the
+explicitly confirmed predecessor, supports older generations, and reports
+uncertain lineage rather than promoting a chronological neighbor to a confirmed
+handover. Reading does not resume or modify a session. If the native transcript
+is absent, unreadable or partial, say so and preserve that status. When no
+terminal surface can be opened, print the read-only command/output fallback.
+An unbooked manual `/clear` remains an unconfirmed chronological neighbor and
+does not show the predecessor notice.
+
 
 ## Workflow Evidence
 
