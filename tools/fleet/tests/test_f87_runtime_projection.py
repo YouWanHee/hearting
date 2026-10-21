@@ -882,36 +882,35 @@ class ProjectionObservationTest(unittest.TestCase):
 
     def test_absolute_native_resume_argv_is_canonicalized_only_at_wire_boundary(self):
         from tools.fleet import herdr_projection as hp
-        for harness in ("claude", "codex", "opencode"):
-            sid = "ses_A"
-            argv = [f"/home/user/.local/bin/{harness}", "--color", "always",
-                    "--resume", sid, "--model", "fixture", "--setting-sources", "user"]
-            with self.subTest(harness=harness):
-                lifecycle = hp._session_lifecycle(harness, 1000001, "resume", argv, session_id=sid)
-                self.assertEqual(lifecycle["resume_argv"], [harness, *argv[1:]])
-                self.assertEqual(argv[0], f"/home/user/.local/bin/{harness}")
-                self.assertNotIn("resume_argv", hp._session_lifecycle(
-                    harness, 1000002, "clear", argv, session_id=sid))
+        cases = json.loads((ROOT / "tools/fleet/tests/native_resume_cases.json").read_text())
+        for case in cases:
+            with self.subTest(name=case["name"]):
+                lifecycle = hp._session_lifecycle(case["harness"], 1000001, "clear",
+                                                  case["argv"], session_id=case["sid"])
+                if case["expected"] is None:
+                    self.assertNotIn("resume_argv", lifecycle)
+                else:
+                    self.assertEqual(lifecycle["resume_argv"], case["expected"])
         self.assertNotIn("resume_argv", hp._session_lifecycle(
             "claude", 1000001, "resume", ["/usr/bin/env", "claude", "--resume", "ses_A"],
             session_id="ses_A"))
-        self.assertNotIn("resume_argv", hp._session_lifecycle(
+        self.assertEqual(hp._session_lifecycle(
             "claude", 1000001, "resume", ["/opt/claude", "--resume", "other-session"],
-            session_id="ses_A"))
+            session_id="ses_A")["resume_argv"], ["claude", "--resume", "ses_A"])
 
     def test_python_opencode_lifecycle_keeps_only_the_process_bound_selection_argv(self):
         from fleet import process_identity
         from fleet import herdr_projection as hp
         from fleet.collectors import opencode
         sid = "ses_A"
-        argv = ["/home/user/.local/bin/opencode", "--resume", sid, "--model", "fixture"]
+        argv = ["/home/user/.local/bin/opencode", "--session", sid, "--model", "fixture"]
         selection = {"value": {"sessionID": sid, "sessionSeq": 1000001,
-                               "sessionStartSource": "resume"}}
+                               "sessionStartSource": "clear"}}
         launch = {"pid": 4321, "proc_start": "123", "argv": argv}
         with unittest.mock.patch.object(process_identity, "current_launch_context", return_value=launch), \
                 unittest.mock.patch.object(opencode, "_tui_selection_record", return_value=selection):
             lifecycle = hp._native_opencode_lifecycle(sid)
-        self.assertEqual(lifecycle["resume_argv"], argv)
+        self.assertEqual(lifecycle["resume_argv"], ["opencode", "--session", sid, "--model", "fixture"])
         self.assertEqual(lifecycle["session_seq"], 1000001)
 
         selection["value"]["sessionID"] = "ses_other"
