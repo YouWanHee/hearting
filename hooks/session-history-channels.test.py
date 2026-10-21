@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Exercise human history notices as a channel separate from model context."""
+import contextlib
+import importlib.util
+import io
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "utilities"))
+sys.path.insert(0, str(ROOT / "tools/install"))
+import session_tidy
+
+spec = importlib.util.spec_from_file_location(
+    "codex_sessionstart", ROOT / "adapters/codex/hooks/sessionstart-lifecycle.py")
+codex = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(codex)
+
+
+class HistoryChannelTests(unittest.TestCase):
+    def test_person_notice_uses_confirmed_predecessor_and_omits_path(self):
+        lineage = [{"harness": "claude", "sid": "new", "relation": "confirmed",
+                    "predecessor": {"harness": "claude", "sid": "old"}},
+                   {"harness": "claude", "sid": "old", "transcript": {
+                       "path": "/private/raw/transcript", "status": "available"}}]
+        seat = session_tidy.Seat("pane", "key", "pane", "claude")
+        with patch.object(session_tidy, "seat_lineage", return_value=lineage), \
+             patch("herdr_integration.history_key_available", return_value=True), \
+             patch("herdr_integration.history_key_label", return_value="Ctrl-b Shift-H"):
+            notice = session_tidy.build_human_history_notice(
+                seat, "claude", "new", env={"HERDR_ACTIVE_PANE_ID": "pane", "HERDR_SOCKET_PATH": "/socket"})
+        self.assertIn("Ctrl-b Shift-H", notice)
+        self.assertIn("원문 있음", notice)
+        self.assertNotIn("/private/raw/transcript", notice)
+
+    def test_unconfirmed_neighbor_does_not_make_notice(self):
+        seat = session_tidy.Seat("pane", "key", "pane", "claude")
+        with patch.object(session_tidy, "seat_lineage", return_value=[
+                {"harness": "claude", "sid": "new", "relation": "chronological"},
+                {"harness": "claude", "sid": "neighbor", "relation": "chronological"}]):
+            self.assertEqual(session_tidy.build_human_history_notice(seat, "claude", "new", env={}), "")
+
+    def test_codex_places_notice_outside_additional_context(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            codex.emit_context("SessionStart", ["MODEL-CARD"], "PERSON-NOTICE")
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["hookSpecificOutput"]["additionalContext"], "MODEL-CARD")
+        self.assertEqual(payload["systemMessage"], "PERSON-NOTICE")
+
+    def test_codex_card_bridge_parses_separate_fields(self):
+        payload = {"additionalContext": "MODEL-CARD", "humanNotice": "PERSON-NOTICE"}
+        result = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        with patch.object(codex.subprocess, "run", return_value=result):
+            card, human = codex.card_context({"session_id": "sid"}, "/fixture")
+        self.assertEqual((card, human), ("MODEL-CARD", "PERSON-NOTICE"))
+
+    def test_human_only_lookup_leaves_ledger_and_receipts_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            seat = session_tidy.Seat("pane", "isolated-seat", "pane", "opencode")
+            emitted = []
+            with patch.dict("os.environ", {"XDG_STATE_HOME": str(state)}, clear=False), \
+                 patch.object(session_tidy, "resolve_seat", return_value=seat), \
+                 patch.object(session_tidy, "build_human_history_notice", return_value="PERSON-NOTICE"):
+                ledger = session_tidy._ledger_path(seat)
+                ledger.parent.mkdir(parents=True)
+                before = b'{"event":"start","sid":"prior"}\n'
+                ledger.write_bytes(before)
+                session_tidy.run_hook("opencode", "start", "current", env={},
+                                      emit_human=emitted.append, human_only=True)
+                self.assertEqual(emitted, ["PERSON-NOTICE"])
+                self.assertEqual(ledger.read_bytes(), before)
+                self.assertFalse(session_tidy._consumed_path(seat).exists())
+
+    def test_opencode_history_notice_lookup_settles_per_session(self):
+        script = r'''
+import { readFileSync } from "node:fs"
+import childProcess from "node:child_process"
+const lookups = new Map()
+const notices = []
+const fakeSpawnSync = (command, args, options) => {
+  if (args?.includes("--human-only")) {
+    const sid = args[args.indexOf("--session-id") + 1]
+    const count = (lookups.get(sid) || 0) + 1
+    lookups.set(sid, count)
+    const notice = sid === "late" && count === 2 ? "NOTICE-APPEARED" : ""
+    return { status: 0, stdout: JSON.stringify({ humanNotice: notice }), stderr: "" }
+  }
+  return childProcess.spawnSync(command, args, options)
+}
+globalThis.__historyNoticeFakeSpawnSync = fakeSpawnSync
+let source = readFileSync("adapters/opencode/plugins/hearting-guards.js", "utf8")
+source = source.replace('import { spawnSync, spawn } from "node:child_process"',
+  'import childProcess from "node:child_process"\nconst spawn = childProcess.spawn\nconst spawnSync = globalThis.__historyNoticeFakeSpawnSync')
+source = source.replace('const pluginDir = path.dirname(fileURLToPath(import.meta.url))',
+  'const pluginDir = path.join(process.cwd(), "adapters/opencode/plugins")')
+const { AgentHarnessGuards } = await import("data:text/javascript;base64," + Buffer.from(source).toString("base64"))
+const plugin = await AgentHarnessGuards({ directory: process.cwd(), worktree: process.cwd(),
+  client: { tui: { showToast: ({ body }) => notices.push(body.message) } } }, { initialize: false })
+const created = (sid) => plugin.event({ event: { type: "session.created", properties: { info: { id: sid } } } })
+const turn = (sid, id) => plugin["chat.message"]({ sessionID: sid, messageID: id },
+  { parts: [{ type: "text", text: "hello" }] })
+await created("empty")
+await turn("empty", "e1")
+await turn("empty", "e2")
+await turn("empty", "e3")
+await created("late")
+await turn("late", "l1")
+await turn("late", "l2")
+await turn("late", "l3")
+if (lookups.get("empty") !== 2) throw new Error(`empty lookup count=${lookups.get("empty")}`)
+if (lookups.get("late") !== 2) throw new Error(`late lookup count=${lookups.get("late")}`)
+if (notices.filter((notice) => notice === "NOTICE-APPEARED").length !== 1)
+  throw new Error(`late notice count=${JSON.stringify(notices)}`)
+console.log("empty=2 late=2 late-notice=1")
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(__import__("os").environ, XDG_STATE_HOME=directory,
+                       PYTHONDONTWRITEBYTECODE="1", AGENT_HOME=str(ROOT))
+            for key in ("AGENT_SESSION_ROLE", "AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH",
+                        "OPENCODE_DISPATCH_SLUG", "FLEET_TITLE_REFRESH"):
+                env.pop(key, None)
+            result = subprocess.run(["node", "--input-type=module", "-e", script], cwd=ROOT,
+                                    env=env, text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("empty=2 late=2 late-notice=1", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

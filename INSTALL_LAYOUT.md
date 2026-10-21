@@ -444,6 +444,18 @@ harness install opencode
 | `opencode.json`/`opencode.jsonc` `skills.paths` | non-destructive merge | Preserves user config; reports conflicts and stops instead of guessing an automatic merge |
 | `opencode.json`/`opencode.jsonc` `instructions[]` | conditional merge | Bootstrap carrier of last resort: added only when the config-home `AGENTS.md` auto-load is missing, and a previously installed entry is dropped once that link exists. User entries are never touched |
 
+The common `~/.local/bin/hearting` launcher may add one optional
+`prefix+shift+h` shell command to `~/.config/herdr/config.toml`. Hearting owns
+only the marked command block. Its metadata comment records the format version,
+whether the file was absent, the separator added, and the managed body hash;
+it does not copy the user's config into a second state file. Full-global
+uninstall restores an untouched key block and its added separator, deleting
+the config only when it was originally absent and no content remains. It leaves
+the common launcher in place. User edits outside the block survive; a modified
+or invalid block is preserved. Partial runtime uninstall retains the key. A key
+conflict keeps the user's binding and the `hearting run session_history`
+command remains available.
+
 `runtime activate` uses the official plural convention directories. Singular
 projections from the legacy `harness install opencode` path remain for
 compatibility but are not part of the active-source contract. Activation

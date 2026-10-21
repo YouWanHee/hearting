@@ -690,6 +690,33 @@ def mark_prompt_source(seat: Seat, harness: str, sid: str, sequence: int, source
     atomic_write_json(path, current)
 
 
+def _record_tidy_clear_succession_locked(seat: Seat, harness: str, sid: str, now: float) -> None:
+    """Record the confirmed session edge from a matching tidy-clear reservation only."""
+    if seat.kind not in ("pane", "native"):
+        return
+    try:
+        import session_tidy_clear
+        booking = session_tidy_clear.read_reservation(seat.key)
+    except Exception:
+        return
+    if not isinstance(booking, dict) or booking.get("harness") != harness:
+        return
+    old = booking.get("sid")
+    observed = booking.get("observed")
+    observed_sid = observed.get("sid") if isinstance(observed, dict) else None
+    if (not isinstance(old, str) or not old or old == sid
+            or not (observed_sid == sid or booking.get("new_session") == sid)):
+        return
+    if isinstance(observed, dict) and observed.get("harness") not in (None, harness):
+        return
+    if any(row.get("event") == "succession" and row.get("harness") == harness
+           and row.get("sid") == sid and row.get("from") == old
+           for row in _read_ledger_lines(seat)):
+        return
+    _append_ledger_entry(seat, {"ts": now, "harness": harness, "sid": sid,
+                                "event": "succession", "from": old, "source": "tidy-clear"})
+
+
 def prompt_state(seat: Seat) -> Optional[dict]:
     data = read_json(_prompt_seq_path(seat))
     return data if isinstance(data, dict) else None
@@ -699,7 +726,7 @@ def session_summary(seat: Seat) -> dict[tuple[str, str], dict]:
     """Fold the ledger: ``(harness, sid) -> first_seen, last_seen, epoch, transcript, cwd, ...``."""
     out: dict[tuple[str, str], dict] = {}
     for item in _read_ledger_lines(seat):
-        if item.get("event") in {"handover", "steward-release", "tidy-claim", "real-prompt"}:
+        if item.get("event") in {"handover", "succession", "steward-release", "tidy-claim", "real-prompt"}:
             # Relations, revocation and prompt provenance are not session activity.
             continue
         key = (str(item.get("harness") or ""), str(item["sid"]))
@@ -738,7 +765,7 @@ def _project_seat_lineage(rows: list[dict], cards: dict, locations: dict,
         if not name or not session:
             continue
         key = (name, session)
-        if row.get("event") == "handover":
+        if row.get("event") in {"handover", "succession"}:
             source = row.get("from")
             if isinstance(source, dict):
                 source = source.get("sid") if source.get("harness") == name else None
@@ -1262,7 +1289,8 @@ def _fold_ledger(seat: Seat) -> None:
     # Registered handovers keep the existing bounded retention. Steward lineage is
     # retained by generation/watch identity so a marker-less holder and a release
     # remain resolvable after ordinary session rows fold.
-    handovers = [(index, row) for index, row in enumerate(lines) if row.get("event") == "handover"]
+    handovers = [(index, row) for index, row in enumerate(lines)
+                 if row.get("event") in {"handover", "succession"}]
     keep_relation_indices = {index for index, _row in handovers[-HANDOVER_KEEP_ROWS:]}
     latest_role_rows, latest_watch_rows = {}, {}
     release_rows = []
@@ -1289,11 +1317,11 @@ def _fold_ledger(seat: Seat) -> None:
     # after the role moved. Keep these compact tombstones in the same ledger.
     keep_relation_indices.update(index for index, _row in release_rows)
     relations = [row for index, row in enumerate(lines) if index in keep_relation_indices
-                 and row.get("event") in {"handover", "steward-release"}]
+                 and row.get("event") in {"handover", "succession", "steward-release"}]
     claims: dict[str, dict] = {}
     real_frontiers: dict[tuple[str, str], dict] = {}
     activity = [l for l in lines if l.get("event") not in {
-        "handover", "steward-release", "tidy-claim", "real-prompt"}]
+        "handover", "succession", "steward-release", "tidy-claim", "real-prompt"}]
     for item in lines:
         if item.get("event") == "tidy-claim" and item.get("claim_id"):
             claims[str(item["claim_id"])] = item
@@ -1828,11 +1856,41 @@ def build_card_injection(card: dict, card_path: Path, now: float, cap: int,
 # Hook
 # ---------------------------------------------------------------------------
 
+def build_human_history_notice(seat: Seat, harness: str, sid: str, *, env=None) -> str:
+    """Build a person-only predecessor notice without adding it to model context."""
+    env = os.environ if env is None else env
+    lineage = seat_lineage(seat, harness=harness, sid=sid)
+    previous = _confirmed_predecessor(lineage, harness, sid)
+    if not previous:
+        return ""
+    transcript_info = previous.get("transcript") or {}
+    state = transcript_info.get("status", "missing")
+    availability = {"available": "원문 있음", "missing": "원문 없음", "expired": "원문 없음",
+                    "unreadable": "원문 읽기 불가"}.get(state, "원문 읽기 불가")
+    pane = str(env.get("HERDR_ACTIVE_PANE_ID") or env.get("HERDR_PANE_ID") or "")
+    socket = str(env.get("HERDR_SOCKET_PATH") or "")
+    key_available = False
+    if pane and socket:
+        try:
+            install_dir = str(Path(__file__).resolve().parents[1] / "tools" / "install")
+            if install_dir not in sys.path:
+                sys.path.append(install_dir)
+            from herdr_integration import history_key_available, history_key_label
+            key_available = bool(history_key_available(env=env))
+            key_label = history_key_label(env=env) if key_available else ""
+        except Exception:
+            pass
+    action = key_label if key_available else "hearting run session_history"
+    return (f"이전 대화 열기: {action} · {previous.get('harness', harness)} "
+            f"{str(previous.get('sid', ''))[:8]} · {availability}")
+
+
 def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript: str = "",
              cwd: str = "", reread: bool = False, env=None, now: Optional[float] = None,
              emit: Optional[Callable[[str], None]] = None, phase: Optional[str] = None,
              compact_summary: str = "", compact_context: Optional[dict] = None,
-             prompt_text: str = "") -> str:
+             prompt_text: str = "", emit_human: Optional[Callable[[str], None]] = None,
+             human_only: bool = False) -> str:
     """Record the session, and print the card / notices it is due exactly once.
 
     Returns the text that was emitted ("" for none). The receipt is written only
@@ -1863,6 +1921,13 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         return booked
     now = now_epoch() if now is None else now
     seat = resolve_seat(harness, cwd or None, env, sid, source)
+    if human_only:
+        if event == "start" and emit_human:
+            with contextlib.suppress(BaseException):
+                notice = build_human_history_notice(seat, harness, sid, env=env)
+                if notice:
+                    emit_human(notice)
+        return ""
     if event == "start":
         with contextlib.suppress(BaseException):
             import session_tidy_clear
@@ -1922,6 +1987,10 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             with contextlib.suppress(BaseException):    # a hook never fails for the clear note
                 import session_tidy_clear
                 session_tidy_clear.note_start_locked(seat, harness, sid, now)
+        if ((event == "start" and source == "clear")
+                or (harness == "opencode" and event == "prompt")):
+            with contextlib.suppress(BaseException):
+                _record_tidy_clear_succession_locked(seat, harness, sid, now)
         # The one place a same-seat handover (A -> B) is recorded: B's confirmed start/first prompt.
         handed = None
         handover = None
@@ -2007,6 +2076,11 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             if resume_text:
                 parts.append(resume_text)
         text = "\n".join(parts)
+        if event == "start" and emit_human:
+            with contextlib.suppress(BaseException):
+                notice = build_human_history_notice(seat, harness, sid, env=env)
+                if notice:
+                    emit_human(notice)
         if not text:
             return ""
         (emit or (lambda t: None))(text)
@@ -2522,6 +2596,9 @@ def cmd_handoff(args) -> int:
 
 def cmd_hook(args) -> int:
     try:
+        emitted = []
+        human = []
+        output_format = getattr(args, "format", "text")
         sid = args.session_id or session_from_env(args.harness)[1] or ""
         summary = ""
         prompt_text = ""
@@ -2545,9 +2622,15 @@ def cmd_hook(args) -> int:
                 if isinstance(transcript, str) and transcript:
                     compact_context["transcript"] = transcript
         result = run_hook(args.harness, args.event, sid, source=args.source or "", transcript=args.transcript or "",
-                          cwd=args.cwd or os.getcwd(), reread=args.reread, emit=_emit_stdout,
+                          cwd=args.cwd or os.getcwd(), reread=args.reread,
+                          emit=(emitted.append if output_format == "json" else _emit_stdout),
+                          emit_human=human.append,
+                          human_only=getattr(args, "human_only", False),
                           phase=args.phase, compact_summary=summary, compact_context=compact_context,
                           prompt_text=prompt_text)
+        if output_format == "json":
+            print(json.dumps({"additionalContext": "\n".join(emitted),
+                              "humanNotice": "\n".join(human)}, ensure_ascii=False))
         if (args.event == "compact" and args.phase == "after" and result.startswith("booking=")) \
                 or (args.event == "runtime-status" and result == "booking=pending"):
             _emit_stdout(result)
@@ -2615,6 +2698,8 @@ def build_parser() -> argparse.ArgumentParser:
     hook.add_argument("--transcript")
     hook.add_argument("--cwd")
     hook.add_argument("--reread", action="store_true")
+    hook.add_argument("--format", choices=("text", "json"), default="text")
+    hook.add_argument("--human-only", action="store_true")
     hook.add_argument("--phase", choices=("before", "after"))
     hook.set_defaults(func=cmd_hook)
     enqueue = sub.add_parser("enqueue", help="queue the memory tidy and return at once")

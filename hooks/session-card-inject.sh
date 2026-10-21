@@ -43,6 +43,7 @@ def text(key):
     value = payload.get(key)
     return value if isinstance(value, str) else ""
 contexts = []
+human = []
 def emit(context):
     contexts.append(context)
 try:
@@ -50,6 +51,7 @@ try:
     session_tidy.run_hook(
         "claude", event, sid, source=text("source"),
         transcript=text("transcript_path"), cwd=text("cwd") or os.getcwd(), emit=emit,
+        emit_human=human.append,
         prompt_text=text("prompt"))
 except Exception:
     pass
@@ -61,11 +63,12 @@ except Exception:
     pass
 if notice:
     contexts.append(notice)
-if contexts:
+system = "\n".join(human + ([notice] if notice else []))
+if contexts or system:
     output = {"hookSpecificOutput": {"hookEventName": name,
               "additionalContext": "\n".join(contexts)}}
-    if notice:
-        output["systemMessage"] = notice
+    if system:
+        output["systemMessage"] = system
     print(json.dumps(output, ensure_ascii=False), flush=True)
 ' 2>/dev/null
 exit 0

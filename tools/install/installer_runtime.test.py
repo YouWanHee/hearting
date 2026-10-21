@@ -23,6 +23,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import installer  # noqa: E402
+import bootstrap  # noqa: E402
+import herdr_integration  # noqa: E402
 import codex_launcher  # noqa: E402
 import runtime_activation  # noqa: E402
 import fixture_env  # noqa: E402
@@ -159,6 +161,23 @@ class LauncherCommitBoundaryTest(unittest.TestCase):
             scope="global",
             dry_run=False,
         )
+
+    def test_refresh_keeps_shared_history_key_in_common_ensure_path(self):
+        target = self.home / ".local/bin/hearting"
+        target.parent.mkdir(parents=True)
+        source = self.home / "hearting-source"
+        _write_executable(source)
+        target.symlink_to(source)
+        launchers = [{"name": "hearting", "target": str(target),
+                      "status": "unchanged"}]
+        with _stubbed_runtime_projection(), \
+             mock.patch.object(bootstrap, "install_launchers", return_value=launchers) as install, \
+             mock.patch.object(herdr_integration, "ensure_history_key",
+                               return_value={"status": "unchanged", "changed": False}) as ensure:
+            result = installer.cmd_runtime(self._args("refresh"))
+        self.assertEqual(result["exit"], installer.EXIT_OK)
+        install.assert_called_once_with(dry_run=True)
+        ensure.assert_called_once_with(str(target), dry_run=False)
 
     def test_activation_reconnects_once_and_rollback_never_reconnects(self):
         with _stubbed_runtime_projection() as mocks, \
