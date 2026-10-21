@@ -2736,8 +2736,8 @@ current native SID. Preserve its unambiguous options while replacing only the
 session selector value. Fork selectors, ambiguous selectors, or positional
 prompts use Herdr's canonical resume form. Launches without an explicit
 session selector omit the field. The optional native `resume_argv` uses the
-proven harness executable as a plain command name; native identity and
-foreground PID birth must still prove that launcher. Foreign executables,
+proven harness executable as a plain command name, only when native identity
+and foreground PID birth prove that launcher. Foreign executables,
 unsupported wrappers, relative paths, malformed argv, or mismatched native
 identity omit that optional field while retaining a valid session-only report.
 Absent transcript, cwd,
