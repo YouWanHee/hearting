@@ -1079,9 +1079,9 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return json.loads(proc.stdout)
 
-    def settle_at(self, handed, now_ns):
+    def settle_at(self, handed, now_ns, messages=None):
         output = io.StringIO()
-        payload = {**handed, "messages": []}
+        payload = {**handed, "messages": messages or []}
         with mock.patch.object(SWEEP, "_state_roots", return_value=[self.root]), \
                 mock.patch.object(SWEEP.time, "monotonic_ns", return_value=now_ns), \
                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
@@ -1126,7 +1126,7 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
 
     def run_plugin(self, body, *, prompt_async="accept", restored_selector=False,
                    extra_env=None, native_messages=None, claim_change=False, claim_expire=False,
-                   claim_receipt=False):
+                   claim_receipt=False, late_native_text=None):
         plugin = ROOT / "adapters/opencode/plugins/hearting-guards.js"
         if restored_selector:
             fixture = self.root.parent / "restored-plugin/adapters/opencode/plugins/hearting-guards.js"
@@ -1158,6 +1158,10 @@ const session = {
         parts: [{type: "text", text: process.env.EXPECTED_NATIVE_TEXT}],
       });
     }
+    if (nativeReads === 2 && process.env.LATE_NATIVE_TEXT) nativeMessages.push({
+      info: {sessionID: "ses-oc-parent", role: "user"},
+      parts: [{type: "text", text: process.env.LATE_NATIVE_TEXT}],
+    });
     return {data: nativeMessages};
   }, prompt: async () => ({data: null}),
   promptAsync: async (request) => {
@@ -1179,6 +1183,8 @@ console.log(JSON.stringify({prompts, logs}));
 '''.replace("MODE", json.dumps(prompt_async)).replace("BODY", body).replace("PLUGIN", json.dumps(str(plugin))).replace(
             "NATIVE_MESSAGES", json.dumps(native_messages or []))
         env = self.env()
+        if late_native_text is not None:
+            env["LATE_NATIVE_TEXT"] = late_native_text
         if claim_change or claim_expire:
             record = {**PD.read(self.root, self.SID, "delivery-" + "a" * 32),
                       SWEEP.STORAGE_KEY: self.SID}
@@ -1309,6 +1315,100 @@ console.log(JSON.stringify({carrierEnv: globalThis.carrierEnv}));
                    if item.get("extra", {}).get("reason") == "native-receipt-before-send"]
         self.assertTrue(any(item.get("received") == 1 and item.get("acked") == 1
                             for item in settled))
+
+    def test_preclaim_recognizes_exact_native_body_with_historical_attempt_count(self):
+        self.seed_turn()
+        did = "delivery-" + "a" * 32
+        first = self._mark_sent_ambiguous(did)
+        first_body = SWEEP.delivery_context([
+            (self.root, [{**first, SWEEP.STORAGE_KEY: self.SID}])])
+        self._expire_ambiguous([did])
+        second = PD.claim(self.root, self.SID, did, claim_owner="second-carrier",
+                          lease_seconds=30, require_generation_proof=False)
+        self.assertEqual((first["attempts"], second["attempts"]), (1, 2))
+        native = [{"info": {"sessionID": self.SID, "role": "user"},
+                   "parts": [{"type": "text", "text": first_body}]}]
+
+        result = self.cli("deliver", json.dumps({"messages": native}))
+
+        self.assertEqual(result["records"], [])
+        self.assertEqual(result["text"], "")
+        self.assertEqual(PD.read(self.root, self.SID, did)["state"], "acked")
+        self.assertEqual(PD.read(self.root, self.SID, did)["attempts"], 2)
+
+    def test_late_first_claim_receipt_settles_before_second_claim_prompt_async(self):
+        self.seed_turn()
+        did = "delivery-" + "a" * 32
+        first = self._mark_sent_ambiguous(did)
+        first_body = SWEEP.delivery_context([
+            (self.root, [{**first, SWEEP.STORAGE_KEY: self.SID}])])
+        self._expire_ambiguous([did])
+
+        result = self.run_plugin(self.IDLE_THEN_WAIT, late_native_text=first_body)
+
+        self.assertEqual(result["prompts"], [])
+        current = PD.read(self.root, self.SID, did)
+        self.assertEqual(current["state"], "acked")
+        self.assertEqual(current["attempts"], 2)
+        settled = [item["extra"] for item in result["logs"]
+                   if item.get("extra", {}).get("reason") == "native-receipt-before-send"]
+        self.assertTrue(any(item.get("received") == 1 and item.get("acked") == 1
+                            for item in settled))
+
+    def test_second_claim_without_original_receipt_keeps_normal_prompt_fallback(self):
+        self.seed_turn()
+        did = "delivery-" + "a" * 32
+        self._mark_sent_ambiguous(did)
+        self._expire_ambiguous([did])
+
+        result = self.run_plugin(self.IDLE_THEN_WAIT)
+
+        self.assertEqual(len(result["prompts"]), 1)
+        self.assertIn("attempts=2", result["prompts"][0]["body"]["parts"][0]["text"])
+        self.assertEqual(PD.read(self.root, self.SID, did)["state"], "acked")
+
+    def test_impossible_historical_attempt_count_does_not_ack_current_claim(self):
+        self.seed_turn()
+        did = "delivery-" + "a" * 32
+        first = self._mark_sent_ambiguous(did)
+        first_body = SWEEP.delivery_context([
+            (self.root, [{**first, SWEEP.STORAGE_KEY: self.SID}])])
+        self._expire_ambiguous([did])
+        handed = self.cli("deliver")
+        self.assertEqual(handed["records"][0]["immutable_identity"]["delivery_id"], did)
+        impossible = first_body.replace("attempts=1", "attempts=3")
+        native = [{"info": {"sessionID": self.SID, "role": "user"},
+                   "parts": [{"type": "text", "text": impossible}]}]
+
+        result = self.cli("settle", json.dumps({**handed, "messages": native}))
+
+        self.assertEqual(result["received_ids"], [])
+        self.assertEqual(result["text"], handed["text"])
+        self.assertEqual(PD.read(self.root, self.SID, did)["state"], "claimed")
+
+    def test_historical_receipt_ack_failure_suppresses_send_and_retries_ack(self):
+        self.seed_turn()
+        did = "delivery-" + "a" * 32
+        first = self._mark_sent_ambiguous(did)
+        first_body = SWEEP.delivery_context([
+            (self.root, [{**first, SWEEP.STORAGE_KEY: self.SID}])])
+        self._expire_ambiguous([did])
+        handed = self.cli("deliver")
+        native = [{"info": {"sessionID": self.SID, "role": "user"},
+                   "parts": [{"type": "text", "text": first_body}]}]
+
+        with mock.patch.object(PD, "ack_received", side_effect=OSError("simulated ACK write failure")):
+            failed_ack = self.settle_at(handed, time.monotonic_ns(), messages=native)
+        self.assertEqual(failed_ack["received_ids"], [did])
+        self.assertEqual(failed_ack["text"], "")
+        self.assertEqual(failed_ack["records"], [])
+        self.assertEqual(PD.read(self.root, self.SID, did)["state"], "claimed")
+
+        retry = self.settle_at(handed, time.monotonic_ns(), messages=native)
+        self.assertEqual(retry["received_ids"], [did])
+        self.assertEqual(retry["settled_count"], 1)
+        self.assertEqual(retry["text"], "")
+        self.assertEqual(PD.read(self.root, self.SID, did)["state"], "acked")
 
     def test_prior_batch_settles_after_unrelated_pending_addition_and_sends_only_new_record(self):
         import dispatch_recipient_receipt as recipient_receipt

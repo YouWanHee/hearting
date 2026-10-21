@@ -564,14 +564,48 @@ def _opencode_native_user_texts(messages, session_id: str) -> list[str]:
     return texts
 
 
+def _opencode_historical_attempts(native_text: str, record: dict) -> int | None:
+    """Read a displayed historical claim count only when it could belong to this record."""
+    delivery_id = record.get("delivery_id")
+    display = _bounded_receipt_text(record).split()
+    if (not isinstance(delivery_id, str) or len(display) < 4
+            or display[0] != f"delivery_id={delivery_id}"
+            or not display[1].startswith("route_id=")
+            or not display[2].startswith("route_node=")
+            or not display[3].startswith("attempts=")):
+        return record.get("attempts")
+
+    lines = []
+    for line in native_text.splitlines():
+        fields = line.split()
+        if (len(fields) >= 4 and fields[0] == "-"
+                and fields[1] == f"delivery_id={delivery_id}"
+                and fields[2].startswith("route_id=")
+                and fields[3].startswith("route_node=")):
+            lines.append(fields)
+    if len(lines) != 1:
+        return None
+    counts = [field[len("attempts="):] for field in lines[0][4:]
+              if field.startswith("attempts=")]
+    current = record.get("attempts")
+    if (len(counts) != 1 or not counts[0].isascii() or not counts[0].isdigit()
+            or type(current) is not int or current < 1
+            or record.get("claim_authority") not in pending_delivery.CLAIM_AUTHORITIES):
+        return None
+    historical = int(counts[0])
+    if historical < 1 or historical > current:
+        return None
+    return historical
+
+
 def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
                                     session_id: str, messages=None) -> list[dict]:
     """Rebuild only batches named by native markers and verify their exact body.
 
     Markers select candidate records; the rendered body and each current immutable
     identity must still match. This recognizes an older batch after unrelated
-    pending records arrive and can use an already-ACKed member to validate the
-    original body without reopening that member.
+    pending records arrive, a member is ACKed, or its displayed claim count advances.
+    Historical counts are accepted only within the record's already-claimed range.
     """
     from dispatch_recipient_receipt import OPENCODE_MARKER_LINE_RE, identity_binding
     from dispatch_seat_handover import record_for_session, storage_recipients
@@ -630,7 +664,13 @@ def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
                 valid = False
                 break
             root, record, identity = matches[0]
-            selected.append((root, record))
+            historical_attempts = _opencode_historical_attempts(native_text, record)
+            if historical_attempts is None:
+                valid = False
+                break
+            rendered_record = (record if historical_attempts == record.get("attempts")
+                               else {**record, "attempts": historical_attempts})
+            selected.append((root, rendered_record))
             identities.append((delivery_id, identity))
         if not valid:
             continue
@@ -794,6 +834,8 @@ def main(argv: list[str] | None = None) -> int:
                 expected = _opencode_expected_message(text, identities)
                 if expected["bindings"]:
                     expected_messages.append(expected)
+            expected_messages.extend(_opencode_delivery_expectations(
+                roots, args.recipient_kind, args.session, handed.get("messages")))
         else:
             supplied = handed.get("expected_native_messages")
             if isinstance(supplied, list):
