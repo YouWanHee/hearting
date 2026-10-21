@@ -316,6 +316,7 @@ def sweep_deliver(
     harness = ("claude" if recipient_kind.startswith("claude") else
                "codex" if recipient_kind.startswith("codex") else
                "opencode" if recipient_kind.startswith("opencode") else "")
+    legacy_bindings_by_evidence: dict[int, tuple[dict, dict]] = {}
 
     def settle_observed(record):
         evidence = native_evidence
@@ -324,6 +325,23 @@ def sweep_deliver(
                 evidence = receipt_observer(root, record.get(STORAGE_KEY) or session_id, record)
             except Exception:
                 evidence = None
+        if harness == "claude" and isinstance(evidence, dict):
+            key = id(evidence)
+            cached = legacy_bindings_by_evidence.get(key)
+            if cached is None or cached[0] is not evidence:
+                try:
+                    from dispatch_recipient_receipt import legacy_claude_receipt_bindings
+                    bindings = legacy_claude_receipt_bindings(
+                        root, recipient_kind, session_id, addressed, evidence)
+                except Exception:
+                    bindings = {}
+                legacy_bindings_by_evidence[key] = (evidence, bindings)
+            storage = record.get(STORAGE_KEY) or session_id
+            legacy_binding = legacy_bindings_by_evidence[key][1].get(
+                (storage, record.get("delivery_id")))
+            if legacy_binding is not None:
+                evidence = {**evidence,
+                            "bindings": [*(evidence.get("bindings") or []), legacy_binding]}
         try:
             return settle_native_receipt(
                 root, record.get(STORAGE_KEY) or session_id, harness, session_id,

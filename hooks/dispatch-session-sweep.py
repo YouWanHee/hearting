@@ -78,19 +78,34 @@ def _process_session(payload: object, session_id: str) -> int:
         return 0
     seen: set[Path] = set()
     batches: list[tuple[Path, list[dict]]] = []
-    native_evidence = None
+    receipt_observer = None
     if _event_name(payload) == "UserPromptSubmit" and isinstance(payload, dict):
         transcript_path = payload.get("transcript_path", payload.get("transcriptPath"))
         cwd = payload.get("cwd")
         if isinstance(transcript_path, str) and isinstance(cwd, str):
-            try:
-                from dispatch_recipient_receipt import claude_transcript_evidence
-                runtime_home = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
-                native_evidence = claude_transcript_evidence(
-                    transcript_path=transcript_path, session_id=session_id, cwd=cwd,
-                    expected_cwd=os.getcwd(), runtime_home=runtime_home)
-            except (OSError, RuntimeError, TypeError, ValueError):
-                native_evidence = None
+            runtime_home = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+            cached_signature = object()
+            cached_evidence = None
+
+            def observe_receipt(_root, _storage, _record):
+                nonlocal cached_signature, cached_evidence
+                try:
+                    info = Path(transcript_path).stat()
+                    signature = (info.st_size, info.st_mtime_ns)
+                except OSError:
+                    signature = None
+                if signature != cached_signature:
+                    try:
+                        from dispatch_recipient_receipt import claude_transcript_evidence
+                        cached_evidence = claude_transcript_evidence(
+                            transcript_path=transcript_path, session_id=session_id, cwd=cwd,
+                            expected_cwd=os.getcwd(), runtime_home=runtime_home)
+                    except (OSError, RuntimeError, TypeError, ValueError):
+                        cached_evidence = None
+                    cached_signature = signature
+                return cached_evidence
+
+            receipt_observer = observe_receipt
     for root in roots:
         if root in seen:
             continue
@@ -104,7 +119,8 @@ def _process_session(payload: object, session_id: str) -> int:
                 records = activate(root, RECIPIENT_KIND, session_id, request_recovery=False)
             else:
                 records, _entries = sweep_deliver(
-                    root, RECIPIENT_KIND, session_id, native_evidence=native_evidence)
+                    root, RECIPIENT_KIND, session_id,
+                    **({"receipt_observer": receipt_observer} if receipt_observer else {}))
         except Exception:  # noqa: BLE001 -- fail-open (§13.33.1-(3))
             continue
         if records:

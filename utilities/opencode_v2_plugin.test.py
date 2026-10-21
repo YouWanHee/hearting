@@ -139,6 +139,9 @@ try {
                 once = root / "root-change-used"
                 sid = "ses_deliveryfixture"
                 recipient = {"harness": "opencode", "session_id": sid}
+                dispatch_root = root / "harness" / "dispatch"
+                dispatch_root.mkdir(parents=True, exist_ok=True)
+                (dispatch_root / "jobs.log").touch()
                 with mock.patch.dict(os.environ, {
                         "HOME": str(root / "home"), "XDG_STATE_HOME": str(root / "state"),
                         "AGENT_PEER_LEDGER_ROOT": str(peer_root),
@@ -146,7 +149,6 @@ try {
                         "AGENT_DISPATCH_JOBS": str(root / "harness" / "dispatch" / "jobs.log"),
                         "AGENT_RUNTIME_ROOT": str(root / "runtime")}):
                     receipt_marker = ""
-                    dispatch_root = root / "harness" / "dispatch"
                     if case == "dispatch-race":
                         import dispatch_pending_delivery as pending
                         import dispatch_recipient_receipt as recipient_receipt
@@ -176,6 +178,44 @@ try {
                     _text, ref = peer.prepare_peer_message(transfer_text, {
                         "harness": "codex", "session_id": "sender"}, recipient, defer=True)
                     expected_text = peer._read_pending(ref)["text"]
+                    fake_peer = root / "fake-peer-command.py"
+                    fake_peer.write_text(r'''import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+def value(option, default=None):
+    try: return args[args.index(option) + 1]
+    except (ValueError, IndexError): return default
+ref = (value("--reserve") or value("--release-reservation") or value("--begin-write")
+       or value("--queued") or value("--resuming") or os.environ["TRANSFER_REF"])
+path = Path(os.environ["AGENT_PEER_LEDGER_ROOT"]) / "peer-messages" / "pending" / (ref + ".json")
+row = json.loads(path.read_text())
+def save(): path.write_text(json.dumps(row))
+if "--reserve" in args:
+    row["rpc_claim"] = {"token": "fixture-claim", "pid": int(value("--claim-pid")),
+        "start": value("--claim-start"), "receipt": "opencode-prompt-inflight",
+        "recipient": {"harness": "opencode", "session_id": value("--to-session-id"), "pane_id": None}}
+    save(); print(json.dumps(row)); raise SystemExit(0)
+if "--release-reservation" in args:
+    if row.get("state") != "pending" or row.get("rpc_claim", {}).get("token") != value("--claim-token"):
+        raise SystemExit(1)
+    row.update(rpc_claim=None, receipt="opencode-prompt-reservation-released")
+    save(); raise SystemExit(0)
+if "--begin-write" in args:
+    if os.environ.get("CASE") == "begin-refused": raise SystemExit(1)
+    row.update(state="unverified", receipt="opencode-prompt-inflight")
+    save(); print(json.dumps(row)); raise SystemExit(0)
+if "--queued" in args:
+    row.update(state="queued", rpc_claim=None, receipt="context-api-accepted",
+               actual_message_id=value("--message-id"))
+    save(); raise SystemExit(0)
+if "--resuming" in args:
+    row["resume_attempted"] = True
+    save(); raise SystemExit(0)
+if "--received" in args:
+    row.update(state="received", receipt="exact-native-history")
+    save(); raise SystemExit(0)
+print(json.dumps([row]))
+''', encoding="utf-8")
                     wrapper = fake_bin / "python3"
                     wrapper.write_text(
                         "#!/bin/sh\n"
@@ -186,6 +226,7 @@ try {
                            if case == "root-change" else "")
                         + ("for arg in \"$@\"; do [ \"$arg\" = \"--begin-write\" ] && exit 1; done\n"
                            if case == "begin-refused" else "")
+                        + "if [ \"$1\" = \"$PEER_HELPER\" ] && [ \"$2\" = \"pending\" ]; then shift; exec \"$REAL_PYTHON\" \"$FAKE_PEER_HELPER\" \"$@\"; fi\n"
                         + "exec \"$REAL_PYTHON\" \"$@\"\n", encoding="utf-8")
                     wrapper.chmod(0o755)
                     alt = root / "other-directory"
@@ -200,6 +241,7 @@ try {
                         "PLUGIN_PATH": str(plugin), "TARGET_SID": sid, "TRANSFER_REF": ref,
                         "EXPECTED_TEXT": expected_text, "RESERVE_MARKER": str(marker),
                         "ALT_DIRECTORY": str(alt), "PEER_HELPER": str(ROOT / "utilities/peer-message.py"),
+                        "FAKE_PEER_HELPER": str(fake_peer),
                         "RESERVE_LOG": str(root / "reserves"),
                         "CASE": case, "RECEIPT_MARKER": receipt_marker,
                         "PYTHONDONTWRITEBYTECODE": "1", "OPENCODE_VERSION": "1.19.0"}

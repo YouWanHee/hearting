@@ -18,6 +18,13 @@ import dispatch_pending_delivery as pending
 
 MARKER_RE = re.compile(r"HEARTING_RECEIPT_V1\s+(delivery-[A-Za-z0-9._-]{1,128})\s+([0-9a-f]{64})")
 MAX_CLAUDE_TRANSCRIPT_BYTES = 4 * 1024 * 1024
+LEGACY_COMPLETION_RE = re.compile(
+    r"Runtime owner completion receipt schema=2 state=(success|attention) "
+    r"attempt_id=([^\s]+) armed=([^\s]+) status=([^\s]+) "
+    r"row_revision=([0-9a-f]{64}) row_digest=([0-9a-f]{64}) "
+    r"marker_current=1 quiescent=[01] owned_children=\d+ advanced=[01] "
+    r"reason=([^\s]+) required_action=([^\s.]+)\."
+)
 SOURCE_BY_HARNESS = {
     "claude": "claude-transcript",
     "codex": "codex-native-queue",
@@ -58,7 +65,7 @@ def _evidence(harness: str, session_id: str, source: str,
     bindings = sorted({(match.group(1), match.group(2))
                        for text in texts for match in MARKER_RE.finditer(text)})
     return {"harness": harness, "session_id": session_id, "source": source,
-            "bindings": bindings}
+            "bindings": bindings, "legacy_texts": list(texts)}
 
 
 def claude_feedback_evidence(events: Any, session_id: str) -> dict[str, Any] | None:
@@ -174,6 +181,128 @@ def codex_consumed_evidence(*, session_id: str, client_message_id: str,
             or not isinstance(expected_message, str)):
         return None
     return _evidence("codex", session_id, "codex-native-queue", [expected_message])
+
+
+def _legacy_completion_match(root: Path, storage: str, session_id: str,
+                             record: dict, text: str) -> bool:
+    matches = list(LEGACY_COMPLETION_RE.finditer(text))
+    if len(matches) != 1 or record.get("recipient_kind") != "claude-parent-runtime":
+        return False
+    state, attempt_id, _armed, status, revision, row_digest, _reason, action = matches[0].groups()
+    if (record.get("attempt_ids") != [attempt_id]
+            or (record.get("row_revisions") or {}).get(attempt_id) != revision):
+        return False
+    receipt = record.get("receipt")
+    if not isinstance(receipt, dict):
+        return False
+    children = receipt.get("children")
+    if not isinstance(children, list) or len(children) != 1 or not isinstance(children[0], dict):
+        return False
+    child = children[0]
+    if (child.get("attempt_id") != attempt_id or child.get("status") != status
+            or child.get("required_action") != action
+            or child.get("delivery_classification") != state
+            or receipt.get("delivery_classification") != state):
+        return False
+    jobs_value = receipt.get("job_registry")
+    if not isinstance(jobs_value, str) or not jobs_value:
+        return False
+    try:
+        from dispatch_completion_join import (
+            child_row_revision, current_attempt_row, pending_record_identity,
+            unseal_delivery_receipt,
+        )
+        from dispatch_seat_handover import effective_parent, effective_parent_harness
+        jobs = Path(jobs_value).expanduser().resolve(strict=True)
+        if jobs.parent != Path(root).resolve():
+            return False
+        row = current_attempt_row(jobs, attempt_id)
+        if (row is None or row.status != status
+                or row.metadata.get("parent_sid") != storage
+                or row.metadata.get("parent_completion_delivery") != record.get("recipient_kind")
+                or row.metadata.get("delivery_id") != record.get("delivery_id")
+                or row.metadata.get("delivery_receipt_digest") != record.get("receipt_digest")
+                or row.metadata.get("delivery_row_revision") != revision
+                or child_row_revision(row) != revision
+                or hashlib.sha256(row.raw.encode("utf-8")).hexdigest() != row_digest
+                or effective_parent(row.metadata, jobs) != session_id
+                or effective_parent_harness(row.metadata, jobs) != "claude"):
+            return False
+        encoded = row.metadata.get("delivery_receipt_b64")
+        if not isinstance(encoded, str) or unseal_delivery_receipt(encoded) != receipt:
+            return False
+        route_id, route_node, parent_attempt_id = pending_record_identity(row.metadata, jobs)
+        identity = pending.received_ack_identity(record, storage, record["delivery_id"])
+        return (identity.get("route_id") == route_id
+                and identity.get("route_node") == route_node
+                and identity.get("parent_attempt_id") == parent_attempt_id)
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError, pending.PendingDeliveryError):
+        return False
+
+
+def legacy_claude_receipt_bindings(root: str | Path, recipient_kind: str,
+                                   session_id: str, records: list[dict],
+                                   evidence: dict | None) -> dict[tuple[str, str], tuple[str, str]]:
+    """Bind marker-free feedback only when one complete current record matches.
+
+    New output always carries a marker. This read-only compatibility path is
+    limited to native Stop feedback and requires unique full-record matching;
+    partial attempts, stale rows and duplicate candidates remain unknown.
+    """
+    if (not isinstance(evidence, dict) or evidence.get("harness") != "claude"
+            or evidence.get("source") != "claude-transcript"
+            or evidence.get("session_id") != session_id):
+        return {}
+    texts = evidence.get("legacy_texts")
+    if not isinstance(texts, list):
+        return {}
+    candidates = []
+    for record in records:
+        storage = record.get("_storage_key") or session_id
+        if (record.get("recipient_kind") != recipient_kind
+                or not isinstance(record.get("delivery_id"), str)):
+            continue
+        candidates.append((storage, record))
+    result: dict[tuple[str, str], tuple[str, str]] = {}
+    for text in texts:
+        matches = []
+        for storage, record in candidates:
+            if recipient_kind != "claude-parent-runtime":
+                continue
+            if _legacy_completion_match(Path(root), storage, session_id, record, text):
+                matches.append((storage, record))
+                continue
+            receipt = record.get("receipt")
+            if not isinstance(receipt, dict) or receipt.get("kind") not in {
+                    "supervision", "human-gate", "notice"}:
+                continue
+            try:
+                from dispatch_session_sweep import _bounded_receipt_text
+                rendered = {_bounded_receipt_text(record)}
+                if receipt.get("kind") == "supervision":
+                    from dispatch_supervision import CONTINUED_KEY, continue_for_parent
+                    try:
+                        continued = continue_for_parent(
+                            record, session_id=session_id, recipient_kind=recipient_kind)
+                    except (OSError, RuntimeError, TypeError, ValueError):
+                        continued = None
+                    if continued:
+                        rendered.add(_bounded_receipt_text({**record, CONTINUED_KEY: continued}))
+                if any(value and value in text for value in rendered):
+                    matches.append((storage, record))
+            except (KeyError, TypeError, ValueError, RuntimeError):
+                continue
+        unique = {(storage, record["delivery_id"]): (storage, record)
+                  for storage, record in matches}
+        if len(unique) != 1:
+            continue
+        (storage, delivery_id), (_storage, record) = next(iter(unique.items()))
+        try:
+            result[(storage, delivery_id)] = (
+                delivery_id, binding_digest(record, storage))
+        except (KeyError, TypeError, ValueError, pending.PendingDeliveryError):
+            continue
+    return result
 
 
 def settle_native_receipt(root: str | Path, storage_recipient: str,

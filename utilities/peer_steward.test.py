@@ -10700,6 +10700,50 @@ class NativeDispatchReceiptTest(unittest.TestCase):
             self.assertTrue(received)
             self.assertEqual(pending.read(root, sid, did)["state"], "acked")
 
+    def test_registered_peer_courier_skips_new_transfer_after_exact_native_receipt(self):
+        from types import SimpleNamespace
+        import dispatch_pending_delivery as pending
+
+        with tempfile.TemporaryDirectory(prefix="peer-native-no-send-") as tmp:
+            jobs = Path(tmp) / "jobs.log"
+            jobs.touch()
+            attempt, sid = "att-peer-native", "claude-peer-session"
+            carrier = "claude-parent-runtime"
+            metadata = {"parent_sid": sid, "parent_harness": "claude",
+                        "parent_completion_delivery": carrier, "delivery_intent": "1",
+                        "delivery_id": "delivery-" + "a" * 32,
+                        "delivery_receipt_digest": "digest-native",
+                        "delivery_row_revision": "revision-native",
+                        "route_id": "route-native", "route_node": "execute"}
+            row = SimpleNamespace(status="done", attempt_id=attempt, metadata=metadata)
+            store = peer_steward.peer_obligations.ObligationStore(Path(tmp))
+            identity = {"jobs": str(jobs), "attempt_id": attempt, "session_id": sid,
+                        "harness": "claude", "server": "default"}
+            duty = store.create("registered-batch-native-" + "a" * 20,
+                                "registered-batch", identity, {"carrier": carrier})
+            record = {"state": "pending", "delivery_id": metadata["delivery_id"],
+                      "recipient_kind": carrier, "attempt_ids": [attempt],
+                      "receipt_digest": metadata["delivery_receipt_digest"]}
+            agents = {"result": {"agents": [{"agent": "claude", "pane_id": "w1:p9",
+                      "agent_session": {"value": sid}}]}}
+            with mock.patch("dispatch_completion_join.current_attempt_row", return_value=row), \
+                 mock.patch("dispatch_completion_join.materialize_after_terminal_close"), \
+                 mock.patch("dispatch_seat_handover.effective_parent", return_value=sid), \
+                 mock.patch("dispatch_seat_handover.effective_parent_harness", return_value="claude"), \
+                 mock.patch.object(pending, "read", return_value=record), \
+                 mock.patch.object(pending, "claim") as claim, \
+                 mock.patch.object(peer_steward, "_settle_claude_native_dispatch_receipt",
+                                   return_value=True) as received, \
+                 mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
+                     stdout=json.dumps(agents), returncode=0)), \
+                 mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", sid)), \
+                 mock.patch.object(peer_steward, "cmd_prompt") as send:
+                peer_steward._resume_registered_obligation(store.get(duty["id"]), store)
+            received.assert_called_once()
+            claim.assert_not_called()
+            send.assert_not_called()
+            self.assertEqual(store.get(duty["id"])["state"], "pending")
+
 
 if __name__ == "__main__":
     unittest.main()

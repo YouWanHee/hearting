@@ -6250,7 +6250,8 @@ def _settle_claude_native_dispatch_receipt(root, storage_recipient, row,
     try:
         from claude_project_dir import resolve_session_transcript
         from dispatch_recipient_receipt import (
-            claude_transcript_evidence, settle_native_receipt,
+            claude_transcript_evidence, legacy_claude_receipt_bindings,
+            settle_native_receipt,
         )
         transcript, _reason = resolve_session_transcript(
             recipient_sid, cwd, expected_cwd=cwd, runtime_home=runtime_home)
@@ -6259,6 +6260,17 @@ def _settle_claude_native_dispatch_receipt(root, storage_recipient, row,
         evidence = claude_transcript_evidence(
             transcript_path=transcript, session_id=recipient_sid, cwd=cwd,
             expected_cwd=cwd, runtime_home=runtime_home)
+        if evidence is not None:
+            from dispatch_session_sweep import addressed_records
+            candidates, _count = addressed_records(
+                Path(root), record.get("recipient_kind", ""), recipient_sid)
+            legacy = legacy_claude_receipt_bindings(
+                root, record.get("recipient_kind", ""), recipient_sid,
+                candidates, evidence)
+            binding = legacy.get((storage_recipient, record.get("delivery_id")))
+            if binding is not None:
+                evidence = {**evidence,
+                            "bindings": [*(evidence.get("bindings") or []), binding]}
         outcome = settle_native_receipt(
             root, storage_recipient, "claude", recipient_sid, record, evidence,
             acked_by=f"native-receipt:claude:{recipient_sid}")
