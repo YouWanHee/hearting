@@ -113,7 +113,7 @@ class OnceSurface(IntegrationEnv):
         render._EXPLORER_STATE = ExplorerState(selection=f"session:claude:{self.fx.sid}",
                                                focus=f"claude:{self.fx.sid}")
 
-    def test_default_once_output_is_the_compose_result(self):
+    def test_explorer_once_output_is_the_compose_result(self):
         self.focus_main_session()
         seen = []
         original = render._explorer_once_frame
@@ -123,7 +123,7 @@ class OnceSurface(IntegrationEnv):
             return seen[-1]
 
         with mock.patch.object(render, "_explorer_once_frame", spy):
-            code, out = self.run_main(["--once"])
+            code, out = self.run_main(["--once", "--explorer"])
         self.assertEqual(code, 0)
         self.assertEqual(len(seen), 1)
         frame = seen[0]
@@ -164,15 +164,17 @@ class OnceSurface(IntegrationEnv):
                     return seen[-1]
 
                 with mock.patch.object(render, "_explorer_once_frame", spy):
-                    code, _out = self.run_main(["--once"], cols=cols)
+                    code, _out = self.run_main(["--once", "--explorer"], cols=cols)
                 self.assertEqual(code, 0)
                 lines = seen[0].lines
                 self.assertEqual(len(lines), 45)
                 self.assertEqual([(i, cell_width(line)) for i, line in enumerate(lines)
                                   if cell_width(line) != cols], [])
 
-    def test_once_with_view_group_or_process_is_the_old_renderer(self):
-        for argv, env in ((["--once", "--view", "group"], {}), (["--once", "--view", "process"], {}),
+    def test_once_without_explorer_is_the_old_renderer(self):
+        # `fleet` keeps the group/process screen; only --explorer (`fleet2`) draws B.
+        for argv, env in ((["--once"], {}), (["--once", "--view", "group"], {}),
+                          (["--once", "--view", "process"], {}),
                           (["--once"], {"FLEET_VIEW": "group"})):
             with self.subTest(argv=argv, env=env):
                 with mock.patch.object(render, "_explorer_compose",
@@ -184,6 +186,18 @@ class OnceSurface(IntegrationEnv):
                 self.assertNotIn("탐색 1–", out)
                 self.assertNotIn("요청 ? ·", out)
         self.assertFalse(render._EXPLORER_ENABLED)
+
+    def test_live_screen_is_the_old_one_unless_explorer_is_asked_for(self):
+        for argv, expected in (([], False), (["--view", "process"], False),
+                               (["--explorer"], True)):
+            with self.subTest(argv=argv):
+                seen = []
+                with mock.patch.object(render, "run_live",
+                                       lambda *a, **k: seen.append(render._EXPLORER_ENABLED) or 0):
+                    code, _out = self.run_main(argv)
+                self.assertEqual(code, 0)
+                self.assertEqual(seen, [expected])
+                self.assertFalse(render._EXPLORER_ENABLED)
 
 
 class Resilience(IntegrationEnv):
