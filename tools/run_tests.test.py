@@ -931,6 +931,25 @@ class CiLikeProfileFixture(unittest.TestCase):
                                 capture_output=True, text=True, env=env)
         self.assertEqual(listed.stdout.strip(), str(repo))
 
+    def test_isolated_env_status_skips_the_optional_index_lock(self):
+        # A suite-end SIGKILL during a refreshing `git status` left a holderless
+        # index.lock on the real worktree (2026-10-21).
+        repo = self.root / "repo"
+        repo.mkdir()
+        env = self.mod.build_isolated_env(self.root / "iso", repo)
+        self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(self.mod.build_ci_like_env(self.root / "ci", repo)["GIT_OPTIONAL_LOCKS"], "0")
+        git = ["git", "-C", str(repo), "-c", "user.name=Fixture", "-c", "user.email=f@example.invalid"]
+        (repo / "a.txt").write_text("a\n", encoding="utf-8")
+        for args in (["init", "-q"], ["add", "a.txt"], ["commit", "-q", "-m", "a"]):
+            subprocess.run(git + args, check=True, capture_output=True, env=env)
+        os.utime(repo / "a.txt", (1_000_000_000, 1_000_000_000))
+        index = repo / ".git" / "index"
+        before = index.stat()
+        subprocess.run(git + ["status", "--porcelain"], check=True, capture_output=True, env=env)
+        after = index.stat()
+        self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+
     def test_isolated_env_puts_the_checkout_under_test_on_the_import_path(self):
         repo = self.root / "repo"
         env = self.mod.build_isolated_env(self.root / "iso", repo)
