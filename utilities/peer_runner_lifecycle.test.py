@@ -1877,7 +1877,8 @@ console.log(JSON.stringify(calls[0]));
                 raise StopAfterTakeover()
 
             runner_clock = SimpleNamespace(
-                sleep=after_reconcile, monotonic=time.monotonic, time=time.time)
+                sleep=after_reconcile, monotonic=time.monotonic,
+                monotonic_ns=time.monotonic_ns, time=time.time)
 
             with mock.patch.object(obligations, "__file__",
                                    str(self.a / "utilities/peer_obligations.py")), \

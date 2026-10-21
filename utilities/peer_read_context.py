@@ -48,6 +48,24 @@ class PeerReadContext:
     def current_attempt_row(self, jobs: Path, attempt_id: str, *, append_only=None):
         """Return the latest exact attempt row from this scan's registry view."""
         from dispatch_completion_join import ChildRow, JoinContractError
+
+        jobs = Path(jobs)
+        try:
+            view = self.registry_view(jobs, append_only=append_only)
+        except OSError as exc:
+            raise JoinContractError("registry-unreadable") from exc
+        if view is None:
+            return None
+        record, error = view.completion_attempt(attempt_id)
+        if error:
+            raise JoinContractError(error)
+        if record is None:
+            return None
+        return ChildRow(record.order, record.status, record.slug, attempt_id,
+                        record.raw, record.completion_metadata())
+
+    def registry_view(self, jobs: Path, *, append_only=None):
+        """Reuse one generation-checked registry view during this runner pass."""
         from dispatch_registry_cache import registry_view
 
         jobs = Path(jobs)
@@ -58,18 +76,7 @@ class PeerReadContext:
                     jobs, append_only=(self.registry_append_only if append_only is None else append_only))
             except FileNotFoundError:
                 self._registry_views[key] = None
-            except OSError as exc:
-                raise JoinContractError("registry-unreadable") from exc
-        view = self._registry_views[key]
-        if view is None:
-            return None
-        record, error = view.completion_attempt(attempt_id)
-        if error:
-            raise JoinContractError(error)
-        if record is None:
-            return None
-        return ChildRow(record.order, record.status, record.slug, attempt_id,
-                        record.raw, record.completion_metadata())
+        return self._registry_views[key]
 
     def handover_snapshots(self, loader):
         if self._handover_snapshots is None:

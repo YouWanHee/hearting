@@ -399,6 +399,12 @@ def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
     gitconfig = tmpdir / "gitconfig"
     gitconfig.write_text(f"[safe]\n\tdirectory = {repo_root}\n", encoding="utf-8")
     env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
+    # Dispatched workers run with GIT_OPTIONAL_LOCKS=0 (core/OPERATIONS.md), but
+    # this env is rebuilt from scratch. Without it a suite descendant's `git
+    # status` takes the optional index lock on the real checkout, and the
+    # suite-end SIGKILL left a holderless index.lock that refused the worker's
+    # next `git add` (2026-10-21, rt-0c8fb880abc841b7).
+    env["GIT_OPTIONAL_LOCKS"] = "0"
     child_stderr = tmpdir / "child-stderr"
     _install_child_stderr_hook(home, child_stderr)
     # PyYAML is the sole dependency exposed from an enabled user site. The
