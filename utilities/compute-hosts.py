@@ -101,6 +101,51 @@ class ConfigError(RuntimeError):
         self.status = status
 
 
+def _canonical_namespace_path(value):
+    if not isinstance(value, str) or not value.startswith("/") or value == "/":
+        return False
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return False
+    return ("//" not in value and not value.endswith("/")
+            and all(part not in {"", ".", ".."} for part in value[1:].split("/")))
+
+
+def _path_contains(parent, child):
+    return child.startswith(parent.rstrip("/") + "/")
+
+
+def _paths_overlap(left, right):
+    return left == right or _path_contains(left, right) or _path_contains(right, left)
+
+
+def _validate_path_namespace(name, host, run_root):
+    if "path_namespace" not in host:
+        return
+    mapping = host["path_namespace"]
+    prefix = f"host {name} path_namespace: "
+    if not isinstance(mapping, dict) or not mapping:
+        raise ConfigError(prefix + "expected a nonempty block mapping (target: source)")
+    pairs = []
+    for target, source in mapping.items():
+        if (not _canonical_namespace_path(target) or not _canonical_namespace_path(source)
+                or target.startswith("\"") or target.startswith("'")):
+            raise ConfigError(prefix + "paths must be absolute and normalized")
+        if source == target:
+            raise ConfigError(prefix + "source and target must differ")
+        pairs.append((target, source))
+    for index, (target, source) in enumerate(pairs):
+        for other_target, other_source in pairs[index + 1:]:
+            if _paths_overlap(target, other_target):
+                raise ConfigError(prefix + "targets overlap")
+        if any(_paths_overlap(source, other_target)
+               for other_target, _ in pairs):
+            raise ConfigError(prefix + "source overlaps target")
+    root_text = str(run_root)
+    covers = [target for target, _ in pairs if _path_contains(target, root_text)]
+    if len(covers) != 1 or not _canonical_namespace_path(root_text):
+        raise ConfigError(prefix + "run_root must be below exactly one target")
+
+
 def load_config(path=None):
     path = Path(path) if path is not None else config_path()
     if path.is_symlink() or not path.is_file():
@@ -127,6 +172,7 @@ def load_config(path=None):
     for name, host in hosts.items():
         if not isinstance(host, dict) or not host.get("ssh_host"):
             raise ConfigError(f"host {name} declares no ssh_host")
+        _validate_path_namespace(name, host, run_root)
     return {"run_root": Path(run_root), "hosts": hosts}
 
 
@@ -205,6 +251,19 @@ def is_self(host):
                 or candidate.split(".", 1)[0] == local):
             return True
     return False
+
+
+def _namespace_self(config):
+    return next(((name, host) for name, host in config.get("hosts", {}).items()
+                 if "path_namespace" in host and is_self(host)), None)
+
+
+def _refuse_namespace_self(config, command):
+    match = _namespace_self(config)
+    if match:
+        name, _host = match
+        raise ConfigError(
+            f"path_namespace refuses local {command} on {name}: run_root requires a launcher on an unmodified shared mount")
 
 
 def _ssh_namespace_config_options():
@@ -1677,9 +1736,10 @@ def _select(config, names):
 
 def cmd_list(args):
     config = load_config()
+    run_root = None if _namespace_self(config) else config["run_root"]
     selected = _select(config, args.hosts)
     live_rows = ({row["host"]: row
-                  for row in _probe_selected(selected, config["run_root"])}
+                  for row in _probe_selected(selected, run_root)}
                  if not args.static else {})
     rows = []
     for name, host in selected:
@@ -1735,7 +1795,8 @@ def cmd_list(args):
 
 def cmd_probe(args):
     config = load_config()
-    results = _probe_selected(_select(config, args.hosts), config["run_root"])
+    run_root = None if _namespace_self(config) else config["run_root"]
+    results = _probe_selected(_select(config, args.hosts), run_root)
     if args.json:
         print(json.dumps(results, ensure_ascii=False, sort_keys=True))
         # JSON is an observation receipt, not a payload verdict. Keep unavailable
@@ -1805,6 +1866,7 @@ PY
 
 def cmd_claim(args):
     config = load_config()
+    _refuse_namespace_self(config, "claim")
     (name, host), = _select(config, [args.host])
     if not args.session:
         # The launcher's own session, read the way `run` exports it.
@@ -1921,6 +1983,7 @@ def _print_run_gpu_observation(observation):
 
 def cmd_run(args):
     config = load_config()
+    _refuse_namespace_self(config, "run")
     (name, host), = _select(config, [args.host])
     command = list(args.command or [])
     if command and command[0] == "--":
@@ -2014,11 +2077,16 @@ def cmd_run(args):
         _print_run_gpu_observation(gpu_observation)
         return 0
 
-    source = Path(gpu_leases.__file__).read_text()
+    namespaced = "path_namespace" in host
+    source = gpu_leases.serialized_compute_source(namespaced=namespaced)
     payload_source = gpu_leases.serialized_payload_source()
-    script = source + ("\ntry:\n    print(json.dumps(launch_compute(%r, %r)))\n"
+    if namespaced:
+        options["path_namespace"] = host["path_namespace"]
+        options["run_root"] = str(config["run_root"])
+    launch_function = "launch_compute_namespaced" if namespaced else "launch_compute"
+    script = source + ("\ntry:\n    print(json.dumps(%s(%%r, %%r)))\n"
                        "except Exception as exc:\n    print(str(exc), file=sys.stderr)\n    raise SystemExit(2)\n") % (
-                           options, payload_source)
+                           launch_function) % (options, payload_source)
     launch = "python3 -c " + shlex.quote(script)
     result = remote(host, launch)
     if result.returncode != 0:
@@ -2098,6 +2166,13 @@ def _spawn_completion_watch(run_dir, meta, *, environ=None, spawn=subprocess.Pop
 
 def cmd_watch_run(args, *, sleep=time.sleep, now=time.time):
     """Internal: wait for `<run_dir>/exit_code`, then leave the launcher one notice."""
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        if exc.status != "missing" and exc.status != "template":
+            raise
+    else:
+        _refuse_namespace_self(config, "watch-run")
     run_dir = Path(args.run_dir)
     deadline = now() + COMPLETION_WATCH_SECONDS
     exit_path = run_dir / "exit_code"
@@ -2252,6 +2327,7 @@ def _tmux_session_alive(
 
 def cmd_runs(args):
     config = load_config()
+    _refuse_namespace_self(config, "runs")
     root = config["run_root"]
     if not root.is_dir():
         print(f"no runs yet: {root}")
@@ -2314,6 +2390,7 @@ def cmd_runs(args):
 
 def cmd_tail(args):
     config = load_config()
+    _refuse_namespace_self(config, "tail")
     state = _run_state(config, args.run_id)
     log = state["dir"] / "log"
     if not log.is_file():
@@ -2331,6 +2408,7 @@ def cmd_tail(args):
 
 def cmd_stop(args):
     config = load_config()
+    _refuse_namespace_self(config, "stop")
     state = _run_state(config, args.run_id)
     host_name = state["meta"].get("host")
     if not host_name:

@@ -1126,6 +1126,7 @@ class ParentCloseTest(unittest.TestCase):
                 "attempt_id": aid, "route": {"route_id": self.route["route_id"], "route_file": path}}}))
         stopped = []
         compute = SimpleNamespace(ConfigError=ValueError, load_config=lambda: {"run_root": run_root},
+            _namespace_self=lambda config: None,
             config_path=lambda: self.base / "original-config.yaml", _run_state=lambda config, rid:
                 {"stop_reason": "parent" if rid in stopped else None,
                  "state": "finished" if rid in stopped else "running"})
@@ -1143,6 +1144,40 @@ class ParentCloseTest(unittest.TestCase):
         self.assertEqual(stopped, ["own-run"])
         self.assertEqual(result["state"], "cancelled")
         self.assertEqual([r["run_id"] for r in result["resources"]], ["own-run"])
+
+    def test_linked_resources_skips_run_root_on_namespace_self_host(self):
+        from types import SimpleNamespace
+        run_root = self.base / "compute-runs"
+        run_root.mkdir()
+        run_id = "linked-run"
+        run_dir = run_root / run_id
+        run_dir.mkdir()
+        (run_dir / "meta.json").write_text(json.dumps({"provenance": {
+            "attempt_id": self.aid("att-owner"),
+            "route": {"route_id": self.route["route_id"], "route_file": str(self.path.resolve())},
+            "node": self.route["nodes"][0]["id"]}}))
+        compute = CLOSE._compute()
+        compute.config_path = lambda: self.base / "compute-hosts.yaml"
+        compute._run_state = lambda config, rid: {"stop_reason": None, "state": "running"}
+
+        class UnreadableRunRoot:
+            def glob(self, pattern):
+                raise AssertionError("namespace self host must not read run_root")
+
+        self_config = {"run_root": UnreadableRunRoot(), "hosts": {
+            "local": {"ssh_host": "local", "path_namespace": {"/home/nas": "/home/nas"}}}}
+        compute.load_config = lambda: self_config
+        with mock.patch.object(CLOSE, "_compute", return_value=compute):
+            self.assertEqual(CLOSE.linked_resources(self.route, self.path, self.jobs,
+                {self.aid("att-owner")}), [])
+
+        normal_config = {"run_root": run_root, "hosts": {
+            "remote": {"ssh_host": "compute.example"}}}
+        compute.load_config = lambda: normal_config
+        with mock.patch.object(CLOSE, "_compute", return_value=compute):
+            resources = CLOSE.linked_resources(self.route, self.path, self.jobs,
+                {self.aid("att-owner")})
+        self.assertEqual([resource["run_id"] for resource in resources], [run_id])
 
     def test_existing_orphan_observer_finishes_interrupted_close_without_parent_recovery(self):
         owner = self.process("att-owner")
