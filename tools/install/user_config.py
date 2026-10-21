@@ -12,6 +12,7 @@ from __future__ import annotations
 import claude_settings_config
 import compute_hosts_config
 import fleet_config
+import herdr_integration
 import memory_sync_config
 import paths
 import report_bundle_config
@@ -55,7 +56,20 @@ def _session_tidy_policy():
     return validate_user_config()
 
 
+def _herdr_history_key():
+    path = herdr_integration._history_path()
+    return {"status": "valid" if herdr_integration.history_key_available() else "absent",
+            "ok": True, "path": str(path), "detail": "optional managed previous-conversation command"}
+
+
 SURFACES = (
+    {
+        "id": "herdr-history-key",
+        "title": "Herdr previous-conversation command",
+        "seeded_by": "harness install (optional managed shell command)",
+        "when_absent": "`hearting run session_history` remains available",
+        "validate": _herdr_history_key,
+    },
     {
         "id": "fleet",
         "title": "Fleet title language",

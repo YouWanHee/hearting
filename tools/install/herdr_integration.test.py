@@ -820,5 +820,82 @@ console.log(JSON.stringify({valid: valid.params, mismatched: mismatched.params,
         self.assertIn('"session_start_source":"resume"', result.stdout)
 
 
+class HistoryKeyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.env = {"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config")}
+        self.path = herdr._history_path(self.env)
+        self.calls = []
+
+    def runner(self, argv, **kwargs):
+        self.calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def test_exact_restore_and_managed_key(self):
+        self.path.parent.mkdir(parents=True)
+        original = b"# user config\n[ui]\nprefix = \"ctrl-b\""
+        self.path.write_bytes(original)
+        result = herdr.ensure_history_key("/tmp/hearting", env=self.env, runner=self.runner)
+        self.assertEqual(result["status"], "reloaded")
+        self.assertTrue(herdr.history_key_available(self.env))
+        self.assertEqual(herdr.history_key_label(self.env), "Ctrl-b Shift-H")
+        restored = herdr.restore_history_key(env=self.env, runner=self.runner)
+        self.assertEqual(restored["status"], "restored")
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_key_label_follows_a_custom_prefix(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text('[ui]\nprefix = "ctrl-a"\n')
+        result = herdr.ensure_history_key("/tmp/hearting", env=self.env, runner=self.runner)
+        self.assertEqual(result["status"], "reloaded")
+        self.assertEqual(herdr.history_key_label(self.env), "Ctrl-a Shift-H")
+
+    def test_originally_absent_file_is_removed_when_restored(self):
+        result = herdr.ensure_history_key("/tmp/hearting", env=self.env, runner=self.runner)
+        self.assertEqual(result["status"], "reloaded")
+        herdr.restore_history_key(env=self.env, runner=self.runner)
+        self.assertFalse(self.path.exists())
+
+    def test_conflicting_key_is_preserved(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text('[[keys.command]]\nkey = "prefix+shift+h"\n')
+        result = herdr.ensure_history_key("/tmp/hearting", env=self.env, runner=self.runner)
+        self.assertEqual(result["status"], "skipped-conflict")
+        self.assertEqual(len(self.calls), 0)
+
+    def test_modified_managed_body_is_preserved(self):
+        self.path.parent.mkdir(parents=True)
+        herdr.ensure_history_key("/tmp/hearting", env=self.env, runner=self.runner)
+        self.path.write_bytes(self.path.read_bytes().replace(b"description =", b"# edited\ndescription ="))
+        result = herdr.restore_history_key(env=self.env, runner=self.runner)
+        self.assertEqual(result["status"], "preserved-modified")
+
+    def test_config_check_failure_rolls_back_the_added_block(self):
+        self.path.parent.mkdir(parents=True)
+        original = b"[ui]\nprefix = \"ctrl-b\"\n"
+        self.path.write_bytes(original)
+        failing = lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1 if argv[-1] == "check" else 0)
+        result = herdr.ensure_history_key("/tmp/hearting", env=self.env, runner=failing)
+        self.assertEqual(result["status"], "rolled-back-check-failed")
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_config_check_failure_during_restore_reinstates_managed_block(self):
+        added = {"done": False}
+        def runner(argv, **kwargs):
+            if argv[-1] == "check" and added["done"]:
+                return subprocess.CompletedProcess(argv, 1)
+            return subprocess.CompletedProcess(argv, 0)
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("[ui]\nprefix = \"ctrl-b\"\n")
+        herdr.ensure_history_key("/tmp/hearting", env=self.env, runner=runner)
+        managed = self.path.read_bytes()
+        added["done"] = True
+        result = herdr.restore_history_key(env=self.env, runner=runner)
+        self.assertEqual(result["status"], "rolled-back-restore-check-failed")
+        self.assertEqual(self.path.read_bytes(), managed)
+
+
 if __name__ == "__main__":
     unittest.main()

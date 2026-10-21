@@ -2686,7 +2686,8 @@ class ClearHelperTest(TidyCase):
         req = {"schema": clear.SCHEMA, "nonce": "0123456789abcdef", "status": "reserved",
                "seat": seat.as_dict(), "harness": "codex", "sid": "thread-A",
                "herdr_transport": {"socket_path": seat.socket_path}}
-        clear._write_reservation(req)
+        with self.iso.patched_environ(self.extra):
+            clear._write_reservation(req)
         process = mock.Mock(pid=4321)
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/run/herdr/foreign.sock",
                                           "AGENT_HERDR_SESSION": "foreign"}), \

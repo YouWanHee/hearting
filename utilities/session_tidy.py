@@ -1828,11 +1828,38 @@ def build_card_injection(card: dict, card_path: Path, now: float, cap: int,
 # Hook
 # ---------------------------------------------------------------------------
 
+def build_human_history_notice(seat: Seat, harness: str, sid: str, *, env=None) -> str:
+    """Build a person-only predecessor notice without adding it to model context."""
+    env = os.environ if env is None else env
+    lineage = seat_lineage(seat, harness=harness, sid=sid)
+    previous = _confirmed_predecessor(lineage, harness, sid)
+    if not previous:
+        return ""
+    transcript_info = previous.get("transcript") or {}
+    state = transcript_info.get("status", "missing")
+    availability = {"available": "원문 있음", "missing": "원문 없음", "expired": "원문 없음",
+                    "unreadable": "원문 읽기 불가"}.get(state, "원문 읽기 불가")
+    pane = str(env.get("HERDR_ACTIVE_PANE_ID") or env.get("HERDR_PANE_ID") or "")
+    socket = str(env.get("HERDR_SOCKET_PATH") or "")
+    key_available = False
+    if pane and socket:
+        try:
+            from herdr_integration import history_key_available, history_key_label
+            key_available = bool(history_key_available(env=env))
+            key_label = history_key_label(env=env) if key_available else ""
+        except Exception:
+            pass
+    action = key_label if key_available else "hearting run session_history"
+    return (f"이전 대화 열기: {action} · {previous.get('harness', harness)} "
+            f"{str(previous.get('sid', ''))[:8]} · {availability}")
+
+
 def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript: str = "",
              cwd: str = "", reread: bool = False, env=None, now: Optional[float] = None,
              emit: Optional[Callable[[str], None]] = None, phase: Optional[str] = None,
              compact_summary: str = "", compact_context: Optional[dict] = None,
-             prompt_text: str = "") -> str:
+             prompt_text: str = "", emit_human: Optional[Callable[[str], None]] = None,
+             human_only: bool = False) -> str:
     """Record the session, and print the card / notices it is due exactly once.
 
     Returns the text that was emitted ("" for none). The receipt is written only
@@ -2007,6 +2034,14 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             if resume_text:
                 parts.append(resume_text)
         text = "\n".join(parts)
+        human_notice = ""
+        if event == "start" and emit_human:
+            with contextlib.suppress(BaseException):
+                human_notice = build_human_history_notice(seat, harness, sid, env=env)
+                if human_notice:
+                    emit_human(human_notice)
+        if human_only:
+            return text
         if not text:
             return ""
         (emit or (lambda t: None))(text)
@@ -2522,6 +2557,9 @@ def cmd_handoff(args) -> int:
 
 def cmd_hook(args) -> int:
     try:
+        emitted = []
+        human = []
+        output_format = getattr(args, "format", "text")
         sid = args.session_id or session_from_env(args.harness)[1] or ""
         summary = ""
         prompt_text = ""
@@ -2545,9 +2583,15 @@ def cmd_hook(args) -> int:
                 if isinstance(transcript, str) and transcript:
                     compact_context["transcript"] = transcript
         result = run_hook(args.harness, args.event, sid, source=args.source or "", transcript=args.transcript or "",
-                          cwd=args.cwd or os.getcwd(), reread=args.reread, emit=_emit_stdout,
+                          cwd=args.cwd or os.getcwd(), reread=args.reread,
+                          emit=(emitted.append if output_format == "json" else _emit_stdout),
+                          emit_human=human.append,
+                          human_only=getattr(args, "human_only", False),
                           phase=args.phase, compact_summary=summary, compact_context=compact_context,
                           prompt_text=prompt_text)
+        if output_format == "json":
+            print(json.dumps({"additionalContext": "\n".join(emitted),
+                              "humanNotice": "\n".join(human)}, ensure_ascii=False))
         if (args.event == "compact" and args.phase == "after" and result.startswith("booking=")) \
                 or (args.event == "runtime-status" and result == "booking=pending"):
             _emit_stdout(result)
@@ -2615,6 +2659,8 @@ def build_parser() -> argparse.ArgumentParser:
     hook.add_argument("--transcript")
     hook.add_argument("--cwd")
     hook.add_argument("--reread", action="store_true")
+    hook.add_argument("--format", choices=("text", "json"), default="text")
+    hook.add_argument("--human-only", action="store_true")
     hook.add_argument("--phase", choices=("before", "after"))
     hook.set_defaults(func=cmd_hook)
     enqueue = sub.add_parser("enqueue", help="queue the memory tidy and return at once")
