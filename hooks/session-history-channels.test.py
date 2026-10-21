@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -58,6 +59,24 @@ class HistoryChannelTests(unittest.TestCase):
         with patch.object(codex.subprocess, "run", return_value=result):
             card, human = codex.card_context({"session_id": "sid"}, "/fixture")
         self.assertEqual((card, human), ("MODEL-CARD", "PERSON-NOTICE"))
+
+    def test_human_only_lookup_leaves_ledger_and_receipts_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            seat = session_tidy.Seat("pane", "isolated-seat", "pane", "opencode")
+            emitted = []
+            with patch.dict("os.environ", {"XDG_STATE_HOME": str(state)}, clear=False), \
+                 patch.object(session_tidy, "resolve_seat", return_value=seat), \
+                 patch.object(session_tidy, "build_human_history_notice", return_value="PERSON-NOTICE"):
+                ledger = session_tidy._ledger_path(seat)
+                ledger.parent.mkdir(parents=True)
+                before = b'{"event":"start","sid":"prior"}\n'
+                ledger.write_bytes(before)
+                session_tidy.run_hook("opencode", "start", "current", env={},
+                                      emit_human=emitted.append, human_only=True)
+                self.assertEqual(emitted, ["PERSON-NOTICE"])
+                self.assertEqual(ledger.read_bytes(), before)
+                self.assertFalse(session_tidy._consumed_path(seat).exists())
 
 
 if __name__ == "__main__":

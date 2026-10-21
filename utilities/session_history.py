@@ -29,31 +29,6 @@ def _identity(args):
     return None, "", ""
 
 
-def _entries(seat):
-    rows = session_tidy.seat_lineage(seat)
-    if not rows:
-        return [], "연결 미확인"
-    current = rows[0]
-    predecessor = session_tidy._confirmed_predecessor(rows, current.get("harness", ""), current.get("sid", ""))
-    if predecessor is None:
-        previous = next((row for row in rows[1:] if row.get("relation") == "chronological"), None)
-        if previous is None:
-            return [], "확정된 이전 대화가 없습니다"
-        predecessor = dict(previous)
-        predecessor["_label"] = "시간순 이웃 · 인계 미확인"
-    else:
-        predecessor["_label"] = "확정된 이전 대화"
-    seen = {(predecessor.get("harness"), predecessor.get("sid"))}
-    result = [predecessor]
-    for row in rows:
-        ident = row.get("harness"), row.get("sid")
-        if ident in seen or ident == (current.get("harness"), current.get("sid")):
-            continue
-        result.append(dict(row, _label="이전 세대" if row.get("relation") != "unknown" else "관계 미확인"))
-        seen.add(ident)
-    return result, ""
-
-
 def _render(entry):
     result = conversation_reader.read_conversation(entry)
     name = f"{entry.get('harness', 'unknown')} {str(entry.get('sid', ''))[:8]}"
@@ -78,7 +53,47 @@ def _show(text):
     return proc.returncode == 0 and sys.stdin.isatty()
 
 
-def _show_local(rows, generation, stdout=False):
+def _view(args):
+    seat = session_tidy.Seat("pane", args.seat_key, args.pane, "codex", "",
+                             endpoint=args.endpoint, socket_path=args.socket_path)
+    rows = session_tidy.seat_lineage(seat)
+    return _display(rows, args.generation, args.stdout)
+
+
+def _entries_for_generation(rows, generation):
+    if not rows:
+        return [], "연결 미확인"
+    current = rows[0]
+    current_id = current.get("harness"), current.get("sid")
+    confirmed = session_tidy._confirmed_predecessor(
+        rows, current.get("harness", ""), current.get("sid", ""))
+    if confirmed is None:
+        confirmed = next((row for row in rows[1:] if row.get("relation") == "chronological"), None)
+        if confirmed is None:
+            return [], "확정된 이전 대화가 없습니다 · hearting run session_history --harness <harness> --session-id <SID>"
+        first_label = "시간순 이웃 · 인계 미확인"
+    else:
+        first_label = "확정된 이전 대화"
+
+    items = [dict(confirmed, _label=first_label)]
+    seen = {current_id, (confirmed.get("harness"), confirmed.get("sid"))}
+    relation_labels = {
+        "confirmed": "확정된 이전 대화",
+        "chronological": "시간순 이웃 · 인계 미확인",
+        "unknown": "관계 미확인",
+    }
+    for row in rows[1:]:
+        ident = row.get("harness"), row.get("sid")
+        if ident in seen:
+            continue
+        items.append(dict(row, _label=relation_labels.get(row.get("relation"), "관계 미확인")))
+        seen.add(ident)
+    if generation < 1 or generation > len(items):
+        return [], f"세대 범위 밖입니다 (1–{len(items)})"
+    return items, ""
+
+
+def _display(rows, generation, stdout=False):
     entries, reason = _entries_for_generation(rows, generation)
     if not entries:
         print(reason)
@@ -87,35 +102,6 @@ def _show_local(rows, generation, stdout=False):
     while True:
         output, _ = _render(entries[index])
         if stdout:
-            print(output)
-            return 0
-        menu = _show(output)
-        if not sys.stdin.isatty():
-            return 0
-        try:
-            choice = input("p 이전 세대 · n 최근 세대 · q 종료: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return 0
-        if choice == "q":
-            return 0
-        if choice == "p" and index + 1 < len(entries):
-            index += 1
-        elif choice == "n" and index > 0:
-            index -= 1
-
-
-def _view(args):
-    seat = session_tidy.Seat("pane", args.seat_key, args.pane, "codex", "",
-                             endpoint=args.endpoint, socket_path=args.socket_path)
-    rows = session_tidy.seat_lineage(seat)
-    entries, reason = _entries_for_generation(rows, args.generation)
-    if not entries:
-        print(reason)
-        return 0
-    index = args.generation - 1
-    while True:
-        output, read = _render(entries[index])
-        if args.stdout:
             print(output)
         else:
             menu = _show(output)
@@ -135,40 +121,6 @@ def _view(args):
                 continue
             continue
         return 0
-
-
-def _entries_for_generation(rows, generation):
-    if not rows:
-        return [], "연결 미확인"
-    current = rows[0]
-    confirmed = session_tidy._confirmed_predecessor(rows, current.get("harness", ""), current.get("sid", ""))
-    if confirmed is None:
-        adjacent = next((row for row in rows[1:] if row.get("relation") == "chronological"), None)
-        if adjacent is None:
-            return [], "확정된 이전 대화가 없습니다 · hearting run session_history --harness <harness> --session-id <SID>"
-        confirmed = dict(adjacent)
-        confirmed["_label"] = "시간순 이웃 · 인계 미확인"
-    else:
-        confirmed["_label"] = "확정된 이전 대화"
-    items = [confirmed]
-    identities = {(confirmed.get("harness"), confirmed.get("sid")),
-                  (current.get("harness"), current.get("sid"))}
-    ancestor = confirmed
-    while True:
-        older = session_tidy._confirmed_predecessor(
-            rows, ancestor.get("harness", ""), ancestor.get("sid", ""))
-        if older is None:
-            break
-        ident = older.get("harness"), older.get("sid")
-        if ident in identities:
-            break
-        older["_label"] = "이전 세대"
-        items.append(older)
-        identities.add(ident)
-        ancestor = older
-    if generation < 1 or generation > len(items):
-        return [], f"세대 범위 밖입니다 (1–{len(items)})"
-    return items, ""
 
 
 def main(argv=None):
@@ -205,11 +157,8 @@ def main(argv=None):
         if result.pane:
             return 0
         print("옆 창을 열지 못했습니다: " + ", ".join(result.notes or [result.placement]))
-    rows, reason = _entries(seat)
-    if not rows:
-        print(reason or "이전 대화를 찾을 수 없습니다")
-        return 0
-    return _show_local(rows, args.generation, args.stdout)
+    rows = session_tidy.seat_lineage(seat)
+    return _display(rows, args.generation, args.stdout)
 
 
 if __name__ == "__main__":

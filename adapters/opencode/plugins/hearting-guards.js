@@ -1561,6 +1561,12 @@ function showHistoryNotice(ctx, sid, notice) {
   showContextAlert(ctx, notice)
 }
 
+function collectHistoryNotice(ctx, sid, cwd, prompt = "") {
+  if (!sid || isWorkerSession() || humanNoticeBySession.has(sid)) return
+  const payload = collectCardPayload("start", sid, cwd, prompt)
+  showHistoryNotice(ctx, sid, payload.humanNotice)
+}
+
 function appendContext(output, text) {
   if (!text) return
   if (!Array.isArray(output.system)) output.system = []
@@ -2206,8 +2212,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
       const createdID = info?.id || event.properties?.sessionID || ""
       if (createdID && info && typeof info === "object") sessionInfoById.set(createdID, info)
       if (createdID && !isWorkerSession()) {
-        const payload = collectCardPayload("start", createdID, baseDir(ctx))
-        showHistoryNotice(ctx, createdID, payload.humanNotice)
+        collectHistoryNotice(ctx, createdID, baseDir(ctx))
       }
     }
     if (event && event.type === "session.created") {
@@ -2338,8 +2343,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
     const cardTurn = turn || prompt
     if (eventSid && (!cardTurn || cardBySession.get(sid)?.turn !== cardTurn)) {
       const cardText = collectCard("prompt", eventSid, baseDir(ctx), prompt)
-      const payload = collectCardPayload("start", eventSid, baseDir(ctx), prompt)
-      showHistoryNotice(ctx, eventSid, payload.humanNotice)
+      collectHistoryNotice(ctx, eventSid, baseDir(ctx), prompt)
       cardBySession.set(sid, { turn: cardTurn, text: cardText })
     }
   },

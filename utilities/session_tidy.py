@@ -1890,6 +1890,13 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         return booked
     now = now_epoch() if now is None else now
     seat = resolve_seat(harness, cwd or None, env, sid, source)
+    if human_only:
+        if event == "start" and emit_human:
+            with contextlib.suppress(BaseException):
+                notice = build_human_history_notice(seat, harness, sid, env=env)
+                if notice:
+                    emit_human(notice)
+        return ""
     if event == "start":
         with contextlib.suppress(BaseException):
             import session_tidy_clear
@@ -2034,14 +2041,11 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             if resume_text:
                 parts.append(resume_text)
         text = "\n".join(parts)
-        human_notice = ""
         if event == "start" and emit_human:
             with contextlib.suppress(BaseException):
-                human_notice = build_human_history_notice(seat, harness, sid, env=env)
-                if human_notice:
-                    emit_human(human_notice)
-        if human_only:
-            return text
+                notice = build_human_history_notice(seat, harness, sid, env=env)
+                if notice:
+                    emit_human(notice)
         if not text:
             return ""
         (emit or (lambda t: None))(text)
