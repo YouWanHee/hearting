@@ -1872,6 +1872,9 @@ def build_human_history_notice(seat: Seat, harness: str, sid: str, *, env=None) 
     key_available = False
     if pane and socket:
         try:
+            install_dir = str(Path(__file__).resolve().parents[1] / "tools" / "install")
+            if install_dir not in sys.path:
+                sys.path.append(install_dir)
             from herdr_integration import history_key_available, history_key_label
             key_available = bool(history_key_available(env=env))
             key_label = history_key_label(env=env) if key_available else ""

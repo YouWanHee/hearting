@@ -116,13 +116,70 @@ class HistoryTests(unittest.TestCase):
     def test_herdr_viewer_replaces_the_shell_with_exec(self):
         seat = viewer.session_tidy.Seat("pane", "key", "pane-id", "claude", "",
                                         endpoint="endpoint", socket_path="/tmp/herdr.sock")
-        result = type("PaneResult", (), {"pane": "viewer-pane"})()
+        result = type("PaneResult", (), {"pane": "viewer-pane", "placement": "tab"})()
         with patch.object(viewer, "_identity", return_value=(seat, "pane-id", "/tmp/herdr.sock")), \
              patch.object(viewer, "open_pane", return_value=result) as open_pane:
             self.assertEqual(viewer.main([]), 0)
         argv = open_pane.call_args.args[0]
         self.assertEqual(argv[0], "exec")
         self.assertIn("--in-pane", argv)
+
+    def test_split_viewer_focuses_the_new_pane_through_the_bound_runner(self):
+        seat = viewer.session_tidy.Seat("pane", "key", "origin", "claude", "",
+                                        endpoint="endpoint", socket_path="/tmp/herdr.sock")
+        calls = []
+
+        result = type("PaneResult", (), {"pane": "viewer", "placement": "split"})()
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs["env"].get("HERDR_SOCKET_PATH")))
+            return viewer.subprocess.CompletedProcess(command, 0, "{}", "")
+
+        with patch.object(viewer, "_identity", return_value=(seat, "origin", "/tmp/herdr.sock")), \
+             patch.object(viewer.HerdrSurface, "layout", return_value={"panes": [
+                 {"pane_id": "origin", "rect": {"x": 0, "y": 0, "width": 50, "height": 40}},
+                 {"pane_id": "viewer", "rect": {"x": 50, "y": 0, "width": 50, "height": 40}},
+             ]}), \
+             patch.object(viewer, "open_pane", return_value=result), \
+             patch.object(viewer.subprocess, "run", side_effect=run):
+            self.assertEqual(viewer.main([]), 0)
+        self.assertEqual(calls, [(["herdr", "pane", "focus", "--pane", "origin",
+                                   "--direction", "right"], "/tmp/herdr.sock")])
+
+    def test_tab_viewer_does_not_attempt_to_focus_a_split(self):
+        seat = viewer.session_tidy.Seat("pane", "key", "origin", "claude", "",
+                                        endpoint="endpoint", socket_path="/tmp/herdr.sock")
+        calls = []
+        result = type("PaneResult", (), {"pane": "viewer", "placement": "tab"})()
+
+        def runner(command):
+            calls.append(command)
+            return type("Process", (), {"returncode": 0, "stdout": "{}", "stderr": ""})()
+
+        with patch.object(viewer, "_identity", return_value=(seat, "origin", "/tmp/herdr.sock")), \
+             patch.object(viewer, "HerdrSurface", side_effect=lambda runner: object()), \
+             patch.object(viewer, "open_pane", return_value=result):
+            self.assertEqual(viewer.main([]), 0)
+        self.assertEqual(calls, [])
+
+    def test_pager_menu_reports_generation_boundaries_and_clears_screen(self):
+        rows = [
+            {"harness": "claude", "sid": "new", "relation": "confirmed",
+             "predecessor": {"harness": "claude", "sid": "old"}},
+            {"harness": "claude", "sid": "old", "relation": "confirmed",
+             "predecessor": {"harness": "claude", "sid": "older"}},
+            {"harness": "claude", "sid": "older", "relation": "unknown"},
+        ]
+        with patch.object(viewer, "_show", return_value=True), \
+             patch("builtins.input", side_effect=["p", "q"]) as prompt, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            viewer._display(rows, 2, clear_before_prompt=True)
+        self.assertIn("더 앞 세대가 없습니다", prompt.call_args_list[1].args[0])
+        self.assertEqual(output.getvalue(), "\x1b[2J\x1b[H\x1b[2J\x1b[H")
+        with patch.object(viewer, "_show", return_value=True), \
+             patch("builtins.input", side_effect=["n", "q"]) as prompt:
+            viewer._display(rows, 1, clear_before_prompt=True)
+        self.assertIn("더 최근 세대가 없습니다", prompt.call_args_list[1].args[0])
 
     def test_viewer_renders_missing_and_unreadable_status(self):
         missing = {"harness": "claude", "sid": "missing",

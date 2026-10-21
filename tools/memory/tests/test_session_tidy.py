@@ -1981,6 +1981,40 @@ class MemoryLayerTest(TidyCase):
         self.assertEqual(lineage[0]["predecessor"], {"harness": "claude", "sid": "sid-old"})
         self.assertIn("이전 대화 열기", notice)
 
+    def test_history_notice_loads_managed_key_with_only_utilities_on_subprocess_path(self):
+        import subprocess
+        import sys
+
+        install_dir = ROOT / "tools" / "install"
+        sys.path.insert(0, str(install_dir))
+        try:
+            import herdr_integration
+            block, _ = herdr_integration._history_block("hearting", {"original_absent": True})
+        finally:
+            sys.path.remove(str(install_dir))
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / ".config" / "herdr" / "config.toml"
+            config.parent.mkdir(parents=True)
+            config.write_bytes(block)
+            code = (
+                f"import sys; sys.path.insert(0, {str(ROOT / 'utilities')!r}); "
+                "import session_tidy as st; "
+                "st.seat_lineage=lambda *a, **k: [{"
+                "'harness':'claude','sid':'current','relation':'confirmed',"
+                "'predecessor':{'harness':'claude','sid':'previous'},'transcript':{}}, "
+                "{'harness':'claude','sid':'previous','transcript':{'status':'available'}}]; "
+                "seat=st.Seat('pane','seat-key','pane-id','claude'); "
+                "print(st.build_human_history_notice(seat,'claude','current',env={"
+                "'HERDR_ACTIVE_PANE_ID':'workspace:pane','HERDR_SOCKET_PATH':'/tmp/socket',"
+                f"'HOME':{str(home)!r}}}))"
+            )
+            proc = subprocess.run([sys.executable, "-c", code], cwd=home,
+                                  env={"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+                                  capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Ctrl-b Shift-H", proc.stdout)
+
     def test_manual_clear_without_booking_stays_an_unconfirmed_neighbor(self):
         with self.library():
             seat = st.resolve_seat("claude", str(self.cwd))

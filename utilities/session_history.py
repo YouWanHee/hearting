@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 from pathlib import Path
 import shutil
@@ -57,7 +58,7 @@ def _view(args):
     seat = session_tidy.Seat("pane", args.seat_key, args.pane, "codex", "",
                              endpoint=args.endpoint, socket_path=args.socket_path)
     rows = session_tidy.seat_lineage(seat)
-    return _display(rows, args.generation, args.stdout)
+    return _display(rows, args.generation, args.stdout, clear_before_prompt=True)
 
 
 def _entries_for_generation(rows, generation):
@@ -99,7 +100,7 @@ def _entries_for_generation(rows, generation):
     return items, ""
 
 
-def _display(rows, generation, stdout=False):
+def _display(rows, generation, stdout=False, clear_before_prompt=False):
     entries, reason = _entries_for_generation(rows, generation)
     if not entries:
         if stdout:
@@ -108,6 +109,7 @@ def _display(rows, generation, stdout=False):
             _show(reason)
         return 0
     index = generation - 1
+    boundary_message = ""
     while True:
         output, _ = _render(entries[index])
         if stdout:
@@ -116,10 +118,16 @@ def _display(rows, generation, stdout=False):
             menu = _show(output)
             if not menu:
                 return 0
+            if clear_before_prompt:
+                print("\x1b[2J\x1b[H", end="")
             try:
-                choice = input("p 이전 세대 · n 최근 세대 · q 종료: ").strip().lower()
+                prompt = "p 이전 세대 · n 최근 세대 · q 종료"
+                if boundary_message:
+                    prompt += " · " + boundary_message
+                choice = input(prompt + ": ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 return 0
+            boundary_message = ""
             if choice == "q":
                 return 0
             if choice == "p" and index + 1 < len(entries):
@@ -128,6 +136,10 @@ def _display(rows, generation, stdout=False):
             if choice == "n" and index > 0:
                 index -= 1
                 continue
+            if choice == "p":
+                boundary_message = "더 앞 세대가 없습니다"
+            elif choice == "n":
+                boundary_message = "더 최근 세대가 없습니다"
             continue
         return 0
 
@@ -164,6 +176,24 @@ def main(argv=None):
         result = open_pane(argv, title="이전 대화", near=near, cwd=active_cwd,
                            env={"HERDR_SOCKET_PATH": socket})
         if result.pane:
+            if result.placement == "split":
+                layout = near.surface.layout(pane)
+                panes = layout.get("panes", []) if isinstance(layout, dict) else []
+                rects = {row.get("pane_id"): row.get("rect") for row in panes
+                         if isinstance(row, dict)}
+                origin_rect, opened_rect = rects.get(pane), rects.get(result.pane)
+                if (isinstance(origin_rect, dict) and isinstance(opened_rect, dict)
+                        and all(type(rect.get(key)) is int for rect in (origin_rect, opened_rect)
+                                for key in ("x", "y", "width", "height"))):
+                    ox = origin_rect["x"] + origin_rect["width"] / 2
+                    oy = origin_rect["y"] + origin_rect["height"] / 2
+                    nx = opened_rect["x"] + opened_rect["width"] / 2
+                    ny = opened_rect["y"] + opened_rect["height"] / 2
+                    direction = ("right" if nx > ox else "left") if abs(nx - ox) >= abs(ny - oy) \
+                        else ("down" if ny > oy else "up")
+                    with contextlib.suppress(OSError, subprocess.SubprocessError):
+                        runner(["herdr", "pane", "focus", "--pane", pane,
+                                "--direction", direction])
             return 0
         print("옆 창을 열지 못했습니다: " + ", ".join(result.notes or [result.placement]))
     rows = session_tidy.seat_lineage(seat)
