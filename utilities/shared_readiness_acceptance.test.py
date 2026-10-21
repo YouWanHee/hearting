@@ -109,7 +109,9 @@ def _lifecycle_child(evidence_dir):
             }
             cleanup_results.append(row)
 
-            if module.EVIDENCE_ROWS:
+            if (module.EVIDENCE_ROWS
+                    and test_case._testMethodName ==
+                        "test_runner_recovers_independent_watches_and_refreshes_without_jobs_change"):
                 fixture = module.EVIDENCE_ROWS[-1]
                 receipt_records = {}
                 ack_records = {}
