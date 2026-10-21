@@ -1219,6 +1219,54 @@ class CompactObservationTest(TidyCase):
         self.assertIn("요약이 못 본 요청", observation["recent"])
         self.assertEqual(observation["recent"].count("남겨 둘 시작 대화"), 1)
 
+    def test_system_compact_boundary_preserves_last_reply_and_refreshes_card(self):
+        path = self.iso.root / f"{self.SID}.jsonl"
+        rows = [
+            {**self.claude_row("user", "u1", "질문"), "parentUuid": None},
+            {**self.claude_row("assistant", "a1", "압축 직전 마지막 답\n세부 내용", stop="end_turn"),
+             "parentUuid": "u1", "timestamp": "2026-10-21T13:46:13.510Z"},
+        ]
+        for row in rows:
+            self.append_claude(path, row)
+        boundary = path.stat().st_size
+        preserved = {"anchorUuid": "a1", "uuids": ["u1", "a1"], "allUuids": ["u1", "a1", "tool"]}
+        self.append_claude(path, {"type": "system", "subtype": "compact_boundary", "uuid": "boundary",
+                                  "timestamp": "2026-10-21T13:46:14Z", "compactMetadata": {
+                                      "preservedMessages": preserved,
+                                      "preservedSegment": {"headUuid": "u1", "anchorUuid": "a1", "tailUuid": "a1"}}})
+        info = path.stat()
+        anchor = {"boundary_offset": boundary, "transcript_identity": f"{info.st_dev}:{info.st_ino}"}
+        self.append_claude(path, {**self.claude_row("assistant", "fake-tool", "secret", stop="end_turn"),
+                                  "isSidechain": True})
+        self.append_claude(path, self.claude_row("user", "after", "후속 질문"))
+        self.append_claude(path, self.claude_row("assistant", "after-answer", "후속 답", stop="end_turn"))
+        observation = tt.compact_observation("claude", self.SID, str(path), anchor)
+        self.assertEqual(observation["state"], "ready")
+        self.assertEqual(observation["last_reply"], {
+            "uuid": "a1", "byte_offset": len((json.dumps(rows[0], ensure_ascii=False) + "\n").encode()) + 0,
+            "timestamp": "2026-10-21T13:46:13.510Z", "first_line": "압축 직전 마지막 답"})
+        self.assertIn("[assistant] 압축 직전 마지막 답", observation["recent_preserved"])
+        self.assertNotIn("secret", observation["recent_preserved"])
+        self.assertIn("[user] 후속 질문", observation["recent_post"])
+        self.assertNotIn("압축 직전 마지막 답", observation["recent_post"])
+
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = st.resolve_seat("claude", str(self.cwd))
+            with st.seat_lock(seat.key):
+                st.write_card(seat, "claude", self.SID, "요약", cwd=str(self.cwd), origin="runtime-compact",
+                              compact_context={"identity": "compact-1", "transcript": str(path)})
+                card = st.read_latest_card(seat)
+                self.assertTrue(st.update_compact_card_locked(
+                    seat, card["generation"], "compact-1", recent=observation["recent_post"],
+                    recent_preserved=observation["recent_preserved"], last_reply=observation["last_reply"],
+                    source=observation["source"], recent_partial=observation["recent_partial"]))
+            card = st.read_latest_card(seat)
+            first_line = card["body"].splitlines()[0]
+            self.assertEqual(first_line,
+                             "압축 직전 마지막 답 (2026-10-21 13:46:13 UTC / 2026-10-21 22:46:13 KST): 압축 직전 마지막 답")
+            self.assertIn("[요약 뒤 그대로 남은 대화]", card["body"])
+            self.assertIn("[압축 뒤 이어진 대화]", card["body"])
+
     def test_partial_latest_row_and_replaced_transcript_fail_closed(self):
         path = self.iso.root / f"{self.SID}.jsonl"
         self.append_claude(path, self.claude_row("assistant", "a1", "완료", stop="end_turn"))
@@ -4042,7 +4090,8 @@ class SeatHandoverTest(TidyCase):
                 {"harness": "unknown", "name": "-"}, "explicit", "1", source="explicit"))
             with st.seat_lock(seat.key):
                 st.record_event(seat, "claude", "sid-A", "start", cwd=str(self.cwd))
-                st.write_card(seat, "claude", "sid-A", "work", cwd=str(self.cwd))
+                st.write_card(seat, "claude", "sid-A", "compact summary", cwd=str(self.cwd),
+                              origin="runtime-compact", compact_context={"identity": "fixture-compact"})
             card = st.read_latest_card(seat)
             request = {"schema": clear.SCHEMA, "seat": seat.as_dict(),
                        "harness": "claude", "sid": "sid-A",
@@ -4058,12 +4107,22 @@ class SeatHandoverTest(TidyCase):
 
             with st.seat_lock(seat.key):
                 st.atomic_write_json(self.handover._snapshot_path(seat.key), {})
-            with mock.patch.object(st, "update_compact_card_locked", return_value=True):
-                clear._refresh_compact_card(request, {"recent": "summary", "source": "fixture"})
+            observation = {"recent": "후속 답", "recent_post": "[assistant] 후속 답",
+                           "recent_preserved": "[assistant] 압축 전 답", "source": "fixture",
+                           "recent_partial": False, "last_reply": {
+                               "uuid": "answer-1", "byte_offset": 42,
+                               "timestamp": "2026-10-21T13:46:13.510Z",
+                               "first_line": "압축 직전 마지막 답"}}
+            clear._refresh_compact_card(request, observation)
             refreshed = self.handover.read_snapshot(seat.key)
             self.assertEqual(refreshed["bindings"], [])
             self.assertEqual(refreshed["steward"]["roles"][0]["generation"],
                              prepared["steward"]["roles"][0]["generation"])
+            compact_card = st.read_latest_card(seat)
+            self.assertEqual(compact_card["compact"]["last_reply"], observation["last_reply"])
+            self.assertEqual(compact_card["compact"]["recent_preserved"], observation["recent_preserved"])
+            self.assertEqual(compact_card["body"].splitlines()[0],
+                             "압축 직전 마지막 답 (2026-10-21 13:46:13 UTC / 2026-10-21 22:46:13 KST): 압축 직전 마지막 답")
 
     def test_watch_snapshot_keeps_exact_unresolved_watch_identity_across_handover(self):
         pm = self.handover._peer_message()
