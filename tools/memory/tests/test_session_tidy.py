@@ -1267,6 +1267,44 @@ class CompactObservationTest(TidyCase):
             self.assertIn("[요약 뒤 그대로 남은 대화]", card["body"])
             self.assertIn("[압축 뒤 이어진 대화]", card["body"])
 
+    def test_large_transcript_reads_last_reply_from_bounded_exact_boundary_window(self):
+        path = self.iso.root / f"{self.SID}.jsonl"
+        self.append_claude(path, {**self.claude_row("assistant", "old-sidechain", "가짜 완료", stop="end_turn"),
+                                  "isSidechain": True})
+        # Make the transcript exceed the bounded window before the valid reply too, so
+        # the boundary read starts inside this row and must discard its partial prefix.
+        with path.open("ab") as handle:
+            handle.write((json.dumps(self.claude_row("assistant", "large-sidechain", "x" * (tt.COMPACT_SCAN_BYTES + 64),
+                                                     stop="end_turn"), ensure_ascii=False) + "\n").encode())
+        self.append_claude(path, {**self.claude_row("assistant", "near-sidechain", "가짜 최근 완료", stop="end_turn"),
+                                  "isSidechain": True})
+        reply_offset = path.stat().st_size
+        self.append_claude(path, {**self.claude_row("assistant", "before-boundary", "압축 직전 보존 답", stop="end_turn"),
+                                  "timestamp": "2026-10-21T13:46:13.510Z"})
+        boundary = path.stat().st_size
+        self.append_claude(path, {"type": "system", "subtype": "compact_boundary", "uuid": "boundary",
+                                  "compactMetadata": {"preservedMessages": {"uuids": ["unknown-preserved-uuid"]}}})
+        info = path.stat()
+        anchor = {"boundary_offset": boundary, "transcript_identity": f"{info.st_dev}:{info.st_ino}"}
+        with path.open("ab") as handle:
+            for index in range(1100):
+                row = self.claude_row("user", f"post-{index}", "뒤쪽 행 " + "z" * 1000)
+                handle.write((json.dumps(row, ensure_ascii=False) + "\n").encode())
+            row = self.claude_row("user", "later-user", "아직 답하지 않은 새 요청")
+            handle.write((json.dumps(row, ensure_ascii=False) + "\n").encode())
+
+        observation = tt.compact_observation("claude", self.SID, str(path), anchor)
+        self.assertGreater(path.stat().st_size, tt.COMPACT_SCAN_BYTES)
+        self.assertGreater(path.stat().st_size - tt.COMPACT_SCAN_BYTES, observation["boundary"])
+        self.assertEqual(observation["state"], "pending")
+        self.assertEqual(observation["latest_type"], "user")
+        self.assertEqual(observation["last_reply"], {
+            "uuid": "before-boundary", "byte_offset": reply_offset,
+            "timestamp": "2026-10-21T13:46:13.510Z", "first_line": "압축 직전 보존 답"})
+        self.assertTrue(observation["recent_partial"])
+        self.assertNotIn("가짜 완료", observation["recent_preserved"])
+        self.assertNotIn("large-sidechain", observation["recent_preserved"])
+
     def test_partial_latest_row_and_replaced_transcript_fail_closed(self):
         path = self.iso.root / f"{self.SID}.jsonl"
         self.append_claude(path, self.claude_row("assistant", "a1", "완료", stop="end_turn"))
