@@ -46,19 +46,33 @@ class RecipientReceiptTest(unittest.TestCase):
         changed = dict(self.record, route_node="other")
         self.assertNotEqual(marker, receipt.receipt_marker(changed, self.storage))
 
-    def test_native_translators_require_exact_session_and_native_user_events(self):
+    def test_opencode_receipts_require_the_exact_expected_carrier_body(self):
         marker = receipt.receipt_marker(self.record, self.storage)
+        body = "Hearting delivery context\n" + marker
+        expected = [{"text": body, "bindings": [
+            (self.delivery_id, receipt.binding_digest(self.record, self.storage))]}]
         messages = [
             {"info": {"sessionID": self.session, "role": "assistant"},
-             "parts": [{"type": "text", "text": marker}]},
+             "parts": [{"type": "text", "text": body}]},
             {"info": {"sessionID": "foreign", "role": "user"},
-             "parts": [{"type": "text", "text": marker}]},
+             "parts": [{"type": "text", "text": body}]},
             {"info": {"sessionID": self.session, "role": "user"},
-             "parts": [{"type": "text", "text": marker}]},
+             "parts": [{"type": "text", "text": "I received this marker: " + marker}]},
+            {"info": {"sessionID": self.session, "role": "user"},
+             "parts": [{"type": "text", "text": "prefix\n" + body}]},
+            {"info": {"sessionID": self.session, "role": "user"},
+             "parts": [{"type": "text", "text": body[:-8]}]},
+            {"info": {"sessionID": self.session, "role": "user"},
+             "parts": [{"type": "text", "text": body}]},
         ]
-        evidence = receipt.opencode_messages_evidence(messages, self.session)
+        evidence = receipt.opencode_messages_evidence(messages, self.session, expected)
         self.assertEqual(evidence["bindings"], [(self.delivery_id, marker.split()[-1])])
         self.assertEqual(evidence["source"], "opencode-session-messages")
+        peer_shape = receipt.opencode_messages_evidence([{
+            "info": {"sessionID": self.session, "role": "user"},
+            "message": {"content": body},
+        }], self.session, expected)
+        self.assertEqual(peer_shape["bindings"], evidence["bindings"])
         claude = receipt.claude_feedback_evidence([
             {"type": "assistant", "sessionId": self.session,
              "summary": "Stop hook feedback", "message": {"content": marker}},
@@ -74,10 +88,12 @@ class RecipientReceiptTest(unittest.TestCase):
     def test_exact_receipt_settles_delivery_only(self):
         self._mark_sent_ambiguous()
         marker = receipt.receipt_marker(self.record, self.storage)
+        body = "Hearting delivery context\n" + marker
         evidence = receipt.opencode_messages_evidence([
             {"info": {"sessionID": self.session, "role": "user"},
-             "parts": [{"type": "text", "text": marker}]},
-        ], self.session)
+             "parts": [{"type": "text", "text": body}]},
+        ], self.session, [{"text": body, "bindings": [
+            (self.delivery_id, receipt.binding_digest(self.record, self.storage))]}])
         result = receipt.settle_native_receipt(
             self.root, self.storage, "opencode", self.session, self.record,
             evidence, acked_by="opencode-session:" + self.session)
@@ -93,10 +109,12 @@ class RecipientReceiptTest(unittest.TestCase):
     def test_ack_write_failure_still_reports_received_and_does_not_resend(self):
         self._mark_sent_ambiguous()
         marker = receipt.receipt_marker(self.record, self.storage)
+        body = "Hearting delivery context\n" + marker
         evidence = receipt.opencode_messages_evidence([
             {"info": {"sessionID": self.session, "role": "user"},
-             "parts": [{"type": "text", "text": marker}]},
-        ], self.session)
+             "parts": [{"type": "text", "text": body}]},
+        ], self.session, [{"text": body, "bindings": [
+            (self.delivery_id, receipt.binding_digest(self.record, self.storage))]}])
         with mock.patch.object(pending, "ack_received", side_effect=OSError("simulated write failure")):
             first = receipt.settle_native_receipt(
                 self.root, self.storage, "opencode", self.session, self.record,
@@ -114,10 +132,12 @@ class RecipientReceiptTest(unittest.TestCase):
 
     def test_foreign_or_stale_identity_cannot_suppress_delivery(self):
         marker = receipt.receipt_marker(self.record, self.storage)
+        body = "Hearting delivery context\n" + marker
         foreign = receipt.opencode_messages_evidence([
             {"info": {"sessionID": "other", "role": "user"},
-             "parts": [{"type": "text", "text": marker}]},
-        ], self.session)
+             "parts": [{"type": "text", "text": body}]},
+        ], self.session, [{"text": body, "bindings": [
+            (self.delivery_id, receipt.binding_digest(self.record, self.storage))]}])
         result = receipt.settle_native_receipt(
             self.root, self.storage, "opencode", self.session, self.record,
             foreign, acked_by="test")
@@ -127,8 +147,9 @@ class RecipientReceiptTest(unittest.TestCase):
             self.root, self.storage, "opencode", self.session, mismatched,
             receipt.opencode_messages_evidence([
                 {"info": {"sessionID": self.session, "role": "user"},
-                 "parts": [{"type": "text", "text": marker}]},
-            ], self.session), acked_by="test")
+                 "parts": [{"type": "text", "text": body}]},
+            ], self.session, [{"text": body, "bindings": [
+                (self.delivery_id, receipt.binding_digest(self.record, self.storage))]}]), acked_by="test")
         self.assertFalse(stale["received"])
         self.assertEqual(pending.read(self.root, self.storage, self.delivery_id)["state"], "pending")
 

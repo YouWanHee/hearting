@@ -17,6 +17,9 @@ from typing import Any
 import dispatch_pending_delivery as pending
 
 MARKER_RE = re.compile(r"HEARTING_RECEIPT_V1\s+(delivery-[A-Za-z0-9._-]{1,128})\s+([0-9a-f]{64})")
+OPENCODE_MARKER_LINE_RE = re.compile(
+    r"(?m)^HEARTING_RECEIPT_V1 (delivery-[A-Za-z0-9._-]{1,128}) ([0-9a-f]{64})$"
+)
 MAX_CLAUDE_TRANSCRIPT_BYTES = 4 * 1024 * 1024
 LEGACY_COMPLETION_RE = re.compile(
     r"Runtime owner completion receipt schema=2 state=(success|attention) "
@@ -41,6 +44,11 @@ def binding_digest(record: dict, storage_recipient: str) -> str:
     """Hash the complete immutable delivery identity, excluding lease state."""
     identity = pending.received_ack_identity(
         record, storage_recipient, record.get("delivery_id", ""))
+    return identity_binding(identity)
+
+
+def identity_binding(identity: dict) -> str:
+    """Hash an immutable identity already carried across a delivery handoff."""
     return hashlib.sha256(_canonical(identity)).hexdigest()
 
 
@@ -48,6 +56,11 @@ def receipt_marker(record: dict, storage_recipient: str) -> str:
     """A transport annotation outside the canonical receipt payload."""
     return (f"HEARTING_RECEIPT_V1 {record['delivery_id']} "
             f"{binding_digest(record, storage_recipient)}")
+
+
+def receipt_marker_for_identity(delivery_id: str, identity: dict) -> str:
+    """Render the marker for a previously handed-off immutable identity."""
+    return f"HEARTING_RECEIPT_V1 {delivery_id} {identity_binding(identity)}"
 
 
 def _text_content(value: Any) -> str:
@@ -123,11 +136,32 @@ def claude_transcript_evidence(*, transcript_path: str | Path, session_id: str,
         return None
 
 
-def opencode_messages_evidence(messages: Any, session_id: str) -> dict[str, Any] | None:
-    """Translate exact user messages returned by this session's native SDK."""
+def opencode_messages_evidence(messages: Any, session_id: str,
+                               expected_messages: Any = None) -> dict[str, Any] | None:
+    """Translate only an exact expected carrier body in this session's native history.
+
+    A marker is a correlation label, so its presence in arbitrary user text is
+    not receipt evidence. Callers provide the exact body they handed to the
+    native carrier and the identities that body was meant to carry.
+    """
     if not isinstance(session_id, str) or not session_id or not isinstance(messages, list):
         return None
-    texts = []
+    expected: dict[str, set[tuple[str, str]]] = {}
+    if isinstance(expected_messages, list):
+        for item in expected_messages:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            pairs = item.get("bindings")
+            if not isinstance(text, str) or not isinstance(pairs, (list, tuple, set)):
+                continue
+            exact_lines = set(OPENCODE_MARKER_LINE_RE.findall(text))
+            for pair in pairs:
+                if (isinstance(pair, (list, tuple)) and len(pair) == 2
+                        and isinstance(pair[0], str) and isinstance(pair[1], str)
+                        and (pair[0], pair[1]) in exact_lines):
+                    expected.setdefault(text, set()).add((pair[0], pair[1]))
+    texts, bindings = [], set()
     for row in messages:
         if not isinstance(row, dict):
             continue
@@ -135,11 +169,15 @@ def opencode_messages_evidence(messages: Any, session_id: str) -> dict[str, Any]
         if (not isinstance(info, dict) or info.get("sessionID") != session_id
                 or info.get("role") != "user"):
             continue
-        parts = row.get("parts")
-        text = _text_content(parts)
-        if text:
+        message = row.get("message")
+        text = (_text_content(message.get("content")) if isinstance(message, dict)
+                else _text_content(row.get("parts")))
+        if text in expected:
             texts.append(text)
-    return _evidence("opencode", session_id, "opencode-session-messages", texts)
+            bindings.update(expected[text])
+    return {"harness": "opencode", "session_id": session_id,
+            "source": "opencode-session-messages", "bindings": sorted(bindings),
+            "legacy_texts": texts}
 
 
 def codex_queue_evidence(*, endpoint: str | Path, session_id: str,

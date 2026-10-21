@@ -520,6 +520,57 @@ def delivery_context(batches: list[tuple[Path, list[dict]]]) -> str:
     return "\n\n".join(blocks)
 
 
+def _opencode_expected_message(text: str, identities: list[tuple[str, dict]]) -> dict:
+    """Bind an exact rendered OpenCode body to its handed-off identities."""
+    from dispatch_recipient_receipt import identity_binding, receipt_marker_for_identity
+    lines = set(text.splitlines()) if isinstance(text, str) else set()
+    bindings = []
+    for delivery_id, identity in identities:
+        try:
+            marker = receipt_marker_for_identity(delivery_id, identity)
+            if marker in lines:
+                bindings.append((delivery_id, identity_binding(identity)))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return {"text": text, "bindings": bindings}
+
+
+def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
+                                    session_id: str) -> list[dict]:
+    """Build exact current renderings that a prior turn carrier could have sent."""
+    batches = []
+    for root in roots:
+        records, _count = addressed_records(root, recipient_kind, session_id)
+        if records:
+            batches.append((root, records))
+    groups = []
+    if batches:
+        groups.append(batches)
+        groups.extend([[(root, records)] for root, records in batches])
+        groups.extend([[(root, [record])] for root, records in batches for record in records])
+    expected, seen = [], set()
+    for group in groups:
+        text = delivery_context(group)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        identities = []
+        for _root, records in group:
+            for record in records:
+                storage = record.get(STORAGE_KEY) or session_id
+                delivery_id = record.get("delivery_id")
+                try:
+                    identity = pending_delivery.received_ack_identity(
+                        record, storage, delivery_id)
+                except (KeyError, TypeError, ValueError, pending_delivery.PendingDeliveryError):
+                    continue
+                identities.append((delivery_id, identity))
+        candidate = _opencode_expected_message(text, identities)
+        if candidate["bindings"]:
+            expected.append(candidate)
+    return expected
+
+
 def ack_delivered(root: Path, session_id: str, records: list[dict], *, acked_by: str) -> int:
     """Ack the records whose bounded receipt was injected; returns the count.
 
@@ -638,7 +689,6 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, TypeError):
             handed = {}
         from dispatch_recipient_receipt import opencode_messages_evidence, settle_native_receipt
-        evidence = opencode_messages_evidence(handed.get("messages"), args.session)
         requested = handed.get("records")
         roots = _state_roots()
         allowed_roots = {Path(root).resolve() for root in roots}
@@ -658,13 +708,73 @@ def main(argv: list[str] | None = None) -> int:
                 records, _count = addressed_records(root, args.recipient_kind, args.session)
                 targets.extend((root, r.get(STORAGE_KEY) or args.session,
                                 r["delivery_id"], None) for r in records)
+        expected_messages = []
+        if isinstance(requested, list):
+            text = handed.get("text")
+            if isinstance(text, str):
+                identities = []
+                for _root, _storage, delivery_id, item in targets:
+                    identity = item.get("immutable_identity")
+                    if (isinstance(identity, dict) and identity.get("delivery_id") == delivery_id):
+                        identities.append((delivery_id, identity))
+                expected = _opencode_expected_message(text, identities)
+                if expected["bindings"]:
+                    expected_messages.append(expected)
+        else:
+            supplied = handed.get("expected_native_messages")
+            if isinstance(supplied, list):
+                for item in supplied:
+                    if (not isinstance(item, dict) or not isinstance(item.get("text"), str)
+                            or item.get("carrier") != args.recipient_kind
+                            or item.get("recipient_sid") != args.session
+                            or not all(isinstance(item.get(key), str) and item[key]
+                                       for key in ("delivery_id", "storage_recipient", "claim_owner",
+                                                   "duty_id", "jobs", "attempt_id"))
+                            or not item["duty_id"].startswith("registered-batch-")
+                            or item["claim_owner"] != "retained-rewake:" + item["duty_id"]
+                            or not Path(item["jobs"]).is_absolute()):
+                        continue
+                    for root, storage, delivery_id, _handed_record in targets:
+                        if (storage != item["storage_recipient"]
+                                or delivery_id != item["delivery_id"]):
+                            continue
+                        try:
+                            current = pending_delivery.read(root, storage, delivery_id)
+                            if (current is None
+                                    or current.get("state") not in pending_delivery.OPEN_STATES):
+                                continue
+                            identity = pending_delivery.received_ack_identity(
+                                current, storage, delivery_id)
+                            expected = _opencode_expected_message(
+                                item["text"], [(delivery_id, identity)])
+                            if expected["bindings"]:
+                                expected_messages.append(expected)
+                        except (OSError, KeyError, TypeError, ValueError,
+                                pending_delivery.PendingDeliveryError):
+                            continue
+                        break
+        evidence = opencode_messages_evidence(
+            handed.get("messages"), args.session, expected_messages)
         received_ids, unknown_ids, settled_count = set(), set(), 0
         remaining_context, remaining_handoffs = [], []
         for root, storage, delivery_id, handed_record in targets:
             try:
                 current = pending_delivery.read(root, storage, delivery_id)
                 if current is None:
+                    if isinstance(requested, list):
+                        unknown_ids.add(delivery_id)
                     continue
+                original_identity = None
+                original_owner = None
+                if isinstance(requested, list):
+                    original_identity = (handed_record or {}).get("immutable_identity")
+                    original_owner = (handed_record or {}).get("claim_owner")
+                    live_identity = pending_delivery.received_ack_identity(
+                        current, storage, delivery_id)
+                    if (not isinstance(original_identity, dict)
+                            or live_identity != original_identity):
+                        unknown_ids.add(delivery_id)
+                        continue
                 outcome = settle_native_receipt(
                     root, storage, "opencode", args.session, current, evidence,
                     acked_by=f"native-receipt:opencode:{args.session}")
@@ -672,23 +782,24 @@ def main(argv: list[str] | None = None) -> int:
                     received_ids.add(delivery_id)
                     settled_count += int(outcome["settled"])
                 elif isinstance(requested, list):
+                    fresh = pending_delivery.read(root, storage, delivery_id)
+                    if (fresh is None
+                            or pending_delivery.received_ack_identity(
+                                fresh, storage, delivery_id) != original_identity
+                            or fresh.get("state") != "claimed"
+                            or fresh.get("claim_owner") != original_owner):
+                        unknown_ids.add(delivery_id)
+                        continue
                     item = dict(handed_record or {})
-                    item.update(root=str(root), storage_key=storage, delivery_id=delivery_id,
-                                claim_owner=current.get("claim_owner"))
-                    remaining_context.append((root, [{**current, STORAGE_KEY: storage}]))
+                    item.update(root=str(root), storage_key=storage, delivery_id=delivery_id)
+                    remaining_context.append((root, [{**fresh, STORAGE_KEY: storage}]))
                     remaining_handoffs.append(item)
             except (OSError, KeyError, TypeError, pending_delivery.PendingDeliveryError):
                 if isinstance(requested, list) and isinstance(handed_record, dict):
-                    item = dict(handed_record)
-                    item.update(root=str(root), storage_key=storage, delivery_id=delivery_id)
-                    remaining_handoffs.append(item)
                     unknown_ids.add(delivery_id)
                 continue
-        fallback_text = handed.get("text") if isinstance(handed.get("text"), str) else ""
-        output_text = (fallback_text if unknown_ids and not received_ids
-                       else delivery_context(remaining_context))
         print(json.dumps({"received_ids": sorted(received_ids), "settled_count": settled_count,
-                          "unknown_ids": sorted(unknown_ids), "text": output_text,
+                          "unknown_ids": sorted(unknown_ids), "text": delivery_context(remaining_context),
                           "records": remaining_handoffs},
                          ensure_ascii=False), flush=True)
         return 0
@@ -699,9 +810,12 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, TypeError):
             handed = {}
         from dispatch_recipient_receipt import opencode_messages_evidence
-        native_evidence = (opencode_messages_evidence(handed.get("messages"), args.session)
+        roots = _state_roots()
+        native_evidence = (opencode_messages_evidence(
+            handed.get("messages"), args.session,
+            _opencode_delivery_expectations(roots, args.recipient_kind, args.session))
                            if args.action == "deliver" else None)
-        for root in _state_roots():
+        for root in roots:
             if args.action == "activate":
                 records = activate(root, args.recipient_kind, args.session,
                                    request_recovery=False)
@@ -714,7 +828,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({
             "text": delivery_context(batches),
             "records": [{"root": str(root), "storage_key": record.get(STORAGE_KEY) or args.session,
-                         "delivery_id": record["delivery_id"], "claim_owner": record.get("claim_owner")}
+                         "delivery_id": record["delivery_id"], "claim_owner": record.get("claim_owner"),
+                         "immutable_identity": pending_delivery.received_ack_identity(
+                             record, record.get(STORAGE_KEY) or args.session, record["delivery_id"])}
                         for root, records in batches for record in records],
         }, ensure_ascii=False), flush=True)
         if args.action == "activate":

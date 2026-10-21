@@ -65,9 +65,10 @@ const ctx = { location: { directory: process.cwd() }, client: { app: { log: asyn
   status: async () => nativeResponse({ [sid]: { type: "idle" } }),
   messages: async () => {
     messageReads++
-    if (process.env.CASE === "dispatch-race" && messageReads >= 2) {
+    if (["dispatch-race", "quoted-dispatch-marker"].includes(process.env.CASE) && messageReads >= 2) {
       return nativeResponse([{ info: { sessionID: sid, role: "user" },
-        parts: [{ type: "text", text: process.env.RECEIPT_MARKER }] }])
+        parts: [{ type: "text", text: process.env.CASE === "quoted-dispatch-marker"
+          ? `Quoted text: ${process.env.RECEIPT_MARKER}` : process.env.EXPECTED_TEXT }] }])
     }
     return nativeResponse([])
   },
@@ -109,6 +110,8 @@ try {
     const released = readTransfer()
     assert.equal(released.state, "pending")
     assert.equal(released.rpc_claim, null)
+  } else if (process.env.CASE === "quoted-dispatch-marker") {
+    assert.equal(writes, 1, "a quoted marker was treated as a native dispatch receipt")
   } else {
     assert.equal(writes, 1, JSON.stringify(traces))
     const stat = fs.readFileSync("/proc/self/stat", "utf8")
@@ -126,7 +129,8 @@ try {
   }
 } finally { hooks.dispose?.({ silent: true }) }
 '''
-        for case in ("root-change", "begin-refused", "ambiguous", "dispatch-race"):
+        for case in ("root-change", "begin-refused", "ambiguous", "dispatch-race",
+                     "quoted-dispatch-marker"):
             with self.subTest(case=case), ExitStack() as stack:
                 tmp = fixture_tempdir(stack)
                 root = Path(tmp)
@@ -149,7 +153,7 @@ try {
                         "AGENT_DISPATCH_JOBS": str(root / "harness" / "dispatch" / "jobs.log"),
                         "AGENT_RUNTIME_ROOT": str(root / "runtime")}):
                     receipt_marker = ""
-                    if case == "dispatch-race":
+                    if case in {"dispatch-race", "quoted-dispatch-marker"}:
                         import dispatch_pending_delivery as pending
                         import dispatch_recipient_receipt as recipient_receipt
                         jobs = dispatch_root / "jobs.log"
@@ -173,10 +177,23 @@ try {
                             claim_owner="sweep-carrier")
                         record = pending.read(dispatch_root, sid, record["delivery_id"])
                         receipt_marker = recipient_receipt.receipt_marker(record, sid)
-                    transfer_text = "one original prompt" + (
-                        "\n" + receipt_marker if receipt_marker else "")
+                    transfer_text = ("Hearting delivery context\n" + receipt_marker
+                                     if receipt_marker else "one original prompt")
+                    duty_id = "registered-batch-fixture"
+                    refs = ([duty_id, "att-owner", record["delivery_id"]]
+                            if receipt_marker else [])
                     _text, ref = peer.prepare_peer_message(transfer_text, {
-                        "harness": "codex", "session_id": "sender"}, recipient, defer=True)
+                        "harness": "codex", "session_id": "sender"}, recipient,
+                        defer=True, refs=refs)
+                    if receipt_marker:
+                        peer.bind_dispatch_notice(ref, {
+                            "duty_id": duty_id,
+                            "jobs": str(dispatch_root / "jobs.log"),
+                            "attempt_id": "att-owner", "carrier": "opencode-turn",
+                            "recipient_sid": sid, "storage_recipient": sid,
+                            "delivery_id": record["delivery_id"],
+                            "claim_owner": "retained-rewake:" + duty_id,
+                        })
                     expected_text = peer._read_pending(ref)["text"]
                     fake_peer = root / "fake-peer-command.py"
                     fake_peer.write_text(r'''import json, os, sys
@@ -259,6 +276,9 @@ print(json.dumps([row]))
                         self.assertIsNone(row.get("rpc_claim"))
                         self.assertEqual(pending.read(dispatch_root, sid,
                             "delivery-" + "d" * 32)["state"], "acked")
+                    elif case == "quoted-dispatch-marker":
+                        self.assertEqual(pending.read(dispatch_root, sid,
+                            "delivery-" + "d" * 32)["state"], "sent-ambiguous")
                     else:
                         self.assertEqual(row["state"], "unverified")
 

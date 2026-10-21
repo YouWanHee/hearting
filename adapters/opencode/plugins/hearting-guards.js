@@ -1872,15 +1872,31 @@ async function pendingPeerDelivery(ctx, sid) {
     const dispatchReceiptIds = (text) => Array.from(String(text || "").matchAll(
       /HEARTING_RECEIPT_V1\s+(delivery-[A-Za-z0-9._-]{1,128})\s+[0-9a-f]{64}/g),
     match => match[1])
-    const nativeReceiptCheck = async (rows) => {
-      if (!Array.isArray(rows)) return new Set()
-      const result = await carrierCommand("settle", sid, { messages: rows })
+    const expectedDispatchMessage = (row) => {
+      const binding = row?.dispatch_notice
+      if (!binding || binding.carrier !== CARRIER_KIND || binding.recipient_sid !== sid
+          || typeof row.text !== "string"
+          || ![binding.delivery_id, binding.storage_recipient, binding.claim_owner,
+            binding.duty_id, binding.jobs, binding.attempt_id].every(value => typeof value === "string" && value)
+          || !dispatchReceiptIds(row.text).includes(binding.delivery_id)
+          || !Array.isArray(row.refs) || !row.refs.includes(binding.duty_id)
+          || !binding.duty_id.startsWith("registered-batch-")
+          || binding.claim_owner !== `retained-rewake:${binding.duty_id}`
+          || !path.isAbsolute(binding.jobs)) return null
+      return { text: row.text, ...binding }
+    }
+    const expectedNativeMessages = rows.map(expectedDispatchMessage).filter(Boolean)
+    const nativeReceiptCheck = async (nativeRows, expected = []) => {
+      if (!Array.isArray(nativeRows)) return new Set()
+      const result = await carrierCommand("settle", sid, {
+        messages: nativeRows, expected_native_messages: expected,
+      })
       return new Set(Array.isArray(result?.received_ids) ? result.received_ids : [])
     }
-    const alreadyReceived = await nativeReceiptCheck(messages)
+    const alreadyReceived = await nativeReceiptCheck(messages, expectedNativeMessages)
     const recheckReceipt = async (row) => {
-      const ids = dispatchReceiptIds(row?.text)
-      if (!ids.length) return false
+      const expected = expectedDispatchMessage(row)
+      if (!expected) return false
       let latest
       try {
         latest = pendingPeerSdkData(await bounded(client.messages({
@@ -1888,12 +1904,13 @@ async function pendingPeerDelivery(ctx, sid) {
         })))
       } catch { return false }
       if (!Array.isArray(latest) || !pendingPeerRoot(ctx, sid)) return false
-      const received = await nativeReceiptCheck(latest)
-      return ids.some(id => received.has(id))
+      const received = await nativeReceiptCheck(latest, [expected])
+      return received.has(expected.delivery_id)
     }
     for (const row of rows.slice(0, 3)) {
       if (!row || typeof row.ref !== "string" || !row.ref || typeof row.text !== "string") continue
-      if (dispatchReceiptIds(row.text).some(id => alreadyReceived.has(id))) {
+      const expectedDispatch = expectedDispatchMessage(row)
+      if (expectedDispatch && alreadyReceived.has(expectedDispatch.delivery_id)) {
         pendingPeerTrace(ctx, sid, "dispatch-receipt", "already-received", {
           refs: [row.ref],
         })
