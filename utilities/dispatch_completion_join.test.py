@@ -1198,8 +1198,10 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.assertEqual(partition.joinable, frozenset())
         self.assertEqual(partition.unstarted, frozenset())
 
+        staged = self.jobs.with_name("jobs.claimed")
         claimed = never_started.replace("launch_claimed=0", "launch_claimed=1")
-        self.jobs.write_text(claimed, encoding="utf-8")
+        staged.write_text(claimed, encoding="utf-8")
+        os.replace(staged, self.jobs)
         child = JOIN.current_children(self.jobs, parent)[0]
         partition = JOIN.partition_runtime_wait_children(
             self.jobs, parent, [child], {child.attempt_id}
@@ -1207,7 +1209,8 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.assertEqual(partition.unstarted, frozenset())
         self.assertEqual(partition.joinable, frozenset({"att-never"}))
 
-        self.jobs.write_text(claimed.replace("\tdone\t", "\topen\t"), encoding="utf-8")
+        staged.write_text(claimed.replace("\tdone\t", "\topen\t"), encoding="utf-8")
+        os.replace(staged, self.jobs)
         child = JOIN.current_children(self.jobs, parent)[0]
         partition = JOIN.partition_runtime_wait_children(
             self.jobs, parent, [child], {child.attempt_id}
