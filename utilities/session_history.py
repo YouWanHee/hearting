@@ -68,9 +68,9 @@ def _entries_for_generation(rows, generation):
     confirmed = session_tidy._confirmed_predecessor(
         rows, current.get("harness", ""), current.get("sid", ""))
     if confirmed is None:
-        confirmed = next((row for row in rows[1:] if row.get("relation") == "chronological"), None)
-        if confirmed is None:
+        if len(rows) < 2 or current.get("relation") != "chronological":
             return [], "확정된 이전 대화가 없습니다 · hearting run session_history --harness <harness> --session-id <SID>"
+        confirmed = rows[1]
         first_label = "시간순 이웃 · 인계 미확인"
     else:
         first_label = "확정된 이전 대화"
@@ -82,11 +82,17 @@ def _entries_for_generation(rows, generation):
         "chronological": "시간순 이웃 · 인계 미확인",
         "unknown": "관계 미확인",
     }
-    for row in rows[1:]:
+    for index, row in enumerate(rows[1:], 1):
         ident = row.get("harness"), row.get("sid")
         if ident in seen:
             continue
-        items.append(dict(row, _label=relation_labels.get(row.get("relation"), "관계 미확인")))
+        newer = rows[index - 1]
+        relation = newer.get("relation")
+        predecessor = newer.get("predecessor")
+        if relation == "confirmed" and isinstance(predecessor, dict):
+            if (predecessor.get("harness"), predecessor.get("sid")) != ident:
+                relation = "unknown"
+        items.append(dict(row, _label=relation_labels.get(relation, "관계 미확인")))
         seen.add(ident)
     if generation < 1 or generation > len(items):
         return [], f"세대 범위 밖입니다 (1–{len(items)})"
@@ -96,7 +102,10 @@ def _entries_for_generation(rows, generation):
 def _display(rows, generation, stdout=False):
     entries, reason = _entries_for_generation(rows, generation)
     if not entries:
-        print(reason)
+        if stdout:
+            print(reason)
+        else:
+            _show(reason)
         return 0
     index = generation - 1
     while True:
@@ -143,7 +152,7 @@ def main(argv=None):
         return 0
     if pane:
         endpoint = seat.endpoint
-        argv = [sys.executable, str(Path(__file__).resolve()), "--in-pane", "--seat-key", seat.key,
+        argv = ["exec", sys.executable, str(Path(__file__).resolve()), "--in-pane", "--seat-key", seat.key,
                 "--pane", pane, "--endpoint", endpoint, "--socket-path", socket,
                 "--generation", str(args.generation)]
         active_cwd = os.environ.get("HERDR_ACTIVE_PANE_CWD") or os.getcwd()

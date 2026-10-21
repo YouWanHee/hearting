@@ -137,6 +137,8 @@ uncertain lineage rather than promoting a chronological neighbor to a confirmed
 handover. Reading does not resume or modify a session. If the native transcript
 is absent, unreadable or partial, say so and preserve that status. When no
 terminal surface can be opened, print the read-only command/output fallback.
+An unbooked manual `/clear` remains an unconfirmed chronological neighbor and
+does not show the predecessor notice.
 
 ## Artifact Ownership
 

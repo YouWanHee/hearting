@@ -1957,6 +1957,44 @@ class MemoryLayerTest(TidyCase):
         self.assertEqual(projected[2]["card"]["status"], "none")
         self.assertEqual(projected[3]["transcript"]["status"], "available")
 
+    def test_tidy_clear_start_records_idempotent_succession_after_reservation_observation(self):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            st.record_event(seat, "claude", "sid-old", "start", source="startup",
+                            cwd=str(self.cwd), now=100)
+            clear._write_reservation({"schema": 1, "nonce": "clear-nonce", "status": "reserved",
+                                      "created": 150, "seat": seat.as_dict(), "harness": "claude",
+                                      "sid": "sid-old"})
+            st.run_hook("claude", "start", "sid-new", source="clear", cwd=str(self.cwd), now=200)
+            booking = clear.read_reservation(seat.key)
+            rows = st._read_ledger_lines(seat)
+            st.run_hook("claude", "start", "sid-new", source="clear", cwd=str(self.cwd), now=201)
+            lineage = st._project_seat_lineage(st._read_ledger_lines(seat), {}, {}, sid="sid-new")
+            notice = st.build_human_history_notice(seat, "claude", "sid-new")
+        self.assertEqual(booking["observed"]["sid"], "sid-new")
+        succession = [row for row in rows if row.get("event") == "succession"]
+        self.assertEqual(len(succession), 1)
+        self.assertFalse(any(row.get("event") == "handover" for row in rows))
+        self.assertEqual((succession[0]["from"], succession[0]["sid"], succession[0]["source"]),
+                         ("sid-old", "sid-new", "tidy-clear"))
+        self.assertEqual(lineage[0]["relation"], "confirmed")
+        self.assertEqual(lineage[0]["predecessor"], {"harness": "claude", "sid": "sid-old"})
+        self.assertIn("이전 대화 열기", notice)
+
+    def test_manual_clear_without_booking_stays_an_unconfirmed_neighbor(self):
+        with self.library():
+            seat = st.resolve_seat("claude", str(self.cwd))
+            st.record_event(seat, "claude", "sid-old", "start", source="startup",
+                            cwd=str(self.cwd), now=100)
+            st.run_hook("claude", "start", "sid-new", source="clear", cwd=str(self.cwd), now=200)
+            rows = st._read_ledger_lines(seat)
+            lineage = st._project_seat_lineage(rows, {}, {}, sid="sid-new")
+            notice = st.build_human_history_notice(seat, "claude", "sid-new")
+        self.assertFalse(any(row.get("event") == "succession" for row in rows))
+        self.assertEqual(lineage[0]["relation"], "chronological")
+        self.assertIsNone(st._confirmed_predecessor(lineage, "claude", "sid-new"))
+        self.assertEqual(notice, "")
+
     def test_lineage_history_expired_missing_and_unreadable_are_distinct(self):
         rows = [{"event": "summary", "harness": "claude", "sid": name, "ts": i,
                  "first_seen": i} for i, name in enumerate(("expired", "missing", "unreadable"), 1)]

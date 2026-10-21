@@ -846,6 +846,7 @@ class HistoryKeyTests(unittest.TestCase):
         self.assertEqual(herdr.history_key_label(self.env), "Ctrl-b Shift-H")
         self.assertEqual(self.calls, [["/test/bin/herdr", "config", "check"],
                                       ["/test/bin/herdr", "server", "reload-config"]])
+        self.assertTrue(self.path.read_bytes().endswith(b"\n"))
         restored = herdr.restore_history_key(env=self.env, runner=self.runner)
         self.assertEqual(restored["status"], "restored")
         self.assertEqual(self.path.read_bytes(), original)

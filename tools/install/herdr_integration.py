@@ -83,7 +83,7 @@ def _history_block(launcher: str, meta: dict) -> tuple[bytes, bytes]:
     metadata = {**meta, "v": 1, "body_sha256": digest}
     block = (_HISTORY_BEGIN + "\n# HEARTING_HISTORY_META="
              + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
-             + "\n" + body + "\n" + _HISTORY_END).encode("utf-8")
+             + "\n" + body + "\n" + _HISTORY_END + "\n").encode("utf-8")
     return block, body.encode()
 
 
@@ -93,12 +93,15 @@ def _history_parts(data: bytes):
         raise ValueError("managed-block-count")
     start = text.index(_HISTORY_BEGIN)
     finish = text.index(_HISTORY_END, start) + len(_HISTORY_END)
+    if text[finish:finish + 1] == "\n":
+        finish += 1
     block_text = text[start:finish]
     match = _HISTORY_META.search(block_text)
     if not match:
         raise ValueError("metadata-missing")
     metadata = json.loads(match.group(1))
-    body = block_text[match.end():-len(_HISTORY_END)].lstrip("\n").removesuffix("\n")
+    body_end = block_text.index(_HISTORY_END)
+    body = block_text[match.end():body_end].lstrip("\n").removesuffix("\n")
     if not isinstance(metadata, dict) or metadata.get("v") != 1:
         raise ValueError("metadata-invalid")
     if hashlib.sha256(body.encode()).hexdigest() != metadata.get("body_sha256"):

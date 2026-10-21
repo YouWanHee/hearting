@@ -690,6 +690,33 @@ def mark_prompt_source(seat: Seat, harness: str, sid: str, sequence: int, source
     atomic_write_json(path, current)
 
 
+def _record_tidy_clear_succession_locked(seat: Seat, harness: str, sid: str, now: float) -> None:
+    """Record the confirmed session edge from a matching tidy-clear reservation only."""
+    if seat.kind not in ("pane", "native"):
+        return
+    try:
+        import session_tidy_clear
+        booking = session_tidy_clear.read_reservation(seat.key)
+    except Exception:
+        return
+    if not isinstance(booking, dict) or booking.get("harness") != harness:
+        return
+    old = booking.get("sid")
+    observed = booking.get("observed")
+    observed_sid = observed.get("sid") if isinstance(observed, dict) else None
+    if (not isinstance(old, str) or not old or old == sid
+            or not (observed_sid == sid or booking.get("new_session") == sid)):
+        return
+    if isinstance(observed, dict) and observed.get("harness") not in (None, harness):
+        return
+    if any(row.get("event") == "succession" and row.get("harness") == harness
+           and row.get("sid") == sid and row.get("from") == old
+           for row in _read_ledger_lines(seat)):
+        return
+    _append_ledger_entry(seat, {"ts": now, "harness": harness, "sid": sid,
+                                "event": "succession", "from": old, "source": "tidy-clear"})
+
+
 def prompt_state(seat: Seat) -> Optional[dict]:
     data = read_json(_prompt_seq_path(seat))
     return data if isinstance(data, dict) else None
@@ -699,7 +726,7 @@ def session_summary(seat: Seat) -> dict[tuple[str, str], dict]:
     """Fold the ledger: ``(harness, sid) -> first_seen, last_seen, epoch, transcript, cwd, ...``."""
     out: dict[tuple[str, str], dict] = {}
     for item in _read_ledger_lines(seat):
-        if item.get("event") in {"handover", "steward-release", "tidy-claim", "real-prompt"}:
+        if item.get("event") in {"handover", "succession", "steward-release", "tidy-claim", "real-prompt"}:
             # Relations, revocation and prompt provenance are not session activity.
             continue
         key = (str(item.get("harness") or ""), str(item["sid"]))
@@ -738,7 +765,7 @@ def _project_seat_lineage(rows: list[dict], cards: dict, locations: dict,
         if not name or not session:
             continue
         key = (name, session)
-        if row.get("event") == "handover":
+        if row.get("event") in {"handover", "succession"}:
             source = row.get("from")
             if isinstance(source, dict):
                 source = source.get("sid") if source.get("harness") == name else None
@@ -1262,7 +1289,8 @@ def _fold_ledger(seat: Seat) -> None:
     # Registered handovers keep the existing bounded retention. Steward lineage is
     # retained by generation/watch identity so a marker-less holder and a release
     # remain resolvable after ordinary session rows fold.
-    handovers = [(index, row) for index, row in enumerate(lines) if row.get("event") == "handover"]
+    handovers = [(index, row) for index, row in enumerate(lines)
+                 if row.get("event") in {"handover", "succession"}]
     keep_relation_indices = {index for index, _row in handovers[-HANDOVER_KEEP_ROWS:]}
     latest_role_rows, latest_watch_rows = {}, {}
     release_rows = []
@@ -1289,11 +1317,11 @@ def _fold_ledger(seat: Seat) -> None:
     # after the role moved. Keep these compact tombstones in the same ledger.
     keep_relation_indices.update(index for index, _row in release_rows)
     relations = [row for index, row in enumerate(lines) if index in keep_relation_indices
-                 and row.get("event") in {"handover", "steward-release"}]
+                 and row.get("event") in {"handover", "succession", "steward-release"}]
     claims: dict[str, dict] = {}
     real_frontiers: dict[tuple[str, str], dict] = {}
     activity = [l for l in lines if l.get("event") not in {
-        "handover", "steward-release", "tidy-claim", "real-prompt"}]
+        "handover", "succession", "steward-release", "tidy-claim", "real-prompt"}]
     for item in lines:
         if item.get("event") == "tidy-claim" and item.get("claim_id"):
             claims[str(item["claim_id"])] = item
@@ -1956,6 +1984,10 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             with contextlib.suppress(BaseException):    # a hook never fails for the clear note
                 import session_tidy_clear
                 session_tidy_clear.note_start_locked(seat, harness, sid, now)
+        if ((event == "start" and source == "clear")
+                or (harness == "opencode" and event == "prompt")):
+            with contextlib.suppress(BaseException):
+                _record_tidy_clear_succession_locked(seat, harness, sid, now)
         # The one place a same-seat handover (A -> B) is recorded: B's confirmed start/first prompt.
         handed = None
         handover = None
