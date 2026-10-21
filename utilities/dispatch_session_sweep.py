@@ -535,38 +535,112 @@ def _opencode_expected_message(text: str, identities: list[tuple[str, dict]]) ->
     return {"text": text, "bindings": bindings}
 
 
+def _opencode_native_user_texts(messages, session_id: str) -> list[str]:
+    """Read only the native same-session user bodies used for candidate selection."""
+    if not isinstance(messages, list):
+        return []
+    texts = []
+    for row in messages:
+        if not isinstance(row, dict):
+            continue
+        info = row.get("info")
+        if (not isinstance(info, dict) or info.get("sessionID") != session_id
+                or info.get("role") != "user"):
+            continue
+        message = row.get("message")
+        content = (message.get("content") if isinstance(message, dict)
+                   else row.get("parts"))
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "\n".join(item["text"] for item in content
+                              if isinstance(item, dict)
+                              and item.get("type") in {"text", "input_text"}
+                              and isinstance(item.get("text"), str))
+        else:
+            text = ""
+        if text:
+            texts.append(text)
+    return texts
+
+
 def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
-                                    session_id: str) -> list[dict]:
-    """Build exact current renderings that a prior turn carrier could have sent."""
-    batches = []
+                                    session_id: str, messages=None) -> list[dict]:
+    """Rebuild only batches named by native markers and verify their exact body.
+
+    Markers select candidate records; the rendered body and each current immutable
+    identity must still match. This recognizes an older batch after unrelated
+    pending records arrive and can use an already-ACKed member to validate the
+    original body without reopening that member.
+    """
+    from dispatch_recipient_receipt import OPENCODE_MARKER_LINE_RE, identity_binding
+    from dispatch_seat_handover import record_for_session, storage_recipients
+
+    by_id: dict[str, list[tuple[Path, dict]]] = {}
+    candidate_ids = set()
+    native_rows = []
+    for text in _opencode_native_user_texts(messages, session_id):
+        markers = OPENCODE_MARKER_LINE_RE.findall(text)
+        if not markers or len({delivery_id for delivery_id, _digest in markers}) != len(markers):
+            continue
+        native_rows.append((text, markers))
+        candidate_ids.update(delivery_id for delivery_id, _digest in markers)
+
     for root in roots:
         records, _count = addressed_records(root, recipient_kind, session_id)
-        if records:
-            batches.append((root, records))
-    groups = []
-    if batches:
-        groups.append(batches)
-        groups.extend([[(root, records)] for root, records in batches])
-        groups.extend([[(root, [record])] for root, records in batches for record in records])
+        for record in records:
+            delivery_id = record.get("delivery_id")
+            if delivery_id in candidate_ids:
+                by_id.setdefault(delivery_id, []).append((root, record))
+
+    # Open records are already enumerated above. Look up only marker-selected
+    # terminal records so an ACKed member can validate the old complete batch.
+    harness = "codex" if recipient_kind.startswith("codex") else None
+    recipients = storage_recipients(session_id, harness=harness)
+    for delivery_id in candidate_ids - by_id.keys():
+        for root in roots:
+            for storage, allowed in recipients:
+                try:
+                    record = pending_delivery.read(root, storage, delivery_id)
+                    if (record is None or record.get("state") != "acked"
+                            or record.get("recipient_kind") != recipient_kind
+                            or not record_for_session(record, allowed)):
+                        continue
+                    by_id.setdefault(delivery_id, []).append(
+                        (root, {**record, STORAGE_KEY: storage}))
+                except (OSError, ValueError, pending_delivery.PendingDeliveryError):
+                    continue
+
     expected, seen = [], set()
-    for group in groups:
-        text = delivery_context(group)
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        identities = []
-        for _root, records in group:
-            for record in records:
+    for native_text, markers in native_rows:
+        selected, identities, valid = [], [], True
+        for delivery_id, digest in markers:
+            matches = []
+            for root, record in by_id.get(delivery_id, ()):
                 storage = record.get(STORAGE_KEY) or session_id
-                delivery_id = record.get("delivery_id")
                 try:
                     identity = pending_delivery.received_ack_identity(
                         record, storage, delivery_id)
-                except (KeyError, TypeError, ValueError, pending_delivery.PendingDeliveryError):
+                    if identity_binding(identity) == digest:
+                        matches.append((root, record, identity))
+                except (KeyError, TypeError, ValueError,
+                        pending_delivery.PendingDeliveryError):
                     continue
-                identities.append((delivery_id, identity))
-        candidate = _opencode_expected_message(text, identities)
-        if candidate["bindings"]:
+            if len(matches) != 1:
+                valid = False
+                break
+            root, record, identity = matches[0]
+            selected.append((root, record))
+            identities.append((delivery_id, identity))
+        if not valid:
+            continue
+        rendered = delivery_context([(root, [record]) for root, record in selected])
+        if not rendered or rendered != native_text:
+            continue
+        candidate = _opencode_expected_message(rendered, identities)
+        key = (candidate["text"], tuple(candidate["bindings"]))
+        if candidate["bindings"] and key not in seen:
+            seen.add(key)
             expected.append(candidate)
     return expected
 
@@ -817,7 +891,8 @@ def main(argv: list[str] | None = None) -> int:
         roots = _state_roots()
         native_evidence = (opencode_messages_evidence(
             handed.get("messages"), args.session,
-            _opencode_delivery_expectations(roots, args.recipient_kind, args.session))
+            _opencode_delivery_expectations(roots, args.recipient_kind, args.session,
+                                            handed.get("messages")))
                            if args.action == "deliver" else None)
         for root in roots:
             if args.action == "activate":

@@ -1059,6 +1059,19 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
     def state(self):
         return PD.read(self.root, self.SID, "delivery-" + "a" * 32)["state"]
 
+    def _mark_sent_ambiguous(self, delivery_id):
+        owner = "prior-carrier-" + delivery_id[-1]
+        PD.claim(self.root, self.SID, delivery_id, claim_owner=owner,
+                 lease_seconds=30, require_generation_proof=False)
+        return PD.mark_sent_ambiguous(
+            self.root, self.SID, delivery_id, claim_owner=owner)
+
+    def _expire_ambiguous(self, delivery_ids):
+        for delivery_id in delivery_ids:
+            record = PD.read(self.root, self.SID, delivery_id)
+            PD.reclaim(self.root, self.SID, delivery_id,
+                       now_ns=record["claim_deadline_ns"] + 1)
+
     def cli(self, action, stdin=""):
         proc = subprocess.run([sys.executable, str(HERE / "dispatch_session_sweep.py"), action,
                                "--recipient-kind", "opencode-turn", "--session", self.SID],
@@ -1296,6 +1309,125 @@ console.log(JSON.stringify({carrierEnv: globalThis.carrierEnv}));
                    if item.get("extra", {}).get("reason") == "native-receipt-before-send"]
         self.assertTrue(any(item.get("received") == 1 and item.get("acked") == 1
                             for item in settled))
+
+    def test_prior_batch_settles_after_unrelated_pending_addition_and_sends_only_new_record(self):
+        import dispatch_recipient_receipt as recipient_receipt
+        first_id = "delivery-" + "a" * 32
+        second_id = "delivery-" + "b" * 32
+        third_id = "delivery-" + "c" * 32
+        self.seed_turn()
+        self._seed(self.SID, recipient_kind="opencode-turn", delivery_id=second_id,
+                   route_id="rt-second")
+        self._seed(self.SID, recipient_kind="opencode-turn", delivery_id=third_id,
+                   route_id="rt-third")
+        first = self._mark_sent_ambiguous(first_id)
+        second = self._mark_sent_ambiguous(second_id)
+        # The prior carrier's body preserves its original order even though the
+        # current directory enumeration presents these records as A then B.
+        prior_body = SWEEP.delivery_context([
+            (self.root, [{**second, SWEEP.STORAGE_KEY: self.SID},
+                         {**first, SWEEP.STORAGE_KEY: self.SID}])])
+        native = [{"info": {"sessionID": self.SID, "role": "user"},
+                   "parts": [{"type": "text", "text": prior_body}]}]
+
+        result = self.run_plugin(self.IDLE_THEN_WAIT, native_messages=native)
+
+        self.assertEqual(len(result["prompts"]), 1)
+        sent_body = result["prompts"][0]["body"]["parts"][0]["text"]
+        self.assertIn(third_id, sent_body)
+        self.assertNotIn(first_id, sent_body)
+        self.assertNotIn(second_id, sent_body)
+        for delivery_id in (first_id, second_id, third_id):
+            self.assertEqual(PD.read(self.root, self.SID, delivery_id)["state"], "acked")
+        self.assertNotIn(recipient_receipt.receipt_marker(first, self.SID), sent_body)
+        self.assertNotIn(recipient_receipt.receipt_marker(second, self.SID), sent_body)
+
+    def test_prior_batch_settles_open_member_after_other_member_was_acked(self):
+        first_id = "delivery-" + "a" * 32
+        second_id = "delivery-" + "b" * 32
+        self.seed_turn()
+        self._seed(self.SID, recipient_kind="opencode-turn", delivery_id=second_id,
+                   route_id="rt-second")
+        first = self._mark_sent_ambiguous(first_id)
+        second = self._mark_sent_ambiguous(second_id)
+        prior_body = SWEEP.delivery_context([
+            (self.root, [{**second, SWEEP.STORAGE_KEY: self.SID},
+                         {**first, SWEEP.STORAGE_KEY: self.SID}])])
+        identity = PD.received_ack_identity(second, self.SID, second_id)
+        PD.ack_received(self.root, self.SID, second_id, expected_identity=identity,
+                        acked_by="independent-carrier")
+        native = [{"info": {"sessionID": self.SID, "role": "user"},
+                   "parts": [{"type": "text", "text": prior_body}]}]
+
+        result = self.run_plugin(self.IDLE_THEN_WAIT, native_messages=native)
+
+        self.assertEqual(result["prompts"], [])
+        self.assertEqual(PD.read(self.root, self.SID, first_id)["state"], "acked")
+        self.assertEqual(PD.read(self.root, self.SID, second_id)["state"], "acked")
+        self.assertEqual(PD.read(self.root, self.SID, first_id)["attempts"], 1)
+        self.assertEqual(PD.read(self.root, self.SID, second_id)["attempts"], 1)
+
+    def test_partial_prior_batch_body_is_unreceived_and_recovers_both_members(self):
+        import dispatch_recipient_receipt as recipient_receipt
+        first_id = "delivery-" + "a" * 32
+        second_id = "delivery-" + "b" * 32
+        self.seed_turn()
+        self._seed(self.SID, recipient_kind="opencode-turn", delivery_id=second_id,
+                   route_id="rt-second")
+        first = self._mark_sent_ambiguous(first_id)
+        second = self._mark_sent_ambiguous(second_id)
+        prior_body = SWEEP.delivery_context([
+            (self.root, [{**first, SWEEP.STORAGE_KEY: self.SID},
+                         {**second, SWEEP.STORAGE_KEY: self.SID}])])
+        second_marker = recipient_receipt.receipt_marker(second, self.SID)
+        partial_body = prior_body[:prior_body.index(second_marker)]
+        self.assertIn(recipient_receipt.receipt_marker(first, self.SID), partial_body)
+        self.assertNotIn(second_marker, partial_body)
+        self._expire_ambiguous((first_id, second_id))
+        native = [{"info": {"sessionID": self.SID, "role": "user"},
+                   "parts": [{"type": "text", "text": partial_body}]}]
+
+        result = self.run_plugin(self.IDLE_THEN_WAIT, native_messages=native)
+
+        self.assertEqual(len(result["prompts"]), 1)
+        sent_body = result["prompts"][0]["body"]["parts"][0]["text"]
+        self.assertIn(first_id, sent_body)
+        self.assertIn(second_id, sent_body)
+        for delivery_id in (first_id, second_id):
+            record = PD.read(self.root, self.SID, delivery_id)
+            self.assertEqual(record["state"], "acked")
+            self.assertEqual(record["attempts"], 2)
+
+    def test_foreign_identity_in_prior_batch_is_unreceived_and_recovers_both_members(self):
+        import dispatch_recipient_receipt as recipient_receipt
+        first_id = "delivery-" + "a" * 32
+        second_id = "delivery-" + "b" * 32
+        self.seed_turn()
+        self._seed(self.SID, recipient_kind="opencode-turn", delivery_id=second_id,
+                   route_id="rt-second")
+        first = self._mark_sent_ambiguous(first_id)
+        second = self._mark_sent_ambiguous(second_id)
+        prior_body = SWEEP.delivery_context([
+            (self.root, [{**first, SWEEP.STORAGE_KEY: self.SID},
+                         {**second, SWEEP.STORAGE_KEY: self.SID}])])
+        genuine_marker = recipient_receipt.receipt_marker(second, self.SID)
+        foreign_body = prior_body.replace(genuine_marker,
+                                          genuine_marker.rsplit(" ", 1)[0] + " " + "0" * 64)
+        self.assertNotEqual(foreign_body, prior_body)
+        self._expire_ambiguous((first_id, second_id))
+        native = [{"info": {"sessionID": self.SID, "role": "user"},
+                   "parts": [{"type": "text", "text": foreign_body}]}]
+
+        result = self.run_plugin(self.IDLE_THEN_WAIT, native_messages=native)
+
+        self.assertEqual(len(result["prompts"]), 1)
+        sent_body = result["prompts"][0]["body"]["parts"][0]["text"]
+        self.assertIn(first_id, sent_body)
+        self.assertIn(second_id, sent_body)
+        for delivery_id in (first_id, second_id):
+            record = PD.read(self.root, self.SID, delivery_id)
+            self.assertEqual(record["state"], "acked")
+            self.assertEqual(record["attempts"], 2)
 
     def test_settle_requires_a_strictly_future_integer_claim_deadline(self):
         self.seed_turn()
