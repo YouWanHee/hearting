@@ -70,7 +70,7 @@ const turnContextBySession = new Map()
 //     candidate probe) and the kept text is re-emitted on every model call of
 //     that turn, so a tool-loop continuation never consumes a second card.
 const cardBySession = new Map()
-const humanNoticeBySession = new Set()
+const historyNoticeSettledBySession = new Set()
 const peerGuidanceBySession = new Map()
 // One threshold notice per native session, retained for the triggering turn so
 // an auxiliary title call cannot consume the answering model's system context.
@@ -1556,15 +1556,16 @@ function collectCardPayload(event, sid, cwd, prompt = "") {
 }
 
 function showHistoryNotice(ctx, sid, notice) {
-  if (!notice || !sid || humanNoticeBySession.has(sid)) return
-  humanNoticeBySession.add(sid)
+  if (!notice || !sid || historyNoticeSettledBySession.has(sid)) return
+  historyNoticeSettledBySession.add(sid)
   showContextAlert(ctx, notice)
 }
 
-function collectHistoryNotice(ctx, sid, cwd, prompt = "") {
-  if (!sid || isWorkerSession() || humanNoticeBySession.has(sid)) return
+function collectHistoryNotice(ctx, sid, cwd, prompt = "", settleEmpty = false) {
+  if (!sid || isWorkerSession() || historyNoticeSettledBySession.has(sid)) return
   const payload = collectCardPayload("start", sid, cwd, prompt)
   showHistoryNotice(ctx, sid, payload.humanNotice)
+  if (settleEmpty) historyNoticeSettledBySession.add(sid)
 }
 
 function appendContext(output, text) {
@@ -2296,7 +2297,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
         localEvidenceBySession.delete(sid)
         turnContextBySession.delete(sid)
         cardBySession.delete(sid)
-        humanNoticeBySession.delete(sid)
+        historyNoticeSettledBySession.delete(sid)
         peerGuidanceBySession.delete(sid)
         contextAlertBySession.delete(sid)
         paneProjectionRetryAt.delete(sid)
@@ -2343,7 +2344,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
     const cardTurn = turn || prompt
     if (eventSid && (!cardTurn || cardBySession.get(sid)?.turn !== cardTurn)) {
       const cardText = collectCard("prompt", eventSid, baseDir(ctx), prompt)
-      collectHistoryNotice(ctx, eventSid, baseDir(ctx), prompt)
+      collectHistoryNotice(ctx, eventSid, baseDir(ctx), prompt, true)
       cardBySession.set(sid, { turn: cardTurn, text: cardText })
     }
   },

@@ -78,6 +78,59 @@ class HistoryChannelTests(unittest.TestCase):
                 self.assertEqual(ledger.read_bytes(), before)
                 self.assertFalse(session_tidy._consumed_path(seat).exists())
 
+    def test_opencode_history_notice_lookup_settles_per_session(self):
+        script = r'''
+import { readFileSync } from "node:fs"
+import childProcess from "node:child_process"
+const lookups = new Map()
+const notices = []
+const fakeSpawnSync = (command, args, options) => {
+  if (args?.includes("--human-only")) {
+    const sid = args[args.indexOf("--session-id") + 1]
+    const count = (lookups.get(sid) || 0) + 1
+    lookups.set(sid, count)
+    const notice = sid === "late" && count === 2 ? "NOTICE-APPEARED" : ""
+    return { status: 0, stdout: JSON.stringify({ humanNotice: notice }), stderr: "" }
+  }
+  return childProcess.spawnSync(command, args, options)
+}
+globalThis.__historyNoticeFakeSpawnSync = fakeSpawnSync
+let source = readFileSync("adapters/opencode/plugins/hearting-guards.js", "utf8")
+source = source.replace('import { spawnSync, spawn } from "node:child_process"',
+  'import childProcess from "node:child_process"\nconst spawn = childProcess.spawn\nconst spawnSync = globalThis.__historyNoticeFakeSpawnSync')
+source = source.replace('const pluginDir = path.dirname(fileURLToPath(import.meta.url))',
+  'const pluginDir = path.join(process.cwd(), "adapters/opencode/plugins")')
+const { AgentHarnessGuards } = await import("data:text/javascript;base64," + Buffer.from(source).toString("base64"))
+const plugin = await AgentHarnessGuards({ directory: process.cwd(), worktree: process.cwd(),
+  client: { tui: { showToast: ({ body }) => notices.push(body.message) } } }, { initialize: false })
+const created = (sid) => plugin.event({ event: { type: "session.created", properties: { info: { id: sid } } } })
+const turn = (sid, id) => plugin["chat.message"]({ sessionID: sid, messageID: id },
+  { parts: [{ type: "text", text: "hello" }] })
+await created("empty")
+await turn("empty", "e1")
+await turn("empty", "e2")
+await turn("empty", "e3")
+await created("late")
+await turn("late", "l1")
+await turn("late", "l2")
+await turn("late", "l3")
+if (lookups.get("empty") !== 2) throw new Error(`empty lookup count=${lookups.get("empty")}`)
+if (lookups.get("late") !== 2) throw new Error(`late lookup count=${lookups.get("late")}`)
+if (notices.filter((notice) => notice === "NOTICE-APPEARED").length !== 1)
+  throw new Error(`late notice count=${JSON.stringify(notices)}`)
+console.log("empty=2 late=2 late-notice=1")
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(__import__("os").environ, XDG_STATE_HOME=directory,
+                       PYTHONDONTWRITEBYTECODE="1", AGENT_HOME=str(ROOT))
+            for key in ("AGENT_SESSION_ROLE", "AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH",
+                        "OPENCODE_DISPATCH_SLUG", "FLEET_TITLE_REFRESH"):
+                env.pop(key, None)
+            result = subprocess.run(["node", "--input-type=module", "-e", script], cwd=ROOT,
+                                    env=env, text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("empty=2 late=2 late-notice=1", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
