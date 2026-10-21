@@ -2758,13 +2758,14 @@ class ClearHelperTest(TidyCase):
         req = {"schema": clear.SCHEMA, "nonce": "0123456789abcdef", "status": "reserved",
                "seat": seat.as_dict(), "harness": "codex", "sid": "thread-A",
                "herdr_transport": {"socket_path": seat.socket_path}}
+        process = mock.Mock(pid=4321)
+        # The reservation is written and read back under the same isolated state root.
         with self.iso.patched_environ(self.extra):
             clear._write_reservation(req)
-        process = mock.Mock(pid=4321)
-        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/run/herdr/foreign.sock",
-                                          "AGENT_HERDR_SESSION": "foreign"}), \
-                mock.patch.object(clear.subprocess, "Popen", return_value=process) as popen:
-            self.assertEqual(clear._start_helper(seat.key, req["nonce"]), 4321)
+            with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/run/herdr/foreign.sock",
+                                              "AGENT_HERDR_SESSION": "foreign"}), \
+                    mock.patch.object(clear.subprocess, "Popen", return_value=process) as popen:
+                self.assertEqual(clear._start_helper(seat.key, req["nonce"]), 4321)
         child_env = popen.call_args.kwargs["env"]
         self.assertEqual(child_env.get("HERDR_SOCKET_PATH"), seat.socket_path)
         self.assertNotIn("AGENT_HERDR_SESSION", child_env)
