@@ -602,5 +602,82 @@ class LeasesTest(unittest.TestCase):
             self.assertTrue(tool.probe_host("fixture", {"ssh_host": "local"}, [], [])["reachable"])
 
 
+class PathNamespaceSerializationTest(unittest.TestCase):
+    def test_legacy_compute_source_is_exact_pre_extension_bytes(self):
+        raw = Path(G.__file__).read_bytes()
+        marker = b"# BEGIN PATH_NAMESPACE EXTENSION\n"
+        prefix = raw.split(marker, 1)[0]
+        self.assertEqual(G.serialized_compute_source(False).encode(), prefix)
+        self.assertNotIn(b"_PATH_NAMESPACE_SOURCE", prefix)
+        self.assertEqual(G.serialized_compute_source(True).encode(), raw)
+
+    def test_remote_namespace_helper_rejects_missing_source_before_syscalls(self):
+        namespace = {}
+        exec(G._PATH_NAMESPACE_SOURCE, namespace)
+        with mock.patch.object(namespace["_ns_os"].path, "exists", return_value=False):
+            with self.assertRaises(namespace["_NamespaceRefusal"]) as caught:
+                namespace["_ns_enter"]({"/target": "/missing"}, "/target/runs")
+        self.assertEqual(caught.exception.code, "source-missing")
+        self.assertEqual(str(caught.exception), "path_namespace refused: source missing: /missing")
+
+    def test_remote_namespace_helper_reports_unshare_eperm_before_mount_or_mkdir(self):
+        namespace = {}
+        exec(G._PATH_NAMESPACE_SOURCE, namespace)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source, target = root / "source", root / "target"
+            (source / "runs").mkdir(parents=True)
+            target.mkdir()
+            rows = [(42, str(source), "nfs"), (1, "/", "rootfs")]
+            libc = mock.MagicMock()
+            libc.unshare.return_value = -1
+            with mock.patch.dict(namespace, {"_ns_mountinfo": mock.Mock(return_value=rows)}), \
+                 mock.patch.object(namespace["_ns_os"].path, "ismount", return_value=True), \
+                 mock.patch.object(namespace["_ns_ctypes"], "CDLL", return_value=libc), \
+                 mock.patch.object(namespace["_ns_ctypes"], "get_errno", return_value=1):
+                with self.assertRaises(namespace["_NamespaceRefusal"]) as caught:
+                    namespace["_ns_enter"]({str(target): str(source)}, str(target / "runs"))
+            self.assertEqual(caught.exception.code, "unshare")
+            self.assertEqual(str(caught.exception),
+                             "path_namespace refused: unshare failed: EPERM (1)")
+            libc.mount.assert_not_called()
+            self.assertFalse((source / "runs" / "fixture").exists())
+
+    def test_remote_namespace_helper_refuses_source_that_is_not_a_mount(self):
+        namespace = {}
+        exec(G._PATH_NAMESPACE_SOURCE, namespace)
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "source"
+            source.mkdir()
+            with mock.patch.object(namespace["_ns_os"].path, "ismount", return_value=False):
+                with self.assertRaises(namespace["_NamespaceRefusal"]) as caught:
+                    namespace["_ns_enter"]({"/target": str(source)}, "/target/runs")
+        self.assertEqual(caught.exception.code, "source-not-mount")
+        self.assertEqual(str(caught.exception),
+                         "path_namespace refused: source is not a mount point: " + str(source))
+
+    def test_namespaced_runner_source_compiles_with_refusal_record_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            captured = {}
+            options = {"state_path": str(Path(td) / "leases.json"),
+                       "observation": {"reachable": True, "gpus": []},
+                       "requested": "", "share": False, "owner": None,
+                       "task": "fixture", "run_id": "fixture-run",
+                       "run_dir": "/target/runs/fixture-run",
+                       "inner": "true", "cwd": None,
+                       "tmux_environment": {"HEARTING_COMPUTE_RUN_ID": "fixture-run"},
+                       "path_namespace": {"/target": "/source"},
+                       "run_root": "/target/runs"}
+            def popen(command, **_kwargs):
+                captured["runner"] = command[2]
+            with mock.patch.object(G, "_ns_namespace_creation"), \
+                 mock.patch.object(G.subprocess, "call", return_value=1), \
+                 mock.patch.object(G.subprocess, "Popen", side_effect=popen):
+                G.launch_compute_namespaced(options, G.serialized_payload_source())
+            compile(captured["runner"], "namespace-runner", "exec")
+            self.assertIn("_ns_record_refusal(safe_fd, exc)", captured["runner"])
+            self.assertIn('b"125\\n"', captured["runner"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1949,5 +1949,82 @@ class ProbeCommandHashTest(unittest.TestCase):
         self.assertIsNone(self.ns["process_command_hash"](live.pid, live_start + 1))
 
 
+class PathNamespaceInventoryTest(unittest.TestCase):
+    def setUp(self):
+        self.module = load_module()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "inventory.yaml"
+
+    def load_text(self, path_namespace, run_root="/home/nas/runs"):
+        self.path.write_text(
+            "schema_version: 1\nrun_root: " + run_root + "\nhosts:\n"
+            "  mpwav:\n    ssh_host: mpwav\n    path_namespace:\n"
+            + path_namespace, encoding="utf-8")
+        return self.module.load_config(str(self.path))
+
+    def test_accepts_block_mapping_and_multiple_disjoint_targets_without_readiness_checks(self):
+        with mock.patch.object(self.module.os.path, "exists",
+                               side_effect=AssertionError("inventory validation must not probe mounts")):
+            config = self.load_text("      /home/nas: /home/nas_IIP\n"
+                                    "      /datasets: /mnt/datasets\n")
+        self.assertEqual(config["hosts"]["mpwav"]["path_namespace"],
+                         {"/home/nas": "/home/nas_IIP", "/datasets": "/mnt/datasets"})
+
+    def test_rejects_invalid_mapping_shapes_and_path_relationships(self):
+        invalid = [
+            ("      /home/nas: {}\n", "paths must be absolute"),
+            ("      /home/nas: relative\n", "paths must be absolute"),
+            ("      /home/nas: /mnt/data/../x\n", "paths must be absolute"),
+            ("      /home/nas: /mnt/data/\n", "paths must be absolute"),
+            ("      /home/nas: /home/nas\n", "source and target must differ"),
+            ("      /home/nas: /mnt/x\n      /home/nas/nested: /mnt/y\n", "targets overlap"),
+            ("      /home/nas: /mnt/x\n      /data: /home/nas/sub\n", "source overlaps target"),
+        ]
+        for mapping, reason in invalid:
+            with self.subTest(mapping=mapping), self.assertRaisesRegex(
+                    self.module.ConfigError, reason):
+                self.load_text(mapping)
+        with self.assertRaisesRegex(self.module.ConfigError, "run_root must be below"):
+            self.load_text("      /data: /mnt/data\n")
+
+    def test_rejects_empty_inline_and_quoted_target_mappings(self):
+        for suffix in ("      /home/nas: {}\n", "      /home/nas: []\n",
+                       "      \"/home/nas\": /mnt/nas\n"):
+            with self.subTest(suffix=suffix), self.assertRaises(self.module.ConfigError):
+                self.load_text(suffix)
+
+    def test_configured_remote_run_serializes_namespace_arguments(self):
+        target = Path(self.tmp.name) / "target"
+        source = Path(self.tmp.name) / "source"
+        target.mkdir(); source.mkdir()
+        run_root = target / "runs"
+        host = {"ssh_host": "fixture.example",
+                "path_namespace": {str(target): str(source)}}
+        config = {"run_root": run_root, "hosts": {"remote": host}}
+        args = SimpleNamespace(host="remote", command=["true"], name="fixture",
+                               cwd=None, env=None, gpus="", dry_run=False,
+                               json=True, share=False)
+        import gpu_leases
+        launch_result = subprocess.CompletedProcess(
+            [], 0, json.dumps({"gpus": "", "gpu_lease": None,
+                               "tmux_transport": {"kind": "nohup-v1"}}), "")
+        output = io.StringIO()
+        with mock.patch.object(self.module, "load_config", return_value=config), \
+             mock.patch.object(self.module, "_run_id", return_value="fixture-run"), \
+             mock.patch.object(self.module, "_run_gpu_observation", return_value={"gpus": []}), \
+             mock.patch.object(self.module, "_launcher_provenance", return_value={}), \
+             mock.patch.object(self.module, "_launcher_route", return_value=None), \
+             mock.patch.object(self.module, "_spawn_completion_watch", return_value=False), \
+             mock.patch.object(gpu_leases, "state_path", return_value=Path(self.tmp.name) / "lease.json"), \
+             mock.patch.object(self.module, "remote", return_value=launch_result) as remote, \
+             mock.patch("sys.stdout", output):
+            self.assertEqual(self.module.cmd_run(args), 0)
+        script = remote.call_args.args[1]
+        self.assertIn("launch_compute_namespaced", script)
+        self.assertIn("path_namespace", script)
+        self.assertIn(str(run_root), script)
+
+
 if __name__ == "__main__":
     unittest.main()
