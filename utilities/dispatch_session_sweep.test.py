@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import select
+import socket
 import threading
 from pathlib import Path
 import sys
@@ -55,14 +56,158 @@ def _log_fixture_env(test_file: str, home: str, xdg: str, harness: str) -> None:
         handle.write(f"{test_file}\t{home}\t{xdg}\t{harness}\n")
 
 
-def _slow_recovery_probe(base: Path, record_path: Path, snapshot_path: Path):
+class _SlowRecoveryBarrier:
+    """Hold the detached probe after entry until the test releases it."""
+
+    def __init__(self, path: Path, timeout: float = 4.0):
+        self.path = path
+        self.timeout = timeout
+        self._condition = threading.Condition()
+        self._release_requested = False
+        self._entered = False
+        self._released = False
+        self._finished = False
+        self._error = None
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server.bind(str(path))
+        self._server.listen(1)
+        self._server.settimeout(0.1)
+        self._thread = threading.Thread(target=self._serve, name="slow-recovery-barrier", daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        try:
+            while True:
+                with self._condition:
+                    if self._release_requested:
+                        return
+                try:
+                    connection, _ = self._server.accept()
+                except socket.timeout:
+                    continue
+                except OSError as exc:
+                    with self._condition:
+                        if not self._release_requested:
+                            self._error = f"{type(exc).__name__}: {exc}"
+                        self._condition.notify_all()
+                    return
+                with connection:
+                    connection.settimeout(self.timeout)
+                    try:
+                        if connection.recv(1) != b"E":
+                            raise RuntimeError("probe did not signal barrier entry")
+                        with self._condition:
+                            self._entered = True
+                            self._condition.notify_all()
+                            released = self._condition.wait_for(
+                                lambda: self._release_requested, timeout=self.timeout
+                            )
+                            if not released:
+                                self._error = "test did not release the entered probe before timeout"
+                                self._release_requested = True
+                                self._condition.notify_all()
+                        connection.sendall(b"R" if released else b"T")
+                        with self._condition:
+                            self._released = released
+                            self._condition.notify_all()
+                    except Exception as exc:
+                        with self._condition:
+                            self._error = f"{type(exc).__name__}: {exc}"
+                            self._condition.notify_all()
+                return
+        finally:
+            self._server.close()
+            self.path.unlink(missing_ok=True)
+            with self._condition:
+                self._finished = True
+                self._condition.notify_all()
+
+    @property
+    def error(self):
+        with self._condition:
+            return self._error
+
+    @property
+    def is_held(self):
+        with self._condition:
+            return self._entered and not self._release_requested and not self._finished
+
+    def wait_until_entered(self, timeout: float) -> bool:
+        with self._condition:
+            ready = self._condition.wait_for(
+                lambda: self._entered or self._error is not None or self._finished,
+                timeout=timeout,
+            )
+            return ready and self._entered
+
+    def release(self):
+        with self._condition:
+            self._release_requested = True
+            self._condition.notify_all()
+
+    def join(self, timeout: float = 5.0) -> bool:
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+
+def _wait_for_child_exit(test_case, pid: int, timeout: float = 5.0):
+    """Observe the detached fixture helper exit before its temporary tree is removed."""
+    if hasattr(os, "pidfd_open"):
+        try:
+            pidfd = os.pidfd_open(pid, 0)
+        except ProcessLookupError:
+            return
+        except OSError:
+            pidfd = None
+        if pidfd is not None:
+            try:
+                poller = select.poll()
+                poller.register(pidfd, select.POLLIN)
+                if poller.poll(int(timeout * 1000)):
+                    return
+                test_case.fail(f"detached recovery helper pid {pid} did not exit within {timeout}s")
+            finally:
+                os.close(pidfd)
+            return
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        stat_path = Path(f"/proc/{pid}/stat")
+        try:
+            if stat_path.read_text(encoding="utf-8").split()[2] == "Z":
+                return
+        except OSError:
+            return
+        time.sleep(0.02)
+    test_case.fail(f"detached recovery helper pid {pid} did not exit within {timeout}s")
+
+
+def _finish_slow_recovery_probe(test_case, barrier, requests: Path, bodies: Path):
+    """Release and observe the fixture server and any detached helper before teardown."""
+    barrier.release()
+    if not barrier.join():
+        test_case.fail("slow recovery barrier server did not stop after release")
+    if requests.exists():
+        request_rows = _read_jsonl_after(test_case, requests)
+        _read_jsonl_after(test_case, bodies)
+        helper_pid = request_rows[0].get("child_pid")
+        if helper_pid is not None:
+            _wait_for_child_exit(test_case, helper_pid)
+
+
+def _slow_recovery_probe(base: Path, record_path: Path, snapshot_path: Path,
+                         barrier: _SlowRecoveryBarrier | None = None):
     """Instrument the common detached entry and hold only the existing ensure body."""
     support = base / "slow-recovery-site"
     support.mkdir(parents=True, exist_ok=True)
     requests = base / "common-recovery-requests.jsonl"
     bodies = base / "slow-recovery-bodies.jsonl"
     (support / "sitecustomize.py").write_text(
-        "import json, os, subprocess, time\n"
+        "import json, os, socket, subprocess, time\n"
         "from pathlib import Path\n"
         "import peer_obligations\n"
         "_real_popen = subprocess.Popen\n"
@@ -72,9 +217,10 @@ def _slow_recovery_probe(base: Path, record_path: Path, snapshot_path: Path):
         "        handle.write(json.dumps(value) + '\\n')\n"
         "def _tracked_popen(args, *pos, **kwargs):\n"
         "    argv = [str(item) for item in args] if not isinstance(args, str) else [args]\n"
+        "    child = _real_popen(args, *pos, **kwargs)\n"
         "    if len(argv) >= 3 and Path(argv[1]).name == 'peer-steward.py' and argv[2] == '__ensure-obligations':\n"
-        "        _append(os.environ['R1_REQUEST_LOG'], {'pid': os.getpid(), 'argv': argv, 'cwd': kwargs.get('cwd'), 'start_new_session': kwargs.get('start_new_session')})\n"
-        "    return _real_popen(args, *pos, **kwargs)\n"
+        "        _append(os.environ['R1_REQUEST_LOG'], {'pid': os.getpid(), 'child_pid': child.pid, 'argv': argv, 'cwd': kwargs.get('cwd'), 'start_new_session': kwargs.get('start_new_session')})\n"
+        "    return child\n"
         "subprocess.Popen = _tracked_popen\n"
         "def _tracked_run(args, *pos, **kwargs):\n"
         "    argv = [str(item) for item in args] if not isinstance(args, str) else [args]\n"
@@ -83,7 +229,20 @@ def _slow_recovery_probe(base: Path, record_path: Path, snapshot_path: Path):
         "    return _real_run(args, *pos, **kwargs)\n"
         "subprocess.run = _tracked_run\n"
         "def _slow_ensure(*args, **kwargs):\n"
-        "    time.sleep(float(os.environ['R1_RECOVERY_DELAY']))\n"
+        "    barrier_error = None\n"
+        "    barrier_path = os.environ.get('R1_RECOVERY_BARRIER')\n"
+        "    if barrier_path:\n"
+        "        try:\n"
+        "            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as barrier:\n"
+        "                barrier.settimeout(float(os.environ['R1_RECOVERY_BARRIER_TIMEOUT']))\n"
+        "                barrier.connect(barrier_path)\n"
+        "                barrier.sendall(b'E')\n"
+        "                if barrier.recv(1) != b'R':\n"
+        "                    raise RuntimeError('recovery barrier was not released normally')\n"
+        "        except Exception as exc:\n"
+        "            barrier_error = f'{type(exc).__name__}: {exc}'\n"
+        "    else:\n"
+        "        time.sleep(float(os.environ['R1_RECOVERY_DELAY']))\n"
         "    try:\n"
         "        state = json.loads(Path(os.environ['R1_RECORD_PATH']).read_text(encoding='utf-8')).get('state')\n"
         "    except Exception as exc:\n"
@@ -92,19 +251,23 @@ def _slow_recovery_probe(base: Path, record_path: Path, snapshot_path: Path):
         "        snapshot = Path(os.environ['R1_SNAPSHOT_PATH']).read_text(encoding='utf-8')\n"
         "    except OSError:\n"
         "        snapshot = None\n"
-        "    _append(os.environ['R1_BODY_LOG'], {'state': state, 'snapshot': snapshot, 'kwargs': {key: str(value) for key, value in kwargs.items()}})\n"
+        "    _append(os.environ['R1_BODY_LOG'], {'pid': os.getpid(), 'state': state, 'snapshot': snapshot, 'barrier_error': barrier_error, 'kwargs': {key: str(value) for key, value in kwargs.items()}})\n"
         "    return True\n"
         "peer_obligations.ensure_normal_runner = _slow_ensure\n",
         encoding="utf-8",
     )
-    return ({
+    env = {
         "PYTHONPATH": str(support) + os.pathsep + str(Path(__file__).resolve().parent),
         "R1_REQUEST_LOG": str(requests),
         "R1_BODY_LOG": str(bodies),
         "R1_RECORD_PATH": str(record_path),
         "R1_SNAPSHOT_PATH": str(snapshot_path),
         "R1_RECOVERY_DELAY": "0.8",
-    }, requests, bodies)
+    }
+    if barrier is not None:
+        env.update(R1_RECOVERY_BARRIER=str(barrier.path),
+                   R1_RECOVERY_BARRIER_TIMEOUT=str(barrier.timeout))
+    return env, requests, bodies
 
 
 def _read_jsonl_after(test_case, path: Path, count: int = 1):
@@ -1663,15 +1826,31 @@ await new Promise(r => setTimeout(r, 1500));
         self.seed_turn()
         record_path = PD.record_path(self.root, self.SID, "delivery-" + "a" * 32)
         snapshot = self.root.parent / "opencode-activation-complete.txt"
-        probe_env, requests, bodies = _slow_recovery_probe(self.root.parent, record_path, snapshot)
-        result = self.run_plugin(f'''writeFileSync(process.env.R1_SNAPSHOT_PATH, "activation-complete\\n");
+        barrier = _SlowRecoveryBarrier(self.root.parent / "opencode-activation-recovery.sock")
+        requests = self.root.parent / "common-recovery-requests.jsonl"
+        bodies = self.root.parent / "slow-recovery-bodies.jsonl"
+        try:
+            probe_env, requests, bodies = _slow_recovery_probe(
+                self.root.parent, record_path, snapshot, barrier=barrier)
+            result = self.run_plugin(f'''writeFileSync(process.env.R1_SNAPSHOT_PATH, "activation-complete\\n");
 await hooks.event({{event: {{type: "session.idle", properties: {{sessionID: "{self.SID}"}}}}}});
-await new Promise(r => setTimeout(r, 1500));
+for (let i = 0; i < 200; i++) {{
+  if (logs.some(row => row.service === "hearting-completion-carrier"
+      && row.extra?.stage === "settle" && row.extra?.reason === "native-receipt")) break;
+  await new Promise(r => setTimeout(r, 50));
+}}
 ''', restored_selector=True, extra_env=probe_env)
-        self.assertEqual(len(result["prompts"]), 1)
-        self.assertIn("att-0000000000000000000000000000bbbb",
-                      result["prompts"][0]["body"]["parts"][0]["text"])
-        self.assertEqual(self.state(), "acked")
+            self.assertEqual(len(result["prompts"]), 1)
+            self.assertIn("att-0000000000000000000000000000bbbb",
+                          result["prompts"][0]["body"]["parts"][0]["text"])
+            self.assertTrue(barrier.wait_until_entered(5), barrier.error or "recovery body did not enter barrier")
+            self.assertTrue(barrier.is_held, "recovery body entered but was not held")
+            self.assertFalse(bodies.exists(), "recovery body sampled state before barrier release")
+            self.assertEqual(snapshot.read_text(encoding="utf-8"), "activation-complete\n")
+            self.assertEqual(self.state(), "acked")
+        finally:
+            _finish_slow_recovery_probe(self, barrier, requests, bodies)
+        self.assertTrue(barrier.join(), "recovery barrier server did not stop after release")
         request_rows = _read_jsonl_after(self, requests)
         self.assertEqual(len(request_rows), 1, request_rows)
         self.assertTrue(request_rows[0]["start_new_session"])
@@ -1679,6 +1858,7 @@ await new Promise(r => setTimeout(r, 1500));
         body_rows = _read_jsonl_after(self, bodies)
         self.assertEqual(body_rows[0]["state"], "acked")
         self.assertEqual(body_rows[0]["snapshot"], "activation-complete\n")
+        self.assertIsNone(body_rows[0]["barrier_error"])
 
     def test_actual_open_code_empty_activation_requests_recovery_without_roots_or_jobs(self):
         for case, root_exists, seed_record in (
