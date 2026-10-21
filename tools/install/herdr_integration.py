@@ -11,6 +11,7 @@ import hashlib
 import re
 import os
 import shlex
+import shutil
 import subprocess
 import tomllib
 from pathlib import Path
@@ -37,8 +38,41 @@ _HISTORY_META = re.compile(r"(?m)^# HEARTING_HISTORY_META=(\{[^\n]+\})\n")
 
 def _history_path(env=None) -> Path:
     env = os.environ if env is None else env
+    if env.get("HERDR_CONFIG_PATH"):
+        configured = Path(env["HERDR_CONFIG_PATH"])
+        if str(configured).startswith("~"):
+            configured = Path(env.get("HOME", str(Path.home()))) / configured.relative_to("~")
+        return configured
     config_home = Path(env.get("XDG_CONFIG_HOME") or Path(env.get("HOME", str(Path.home()))) / ".config")
     return config_home / "herdr" / "config.toml"
+
+
+def _herdr_executable(env, which=None) -> str | None:
+    which = shutil.which if which is None else which
+    found = which("herdr", path=env.get("PATH"))
+    if found:
+        return str(Path(found).expanduser().resolve())
+    local = Path(env.get("HOME", str(Path.home()))) / ".local/bin/herdr"
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local.resolve())
+    return None
+
+
+def _has_history_binding(keys: dict) -> bool:
+    """Find a user action bound to the managed chord outside command rows."""
+    def contains(value):
+        if isinstance(value, str):
+            return value == "prefix+shift+h"
+        if isinstance(value, dict):
+            return any(contains(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains(item) for item in value)
+        return False
+
+    commands = keys.get("command", [])
+    if any(isinstance(row, dict) and row.get("key") == "prefix+shift+h" for row in commands):
+        return True
+    return any(name != "command" and contains(value) for name, value in keys.items())
 
 
 def _history_block(launcher: str, meta: dict) -> tuple[bytes, bytes]:
@@ -91,12 +125,16 @@ def history_key_label(env=None) -> str:
     try:
         text, _, _, _, _ = _history_parts(path.read_bytes())
         config = tomllib.loads(text)
-        prefix = config.get("ui", {}).get("prefix", "ctrl-b")
+        prefix = config.get("keys", {}).get("prefix", "ctrl+b")
         if not isinstance(prefix, str) or not prefix.strip():
             return "prefix+shift+h"
         prefix = prefix.strip()
-        if prefix.lower().startswith("ctrl-"):
+        if prefix.lower().startswith("ctrl+"):
             prefix = "Ctrl-" + prefix[5:]
+        elif len(prefix) >= 2 and prefix[0].lower() == "f" and prefix[1:].isdigit():
+            prefix = prefix.upper()
+        else:
+            prefix = prefix[:1].upper() + prefix[1:]
         return prefix + " Shift-H"
     except (OSError, UnicodeError, ValueError, tomllib.TOMLDecodeError):
         return "prefix+shift+h"
@@ -112,13 +150,16 @@ def _restore_history_bytes(path: Path, payload: bytes | None) -> None:
                                    expected=current, create_parents=True)
 
 
-def ensure_history_key(launcher: str, *, dry_run=False, env=None, runner=None) -> dict:
+def ensure_history_key(launcher: str, *, dry_run=False, env=None, runner=None, which=None) -> dict:
     """Own one bounded herdr command leaf; never rewrite the user's TOML."""
     env = os.environ if env is None else env
     path = _history_path(env)
     result = {"path": str(path), "status": "unchanged", "changed": False}
     if not launcher:
         return {**result, "status": "skipped-launcher"}
+    executable = _herdr_executable(env, which)
+    if not executable:
+        return {**result, "status": "skipped-herdr-absent"}
     if path.is_symlink() or (path.exists() and not path.is_file()):
         return {**result, "status": "skipped-nonregular"}
     try:
@@ -132,8 +173,10 @@ def ensure_history_key(launcher: str, *, dry_run=False, env=None, runner=None) -
                 raise ValueError("metadata-invalid")
             # A user-owned conflicting declaration is never overwritten.
             declarations = config.get("keys", {}).get("command", [])
-            if sum(1 for row in declarations if isinstance(row, dict)
-                   and row.get("key") == "prefix+shift+h") != 1:
+            if (sum(1 for row in declarations if isinstance(row, dict)
+                    and row.get("key") == "prefix+shift+h") != 1
+                    or any(name != "command" and _has_history_binding({name: value})
+                           for name, value in config.get("keys", {}).items())):
                 raise ValueError("key-conflict")
             base_meta = {key: meta[key] for key in ("original_absent", "separator_added")}
             block, _ = _history_block(launcher, base_meta)
@@ -141,8 +184,7 @@ def ensure_history_key(launcher: str, *, dry_run=False, env=None, runner=None) -
                      + before[len(original[:finish].encode()):])
         else:
             config = tomllib.loads(text)
-            declarations = config.get("keys", {}).get("command", [])
-            if any(isinstance(row, dict) and row.get("key") == "prefix+shift+h" for row in declarations):
+            if _has_history_binding(config.get("keys", {})):
                 return {**result, "status": "skipped-conflict"}
             separator = bool(before and not before.endswith((b"\n", b"\r")))
             base_meta = {"original_absent": not existed, "separator_added": separator}
@@ -160,7 +202,7 @@ def ensure_history_key(launcher: str, *, dry_run=False, env=None, runner=None) -
             safe_fs.atomic_write_bytes(auth, after, 0o600 if current.kind == "missing" else path.stat().st_mode & 0o777,
                                        expected=current, create_parents=True)
         try:
-            check = (runner or subprocess.run)(["herdr", "config", "check"], capture_output=True, text=True,
+            check = (runner or subprocess.run)([executable, "config", "check"], capture_output=True, text=True,
                                                timeout=10, check=False)
         except (OSError, subprocess.SubprocessError):
             _restore_history_bytes(path, before if existed else None)
@@ -169,7 +211,7 @@ def ensure_history_key(launcher: str, *, dry_run=False, env=None, runner=None) -
             _restore_history_bytes(path, before if existed else None)
             return {**result, "status": "rolled-back-check-failed"}
         try:
-            reload_result = (runner or subprocess.run)(["herdr", "server", "reload-config"],
+            reload_result = (runner or subprocess.run)([executable, "server", "reload-config"],
                                                         capture_output=True, text=True,
                                                         timeout=10, check=False)
             reload_status = "reloaded" if reload_result.returncode == 0 else "reload-unavailable"
@@ -181,10 +223,13 @@ def ensure_history_key(launcher: str, *, dry_run=False, env=None, runner=None) -
         return {**result, "status": "skipped-conflict", "detail": type(exc).__name__}
 
 
-def restore_history_key(*, dry_run=False, env=None, runner=None) -> dict:
+def restore_history_key(*, dry_run=False, env=None, runner=None, which=None) -> dict:
     env = os.environ if env is None else env
     path = _history_path(env)
     result = {"path": str(path), "status": "unchanged", "changed": False}
+    executable = _herdr_executable(env, which)
+    if not executable:
+        return {**result, "status": "skipped-herdr-absent"}
     try:
         before = path.read_bytes()
         text, start, finish, meta, _ = _history_parts(before)
@@ -207,7 +252,7 @@ def restore_history_key(*, dry_run=False, env=None, runner=None) -> dict:
                 safe_fs.atomic_write_bytes(auth, after, path.stat().st_mode & 0o777,
                                            expected=current, create_parents=True)
         try:
-            check = (runner or subprocess.run)(["herdr", "config", "check"], capture_output=True, text=True,
+            check = (runner or subprocess.run)([executable, "config", "check"], capture_output=True, text=True,
                                                timeout=10, check=False)
         except (OSError, subprocess.SubprocessError):
             _restore_history_bytes(path, before)
@@ -216,7 +261,7 @@ def restore_history_key(*, dry_run=False, env=None, runner=None) -> dict:
             _restore_history_bytes(path, before)
             return {**result, "status": "rolled-back-restore-check-failed"}
         try:
-            (runner or subprocess.run)(["herdr", "server", "reload-config"], capture_output=True,
+            (runner or subprocess.run)([executable, "server", "reload-config"], capture_output=True,
                                        text=True, timeout=10, check=False)
         except (OSError, subprocess.SubprocessError):
             pass

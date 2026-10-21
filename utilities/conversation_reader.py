@@ -119,4 +119,3 @@ def read_conversation(entry: dict) -> ConversationRead:
     except (OSError, ValueError, TypeError) as exc:
         return ConversationRead("unreadable" if cursor == 0 else "partial", "\n".join(chunks), str(path),
                                 type(exc).__name__)
-

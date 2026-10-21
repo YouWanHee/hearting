@@ -39,6 +39,11 @@ import compute_hosts_config
 import fleet_config
 import herdr_integration
 import user_config
+import host_probes
+import node_runtime
+import safe_fs
+import model_settings
+from drivers import get_driver, RUNTIMES
 
 
 def _ensure_herdr_history_key(launcher_results, *, dry_run=False):
@@ -52,11 +57,6 @@ def _ensure_herdr_history_key(launcher_results, *, dry_run=False):
     if not dry_run and (not target.is_symlink() or not target.exists()):
         return {"status": "skipped-launcher", "changed": False}
     return herdr_integration.ensure_history_key(str(target), dry_run=dry_run)
-import host_probes
-import node_runtime
-import safe_fs
-import model_settings
-from drivers import get_driver, RUNTIMES
 
 # Exit codes map one-to-one to the PRD CLI table.
 EXIT_OK = 0
