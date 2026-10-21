@@ -75,6 +75,17 @@ def _has_history_binding(keys: dict) -> bool:
     return any(name != "command" and contains(value) for name, value in keys.items())
 
 
+def _history_key_conflict(keys: dict, *, managed: bool) -> bool:
+    """Check the history chord across command rows and user action bindings."""
+    commands = keys.get("command", [])
+    command_count = sum(1 for row in commands
+                        if isinstance(row, dict) and row.get("key") == "prefix+shift+h")
+    if command_count != (1 if managed else 0):
+        return True
+    return any(name != "command" and _has_history_binding({name: value})
+               for name, value in keys.items())
+
+
 def _history_block(launcher: str, meta: dict) -> tuple[bytes, bytes]:
     body = ("[[keys.command]]\nkey = \"prefix+shift+h\"\ntype = \"shell\"\n"
             f"command = {json.dumps(shlex.quote(launcher) + ' run session_history', ensure_ascii=False)}\n"
@@ -115,9 +126,12 @@ def history_key_available(env=None) -> bool:
         data = path.read_bytes()
         text, _, _, _, body = _history_parts(data)
         config = tomllib.loads(text)
-        return (any(row.get("key") == "prefix+shift+h" for row in
-                    config.get("keys", {}).get("command", []) if isinstance(row, dict))
-                and "command = " in body)
+        managed_config = tomllib.loads(body)
+        managed_rows = managed_config.get("keys", {}).get("command", [])
+        return (not _history_key_conflict(config.get("keys", {}), managed=True)
+                and any(isinstance(row, dict) and row.get("key") == "prefix+shift+h"
+                        and isinstance(row.get("command"), str) and row["command"]
+                        for row in managed_rows))
     except (OSError, UnicodeError, ValueError, tomllib.TOMLDecodeError):
         return False
 
@@ -175,11 +189,7 @@ def ensure_history_key(launcher: str, *, dry_run=False, env=None, runner=None, w
             if meta.get("original_absent") not in (True, False):
                 raise ValueError("metadata-invalid")
             # A user-owned conflicting declaration is never overwritten.
-            declarations = config.get("keys", {}).get("command", [])
-            if (sum(1 for row in declarations if isinstance(row, dict)
-                    and row.get("key") == "prefix+shift+h") != 1
-                    or any(name != "command" and _has_history_binding({name: value})
-                           for name, value in config.get("keys", {}).items())):
+            if _history_key_conflict(config.get("keys", {}), managed=True):
                 raise ValueError("key-conflict")
             base_meta = {key: meta[key] for key in ("original_absent", "separator_added")}
             block, _ = _history_block(launcher, base_meta)
@@ -187,7 +197,7 @@ def ensure_history_key(launcher: str, *, dry_run=False, env=None, runner=None, w
                      + before[len(original[:finish].encode()):])
         else:
             config = tomllib.loads(text)
-            if _has_history_binding(config.get("keys", {})):
+            if _history_key_conflict(config.get("keys", {}), managed=False):
                 return {**result, "status": "skipped-conflict"}
             separator = bool(before and not before.endswith((b"\n", b"\r")))
             base_meta = {"original_absent": not existed, "separator_added": separator}

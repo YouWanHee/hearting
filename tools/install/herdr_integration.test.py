@@ -851,6 +851,26 @@ class HistoryKeyTests(unittest.TestCase):
         self.assertEqual(restored["status"], "restored")
         self.assertEqual(self.path.read_bytes(), original)
 
+    def test_history_key_unavailable_with_an_additional_command_row(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text('[keys]\nprefix = "ctrl+b"\n')
+        herdr.ensure_history_key("/tmp/hearting", env=self.env, runner=self.runner)
+        with self.path.open("a") as config:
+            config.write('[[keys.command]]\nkey = "prefix+shift+h"\ntype = "exec"\ncommand = "user-action"\n')
+        self.assertFalse(herdr.history_key_available(self.env))
+
+    def test_history_key_unavailable_with_a_user_action_binding(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text('[keys]\nprefix = "ctrl+b"\n')
+        herdr.ensure_history_key("/tmp/hearting", env=self.env, runner=self.runner)
+        contents = self.path.read_text()
+        self.path.write_text(contents.replace(
+            'prefix = "ctrl+b"\n',
+            'prefix = "ctrl+b"\nuser_action = "prefix+shift+h"\n',
+            1,
+        ))
+        self.assertFalse(herdr.history_key_available(self.env))
+
     def test_key_label_follows_a_custom_prefix(self):
         self.path.parent.mkdir(parents=True)
         self.path.write_text('[keys]\nprefix = "ctrl+a"\n')
