@@ -3514,6 +3514,21 @@ class SeatHandoverTest(TidyCase):
         self.assertIn("capability-route.py start --route /tmp/rt-1.json --jobs " + str(self.jobs), text)
         self.assertIn("카드 본문", text)
 
+    def test_the_card_drops_a_finished_attempt_once_its_route_is_closed(self):
+        import dispatch_pending_delivery as pending
+        path = Path(self.open_route("rt-1", "sha256:aa"))
+        self.row("att-done", status="done", route_file=str(path))
+        record_path = pending.record_path(self.jobs.parent, "sid-A", "delivery-owed")
+        record_path.parent.mkdir(parents=True)
+        record_path.write_text(json.dumps({"attempt_ids": ["att-done"], "state": "pending"}))
+        self.snapshot(now=st.now_epoch() - 5)
+        self.start("sid-B")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            self.assertIn("route=rt-1", self.handover.resume_line(seat, "claude", "sid-B"))
+            path.with_suffix(".outcome.json").write_text("{}")     # closed; the pending record lingers
+            self.assertEqual(self.handover.resume_line(seat, "claude", "sid-B"), "")
+
     def test_only_a_confirmed_clear_hands_over(self):
         meta = self.row("att-1")
         self.snapshot(now=st.now_epoch() - 5)

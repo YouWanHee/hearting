@@ -1557,7 +1557,10 @@ def resume_line(seat, harness: str, sid: str) -> str:
             for status, meta in registries[jobs].get(identity, ()):
                 if status not in OPEN_ROW_STATUSES and status != "done":
                     continue
-                if not owns(meta, sid, jobs) or (status == "done" and not _delivery_open(jobs, meta)):
+                # A finished attempt is shown only while its notice is owed and its route is
+                # still open: a closed route has nothing to resume, whatever record lingers.
+                if not owns(meta, sid, jobs) or (status == "done" and not (
+                        _delivery_open(jobs, meta) and _route_open(jobs, meta))):
                     continue
                 shown.setdefault((jobs, route_identity(meta)[0]), meta.get("route_file", ""))
         parts = []
