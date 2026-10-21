@@ -3654,6 +3654,18 @@ class WatchMessageTransportSettlementTest(_WatchMixin, unittest.TestCase):
              "to": row["to"], "refs": row["refs"]})
         return ref, row, store, duty
 
+    def _resume_until(self, store, duty_id, settled):
+        # The detached shared runner may checkpoint this duty from a read taken
+        # before the ACK; a stale revision then skips our CAS write. Resume from
+        # the current row, as the runner's next pass would (2026-10-21, after #719).
+        deadline = time.monotonic() + 10
+        while True:
+            peer_steward._resume_message_obligation(store.get(duty_id), store)
+            latest = store.get(duty_id)
+            if settled(latest) or time.monotonic() >= deadline:
+                return latest
+            time.sleep(0.05)
+
     def test_cmd_ack_settles_old_and_new_watch_transport_without_body_receipt(self):
         for target, old_transfer in (("watch-old-transfer", True),
                                      ("watch-new-transfer", False)):
@@ -3677,8 +3689,8 @@ class WatchMessageTransportSettlementTest(_WatchMixin, unittest.TestCase):
                 self.assertEqual(row["watch_receipt_binding"]["recipient"],
                                  {"harness": "claude", "session_id": "steward-1"})
 
-                peer_steward._resume_message_obligation(duty, store)
-                settled = store.get(duty["id"])
+                settled = self._resume_until(
+                    store, duty["id"], lambda latest: latest["state"] == "complete")
                 self.assertEqual((settled["state"], settled["result"], settled["delivery"]),
                                  ("complete", None, "not-required"))
                 self.assertNotIn("receiver_receipt", settled["observation"])
@@ -3720,8 +3732,9 @@ class WatchMessageTransportSettlementTest(_WatchMixin, unittest.TestCase):
                 pending, include_acked=True)
             self.assertNotEqual(current_binding, old_binding)
 
-        peer_steward._resume_message_obligation(duty, store)
-        latest = store.get(duty["id"])
+        latest = self._resume_until(
+            store, duty["id"],
+            lambda row: row["observation"].get("reason") == "received-binding-unverified")
         self.assertEqual(latest["state"], "unknown")
         self.assertEqual(latest["observation"]["reason"], "received-binding-unverified")
         self.assertEqual(latest["delivery"], "pending")
