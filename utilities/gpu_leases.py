@@ -865,7 +865,8 @@ def _ns_namespace_creation(mapping, run_root, run_dir, cwd):
             finally: _ns_os.close(root_fd)
             receipt = {"ok": True}
         except Exception as exc:
-            receipt = {"ok": False, "error": str(exc)}
+            receipt = {"ok": False, "error": str(exc),
+                       "code": getattr(exc, "code", "child")}
         try: _ns_os.write(write_fd, _ns_json.dumps(receipt).encode()[:2048])
         finally:
             _ns_os.close(write_fd); _ns_os._exit(0 if receipt.get("ok") else 1)
@@ -879,8 +880,19 @@ def _ns_namespace_creation(mapping, run_root, run_dir, cwd):
     _pid, status = _ns_os.waitpid(pid, 0)
     try: receipt = _ns_json.loads(b"".join(chunks))
     except Exception: receipt = {}
-    if not _ns_os.WIFEXITED(status) or _ns_os.WEXITSTATUS(status) != 0 or not receipt.get("ok"):
-        raise _NamespaceRefusal("child", "creation child failed: " + receipt.get("error", "missing receipt or abnormal exit"))
+    if not _ns_os.WIFEXITED(status):
+        raise _NamespaceRefusal("child", "creation child failed: abnormal exit")
+    child_status = _ns_os.WEXITSTATUS(status)
+    if child_status == 0 and receipt.get("ok") is True:
+        return
+    if (child_status == 1 and receipt.get("ok") is False
+            and isinstance(receipt.get("code"), str)
+            and isinstance(receipt.get("error"), str)
+            and receipt["error"].startswith("path_namespace refused: ")):
+        prefix = "path_namespace refused: "
+        raise _NamespaceRefusal(receipt["code"], receipt["error"][len(prefix):])
+    reason = "abnormal exit" if child_status != 0 else "missing or invalid receipt"
+    raise _NamespaceRefusal("child", "creation child failed: " + reason)
 
 def launch_compute_namespaced(options, payload_source):
     path = options["state_path"]
@@ -899,18 +911,31 @@ def launch_compute_namespaced(options, payload_source):
     if not isinstance(tmux_environment, dict):
         release(path, lease)
         raise GPUUnavailable("invalid tmux launch environment")
+    runner_created = False
     try:
         _ns_namespace_creation(mapping, run_root, options["run_dir"], options.get("cwd"))
-        runner = payload_source + "\n" + _PATH_NAMESPACE_SOURCE + "\n" + (
-            "\nsafe_fd = None\nroot_fd = run_fd = None\n"
-            "try:\n    safe_fd = _ns_safe_run_fd(%r, %r, %r)\n"
-            "    root_fd, run_fd = _ns_enter(%r, %r, %r, %r)\n"
-            "    raise SystemExit(payload(%r, %r, %r))\n"
+        runner_dir = Path(path).parent / "compute-runners"
+        runner_dir_resolved = os.path.realpath(str(runner_dir))
+        for target in mapping:
+            target_resolved = os.path.realpath(target)
+            if (runner_dir_resolved == target_resolved
+                    or runner_dir_resolved.startswith(target_resolved.rstrip(os.sep) + os.sep)):
+                raise GPUUnavailable("compute runner directory is inside a path_namespace target")
+        runner_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(runner_dir, 0o700)
+        runner_path = runner_dir / (options["run_id"] + ".py")
+        runner = ("import os as _runner_os; _runner_os.unlink(__file__)\n"
+                  + payload_source + "\n" + _PATH_NAMESPACE_SOURCE + "\n" + (
+            "\nrunner_args = %r\n"
+            "safe_fd = None\nroot_fd = run_fd = None\n"
+            "try:\n    safe_fd = _ns_safe_run_fd(*runner_args['safe_run'])\n"
+            "    root_fd, run_fd = _ns_enter(*runner_args['enter'])\n"
+            "    raise SystemExit(payload(*runner_args['payload']))\n"
             "except _NamespaceRefusal as exc:\n"
             "    if safe_fd is not None:\n"
             "        try: _ns_record_refusal(safe_fd, exc)\n"
             "        except OSError: pass\n"
-            "    release(%r, %r)\n"
+            "    release(*runner_args['release'])\n"
             "    print(str(exc), file=__import__('sys').stderr)\n"
             "    raise SystemExit(125)\n"
             "except Exception as raw:\n"
@@ -918,17 +943,28 @@ def launch_compute_namespaced(options, payload_source):
             "    if safe_fd is not None:\n"
             "        try: _ns_record_refusal(safe_fd, exc)\n"
             "        except OSError: pass\n"
-            "    try: release(%r, %r)\n    except Exception: pass\n"
+            "    try: release(*runner_args['release'])\n    except Exception: pass\n"
             "    print(str(exc), file=__import__('sys').stderr)\n"
             "    raise SystemExit(125)\n"
             "finally:\n"
             "    if root_fd is not None: _ns_os.close(root_fd)\n"
             "    if run_fd is not None: _ns_os.close(run_fd)\n"
-            "    if safe_fd is not None: _ns_os.close(safe_fd)\n") % (
-                mapping, run_root, options["run_dir"],
-                mapping, run_root, options.get("cwd"), options["run_dir"],
-                path, lease, path, lease, path, lease, inner)
-        command = "python3 -c " + shlex.quote(runner)
+            "    if safe_fd is not None: _ns_os.close(safe_fd)\n") % ({
+                "safe_run": (mapping, run_root, options["run_dir"]),
+                "enter": (mapping, run_root, options.get("cwd"), options["run_dir"]),
+                "payload": (path, lease, inner),
+                "release": (path, lease),
+            }))
+        fd = os.open(runner_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        runner_created = True
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(runner)
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                runner_path.unlink()
+            raise
+        command = "python3 " + shlex.quote(str(runner_path))
         env = dict(os.environ)
         tmux_environment = dict(tmux_environment)
         for key in (*_TMUX_SESSION_ENV_KEYS, "AGENT_HOME", "AGENT_DISPATCH_ATTEMPT_ID",
@@ -952,7 +988,7 @@ def launch_compute_namespaced(options, payload_source):
             transport = {"kind": "hearting-tmux-v1", "server": server}
         else:
             with open(os.devnull, "rb") as stdin, open(os.devnull, "ab") as output:
-                subprocess.Popen(["python3", "-c", runner], stdin=stdin, stdout=output,
+                subprocess.Popen(["python3", str(runner_path)], stdin=stdin, stdout=output,
                                  stderr=output, start_new_session=True, cwd="/")
             transport = {"kind": "nohup-v1"}
         deadline = time.monotonic() + 5
@@ -967,6 +1003,9 @@ def launch_compute_namespaced(options, payload_source):
                 raise GPUUnavailable("GPU launch did not establish its wrapper")
         return {"gpus": devices, "gpu_lease": lease, "tmux_transport": transport}
     except Exception:
+        if runner_created:
+            with contextlib.suppress(FileNotFoundError):
+                runner_path.unlink()
         release(path, lease)
         raise
 '''

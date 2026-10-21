@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -573,7 +574,7 @@ class LeasesTest(unittest.TestCase):
              mock.patch.object(tool, "remote", side_effect=local_remote), \
              mock.patch("sys.stdout", output), mock.patch("sys.stderr", warning):
             try:
-                self.assertEqual(tool.cmd_run(args), 0)
+                self.assertEqual(tool.cmd_run(args), 0, warning.getvalue())
                 receipt = json.loads(output.getvalue())
                 self.assertEqual(receipt["gpus"], "0")
                 self.assertTrue(receipt["gpu_lease"]["token"])
@@ -669,15 +670,150 @@ class PathNamespaceSerializationTest(unittest.TestCase):
                        "path_namespace": {"/target": "/source"},
                        "run_root": "/target/runs"}
             def popen(command, **_kwargs):
-                captured["runner"] = command[2]
+                captured["runner_path"] = command[1]
             with mock.patch.object(G, "_ns_namespace_creation"), \
                  mock.patch.object(G.subprocess, "call", return_value=1), \
                  mock.patch.object(G.subprocess, "Popen", side_effect=popen):
                 G.launch_compute_namespaced(options, G.serialized_payload_source())
-            compile(captured["runner"], "namespace-runner", "exec")
-            self.assertIn("_ns_record_refusal(safe_fd, exc)", captured["runner"])
-            self.assertIn('b"125\\n"', captured["runner"])
-            self.assertIn("_NamespaceRefusal('runner', 'runner failed: '", captured["runner"])
+            runner = Path(captured["runner_path"]).read_text()
+            compile(runner, "namespace-runner", "exec")
+            self.assertIn("_ns_record_refusal(safe_fd, exc)", runner)
+            self.assertIn('b"125\\n"', runner)
+            self.assertIn("_NamespaceRefusal('runner', 'runner failed: '", runner)
+            self.assertTrue(runner.startswith("import os as _runner_os; _runner_os.unlink(__file__)"))
+
+    def test_generated_runner_executes_named_arguments_and_unlinks_itself(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state_path = root / "state" / "leases.json"
+            lease = {"token": "lease-token", "pid": 77, "gpus": ["0"]}
+            options = {"state_path": str(state_path),
+                       "observation": {"reachable": True, "gpus": []},
+                       "requested": "0", "share": False, "owner": None,
+                       "task": "fixture", "run_id": "fixture-run",
+                       "run_dir": "/target/runs/fixture-run", "inner": "echo inner",
+                       "cwd": "/work", "tmux_environment": {"FIXTURE": "yes"},
+                       "path_namespace": {"/target": "/lab"},
+                       "run_root": "/target/runs"}
+            payload_source = "\n".join([
+                "events = []",
+                "class _NamespaceRefusal(Exception):",
+                "    def __init__(self, code, message):",
+                "        super().__init__(message); self.code = code",
+                "def _ns_safe_run_fd(*args):",
+                "    events.append(('safe_run', args))",
+                "    if mode == 'refusal': raise _NamespaceRefusal('source-missing', 'path_namespace refused: source missing: /lab')",
+                "    if mode == 'error': raise RuntimeError('injected runner error')",
+                "    return 31",
+                "def _ns_enter(*args): events.append(('enter', args)); return 32, 33",
+                "def _ns_record_refusal(fd, error): events.append(('record', fd, error.code))",
+                "def payload(*args): events.append(('payload', args)); return 0",
+                "def release(*args): events.append(('release', args))",
+                "class _ns_os:",
+                "    @staticmethod",
+                "    def close(fd): events.append(('close', fd))",
+            ])
+            for mode in ("success", "refusal", "error"):
+                captured = {}
+                def check_call(argv, **_kwargs):
+                    if "new-session" in argv:
+                        captured["argv"] = argv
+                        captured["runner"] = Path(shlex.split(argv[-1])[1])
+                bound = mock.MagicMock()
+                bound.__enter__.return_value = {"leases": {}}
+                with mock.patch.object(G, "acquire", return_value=lease), \
+                     mock.patch.object(G, "release") as launcher_release, \
+                     mock.patch.object(G, "_ns_namespace_creation"), \
+                     mock.patch.object(G, "_PATH_NAMESPACE_SOURCE", ""), \
+                     mock.patch.object(G.subprocess, "call", return_value=0), \
+                     mock.patch.object(G.subprocess, "check_call", side_effect=check_call), \
+                     mock.patch.object(G, "locked", return_value=bound), \
+                     mock.patch.object(G.time, "monotonic", side_effect=[0, 0]):
+                    G.launch_compute_namespaced(options, payload_source)
+                runner_path = captured["runner"]
+                self.assertEqual(runner_path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(runner_path.parent.stat().st_mode & 0o777, 0o700)
+                argv_text = "\0".join(captured["argv"])
+                self.assertLess(len(argv_text), 2048)
+                self.assertNotIn("_ns_safe_run_fd", argv_text)
+                self.assertNotIn(payload_source, argv_text)
+                runner = runner_path.read_text()
+                self.assertTrue(runner.startswith("import os as _runner_os; _runner_os.unlink(__file__)"))
+                events = []
+                namespace = {"__file__": str(runner_path), "mode": mode, "events": events}
+                with self.assertRaises(SystemExit) as result:
+                    exec(compile(runner, str(runner_path), "exec"), namespace)
+                events = namespace["events"]
+                if mode == "success":
+                    self.assertEqual(result.exception.code, 0)
+                    self.assertIn(("safe_run", ({"/target": "/lab"}, "/target/runs",
+                                                  "/target/runs/fixture-run")), events)
+                    self.assertIn(("enter", ({"/target": "/lab"}, "/target/runs", "/work",
+                                               "/target/runs/fixture-run")), events)
+                    self.assertIn(("payload", (str(state_path), lease, "echo inner")), events)
+                else:
+                    self.assertEqual(result.exception.code, 125)
+                    self.assertEqual([event for event in events if event[0] == "payload"], [])
+                    self.assertEqual([event for event in events if event[0] == "release"],
+                                     [("release", (str(state_path), lease))])
+                self.assertFalse(runner_path.exists())
+                launcher_release.assert_not_called()
+
+    def test_runner_file_is_outside_targets_bounded_and_removed_on_launch_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state_path = root / "local" / "state.json"
+            options = {"state_path": str(state_path),
+                       "observation": {"reachable": True, "gpus": []},
+                       "requested": "", "task": "fixture", "run_id": "bounded",
+                       "run_dir": "/mnt/lab/runs/bounded", "inner": "true", "cwd": None,
+                       "tmux_environment": {"FIXTURE": "yes"},
+                       "path_namespace": {"/mnt/lab": "/volume/lab"},
+                       "run_root": "/mnt/lab/runs"}
+            captured = {}
+            def check_call(argv, **_kwargs):
+                if "new-session" in argv:
+                    captured["argv"] = argv
+                    raise OSError("tmux launch failed")
+            with mock.patch.object(G, "acquire", return_value=None), \
+                 mock.patch.object(G, "_ns_namespace_creation"), \
+                 mock.patch.object(G, "_PATH_NAMESPACE_SOURCE", "x" * 200000), \
+                 mock.patch.object(G.subprocess, "call", return_value=0), \
+                 mock.patch.object(G.subprocess, "check_call", side_effect=check_call):
+                with self.assertRaisesRegex(OSError, "tmux launch failed"):
+                    G.launch_compute_namespaced(options, "payload" * 10000)
+            argv_text = "\0".join(captured["argv"])
+            self.assertLess(len(argv_text), 2048)
+            self.assertNotIn("x" * 100, argv_text)
+            runner_path = Path(shlex.split(captured["argv"][-1])[1])
+            self.assertFalse(runner_path.exists())
+            self.assertFalse((root / "volume").exists())
+
+            target = root / "target"
+            target.mkdir()
+            inside = dict(options, state_path=str(target / "leases.json"),
+                          path_namespace={str(target): "/volume/lab"},
+                          run_root=str(target / "runs"), run_id="inside-target")
+            with mock.patch.object(G, "acquire", return_value=None), \
+                 mock.patch.object(G, "_ns_namespace_creation"), \
+                 mock.patch.object(G.subprocess, "call", return_value=0), \
+                 mock.patch.object(G.subprocess, "check_call") as start:
+                with self.assertRaisesRegex(G.GPUUnavailable, "inside a path_namespace target"):
+                    G.launch_compute_namespaced(inside, "payload")
+            start.assert_not_called()
+            self.assertFalse((target / "compute-runners").exists())
+
+            runner_dir = root / "local" / "compute-runners"
+            runner_dir.mkdir(parents=True, exist_ok=True)
+            collision = runner_dir / "bounded.py"
+            collision.write_text("owned by another launch\n")
+            with mock.patch.object(G, "acquire", return_value=None), \
+                 mock.patch.object(G, "_ns_namespace_creation"), \
+                 mock.patch.object(G.subprocess, "call", return_value=0), \
+                 mock.patch.object(G.subprocess, "check_call"):
+                with self.assertRaises(FileExistsError):
+                    G.launch_compute_namespaced(options, "payload")
+            self.assertEqual(collision.read_text(), "owned by another launch\n")
 
     def test_mountinfo_chooses_top_stacked_mount_and_namespace_ids_are_not_rechecked(self):
         namespace = {}
@@ -930,9 +1066,12 @@ class PathNamespaceSerializationTest(unittest.TestCase):
             def refuse(*_args):
                 raise namespace["_NamespaceRefusal"]("unshare", "unshare failed: EPERM (1)")
             with mock.patch.dict(namespace, {"_ns_enter": refuse}):
-                with self.assertRaisesRegex(namespace["_NamespaceRefusal"], "creation child failed"):
+                with self.assertRaises(namespace["_NamespaceRefusal"]) as caught:
                     namespace["_ns_namespace_creation"]({"/target": "/source"},
                                                           "/target/runs", str(failed_dir), None)
+            self.assertEqual(caught.exception.code, "unshare")
+            self.assertEqual(str(caught.exception),
+                             "path_namespace refused: unshare failed: EPERM (1)")
             self.assertFalse(failed_dir.exists())
             os.close(fd)
 
