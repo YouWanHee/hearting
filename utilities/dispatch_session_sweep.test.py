@@ -1066,6 +1066,18 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return json.loads(proc.stdout)
 
+    def settle_at(self, handed, now_ns):
+        output = io.StringIO()
+        payload = {**handed, "messages": []}
+        with mock.patch.object(SWEEP, "_state_roots", return_value=[self.root]), \
+                mock.patch.object(SWEEP.time, "monotonic_ns", return_value=now_ns), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(SWEEP.main([
+                "settle", "--recipient-kind", "opencode-turn", "--session", self.SID,
+            ]), 0)
+        return json.loads(output.getvalue())
+
     def test_the_sweep_steps_claim_render_and_settle_one_record(self):
         self.seed_turn()
         roots = self.cli("roots")
@@ -1100,7 +1112,7 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
             self.assertIn("delivery_context", hook.read_text(encoding="utf-8"))
 
     def run_plugin(self, body, *, prompt_async="accept", restored_selector=False,
-                   extra_env=None, native_messages=None, claim_change=False,
+                   extra_env=None, native_messages=None, claim_change=False, claim_expire=False,
                    claim_receipt=False):
         plugin = ROOT / "adapters/opencode/plugins/hearting-guards.js"
         if restored_selector:
@@ -1123,8 +1135,9 @@ let nativeReads = 0;
 const session = {
   messages: async () => {
     nativeReads++;
-    if (process.env.CLAIM_CHANGE_PY && nativeReads === 2) {
-      const changed = childProcess.spawnSync("python3", ["-c", process.env.CLAIM_CHANGE_PY],
+    const claimMutation = process.env.CLAIM_CHANGE_PY || process.env.CLAIM_EXPIRE_PY;
+    if (claimMutation && nativeReads === 2) {
+      const changed = childProcess.spawnSync("python3", ["-c", claimMutation],
         {encoding: "utf8"});
       if (changed.status !== 0) throw new Error(changed.stderr || "claim change failed");
       if (process.env.CLAIM_RECEIPT === "1") nativeMessages.push({
@@ -1153,13 +1166,15 @@ console.log(JSON.stringify({prompts, logs}));
 '''.replace("MODE", json.dumps(prompt_async)).replace("BODY", body).replace("PLUGIN", json.dumps(str(plugin))).replace(
             "NATIVE_MESSAGES", json.dumps(native_messages or []))
         env = self.env()
-        if claim_change:
+        if claim_change or claim_expire:
             record = {**PD.read(self.root, self.SID, "delivery-" + "a" * 32),
                       SWEEP.STORAGE_KEY: self.SID}
             record["attempts"] += 1  # deliver claims before rendering the native body.
             native_body = SWEEP.delivery_context([(self.root, [record])])
-            env.update(
-                CLAIM_CHANGE_PY=(
+            env.update(CLAIM_RECEIPT="1" if claim_receipt else "0",
+                       EXPECTED_NATIVE_TEXT=native_body)
+        if claim_change:
+            env["CLAIM_CHANGE_PY"] = (
                     "import os,sys; from pathlib import Path; "
                     "sys.path.insert(0, str(Path(os.environ['AGENT_HOME'])/'utilities')); "
                     "import dispatch_pending_delivery as p; "
@@ -1167,10 +1182,21 @@ console.log(JSON.stringify({prompts, logs}));
                     "did='delivery-'+'a'*32; row=p.read(root,sid,did); "
                     "p.reclaim(root,sid,did,now_ns=row['claim_deadline_ns']+1); "
                     "p.claim(root,sid,did,claim_owner='replacement-carrier',lease_seconds=30,"
-                    "require_generation_proof=False)"),
-                CLAIM_RECEIPT="1" if claim_receipt else "0",
-                EXPECTED_NATIVE_TEXT=native_body,
-            )
+                    "require_generation_proof=False)")
+        if claim_expire:
+            env["CLAIM_EXPIRE_PY"] = (
+                "import json,os,sys,time; from pathlib import Path; "
+                "sys.path.insert(0, str(Path(os.environ['AGENT_HOME'])/'utilities')); "
+                "import dispatch_pending_delivery as p; "
+                "root=Path(os.environ['HARNESS_STATE_ROOT']); sid='ses-oc-parent'; "
+                "did='delivery-'+'a'*32; row=p.read(root,sid,did); "
+                "owner=row['claim_owner']; identity=p.received_ack_identity(row,sid,did); "
+                "path=p.record_path(root,sid,did); raw=json.loads(path.read_text(encoding='utf-8')); "
+                "raw['claim_deadline_ns']=time.monotonic_ns()-1; "
+                "path.write_text(json.dumps(raw),encoding='utf-8'); "
+                "after=p.read(root,sid,did); "
+                "assert after['claim_owner']==owner and "
+                "p.received_ack_identity(after,sid,did)==identity")
         if extra_env:
             env.update(extra_env)
         run = subprocess.run(["node", "--input-type=module", "-e", js], env=env, cwd=str(self.root),
@@ -1246,6 +1272,60 @@ console.log(JSON.stringify({carrierEnv: globalThis.carrierEnv}));
         result = self.run_plugin(self.IDLE_THEN_WAIT, claim_change=True, claim_receipt=True)
         self.assertEqual(result["prompts"], [])
         self.assertEqual(self.state(), "acked")
+
+    def test_expired_original_claim_does_not_send_and_remains_reclaimable(self):
+        self.seed_turn()
+        stale = self.run_plugin(self.IDLE_THEN_WAIT, claim_expire=True)
+        self.assertEqual(stale["prompts"], [])
+        record = PD.read(self.root, self.SID, "delivery-" + "a" * 32)
+        self.assertEqual(record["state"], "claimed")
+        self.assertLessEqual(record["claim_deadline_ns"], time.monotonic_ns())
+        self.assertTrue(any(item.get("extra", {}).get("reason") == "native-receipt-before-send"
+                            for item in stale["logs"]))
+
+        fallback = self.run_plugin(self.IDLE_THEN_WAIT)
+        self.assertEqual(len(fallback["prompts"]), 1)
+        self.assertEqual(self.state(), "acked")
+
+    def test_exact_native_receipt_settles_after_claim_deadline_expires(self):
+        self.seed_turn()
+        result = self.run_plugin(self.IDLE_THEN_WAIT, claim_expire=True, claim_receipt=True)
+        self.assertEqual(result["prompts"], [])
+        self.assertEqual(self.state(), "acked")
+        settled = [item["extra"] for item in result["logs"]
+                   if item.get("extra", {}).get("reason") == "native-receipt-before-send"]
+        self.assertTrue(any(item.get("received") == 1 and item.get("acked") == 1
+                            for item in settled))
+
+    def test_settle_requires_a_strictly_future_integer_claim_deadline(self):
+        self.seed_turn()
+        handed = self.cli("deliver")
+        did = handed["records"][0]["delivery_id"]
+        path = PD.record_path(self.root, self.SID, did)
+        now_ns = 20000
+        cases = (
+            ("missing", None, False),
+            ("malformed", "20000", False),
+            ("boolean", True, False),
+            ("expired", now_ns - 1, False),
+            ("exactly-now", now_ns, False),
+            ("future", now_ns + 1, True),
+        )
+        for name, deadline, valid in cases:
+            with self.subTest(deadline=name):
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if deadline is None:
+                    record.pop("claim_deadline_ns", None)
+                else:
+                    record["claim_deadline_ns"] = deadline
+                path.write_text(json.dumps(record), encoding="utf-8")
+                result = self.settle_at(handed, now_ns)
+                if valid:
+                    self.assertEqual(result["records"][0]["delivery_id"], did)
+                    self.assertEqual(result["text"], handed["text"])
+                else:
+                    self.assertEqual(result["text"], "")
+                    self.assertEqual(result["records"], [])
 
     def test_settle_with_replaced_identity_returns_no_stale_context(self):
         self.seed_turn()

@@ -783,11 +783,15 @@ def main(argv: list[str] | None = None) -> int:
                     settled_count += int(outcome["settled"])
                 elif isinstance(requested, list):
                     fresh = pending_delivery.read(root, storage, delivery_id)
+                    claim_deadline_ns = (fresh.get("claim_deadline_ns")
+                                         if fresh is not None else None)
                     if (fresh is None
                             or pending_delivery.received_ack_identity(
                                 fresh, storage, delivery_id) != original_identity
                             or fresh.get("state") != "claimed"
-                            or fresh.get("claim_owner") != original_owner):
+                            or fresh.get("claim_owner") != original_owner
+                            or type(claim_deadline_ns) is not int
+                            or claim_deadline_ns <= time.monotonic_ns()):
                         unknown_ids.add(delivery_id)
                         continue
                     item = dict(handed_record or {})
