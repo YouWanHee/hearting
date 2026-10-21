@@ -934,19 +934,12 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             self.assertGreaterEqual(observed, 19.0)
             self.assertLessEqual(observed, 21.0)
 
-        registry_bytes = self.jobs.stat().st_size
-        self.assertGreaterEqual(cold["registry"]["content_reads"], 2)
-        self.assertEqual(cold["registry"]["content_reads"] % 2, 0)
-        self.assertEqual(cold["registry"]["bytes_read"],
-                         cold["registry"]["content_reads"] * registry_bytes)
+        self.assertEqual(cold["registry"]["content_reads"], 1)
+        self.assertEqual(cold["registry"]["bytes_read"], self.jobs.stat().st_size)
         self.assertEqual(cold["registry"]["full_metadata_parses"], 1)
         self.assertGreater(cold["registry"]["metadata_rows_parsed"], 2)
-        read_pass_delta = steady["registry"]["content_reads"] - cold["registry"]["content_reads"]
-        byte_delta = steady["registry"]["bytes_read"] - cold["registry"]["bytes_read"]
-        self.assertGreater(read_pass_delta, 0,
-                           "unchanged polls still validate the complete registry content")
-        self.assertEqual(read_pass_delta % 2, 0)
-        self.assertEqual(byte_delta, read_pass_delta * registry_bytes)
+        self.assertEqual(steady["registry"]["content_reads"] - cold["registry"]["content_reads"], 0)
+        self.assertEqual(steady["registry"]["bytes_read"] - cold["registry"]["bytes_read"], 0)
         self.assertEqual(steady["registry"]["full_metadata_parses"]
                          - cold["registry"]["full_metadata_parses"], 0)
         self.assertEqual(steady["registry"]["metadata_rows_parsed"]

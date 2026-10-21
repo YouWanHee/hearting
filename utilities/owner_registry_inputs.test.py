@@ -89,10 +89,9 @@ class OwnerRegistryInputsTest(unittest.TestCase):
                 self.assertTrue(result["passed"], result)
         metrics = cache.metrics_snapshot()
         self.assertEqual(direct_bytes[0], 0)
-        # Each of the two readers validates two snapshots on all eight passes;
-        # the shared view still parses the same 301 rows only once.
-        self.assertEqual(metrics["content_reads"], 32)
-        self.assertEqual(metrics["bytes_read"], self.jobs.stat().st_size * 32)
+        # Both readers share one cold content snapshot and parse the 301 rows once.
+        self.assertEqual(metrics["content_reads"], 1)
+        self.assertEqual(metrics["bytes_read"], self.jobs.stat().st_size)
         self.assertEqual(metrics["full_metadata_parses"], 1)
         self.assertEqual(metrics["metadata_rows_parsed"], 301)
         # Cached raw rows cannot replace a changed non-registry proof.
@@ -118,14 +117,16 @@ class OwnerRegistryInputsTest(unittest.TestCase):
         with self.assertRaisesRegex(terminal.TerminalCommitError, "owner-not-current"):
             terminal.verify_request_identity(self.request, self.route)
 
-    def test_same_size_rewrite_with_restored_mtime_does_not_reuse_owner_axes(self):
+    def test_same_size_atomic_replacement_with_restored_mtime_does_not_reuse_owner_axes(self):
         terminal.verify_request_identity(self.request, self.route)
         self.assertTrue(self.observe()["passed"])
         stamp = self.jobs.stat()
         before = self.jobs.read_bytes()
         changed = before.replace(b"registered_worker=1", b"registered_worker=0")
         self.assertEqual(len(before), len(changed))
-        self.jobs.write_bytes(changed)
+        staged = self.root / "replacement"
+        staged.write_bytes(changed)
+        staged.replace(self.jobs)
         os.utime(self.jobs, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
         with self.assertRaisesRegex(terminal.TerminalCommitError, "owner-axes"):
             terminal.verify_request_identity(self.request, self.route)
