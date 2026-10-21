@@ -2650,6 +2650,12 @@ times out, loses herdr, or exits; the existing startup/reconnect path replaces
 only that observer and continues the same watch id. `join`/`status`/`ack` report
 the stored obligation and its current observation; a fulfilled duty may be
 followed by an explicit new watch. A tab is a location hint, not identity.
+The existing obligation runner may share a narrow, target-bound readiness
+observation across watchers after their native results arrive. Each watcher
+retains its own native result, deadline, receipt, and ack; the shared observation
+does not settle a watch. Stale or unavailable observations remain pending and
+reconnect through the same watch id, with current identity and transition
+authority checked by the existing owner.
 A target with no session yet (a Codex before its first input) is held by server
 and pane, and the observer continues on the first session that pane reports;
 `prompt` types into such a pane and `retire` exits it on its native turn and

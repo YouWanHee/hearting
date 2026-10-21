@@ -38,6 +38,7 @@ from dispatch_completion_join import (  # noqa: E402
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
 import peer_obligations  # noqa: E402
+import shared_readiness  # noqa: E402
 from frame_interview import PENDING_ANSWER_RULE  # noqa: E402
 import dispatch_seat_handover as seat_handover  # noqa: E402
 from parent_next_directive import entrypoint, resume_command, wait_command  # noqa: E402
@@ -759,6 +760,67 @@ def _bounded_number(name: str, default: int, minimum: int, maximum: int) -> int:
     return min(maximum, max(minimum, value))
 
 
+def _wait_for_shared_attempt(launch: Launch, *, gate_probe=None,
+                             deadline: float | None = None) -> tuple[str, str]:
+    interval = _bounded_number(
+        "AGENT_CLAUDE_REWAKE_INTERVAL_SECONDS", DEFAULT_INTERVAL_SECONDS, 1, 300
+    )
+    maximum = _bounded_number(
+        "AGENT_CLAUDE_REWAKE_MAX_SECONDS", DEFAULT_MAX_SECONDS, interval, 86_400
+    )
+    if deadline is None:
+        deadline = time.monotonic() + maximum
+    process_identity = _process_identity(os.getpid())
+    if process_identity is None:
+        return "bridge-error", "consumer-identity-unavailable"
+    identity = shared_readiness.attempt_identity(
+        launch.jobs, launch.attempt_id, consumer_pid=os.getpid(),
+        consumer_start=process_identity[1], request_token=os.urandom(12).hex())
+    duty_id = shared_readiness.duty_id(identity)
+    store = peer_obligations.ObligationStore(launch.jobs.parent)
+    try:
+        store.create(
+            duty_id, shared_readiness.DUTY_KIND, identity,
+            {"jobs": identity["jobs"], "attempt_id": launch.attempt_id,
+             "parent": "", "slug": ""},
+        )
+        shared_readiness.wake_runner(store.root)
+        if not peer_obligations.ensure_normal_runner(launch.jobs.parent):
+            store.update(duty_id, state="complete", result="runner-unavailable",
+                         cleanup="complete")
+            return "bridge-error", "readiness-runner-unavailable"
+    except (OSError, ValueError, RuntimeError, peer_obligations.ObligationError):
+        return "bridge-error", "readiness-runner-unavailable"
+
+    try:
+        while True:
+            try:
+                duty = store.get(duty_id)
+            except (OSError, ValueError, RuntimeError):
+                return "bridge-error", "readiness-observation-unreadable"
+            result = shared_readiness.current_result(duty, identity)
+            if result is not None:
+                state = result.get("state")
+                if state == "ready":
+                    return "ready", "terminal-quiescent"
+                if state == "terminal":
+                    return "attention", "terminal-failure-or-unclosed"
+                if state == "contract-error":
+                    return "bridge-error", "readiness-contract-error"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "timeout", f"owner-not-quiescent-after-{maximum}s"
+            if gate_probe is not None and gate_probe():
+                return "gate", "human-gate-open"
+            time.sleep(min(interval, remaining))
+    finally:
+        try:
+            store.update(duty_id, state="complete", result="consumer-finished",
+                         cleanup="complete")
+        except (OSError, ValueError, RuntimeError):
+            pass
+
+
 def wait_for_attempt(
     launch: Launch, readiness: Path, *, gate_probe: Any = None, deadline: float | None = None
 ) -> tuple[str, str]:
@@ -773,6 +835,12 @@ def wait_for_attempt(
     sweep (measured 2026-09-04, rt-da62cded: 3.5 minutes, and only because the
     user happened to type).
     """
+    canonical_readiness = agent_home() / "utilities" / "dispatch-attempt-ready.py"
+    shared_runner_available = ((canonical_readiness.parent / "shared_readiness.py").is_file()
+                               and (canonical_readiness.parent / "peer-steward.py").is_file())
+    if (shared_runner_available
+            and Path(readiness).resolve(strict=False) == canonical_readiness.resolve(strict=False)):
+        return _wait_for_shared_attempt(launch, gate_probe=gate_probe, deadline=deadline)
     interval = _bounded_number(
         "AGENT_CLAUDE_REWAKE_INTERVAL_SECONDS", DEFAULT_INTERVAL_SECONDS, 1, 300
     )

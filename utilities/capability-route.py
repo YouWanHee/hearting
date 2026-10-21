@@ -6068,7 +6068,8 @@ def _migrate_completion_dir_forward(route_id, *, jobs=None):
 # route hash, node id, terminal-gate name, evidence readability, evidence hash), so it
 # lives once here and `workflow-supervisor.py` dynamically loads this module rather than
 # re-deriving it -- the dependency stays one-way (supervisor -> capability-route).
-def terminal_gate_observation(route, *, jobs=None, exact_terminal=False):
+def terminal_gate_observation(route, *, jobs=None, exact_terminal=False, registry_rows=None,
+                              registry_snapshot=None):
     """Per declared-terminal-node completion-gate truth, verified fresh from disk.
 
     An owner-merge auxiliary-bearing group contributes one extra row keyed
@@ -6082,14 +6083,36 @@ def terminal_gate_observation(route, *, jobs=None, exact_terminal=False):
     nodes={node.get("id"):node for node in route.get("nodes",[])}
     terminal_ids=[node_id for node_id,node in nodes.items() if node.get("terminal") is True]
     rows={}
+    if registry_snapshot is not None:
+        try:
+            snapshot_valid = (registry_snapshot.matches_jobs(jobs)
+                              and registry_snapshot.complete)
+        except (AttributeError, OSError, TypeError, ValueError):
+            snapshot_valid = False
+        if not snapshot_valid:
+            reason = "registry-unreadable"
+            for node_id in terminal_ids:
+                rows[node_id] = {"passed": False, "reason": reason}
+            for group_id, _error in sorted(owner_merge_auxiliary_groups(route).items()):
+                rows[f"parallel_group:{group_id}"] = {"passed": False, "reason": reason}
+            return rows
+        registry_view = registry_snapshot.view
+        registry_lines = registry_snapshot.lines
+    else:
+        registry_view = None
+        registry_lines = (["\t".join(fields) for fields, _metadata in registry_rows]
+                          if registry_rows is not None else None)
     for node_id in terminal_ids:
         node=nodes[node_id]
         marker=completion_dir(route["route_id"],jobs=jobs)/f"{node_id}.json"
         if owner_executed_terminal(node) and not (marker.exists() or marker.is_symlink()):
-            rows[node_id]=_owner_terminal_observation(route,node,jobs=jobs)
+            rows[node_id]=_owner_terminal_observation(
+                route,node,jobs=jobs,registry_rows=registry_rows,
+                registry_lines=registry_lines,registry_view=registry_view)
         else:
             rows[node_id]=_marker_identity_row(route,node,node_id,node.get("terminal_gate"), jobs=jobs,
-                                              exact_terminal=exact_terminal)
+                                              exact_terminal=exact_terminal,
+                                              registry_lines=registry_lines)
     for group_id,error in sorted(owner_merge_auxiliary_groups(route).items()):
         key=f"parallel_group:{group_id}"
         row=_arbitration_observation(route,group_id,error)
@@ -6098,7 +6121,8 @@ def terminal_gate_observation(route, *, jobs=None, exact_terminal=False):
                 raw=arbitration_path(route["route_id"],group_id).read_bytes()
                 record=json.loads(raw); anchor=nodes[record["anchor_node"]]
                 proof=_marker_identity_row(route,anchor,anchor["id"],anchor["completion_gate"],
-                                           jobs=jobs,exact_terminal=True)
+                                           jobs=jobs,exact_terminal=True,
+                                           registry_lines=registry_lines)
                 if not proof.get("passed"):
                     row=proof
                 else:
@@ -6116,7 +6140,8 @@ def owner_executed_terminal(node):
             and node.get("unit") == "_kernel/owner" and node.get("dispatch_depth") == 1)
 
 
-def _owner_terminal_observation(route,node,*,jobs=None):
+def _owner_terminal_observation(route,node,*,jobs=None,registry_rows=None,
+                                registry_lines=None,registry_view=None):
     """Consume the same exact native handoff as worker completion, without
     inventing a second attempt or publishing a synthetic worker marker.
 
@@ -6128,16 +6153,23 @@ def _owner_terminal_observation(route,node,*,jobs=None):
         return {"passed":False,"reason":reason}
     try:
         jobs=Path(jobs) if jobs is not None else completion_dir(route["route_id"]).parents[1]/"jobs.log"
-        from dispatch_registry_cache import registry_view
-        view=registry_view(jobs)
-        if view.has_invalid_utf8 or view.has_partial_tail:
-            # Keep the existing strict decoder and incomplete-line semantics.
-            lines=jobs.read_text(encoding="utf-8").splitlines()
-            candidates=((fields,parse_registry_metadata(fields[5]))
-                        for line in lines for fields in (line.split("\t"),) if len(fields)==6)
-        else:
+        if registry_view is not None:
             candidates=((record.fields,record.completion_metadata()) for record in
-                        view.completion_related("",route["route_id"],route["route_hash"]))
+                        registry_view.completion_related("",route["route_id"],route["route_hash"]))
+        elif registry_rows is not None:
+            candidates=registry_rows
+        else:
+            from dispatch_registry_cache import registry_view as load_registry_view
+            view=load_registry_view(jobs)
+            registry_view=view
+            if view.has_invalid_utf8 or view.has_partial_tail:
+                # Keep the existing strict decoder and incomplete-line semantics.
+                lines=jobs.read_text(encoding="utf-8").splitlines()
+                candidates=((fields,parse_registry_metadata(fields[5]))
+                            for line in lines for fields in (line.split("\t"),) if len(fields)==6)
+            else:
+                candidates=((record.fields,record.completion_metadata()) for record in
+                            view.completion_related("",route["route_id"],route["route_hash"]))
         owners=[]
         for fields,meta in candidates:
             if meta.get("worker_type")!="owner" or meta.get("dispatch_depth")!="1": continue
@@ -6149,7 +6181,8 @@ def _owner_terminal_observation(route,node,*,jobs=None):
                 owners.append((fields,meta))
         if not owners: return absent("owner-attempt-absent")
         fields,meta=owners[-1]
-        binding,_=resolve_owner_route_lifecycle(jobs,owner_attempt_id=meta["attempt_id"])
+        binding,_=resolve_owner_route_lifecycle(
+            jobs,owner_attempt_id=meta["attempt_id"],registry_rows=registry_rows)
         # A one-shot owner sealed by `route_*` fields alone (its supervisor closed the row
         # before the marker writer ran) has no lifecycle binding; the quick node-bound
         # contract that `dispatch_terminal_commit.validate_owner_route` enforces stands in.
@@ -6166,7 +6199,9 @@ def _owner_terminal_observation(route,node,*,jobs=None):
         process=attempt_process_quiescence(meta,terminal_receipt=True)
         if process.state!="quiescent": return absent("owner-not-quiescent")
         # A PASS proposal cannot erase a missing review or other prerequisite.
-        prerequisites=owner_terminal_prerequisites(route,node,jobs)
+        prerequisites=owner_terminal_prerequisites(
+            route,node,jobs,registry_rows=registry_rows,
+            registry_lines=registry_lines)
         if prerequisites:
             return absent("owner-prerequisite-unproven:"+json.dumps(prerequisites,sort_keys=True))
         # The owner's own operation is a node entry like any other: a PASS does not stand in
@@ -6198,7 +6233,7 @@ def _owner_terminal_observation(route,node,*,jobs=None):
         return absent("owner-terminal-evidence-unverified")
 
 
-def owner_terminal_prerequisites(route,node,jobs):
+def owner_terminal_prerequisites(route,node,jobs,*,registry_rows=None,registry_lines=None):
     nodes={n["id"]:n for n in route["nodes"]}
     pending=list(node.get("depends_on",[])); seen=set(); missing={}
     while pending:
@@ -6211,7 +6246,11 @@ def owner_terminal_prerequisites(route,node,jobs):
                 and predecessor.get("dispatch_depth")==1):
             continue  # This executor's final handoff includes its own preceding operations.
         proof=_marker_identity_row(route,predecessor,node_id,predecessor.get("completion_gate"),
-                                   jobs=jobs,exact_terminal=predecessor.get("dispatch_depth") in (1,2))
+                                   jobs=jobs,exact_terminal=predecessor.get("dispatch_depth") in (1,2),
+                                   registry_lines=(registry_lines if registry_lines is not None else
+                                                   (None if registry_rows is None else
+                                                    ["\t".join(fields)
+                                                     for fields, _metadata in registry_rows])))
         if not proof.get("passed"): missing[node_id]=proof["reason"]
     return missing
 
@@ -7877,7 +7916,8 @@ def arbitration_path(route_id, group_id):
     return completion_dir(route_id)/f"{_safe_group_id(group_id)}.arbitration.json"
 
 
-def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_terminal=False):
+def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_terminal=False,
+                         registry_lines=None):
     """One completion marker's on-disk truth, in the shared gate vocabulary."""
     path = completion_dir(route["route_id"],jobs=jobs)/f"{node_id}.json"
     try:
@@ -7935,22 +7975,28 @@ def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_termina
             registry = Path(jobs) if jobs is not None else _continuation_source_jobs(route)
         except ValueError:
             registry = path.parents[2] / "jobs.log"
-        try:
-            lines = registry.read_text(encoding="utf-8").splitlines()
-        except FileNotFoundError:
-            lines = []  # Existing semantic-history contract permits archived process rows.
-        except OSError:
-            return {"passed": False, "reason": "registry-unreadable"}
+        if registry_lines is None:
+            try:
+                lines = registry.read_text(encoding="utf-8").splitlines()
+            except FileNotFoundError:
+                lines = []  # Existing semantic-history contract permits archived process rows.
+            except OSError:
+                return {"passed": False, "reason": "registry-unreadable"}
+        else:
+            lines = registry_lines
         if completion_conflict_attempt(marker, lines):
             return {"passed": False, "reason": "terminal-evidence-conflict"}
     if exact_terminal:
         if jobs is None or not completion_marker_is_current(route, node, path, marker, jobs=jobs):
             return {"passed": False, "reason": "completion-marker-not-current"}
-        try:
-            lines = Path(jobs).read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            return {"passed": False, "reason": "registry-unreadable", "current": False,
-                    "attempt_id": marker.get("attempt_id")}
+        if registry_lines is None:
+            try:
+                lines = Path(jobs).read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                return {"passed": False, "reason": "registry-unreadable", "current": False,
+                        "attempt_id": marker.get("attempt_id")}
+        else:
+            lines = registry_lines
         # The readiness helper is the single exact-attempt proof.  In
         # particular, it resolves depth-1 owner rows through owner_route_* and
         # admits supported no-process markers without inventing a registry row.

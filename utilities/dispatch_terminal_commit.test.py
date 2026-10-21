@@ -1497,6 +1497,146 @@ class OwnerCompletionStateTest(_TerminalCommitFixture):
         self.assertEqual(T._PROVEN_BLOCKED_GATE_REASONS,
                          {"completion-attempt-not-current", "completion-evidence-revised-unrecorded"})
 
+    def test_no_commit_gate_receives_complete_snapshot_and_rejects_stale_selection(self):
+        import dispatch_registry_cache as registry
+
+        owner_line = ("job\tdone\t/repo\t/wt\towner\t"
+                      "attempt_id=att-a,attempt_schema_version=2,worker_type=owner\n")
+        prerequisite_line = ("job\tdone\t/repo\t/wt\tprerequisite\t"
+                             "attempt_id=att-prereq,attempt_schema_version=2\n")
+        self.jobs.write_text(owner_line + prerequisite_line, encoding="utf-8")
+        rows = registry.registry_view(self.jobs).select_rows(attempt_id="att-a")
+        request = SimpleNamespace(route_file=self.route_file, jobs=self.jobs)
+        self.route_file.write_text(json.dumps(self.route), encoding="utf-8")
+        with mock.patch.object(T, "_historical_request", return_value=request), \
+             mock.patch.object(T, "_completion_request", return_value=request), \
+             mock.patch.object(T, "_commit_state_path", return_value=self.root / "missing-commit.json"), \
+             mock.patch.object(T, "_route_module") as route_module:
+            route_module.return_value.terminal_gate_observation.return_value = {
+                "execute": {"passed": True}}
+            state = T.owner_completion_state(
+                self.jobs, "done", self._metadata(attempt_id="att-a"),
+                selected_registry_rows=rows)
+            self.assertEqual(state.state, "pending")
+            kwargs = route_module.return_value.terminal_gate_observation.call_args.kwargs
+            snapshot = kwargs["registry_snapshot"]
+            self.assertTrue(snapshot.complete)
+            self.assertEqual(len(snapshot.view.records), 2,
+                             "the bounded owner row must not stand in for the full registry")
+            self.assertEqual(snapshot.lines, (owner_line.rstrip("\n"), prerequisite_line.rstrip("\n")))
+
+            stale_rows = [(list(rows[0][0]), dict(rows[0][1]))]
+            stale_rows[0][0][1] = "open"
+            changed = T.owner_completion_state(
+                self.jobs, "done", self._metadata(attempt_id="att-a"),
+                selected_registry_rows=stale_rows)
+            self.assertEqual(changed.state, "unknown")
+            self.assertEqual(changed.reason, "registry-generation-changed")
+            self.assertEqual(route_module.return_value.terminal_gate_observation.call_count, 1)
+
+    def test_owner_classifications_share_one_read_per_readiness_pass(self):
+        import dispatch_registry_cache as registry
+
+        def row(attempt):
+            return (f"job\tdone\t/repo\t/wt\towner\tattempt_id={attempt},"
+                    "attempt_schema_version=2,worker_type=owner\n")
+
+        self.jobs.write_text(row("att-a") + row("att-b"), encoding="utf-8")
+        self.route_file.write_text(json.dumps(self.route), encoding="utf-8")
+        request = SimpleNamespace(route_file=self.route_file, jobs=self.jobs)
+        metadata = [self._metadata(attempt_id=attempt) for attempt in ("att-a", "att-b")]
+        selections = [registry.registry_view(self.jobs).select_rows(
+            attempt_id=item["attempt_id"]) for item in metadata]
+        with mock.patch.object(T, "_historical_request", return_value=request), \
+             mock.patch.object(T, "_completion_request", return_value=request), \
+             mock.patch.object(T, "_commit_state_path", return_value=self.root / "missing-commit.json"), \
+             mock.patch.object(T, "_route_module") as route_module:
+            route_module.return_value.terminal_gate_observation.return_value = {
+                "execute": {"passed": True}}
+            registry.reset_metrics()
+            for item, selected in zip(metadata, selections):
+                self.assertEqual(T.owner_completion_state(
+                    self.jobs, "done", item, selected_registry_rows=selected).state,
+                    "pending")
+            repeated_reads = registry.metrics_snapshot()["content_reads"]
+            self.assertEqual(repeated_reads, 2,
+                             "separate standalone classifications each acquire their own generation")
+
+            registry.reset_metrics()
+            snapshots = []
+            route_module.return_value.terminal_gate_observation.side_effect = (
+                lambda _route, **kwargs: (
+                    snapshots.append(kwargs["registry_snapshot"])
+                    or {"execute": {"passed": True}}))
+            with registry.registry_read_scope():
+                pass_view = registry.registry_view(self.jobs)
+                for item in metadata:
+                    selected = pass_view.select_rows(attempt_id=item["attempt_id"])
+                    self.assertEqual(T.owner_completion_state(
+                        self.jobs, "done", item, selected_registry_rows=selected).state,
+                        "pending")
+            self.assertEqual(registry.metrics_snapshot()["content_reads"], 1)
+            self.assertEqual(len(snapshots), 2)
+            self.assertTrue(all(snapshot.view is pass_view for snapshot in snapshots))
+            self.assertEqual(len({snapshot.signature for snapshot in snapshots}), 1)
+
+    def test_registry_change_after_selection_keeps_gate_pinned_then_requires_fresh_generation(self):
+        import dispatch_registry_cache as registry
+        import shared_readiness
+
+        owner_line = ("job\tdone\t/repo\t/wt\towner\t"
+                      "attempt_id=att-a,attempt_schema_version=2,worker_type=owner\n")
+        self.jobs.write_text(owner_line, encoding="utf-8")
+        self.route_file.write_text(json.dumps(self.route), encoding="utf-8")
+        request = SimpleNamespace(route_file=self.route_file, jobs=self.jobs)
+        snapshots = []
+        with mock.patch.object(T, "_historical_request", return_value=request), \
+             mock.patch.object(T, "_completion_request", return_value=request), \
+             mock.patch.object(T, "_commit_state_path", return_value=self.root / "missing-commit.json"), \
+             mock.patch.object(T, "_route_module") as route_module:
+            route_module.return_value.terminal_gate_observation.side_effect = (
+                lambda _route, **kwargs: (
+                    snapshots.append(kwargs["registry_snapshot"])
+                    or {"execute": {"passed": True}}))
+            registry.reset_metrics()
+            with registry.registry_read_scope():
+                selected_view = registry.registry_view(self.jobs)
+                selected = selected_view.select_rows(attempt_id="att-a")
+                with self.jobs.open("a", encoding="utf-8") as stream:
+                    stream.write("job\topen\t/repo\t/wt\tother\t"
+                                 "attempt_id=att-prereq,attempt_schema_version=2\n")
+                state = T.owner_completion_state(
+                    self.jobs, "done", self._metadata(attempt_id="att-a"),
+                    selected_registry_rows=selected)
+                self.assertEqual(state.state, "pending")
+                self.assertIs(snapshots[-1].view, selected_view)
+                self.assertEqual(snapshots[-1].lines, selected_view.lines)
+                self.assertIsNone(shared_readiness.registry_generation(
+                    self.jobs, snapshots[-1].view, selected=True))
+            fresh = registry.registry_snapshot(self.jobs)
+            self.assertNotEqual(fresh.signature, snapshots[-1].signature)
+            self.assertIsNotNone(shared_readiness.registry_generation(
+                self.jobs, fresh.view, selected=True))
+
+    def test_incomplete_or_unreadable_registry_cannot_prove_no_commit_gate(self):
+        request = SimpleNamespace(route_file=self.route_file, jobs=self.jobs)
+        self.route_file.write_text(json.dumps(self.route), encoding="utf-8")
+        with mock.patch.object(T, "_historical_request", return_value=request), \
+             mock.patch.object(T, "_completion_request", return_value=request), \
+             mock.patch.object(T, "_commit_state_path", return_value=self.root / "missing-commit.json"), \
+             mock.patch.object(T, "_route_module") as route_module:
+            for raw in (b"malformed\n", b"job\tdone\t/repo\t/wt\towner\tpartial",
+                        b"job\tdone\t/repo\t/wt\towner\tvalue=\xff\n"):
+                with self.subTest(raw=raw):
+                    self.jobs.write_bytes(raw)
+                    state = T.owner_completion_state(
+                        self.jobs, "done", self._metadata())
+                    self.assertEqual(state.state, "unknown")
+            self.jobs.unlink()
+            state = T.owner_completion_state(self.jobs, "done", self._metadata())
+            self.assertEqual(state.state, "unknown")
+            route_module.return_value.terminal_gate_observation.assert_not_called()
+
 
 class CompletionRequestDeferredGuardTest(unittest.TestCase):
     """C10 (S3a): `_completion_request`'s atomic pass check via `verdict_pass`."""

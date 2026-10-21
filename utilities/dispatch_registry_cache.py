@@ -81,13 +81,15 @@ def _handover_metadata(raw: str) -> tuple[tuple[str, str], ...]:
     return tuple(values.items())
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RegistryRecord:
     order: int
-    raw: str
     fields: tuple[str, ...]
-    completion_items: tuple[tuple[str, str], ...]
-    handover_items: tuple[tuple[str, str], ...]
+
+    @property
+    def raw(self) -> str:
+        """Compatibility view; avoid retaining a second copy of every row."""
+        return "\t".join(self.fields)
 
     @property
     def status(self) -> str:
@@ -98,10 +100,10 @@ class RegistryRecord:
         return self.fields[4]
 
     def completion_metadata(self) -> dict[str, str]:
-        return dict(self.completion_items)
+        return dict(_completion_metadata(self.fields[5]))
 
     def handover_metadata(self) -> dict[str, str]:
-        return dict(self.handover_items)
+        return dict(_handover_metadata(self.fields[5]))
 
 
 class _RegistrySegment:
@@ -112,7 +114,8 @@ class _RegistrySegment:
                  "completion_by_parent_sid",
                  "completion_by_route_alias", "settlement_owners",
                  "handover_latest", "handover_by_parent", "handover_by_binding",
-                 "headless_owner_rows")
+                 "headless_owner_rows", "selection_by_parent", "selection_by_slug",
+                 "selection_by_attempt", "selection_by_parent_slug")
 
     def __init__(self, lines: tuple[str, ...], order_base: int):
         self.lines = lines
@@ -125,18 +128,29 @@ class _RegistrySegment:
         completion_by_route_alias = {}
         settlement_owners = []
         handover_latest = {}
+        selection_by_parent = {}
+        selection_by_slug = {}
+        selection_by_attempt = {}
+        selection_by_parent_slug = {}
         self.malformed_rows = 0
         for relative_order, line in enumerate(lines):
             fields = tuple(line.split("\t"))
             if len(fields) != 6:
                 self.malformed_rows += 1
                 continue
-            completion_items = _completion_metadata(fields[5])
-            handover_items = _handover_metadata(fields[5])
-            record = RegistryRecord(order_base + relative_order, line, fields,
-                                     completion_items, handover_items)
+            record = RegistryRecord(order_base + relative_order, fields)
             records.append(record)
-            completion_meta = dict(completion_items)
+            completion_meta = dict(_completion_metadata(fields[5]))
+            handover_meta = dict(_handover_metadata(fields[5]))
+            parent = completion_meta.get("parent")
+            attempt_id = completion_meta.get("attempt_id")
+            if parent:
+                selection_by_parent.setdefault(parent, []).append(record)
+            selection_by_slug.setdefault(fields[4], []).append(record)
+            if attempt_id:
+                selection_by_attempt.setdefault(attempt_id, []).append(record)
+            if parent:
+                selection_by_parent_slug.setdefault((parent, fields[4]), []).append(record)
             attempt = completion_meta.get("attempt_id")
             if attempt:
                 completion_all.setdefault(attempt, []).append(record)
@@ -157,7 +171,6 @@ class _RegistrySegment:
                     and completion_meta.get("launch_started") == "1"
                     and completion_meta.get("supervisor_lease") == "flock-v1"):
                 settlement_owners.append(record)
-            handover_meta = dict(handover_items)
             handover_attempt = handover_meta.get("attempt_id")
             if handover_attempt:
                 handover_latest[handover_attempt] = (fields[1], record)
@@ -174,6 +187,12 @@ class _RegistrySegment:
         }
         self.settlement_owners = tuple(settlement_owners)
         self.handover_latest = handover_latest
+        self.selection_by_parent = {key: tuple(value) for key, value in selection_by_parent.items()}
+        self.selection_by_slug = {key: tuple(value) for key, value in selection_by_slug.items()}
+        self.selection_by_attempt = {key: tuple(value) for key, value in selection_by_attempt.items()}
+        self.selection_by_parent_slug = {
+            key: tuple(value) for key, value in selection_by_parent_slug.items()
+        }
         self._index_handover()
 
     def _index_handover(self):
@@ -212,6 +231,10 @@ class _RegistrySegment:
         completion_by_parent_sid = {}
         completion_by_route_alias = {}
         result.handover_latest = {}
+        selection_by_parent = {}
+        selection_by_slug = {}
+        selection_by_attempt = {}
+        selection_by_parent_slug = {}
         for segment in segments:
             result.completion_latest.update(segment.completion_latest)
             for attempt, error in segment.completion_errors.items():
@@ -223,6 +246,14 @@ class _RegistrySegment:
                 for key, rows in source.items():
                     target.setdefault(key, []).extend(rows)
             result.handover_latest.update(segment.handover_latest)
+            for target, source in (
+                (selection_by_parent, segment.selection_by_parent),
+                (selection_by_slug, segment.selection_by_slug),
+                (selection_by_attempt, segment.selection_by_attempt),
+                (selection_by_parent_slug, segment.selection_by_parent_slug),
+            ):
+                for key, rows in source.items():
+                    target.setdefault(key, []).extend(rows)
         result.completion_all = {key: tuple(value) for key, value in completion_all.items()}
         result.completion_children = {key: tuple(value) for key, value in completion_children.items()}
         result.completion_by_parent_sid = {
@@ -233,6 +264,12 @@ class _RegistrySegment:
         }
         result.settlement_owners = tuple(record for segment in segments
                                         for record in segment.settlement_owners)
+        result.selection_by_parent = {key: tuple(value) for key, value in selection_by_parent.items()}
+        result.selection_by_slug = {key: tuple(value) for key, value in selection_by_slug.items()}
+        result.selection_by_attempt = {key: tuple(value) for key, value in selection_by_attempt.items()}
+        result.selection_by_parent_slug = {
+            key: tuple(value) for key, value in selection_by_parent_slug.items()
+        }
         result._index_handover()
         return result
 
@@ -320,6 +357,47 @@ class RegistryView:
     @property
     def records(self) -> tuple[RegistryRecord, ...]:
         return tuple(record for segment in self._segments for record in segment.records)
+
+    def select_rows(self, *, parent: str = "", slug: str = "", attempt_id: str = ""):
+        """Select latest CLI rows from indexes built with this registry generation."""
+        candidates = {}
+        for segment in self._segments:
+            if attempt_id:
+                rows = segment.selection_by_attempt.get(attempt_id, ())
+            elif parent and slug:
+                rows = segment.selection_by_parent_slug.get((parent, slug), ())
+            elif parent:
+                rows = segment.selection_by_parent.get(parent, ())
+            elif slug:
+                rows = segment.selection_by_slug.get(slug, ())
+            else:
+                rows = segment.records
+            for record in rows:
+                candidates[record.order] = record
+
+        ordered = [(record.order, list(record.fields), record.completion_metadata())
+                   for record in candidates.values()]
+        if self._tail:
+            tail_lines = self._tail.decode("utf-8", errors="replace").splitlines()
+            for offset, line in enumerate(tail_lines):
+                fields = line.split("\t")
+                if len(fields) == 6:
+                    metadata = dict(_completion_metadata(fields[5]))
+                    ordered.append((self.line_count - 1 + offset,
+                                    fields, metadata))
+
+        latest = {}
+        for order, fields, metadata in sorted(ordered, key=lambda item: item[0]):
+            if parent and metadata.get("parent") != parent:
+                continue
+            if slug and fields[4] != slug:
+                continue
+            if attempt_id and metadata.get("attempt_id") != attempt_id:
+                continue
+            key = (("attempt", metadata["attempt_id"]) if metadata.get("attempt_id")
+                   else ("legacy", fields[2], fields[3], fields[4]))
+            latest[key] = (fields, metadata)
+        return list(latest.values())
 
     def require_complete_text(self) -> None:
         """Authority cannot prove absence from damaged or uncommitted text."""
@@ -448,6 +526,56 @@ class RegistryView:
                     continue
                 result.append((status, record))
         return tuple(result)
+
+
+@dataclass(frozen=True, slots=True)
+class RegistrySnapshot:
+    """One complete registry generation with the exact lines decoded from it.
+
+    Selected authority envelopes intentionally remain separate: a bounded row
+    selection can identify candidates, but it cannot establish registry-wide
+    absence. Consumers that need absence proofs must use a complete snapshot.
+    """
+
+    path_identity: str
+    resolved_path: str
+    signature: tuple[int, int, int, int, int]
+    view: RegistryView
+    lines: tuple[str, ...]
+    complete: bool
+    reason: str = ""
+
+    def matches_jobs(self, jobs) -> bool:
+        path = Path(jobs)
+        try:
+            return (str(path.absolute()) == self.path_identity
+                    and str(path.resolve(strict=True)) == self.resolved_path
+                    and tuple(self.view.signature) == tuple(self.signature))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+
+    def contains_current_attempt(self, rows, *, attempt_id: str, status: str) -> bool:
+        """Match the selected owner row to this generation's current attempt.
+
+        This checks only the selected target. Registry-wide absence and
+        prerequisite proofs still use ``rows`` from the complete snapshot.
+        """
+        if (not self.complete or not attempt_id
+                or not isinstance(rows, (list, tuple))):
+            return False
+        latest, error = self.view.completion_attempt(attempt_id)
+        if error or latest is None or latest.status != status:
+            return False
+        latest_metadata = latest.completion_metadata()
+        try:
+            for fields, metadata in rows:
+                if (isinstance(fields, (list, tuple)) and isinstance(metadata, dict)
+                        and tuple(fields) == latest.fields
+                        and metadata == latest_metadata):
+                    return True
+        except (TypeError, ValueError):
+            return False
+        return False
 
 
 def _stable_read(path: Path, path_identity: str, *, start: int = 0):
@@ -599,6 +727,38 @@ def registry_text_lines(jobs: Path) -> tuple[str, ...] | None:
     if scope is None:
         return None
     return _pinned_generation(scope, jobs)[1]
+
+
+def registry_snapshot(jobs: Path) -> RegistrySnapshot:
+    """Return the complete view and exact source lines from one stable generation.
+
+    Outside an existing pass, the temporary scope ensures the view and text
+    lines come from the same stable read. Inside a pass, every consumer of this
+    path receives the already pinned generation and a failed read stays failed
+    until that pass ends.
+    """
+    path = Path(jobs)
+    scope = _READ_SCOPE.get()
+    if scope is None:
+        with registry_read_scope():
+            return registry_snapshot(path)
+    view, lines = _pinned_generation(scope, path)
+    reason = ""
+    if view.has_invalid_utf8:
+        reason = "registry-invalid-utf8"
+    elif view.has_partial_tail:
+        reason = "registry-partial-tail"
+    elif view.malformed_rows:
+        reason = "registry-malformed"
+    elif tuple(lines) != view.lines:
+        # The segmented view indexes LF records. Non-canonical splitlines
+        # separators remain readable for diagnostics but cannot prove absence.
+        reason = "registry-line-boundary-invalid"
+    return RegistrySnapshot(
+        path_identity=str(path.absolute()), resolved_path=view.resolved_path,
+        signature=tuple(view.signature), view=view, lines=tuple(lines),
+        complete=not reason, reason=reason,
+    )
 
 
 def registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:

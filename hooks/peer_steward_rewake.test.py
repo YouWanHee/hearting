@@ -9,9 +9,11 @@ import io
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -24,20 +26,24 @@ _PEER_STEWARD = _HERE.parent / "utilities" / "peer-steward.py"
 sys.path.insert(0, str(_HERE.parent / "tools"))
 sys.path.insert(0, str(_HERE.parent / "utilities"))
 import fixture_processes  # noqa: E402
+from dispatch_contract import process_start_ticks  # noqa: E402
 
 _FAKE_HERDR = r'''#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
 mode = os.environ.get("FAKE_HERDR_MODE", "idle")
 target = argv[2] if len(argv) > 2 else "-"
+shell_pid = int(os.environ["FAKE_HERDR_SHELL_PID"])
+shell_pgid = int(os.environ["FAKE_HERDR_SHELL_PGID"])
+shell_argv = json.loads(os.environ["FAKE_HERDR_SHELL_ARGV"])
 info = {"result": {"agent": {"agent": "claude", "agent_session": {"value": "sid-fake"},
         "agent_status": "idle", "name": target, "pane_id": "w1:p9"}, "type": "agent_info"}}
 verb = argv[1] if len(argv) > 1 else ""
 if argv[:2] == ["pane", "process-info"]:
     print(json.dumps({"result": {"process_info": {
-        "pane_id": argv[-1], "shell_pid": os.getppid(),
-        "foreground_process_group_id": os.getppid(),
-        "foreground_processes": [{"pid": os.getppid(), "argv": ["zsh"]}]}}}))
+        "pane_id": argv[-1], "shell_pid": shell_pid,
+        "foreground_process_group_id": shell_pgid,
+        "foreground_processes": [{"pid": shell_pid, "argv": shell_argv}]}}}))
     sys.exit(0)
 if verb == "wait" and mode == "held":
     with open(os.environ["FAKE_HERDR_FIFO"], "r") as fh:
@@ -51,9 +57,15 @@ class _HookMixin:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
-        # After the tmp-dir cleanup so it runs first (LIFO).
+        self.shell = subprocess.Popen(
+            ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(self._stop_shell)
+        # Reap detached watches before the target shell and temporary state go away.
         self.addCleanup(fixture_processes.reap, str(self.root), fifo=str(self.root / "release.fifo"))
-        self.jobs = self.root / "jobs.log"
+        self.jobs = self.root / "peer-state" / "jobs.log"
+        self.jobs.parent.mkdir(parents=True)
         self.jobs.touch()
         self.bin = self.root / "fakebin"
         self.bin.mkdir()
@@ -62,7 +74,42 @@ class _HookMixin:
         fake.chmod(0o755)
         self.fifo = self.root / "release.fifo"
         os.mkfifo(self.fifo)
+        self.endpoint_path = self.root / "herdr.sock"
+        self.endpoint_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.endpoint_listener.bind(str(self.endpoint_path))
+        self.endpoint_listener.listen()
+        self.endpoint_listener.settimeout(0.1)
+        self.endpoint_stop = threading.Event()
+        self.endpoint_accepts = 0
+        self.endpoint_thread = threading.Thread(target=self._serve_endpoint, daemon=True)
+        self.endpoint_thread.start()
+        self.addCleanup(self._stop_endpoint)
         self.session = "steward-hook-1"
+
+    def _stop_shell(self):
+        if self.shell.poll() is None:
+            self.shell.terminate()
+        try:
+            self.shell.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.shell.kill()
+            self.shell.wait(timeout=2)
+
+    def _serve_endpoint(self):
+        while not self.endpoint_stop.is_set():
+            try:
+                connection, _address = self.endpoint_listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            self.endpoint_accepts += 1
+            connection.close()
+
+    def _stop_endpoint(self):
+        self.endpoint_stop.set()
+        self.endpoint_listener.close()
+        self.endpoint_thread.join(timeout=1)
 
     def _env(self, mode="idle", session_id=None):
         env = dict(os.environ)
@@ -90,6 +137,12 @@ class _HookMixin:
         env["XDG_DATA_HOME"] = str(self.root / "data")
         env["FAKE_HERDR_MODE"] = mode
         env["FAKE_HERDR_FIFO"] = str(self.fifo)
+        env["FAKE_HERDR_SHELL_PID"] = str(self.shell.pid)
+        env["FAKE_HERDR_SHELL_PGID"] = str(os.getpgid(self.shell.pid))
+        env["FAKE_HERDR_SHELL_ARGV"] = json.dumps([
+            part.decode("utf-8", errors="replace") for part in
+            Path(f"/proc/{self.shell.pid}/cmdline").read_bytes().split(b"\0") if part])
+        env["HERDR_SOCKET_PATH"] = str(self.endpoint_path)
         env["CLAUDE_CODE_SESSION_ID"] = session_id or self.session
         env["PATH"] = str(self.bin) + os.pathsep + env.get("PATH", "")
         env.pop("AGENT_PEER_STEWARD_REWAKE_MAX_SECONDS", None)
@@ -250,6 +303,26 @@ class DeliveryTest(_HookMixin, unittest.TestCase):
         ack = json.loads(ack_path.read_text())
         self.assertEqual(ack["carrier"], "claude-async-rewake")
         self.assertEqual(ack["session_id"], self.session)
+
+        # The explicit local endpoint accepted real ObservationTransport
+        # connections and closed them without a census. The existing runner
+        # then used the stable-identity Herdr CLI path to publish readiness.
+        self.assertGreater(self.endpoint_accepts, 0)
+        readiness_root = (self.root / "peer-state" / "peer-steward" /
+                          "obligations" / "readiness-v1")
+        projections = [json.loads(path.read_text())
+                       for path in readiness_root.glob("*.json")
+                       if path.name != "runner.json"]
+        matches = [item for item in projections
+                   if item.get("identity", {}).get("endpoint") == str(self.endpoint_path)
+                   and item.get("identity", {}).get("pane") == "w1:p9"
+                   and item.get("identity", {}).get("session_id") == "sid-fake"]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["result"]["state"], "ready")
+        self.assertEqual(matches[0].get("lineage"), {
+            "shell_pid": self.shell.pid,
+            "shell_start": str(process_start_ticks(self.shell.pid)),
+        })
 
         # A second carrier must not create a second ack.
         again = subprocess.run(
