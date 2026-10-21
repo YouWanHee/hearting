@@ -31,11 +31,15 @@ describe how to reach them; judge any structure or change against these first.
    execution. There are no per-harness exception branches or duplicated
    judgments. (See §3 and §5.)
 
-For durable completion delivery, an exact recipient-side receipt remains valid
-after the transport claim expires or changes owner. The shared delivery record
-may settle only the matching delivery from that verified receipt; receiving a
-notice does not mean its work or follow-up has completed. Emission remains
-recoverable when no receipt exists.
+For durable completion delivery, an exact native receipt remains valid after
+the transport claim expires or changes owner. All carriers reuse that receipt
+through the delivery's existing immutable identity and `ack_received` CAS; an
+ACK write failure leaves the verified receipt usable for suppressing another
+send while settlement is retried naturally. Output, process exit, queue
+acceptance, or an incomplete native-history read is not receipt evidence.
+Receiving a notice settles delivery only: it does not complete the work or its
+follow-up. When native receipt evidence is absent or unknown, emission remains
+recoverable through the existing fallback.
 
 ## 1. The unit of a feature is a responsibility carried to the end
 
@@ -141,6 +145,13 @@ under the duty's existing update lock before that successor can claim it.
 The inherited descriptor and that record carry the transfer without another
 CLI input or a second recovery owner.
 
+When several consumers need the same expensive read, the existing runner may
+publish one narrow, identity-bound observation for them to reuse. Each detached
+watch still owns its native result, watch id, deadline, receipt, and ack; a
+shared projection only answers readiness and never settles another watch. A
+consumer with a missing or stale projection reconnects to its existing duty
+and observes again without replaying work already owned by its live runner.
+
 Session hooks request that existing recovery runner and return; they do not
 replay global settlement history before delivering and acknowledging the
 session's own notices. The runner retains observation state across requests.
@@ -156,20 +167,21 @@ blocking or its identity becomes uncertain. An unrelated pane event alone
 must not restart the native readiness probes while completion is impossible.
 
 Long-lived observers may retain a bounded projection of an immutable result
-while every file generation it depended on remains current. File metadata is a
-candidate-generation hint, not proof that the bytes are unchanged: reuse a
-parsed view only after observing stable current bytes and confirming equality
-with the cached content. This validation reads the file even when parsing and
-index construction can be reused, and its I/O belongs in read-cost metrics.
-The projection must name its dependencies, and a missing, unreadable,
-retargeted, or unstable input discards the prior result instead of turning it
-into authority. Mutable writer documents stay separate from historical read
-projections. Append-only reuse is limited to a continuously observed file
-whose supported writer appends records. After stable current bytes are read,
-compare the entire cached prefix before reusing prior segments and indexes; a
-changed prefix or uncertain write rebuilds the view. A partial byte tail
-remains data, not a row, until its newline arrives. Reusing parsed segments
-avoids reparsing unchanged rows, while content validation still incurs I/O.
+while every file generation it depended on remains current. A retained open
+descriptor identifies the generation behind each cached registry view; path
+metadata is checked against that descriptor before reuse, and an atomic path
+replacement moves the cache to the new file generation. Append reuse is
+limited to the registry writer's append protocol and reads only the suffix
+through the retained descriptor. Scoped readers that already read current
+bytes compare their digest with the cached generation before reusing its
+indexes. Registry writers may append rows or atomically replace the file;
+arbitrary in-place truncation or rewrite is unsupported. A partial byte tail
+remains data, not a row, until its newline arrives. The projection must name
+its dependencies, and a missing, unreadable, retargeted, or unstable input
+discards the prior result instead of turning it into authority. Mutable writer
+documents stay separate from historical read projections. Reusing parsed
+segments avoids reparsing unchanged rows, while append reads incur only suffix
+I/O and scoped digest validation counts the bytes it reads.
 Reusing derived decisions additionally requires unchanged dependencies, while
 live recipients, leases, claims, processes, and
 state transitions remain fresh observations.
@@ -214,6 +226,14 @@ Exact comparison protects sealed evidence from tampering; it is not a reason to
 refuse the normal ways work moves. When a recovery path still refuses, the
 refusal names what differs and the supported next step. A state with no
 supported way forward is a defect in the path, not a task for the operator.
+
+An attempt registration is not work that reached the launch fence. Only a
+never-started registration closed as cancelled under the registry lock is
+withdrawn from round censuses. An open registration reserves its round until
+claimed or closed, and an actual pre-launch failure remains a verdict-less
+round. Timeout cleanup closes only that exact row while the never-started proof
+still holds under the registry lock; claimed, identified, started, and
+unobservable rows remain with reconciliation.
 
 A caller-identity refusal records who may not launch; it does not settle the
 existing recovery duty. An explicit start may re-enter the same exact claim

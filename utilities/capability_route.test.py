@@ -8127,10 +8127,13 @@ class ComposeRouteTest(TestRoute):
   before=json.dumps(route,sort_keys=True)
   caller=types.SimpleNamespace(known=True,harness="codex",session_id="this-turn")
   with mock.patch("session_identity.identity",return_value=caller):
-   for origin,expected in (("peer:verifier·ref","peer-notice"),("unattributed","user-card")):
+   for origin,expected in (("peer:verifier·ref","peer-notice"),
+                           ("runtime:completion·attempt/delivery","user-card"),
+                           ("unattributed","user-card")):
     with self.subTest(origin=origin), mock.patch.object(R,"_turn_peer_source",return_value=origin):
      observed=R.compose_observations(route)
      self.assertEqual(observed["confirmation"]["method"],expected)
+     self.assertEqual(observed["confirmation"]["origin"],origin)
      self.assertIn("확인 방식 "+expected,R.compose_card(route))
   self.assertEqual(json.dumps(route,sort_keys=True),before)
   R.verify_route(route)
@@ -10418,6 +10421,46 @@ class GitIndexLockPreparationReceipt(unittest.TestCase):
    self.assertEqual((os.fstat(lock_fd).st_dev,os.fstat(lock_fd).st_ino),
                     (os.lstat(lock).st_dev,os.lstat(lock).st_ino))
    os.close(lock_fd)
+
+
+class TerminalGateRegistrySnapshotTest(unittest.TestCase):
+ def test_complete_snapshot_reaches_marker_and_owner_terminal_helpers(self):
+  import dispatch_registry_cache as CACHE
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); jobs=root/"jobs.log"; completions=root/"completions"
+   jobs.write_text(
+    "job\tdone\t/repo\t/wt\towner\tattempt_id=att-owner,attempt_schema_version=2\n"
+    "job\tdone\t/repo\t/wt\tprerequisite\tattempt_id=att-prereq,attempt_schema_version=2\n",
+    encoding="utf-8")
+   CACHE.clear_cache()
+   snapshot=CACHE.registry_snapshot(jobs)
+   route={"route_id":"rt-snapshot","route_hash":"sha256:"+"a"*64,
+    "artifact_root":str(root),"nodes":[
+     {"id":"marked","terminal":True,"terminal_gate":"worker"},
+     {"id":"owner","terminal":True,"terminal_gate":"owner",
+      "kind":"capability-owner","unit":"_kernel/owner","dispatch_depth":1,
+      "depends_on":["marked"]}]}
+   seen={"marker_lines":[]}
+   def marker(*_args,**kwargs):
+    seen["marker_lines"].append(kwargs["registry_lines"])
+    return {"passed":False,"reason":"fixture"}
+   def owner(*_args,**kwargs):
+    seen["owner_view"]=kwargs["registry_view"]
+    seen["owner_lines"]=kwargs["registry_lines"]
+    return {"passed":False,"reason":"fixture"}
+   with mock.patch.object(R,"completion_dir",return_value=completions), \
+        mock.patch.object(R,"_marker_identity_row",side_effect=marker), \
+        mock.patch.object(R,"_owner_terminal_observation",side_effect=owner):
+    R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True,
+                                registry_snapshot=snapshot)
+    self.assertEqual(R.owner_terminal_prerequisites(
+     route,route["nodes"][1],jobs,registry_lines=snapshot.lines),{"marked":"fixture"})
+   self.assertIs(seen["owner_view"],snapshot.view)
+   self.assertEqual(tuple(seen["owner_lines"]),snapshot.lines)
+   self.assertTrue(seen["marker_lines"])
+   self.assertTrue(all(tuple(lines)==snapshot.lines for lines in seen["marker_lines"]))
+   self.assertEqual(len(seen["owner_view"].records),2,
+                    "owner absence checks must receive the full view, not its selected owner row")
 
 
 if __name__=="__main__": unittest.main()

@@ -394,7 +394,8 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
     metadata = metadata or {}
     if action == "handover" and not facts.get("eligible", False):
         return ContinuationDecision(False, "settled", next_action="settle")
-    if (action == "handover" or facts.get("actor")) and not owns(metadata, facts.get("actor"), jobs):
+    if (action == "handover" or facts.get("actor")) and not owns(
+            metadata, facts.get("actor"), jobs, read_context=facts.get("read_context")):
         return ContinuationDecision(False, "protected", "work-parent-recovery-required", "report")
     if facts.get("history_conflict"):
         return ContinuationDecision(False, "protected", facts["history_conflict"], "report")
@@ -542,7 +543,7 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                                     "The same owner's input consumer is reachable or its terminal result settles.")
     if action == "handover":
         allowed = status in {"open", "running"}
-        if status == "done":
+        if status in {"done", "cancelled", "killed"}:
             import dispatch_seat_handover as handover
             allowed = (facts.get("delivery_open") if "delivery_open" in facts else
                        handover._delivery_open(jobs, metadata)) or (
@@ -794,14 +795,19 @@ def correction_source_session(environ=None) -> str:
     return session_label(environ)
 
 
-def owns(meta, session, jobs) -> bool:
-    """The launching session, or its confirmed same-seat successor after a /clear (seat handover)."""
-    if session and meta.get("parent_sid") == session:
-        return True
-    if not session or jobs is None:
+def owns(meta, session, jobs, *, read_context=None) -> bool:
+    """Only the session that answers for the attempt now (``effective_parent``).
+
+    That is the registered parent before a confirmed handover and the end of its
+    lineage after one. Unreadable handover state retains the existing
+    registered-parent fallback.
+    """
+    if not session:
         return False
     from dispatch_seat_handover import owns as seat_owns
-    return seat_owns(meta, session, jobs)
+    if read_context is None:
+        return seat_owns(meta, session, jobs)
+    return seat_owns(meta, session, jobs, read_context=read_context)
 
 
 def require_replacement_parent(jobs, rows, meta, *, current_session) -> None:
@@ -835,7 +841,7 @@ def replacement_parent_matches(source, candidate, jobs, *, lineage=False) -> boo
         return True
     if lineage and candidate.get('dispatch_depth') == '1':
         # A registered A -> B edge survives a later B -> C handover. Admission
-        # still accepts only the registered parent or the current successor.
+        # still accepts only the source's current effective parent.
         from dispatch_seat_handover import effective_parent
         current = effective_parent(source, jobs)
         return bool(current) and effective_parent(candidate, jobs) == current
@@ -1716,7 +1722,10 @@ def _recorded_pid_reused(row, identity):
 
 def resource_predecessor_finished(row):
     """A resource's exact ended execution, independent of its scientific verdict."""
-    from resource_run_registry import classify_identity, resource_never_started, reboot_evidence
+    from resource_run_registry import (
+        classify_identity, resource_never_started, resource_process_group_quiescent,
+        reboot_evidence,
+    )
     from dispatch_resource_wait import supervisor
     if resource_never_started(row):
         return True
@@ -1735,9 +1744,13 @@ def resource_predecessor_finished(row):
             and reboot_evidence(row)):
         return True
     code = supervisor().runner().read_sentinel(row.get("sentinel"))
+    # A foreign recorded exit proves the leader's result only. Supervised
+    # resources still need the independent process-group quiescence check.
     return (code is not None and row.get("exit_code", code) == code
             and not (row.get("status") == "failed" and code == 0)
-            and not (row.get("status") == "succeeded" and code != 0))
+            and not (row.get("status") == "succeeded" and code != 0)
+            and (row.get("resource_policy") != "supervised-owner"
+                 or resource_process_group_quiescent(row)))
 
 
 def require_resource_predecessors(rows, candidate):
@@ -2141,10 +2154,10 @@ def declared_subsession(args) -> bool:
 
 
 def new_owner_request(previous_row, *, jobs=None, task=None):
-    """A changed sealed assignment after a settled failure, without rewriting it."""
+    """A changed sealed assignment after a settled attempt, without rewriting it."""
     if (jobs is None or not isinstance(task, str) or not task.strip()
             or previous_row.get("_status") not in {"done", "closed"}
-            or committed_outcome(previous_row["_status"], previous_row) != "failed"):
+            or committed_outcome(previous_row["_status"], previous_row) not in {"failed", "succeeded"}):
         return False
     from dispatch_contract import (
         DispatchContractError, attempt_process_quiescence, terminal_conflict_pending,
@@ -2589,6 +2602,95 @@ def completion_gate_fail_fields(error, route_file, route_node) -> dict:
     return fields
 
 
+def _admit_supervised_owner_resource_start(args, agent_home, jobs):
+    """Use the normal child start as the owner-controlled resource completion edge."""
+    route_file = getattr(args, "route_file", None)
+    route_node = getattr(args, "route_node", None)
+    if not route_file or not route_node:
+        return False
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        target = next((row for row in route.get("nodes", [])
+                       if isinstance(row, dict) and row.get("id") == route_node), None)
+    except (OSError, ValueError, TypeError):
+        return False
+    if target is None:
+        return False
+    supervised_resources = {
+        row.get("id") for row in route.get("nodes", [])
+        if isinstance(row, dict) and row.get("kind") == "resource-runner"
+        and (row.get("continuation") or {}).get("kind") == "supervised"
+    }
+    # Ordinary stages never open the workflow ledger here: only a start that
+    # follows a supervised resource node can be its owner-controlled edge.
+    if not supervised_resources.intersection(target.get("depends_on") or []):
+        return False
+    import dispatch_resource_wait as OWNER_RESOURCE
+    supervisor = OWNER_RESOURCE.supervisor()
+    ledger = supervisor.ledger_for(route, str(jobs))
+    armed_rows = supervisor.read_armed(ledger)
+    candidates = []
+    for predecessor in target.get("depends_on") or []:
+        node = next((row for row in route.get("nodes", [])
+                    if isinstance(row, dict) and row.get("id") == predecessor), None)
+        armed = armed_rows.get(predecessor)
+        if (node is None or node.get("kind") != "resource-runner"
+                or (node.get("continuation") or {}).get("kind") != "supervised"
+                or not armed or armed.get("predecessor_kind") != "resource"
+                or route_node not in (armed.get("successors") or [])):
+            continue
+        try:
+            registry = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
+            row = registry["runs"][armed["predecessor_id"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if row.get("resource_policy") == "supervised-owner":
+            candidates.append((predecessor, armed))
+    if not candidates:
+        return False
+    if getattr(args, "dispatch_depth", None) != 2:
+        raise _contract_error("resource-owner-start-requires-live-parent", str(route_node))
+    from dispatch_contract import (
+        DispatchContractError, parent_lookup_worktree, resolve_live_parent_attempt,
+    )
+    import dispatch_owner_input as INPUT
+    import subprocess
+    try:
+        repo = subprocess.check_output(
+            ["git", "-C", args.worktree, "rev-parse", "--show-toplevel"], text=True,
+        ).strip()
+        owner = resolve_live_parent_attempt(
+            Path(jobs),
+            parent_slug=getattr(args, "parent_slug", None) or "",
+            repo=repo,
+            worktree=parent_lookup_worktree(
+                args.worktree, route_file,
+                subsession=bool(getattr(args, "subsession_id", None)),
+                parent_attempt_id=getattr(args, "parent_attempt_id", None),
+            ),
+            expected_attempt_id=getattr(args, "parent_attempt_id", None),
+            expected_harness=getattr(args, "parent_harness", None),
+            expected_transport=getattr(args, "parent_transport", None),
+            expected_sandbox=getattr(args, "parent_sandbox", None),
+        )
+        owner_input = INPUT.inspect(jobs, owner.attempt_id)
+        if (owner_input.get("supervisor_live") is not True
+                or not owner_input.get("thread_id")
+                or owner_input.get("thread_id") == INPUT.PLACEHOLDER_THREAD):
+            raise DispatchContractError("resource-owner-session-unavailable", owner.attempt_id)
+        try:
+            supervisor.admit_owner_successor_start(
+                route, route_node, jobs, owner.attempt_id, owner_input["thread_id"],
+            )
+        except supervisor.SupervisorError as error:
+            raise DispatchContractError("resource-owner-stage-admission-blocked", str(error)) from error
+    except (DispatchContractError, INPUT.InputError, OSError, subprocess.SubprocessError) as error:
+        if isinstance(error, DispatchContractError):
+            raise
+        raise _contract_error("resource-owner-start-authority-unavailable", str(error)) from error
+    return True
+
+
 def completion_gate(args, action: str, agent_home, jobs, *, gate, before=()):
     """The route's completion and preview gate for one launch, the same in every wrapper.
 
@@ -2601,6 +2703,8 @@ def completion_gate(args, action: str, agent_home, jobs, *, gate, before=()):
     try:
         for check in before:
             check()
+        if action == "start":
+            _admit_supervised_owner_resource_start(args, agent_home, jobs)
         gate(args.route_file, args.route_node, action, agent_home, jobs, attempt_id=args.attempt_id,
              planned_revision_nodes=preview_request_nodes(args, jobs))
     except DispatchContractError as error:

@@ -2034,6 +2034,56 @@ class DispatchContractTest(unittest.TestCase):
     if proc.poll() is None:proc.kill()
     proc.wait()
 
+ def test_completion_readiness_ignores_withdrawn_but_drains_for_active_siblings(self):
+  route={"route_id":"rt-ready-fence"};node={"id":"plan","kind":"pipeline-stage"}
+  marker={"attempt_id":"att-ready-main","registered_worker":True}
+  exact=attempt_row({"route_id":route["route_id"],"route_node":node["id"],
+                     "attempt_id":marker["attempt_id"],"note":"completed-marker",
+                     "failure_class":"pass"},status="done")
+  residue={"route_id":route["route_id"],"route_node":node["id"],
+           "attempt_id":"att-ready-residue","launch_claimed":"0"}
+  withdrawn={**residue,"failure_class":"cancelled","launch_outcome":"never-launched"}
+  cases=(
+   (withdrawn,"done","ready"),
+   ({**residue},"open","draining"),
+   ({**residue},"running","draining"),
+   ({**residue,"launch_claimed":"1"},"open","draining"),
+   ({**residue,"pid":"123"},"open","draining"),
+   ({**residue,"launch_started":"1"},"open","draining"),
+   ({key:value for key,value in residue.items() if key!="launch_claimed"},"open","draining"),
+  )
+  with mock.patch.object(D,"attempt_process_quiescence",
+                         return_value=D.ProcessQuiescence("quiescent","fixture")):
+   for sibling,status,expected in cases:
+    with self.subTest(sibling=sibling):
+     result=D.completion_attempt_readiness(
+      route,node,marker,Path("unused"),
+      registry_lines=[exact,attempt_row(sibling,status=status)])
+     self.assertEqual(result.state,expected)
+
+ def test_withdrawn_before_launch_predicate_requires_terminal_cancellation(self):
+  base={"route_id":"rt-withdrawn","route_node":"plan","attempt_id":"att-withdrawn",
+        "launch_claimed":"0","launch_outcome":"never-launched","failure_class":"cancelled"}
+  for status in ("done","cancelled","killed"):
+   self.assertTrue(D.attempt_row_withdrawn_before_launch(
+    attempt_row(base,status=status).split("\t")))
+  negatives=(
+   (attempt_row(base,status="open").split("\t")),
+   (attempt_row(base,status="running").split("\t")),
+   (attempt_row({k:v for k,v in base.items() if k!="launch_claimed"},status="done").split("\t")),
+   (attempt_row({**base,"launch_claimed":"1"},status="done").split("\t")),
+   (attempt_row({**base,"pid":"123"},status="done").split("\t")),
+   (attempt_row({**base,"launch_started":"1"},status="done").split("\t")),
+   (attempt_row({**base,"launch_outcome":"started"},status="done").split("\t")),
+   (attempt_row({k:v for k,v in base.items() if k!="failure_class"},status="done").split("\t")),
+   (attempt_row({**base,"failure_class":"contract"},status="done").split("\t")),
+   (attempt_row({**base,"failure_class":"capacity"},status="done").split("\t")),
+   (attempt_row(base,status="done").split("\t")[:5]),
+  )
+  for fields in negatives:
+   with self.subTest(fields=fields):
+    self.assertFalse(D.attempt_row_withdrawn_before_launch(fields))
+
  def test_claimed_spawn_rechecks_parent_and_publishes_identity_under_lock(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"
@@ -2067,6 +2117,58 @@ class DispatchContractTest(unittest.TestCase):
     for proc in (child,parent):
      if proc is not None and proc.poll() is None:proc.kill()
      if proc is not None:proc.wait()
+
+ def _fenced_spawn(self,td,suffix,**kwargs):
+  """A live owner process, the jobs log and the binding for a claimed, not yet spawned child row."""
+  jobs=Path(td)/"jobs.log"
+  parent=subprocess.Popen(["sleep","60"])
+  start=D.process_start_ticks(parent.pid)
+  jobs.write_text(self.owner_row(f"att-parent-{suffix}",parent.pid,start)+"\n")
+  binding=D.resolve_live_parent_attempt(
+   jobs,parent_slug="owner",repo="/repo",worktree="/wt",
+   expected_attempt_id=f"att-parent-{suffix}")
+  child_row=("2026-07-23T00:00:01Z\topen\t/repo\t/wt\tchild\t"
+             f"{CURRENT},worker_type=stage,parent=owner,"
+             f"parent_attempt_id=att-parent-{suffix},attempt_id=att-child-{suffix}")
+  self.assertTrue(D.claim_attempt_row(jobs,f"att-child-{suffix}",child_row,launch=False))
+  return parent,jobs,binding
+
+ def _fence_spawn(self,gate_fd):
+  return subprocess.Popen(
+   [sys.executable, str(Path(__file__).with_name("launch-fence.py")),
+    "--parent-pid", str(os.getpid()), "--gate-fd", str(gate_fd), "--",
+    "sleep", "60"],
+   pass_fds=(gate_fd,), start_new_session=True)
+
+ def test_claimed_spawn_records_the_launch_cgroup_while_the_child_is_fenced(self):
+  with tempfile.TemporaryDirectory() as td:
+   parent,jobs,binding=self._fenced_spawn(td,"cgroup-record")
+   child=None
+   try:
+    with mock.patch.object(D,"process_unified_cgroup",return_value="/x/session-1.scope"), \
+         mock.patch.object(D,"process_cgroup_namespace_identity",return_value="cgroup:[9]"):
+     child,_identity=D.spawn_claimed_attempt(
+      jobs,"att-child-cgroup-record",parent_binding=binding,spawn=self._fence_spawn,
+      launch_metadata={"launch_lifecycle":"detached"})
+    meta=D.parse_registry_metadata(jobs.read_text().splitlines()[1].split("\t")[5])
+    self.assertEqual(D._recorded_launch_cgroup(meta),("/x/session-1.scope","cgroup:[9]"))
+    self.assertEqual(meta["launch_cgroup_ns"],"cgroup:[9]")
+   finally:
+    for proc in (child,parent):
+     if proc is not None and proc.poll() is None:proc.kill()
+     if proc is not None:proc.wait()
+
+ def test_claimed_spawn_refuses_a_supplied_launch_cgroup(self):
+  with tempfile.TemporaryDirectory() as td:
+   parent,jobs,binding=self._fenced_spawn(td,"cgroup-supplied")
+   try:
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.spawn_claimed_attempt(
+      jobs,"att-child-cgroup-supplied",parent_binding=binding,spawn=self._fence_spawn,
+      launch_metadata={"launch_cgroup_b64":"L3g="})
+    self.assertEqual(caught.exception.reason,"attempt-launch-identity-metadata-conflict")
+   finally:
+    parent.kill();parent.wait()
 
  def test_claimed_spawn_starts_zero_children_when_parent_dies_before_final_check(self):
   with tempfile.TemporaryDirectory() as td:
@@ -2832,6 +2934,55 @@ class DispatchContractTest(unittest.TestCase):
    self.assertIn("\topen\t",jobs.read_text())
    self.assertTrue(D.close_attempt_row_if(jobs,attempt,"dead-test",lambda _fields:True))
    self.assertIn("note=dead-test",jobs.read_text())
+
+ def test_conditional_close_refuses_claimed_rows_and_duplicate_identity(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log";attempt="att-close-claim-race"
+   row=(f"2026-07-16T00:00:00Z\topen\t/r\t/w\ts\t{CURRENT},"
+        f"route_id=r,route_node=n,attempt_id={attempt},launch_claimed=0")
+   self.assertTrue(D.claim_attempt_row(jobs,attempt,row))
+   self.assertTrue(D.claim_attempt_row(jobs,attempt,row,launch=True))
+   self.assertFalse(D.close_attempt_row_if(
+    jobs,attempt,"never-launched",D.attempt_row_never_started))
+   fields=jobs.read_text().strip().split("\t")
+   metadata=D.parse_registry_metadata(fields[5])
+   self.assertEqual((metadata["launch_claimed"],fields[1]),("1","open"))
+   jobs.write_text("\n".join((row,row))+"\n",encoding="utf-8")
+   self.assertFalse(D.close_attempt_row_if(
+    jobs,attempt,"never-launched",D.attempt_row_never_started))
+   self.assertEqual([line.split("\t")[1] for line in jobs.read_text().splitlines()],
+                    ["open","open"])
+
+ def test_timeout_close_and_launch_claim_race_has_one_winner(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log";attempt="att-close-launch-race"
+   row=(f"2026-07-16T00:00:00Z\topen\t/r\t/w\ts\t{CURRENT},"
+        f"route_id=r,route_node=n,attempt_id={attempt},launch_claimed=0")
+   self.assertTrue(D.claim_attempt_row(jobs,attempt,row))
+   gate=threading.Barrier(3);results={}
+   def close():
+    gate.wait(timeout=5)
+    results["close"]=D.close_attempt_row_if(
+     jobs,attempt,"never-launched",D.attempt_row_never_started)
+   def claim():
+    gate.wait(timeout=5)
+    results["claim"]=D.claim_attempt_row(jobs,attempt,row,launch=True)
+   workers=[threading.Thread(target=close),threading.Thread(target=claim)]
+   for worker in workers:worker.start()
+   gate.wait(timeout=5)
+   for worker in workers:worker.join(timeout=5)
+   self.assertTrue(all(not worker.is_alive() for worker in workers))
+   self.assertEqual(sum(bool(results.get(key)) for key in ("close","claim")),1,results)
+   fields=jobs.read_text(encoding="utf-8").strip().split("\t")
+   metadata=D.parse_registry_metadata(fields[5])
+   if results["close"]:
+    self.assertEqual(fields[1],"done")
+    self.assertEqual(metadata.get("launch_claimed"),"0")
+   else:
+    self.assertEqual(fields[1],"open")
+    self.assertEqual(metadata.get("launch_claimed"),"1")
+    self.assertFalse(D.close_attempt_row_if(
+     jobs,attempt,"never-launched",D.attempt_row_never_started))
 
  def test_teardown_claim_excludes_ordinary_close_and_owner_closes_atomically(self):
   with tempfile.TemporaryDirectory() as td:
@@ -4922,6 +5073,124 @@ class DrainReceiptDeniedEnvironTest(unittest.TestCase):
                     ("unverifiable",f"procfs-environ:{self.late.pid}:{errno.EIO}"))
    self.assertEqual(D.attempt_process_quiescence(self.sealed,terminal_receipt=True).reason,
                     "attempt-descendant-unverifiable")
+
+
+class LaunchCgroupDeniedEnvironTest(unittest.TestCase):
+ """A same-UID process whose environment cannot be read is outside the attempt when it runs in a
+ systemd service unit disjoint from the cgroup recorded at launch; anything else stays unverifiable."""
+
+ LAUNCH="/user.slice/user-1000.slice/session-7.scope"
+ NS="cgroup:[4026531835]"
+ DBUS="/user.slice/user-1000.slice/user@1000.service/dbus.service"
+
+ def setUp(self):
+  proc=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],start_new_session=True)
+  self.plain=dict(D.process_launch_identity(proc.pid),pgid=str(proc.pid),
+                  attempt_id="att-launch-cgroup",launch_lifecycle="detached")
+  proc.terminate();proc.wait(timeout=5)
+  self.recorded=dict(self.plain,**D.launch_cgroup_values(self.LAUNCH,self.NS))
+  self.late=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"])
+  self.addCleanup(self.late.wait,5);self.addCleanup(self.late.terminate)
+
+ def denied(self):
+  real=Path.read_bytes
+  target=f"/proc/{self.late.pid}/environ"
+  def read_bytes(path):
+   if str(path)==target:
+    raise PermissionError(errno.EACCES,"denied")
+   return real(path)
+  return mock.patch.object(Path,"read_bytes",read_bytes)
+
+ def cgroup(self,path):
+  real=Path.read_text
+  target=f"/proc/{self.late.pid}/cgroup"
+  def read_text(p,*args,**kwargs):
+   if str(p)==target:
+    return f"0::{path}\n"
+   return real(p,*args,**kwargs)
+  return mock.patch.object(Path,"read_text",read_text)
+
+ def same_ns(self,namespace=None):
+  return mock.patch.object(D,"process_cgroup_namespace_identity",return_value=namespace or self.NS)
+
+ def probes(self,metadata):
+  """Single-shot and batch answers for the same row."""
+  single=D.attempt_tagged_descendants(metadata)
+  with D.process_table_scan_scope():
+   batch=D.attempt_tagged_descendants(metadata)
+  self.assertEqual((single.state,single.reason),(batch.state,batch.reason))
+  return single
+
+ def unverifiable(self,metadata):
+  probe=self.probes(metadata)
+  self.assertEqual((probe.state,probe.reason),
+                   ("unverifiable",f"procfs-environ:{self.late.pid}:same-uid-unobservable"))
+
+ def test_a_denied_process_inside_the_launch_cgroup_stays_unverifiable(self):
+  for path in (self.LAUNCH,self.LAUNCH+"/sub"):
+   with self.denied(),self.cgroup(path),self.same_ns():
+    self.unverifiable(self.recorded)
+    self.assertEqual(D.attempt_process_quiescence(self.recorded,terminal_receipt=True).reason,
+                     "attempt-descendant-unverifiable")
+
+ def test_a_denied_service_born_after_launch_outside_the_launch_cgroup_is_not_a_descendant(self):
+  for path in (self.DBUS,"/user.slice/user-1000.slice/user@1000.service/app.slice/gnome-keyring.service"):
+   with self.denied(),self.cgroup(path),self.same_ns():
+    self.assertEqual(self.probes(self.recorded).state,"empty")
+    self.assertEqual(D.attempt_process_quiescence(self.recorded,terminal_receipt=True).state,"quiescent")
+
+ def test_a_disjoint_scope_stays_unverifiable(self):
+  for path in ("/user.slice/user-1000.slice/user@1000.service/app.slice/vte-spawn-1.scope",
+               "/user.slice/user-1000.slice/session-8.scope"):
+   with self.denied(),self.cgroup(path),self.same_ns():
+    self.unverifiable(self.recorded)
+
+ def test_a_row_without_a_launch_cgroup_keeps_todays_answer(self):
+  with self.denied(),self.cgroup(self.DBUS),self.same_ns():
+   self.unverifiable(self.plain)
+   self.assertEqual(D.attempt_process_quiescence(self.plain,terminal_receipt=True).reason,
+                    "attempt-descendant-unverifiable")
+
+ def test_another_cgroup_namespace_or_an_enclosing_launch_cgroup_never_excludes(self):
+  with self.denied(),self.cgroup(self.DBUS):
+   with self.same_ns("cgroup:[1]"):
+    self.unverifiable(self.recorded)
+   with self.same_ns():
+    self.unverifiable(dict(self.plain,**D.launch_cgroup_values("/",self.NS)))
+    self.unverifiable(dict(self.plain,**D.launch_cgroup_values(self.DBUS+"/x",self.NS)))
+    self.unverifiable(dict(self.recorded,launch_cgroup_b64="!!not-base64!!"))
+    for malformed in ("L3g=!!!","L3g=garbage"):
+     self.unverifiable(dict(self.recorded,launch_cgroup_b64=malformed))
+    self.unverifiable(dict(self.recorded,launch_cgroup_ns=""))
+
+ def test_a_readable_tag_still_wins_over_a_service_cgroup(self):
+  tagged=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],
+                          env=dict(os.environ,**{D.ATTEMPT_DESCENDANT_ENV:self.recorded["attempt_id"]}))
+  try:
+   with self.denied(),self.cgroup(self.DBUS),self.same_ns():
+    verdict=D.attempt_process_quiescence(self.recorded,terminal_receipt=True)
+    self.assertEqual((verdict.state,verdict.reason,verdict.pid),("live","attempt-descendant-live",tagged.pid))
+  finally:
+   tagged.terminate();tagged.wait(timeout=5)
+
+ def test_a_changed_start_between_reads_is_not_excluded(self):
+  real=Path.read_text
+  target=f"/proc/{self.late.pid}/stat"
+  reads=[]
+  def read_text(path,*args,**kwargs):
+   text=real(path,*args,**kwargs)
+   if str(path)==target:
+    reads.append(text)
+    if len(reads)>1:   # the cgroup re-check sees another incarnation of the pid
+     head,_,tail=text.rpartition(") ")
+     fields=tail.split();fields[19]=str(int(fields[19])+1)
+     return head+") "+" ".join(fields)
+   return text
+  with self.denied(),self.cgroup(self.DBUS),self.same_ns(),mock.patch.object(Path,"read_text",read_text):
+   probe=D.attempt_tagged_descendants(self.recorded)
+  self.assertGreater(len(reads),1)
+  self.assertEqual((probe.state,probe.reason),
+                   ("unverifiable",f"procfs-environ:{self.late.pid}:same-uid-unobservable"))
 
 
 class CancellationReceiptWedgeTest(unittest.TestCase):

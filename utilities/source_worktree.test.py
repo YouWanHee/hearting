@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Focused worktree preparation and compose --start failure/retry boundary tests."""
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -204,6 +206,152 @@ class SourceWorktreeFixture(unittest.TestCase):
         self.assertEqual(self.probe_cwds, [route["cwd"]])
         self.assertEqual(self.start_calls[0][0]["work_request"]["text"], original_prompt.decode())
         self.assertEqual(self.start_calls[0][0]["artifact_root"], str(self.artifact_root.resolve()))
+
+class FramedStartPolicyTest(SourceWorktreeFixture):
+    def linked_at(self, branch, ref):
+        path = Path(self.tmp.name) / f"linked-{branch}"
+        git(self.primary, "worktree", "add", "-q", "-b", branch, str(path), ref)
+        git(path, "config", "user.name", "Fixture")
+        git(path, "config", "user.email", "fixture@example.test")
+        return path
+
+    def test_implicit_dirty_or_unmerged_linked_checkout_is_retained(self):
+        base_sha = git(self.writer, "rev-parse", "HEAD~1")
+        dirty = self.linked_at("dirty-linked", base_sha)
+        (dirty / "untracked.txt").write_text("keep me\n", encoding="utf-8")
+        dirty_head = git(dirty, "rev-parse", "HEAD")
+        result = R.prepare_isolated_worktree(dirty, "framed-dirty", artifact_root=self.artifact_root,
+                                             preparation_key={"test": "dirty"}, framed_start=True)
+        self.assertEqual(result["state"], "retained-linked")
+        self.assertEqual(result["reason"], "linked-worktree-dirty")
+        self.assertEqual(result["cwd"], str(dirty.resolve()))
+        self.assertEqual(git(dirty, "rev-parse", "HEAD"), dirty_head)
+        self.assertTrue((dirty / "untracked.txt").exists())
+
+        unmerged = self.linked_at("unmerged-linked", base_sha)
+        (unmerged / "local.txt").write_text("local\n", encoding="utf-8")
+        git(unmerged, "add", "local.txt")
+        git(unmerged, "commit", "-qm", "unmerged local work")
+        unmerged_head = git(unmerged, "rev-parse", "HEAD")
+        result = R.prepare_isolated_worktree(unmerged, "framed-unmerged", artifact_root=self.artifact_root,
+                                             preparation_key={"test": "unmerged"}, framed_start=True)
+        self.assertEqual(result["state"], "retained-linked")
+        self.assertEqual(result["reason"], "linked-worktree-unmerged")
+        self.assertEqual(git(unmerged, "rev-parse", "HEAD"), unmerged_head)
+
+    def test_clean_merged_linked_checkout_allocates_from_the_fetched_remote_sha_once(self):
+        base_sha = git(self.writer, "rev-parse", "HEAD~1")
+        linked = self.linked_at("merged-linked", base_sha)
+        real = R._worktree_git
+        calls = []
+
+        def record(cwd, *args):
+            calls.append(args)
+            return real(cwd, *args)
+
+        with mock.patch.object(R, "_worktree_git", side_effect=record):
+            result = R.prepare_isolated_worktree(linked, "framed-merged", artifact_root=self.artifact_root,
+                                                 preparation_key={"test": "merged"}, framed_start=True)
+        self.assertEqual(result["state"], "created")
+        self.assertEqual(Path(result["cwd"]).parent, self.primary.parent / "repo-wt")
+        self.assertEqual(git(result["cwd"], "rev-parse", "HEAD"), self.remote_sha)
+        self.assertEqual(sum(args[:1] == ("fetch",) for args in calls), 1)
+
+    def test_explicit_linked_checkout_keeps_approved_meaning_without_fetch(self):
+        linked = self.linked_at("explicit-linked", git(self.writer, "rev-parse", "HEAD~1"))
+        with mock.patch.object(R, "_remote_default_base", side_effect=AssertionError("explicit cwd is approved")):
+            result = R.prepare_isolated_worktree(linked, "explicit", artifact_root=self.artifact_root,
+                                                 preparation_key={"test": "explicit"},
+                                                 explicitly_approved=True, framed_start=True)
+        self.assertEqual(result["state"], "reused")
+        self.assertEqual(result["reason"], "approved-linked-task")
+        self.assertEqual(result["cwd"], str(linked.resolve()))
+
+    def test_framed_compose_start_from_a_stale_merged_branch_reads_the_fetched_remote_default(self):
+        git(self.primary, "switch", "-q", "-c", "merged-long-ago", "HEAD~1")
+        before = self.primary_fingerprint()
+        argv = self.argv()
+        for flag in ("--shape", "--capability"):
+            del argv[argv.index(flag):argv.index(flag) + 2]
+        started = []
+
+        def start(route, path, jobs):
+            started.append(route)
+            return {"state": "running", "owner_started": True, "launches": []}
+
+        def readiness(cwd, jobs, parent_harness, children, **kwargs):
+            self.probe_cwds.append(str(Path(cwd).resolve()))
+            # The caller's harness follows the session running the test; seal a sandbox its wrapper exports.
+            return {"tuples": [{
+                "parent_harness": parent_harness, "parent_transport": "headless",
+                "parent_sandbox": {"codex": "workspace-write"}.get(parent_harness, "adapter-default"),
+                "child_harness": "codex",
+                "launch_authority": "conductor", "status": "supported",
+                "probe_source": "fixture", "probe_time": "2026-10-15T00:00:00Z",
+                "failure_class": "", "checked_worktree": str(Path(cwd).resolve()),
+                "failure_scope": "none", "codex_command": "ok", "retry_on_isolated_worktree": 0,
+            }], **candidates()}
+
+        notice = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(W, "start_work", side_effect=start), \
+                mock.patch.object(R, "_compose_readiness", side_effect=readiness), \
+                contextlib.redirect_stderr(notice):
+            self.assertEqual(R.main(), 0)
+        route, = started
+        expected = str((self.primary.parent / "repo-wt" / "retry-task").resolve())
+        self.assertEqual((route["capability"], route["selection"]["shape"]), ("route-frame", "framed"))
+        self.assertEqual((route["cwd"], route["source_commit"]), (expected, self.remote_sha))
+        self.assertEqual((route["framed_worktree"]["state"], route["framed_worktree"]["branch"]),
+                         ("created", "retry-task"))
+        self.assertEqual(git(expected, "branch", "--show-current"), "retry-task")
+        self.assertEqual(set(self.probe_cwds), {expected})
+        self.assertEqual(self.primary_fingerprint(), before)
+        self.assertIn("worktree_prepared=created", notice.getvalue())
+        self.assertIn(f"Frame read basis: prepared {expected} at {self.remote_sha}.", W.frame_task_text(route))
+
+    def test_framed_compose_start_fetch_failure_seals_old_cwd_and_continues(self):
+        argv = self.argv()
+        argv[argv.index("solo")] = "framed"
+        self.evidence.write_text(json.dumps({"tuples": [{
+            "parent_harness": "claude", "parent_transport": "headless",
+            "parent_sandbox": "adapter-default", "child_harness": "codex",
+            "launch_authority": "conductor", "status": "supported",
+            "probe_source": "fixture", "probe_time": "2026-10-15T00:00:00Z",
+            "failure_class": "", "checked_worktree": str(self.primary.resolve()),
+            "failure_scope": "none", "codex_command": "ok", "retry_on_isolated_worktree": 0,
+        }], "native_subagent": []}), encoding="utf-8")
+        real = R._worktree_git
+
+        def fail_fetch(cwd, *args):
+            if args[:1] == ("fetch",):
+                return subprocess.CompletedProcess(["git", *args], 128, "", "injected\nfetch failure")
+            return real(cwd, *args)
+
+        started = []
+        def start(route, path, jobs):
+            started.append((route, Path(path)))
+            return {"state": "running", "owner_started": True, "launches": []}
+
+        notice = io.StringIO()
+        with mock.patch.object(R, "_worktree_git", side_effect=fail_fetch), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(W, "start_work", side_effect=start), \
+                contextlib.redirect_stderr(notice):
+            self.assertEqual(R.main(), 0)
+        self.assertEqual(len(started), 1)
+        route_files = self.route_files()
+        self.assertEqual(len(route_files), 1)
+        route = json.loads(route_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(route["cwd"], str(self.primary.resolve()))
+        self.assertEqual(route["source_commit"], git(self.primary, "rev-parse", "HEAD"))
+        self.assertEqual(route["framed_worktree"]["state"], "failed")
+        self.assertEqual(route["selection"]["shape"], "framed")
+        self.assertEqual(notice.getvalue().count("framed_worktree_fallback="), 1)
+        self.assertNotIn("worktree_prepared=failed", notice.getvalue())
+        self.assertEqual(notice.getvalue().count("framed_worktree_fallback="),
+                         sum(line.startswith("framed_worktree_fallback=") for line in notice.getvalue().splitlines()))
+        self.assertNotIn("\nfetch failure", notice.getvalue())
+
 
 class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
     def test_read_only_changed_file_status_disables_optional_index_refresh(self):

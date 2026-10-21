@@ -1061,6 +1061,66 @@ def _native_queue_delivery_once(
             "client_user_message_id": client_message_id,
             "deduplicated_by": "pending-delivery-ledger",
         }
+    from dispatch_recipient_receipt import (
+        codex_consumed_evidence, codex_queue_evidence, receipt_marker,
+        settle_native_receipt,
+    )
+    context += "\n" + "\n".join(
+        receipt_marker(record, args.thread_id) for record in records)
+    # Recover an exact native receipt before taking another queue claim. A
+    # successful queue RPC is insufficient; the strict history translator
+    # requires the stable client id and this exact marker-bearing body.
+    # The registered recipient owns the record; after an approved handover,
+    # only the exact current successor may settle it. A predecessor's native
+    # history is never promoted into the successor's receipt.
+    native_threads = (target,) if target != args.thread_id else (args.thread_id,)
+    previous_send_observed = any(
+        record.get("state") in {"claimed", "sent-ambiguous"}
+        or int(record.get("attempts") or 0) > 0
+        for record in records)
+    for native_thread in (native_threads if previous_send_observed else ()):
+        evidence = codex_queue_evidence(
+            endpoint=path, session_id=native_thread, delivery_id=client_message_id,
+            expected_message=context, timeout=5.0, session=session)
+        if evidence is None:
+            continue
+        bindings = set(evidence.get("bindings") or ())
+        expected_ids = {record["delivery_id"] for record in records}
+        found_ids = {delivery_id for delivery_id, _digest in bindings}
+        if not expected_ids & found_ids:
+            continue
+        receiving_turn = evidence.get("receiving_turn")
+        if (not isinstance(receiving_turn, dict)
+                or not isinstance(receiving_turn.get("turn_id"), str)
+                or not isinstance(receiving_turn.get("status"), str)):
+            return {"schema_version": 1, "status": "sent-ambiguous",
+                    "reason": "native-receiving-turn-unknown", "submitted": True,
+                    "thread_id": args.thread_id, "client_user_message_id": client_message_id}
+        from peer_obligations import retain_registered_completion
+        retained = all(retain_registered_completion(
+            args.jobs, row.attempt_id, native_thread, "codex-native-queue",
+            delivery_record={**record, "_storage_key": args.thread_id},
+            receiving_turn=receiving_turn)
+            for row, record in zip(rows, records))
+        if not retained:
+            return {"schema_version": 1, "status": "sent-ambiguous",
+                    "reason": "native-receipt-retention-pending", "submitted": True,
+                    "thread_id": args.thread_id, "client_user_message_id": client_message_id}
+        outcomes = [settle_native_receipt(
+            root, args.thread_id, "codex", native_thread, record, evidence,
+            acked_by=acked_by) for record in records]
+        if all(outcome["received"] for outcome in outcomes):
+            return {"schema_version": 1, "status": "accepted",
+                    "reason": ("native-receipt-ack-pending"
+                               if not all(outcome["settled"] for outcome in outcomes)
+                               else "native-receipt-settled"),
+                    "thread_id": args.thread_id, "client_user_message_id": client_message_id}
+        # The batch body and native client id are exact. A partial binding is
+        # malformed evidence, so preserve recovery without enqueueing a second
+        # copy of a message that already reached this native turn.
+        return {"schema_version": 1, "status": "sent-ambiguous",
+                "reason": "native-batch-receipt-partial", "submitted": True,
+                "thread_id": args.thread_id, "client_user_message_id": client_message_id}
     records = [record for record in records if record.get("state") != "acked"]
     if any(record.get("state") not in {"pending", "claimed", "sent-ambiguous"}
            for record in records):
@@ -1134,9 +1194,29 @@ def _native_queue_delivery_once(
                         "reason": "native-receiving-turn-retain-unavailable",
                         "submitted": True, "thread_id": args.thread_id,
                         "client_user_message_id": client_message_id}
+            evidence = codex_consumed_evidence(
+                session_id=turn_thread, client_message_id=client_message_id,
+                confirmed_client_message_id=client_message_id, expected_message=context)
+            outcomes = []
             for delivery_id in claimed:
-                pending_delivery.ack(root, args.thread_id, delivery_id, acked_by=acked_by)
-            return {"schema_version": 1, "status": "accepted",
+                exact = pending_delivery.read(root, args.thread_id, delivery_id)
+                if exact is None:
+                    outcomes.append({"received": False, "settled": False})
+                    continue
+                outcomes.append(settle_native_receipt(
+                    root, args.thread_id, "codex", turn_thread, exact, evidence,
+                    acked_by=acked_by))
+            if all(outcome["received"] for outcome in outcomes):
+                return {"schema_version": 1, "status": "accepted",
+                        "reason": ("native-receipt-ack-pending"
+                                   if not all(outcome["settled"] for outcome in outcomes)
+                                   else "native-receipt-settled"),
+                        "thread_id": args.thread_id, "client_user_message_id": client_message_id}
+            for delivery_id in claimed:
+                pending_delivery.mark_sent_ambiguous(
+                    root, args.thread_id, delivery_id, claim_owner=claim_owner)
+            return {"schema_version": 1, "status": "sent-ambiguous",
+                    "reason": "native-receipt-binding-unavailable", "submitted": True,
                     "thread_id": args.thread_id, "client_user_message_id": client_message_id}
         if send_observed:
             for delivery_id in claimed:

@@ -34,6 +34,12 @@ assert SPEC is not None and SPEC.loader is not None
 rewake = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = rewake
 SPEC.loader.exec_module(rewake)
+FIXTURE_PROCESSES_SPEC = importlib.util.spec_from_file_location(
+    "dispatch_fixture_processes", ROOT / "tools/fixture_processes.py"
+)
+assert FIXTURE_PROCESSES_SPEC is not None and FIXTURE_PROCESSES_SPEC.loader is not None
+fixture_processes = importlib.util.module_from_spec(FIXTURE_PROCESSES_SPEC)
+FIXTURE_PROCESSES_SPEC.loader.exec_module(fixture_processes)
 
 _JOIN_PATH = Path(__file__).resolve().parents[1] / "utilities" / "dispatch_completion_join.py"
 _JOIN_SPEC = importlib.util.spec_from_file_location("dispatch_completion_join", _JOIN_PATH)
@@ -348,6 +354,25 @@ class DispatchOwnerRewakeTest(unittest.TestCase):
         command = run.call_args_list[0].args[0]
         self.assertEqual(command[-2:], ["--attempt-id", "att-owner-1"])
         self.assertIn(str(self.jobs), command)
+
+    def test_canonical_wait_consumes_runner_projection_without_helper_process(self) -> None:
+        launch = rewake.parse_launch(self.payload())
+        assert launch is not None
+        store = mock.Mock()
+        store.get.return_value = {"id": "readiness-request"}
+        source_root = MODULE_PATH.parents[1]
+        with mock.patch.object(rewake, "agent_home", return_value=source_root), \
+                mock.patch.object(rewake.peer_obligations, "ObligationStore", return_value=store), \
+                mock.patch.object(rewake.peer_obligations, "ensure_normal_runner", return_value=True), \
+                mock.patch.object(rewake.shared_readiness, "current_result",
+                                  return_value={"state": "ready", "children": []}) as result, \
+                mock.patch.object(rewake.subprocess, "run", side_effect=AssertionError("helper spawned")):
+            outcome = rewake.wait_for_attempt(
+                launch, source_root / "utilities" / "dispatch-attempt-ready.py")
+        self.assertEqual(outcome, ("ready", "terminal-quiescent"))
+        result.assert_called_once()
+        store.create.assert_called_once()
+        self.assertEqual(store.update.call_args.kwargs["state"], "complete")
 
     def test_probe_timeout_keeps_the_exact_owner_wait_armed(self) -> None:
         launch = rewake.parse_launch(self.payload())
@@ -1572,7 +1597,17 @@ class CarrierOneClaimGateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
+        self._fixture_child_handles = []
         self.root = Path(self.temporary.name)
+        fixture_root = str(self.root)
+        child_handles = self._fixture_child_handles
+
+        def reap_fixture_processes():
+            fixture_processes.reap(fixture_root)
+            for child in child_handles:
+                child.wait(timeout=10)
+
+        self.addCleanup(reap_fixture_processes)
         self.jobs = self.root / "jobs.log"
         # This suite's env was previously ambient (only exercised correctly
         # because the invoking shell already had a real AGENT_HOME); under
@@ -1713,12 +1748,67 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                 self._open_row(ancestry=restorable_parent)
                 self.jobs.write_text(self.jobs.read_text().replace("claude-parent-runtime", carrier))
                 path = self._close_and_materialize(close_note)
-                with mock.patch.object(rewake.peer_obligations, "ensure_normal_runner"):
+                with mock.patch.object(rewake.peer_obligations, "ensure_normal_runner"), \
+                        mock.patch.object(steward.peer_obligations, "request_dispatch_reconciliation") as reconcile:
                     activate(self.root, carrier, "session-1")
+                    reconcile.assert_called_once_with(self.root)
                 store = rewake.peer_obligations.ObligationStore(self.root)
                 duty = next(d for d in store.list() if d["intent"]["identity"]["harness"] == harness)
                 self.assertEqual(json.loads(path.read_text())["attempts"], 0)
                 agents = {"result": {"agents": []}}
+                recipient_agent = {"agent": harness, "pane_id": "w1:p9", "name": "fixture",
+                                   "agent_status": "idle",
+                                   "agent_session": {"kind": "id", "value": "session-1"}}
+                process_pid = 73101
+                process_info = {"pane_id": "w1:p9", "shell_pid": 73100,
+                                "foreground_process_group_id": process_pid,
+                                "foreground_processes": [{"pid": process_pid, "argv": [harness]}]}
+                observed_commands = []
+                native_identity_calls = []
+                codex_thread_calls = []
+
+                def external_observation(argv, **_kwargs):
+                    command = list(argv)
+                    if command[:2] == ["herdr", "--session"]:
+                        command = command[3:]
+                    elif command[:1] == ["herdr"]:
+                        command = command[1:]
+                    observed_commands.append(tuple(command))
+                    if command[:2] == ["agent", "list"]:
+                        payload = agents
+                    elif command[:2] == ["agent", "get"]:
+                        self.assertEqual(command[2], "w1:p9")
+                        payload = {"result": {"agent": recipient_agent}}
+                    elif command[:2] == ["pane", "list"]:
+                        payload = {"result": {"panes": [{
+                            "pane_id": "w1:p9", "agent": harness, "agent_status": "idle",
+                            "agent_session": {"kind": "id", "value": "session-1"},
+                            "title": "fixture", "cwd": str(self.root),
+                        }]}}
+                    elif command[:2] == ["pane", "process-info"]:
+                        self.assertEqual(command[command.index("--pane") + 1], "w1:p9")
+                        payload = {"result": {"process_info": process_info}}
+                    else:
+                        self.fail(f"unexpected herdr observation request: {command!r}")
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout=json.dumps(payload), stderr="")
+
+                from types import SimpleNamespace
+                from fleet import process_identity as native_identity
+                import pane_ownership
+
+                def process_identity(pid, observed_harness):
+                    native_identity_calls.append((pid, observed_harness))
+                    if pid == process_pid and observed_harness == harness:
+                        return SimpleNamespace(confidence=native_identity.PROVEN,
+                                               session_id="session-1")
+                    return SimpleNamespace(confidence=native_identity.HARNESS_ONLY,
+                                           session_id="")
+
+                def current_codex_thread(pane, pid=None, server=None, **_kwargs):
+                    codex_thread_calls.append((pane, pid, server))
+                    return "session-1" if pane == "w1:p9" and pid == process_pid else ""
+
                 real_prompt = steward.cmd_prompt
                 delivered = []
                 sent_texts = []
@@ -1799,10 +1889,8 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                             mock.patch.object(steward.peer_message, "_ack_registered_delivery",
                                               side_effect=receiver_ack), \
                             mock.patch.object(steward.peer_message, "bind_dispatch_notice", side_effect=bind), \
-                            mock.patch.object(steward, "_herdr_missing", return_value=False), \
                             mock.patch.object(steward, "_current_session_identity", return_value=("sender-1", "claude")), \
                             mock.patch.object(steward, "_from_name", return_value="fixture"), \
-                            mock.patch.object(steward, "_agent_state", return_value=("idle", "w1:p9")), \
                             mock.patch.object(steward, "_pane_readiness", return_value=type(
                                 "Ready", (), {"state": "ready", "reason": ""})()), \
                             mock.patch.object(steward, "_flush_pending_for_target", return_value=(0, 0)), \
@@ -1836,11 +1924,13 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                                 prepared_refs[0])
                             repair_ack.assert_called_once_with(received)
                         return code
-                with mock.patch.object(steward.subprocess, "run", side_effect=lambda *a, **kw:
-                        type("Reply", (), {"stdout": json.dumps(agents), "returncode": 0})()), \
+                with mock.patch.object(steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                        mock.patch.object(steward.subprocess, "run", side_effect=external_observation), \
+                        mock.patch.object(native_identity, "process_identity", side_effect=process_identity), \
+                        mock.patch.object(pane_ownership, "current_codex_thread",
+                                          side_effect=current_codex_thread), \
                         mock.patch.object(rewake.pending_delivery, "claim",
                                           wraps=rewake.pending_delivery.claim) as claim_spy, \
-                        mock.patch.object(steward, "_resolve_target", return_value=(harness, "session-1", None)), \
                         mock.patch.object(steward, "cmd_prompt", side_effect=prompt) as prompt_call:
                     steward._resume_registered_obligation(duty, store)
                     prompt_call.assert_not_called()
@@ -1857,6 +1947,17 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                     self.assertEqual(prompt_call.call_args.kwargs["expected_recipient"], (harness, "session-1"))
                     self.assertTrue(any(call.kwargs.get("jobs") == self.jobs
                                         for call in claim_spy.call_args_list))
+                    self.assertIn(("agent", "get", "w1:p9"), observed_commands)
+                    self.assertTrue(any(command[:2] == ("pane", "process-info")
+                                        for command in observed_commands))
+                    if harness == "codex":
+                        self.assertTrue(codex_thread_calls)
+                        self.assertTrue(all(pane == "w1:p9" and pid == process_pid
+                                            for pane, pid, _server in codex_thread_calls))
+                    else:
+                        self.assertTrue(native_identity_calls)
+                        self.assertTrue(all((pid, observed_harness) == (process_pid, harness)
+                                            for pid, observed_harness in native_identity_calls))
                     if not immediate:
                         queued = store.get(duty["id"])
                         self.assertEqual(queued["state"], "pending")
@@ -1971,15 +2072,31 @@ class CarrierOneClaimGateTest(unittest.TestCase):
         duty, = store.list()
         sent = []
         real_prompt = steward.cmd_prompt
-        def prompt(args, *, expected_recipient, on_prepared=None):
+        def prompt(args, *, expected_recipient, on_prepared=None, producer_binding=None):
             self.assertEqual(expected_recipient, ("claude", recipient_sid))
+            self.assertIsInstance(producer_binding, dict)
+            delivery = json.loads(path.read_text())
+            self.assertEqual(producer_binding["schema"], steward.peer_message._RUNTIME_PRODUCER_SCHEMA)
+            self.assertEqual(producer_binding["duty_id"], duty["id"])
+            self.assertEqual(producer_binding["jobs"], str(self.jobs))
+            self.assertEqual(producer_binding["attempt_id"], duty["intent"]["identity"]["attempt_id"])
+            self.assertEqual(producer_binding["carrier"], duty["intent"]["carrier"])
+            self.assertEqual(producer_binding["delivery_id"], delivery["delivery_id"])
+            self.assertEqual(producer_binding["receipt_digest"], delivery["receipt_digest"])
+            self.assertEqual(producer_binding["recipient"], {
+                "harness": expected_recipient[0], "session_id": expected_recipient[1]})
+            self.assertEqual(producer_binding["route_id"], "rt-owner")
+            self.assertEqual(producer_binding["route_node"], "report")
+            self.assertEqual(args.ref, [duty["id"], duty["intent"]["identity"]["attempt_id"],
+                                        delivery["delivery_id"]])
             if changed_pane:
                 # The real courier must refuse before sealing any payload if
                 # its own target read no longer matches the retained identity.
                 with mock.patch.object(steward, "_herdr_missing", return_value=False), \
                         mock.patch.object(steward, "_resolve_target", return_value=("claude", "stranger", None)), \
                         mock.patch.object(steward.peer_message, "prepare_peer_message") as sealed:
-                    code = real_prompt(args, expected_recipient=expected_recipient, on_prepared=on_prepared)
+                    code = real_prompt(args, expected_recipient=expected_recipient,
+                                       on_prepared=on_prepared, producer_binding=producer_binding)
                     sealed.assert_not_called()
                     return code
             sent.append(Path(args.body_file).read_text())
@@ -2173,6 +2290,77 @@ class CarrierOneClaimGateTest(unittest.TestCase):
         self.assertEqual(rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))["state"], "lapsed")
 
 
+class CarrierFixtureCleanupBoundaryTest(unittest.TestCase):
+    def _run_probe(self, fail_body):
+        observations = {}
+        original_cleanup = tempfile.TemporaryDirectory.cleanup
+        writer = (
+            "import os,time\n"
+            "d=os.environ['FIXTURE_DIR']\n"
+            "open(os.path.join(d,'writer-ready'),'w').write(str(os.getpid()))\n"
+            "i=0\n"
+            "while True:\n"
+            "    i+=1; open(os.path.join(d,'writer-%d'%i),'w').close(); time.sleep(0.005)\n"
+        )
+
+        class Probe(CarrierOneClaimGateTest):
+            def __init__(self):
+                super().__init__("runTest")
+
+            def setUp(self):
+                super().setUp()
+                env = dict(os.environ, FIXTURE_DIR=str(self.root))
+                child = subprocess.Popen([sys.executable, "-c", writer], env=env,
+                                         start_new_session=True, stdin=subprocess.DEVNULL)
+                self._fixture_child_handles.append(child)
+                deadline = time.monotonic() + 10
+                ready = self.root / "writer-ready"
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "fixture writer did not start")
+                pid = int(ready.read_text(encoding="utf-8"))
+                start = fixture_processes._start_ticks(pid)
+                self.assertIsNotNone(start)
+                observations.update(root=str(self.root), pid=pid, start=start)
+
+            def runTest(self):
+                self.assertIn(observations["pid"],
+                              fixture_processes.marked_processes(observations["root"]))
+                if fail_body:
+                    self.fail("intentional carrier fixture assertion failure")
+
+        def observe_before_delete(temporary_directory):
+            if temporary_directory.name == observations.get("root"):
+                pid, start = observations["pid"], observations["start"]
+                observations["remaining"] = fixture_processes.marked_processes(temporary_directory.name)
+                observations["gone_before_delete"] = fixture_processes._gone(pid, start)
+                observations["root_present_before_delete"] = Path(temporary_directory.name).is_dir()
+            return original_cleanup(temporary_directory)
+
+        result = unittest.TestResult()
+        with mock.patch.object(tempfile.TemporaryDirectory, "cleanup", observe_before_delete):
+            Probe().run(result)
+        return result, observations
+
+    def _assert_cleanup_evidence(self, observations):
+        self.assertTrue(observations["root_present_before_delete"])
+        self.assertTrue(observations["gone_before_delete"])
+        self.assertEqual(observations["remaining"], {})
+        self.assertFalse(Path(observations["root"]).exists())
+
+    def test_carrier_fixture_drains_writer_after_normal_body(self):
+        result, observations = self._run_probe(False)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self._assert_cleanup_evidence(observations)
+
+    def test_carrier_fixture_preserves_body_failure_and_drains_writer(self):
+        result, observations = self._run_probe(True)
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("intentional carrier fixture assertion failure", result.failures[0][1])
+        self.assertEqual(result.errors, [])
+        self._assert_cleanup_evidence(observations)
+
+
 class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
     """Top review B1: a hook that lost the completion claim must not consume
     the recipient's gate records on its way to a silent exit, and a winning
@@ -2254,7 +2442,7 @@ class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
         self.assertEqual(code, 0)
         self.assertEqual(rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))["state"], "lapsed")
 
-    def test_a_winning_carrier_acks_a_folded_gate_only_after_the_receipt_went_out(self):
+    def test_a_winning_carrier_keeps_a_folded_gate_ambiguous_after_output(self):
         self._open_row()
         self._close_and_materialize()
         gate_id = self._gate()
@@ -2262,7 +2450,10 @@ class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
             code, out, err = self._run_main()
         self.assertEqual(code, 2)
         self.assertIn("required_action=human-gate:frame-review", err)
-        self.assertEqual(rewake.pending_delivery.read(self.root, "session-1", gate_id)["state"], "acked")
+        gate = rewake.pending_delivery.read(self.root, "session-1", gate_id)
+        self.assertEqual(gate["state"], "sent-ambiguous")
+        from dispatch_recipient_receipt import receipt_marker
+        self.assertIn(receipt_marker(gate, "session-1"), err)
         # and when the emit itself fails, the gate stays retryable
         rewake.arm_path(self.jobs, "att-owner-1").unlink()   # a fresh claim for the second run
         self._open_row()
@@ -2491,7 +2682,7 @@ class CarrierExitRecordTest(unittest.TestCase):
             self.assertEqual(rewake._observe_carrier(rewake.Launch(claim.attempt_id, self.fixture.jobs, claim.session_id), claim, {}), 2)
         self.assertEqual(foreign.read_text(), "keep me")
 
-    def test_append_failure_preserves_completed_claim_and_folded_gate_ack(self):
+    def test_append_failure_preserves_completed_claim_and_folded_gate_recovery(self):
         self.fixture._open_row()
         record_path = self.fixture._close_and_materialize()
         gate_id = self.fixture._gate()
@@ -2503,7 +2694,10 @@ class CarrierExitRecordTest(unittest.TestCase):
         self.assertTrue(out)
         self.assertIn("required_action=human-gate:frame-review", err)
         self.assertEqual(json.loads(record_path.read_text())["state"], "sent-ambiguous")
-        self.assertEqual(rewake.pending_delivery.read(self.fixture.root, "session-1", gate_id)["state"], "acked")
+        gate = rewake.pending_delivery.read(self.fixture.root, "session-1", gate_id)
+        self.assertEqual(gate["state"], "sent-ambiguous")
+        from dispatch_recipient_receipt import receipt_marker
+        self.assertIn(receipt_marker(gate, "session-1"), err)
         self.assertEqual(rewake._read_arm(self.path)["state"], "ended")
 
     def test_term_and_hup_record_then_keep_native_signal_exit(self):
@@ -3300,6 +3494,109 @@ class SupervisionWakeRearmTest(unittest.TestCase):
         self.assertEqual(rewake._read_arm(claim.path)["state"], "ended")
         self.assertEqual(rewake.registry_launch(self._parent_call()).reason, "ended")
 
+    def test_native_supervision_receipt_settles_delivery_but_not_open_owner(self):
+        import dispatch_recipient_receipt as recipient_receipt
+        code, text = self._run("gate")
+        self.assertEqual(code, 2)
+        record = rewake.pending_delivery.read(
+            self.root, "session-1", self.notice["delivery_id"])
+        self.assertEqual(record["receipt"]["kind"], "supervision")
+        evidence = recipient_receipt.claude_feedback_evidence([{
+            "type": "user", "sessionId": "session-1", "summary": "Stop hook feedback",
+            "message": {"content": text},
+        }], "session-1")
+        settled = recipient_receipt.settle_native_receipt(
+            self.root, "session-1", "claude", "session-1", record, evidence,
+            acked_by="native-receipt:claude:session-1")
+        self.assertTrue(settled["received"])
+        self.assertTrue(settled["settled"])
+        self.assertEqual(rewake.pending_delivery.read(
+            self.root, "session-1", self.notice["delivery_id"])["state"], "acked")
+        from dispatch_session_sweep import sweep_deliver
+        self.assertEqual(sweep_deliver(
+            self.root, "claude-parent-runtime", "session-1")[0], [])
+        duty, = [item for item in rewake.peer_obligations.ObligationStore(self.root).list()
+                 if item["intent"]["identity"].get("attempt_id") == "att-owner-1"]
+        self.assertEqual(duty["state"], "pending")
+        owner = JOIN.current_attempt_row(self.jobs, "att-owner-1")
+        self.assertEqual(owner.status, "open")
+        self.assertEqual(json.loads(rewake.arm_path(
+            self.jobs, "att-owner-1").read_text())["state"], "gate-wake-sent")
+
+        self._dead_holder()
+        launch, claim = rewake.registry_launch(self._parent_call())
+        self.assertEqual(launch.armed, "registry-rearm")
+        self.assertEqual(claim.arms, 2)
+        self.assertEqual(JOIN.current_attempt_row(self.jobs, "att-owner-1").status, "open")
+        self._dead_holder()
+        completion = self._complete_owner()
+        self.assertNotEqual(completion.stem, self.notice["delivery_id"])
+        code, completion_text = self._run("ready", self._parent_call())
+        self.assertEqual(code, 2)
+        self.assertIn("state=success", completion_text)
+        completion_record = rewake.pending_delivery.read(
+            self.root, "session-1", completion.stem)
+        self.assertEqual(completion_record["state"], "sent-ambiguous")
+        self.assertIn(recipient_receipt.receipt_marker(completion_record, "session-1"),
+                      completion_text)
+
+    def test_supervision_ack_write_failure_keeps_watch_until_native_retry(self):
+        import dispatch_recipient_receipt as recipient_receipt
+        code, text = self._run("gate")
+        self.assertEqual(code, 2)
+        did = self.notice["delivery_id"]
+        record = rewake.pending_delivery.read(self.root, "session-1", did)
+        evidence = recipient_receipt.claude_feedback_evidence([{
+            "type": "user", "sessionId": "session-1", "summary": "Stop hook feedback",
+            "message": {"content": text},
+        }], "session-1")
+        with mock.patch.object(rewake.pending_delivery, "ack_received",
+                               side_effect=OSError("simulated receipt write failure")):
+            first = recipient_receipt.settle_native_receipt(
+                self.root, "session-1", "claude", "session-1", record, evidence,
+                acked_by="native-receipt:claude:session-1")
+        self.assertTrue(first["received"])
+        self.assertFalse(first["settled"])
+        self.assertEqual(rewake.pending_delivery.read(self.root, "session-1", did)["state"],
+                         "pending")
+        self.assertEqual(JOIN.current_attempt_row(self.jobs, "att-owner-1").status, "open")
+        duty, = [item for item in rewake.peer_obligations.ObligationStore(self.root).list()
+                 if item["intent"]["identity"].get("attempt_id") == "att-owner-1"]
+        self.assertEqual(duty["state"], "pending")
+        self._dead_holder()
+        self.assertEqual(rewake.registry_launch(self._parent_call()).reason, "gate-open")
+
+        retry = recipient_receipt.settle_native_receipt(
+            self.root, "session-1", "claude", "session-1", record, evidence,
+            acked_by="native-receipt:claude:session-1")
+        self.assertTrue(retry["received"])
+        self.assertTrue(retry["settled"])
+        self.assertEqual(rewake.pending_delivery.read(self.root, "session-1", did)["state"],
+                         "acked")
+        from dispatch_session_sweep import sweep_deliver
+        self.assertEqual(sweep_deliver(
+            self.root, "claude-parent-runtime", "session-1")[0], [])
+        self.assertEqual(JOIN.current_attempt_row(self.jobs, "att-owner-1").status, "open")
+        duty, = [item for item in rewake.peer_obligations.ObligationStore(self.root).list()
+                 if item["intent"]["identity"].get("attempt_id") == "att-owner-1"]
+        self.assertEqual(duty["state"], "pending")
+
+        self._dead_holder()
+        launch, claim = rewake.registry_launch(self._parent_call())
+        self.assertEqual(launch.armed, "registry-rearm")
+        self.assertEqual(claim.arms, 2)
+        self._dead_holder()
+        completion = self._complete_owner()
+        self.assertNotEqual(completion.stem, did)
+        code, completion_text = self._run("ready", self._parent_call())
+        self.assertEqual(code, 2)
+        self.assertIn("state=success", completion_text)
+        completion_record = rewake.pending_delivery.read(
+            self.root, "session-1", completion.stem)
+        self.assertEqual(completion_record["state"], "sent-ambiguous")
+        self.assertIn(recipient_receipt.receipt_marker(completion_record, "session-1"),
+                      completion_text)
+
     def test_lost_wake_is_not_acked_and_successor_claim_is_preserved(self):
         pending = rewake.pending_delivery
         delivery_id = self.notice["delivery_id"]
@@ -3461,6 +3758,35 @@ class GateCloseRearmTest(GateCarrierTest):
         # a done row with no claim of this session's is never a new candidate
         self.jobs.write_text(self.jobs.read_text(encoding="utf-8").replace("att-gate-owner", "att-other-done"), encoding="utf-8")
         self.assertIsNone(rewake.registry_launch(self.call()))
+
+    def test_the_chain_end_rearms_what_the_cleared_arming_session_left_after_two_clears(self):
+        # Registered parent A (`session-gate`) -> B -> C by same-seat /clear. B armed the wake and spent it on
+        # a gate record stored under A's key (the owner row's recipient key); B no longer answers for the owner.
+        delivery_id = self._gate_record(state="sent-ambiguous")
+        claim = rewake.claim_arm(self.jobs, "att-gate-owner", "session-B", fresh=True)
+        assert isinstance(claim, rewake.ArmClaim)
+        self.assertTrue(rewake.settle_arm(claim, "gate-wake-sent", gate_delivery_id=delivery_id))
+        path = rewake.arm_path(self.jobs, "att-gate-owner")
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record.update(holder=DEAD_HOLDER, arms=2)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        resolver = lambda meta, jobs=None, **kw: "session-C" if meta.get("parent_sid") == "session-gate" else meta.get("parent_sid")
+        lineage = (mock.patch.object(rewake.seat_handover, "effective_parent", side_effect=resolver),
+                   mock.patch.object(rewake.seat_handover, "owns",
+                                     side_effect=lambda meta, session, jobs=None, **kw:
+                                     meta.get("parent_sid") == session or resolver(meta, jobs) == session))
+        with lineage[0], lineage[1]:
+            existing = rewake._read_arm(path)
+            # Safety unchanged: while the gate record under A's key is open, nobody re-arms.
+            self.assertEqual(rewake._reclaim_refusal(existing, self.jobs, "session-C"), "gate-open")
+            rewake.pending_delivery.ack(self.state, "session-gate", delivery_id, acked_by="gate-release")
+            self.assertIsNone(rewake._reclaim_refusal(existing, self.jobs, "session-C"))
+            self.assertEqual(rewake._reclaim_refusal(existing, self.jobs, "session-B"), "foreign-session")
+            self.assertEqual([a for a, _age in rewake._session_owner_rows(self.jobs, "session-C")], ["att-gate-owner"])
+            self.assertEqual(rewake._session_owner_rows(self.jobs, "session-B"), [])
+            taken = rewake.claim_arm(self.jobs, "att-gate-owner", "session-C", fresh=False)
+            self.assertIsInstance(taken, rewake.ArmClaim)
+            self.assertEqual((taken.session_id, taken.arms), ("session-C", 3))
 
     def test_a_missing_or_unnamed_gate_record_counts_as_open(self):
         # Review R1 B2: only a record that was read and is closed re-arms; an

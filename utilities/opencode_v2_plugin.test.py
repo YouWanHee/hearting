@@ -1,25 +1,339 @@
 #!/usr/bin/env python3
 """Hermetic registration and D-42 regression for the OpenCode V2 plugin API."""
 import os
+import importlib.util
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
+from contextlib import ExitStack
 
 ROOT = Path(__file__).resolve().parents[1]
 # A test run inside a registered worker must not lend the fixture its markers.
 WORKER_MARKERS = ("AGENT_SESSION_ROLE", "AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH",
                   "OPENCODE_DISPATCH_SLUG", "FLEET_TITLE_REFRESH", "AGENT_DISPATCH_REGISTERED_WORKER")
 BASE_ENV = {key: value for key, value in os.environ.items() if key not in WORKER_MARKERS}
+sys.path.insert(0, str(ROOT / "tools"))
+import fixture_processes
+
+
+def fixture_tempdir(stack):
+    raw = stack.enter_context(tempfile.TemporaryDirectory())
+    stack.callback(fixture_processes.reap, raw)
+    return raw
 
 
 class OpenCodeV2PluginTest(unittest.TestCase):
+    def test_pending_peer_delivery_releases_only_prewrite_reservations(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the native plugin harness")
+        spec = importlib.util.spec_from_file_location("opencode_delivery_peer", ROOT / "utilities/peer-message.py")
+        peer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(peer)
+        real_python = shutil.which("python3")
+        plugin = ROOT / "adapters/opencode/plugins/hearting-guards.js"
+        script = r'''
+import assert from "node:assert/strict"
+import fs from "node:fs"
+import childProcess from "node:child_process"
+import { pathToFileURL } from "node:url"
+const ownStat = fs.readFileSync("/proc/self/stat", "utf8")
+const ownSplit = ownStat.lastIndexOf(") ")
+const ownStart = ownStat.slice(ownSplit + 2).trim().split(/\s+/)[19]
+const selectionDir = `${process.env.XDG_STATE_HOME}/hearting/tui-identity`
+fs.mkdirSync(selectionDir, { recursive: true })
+fs.writeFileSync(`${selectionDir}/${process.pid}-${ownStart}.json`, JSON.stringify({
+  schema: "hearting-tui-selection-v1", sessionID: process.env.TARGET_SID,
+  pid: process.pid, start: ownStart,
+}))
+const { AgentHarnessGuards } = await import(pathToFileURL(process.env.PLUGIN_PATH))
+const sid = process.env.TARGET_SID
+const marker = process.env.RESERVE_MARKER
+const otherDirectory = process.env.ALT_DIRECTORY
+let writes = 0
+const traces = []
+let directoryReads = 0
+let messageReads = 0
+const nativeResponse = (data) => ({ data, response: { ok: true, status: 200 } })
+const ctx = { location: { directory: process.cwd() }, client: { app: { log: async (row) => traces.push(row.body.extra) }, session: {
+  get: async () => nativeResponse({ id: sid, projectID: "fixture", directory: process.cwd(),
+    slug: "fixture", title: "fixture", version: "1", time: { created: 1, updated: 1 } }),
+  status: async () => nativeResponse({ [sid]: { type: "idle" } }),
+  messages: async () => {
+    messageReads++
+    if (["dispatch-race", "quoted-dispatch-marker"].includes(process.env.CASE) && messageReads >= 2) {
+      return nativeResponse([{ info: { sessionID: sid, role: "user" },
+        parts: [{ type: "text", text: process.env.CASE === "quoted-dispatch-marker"
+          ? `Quoted text: ${process.env.RECEIPT_MARKER}` : process.env.EXPECTED_TEXT }] }])
+    }
+    return nativeResponse([])
+  },
+  prompt: async () => {
+    writes++
+    if (process.env.CASE === "ambiguous") throw Object.assign(new Error("lost"), {
+      response: { ok: false, status: 500 },
+    })
+    return nativeResponse({ info: { id: "user_saved", sessionID: sid, role: "user" },
+      parts: [{ type: "text", text: process.env.EXPECTED_TEXT }] })
+  },
+  promptAsync: async () => ({ response: { ok: true, status: 204 } }),
+} } }
+Object.defineProperty(ctx, "directory", { get() {
+  directoryReads++
+  if (fs.existsSync(marker)) { fs.unlinkSync(marker); return otherDirectory }
+  return process.cwd()
+} })
+const hooks = await AgentHarnessGuards(ctx)
+const readTransfer = () => {
+  const result = childProcess.spawnSync("python3", [process.env.PEER_HELPER, "pending",
+    "--to-harness", "opencode", "--to-session-id", sid], { encoding: "utf8" })
+  assert.equal(result.status, 0, result.stderr)
+  return JSON.parse(result.stdout).find((candidate) => candidate.ref === process.env.TRANSFER_REF)
+}
+try {
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+  if (process.env.CASE === "root-change") {
+    assert.equal(writes, 0)
+    const released = readTransfer()
+    assert.equal(released.state, "pending")
+    assert.equal(released.rpc_claim, null)
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    assert.equal(writes, 1, `the next callback did not deliver the released reservation: ${JSON.stringify({ traces, row: readTransfer(), directoryReads, reserves: fs.existsSync(process.env.RESERVE_LOG) ? fs.readFileSync(process.env.RESERVE_LOG, "utf8") : "" })}`)
+  } else if (process.env.CASE === "begin-refused") {
+    assert.equal(writes, 0)
+  } else if (process.env.CASE === "dispatch-race") {
+    assert.equal(writes, 0, "peer carrier sent after final exact native receipt recheck")
+    const released = readTransfer()
+    assert.equal(released.state, "pending")
+    assert.equal(released.rpc_claim, null)
+  } else if (process.env.CASE === "quoted-dispatch-marker") {
+    assert.equal(writes, 1, "a quoted marker was treated as a native dispatch receipt")
+  } else {
+    assert.equal(writes, 1, JSON.stringify(traces))
+    const stat = fs.readFileSync("/proc/self/stat", "utf8")
+    const split = stat.lastIndexOf(") ")
+    const start = stat.slice(split + 2).trim().split(/\s+/)[19]
+    const row = readTransfer()
+    assert.equal(row.state, "unverified")
+    const released = childProcess.spawnSync("python3", [process.env.PEER_HELPER, "pending",
+      "--to-harness", "opencode", "--to-session-id", sid, "--release-reservation", row.ref,
+      "--claim-token", row.rpc_claim.token, "--claim-pid", String(process.pid), "--claim-start", start],
+      { encoding: "utf8" })
+    assert.equal(released.status, 1, "release must be a no-op after begin-write")
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    assert.equal(writes, 1, "an ambiguous write was submitted again")
+  }
+} finally { hooks.dispose?.({ silent: true }) }
+'''
+        for case in ("root-change", "begin-refused", "ambiguous", "dispatch-race",
+                     "quoted-dispatch-marker"):
+            with self.subTest(case=case), ExitStack() as stack:
+                tmp = fixture_tempdir(stack)
+                root = Path(tmp)
+                peer_root = root / "peer"
+                fake_bin = root / "bin"
+                fake_bin.mkdir()
+                native_node = fake_bin / "opencode"
+                native_node.symlink_to(node)
+                marker = root / "reserved"
+                once = root / "root-change-used"
+                sid = "ses_deliveryfixture"
+                recipient = {"harness": "opencode", "session_id": sid}
+                dispatch_root = root / "harness" / "dispatch"
+                dispatch_root.mkdir(parents=True, exist_ok=True)
+                (dispatch_root / "jobs.log").touch()
+                with mock.patch.dict(os.environ, {
+                        "HOME": str(root / "home"), "XDG_STATE_HOME": str(root / "state"),
+                        "AGENT_PEER_LEDGER_ROOT": str(peer_root),
+                        "HARNESS_STATE_ROOT": str(root / "harness"),
+                        "AGENT_DISPATCH_JOBS": str(root / "harness" / "dispatch" / "jobs.log"),
+                        "AGENT_RUNTIME_ROOT": str(root / "runtime")}):
+                    receipt_marker = ""
+                    if case in {"dispatch-race", "quoted-dispatch-marker"}:
+                        import dispatch_pending_delivery as pending
+                        import dispatch_recipient_receipt as recipient_receipt
+                        jobs = dispatch_root / "jobs.log"
+                        jobs.parent.mkdir(parents=True, exist_ok=True)
+                        jobs.touch()
+                        body = {"schema_version": 1, "kind": "supervision",
+                                "owner_attempt_id": "att-owner", "reason": "waiting"}
+                        record = pending.create(
+                            dispatch_root, recipient_kind="opencode-turn", recipient_key=sid,
+                            delivery_id="delivery-" + "d" * 32, session_generation="g1",
+                            session_generation_supported="1", attempt_ids=["att-owner"],
+                            parent_attempt_id="att-owner", route_id="route-fixture",
+                            route_node="execute", receipt=body,
+                            receipt_digest=pending._canonical_receipt_digest(body),
+                            row_revisions={"att-owner": "revision-1"})
+                        pending.claim(dispatch_root, sid, record["delivery_id"],
+                                      claim_owner="sweep-carrier", lease_seconds=30,
+                                      require_generation_proof=False)
+                        pending.mark_sent_ambiguous(
+                            dispatch_root, sid, record["delivery_id"],
+                            claim_owner="sweep-carrier")
+                        record = pending.read(dispatch_root, sid, record["delivery_id"])
+                        receipt_marker = recipient_receipt.receipt_marker(record, sid)
+                    transfer_text = ("Hearting delivery context\n" + receipt_marker
+                                     if receipt_marker else "one original prompt")
+                    duty_id = "registered-batch-fixture"
+                    refs = ([duty_id, "att-owner", record["delivery_id"]]
+                            if receipt_marker else [])
+                    _text, ref = peer.prepare_peer_message(transfer_text, {
+                        "harness": "codex", "session_id": "sender"}, recipient,
+                        defer=True, refs=refs)
+                    if receipt_marker:
+                        peer.bind_dispatch_notice(ref, {
+                            "duty_id": duty_id,
+                            "jobs": str(dispatch_root / "jobs.log"),
+                            "attempt_id": "att-owner", "carrier": "opencode-turn",
+                            "recipient_sid": sid, "storage_recipient": sid,
+                            "delivery_id": record["delivery_id"],
+                            "claim_owner": "retained-rewake:" + duty_id,
+                        })
+                    expected_text = peer._read_pending(ref)["text"]
+                    fake_peer = root / "fake-peer-command.py"
+                    fake_peer.write_text(r'''import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+def value(option, default=None):
+    try: return args[args.index(option) + 1]
+    except (ValueError, IndexError): return default
+ref = (value("--reserve") or value("--release-reservation") or value("--begin-write")
+       or value("--queued") or value("--resuming") or os.environ["TRANSFER_REF"])
+path = Path(os.environ["AGENT_PEER_LEDGER_ROOT"]) / "peer-messages" / "pending" / (ref + ".json")
+row = json.loads(path.read_text())
+def save(): path.write_text(json.dumps(row))
+if "--reserve" in args:
+    row["rpc_claim"] = {"token": "fixture-claim", "pid": int(value("--claim-pid")),
+        "start": value("--claim-start"), "receipt": "opencode-prompt-inflight",
+        "recipient": {"harness": "opencode", "session_id": value("--to-session-id"), "pane_id": None}}
+    save(); print(json.dumps(row)); raise SystemExit(0)
+if "--release-reservation" in args:
+    if row.get("state") != "pending" or row.get("rpc_claim", {}).get("token") != value("--claim-token"):
+        raise SystemExit(1)
+    row.update(rpc_claim=None, receipt="opencode-prompt-reservation-released")
+    save(); raise SystemExit(0)
+if "--begin-write" in args:
+    if os.environ.get("CASE") == "begin-refused": raise SystemExit(1)
+    row.update(state="unverified", receipt="opencode-prompt-inflight")
+    save(); print(json.dumps(row)); raise SystemExit(0)
+if "--queued" in args:
+    row.update(state="queued", rpc_claim=None, receipt="context-api-accepted",
+               actual_message_id=value("--message-id"))
+    save(); raise SystemExit(0)
+if "--resuming" in args:
+    row["resume_attempted"] = True
+    save(); raise SystemExit(0)
+if "--received" in args:
+    row.update(state="received", receipt="exact-native-history")
+    save(); raise SystemExit(0)
+print(json.dumps([row]))
+''', encoding="utf-8")
+                    wrapper = fake_bin / "python3"
+                    wrapper.write_text(
+                        "#!/bin/sh\n"
+                        f"REAL_PYTHON={real_python}\n"
+                        + (f"case \" $* \" in *\" --reserve \"*) if [ ! -e {once} ]; then touch {once} {marker}; fi;; esac\n"
+                           if case == "root-change" else "")
+                        + (f"case \" $* \" in *\" --reserve \"*) echo reserve >> {root / 'reserves'};; esac\n"
+                           if case == "root-change" else "")
+                        + ("for arg in \"$@\"; do [ \"$arg\" = \"--begin-write\" ] && exit 1; done\n"
+                           if case == "begin-refused" else "")
+                        + "if [ \"$1\" = \"$PEER_HELPER\" ] && [ \"$2\" = \"pending\" ]; then shift; exec \"$REAL_PYTHON\" \"$FAKE_PEER_HELPER\" \"$@\"; fi\n"
+                        + "exec \"$REAL_PYTHON\" \"$@\"\n", encoding="utf-8")
+                    wrapper.chmod(0o755)
+                    alt = root / "other-directory"
+                    alt.mkdir()
+                    env = {**BASE_ENV, "PATH": f"{fake_bin}:/usr/bin:/bin", "HOME": str(root / "home"),
+                        "XDG_STATE_HOME": str(root / "state"), "XDG_CONFIG_HOME": str(root / "config"),
+                        "XDG_DATA_HOME": str(root / "data"), "XDG_CACHE_HOME": str(root / "cache"),
+                        "AGENT_HOME": str(ROOT), "AGENT_PEER_LEDGER_ROOT": str(peer_root),
+                        "HARNESS_STATE_ROOT": str(root / "harness"),
+                        "AGENT_DISPATCH_JOBS": str(root / "harness" / "dispatch" / "jobs.log"),
+                        "AGENT_RUNTIME_ROOT": str(root / "runtime"),
+                        "PLUGIN_PATH": str(plugin), "TARGET_SID": sid, "TRANSFER_REF": ref,
+                        "EXPECTED_TEXT": expected_text, "RESERVE_MARKER": str(marker),
+                        "ALT_DIRECTORY": str(alt), "PEER_HELPER": str(ROOT / "utilities/peer-message.py"),
+                        "FAKE_PEER_HELPER": str(fake_peer),
+                        "RESERVE_LOG": str(root / "reserves"),
+                        "CASE": case, "RECEIPT_MARKER": receipt_marker,
+                        "PYTHONDONTWRITEBYTECODE": "1", "OPENCODE_VERSION": "1.19.0"}
+                    run = subprocess.run([str(native_node), "--input-type=module", "-e", script],
+                        cwd=root, env=env, text=True, capture_output=True, timeout=20)
+                    self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                    row = peer._read_pending(ref)
+                    if case == "root-change":
+                        self.assertIn(row["state"], {"queued", "received"})
+                    elif case == "begin-refused":
+                        self.assertEqual(row["state"], "pending")
+                        self.assertIsNone(row.get("rpc_claim"))
+                    elif case == "dispatch-race":
+                        self.assertEqual(row["state"], "pending")
+                        self.assertIsNone(row.get("rpc_claim"))
+                        self.assertEqual(pending.read(dispatch_root, sid,
+                            "delivery-" + "d" * 32)["state"], "acked")
+                    elif case == "quoted-dispatch-marker":
+                        self.assertEqual(pending.read(dispatch_root, sid,
+                            "delivery-" + "d" * 32)["state"], "sent-ambiguous")
+                    else:
+                        self.assertEqual(row["state"], "unverified")
+
+    def test_peer_prompt_write_boundary_orders_reserve_recheck_begin_and_no_reply(self):
+        source = (ROOT / "adapters/opencode/plugins/hearting-guards.js").read_text()
+        start = source.index('const reserveStarted = performance.now()',
+                             source.index('async function pendingPeerDelivery(ctx, sid)'))
+        end = source.index('pendingPeerTrace(ctx, sid, "noReply-save"', start)
+        delivery = source[start:end]
+        reserve = delivery.index('["--reserve", row.ref')
+        root_recheck = delivery.index('if (!pendingPeerRoot(ctx, sid)) { releaseReservation(); return "native-origin-changed" }')
+        receipt_recheck = delivery.index('if (await recheckReceipt(reserved))')
+        begin_write = delivery.index('["--begin-write", row.ref')
+        sdk_write = delivery.index('client.prompt({ path: { id: sid }')
+        self.assertLess(reserve, root_recheck)
+        self.assertLess(root_recheck, receipt_recheck)
+        self.assertLess(receipt_recheck, begin_write)
+        self.assertLess(begin_write, sdk_write)
+        self.assertIn('noReply: true', delivery[sdk_write:])
+
+    def test_python_reserve_begin_write_failure_stays_pending_and_ambiguous_write_is_not_retried(self):
+        spec = importlib.util.spec_from_file_location("opencode_peer_message", ROOT / "utilities/peer-message.py")
+        peer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(peer)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
+                "HOME": tmp, "XDG_STATE_HOME": tmp + "/state",
+                "AGENT_PEER_LEDGER_ROOT": tmp + "/peer", "AGENT_DISPATCH_JOBS": tmp + "/jobs.log",
+                "AGENT_RUNTIME_ROOT": tmp + "/runtime"}):
+            sender = {"harness": "codex", "session_id": "sender"}
+            recipient = {"harness": "opencode", "session_id": "recipient"}
+            _text, ref = peer.prepare_peer_message("one original prompt", sender, recipient, defer=True)
+            claimant = {"pid": os.getpid(), "start": "123"}
+            reserved = peer.reserve_pending_herdr(ref, recipient, claimant=claimant)
+            self.assertEqual(peer._read_pending(ref)["state"], "pending")
+            # A begin-write transition that fails or times out has not crossed the SDK boundary.
+            with mock.patch("dispatch_contract.process_identity_disposition", return_value="unknown"):
+                self.assertIsNone(peer.begin_pending_write(reserved, recipient=recipient, claimant=claimant))
+            pending = peer._read_pending(ref)
+            self.assertEqual(pending["state"], "pending")
+            self.assertTrue(pending["text"].startswith("one original prompt"))
+            self.assertTrue(peer.release_unsent_herdr_claim(reserved))
+            retry = peer.reserve_pending_herdr(ref, recipient, claimant=claimant)
+            self.assertIsNotNone(retry)
+            with mock.patch("dispatch_contract.process_identity_disposition", return_value="live"):
+                writing = peer.begin_pending_write(retry, recipient=recipient, claimant=claimant)
+            self.assertEqual(writing["state"], "unverified")
+            self.assertIsNone(peer.reserve_pending_herdr(ref, recipient, claimant=claimant))
+            self.assertTrue(peer._read_pending(ref)["text"].startswith("one original prompt"))
+
     def test_v1_reinjects_contract_without_main_lifecycle_or_native_child_leak(self):
         node = shutil.which("node")
         if not node:
             self.skipTest("node is unavailable")
-        with tempfile.TemporaryDirectory() as tmp:
+        with ExitStack() as stack:
+            tmp = fixture_tempdir(stack)
             script = r'''
 import assert from "node:assert/strict"
 import { pathToFileURL } from "node:url"

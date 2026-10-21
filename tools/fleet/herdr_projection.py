@@ -564,9 +564,7 @@ def _session_lifecycle(harness, session_seq, session_start_source, resume_argv=N
         return None
     result = dict(session_seq=session_seq, session_start_source=session_start_source)
     if resume_argv is not None:
-        wire_argv = (native_resume_wire_argv(resume_argv, harness, session_id)
-                     if session_start_source in {"resume", "select"}
-                     and isinstance(session_id, str) and session_id else None)
+        wire_argv = native_resume_wire_argv(resume_argv, harness, session_id)
         if wire_argv is None:
             result.pop("resume_argv", None)
         else:
@@ -577,7 +575,7 @@ def _session_lifecycle(harness, session_seq, session_start_source, resume_argv=N
 def _native_opencode_lifecycle(session_id):
     """Read lifecycle metadata only from this proven TUI's PID/birth selection record."""
     try:
-        from fleet.process_identity import current_launch_context, is_native_resume_argv
+        from fleet.process_identity import current_launch_context, native_resume_wire_argv
         from fleet.collectors import opencode
         launch = current_launch_context("opencode", session_id)
         if not launch:
@@ -594,9 +592,9 @@ def _native_opencode_lifecycle(session_id):
         if source in ("startup", "resume", "select", "clear", "compact", "fork"):
             result["session_start_source"] = source
         argv = launch.get("argv")
-        if (result.get("session_start_source") in {"resume", "select"}
-                and is_native_resume_argv(argv, "opencode", session_id)):
-            result["resume_argv"] = argv
+        wire_argv = native_resume_wire_argv(argv, "opencode", session_id)
+        if wire_argv is not None:
+            result["resume_argv"] = wire_argv
         return result
     except Exception:
         return {}
@@ -654,15 +652,22 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
                 resume_argv = native.get("resume_argv", resume_argv)
             if session_start_source and session_seq is None:
                 session_seq = time.time_ns() if harness != "opencode" else time.time_ns() // 1000
-            if session_start_source == "resume" and resume_argv is None:
+            if resume_argv is None:
                 from fleet.process_identity import current_launch_context
-                from fleet.process_identity import is_native_resume_argv
+                from fleet.process_identity import native_resume_wire_argv
                 launch = current_launch_context(harness, session_id)
                 argv = (launch or {}).get("argv")
-                if is_native_resume_argv(argv, harness, session_id):
-                    resume_argv = argv
+                resume_argv = native_resume_wire_argv(argv, harness, session_id)
         except Exception:
             session_start_source = None
+    if (report_session and resume_argv is None
+            and session_start_source in {"startup", "resume", "select", "clear", "compact", "fork"}):
+        try:
+            from fleet.process_identity import current_launch_context, native_resume_wire_argv
+            launch = current_launch_context(harness, session_id)
+            resume_argv = native_resume_wire_argv((launch or {}).get("argv"), harness, session_id)
+        except Exception:
+            resume_argv = None
     lifecycle = _session_lifecycle(harness, session_seq, session_start_source, resume_argv,
                                    session_id=session_id)
     if lifecycle is None:

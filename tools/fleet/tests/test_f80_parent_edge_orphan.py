@@ -179,7 +179,8 @@ class L2CollectorIntegrationTest(unittest.TestCase):
                 self.assertEqual(job._registry_metadata, metadata)
                 foreign = {**binding, "hash": "sha256:" + "b" * 64}
                 with mock.patch.object(handover, "_all_snapshots", return_value=[{**snapshot, "bindings": [foreign]}]), \
-                     mock.patch.object(handover, "handover_rows", return_value=[relation]):
+                     mock.patch.object(handover, "handover_rows",
+                                       return_value=[{**relation, "bindings": [foreign]}]):
                     fleet_collectors.resolve_parent_edges([predecessor, successor], [job])
                     self.assertIsNone(job._parent_edge_sid)
                     self.assertTrue(job._parent_edge_promoted_orphan)

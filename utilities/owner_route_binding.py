@@ -644,6 +644,7 @@ def _resolve_attachment_locked(jobs: Path, owner_attempt_id: str,
 def resolve_owner_route_lifecycle(jobs: str | Path, *, owner_attempt_id: str,
                                   sealed_binding: OwnerRouteBinding | None = None,
                                   sealed_generation: int | None = None,
+                                  registry_rows: list[tuple[list[str], dict[str, str]]] | None = None,
                                   observer=None
                                   ) -> tuple[OwnerRouteBinding | None, str]:
     """Resolve launch binding or post-launch attachment, then verified advances."""
@@ -659,8 +660,10 @@ def resolve_owner_route_lifecycle(jobs: str | Path, *, owner_attempt_id: str,
     # side of a concurrent transition.
     if observer is not None:
         observer("file", canonical_jobs)
-    rows = registry_view(canonical_jobs)
-    fields, meta = _owner_snapshot(canonical_jobs, owner_attempt_id)
+    rows = registry_view(canonical_jobs) if registry_rows is None else registry_rows
+    fields, meta = _owner_snapshot(
+        canonical_jobs, owner_attempt_id,
+        rows=None if registry_rows is None else registry_rows)
     row_binding = _row_binding(meta)
     if sealed_binding is not None and row_binding != sealed_binding:
         if gates_on():

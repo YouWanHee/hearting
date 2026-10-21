@@ -1806,6 +1806,134 @@ def read_session_observation(session_id: str, *, db_path: str | Path | None = No
             connection.close()
 
 
+def _bounded_rows(con, select, order_column, session_id, after_cursor, refresh, limit, newest,
+                  before_cursor):
+    """Budgeted variant of the viewer read: rows come back oldest first (see read_session_parts)."""
+    after = max(0, int(after_cursor))
+    count = max(1, int(limit)) if limit is not None else -1
+    params = [session_id, after]
+    clause = f" AND {order_column}>?"
+    if before_cursor is not None:
+        clause += f" AND {order_column}<?"
+        params.append(max(0, int(before_cursor)))
+    descending = newest or before_cursor is not None
+    rows = con.execute(f"{select}{clause} ORDER BY {order_column} {'DESC' if descending else 'ASC'}"
+                       " LIMIT ?", params + [count]).fetchall()
+    if descending:
+        rows.reverse()
+    if refresh and before_cursor is None:
+        have = {row[1] if order_column == "seq" else row[0] for row in rows}
+        extra = [value for value in refresh if value not in have]
+        if extra:
+            marks = ",".join("?" for _ in extra)
+            rows += con.execute(f"{select} AND {order_column} IN ({marks}) ORDER BY {order_column}",
+                                [session_id] + extra).fetchall()
+            key = 1 if order_column == "seq" else 0
+            rows.sort(key=lambda row: row[key])
+    return rows
+
+
+def _parts_result(generation, parts, cursors, after_cursor, limit, before_cursor):
+    result = {"state": "observed", "generation": generation, "parts": parts,
+              "cursor": max(cursors, default=max(0, int(after_cursor)))}
+    if limit is not None or before_cursor is not None:
+        result["first_cursor"] = min(cursors) if cursors else None
+    return result
+
+
+def read_session_parts(session_id: str, *, db_path: str | Path | None = None,
+                       after_cursor: int = 0, refresh_cursors=(), limit: int | None = None,
+                       newest: bool = False, before_cursor: int | None = None) -> dict:
+    """Read complete native session parts after a generation-specific cursor.
+
+    By default this additive viewer API has no message-count or text-size
+    cap. ``refresh_cursors`` re-reads mutable rows which were previously
+    observed while streaming. V1 cursors are part rowids; V2 cursors are
+    session_message sequence numbers. The existing bounded observation API is
+    unchanged.
+
+    The optional budget arguments leave that default untouched: ``limit`` reads
+    at most that many rows after ``after_cursor`` (oldest first; refreshed rows
+    are added on top), ``newest`` makes ``limit`` pick the newest rows instead,
+    and ``before_cursor`` reads the rows strictly before it (newest ``limit`` of
+    them). A bounded read also reports ``first_cursor``, the smallest cursor it
+    returned.
+    """
+    if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
+        return {"state": "unknown", "reason": "session-id-invalid", "parts": []}
+    path = Path(db_path) if db_path is not None else opencode_db_path()
+    if not path.is_file():
+        return {"state": "missing", "reason": "database-unavailable", "parts": []}
+    uri = "file:" + quote(str(path.resolve()), safe="/:\\") + "?mode=ro"
+    con = None
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=.5)
+        con.execute("PRAGMA query_only=ON")
+        con.execute("PRAGMA busy_timeout=500")
+        tables = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        v2 = "session_message" in tables and con.execute(
+            "SELECT 1 FROM session_message WHERE session_id=? LIMIT 1", (session_id,)).fetchone()
+        v1 = "part" in tables and con.execute(
+            "SELECT 1 FROM part WHERE session_id=? LIMIT 1", (session_id,)).fetchone()
+        if v1 and v2:
+            return {"state": "unknown", "reason": "session-generation-ambiguous", "parts": []}
+        result = []
+        if v2:
+            columns = _table_columns(con, "session_message")
+            if not {"session_id", "type", "seq", "data"}.issubset(columns):
+                return {"state": "unknown", "reason": "session-message-schema-invalid", "parts": []}
+            refresh = sorted({int(v) for v in refresh_cursors if isinstance(v, int) and v >= 0})
+            if limit is not None or before_cursor is not None:
+                rows = _bounded_rows(con, "SELECT type,seq,data FROM session_message WHERE session_id=?",
+                                     "seq", session_id, after_cursor, refresh, limit, newest, before_cursor)
+            else:
+                where = "session_id=? AND (seq>?"
+                params = [session_id, max(0, int(after_cursor))]
+                if refresh:
+                    where += " OR seq IN (" + ",".join("?" for _ in refresh) + ")"
+                    params.extend(refresh)
+                where += ")"
+                rows = con.execute("SELECT type,seq,data FROM session_message WHERE " + where +
+                                   " ORDER BY seq", params).fetchall()
+            for typ, cursor, raw in rows:
+                data = _decode_json(raw)
+                result.append({"cursor": cursor, "role": typ, "data": data,
+                               "raw": raw if data is None else None})
+            return _parts_result("v2", result, [row[1] for row in rows], after_cursor, limit, before_cursor)
+        if v1:
+            if not {"session_id", "message_id", "data"}.issubset(_table_columns(con, "part")):
+                return {"state": "unknown", "reason": "part-schema-invalid", "parts": []}
+            message_cols = _table_columns(con, "message") if "message" in tables else set()
+            role_expr = "m.role" if "role" in message_cols else "NULL"
+            join = " LEFT JOIN message m ON m.id=p.message_id" if "id" in message_cols else ""
+            refresh = sorted({int(v) for v in refresh_cursors if isinstance(v, int) and v >= 0})
+            if limit is not None or before_cursor is not None:
+                rows = _bounded_rows(con, "SELECT p.rowid," + role_expr + ",p.data FROM part p" + join +
+                                     " WHERE p.session_id=?", "p.rowid", session_id, after_cursor, refresh,
+                                     limit, newest, before_cursor)
+            else:
+                where = "p.session_id=? AND (p.rowid>?"
+                params = [session_id, max(0, int(after_cursor))]
+                if refresh:
+                    where += " OR p.rowid IN (" + ",".join("?" for _ in refresh) + ")"
+                    params.extend(refresh)
+                where += ")"
+                rows = con.execute("SELECT p.rowid," + role_expr + ",p.data FROM part p" + join +
+                                   " WHERE " + where + " ORDER BY p.rowid", params).fetchall()
+            for cursor, role, raw in rows:
+                data = _decode_json(raw)
+                result.append({"cursor": cursor, "role": role, "data": data,
+                               "raw": raw if data is None else None})
+            return _parts_result("v1", result, [row[0] for row in rows], after_cursor, limit, before_cursor)
+        return {"state": "missing", "reason": "exact-session-not-found", "parts": []}
+    except (OSError, sqlite3.Error) as exc:
+        return {"state": "unknown", "reason": "database-read-failed", "detail": str(exc), "parts": []}
+    finally:
+        if con is not None:
+            con.close()
+
+
 def list_session_candidates(directory: str, *, db_path: str | Path | None = None,
                             after_created: int | None = None,
                             before_created: int | None = None, limit=8) -> list[dict]:

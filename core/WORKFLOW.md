@@ -428,19 +428,26 @@ stages are not mandatory. The sealed result shows the realized stages and omitte
 defaults before execution. Input/output, explicit human gates, and terminal proof
 remain binding contracts for the selected work.
 `compile` remains the low-level explicit interface. Callers need not switch to it
-to obtain a complete recipe. `compose` fills omitted flags from the checkout: cwd (for a
-source-changing `--start` from a primary checkout, the worktree
+to obtain a complete recipe. `compose` fills omitted flags from the checkout:
+cwd (for a source-changing `--start` from a primary checkout, the worktree
 `<repo>-wt/<slug>` on a collision-free branch and path, based on the commit SHA
 resolved by a successful fetch of the current remote default. If the repository
 has no remotes, preparation uses the primary worktree's current `HEAD` commit
 without fetching; an unresolved `HEAD` fails before publication. This applies
 regardless of shape, explicit cwd, or supplied dispatch evidence. An explicitly
-approved task linked worktree is reused with its changes, and exact saved route
+approved task linked worktree is reused with its changes. A framed start
+prepares the frame's read cwd too: an implicit linked cwd with dirty or unmerged
+work is retained for reading, but a source-changing leg still needs the existing
+proposed `cwd` approval to work there; clean, merged linked worktrees can be
+allocated afresh. A newly allocated frame worktree is carried into its first
+source-changing leg, while retained or explicitly approved linked worktrees
+keep their established approval behavior. Exact saved route
 snapshots/cursors/receipts and official continuations resume before any new
-preparation. A framed first leg and each new successor use the same preparation
-contract; an existing plan cursor wins over allocation. A preparation failure
-leaves the start unpublished and retryable through the same request. Preview,
-explain, non-start `compose`, and low-level `compile` remain read-only), artifact root
+preparation; an existing plan cursor wins over allocation. Source-changing
+preparation failure leaves that start unpublished and retryable through the
+same request. If framed-start preparation fails, frame start records a one-line
+reason and continues from the original cwd. Preview, explain, non-start
+`compose`, and low-level `compile` remain read-only), artifact root
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
 `compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the
@@ -570,7 +577,12 @@ for `direct` or `solo` (`quick`). A received peer envelope (the existing
 `compose` prints (capability · shape · route id · human gates) plus one clause
 of scope and proceeds in the same turn; a steward cannot approve for the user.
 Compose's notice and receipt name this confirmation method from the current
-turn's existing peer-receive observation. Unknown origin uses the card method;
+turn's existing peer-receive observation. Peer origin is known only when the
+current prompt boundary is bound to the exact validated transfer or native
+Claude envelope it contains. A previous receipt or a later notice cannot
+classify this prompt. Runtime completion transfers retain their producer
+binding and runtime source independently of the courier. Unknown or mixed
+origin uses the card method;
 the label is observational, with existing approval and routing unchanged.
 `confirmation.small_work` and its sealed value retain their existing route
 metadata meaning, without changing this distinction. The card stays blocking,
@@ -681,7 +693,9 @@ The interview proceeds in this order:
    with 예 / 아니오(고쳐 말하기) — and record a correction in the user's words.
 2. Put the `[방향 확인]` five-field summary as the card above.
 3. Ask the understanding sentence first, then the registered interview
-   questions in the same native question batch. Use Claude `AskUserQuestion`,
+   questions, in one native question call when the tool accepts them all;
+   otherwise continue with the remaining questions verbatim in the next call,
+   and the runtime combines the calls of one interview. Use Claude `AskUserQuestion`,
    Codex `request_user_input`, or OpenCode `question`, one topic
    per question, the recommended option first and labelled
    (권장), each option with its one-line meaning; never paraphrase a question
@@ -689,7 +703,8 @@ The interview proceeds in this order:
    carry. A tired reader must be able to answer without opening the plan.
 4. The native tool's reply is kept by the harness's post-tool hook beside the
    registered question (`answers.native.json`; the restatement asked verbatim,
-   its first option confirming it), so `resume_command` alone continues. A
+   its first option confirming it — a partial reply waits beside it until every
+   registered question has an answer), so `resume_command` alone continues. A
    reply given in conversation goes into the returned `answers_template` and
    `start --route <file> --answers <file>`. The runtime renders intent and
    records the release that authorizes owner launch. A repeated submission
@@ -1012,9 +1027,18 @@ watch is ready before the once-only payload release. The owner yields the model
 turn with `runtime_wait: registered-children`; the existing controller waits for
 the exact resource outside that turn and resumes the same native owner from a
 bounded receipt. Resource receipts are separate from registered model children.
-After pending user corrections, the watch writes the resource completion marker
-from the original producer artifact before recording stage success and claiming
-next work. Exit and this marker are neither verification PASS nor workflow completion.
+After pending user corrections, the watch records the exact resource result and
+returns it to the same owner. For a `supervised-owner` resource, even exit 0 with
+all declared files present is only resource success: polling does not write the
+stage completion marker or claim a successor. The owner can continue with another
+approved resource in the same node. When the owner finishes that node's approved
+scope, its ordinary `start` of the declared immediate successor passes through
+the existing shared admission gate; that gate rechecks the live owner, resource,
+pending corrections, and output evidence, then records stage success and claims
+the successor once. This uses the existing start path and adds no close command
+or required proof. Owner terminal settlement can reconcile an already-finished
+node, without starting a successor. Exit and the stage marker are neither
+verification PASS nor workflow completion.
 
 A resource watch lasts while its recorded PID/start/command identity is alive,
 without a fixed elapsed-time ceiling. The existing start/resume can reattach a
@@ -1022,16 +1046,18 @@ lost or expired watch to the same run without releasing a payload again. Explici
 parent cancellation still suppresses the preserved resource's successors.
 
 One supervised owner stage may use resources sequentially through the existing
-runner. An exact successful resource exit with stage outputs still absent waits
-for the next resource; it does not fail or complete the stage. The same owner
-receives that execution result and may register the next run after the previous
-identity is gone and its exit sentinel proves success. Historical run records
-remain intact, including their evidence paths and unacknowledged receipts.
-Receipt recovery follows the preserved binding after the next run is registered;
-acknowledgement remains with the returning owner turn, without a lifetime run-count
-ceiling. Stage success and successor admission still require the declared
-outputs; failed, unverifiable, active, or explicitly cancelled resources cannot
-be replaced by another run.
+runner. Every exact successful `supervised-owner` resource exit waits for the
+same owner to decide the next approved work, whether its output files are absent,
+runtime-authored, or already present. Polling does not infer logical-stage
+completion from those files or claim the successor. The owner may register the
+next resource after the previous identity is gone and its exit sentinel proves
+success. Historical run records remain intact, including their evidence paths
+and unacknowledged receipts. Receipt recovery follows the preserved binding
+after the next run is registered; acknowledgement remains with the returning
+owner turn, without a lifetime run-count ceiling. The existing successor `start`
+admits the completed node after rechecking its declared outputs. Failed,
+unverifiable, active, or explicitly cancelled resources cannot be replaced by
+another run.
 
 Human decisions have no elapsed-time default. A question window closing or an
 empty response does not release, reject, or cancel the durable gate. Its owner

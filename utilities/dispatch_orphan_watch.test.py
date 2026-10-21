@@ -318,6 +318,18 @@ class IdleOwnerWatchTest(unittest.TestCase):
         replacement.write_text(text, encoding="utf-8")
         replacement.replace(self.jobs)
 
+    def test_registry_refresh_keeps_the_passive_judgment_inside_one_read_scope(self):
+        import dispatch_registry_cache
+        import route_parent_close
+        registry = self.watch.RegistryObservation(self.jobs, "att-idle")
+        observed = []
+        with mock.patch.object(
+                route_parent_close, "row_requested",
+                side_effect=lambda *_args: observed.append(
+                    dispatch_registry_cache.registry_scope_active()) or False):
+            registry.refresh(force=True)
+        self.assertEqual(observed, [True])
+
     def test_unchanged_registry_is_not_reparsed_and_close_intent_has_a_backstop(self):
         registry = self.watch.RegistryObservation(self.jobs, "att-idle")
         for _ in range(10):

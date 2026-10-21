@@ -3206,7 +3206,9 @@ def exact_attempt_row(jobs: Path, attempt_id: str, *,
     if not attempt_id:
         raise JoinContractError("attempt-id-missing")
     try:
-        view = registry_view(jobs, append_only=registry_append_only)
+        import dispatch_registry_cache
+        with dispatch_registry_cache.registry_read_scope():
+            view = registry_view(jobs, append_only=registry_append_only)
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
     matches: list[ChildRow] = []
@@ -3467,10 +3469,11 @@ def read_join_observation(jobs: Path, identity: dict[str, str], *, now: float | 
 
 def write_join_observation(jobs: Path, identity: dict[str, str], children: list[dict],
                            *, elapsed: float, recovery_results: dict,
+                           eligible_attempt_ids: set[str],
                            residue_pids: dict[str, list[int]] | None = None) -> None:
     """Publish bounded diagnostics separately from the completion receipt."""
     pending = [child for child in children if child["readiness"] == "pending"]
-    attention = elapsed >= 30 and any(child["reason"] == "process-unverifiable" for child in pending)
+    attention = any(child["attempt_id"] in eligible_attempt_ids for child in pending)
     value = {"schema_version": 1, "identity": identity, "observed_at": time.time(),
              "state": "attention" if attention else ("waiting" if pending else "ready"),
              "elapsed_seconds": round(elapsed, 1),
@@ -3676,7 +3679,8 @@ def _join_snapshot(
         "started": time.monotonic(), "last_recovery": {}, "last_settlement": {},
         "settlement_backoff": {}, "recovery_results": {},
         "last_observation": float("-inf"), "last_signature": "",
-        "observation_error": "", "notice_published": False,
+        "observation_error": "", "unverifiable_since": {},
+        "notified_attempt_ids": set(),
         "last_notice_attempt": float("-inf"), "blocked_notice_published": False,
         "last_blocked_notice_attempt": float("-inf"), "registry_generation": None,
     })
@@ -3688,7 +3692,8 @@ def _join_snapshot(
     last_observation = state["last_observation"]
     last_signature = state["last_signature"]
     observation_error = state["observation_error"]
-    notice_published = state["notice_published"]
+    unverifiable_since = state["unverifiable_since"]
+    notified_attempt_ids = state["notified_attempt_ids"]
     last_notice_attempt = state["last_notice_attempt"]
     blocked_notice_published = state["blocked_notice_published"]
     last_blocked_notice_attempt = state["last_blocked_notice_attempt"]
@@ -3716,6 +3721,7 @@ def _join_snapshot(
         for row in rows:
             import route_parent_close
             if route_parent_close.row_requested(row.metadata, jobs):
+                unverifiable_since.pop(row.attempt_id, None)
                 outcome = route_parent_close.recover_attempt(jobs, row.metadata)
                 current = current_attempt_row(
                     jobs, row.attempt_id, registry_append_only=registry_append_only)
@@ -3754,6 +3760,10 @@ def _join_snapshot(
                 blocked_attempt_ids.add(row.attempt_id)
                 blocked_reasons[row.attempt_id] = completion_state.reason
             readiness, reason = choice.state, choice.reason
+            if reason == "process-unverifiable":
+                unverifiable_since.setdefault(row.attempt_id, time.monotonic())
+            else:
+                unverifiable_since.pop(row.attempt_id, None)
             pending = pending or choice.state == "pending"
             closure_eligible[row.attempt_id] = choice.census["closure_eligible"]
             if choice.census["settle"]:
@@ -3802,6 +3812,9 @@ def _join_snapshot(
                     "required_action": choice.next_action,
                 }
             )
+        current_attempt_ids = {child["attempt_id"] for child in children}
+        for attempt_id in set(unverifiable_since) - current_attempt_ids:
+            unverifiable_since.pop(attempt_id, None)
         if recovered:
             # Re-read the canonical rows and all process evidence. The helper's
             # exit code or JSON alone never makes a child ready.
@@ -3841,8 +3854,14 @@ def _join_snapshot(
                         last_child_terminal_ns=time.monotonic_ns()
                     ),
                 }
-        signature = json.dumps(children, sort_keys=True)
         elapsed = time.monotonic() - started
+        now = started + elapsed
+        eligible = {
+            child["attempt_id"] for child in children
+            if child["reason"] == "process-unverifiable"
+            and now - unverifiable_since[child["attempt_id"]] >= 30
+        }
+        signature = json.dumps({"children": children, "eligible": sorted(eligible)}, sort_keys=True)
         if observation_jobs is not None and (signature != last_signature
                 or time.monotonic() - last_observation >= 30):
             try:
@@ -3856,6 +3875,7 @@ def _join_snapshot(
                 }
                 write_join_observation(observation_jobs, identity, children,
                                        elapsed=elapsed, recovery_results=recovery_results,
+                                       eligible_attempt_ids=eligible,
                                        residue_pids=residue_pids)
                 observation_error = ""
             except OSError:
@@ -3864,16 +3884,15 @@ def _join_snapshot(
             last_signature, last_observation = signature, time.monotonic()
             state["last_signature"], state["last_observation"] = last_signature, last_observation
             state["observation_error"] = observation_error
-        if (not notice_published and observation_jobs is not None and elapsed >= 30
-                and time.monotonic() - last_notice_attempt >= 30
-                and any(child["reason"] == "process-unverifiable" for child in children)):
-            last_notice_attempt = time.monotonic()
+        notice_attempt_ids = eligible - notified_attempt_ids
+        if (notice_attempt_ids and observation_jobs is not None
+                and now - last_notice_attempt >= 30):
+            last_notice_attempt = now
             state["last_notice_attempt"] = last_notice_attempt
             try:
                 from dispatch_supervision import materialize
-                materialize(observation_jobs, snapshot, reason="process-unverifiable")
-                notice_published = True
-                state["notice_published"] = True
+                materialize(observation_jobs, notice_attempt_ids, reason="process-unverifiable")
+                notified_attempt_ids.update(notice_attempt_ids)
             except (OSError, ValueError, pending_delivery.PendingDeliveryError) as exc:
                 observation_error = "supervision-notice-unpersisted:" + str(exc)
         if (not blocked_notice_published and observation_jobs is not None and blocked_attempt_ids

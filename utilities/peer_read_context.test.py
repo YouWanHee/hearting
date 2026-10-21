@@ -22,7 +22,7 @@ class PeerReadContextTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.jobs = Path(self.tmp.name) / "jobs.log"
-        CACHE._CACHE.clear()
+        CACHE.clear_cache()
 
     def test_attempt_rows_are_indexed_once_and_keep_latest_exact_row(self):
         self.jobs.write_text("\n".join((row("att-a", "queued"), row("att-b"),
@@ -36,7 +36,7 @@ class PeerReadContextTest(unittest.TestCase):
         self.assertEqual(second.attempt_id, "att-b")
         self.assertEqual(again.raw, first.raw)
         metrics = CACHE.metrics_snapshot()
-        self.assertEqual(metrics["content_reads"], 2)
+        self.assertEqual(metrics["content_reads"], 1)
         self.assertEqual(metrics["full_metadata_parses"], 1)
 
     def test_unrelated_invalid_schema_is_ignored_and_exact_invalid_schema_fails(self):

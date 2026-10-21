@@ -815,6 +815,10 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             if requested:
                 real_sleep(requested)
 
+        def controlled_select(readers, writers, exceptional, timeout=None):
+            controlled_sleep(0.0 if timeout is None else timeout)
+            return [], [], []
+
         ticks = os.sysconf("SC_CLK_TCK")
         monitoring[0] = True
         phase[0] = "runner"
@@ -872,6 +876,7 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                     mock.patch.object(os, "replace", side_effect=checked_replace),
                     mock.patch.object(os, "unlink", side_effect=checked_unlink),
                     mock.patch.object(os, "kill", side_effect=checked_kill),
+                    mock.patch.object(peer_steward.select, "select", side_effect=controlled_select),
                     mock.patch.object(peer_steward.time, "sleep", side_effect=controlled_sleep),
                     mock.patch.object(peer_message, "deliver_pending_codex",
                                       side_effect=AssertionError("fixture attempted a native send")),

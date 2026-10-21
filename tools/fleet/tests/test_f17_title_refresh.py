@@ -1265,7 +1265,11 @@ class SecurityTest(_ConfigHomeMixin, unittest.TestCase):
         self.assertIn("--ephemeral", argv)
 
     def test_opencode_provider_runs_a_tool_free_agent(self):
-        argv = self._run_pinned("opencode")["argv"]
+        # The pre-V2 command shape. Pin the version: the probe is cached per process
+        # and would otherwise follow whatever OpenCode the host has installed.
+        # test_text_provider_context.py covers the V2 shape.
+        with mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "1.19.0"}):
+            argv = self._run_pinned("opencode")["argv"]
         self.assertEqual(argv[:2], ["opencode", "run"])
         self.assertIn("--pure", argv)                      # no external plugins
         self.assertIn("--agent", argv)

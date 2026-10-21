@@ -1,12 +1,12 @@
 """A process's harness session, in the one identity record shape (OpenCode included)."""
 import json
+from pathlib import Path
 import os
 import sys
 import tempfile
 import unittest
 import unittest.mock
 from types import SimpleNamespace
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 for entry in (str(ROOT / "tools"), str(ROOT / "utilities")):
@@ -16,8 +16,41 @@ for entry in (str(ROOT / "tools"), str(ROOT / "utilities")):
 from fleet import herdr_projection as hp  # noqa: E402
 from fleet import process_identity as P  # noqa: E402
 from fleet.collectors import opencode  # noqa: E402
+from fleet.collectors import claude  # noqa: E402
+import claude_process_identity as claude_identity  # noqa: E402
 
 SID = "ses_abcDEF123"
+
+
+class ClaudeNativeIdentityHelperTest(unittest.TestCase):
+    def test_indexed_and_direct_taps_match_fleet_exact_pid_start_claims(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            taps = home / ".statusline"
+            taps.mkdir()
+            (taps / "one.json").write_text(json.dumps({
+                "pid": 17, "proc_start": "100", "session_id": "sid-one"}))
+            (taps / "two.json").write_text(json.dumps({
+                "pid": "17", "proc_start": "100", "session_id": "sid-two"}))
+            (taps / "stale.json").write_text(json.dumps({
+                "pid": 17, "proc_start": "99", "session_id": "sid-stale"}))
+            (taps / "bad.json").write_text("{")
+
+            direct = claude_identity.tap_sids_by_pid(home, 17, "100")
+            indexed = claude_identity.tap_sids_by_pid(
+                home, 17, "100", index=claude_identity.tap_claim_index(home))
+            self.assertEqual(direct, {"sid-one", "sid-two"})
+            self.assertEqual(indexed, direct)
+            self.assertEqual(claude._tap_sids_by_pid(home, 17, "100"), direct)
+            self.assertEqual(claude_identity.tap_sids_by_pid(home, 17, "101"), set())
+
+    def test_strict_census_tap_index_surfaces_unreadable_identity_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            taps = Path(temp) / ".statusline"
+            taps.mkdir()
+            (taps / "bad.json").write_text("{")
+            with self.assertRaises(OSError):
+                claude_identity.tap_claim_index(temp, strict=True)
 
 
 class OpenCodeProcessTest(unittest.TestCase):
@@ -192,33 +225,34 @@ class LaunchContextTest(unittest.TestCase):
 
 
 class NativeResumeArgvTest(unittest.TestCase):
-    def test_wire_argv_uses_plain_harness_name_without_mutating_raw_launch_argv(self):
-        for harness in ("claude", "codex", "opencode"):
-            argv = [f"/home/user/.local/bin/{harness}", "--color", "always",
-                    "--resume", SID, "--model", "fixture", "--setting-sources", "user"]
-            with self.subTest(harness=harness):
-                self.assertTrue(P.is_native_resume_argv(argv, harness, SID))
-                self.assertEqual(argv[0], f"/home/user/.local/bin/{harness}")
-                wire = P.native_resume_wire_argv(argv, harness, SID)
-                self.assertEqual(wire, [harness, *argv[1:]])
-                self.assertEqual(argv[0], f"/home/user/.local/bin/{harness}")
+    def test_shared_case_table_rekeys_launches_and_preserves_raw_input(self):
+        cases = json.loads((Path(__file__).with_name("native_resume_cases.json")).read_text())
+        for case in cases:
+            argv = list(case["argv"])
+            with self.subTest(name=case["name"]):
+                self.assertEqual(P.native_resume_wire_argv(argv, case["harness"], case["sid"]),
+                                 case["expected"])
+                self.assertEqual(argv, case["argv"])
+                self.assertEqual(P.is_native_resume_argv(argv, case["harness"], case["sid"]),
+                                 case["expected"] is not None)
 
     def test_bad_executables_foreign_wrappers_wrong_sid_and_bounded_inputs_are_rejected(self):
         cases = (
             (["/usr/bin/python3", "/opt/claude", "--resume", SID], "claude", SID),
             (["/usr/bin/env", "claude", "--resume", SID], "claude", SID),
             (["bin/claude", "--resume", SID], "claude", SID),
-            (["/opt/claude", "--resume", "another-session"], "claude", SID),
             (["/opt/claude", "--resume", SID, "\0bad"], "claude", SID),
             (["/opt/claude", "--resume", SID, "x" * 8192], "claude", SID),
             (["/opt/claude", *(["x"] * 63), SID], "claude", SID),
-            (["/opt/claude", "--resume", SID], "claude", "wrong-session"),
             (["/opt/claude", "--resume", SID], "codex", SID),
+            (["claude"], "claude", ""),
         )
         for argv, harness, sid in cases:
             with self.subTest(argv=argv[:3], harness=harness, sid=sid):
                 self.assertFalse(P.is_native_resume_argv(argv, harness, sid))
                 self.assertIsNone(P.native_resume_wire_argv(argv, harness, sid))
+        self.assertIsNone(P.native_resume_wire_argv(["claude", "--fork-session"],
+                                                    "claude", "x" * 8192))
 
 
 if __name__ == "__main__":

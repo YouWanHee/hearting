@@ -293,6 +293,8 @@ ATTEMPT_MUTABLE_METADATA = {
     # Observational caller provenance, never parent execution/delivery authority.
     "caller_sid", "caller_harness", "caller_pane", "caller_cwd",
     "launch_claimed",
+    "launch_cgroup_b64",
+    "launch_cgroup_ns",
     "pid",
     "pid_start",
     "pid_scope",
@@ -1925,6 +1927,62 @@ def process_namespace_identity(pid: int | str = "self") -> str | None:
         return None
 
 
+LAUNCH_CGROUP_METADATA_KEYS = ("launch_cgroup_b64", "launch_cgroup_ns")
+
+
+def process_cgroup_namespace_identity(pid: int | str = "self") -> str | None:
+    """The cgroup namespace inode; a cgroup path is only comparable from the same one."""
+
+    try:
+        return os.readlink(f"/proc/{pid}/ns/cgroup")
+    except OSError:
+        return None
+
+
+def _unified_cgroup_path(text: str) -> str:
+    """The single cgroup v2 `0::` path, or "" (cgroup v1 only, malformed, or ambiguous)."""
+
+    paths = [line[3:] for line in text.splitlines() if line.startswith("0::")]
+    return paths[0] if len(paths) == 1 and paths[0].startswith("/") else ""
+
+
+def process_unified_cgroup(pid: int | str) -> str:
+    try:
+        return _unified_cgroup_path((Path("/proc") / str(pid) / "cgroup").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+
+
+def launch_cgroup_values(path: str, namespace: str) -> dict[str, str]:
+    """Registry encoding: the path is urlsafe base64 (a cgroup path may hold `,`, `=`, tabs)."""
+
+    if not (path.startswith("/") and namespace):
+        return {}
+    return {"launch_cgroup_b64": base64.urlsafe_b64encode(path.encode("utf-8")).decode("ascii"),
+            "launch_cgroup_ns": namespace}
+
+
+def process_launch_cgroup(pid: int) -> dict[str, str]:
+    """Where a fenced, not-yet-released leader runs: its unified cgroup and the observer's cgroup namespace."""
+
+    return launch_cgroup_values(process_unified_cgroup(pid), process_cgroup_namespace_identity() or "")
+
+
+def _recorded_launch_cgroup(metadata) -> tuple[str, str]:
+    raw, namespace = metadata.get("launch_cgroup_b64", ""), metadata.get("launch_cgroup_ns", "")
+    if not raw or not namespace:
+        return "", ""
+    try:
+        encoded = raw.encode("ascii")
+        decoded = base64.b64decode(encoded, altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(decoded).decode("ascii") != raw:
+            return "", ""
+        path = decoded.decode("utf-8")
+    except (ValueError, UnicodeError):
+        return "", ""
+    return (path, namespace) if path.startswith("/") else ("", "")
+
+
 def _runtime_ancestry_proc_stat(pid: int) -> dict[str, int] | None:
     """`ppid`/`start` for one PID -- same two /proc/<pid>/stat fields
     ``compute-hosts.py``'s own ``proc_stat()`` reads (SD-111 §3.2.1: same
@@ -2878,27 +2936,29 @@ def bounded_candidate_outcomes(values: object, omitted: object = 0) -> tuple[lis
 
 
 def route_state_next_action(reason: str, detail: str, route_file: str | None,
-                             node) -> str:
+                             node, *, evidence: str | None = None) -> str:
     """The supported next action a route-state refusal carries (13.59.3 rule 6).
 
     ``node`` may be a node dict or a bare node id string; only its id is used.
     ``detail`` is the raiser's detail string (often the dependency node id for
     `completion-marker-missing`/`completion-evidence-revised-unrecorded`).
+    ``evidence``, when the caller holds the marker, fills the evidence path.
     """
     node_id = node.get("id") if isinstance(node, Mapping) else node
     target = detail or node_id or "<node>"
     route_arg = f"--route {route_file}" if route_file else "--route <route-file>"
+    evidence_arg = shlex.quote(evidence) if evidence else "<evidence-path>"
     if reason == "completion-evidence-revised-unrecorded":
         return (
             f"capability-route.py revise {route_arg} --node {target} "
-            "--evidence <evidence-path> "
+            f"--evidence {evidence_arg} "
             "--basis review-findings|user-direction|owner-correction"
         )
     if reason == "completion-marker-missing":
         return (
             f"wait for node {target} to publish a completion marker, or if its "
             f"gate evidence already changed run: capability-route.py revise {route_arg} "
-            f"--node {target} --evidence <evidence-path> "
+            f"--node {target} --evidence {evidence_arg} "
             "--basis review-findings|user-direction|owner-correction"
         )
     if reason == "completion-evidence-superseded":
@@ -2965,6 +3025,7 @@ class ProcessTableScan:
     group_errors: tuple[tuple[int, int | None, str], ...] = ()
     error: str = ""
     tag_access_errors: tuple[tuple[int, str, str], ...] = ()
+    tag_access_cgroups: tuple[tuple[tuple[int, str], str], ...] = ()
 
 
 _PROCESS_TABLE_SCAN: contextvars.ContextVar = contextvars.ContextVar(
@@ -2992,6 +3053,7 @@ def scan_process_table() -> ProcessTableScan:
     incomplete_reason = ""
     group_errors: list[tuple[int, int | None, str]] = []
     tag_access_errors: list[tuple[int, str, str]] = []
+    tag_access_cgroups: list[tuple[tuple[int, str], str]] = []
     try:
         entries = tuple(Path("/proc").iterdir())
     except OSError as exc:
@@ -3055,6 +3117,9 @@ def scan_process_table() -> ProcessTableScan:
                 stable_start, reason = _tag_access_observation(entry, start)
                 if reason:
                     tag_access_errors.append((pid, stable_start, reason))
+                    cgroup = _denied_process_cgroup(entry, stable_start)
+                    if cgroup:
+                        tag_access_cgroups.append(((pid, stable_start), cgroup))
                 continue
             incomplete_reason = f"procfs-environ:{entry.name}:{exc.errno or 'error'}"
             continue
@@ -3071,6 +3136,7 @@ def scan_process_table() -> ProcessTableScan:
         incomplete_reason,
         tuple(group_errors),
         tag_access_errors=tuple(tag_access_errors),
+        tag_access_cgroups=tuple(tag_access_cgroups),
     )
 
 
@@ -3133,9 +3199,11 @@ def _tagged_descendants_from_scan(
         return ProcessGroupObservation(
             "unverifiable", (), "observer-namespace-mismatch"
         )
+    cgroups = dict(scan.tag_access_cgroups)
     access_reason = next((reason for pid, start, reason in scan.tag_access_errors
                           if pid not in excluded_pids and not _denied_process_outside_attempt(
-                              start, metadata, host_complete=host_complete)), "")
+                              start, metadata, host_complete=host_complete,
+                              cgroup=cgroups.get((pid, start), ""))), "")
     if access_reason:
         return ProcessGroupObservation("unverifiable", (), access_reason)
     return ProcessGroupObservation("empty")
@@ -3226,8 +3294,41 @@ def _tag_access_observation(entry: Path, start: str = "") -> tuple[str, str]:
     return stable, f"procfs-environ:{entry.name}:same-uid-unobservable"
 
 
-def _denied_process_outside_attempt(start: str, metadata: dict[str, str], *, host_complete=False) -> bool:
-    """A denied process born before this exact local child is not its descendant."""
+def _denied_process_cgroup(entry: Path, stable_start: str) -> str:
+    """The unified cgroup of a denied same-UID process, only while its start ticks still match."""
+
+    if not stable_start:
+        return ""
+    try:
+        path = _unified_cgroup_path((entry / "cgroup").read_text(encoding="utf-8"))
+        raw = (entry / "stat").read_text(encoding="utf-8")
+        current = raw[raw.rfind(")") + 2:].split()[19]
+    except (OSError, IndexError, ValueError):
+        return ""
+    return path if current == stable_start else ""
+
+
+def _service_cgroup_outside_launch(cgroup: str, metadata) -> bool:
+    """A denied process in a systemd service unit disjoint from the recorded launch cgroup is not a descendant."""
+
+    launch, namespace = _recorded_launch_cgroup(metadata)
+    if not (launch and cgroup.startswith("/") and namespace
+            and process_cgroup_namespace_identity() == namespace):
+        return False
+    if not cgroup.rstrip("/").rsplit("/", 1)[-1].endswith(".service"):
+        return False
+
+    def inside(outer: str, inner: str) -> bool:
+        return inner == outer or inner.startswith(outer.rstrip("/") + "/")
+
+    return not inside(launch, cgroup) and not inside(cgroup, launch)
+
+
+def _denied_process_outside_attempt(
+    start: str, metadata: dict[str, str], *, host_complete=False, cgroup: str = ""
+) -> bool:
+    """A denied process born before this exact local child, or running in a systemd service
+    unit disjoint from the cgroup recorded at launch, is not its descendant."""
     if not metadata.get('pid') and metadata.get('launch_outcome') in {'never-launched', 'reaped-before-publish'}:
         return True  # atomic fenced outcome: no payload could create a descendant
     if (metadata.get("launch_claimed") == "0"
@@ -3241,6 +3342,8 @@ def _denied_process_outside_attempt(start: str, metadata: dict[str, str], *, hos
         # The watcher sealed this receipt only from an empty tagged scan, and an
         # environment passes from parent to child only, so no process born since
         # can carry this attempt's tag. Readable tags still answer `live`.
+        return True
+    if _service_cgroup_outside_launch(cgroup, metadata):
         return True
     origin = metadata.get("pid_start", "")
     authority = attempt_scan_namespace_authority(metadata) or (
@@ -3265,8 +3368,9 @@ def attempt_tagged_descendants(
     from anywhere else the tagged processes may simply be invisible, so that
     case is ``unverifiable`` rather than a false death. Only a verified different
     UID, a fork by a live parent under another real UID (`_forked_across_uid_boundary`),
-    or an adjacent stable birth earlier than this exact local child, excludes
-    a denied environment. Readable positive tags always win. ``host_complete`` is used only once the
+    an adjacent stable birth earlier than this exact local child, or a systemd
+    `.service` unit disjoint from the cgroup recorded at launch (`launch_cgroup_b64`,
+    same cgroup namespace), excludes a denied environment. Readable positive tags always win. ``host_complete`` is used only once the
     recorded namespaces are extinct (`attempt_process_quiescence`): then a
     complete walk by a host-like observer, which sees every namespace, is the
     one that may answer ``empty``.
@@ -3323,7 +3427,7 @@ def attempt_tagged_descendants(
                     continue
                 stable_start, reason = _tag_access_observation(entry, start)
                 if reason:
-                    access_errors.append((stable_start, reason))
+                    access_errors.append((stable_start, reason, _denied_process_cgroup(entry, stable_start)))
                 continue
             incomplete_reason = f"procfs-environ:{entry.name}:{exc.errno or 'error'}"
             continue
@@ -3343,8 +3447,8 @@ def attempt_tagged_descendants(
         return ProcessGroupObservation(
             "unverifiable", (), "observer-namespace-mismatch"
         )
-    access_reason = next((reason for start, reason in access_errors if not _denied_process_outside_attempt(
-        start, metadata, host_complete=host_complete)), '')
+    access_reason = next((reason for start, reason, cgroup in access_errors if not _denied_process_outside_attempt(
+        start, metadata, host_complete=host_complete, cgroup=cgroup)), '')
     if access_reason:
         return ProcessGroupObservation('unverifiable', (), access_reason)
     return ProcessGroupObservation("empty")
@@ -5150,13 +5254,15 @@ def spawn_claimed_attempt(
             raise
         os.close(gate_read)
         identity = process_launch_identity(proc.pid)
+        identity.update(process_launch_cgroup(proc.pid))
         provided_metadata = {
             key: str(value)
             for key, value in (launch_metadata or {}).items()
             if value not in (None, "")
         }
         conflicting_identity = sorted(
-            _PROCESS_IDENTITY_METADATA_KEYS.intersection(provided_metadata)
+            (_PROCESS_IDENTITY_METADATA_KEYS | set(LAUNCH_CGROUP_METADATA_KEYS))
+            .intersection(provided_metadata)
         )
         if conflicting_identity:
             cleanup_verified = _abort_fenced_launch(
@@ -5309,7 +5415,7 @@ def spawn_claimed_attempt(
                     changed_detail,
                 )
         callback_conflicts = sorted(
-            ({*_PROCESS_IDENTITY_METADATA_KEYS, "launch_claimed"})
+            ({*_PROCESS_IDENTITY_METADATA_KEYS, *LAUNCH_CGROUP_METADATA_KEYS, "launch_claimed"})
             .intersection(observer_metadata)
         )
         if callback_conflicts:
@@ -8299,6 +8405,77 @@ class GateCurrency(NamedTuple):
     evidence_digest: str | None = None
 
 
+def _resource_stage_marker_current(route, node, marker, marker_path, jobs):
+    """Bind supervised-owner marker use to the journaled owner admission.
+
+    Legacy markers keep their existing interpretation unless an exact
+    same-route reconciliation records that a poll-only marker was unconsumed.
+    New supervised-owner markers carry the resource identity that the owner
+    admitted at the existing successor-start boundary.
+    """
+    if (node.get("kind") != "resource-runner"
+            or (node.get("continuation") or {}).get("kind") != "supervised"):
+        return None
+    jobs_path = Path(jobs) if jobs else None
+    try:
+        import workflow_state as WS
+        ledger = WS.WorkflowLedger(route["route_id"], route.get("route_hash", ""), jobs=jobs_path)
+        state = ledger.read_only_state()
+        if not state.get("ledger_dir_exists"):
+            return (GateCurrency("resource-stage-not-current", "completion-marker-missing")
+                    if marker.get("resource_execution_identity") is not None else None)
+        if state.get("journal_unreadable"):
+            return GateCurrency("resource-stage-not-current", "completion-marker-missing")
+        armed_path = ledger.root / "armed" / f"{node['id']}.json"
+        armed = json.loads(armed_path.read_text(encoding="utf-8"))
+        if armed.get("predecessor_kind") != "resource":
+            return None
+        registry = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
+        row = registry["runs"][armed["predecessor_id"]]
+        if row.get("resource_policy") != "supervised-owner":
+            return None
+        raw = marker_path.read_bytes()
+        marker_sha = hashlib.sha256(raw).hexdigest()
+        marker_sequence = marker.get("sequence")
+        for entry in ledger.journal():
+            evidence = entry.get("evidence") or {}
+            if (entry.get("actor") == "resource-false-success-reconciliation"
+                    and evidence.get("marker_sha256") == marker_sha
+                    and evidence.get("marker_sequence") == marker_sequence):
+                return GateCurrency("resource-stage-not-current", "completion-marker-missing")
+        stage = state.get("nodes", {}).get(node["id"], {})
+        if stage.get("state") != "STAGE_SUCCEEDED":
+            return GateCurrency("resource-stage-not-current", "completion-marker-missing")
+        resource_identity = marker.get("resource_execution_identity")
+        if resource_identity is None:
+            return None
+        evidence = stage.get("evidence") or {}
+        try:
+            import resource_resume as RESOURCE_RESUME
+            current_digest = RESOURCE_RESUME.row_digest(row)
+        except (ImportError, KeyError, TypeError, ValueError):
+            return GateCurrency("resource-stage-not-current", "completion-marker-missing")
+        owner_id = (row.get("owner_wait") or {}).get("parent_attempt_id")
+        output = __import__("resource_run_evidence").paths(armed).get("runtime_output")
+        if (stage.get("state") != "STAGE_SUCCEEDED"
+                or evidence.get("resource_execution_identity") != resource_identity
+                or evidence.get("identity") != resource_identity
+                or evidence.get("resource_sha256") != current_digest
+                or evidence.get("owner_attempt_id") != owner_id
+                or not (evidence.get("owner_successor_start") is True
+                        or evidence.get("owner_terminal_settlement") is True)
+                or marker.get("evidence", {}).get("path") != output):
+            return GateCurrency("resource-stage-not-current", "completion-marker-missing")
+        return None
+    except FileNotFoundError:
+        return (GateCurrency("resource-stage-not-current", "completion-marker-missing")
+                if marker.get("resource_execution_identity") is not None else None)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        if marker.get("resource_execution_identity") is not None:
+            return GateCurrency("resource-stage-not-current", "completion-marker-missing")
+        return None
+
+
 def evidence_change_history_path(marker_path: Path, node_id: str) -> Path:
     """The append-only history of a node's evidence edits after its marker."""
     return marker_path.parent / f"{node_id}.evidence-changes.jsonl"
@@ -8575,6 +8752,10 @@ def gate_currency(
                     route_state_next_action(reason, str(node.get("id")), None, node)
                     if state == "superseded" else None,
                     provenance.evidence_digest)
+    if provenance.state in {"current", "revised-unrecorded"}:
+        resource_currency = _resource_stage_marker_current(route, node, marker, marker_path, jobs)
+        if resource_currency is not None:
+            return resource_currency
     return provenance
 
 
@@ -10380,6 +10561,7 @@ def recover_unstarted_attempt(jobs: Path, attempt_id: str) -> bool:
             return False
         remove = {
             *_PROCESS_IDENTITY_METADATA_KEYS,
+            *LAUNCH_CGROUP_METADATA_KEYS,
             "launch_claimed",
             "launch_lifecycle",
             "launch_started",
@@ -11358,49 +11540,56 @@ def close_attempt_row_if(
     with Path(f"{jobs}.lock").open("a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        matches = []
         for index, line in enumerate(lines):
             fields = line.split("\t")
-            if len(fields) != 6 or fields[1] not in {"open", "running"}:
+            if len(fields) != 6:
                 continue
             metadata = parse_registry_metadata(fields[5])
             if metadata.get("attempt_id") != attempt_id:
                 continue
-            validate_attempt_metadata(metadata)
-            import route_parent_close
-            if route_parent_close.row_requested(metadata, jobs) and note != "cancelled-by-parent":
+            matches.append((index, fields, metadata))
+        if len(matches) != 1:
+            return False
+        index, fields, metadata = matches[0]
+        if fields[1] not in {"open", "running"}:
+            return False
+        validate_attempt_metadata(metadata)
+        import route_parent_close
+        if route_parent_close.row_requested(metadata, jobs) and note != "cancelled-by-parent":
+            return False
+        recorded_claim = metadata.get("teardown_claim", "")
+        if recorded_claim:
+            if not teardown_claim or recorded_claim != teardown_claim:
                 return False
-            recorded_claim = metadata.get("teardown_claim", "")
-            if recorded_claim:
-                if not teardown_claim or recorded_claim != teardown_claim:
-                    return False
-            elif teardown_claim:
-                return False
-            if not predicate(fields.copy()):
-                continue
-            fields[1] = "done"
-            values = {"note": note}
-            if teardown_claim:
-                values.update(
-                    teardown_claim="",
-                    teardown_claimed_at="",
-                    teardown_claim_pid="",
-                    teardown_claim_pid_start="",
-                )
-            values.update({
-                key: value for key, value in (evidence or {}).items()
-                if value not in (None, "")
-            })
-            values.update(_terminal_cleanup_values({**metadata, **values}))
-            values.update(_delivery_intent_values(fields, {**metadata, **values}))
-            try:
-                fields[5] = _updated_attempt_metadata(
-                    fields[5], values, terminal=True
-                )
-            except DispatchContractError:
-                return False
-            lines[index] = "\t".join(fields)
-            _atomic_registry_replace(jobs, lines)
-            return True
+        elif teardown_claim:
+            return False
+        if not predicate(fields.copy()):
+            return False
+        fields[1] = "done"
+        values = {"note": note}
+        if teardown_claim:
+            values.update(
+                teardown_claim="",
+                teardown_claimed_at="",
+                teardown_claim_pid="",
+                teardown_claim_pid_start="",
+            )
+        values.update({
+            key: value for key, value in (evidence or {}).items()
+            if value not in (None, "")
+        })
+        values.update(_terminal_cleanup_values({**metadata, **values}))
+        values.update(_delivery_intent_values(fields, {**metadata, **values}))
+        try:
+            fields[5] = _updated_attempt_metadata(
+                fields[5], values, terminal=True
+            )
+        except DispatchContractError:
+            return False
+        lines[index] = "\t".join(fields)
+        _atomic_registry_replace(jobs, lines)
+        return True
     return False
 
 
@@ -11428,6 +11617,20 @@ def attempt_row_never_started(fields: list[str]) -> bool:
         and not metadata.get("pid")
         and metadata.get("launch_outcome", "") in {"", "never-launched"}
     )
+
+
+def attempt_row_withdrawn_before_launch(fields: list[str]) -> bool:
+    """Identify a never-started registration withdrawn under the jobs lock.
+
+    An unclaimed open row may still be launched. Only a terminal row explicitly
+    closed as cancelled has lost that launch authority and can leave the round
+    census without hiding a real pre-launch failure.
+    """
+
+    if len(fields) != 6 or not attempt_row_never_started(fields):
+        return False
+    metadata = parse_registry_metadata(fields[5])
+    return fields[1] in {"done", "cancelled", "killed"} and metadata.get("failure_class") == "cancelled"
 
 
 def close_refused_chain_rows(

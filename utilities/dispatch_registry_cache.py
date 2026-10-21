@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import atexit
 import codecs
 import contextlib
 import contextvars
+import hashlib
 import os
 from pathlib import Path
 import threading
@@ -26,6 +28,9 @@ _CACHE_MAX_PATHS = 128
 _CACHE_MAX_BYTES = 64 * 1024 * 1024
 _MAX_SEGMENTS = 256
 _COMPACT_SEGMENTS = 128
+_NON_CANONICAL_LINE_SEPARATORS = (b"\r", b"\v", b"\f", b"\x1c", b"\x1d",
+                                 b"\x1e", b"\xc2\x85", b"\xe2\x80\xa8",
+                                 b"\xe2\x80\xa9")
 _LOCK = threading.RLock()
 _CACHE: OrderedDict[str, "RegistryView"] = OrderedDict()
 _READ_SCOPE: contextvars.ContextVar = contextvars.ContextVar("dispatch_registry_read_scope", default=None)
@@ -78,13 +83,15 @@ def _handover_metadata(raw: str) -> tuple[tuple[str, str], ...]:
     return tuple(values.items())
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RegistryRecord:
     order: int
-    raw: str
     fields: tuple[str, ...]
-    completion_items: tuple[tuple[str, str], ...]
-    handover_items: tuple[tuple[str, str], ...]
+
+    @property
+    def raw(self) -> str:
+        """Compatibility view; avoid retaining a second copy of every row."""
+        return "\t".join(self.fields)
 
     @property
     def status(self) -> str:
@@ -95,10 +102,10 @@ class RegistryRecord:
         return self.fields[4]
 
     def completion_metadata(self) -> dict[str, str]:
-        return dict(self.completion_items)
+        return dict(_completion_metadata(self.fields[5]))
 
     def handover_metadata(self) -> dict[str, str]:
-        return dict(self.handover_items)
+        return dict(_handover_metadata(self.fields[5]))
 
 
 class _RegistrySegment:
@@ -109,7 +116,8 @@ class _RegistrySegment:
                  "completion_by_parent_sid",
                  "completion_by_route_alias", "settlement_owners",
                  "handover_latest", "handover_by_parent", "handover_by_binding",
-                 "headless_owner_rows")
+                 "headless_owner_rows", "selection_by_parent", "selection_by_slug",
+                 "selection_by_attempt", "selection_by_parent_slug")
 
     def __init__(self, lines: tuple[str, ...], order_base: int):
         self.lines = lines
@@ -122,18 +130,29 @@ class _RegistrySegment:
         completion_by_route_alias = {}
         settlement_owners = []
         handover_latest = {}
+        selection_by_parent = {}
+        selection_by_slug = {}
+        selection_by_attempt = {}
+        selection_by_parent_slug = {}
         self.malformed_rows = 0
         for relative_order, line in enumerate(lines):
             fields = tuple(line.split("\t"))
             if len(fields) != 6:
                 self.malformed_rows += 1
                 continue
-            completion_items = _completion_metadata(fields[5])
-            handover_items = _handover_metadata(fields[5])
-            record = RegistryRecord(order_base + relative_order, line, fields,
-                                     completion_items, handover_items)
+            record = RegistryRecord(order_base + relative_order, fields)
             records.append(record)
-            completion_meta = dict(completion_items)
+            completion_meta = dict(_completion_metadata(fields[5]))
+            handover_meta = dict(_handover_metadata(fields[5]))
+            parent = completion_meta.get("parent")
+            attempt_id = completion_meta.get("attempt_id")
+            if parent:
+                selection_by_parent.setdefault(parent, []).append(record)
+            selection_by_slug.setdefault(fields[4], []).append(record)
+            if attempt_id:
+                selection_by_attempt.setdefault(attempt_id, []).append(record)
+            if parent:
+                selection_by_parent_slug.setdefault((parent, fields[4]), []).append(record)
             attempt = completion_meta.get("attempt_id")
             if attempt:
                 completion_all.setdefault(attempt, []).append(record)
@@ -154,7 +173,6 @@ class _RegistrySegment:
                     and completion_meta.get("launch_started") == "1"
                     and completion_meta.get("supervisor_lease") == "flock-v1"):
                 settlement_owners.append(record)
-            handover_meta = dict(handover_items)
             handover_attempt = handover_meta.get("attempt_id")
             if handover_attempt:
                 handover_latest[handover_attempt] = (fields[1], record)
@@ -171,6 +189,12 @@ class _RegistrySegment:
         }
         self.settlement_owners = tuple(settlement_owners)
         self.handover_latest = handover_latest
+        self.selection_by_parent = {key: tuple(value) for key, value in selection_by_parent.items()}
+        self.selection_by_slug = {key: tuple(value) for key, value in selection_by_slug.items()}
+        self.selection_by_attempt = {key: tuple(value) for key, value in selection_by_attempt.items()}
+        self.selection_by_parent_slug = {
+            key: tuple(value) for key, value in selection_by_parent_slug.items()
+        }
         self._index_handover()
 
     def _index_handover(self):
@@ -185,7 +209,7 @@ class _RegistrySegment:
             route = metadata.get("owner_route_id") or metadata.get("route_id") or ""
             digest = metadata.get("owner_route_hash") or metadata.get("route_hash") or ""
             node = metadata.get("route_node") or ""
-            if route and digest and node:
+            if route and digest:     # an owner row has no route node: it binds as (route, hash, "")
                 self.handover_by_binding.setdefault((route, digest, node), {})[attempt] = (status, record)
             if (metadata.get("dispatch_depth") == "1" and metadata.get("worker_type") == "owner"
                     and metadata.get("harness") == "opencode"
@@ -209,6 +233,10 @@ class _RegistrySegment:
         completion_by_parent_sid = {}
         completion_by_route_alias = {}
         result.handover_latest = {}
+        selection_by_parent = {}
+        selection_by_slug = {}
+        selection_by_attempt = {}
+        selection_by_parent_slug = {}
         for segment in segments:
             result.completion_latest.update(segment.completion_latest)
             for attempt, error in segment.completion_errors.items():
@@ -220,6 +248,14 @@ class _RegistrySegment:
                 for key, rows in source.items():
                     target.setdefault(key, []).extend(rows)
             result.handover_latest.update(segment.handover_latest)
+            for target, source in (
+                (selection_by_parent, segment.selection_by_parent),
+                (selection_by_slug, segment.selection_by_slug),
+                (selection_by_attempt, segment.selection_by_attempt),
+                (selection_by_parent_slug, segment.selection_by_parent_slug),
+            ):
+                for key, rows in source.items():
+                    target.setdefault(key, []).extend(rows)
         result.completion_all = {key: tuple(value) for key, value in completion_all.items()}
         result.completion_children = {key: tuple(value) for key, value in completion_children.items()}
         result.completion_by_parent_sid = {
@@ -230,6 +266,12 @@ class _RegistrySegment:
         }
         result.settlement_owners = tuple(record for segment in segments
                                         for record in segment.settlement_owners)
+        result.selection_by_parent = {key: tuple(value) for key, value in selection_by_parent.items()}
+        result.selection_by_slug = {key: tuple(value) for key, value in selection_by_slug.items()}
+        result.selection_by_attempt = {key: tuple(value) for key, value in selection_by_attempt.items()}
+        result.selection_by_parent_slug = {
+            key: tuple(value) for key, value in selection_by_parent_slug.items()
+        }
         result._index_handover()
         return result
 
@@ -237,23 +279,29 @@ class _RegistrySegment:
 class RegistryView:
     """Immutable segmented registry view with incremental append indexes."""
 
-    __slots__ = ("path_identity", "resolved_path", "signature", "_raw", "_segments", "_tail",
+    __slots__ = ("path_identity", "resolved_path", "signature", "_raw", "_fd", "_segments", "_tail",
                  "line_count", "record_count", "malformed_rows", "has_partial_tail",
                  "last_observed_at", "_has_duplicate_attempts", "_invalid_utf8_prefix",
-                 "has_invalid_utf8")
+                 "has_invalid_utf8", "_raw_digest", "_prefix_reuse_eligible")
 
     def __init__(self, path_identity: str, resolved_path: str, signature: tuple,
-                 raw: bytes, *, previous: "RegistryView | None" = None):
+                 raw: bytes, *, previous: "RegistryView | None" = None, fd: int = -1):
         self.path_identity = path_identity
         self.resolved_path = resolved_path
         self.signature = signature
         self._raw = raw if previous is None else previous._raw + raw
+        self._fd = fd
         self.last_observed_at = time.monotonic()
         self._has_duplicate_attempts = None
+        self._raw_digest = hashlib.sha256(raw)
         if previous is None:
             invalid_utf8, incomplete_utf8 = _utf8_status(raw)
             self._invalid_utf8_prefix = invalid_utf8
             self.has_invalid_utf8 = invalid_utf8 or incomplete_utf8
+            self._prefix_reuse_eligible = (
+                not invalid_utf8
+                and not any(separator in raw for separator in _NON_CANONICAL_LINE_SEPARATORS)
+            )
             boundary = raw.rfind(b"\n") + 1
             complete = raw[:boundary].decode("utf-8", errors="replace").splitlines()
             tail = raw[boundary:]
@@ -262,12 +310,18 @@ class RegistryView:
             self._tail = tail
             self.line_count = len(complete) + (1 if tail else 0)
         else:
-            # The caller proved the entire old prefix unchanged before supplying
-            # only its appended bytes. Rejoin the pending UTF-8 byte tail.
+            # The caller supplied only bytes appended to a continuously observed,
+            # trusted append-only registry. Rejoin its pending UTF-8 byte tail.
             combined = previous._tail + raw
             invalid_utf8, incomplete_utf8 = _utf8_status(combined)
             self._invalid_utf8_prefix = previous._invalid_utf8_prefix or invalid_utf8
             self.has_invalid_utf8 = self._invalid_utf8_prefix or incomplete_utf8
+            self._raw_digest = previous._raw_digest.copy()
+            self._raw_digest.update(raw)
+            self._prefix_reuse_eligible = (
+                previous._prefix_reuse_eligible and not invalid_utf8
+                and not any(separator in combined for separator in _NON_CANONICAL_LINE_SEPARATORS)
+            )
             pieces = combined.split(b"\n")
             complete_bytes, tail = pieces[:-1], pieces[-1]
             complete = tuple(piece.decode("utf-8", errors="replace") for piece in complete_bytes)
@@ -307,6 +361,47 @@ class RegistryView:
     @property
     def records(self) -> tuple[RegistryRecord, ...]:
         return tuple(record for segment in self._segments for record in segment.records)
+
+    def select_rows(self, *, parent: str = "", slug: str = "", attempt_id: str = ""):
+        """Select latest CLI rows from indexes built with this registry generation."""
+        candidates = {}
+        for segment in self._segments:
+            if attempt_id:
+                rows = segment.selection_by_attempt.get(attempt_id, ())
+            elif parent and slug:
+                rows = segment.selection_by_parent_slug.get((parent, slug), ())
+            elif parent:
+                rows = segment.selection_by_parent.get(parent, ())
+            elif slug:
+                rows = segment.selection_by_slug.get(slug, ())
+            else:
+                rows = segment.records
+            for record in rows:
+                candidates[record.order] = record
+
+        ordered = [(record.order, list(record.fields), record.completion_metadata())
+                   for record in candidates.values()]
+        if self._tail:
+            tail_lines = self._tail.decode("utf-8", errors="replace").splitlines()
+            for offset, line in enumerate(tail_lines):
+                fields = line.split("\t")
+                if len(fields) == 6:
+                    metadata = dict(_completion_metadata(fields[5]))
+                    ordered.append((self.line_count - 1 + offset,
+                                    fields, metadata))
+
+        latest = {}
+        for order, fields, metadata in sorted(ordered, key=lambda item: item[0]):
+            if parent and metadata.get("parent") != parent:
+                continue
+            if slug and fields[4] != slug:
+                continue
+            if attempt_id and metadata.get("attempt_id") != attempt_id:
+                continue
+            key = (("attempt", metadata["attempt_id"]) if metadata.get("attempt_id")
+                   else ("legacy", fields[2], fields[3], fields[4]))
+            latest[key] = (fields, metadata)
+        return list(latest.values())
 
     def require_complete_text(self) -> None:
         """Authority cannot prove absence from damaged or uncommitted text."""
@@ -437,13 +532,58 @@ class RegistryView:
         return tuple(result)
 
 
-def _stable_read(path: Path, path_identity: str):
-    """Read two equal full snapshots from one stable descriptor.
+@dataclass(frozen=True, slots=True)
+class RegistrySnapshot:
+    """One complete registry generation with the exact lines decoded from it.
 
-    Metadata brackets the reads, but content equality is the evidence that a
-    stat collision did not hide an in-place rewrite. Metrics count every read
-    pass and byte, including partial reads from observations that are retried.
+    Selected authority envelopes intentionally remain separate: a bounded row
+    selection can identify candidates, but it cannot establish registry-wide
+    absence. Consumers that need absence proofs must use a complete snapshot.
     """
+
+    path_identity: str
+    resolved_path: str
+    signature: tuple[int, int, int, int, int]
+    view: RegistryView
+    lines: tuple[str, ...]
+    complete: bool
+    reason: str = ""
+
+    def matches_jobs(self, jobs) -> bool:
+        path = Path(jobs)
+        try:
+            return (str(path.absolute()) == self.path_identity
+                    and str(path.resolve(strict=True)) == self.resolved_path
+                    and tuple(self.view.signature) == tuple(self.signature))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+
+    def contains_current_attempt(self, rows, *, attempt_id: str, status: str) -> bool:
+        """Match the selected owner row to this generation's current attempt.
+
+        This checks only the selected target. Registry-wide absence and
+        prerequisite proofs still use ``rows`` from the complete snapshot.
+        """
+        if (not self.complete or not attempt_id
+                or not isinstance(rows, (list, tuple))):
+            return False
+        latest, error = self.view.completion_attempt(attempt_id)
+        if error or latest is None or latest.status != status:
+            return False
+        latest_metadata = latest.completion_metadata()
+        try:
+            for fields, metadata in rows:
+                if (isinstance(fields, (list, tuple)) and isinstance(metadata, dict)
+                        and tuple(fields) == latest.fields
+                        and metadata == latest_metadata):
+                    return True
+        except (TypeError, ValueError):
+            return False
+        return False
+
+
+def _stable_read(path: Path, path_identity: str):
+    """Read one stable generation and return its still-open descriptor to cache."""
     last_error = None
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     for _attempt in range(_RETRIES):
@@ -454,42 +594,110 @@ def _stable_read(path: Path, path_identity: str):
             fd = os.open(path, flags)
             fd_before = os.fstat(fd)
             before_signature = _stat_signature(path_before)
-            if _stat_signature(fd_before) != before_signature:
+            if (fd_before.st_nlink <= 0
+                    or (path_before.st_dev, path_before.st_ino) != (fd_before.st_dev, fd_before.st_ino)
+                    or _stat_signature(fd_before) != before_signature):
                 raise OSError("registry changed before read")
-            snapshots = []
-            for _pass in range(2):
-                os.lseek(fd, 0, os.SEEK_SET)
-                chunks = []
-                size = 0
-                _METRICS["content_reads"] += 1
-                while True:
-                    chunk = os.read(fd, _CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    size += len(chunk)
-                    _METRICS["bytes_read"] += len(chunk)
-                if size != before_signature[2]:
-                    raise OSError("registry size changed during read")
-                snapshots.append(b"".join(chunks))
+            chunks = []
+            size = 0
+            _METRICS["content_reads"] += 1
+            while True:
+                chunk = os.read(fd, _CHUNK_SIZE)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                _METRICS["bytes_read"] += len(chunk)
 
             fd_after = os.fstat(fd)
             path_after = path.stat()
             resolved_after = str(path.resolve(strict=True))
             after_signature = _stat_signature(path_after)
-            if (resolved_before != resolved_after
+            if (resolved_before != resolved_after or fd_after.st_nlink <= 0
+                    or (path_after.st_dev, path_after.st_ino) != (fd_after.st_dev, fd_after.st_ino)
                     or before_signature != _stat_signature(fd_after)
                     or before_signature != after_signature
-                    or snapshots[0] != snapshots[1]):
+                    or size != before_signature[2]):
                 raise OSError("registry changed during read")
-            return resolved_after, after_signature, snapshots[1]
-        except (OSError, RuntimeError, ValueError) as exc:
+            owned_fd, fd = fd, None
+            return resolved_after, after_signature, b"".join(chunks), owned_fd
+        except (OSError, RuntimeError) as exc:
             last_error = exc
         finally:
             if fd is not None:
                 os.close(fd)
     raise OSError(getattr(last_error, "errno", None),
                   f"could not read a stable registry generation: {path_identity}") from last_error
+
+
+def _close_view_fd(view: RegistryView | None) -> None:
+    if view is None:
+        return
+    fd, view._fd = view._fd, -1
+    if fd >= 0:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _path_matches_fd(path: Path, resolved: str, signature: tuple, fd: int) -> bool:
+    try:
+        path_info = path.stat()
+        fd_info = os.fstat(fd)
+        return (str(path.resolve(strict=True)) == resolved
+                and path_info.st_dev == fd_info.st_dev
+                and path_info.st_ino == fd_info.st_ino
+                and fd_info.st_nlink > 0
+                and _stat_signature(path_info) == signature
+                and _stat_signature(fd_info) == signature)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _read_retained_suffix(path: Path, path_identity: str, cached: RegistryView):
+    """Read appended bytes from the cache owner's continuously retained fd."""
+    last_error = None
+    for _attempt in range(_RETRIES):
+        try:
+            resolved_before = str(path.resolve(strict=True))
+            path_before = path.stat()
+            fd_before = os.fstat(cached._fd)
+            before_signature = _stat_signature(path_before)
+            fd_signature = _stat_signature(fd_before)
+            if (resolved_before != cached.resolved_path or fd_before.st_nlink <= 0
+                    or fd_signature[:2] != cached.signature[:2]
+                    or (path_before.st_dev, path_before.st_ino) != (fd_before.st_dev, fd_before.st_ino)
+                    or before_signature[:2] != cached.signature[:2]
+                    or before_signature[2] <= cached.signature[2]):
+                raise OSError("registry append generation changed")
+            os.lseek(cached._fd, cached.signature[2], os.SEEK_SET)
+            chunks, size = [], 0
+            _METRICS["content_reads"] += 1
+            while True:
+                chunk = os.read(cached._fd, _CHUNK_SIZE)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                _METRICS["bytes_read"] += len(chunk)
+            fd_after = os.fstat(cached._fd)
+            path_after = path.stat()
+            resolved_after = str(path.resolve(strict=True))
+            after_signature = _stat_signature(path_after)
+            if (resolved_before != resolved_after
+                    or before_signature != after_signature
+                    or fd_signature[:2] != _stat_signature(fd_after)[:2]
+                    or _stat_signature(fd_after) != after_signature
+                    or fd_after.st_nlink <= 0
+                    or (path_after.st_dev, path_after.st_ino) != (fd_after.st_dev, fd_after.st_ino)
+                    or size != after_signature[2] - cached.signature[2]):
+                raise OSError("registry changed during append read")
+            _METRICS["delta_reads"] += 1
+            _METRICS["delta_bytes_read"] += size
+            return resolved_after, after_signature, b"".join(chunks)
+        except (OSError, RuntimeError, ValueError) as exc:
+            last_error = exc
+    raise OSError(getattr(last_error, "errno", None),
+                  f"could not read a stable registry append: {path_identity}") from last_error
 
 
 @contextlib.contextmanager
@@ -512,8 +720,6 @@ def registry_scope_active() -> bool:
 
 def _pinned_generation(scope: dict, jobs: Path) -> tuple[RegistryView, tuple[str, ...]]:
     path = Path(jobs)
-    # Bind an alias on first access too: retargeting it must not split one
-    # Fleet pass across generations. The next pass resolves the alias afresh.
     key = str(path.absolute())
     held = scope.get(key)
     if held is None:
@@ -528,14 +734,67 @@ def _pinned_generation(scope: dict, jobs: Path) -> tuple[RegistryView, tuple[str
 
 
 def _observe_generation(path: Path) -> tuple[RegistryView, tuple[str, ...]]:
-    """Pin a content-validated view and the plain text lines of those same bytes.
+    """Read one full stable generation into its view and its plain text lines.
 
-    Both scoped and unscoped observations share the content proof. The lines
-    equal ``read_text(errors="replace").splitlines()``; the view's LF-segmented
-    lines do not promise that for other line separators.
+    The lines equal ``read_text(errors="replace").splitlines()`` of the same bytes;
+    the view's LF-segmented lines do not promise that for other line separators.
+    The view is the cached one when that generation is already cached.
     """
-    view = _registry_view_fresh(path)
-    return view, tuple(view._raw.decode("utf-8", errors="replace").splitlines())
+    identity = str(path.absolute())
+    with _LOCK:
+        fd = None
+        try:
+            path.resolve(strict=True)  # a missing path fails at once, as in registry_view
+            resolved, signature, raw, fd = _stable_read(path, identity)
+        except OSError:
+            if _drop(identity) is not None:
+                _METRICS["invalidations"] += 1
+            raise
+        except RuntimeError as exc:
+            if _drop(identity) is not None:
+                _METRICS["invalidations"] += 1
+            raise OSError(f"could not resolve registry path: {identity}") from exc
+        cached = _CACHE.get(identity)
+        if (cached is not None and cached.resolved_path == resolved
+                and cached.signature == signature
+                and hashlib.sha256(raw).digest() == cached._raw_digest.digest()):
+            os.close(fd)
+            fd = None
+            _METRICS["cache_hits"] += 1
+            _CACHE.move_to_end(identity)
+            cached.last_observed_at = time.monotonic()
+            view = cached
+        else:
+            reusable = bool(
+                cached is not None and cached._prefix_reuse_eligible
+                and cached.resolved_path == resolved
+                and cached.signature[:2] == signature[:2]
+                and signature[2] > cached.signature[2]
+                and len(raw) == signature[2]
+                and raw[:cached.signature[2]] == cached._raw
+                and not any(separator in raw for separator in _NON_CANONICAL_LINE_SEPARATORS)
+                and not _utf8_status(raw)[0]
+            )
+            previous = cached if reusable else None
+            suffix = raw[previous.signature[2]:] if previous is not None else raw
+            _drop(identity)
+            if previous is None:
+                cached = None
+            _METRICS["invalidations"] += 1
+            view = RegistryView(identity, resolved, signature, suffix,
+                                previous=previous, fd=fd)
+            fd = None
+            if previous is not None:
+                _METRICS["append_reuses"] += 1
+                _METRICS["metadata_rows_parsed"] += view.record_count - previous.record_count
+            else:
+                cached = previous = None
+                _METRICS["full_metadata_parses"] += 1
+                _METRICS["metadata_rows_parsed"] += view.record_count
+            _remember(identity, view)
+        if fd is not None:
+            os.close(fd)
+    return view, tuple(raw.decode("utf-8", errors="replace").splitlines())
 
 
 def current_registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:
@@ -554,6 +813,38 @@ def registry_text_lines(jobs: Path) -> tuple[str, ...] | None:
     return _pinned_generation(scope, jobs)[1]
 
 
+def registry_snapshot(jobs: Path) -> RegistrySnapshot:
+    """Return the complete view and exact source lines from one stable generation.
+
+    Outside an existing pass, the temporary scope ensures the view and text
+    lines come from the same stable read. Inside a pass, every consumer of this
+    path receives the already pinned generation and a failed read stays failed
+    until that pass ends.
+    """
+    path = Path(jobs)
+    scope = _READ_SCOPE.get()
+    if scope is None:
+        with registry_read_scope():
+            return registry_snapshot(path)
+    view, lines = _pinned_generation(scope, path)
+    reason = ""
+    if view.has_invalid_utf8:
+        reason = "registry-invalid-utf8"
+    elif view.has_partial_tail:
+        reason = "registry-partial-tail"
+    elif view.malformed_rows:
+        reason = "registry-malformed"
+    elif tuple(lines) != view.lines:
+        # The segmented view indexes LF records. Non-canonical splitlines
+        # separators remain readable for diagnostics but cannot prove absence.
+        reason = "registry-line-boundary-invalid"
+    return RegistrySnapshot(
+        path_identity=str(path.absolute()), resolved_path=view.resolved_path,
+        signature=tuple(view.signature), view=view, lines=tuple(lines),
+        complete=not reason, reason=reason,
+    )
+
+
 def registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:
     scope = _READ_SCOPE.get()
     if scope is not None:
@@ -562,46 +853,81 @@ def registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:
 
 
 def _registry_view_fresh(jobs: Path, *, append_only: bool = False) -> RegistryView:
-    """Validate full contents before reusing a view or its parsed append prefix.
+    """Return the current stable view, rebuilding once when the source generation changes.
 
-    Failed observations drop old authority. Metadata alone cannot distinguish
-    replacement with a recycled inode or an in-place rewrite with coarse clocks.
-    ``append_only`` permits segment reuse only after the entire prefix matches.
+    A failed or unstable observation invalidates the cached generation; an older
+    successful view is never returned as authority for a missing/unreadable path.
+    ``append_only`` is an assertion by a caller executing the supported dispatch
+    writer protocol: same-inode growth is used as a suffix only on that path.
+    Arbitrary files and direct rewrites must leave it false; stat size alone is
+    not evidence that an arbitrary writer preserved the old prefix.
     """
     path = Path(jobs)
     identity = str(path.absolute())
     with _LOCK:
         try:
-            resolved, signature, raw = _stable_read(path, identity)
+            resolved = str(path.resolve(strict=True))
+            signature = _stat_signature(path.stat())
         except OSError:
             if _drop(identity) is not None:
                 _METRICS["invalidations"] += 1
             raise
+        except RuntimeError as exc:
+            if _drop(identity) is not None:
+                _METRICS["invalidations"] += 1
+            raise OSError(f"could not resolve registry path: {identity}") from exc
 
         cached = _CACHE.get(identity)
         if (cached is not None and cached.resolved_path == resolved
-                and cached._raw == raw):
+                and cached.signature == signature and cached._fd >= 0
+                and _path_matches_fd(path, resolved, signature, cached._fd)):
             _METRICS["cache_hits"] += 1
             _CACHE.move_to_end(identity)
             cached.last_observed_at = time.monotonic()
             return cached
 
+        can_append = bool(
+            append_only and cached is not None and cached.resolved_path == resolved
+            and cached._fd >= 0
+            and cached.signature[:2] == signature[:2]
+            and signature[2] > cached.signature[2]
+            and time.monotonic() - cached.last_observed_at <= _APPEND_OBSERVATION_GAP_SECONDS
+        )
         previous = None
-        if (append_only and cached is not None and cached.resolved_path == resolved
-                and cached.signature[:2] == signature[:2]
-                and signature[2] > cached.signature[2]
-                and time.monotonic() - cached.last_observed_at <= _APPEND_OBSERVATION_GAP_SECONDS
-                and raw[:len(cached._raw)] == cached._raw):
-            previous = cached
-            raw = raw[len(cached._raw):]
-            _METRICS["append_reuses"] += 1
-        _drop(identity)
-        _METRICS["invalidations"] += 1
-        view = RegistryView(identity, resolved, signature, raw, previous=previous)
+        fd = -1
+        if can_append:
+            try:
+                observed_resolved, observed_signature, raw = _read_retained_suffix(path, identity, cached)
+                if (observed_resolved == cached.resolved_path
+                        and observed_signature[:2] == cached.signature[:2]
+                        and observed_signature[2] > cached.signature[2]):
+                    resolved, signature = observed_resolved, observed_signature
+                    previous = cached
+                    fd, cached._fd = cached._fd, -1
+                else:
+                    raise OSError("registry append generation changed")
+            except OSError:
+                _drop(identity)
+                cached = None
+                _METRICS["invalidations"] += 1
+                previous = None
+        else:
+            if cached is not None:
+                _drop(identity)
+                cached = None
+                _METRICS["invalidations"] += 1
+        if previous is None:
+            resolved, signature, raw, fd = _stable_read(path, identity)
+        else:
+            _drop(identity)
+            cached = None
+            _METRICS["invalidations"] += 1
+        view = RegistryView(identity, resolved, signature, raw, previous=previous, fd=fd)
         if previous is None:
             _METRICS["full_metadata_parses"] += 1
             _METRICS["metadata_rows_parsed"] += view.record_count
         else:
+            _METRICS["append_reuses"] += 1
             _METRICS["metadata_rows_parsed"] += view.record_count - previous.record_count
         _remember(identity, view)
         return view
@@ -613,6 +939,7 @@ def _drop(identity: str) -> "RegistryView | None":
     removed = _CACHE.pop(identity, None)
     if removed is not None:
         _CACHE_BYTES -= len(removed._raw)
+        _close_view_fd(removed)
     return removed
 
 
@@ -622,9 +949,12 @@ def _remember(identity: str, view: RegistryView) -> None:
     if len(view._raw) <= _CACHE_MAX_BYTES:
         _CACHE[identity] = view
         _CACHE_BYTES += len(view._raw)
+    else:
+        _close_view_fd(view)
     while (len(_CACHE) > _CACHE_MAX_PATHS or _CACHE_BYTES > _CACHE_MAX_BYTES):
         _evicted_identity, evicted = _CACHE.popitem(last=False)
         _CACHE_BYTES -= len(evicted._raw)
+        _close_view_fd(evicted)
         _METRICS["cache_evictions"] += 1
 
 
@@ -650,5 +980,10 @@ def clear_cache() -> None:
     """Test helper: discard process-local views."""
     global _CACHE_BYTES
     with _LOCK:
+        for view in _CACHE.values():
+            _close_view_fd(view)
         _CACHE.clear()
         _CACHE_BYTES = 0
+
+
+atexit.register(clear_cache)

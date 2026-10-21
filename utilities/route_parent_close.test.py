@@ -978,6 +978,30 @@ class ParentCloseTest(unittest.TestCase):
         self.assertEqual(worker.wait(timeout=2), -signal.SIGTERM)
         self.assertEqual(CLOSE._rows(self.jobs)[self.aid("att-worker")][1]["failure_class"], "pass")
 
+    def test_confirmed_handover_refuses_old_parent_close_and_allows_successor(self):
+        import dispatch_seat_handover as handover
+        import session_tidy as tidy
+        owner = self.process("att-owner")
+        meta = self.row("att-owner", process=owner)
+        seat = tidy.Seat("pane", "fixture-successor-seat", "w8:pSuccessor")
+        binding = handover.binding_of(self.jobs, meta)
+        tidy.atomic_write_json(handover._snapshot_path(seat.key), {
+            "schema": handover.SCHEMA,
+            "seat": {"kind": "pane", "key": seat.key, "pane": seat.pane},
+            "from": {"sid": meta["parent_sid"]}, "bindings": [binding],
+        })
+        ledger = tidy._ledger_path(seat)
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(json.dumps({"event": "handover", "from": meta["parent_sid"],
+            "sid": "successor", "harness": "codex", "ts": time.time(),
+            "bindings": [binding]}) + "\n")
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": meta["parent_sid"]}):
+            with self.assertRaisesRegex(ValueError, "parent-close-owner-not-owned"):
+                self.close()
+        self.assertIsNone(owner.poll())
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "successor"}):
+            self.assertEqual(self.close()["state"], "cancelled")
+
     def test_crash_after_journal_intent_fences_late_pass_and_launch(self):
         owner = self.process("att-owner")
         self.row("att-owner", process=owner)
@@ -1102,6 +1126,7 @@ class ParentCloseTest(unittest.TestCase):
                 "attempt_id": aid, "route": {"route_id": self.route["route_id"], "route_file": path}}}))
         stopped = []
         compute = SimpleNamespace(ConfigError=ValueError, load_config=lambda: {"run_root": run_root},
+            _namespace_self=lambda config: None,
             config_path=lambda: self.base / "original-config.yaml", _run_state=lambda config, rid:
                 {"stop_reason": "parent" if rid in stopped else None,
                  "state": "finished" if rid in stopped else "running"})
@@ -1119,6 +1144,40 @@ class ParentCloseTest(unittest.TestCase):
         self.assertEqual(stopped, ["own-run"])
         self.assertEqual(result["state"], "cancelled")
         self.assertEqual([r["run_id"] for r in result["resources"]], ["own-run"])
+
+    def test_linked_resources_skips_run_root_on_namespace_self_host(self):
+        from types import SimpleNamespace
+        run_root = self.base / "compute-runs"
+        run_root.mkdir()
+        run_id = "linked-run"
+        run_dir = run_root / run_id
+        run_dir.mkdir()
+        (run_dir / "meta.json").write_text(json.dumps({"provenance": {
+            "attempt_id": self.aid("att-owner"),
+            "route": {"route_id": self.route["route_id"], "route_file": str(self.path.resolve())},
+            "node": self.route["nodes"][0]["id"]}}))
+        compute = CLOSE._compute()
+        compute.config_path = lambda: self.base / "compute-hosts.yaml"
+        compute._run_state = lambda config, rid: {"stop_reason": None, "state": "running"}
+
+        class UnreadableRunRoot:
+            def glob(self, pattern):
+                raise AssertionError("namespace self host must not read run_root")
+
+        self_config = {"run_root": UnreadableRunRoot(), "hosts": {
+            "local": {"ssh_host": "local", "path_namespace": {"/home/nas": "/home/nas"}}}}
+        compute.load_config = lambda: self_config
+        with mock.patch.object(CLOSE, "_compute", return_value=compute):
+            self.assertEqual(CLOSE.linked_resources(self.route, self.path, self.jobs,
+                {self.aid("att-owner")}), [])
+
+        normal_config = {"run_root": run_root, "hosts": {
+            "remote": {"ssh_host": "compute.example"}}}
+        compute.load_config = lambda: normal_config
+        with mock.patch.object(CLOSE, "_compute", return_value=compute):
+            resources = CLOSE.linked_resources(self.route, self.path, self.jobs,
+                {self.aid("att-owner")})
+        self.assertEqual([resource["run_id"] for resource in resources], [run_id])
 
     def test_existing_orphan_observer_finishes_interrupted_close_without_parent_recovery(self):
         owner = self.process("att-owner")

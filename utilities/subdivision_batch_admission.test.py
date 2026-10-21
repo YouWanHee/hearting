@@ -633,7 +633,10 @@ class SliceCommandTest(unittest.TestCase):
             def _run(cmd, env):
                 envs.append((cmd[cmd.index("--action") + 1], env.get("GIT_OPTIONAL_LOCKS"), env.get("TOKEN")))
                 return mock.Mock(returncode=0, stdout="", stderr="")
-            with mock.patch.object(SUBDIV, "dispatch_command", side_effect=lambda m, s, a, p, j: ["x", "--action", a]):
+            # tools/run-tests.py itself exports GIT_OPTIONAL_LOCKS=0; measure from a clean ambient.
+            with mock.patch.dict(os.environ), \
+                    mock.patch.object(SUBDIV, "dispatch_command", side_effect=lambda m, s, a, p, j: ["x", "--action", a]):
+                os.environ.pop("GIT_OPTIONAL_LOCKS", None)
                 SUBDIV.start_admitted_batch(admission, parent="o", jobs=jobs, governor_reservation_env="TOKEN", run=_run)
             self.assertEqual(envs, [("register", None, None), ("start", "0", "t1")])
 

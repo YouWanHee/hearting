@@ -54,10 +54,11 @@ try:
 except Exception:  # a monitor must never fail to import over a bookkeeping helper
     _note_worker_home_view = None
 from dispatch_completion_join import read_supervisor_phase_state, read_join_observation  # noqa: E402
-from dispatch_attempt_policy import terminal_conflict_pending  # noqa: E402
+from dispatch_attempt_policy import decide_attempt, terminal_conflict_pending  # noqa: E402
 import dispatch_registry_cache as _dispatch_registry_cache  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
 from claude_project_dir import encode_project_dir  # noqa: E402
+from attempt_view import owned_attempt_log_path as _shared_owned_attempt_log_path  # noqa: E402
 
 try:  # W7D read-side layout resolver; absent on a pre-cutover checkout.
     import artifact_reader  # noqa: E402
@@ -1189,65 +1190,8 @@ _ATTEMPT_PARSE_CACHE_LIMIT = 4096
 
 
 def _owned_attempt_log_path(job):
-    """Return one exact Claude/Codex/OpenCode attempt log, or fail closed.
-
-    ``--log-dir`` may place registered-worker streams either under the dispatch
-    registry or below the canonical artifact root.  ``log_file`` is registry data,
-    so accept only a real file below one of those roots whose basename binds both
-    the exact attempt id and the declared harness suffix.
-    """
-    raw = getattr(job, "_log_file", None)
-    attempt_id = getattr(job, "attempt_id", None)
-    harness = getattr(job, "harness", None)
-    if harness not in ("claude", "codex", "opencode") or not raw or not attempt_id:
-        return None
-    path = os.path.realpath(raw)
-    roots = []
-    registry_path = getattr(job, "_registry_path", None)
-    if registry_path:
-        registry_dir = os.path.dirname(os.path.realpath(registry_path))
-        roots.append(os.path.join(registry_dir, "logs"))
-        # Installed runtime registries use `<runtime>/.harness/dispatch/jobs.log`,
-        # while a wrapper with that agent home still defaults logs to the sibling
-        # hidden `.dispatch/logs` directory.
-        if os.path.basename(registry_dir) == "dispatch":
-            roots.append(os.path.join(os.path.dirname(registry_dir), ".dispatch", "logs"))
-    artifact_root = getattr(job, "artifact_root", None)
-    if artifact_root:
-        real_artifact = os.path.realpath(artifact_root)
-        roots.append(real_artifact)
-        # A launcher streams workers to $AGENT_HOME/.dispatch/logs
-        # (dispatch-liveness.sh), while a managed parent may register the row in
-        # a DIFFERENT runtime-home registry (codex managed gateway). The only
-        # row-declared anchor for that launch home is the artifact root's
-        # parent — accept exactly its .dispatch/logs subtree, nothing wider.
-        roots.append(os.path.join(os.path.dirname(real_artifact), ".dispatch", "logs"))
-    # OPERATIONS §5.10 SD-49: current wrappers seal launch_home=<resolved agent
-    # home> in the row, so the launch's default log dir needs no layout guessing.
-    # Accept exactly that home's .dispatch/logs subtree; legacy rows without the
-    # key keep the heuristic roots above.
-    launch_home = getattr(job, "_launch_home", None)
-    if launch_home:
-        roots.append(os.path.join(os.path.realpath(launch_home), ".dispatch", "logs"))
-    if not roots:
-        # Legacy compatibility only when the row carries no owning root at all.
-        # Otherwise the observer's AGENT_HOME would make one Fleet process trust
-        # a log path that the same binary launched by another user rejects.
-        roots.append(os.path.realpath(os.path.join(_registry_home(), ".dispatch", "logs")))
-    allowed = False
-    for root in roots:
-        try:
-            if os.path.commonpath((root, path)) == root:
-                allowed = True
-                break
-        except (TypeError, ValueError):
-            continue
-    if not allowed:
-        return None
-    name = os.path.basename(path)
-    if not name.endswith(".%s.jsonl" % harness) or ("." + attempt_id + ".") not in name:
-        return None
-    return path if os.path.isfile(path) else None
+    """Fleet adapter for the portable shared exact-path validator."""
+    return _shared_owned_attempt_log_path(job, fallback_home=_registry_home())
 
 
 def _owned_claude_stream_path(job):
@@ -4109,6 +4053,44 @@ def _attach_execution_evidence(jobs, session_rows):
             job.exec_child = candidates[0]
 
 
+NO_PROCESS_PROOF_REASON = "no-exact-process-proof"
+
+
+def attempt_decision_payload(status, metadata, state_evidence=None):
+    """The one mapping from a registry row plus its observed evidence to ``attempt_decision``.
+
+    Process evidence is the row's ``observed_liveness``; without it the process state is
+    ``unknown`` (never inferred from the registry word), so a finished row still gets the
+    same outcome the policy gives a frozen record. Terminal observation and the result state
+    come from the same ``state_evidence`` the classifier read. ``None`` only when the
+    metadata is absent or the policy rejects it.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    evidence = state_evidence if isinstance(state_evidence, dict) else {}
+    inputs = evidence.get("inputs") or {}
+    observed = inputs.get("observed_liveness") or {}
+    process_state = observed.get("process_state")
+    if isinstance(process_state, str) and process_state:
+        process_reason = str(observed.get("process_reason") or "")
+    else:
+        process_state, process_reason = "unknown", NO_PROCESS_PROOF_REASON
+    try:
+        decision = decide_attempt(
+            str(status or ""), metadata, process_state=process_state,
+            process_reason=process_reason,
+            terminal_observed=bool(inputs.get("terminal_observation")),
+            result_state=evidence.get("result_state"))
+    except (TypeError, ValueError, KeyError):
+        # Preserve the Fleet row if historical metadata is incomplete.
+        return None
+    return {
+        "outcome": decision.outcome, "action": decision.action,
+        "responsible": decision.responsible, "reason": decision.reason,
+        "retry_kind": decision.retry_kind, "retry_allowed": decision.retry_allowed,
+    }
+
+
 def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False):
     """Return merged [DispatchJob]. harness_filter does not restrict dispatch — the section
     is cross-harness by design (jobs, not sessions).
@@ -4310,6 +4292,8 @@ def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fa
         now = time.time()
         for j in jobs:
             j.liveness = _dispatch_liveness(j, now, codex_index=codex_index)
+            j.attempt_decision = attempt_decision_payload(
+                str(j.status or ""), getattr(j, "_registry_metadata", None), j.state_evidence)
         jobs = _retain_dead_terminal_owners(jobs, now, jobs_path=jobs_path)
         _annotate_orphan_conductors(jobs, now, jobs_path=jobs_path)
     # Plan QA is display detail. Resolve it only after dedup/retention and the

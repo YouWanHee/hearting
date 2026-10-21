@@ -13,7 +13,14 @@ resource-wait turn with only
 Reserve that handoff for the terminal final response. Yield the wait sentinel
 after that receipt rather than waiting for training inside a Bash/model turn.
 This registered resource is not a model child and needs no model-child launch tuple. Its typed result resumes
-this owner; apply pending corrections before admitting the declared next work.
+this owner and records resource execution only. Apply pending corrections
+before deciding whether the same node needs another approved resource or its
+declared successor. A prepared, failed, runtime-only, or absent output document
+does not settle the stage, and output presence does not settle it either. When
+the approved node scope is finished, use the existing successor `start`; the
+shared gate rechecks the live owner and exact resource evidence and records the
+stage completion and once-only successor claim. No separate close or proof step
+is needed.
 The runtime acknowledges notifications and reconciles exact worker outcomes; inspect the
 reported evidence and decide the authorized next work. Synthesize one owner artifact.
 When the sealed entry scope is `complete`, the existing route grants task-branch

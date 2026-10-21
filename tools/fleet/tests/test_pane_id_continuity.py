@@ -33,7 +33,7 @@ class PaneContinuityTest(unittest.TestCase):
 
     def record(self, harness, sid, pane="w:p", cwd=None, source="resume", now=100):
         seat = session_tidy._pane_seat_of(pane)
-        with session_tidy.seat_lock(seat):
+        with session_tidy.seat_lock(seat.key):
             session_tidy.record_event(seat, harness, sid, "start", source=source,
                                       cwd=str(cwd or self.repo), now=now)
 
@@ -41,7 +41,7 @@ class PaneContinuityTest(unittest.TestCase):
         seat = session_tidy._pane_seat_of(pane)
         row = {"ts": now, "harness": harness, "sid": newer, "event": "handover",
                "from": older, "source": source}
-        with session_tidy.seat_lock(seat):
+        with session_tidy.seat_lock(seat.key):
             session_tidy._append_ledger_entry(seat, row)
 
     def test_aliases_use_exact_pane_harness_repository_and_both_id_directions(self):
@@ -64,7 +64,7 @@ class PaneContinuityTest(unittest.TestCase):
                 for index, sid in enumerate(ids[1:], start=1):
                     if harness == "opencode":
                         seat = session_tidy._pane_seat_of("w:p")
-                        with session_tidy.seat_lock(seat):
+                        with session_tidy.seat_lock(seat.key):
                             session_tidy.record_event(seat, harness, sid, "prompt",
                                                       cwd=str(self.repo), now=100 + index)
                         source = "first-message"
@@ -73,7 +73,7 @@ class PaneContinuityTest(unittest.TestCase):
                         source = "clear"
                     self.handover(harness, ids[index - 1], sid, source=source, now=200 + index)
                     seat = session_tidy._pane_seat_of("w:p")
-                    with session_tidy.seat_lock(seat):
+                    with session_tidy.seat_lock(seat.key):
                         session_tidy.record_event(seat, harness, sid, "compact", now=300 + index)
                         session_tidy.record_event(seat, harness, sid, "start", source="resume",
                                                   cwd=str(self.repo), now=400 + index)
@@ -93,10 +93,10 @@ class PaneContinuityTest(unittest.TestCase):
             current = session_tidy._pane_seat_of("w:p")
             legacy = session_tidy.Seat("pane", session_tidy._digest("pane", "w:p"),
                                        "w:p", "codex")
-            with session_tidy.seat_lock(current):
+            with session_tidy.seat_lock(current.key):
                 session_tidy.record_event(current, "codex", "shared", "start",
                                           source="startup", cwd=str(self.repo), now=300)
-            with session_tidy.seat_lock(legacy):
+            with session_tidy.seat_lock(legacy.key):
                 session_tidy.record_event(legacy, "codex", "older", "start",
                                           source="startup", cwd=str(self.repo), now=100)
                 session_tidy.record_event(legacy, "codex", "shared", "start",
@@ -120,11 +120,11 @@ class PaneContinuityTest(unittest.TestCase):
                 "w:p", "codex", endpoint=other_endpoint_id)
             legacy = session_tidy.Seat("pane", session_tidy._digest("pane", "w:p"),
                                        "w:p", "codex")
-            with session_tidy.seat_lock(current):
+            with session_tidy.seat_lock(current.key):
                 session_tidy.record_event(current, "codex", "current", "start",
                                           source="startup", cwd=str(self.repo), now=300)
             for seat, successor in ((other_endpoint, "current"), (legacy, "legacy-current")):
-                with session_tidy.seat_lock(seat):
+                with session_tidy.seat_lock(seat.key):
                     session_tidy.record_event(seat, "codex", "foreign-old", "start",
                                               source="startup", cwd=str(self.repo), now=100)
                     session_tidy.record_event(seat, "codex", successor, "start",
@@ -139,7 +139,7 @@ class PaneContinuityTest(unittest.TestCase):
         seat = session_tidy._pane_seat_of("w:p")
         self.record("codex", "old", source="startup", now=100)
         self.record("codex", "current", source="clear", now=200)
-        with session_tidy.seat_lock(seat):
+        with session_tidy.seat_lock(seat.key):
             session_tidy._append_ledger_entry(seat, {
                 "ts": 250, "harness": "codex", "sid": "current", "event": "handover",
                 "from": "old", "source": "clear", "pane": "w:foreign"})
@@ -172,7 +172,7 @@ class PaneContinuityTest(unittest.TestCase):
     def test_folded_start_provenance_confirms_clear_when_raw_predecessor_start_is_gone(self):
         import session_tidy_clear
         seat = session_tidy._pane_seat_of("w:p")
-        with session_tidy.seat_lock(seat):
+        with session_tidy.seat_lock(seat.key):
             session_tidy._append_ledger_entry(seat, {
                 "ts": 150, "harness": "codex", "sid": "folded-old", "event": "summary",
                 "cwd": str(self.repo), "latest_start_source": "startup", "latest_start_at": 100})
@@ -315,6 +315,21 @@ class PaneContinuityTest(unittest.TestCase):
                 self.assertEqual(kwargs["session_start_source"], source)
                 self.assertNotIn("resume_argv", kwargs)
 
+    def test_codex_projection_rekeys_only_when_current_native_launch_is_proven(self):
+        from fleet import process_identity
+        argv = ["/opt/codex", "resume", "old-session", "--model", "fixture"]
+        with mock.patch.object(herdr_projection.shutil, "which", return_value="/fixture/herdr"), \
+                mock.patch.object(herdr_projection, "may_report", return_value=True), \
+                mock.patch.object(process_identity, "current_launch_context", return_value={"argv": argv}), \
+                mock.patch.object(herdr_projection, "_formatter_overrides", return_value=(None, None)), \
+                mock.patch.object(herdr_projection, "compose", return_value=("codex", "")), \
+                mock.patch.object(herdr_projection.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+            herdr_projection.project("codex", "current-session", pane_id="w:p", session_seq=100,
+                                     session_start_source="clear")
+        command = run.call_args_list[0].args[0]
+        self.assertEqual(command[-8:], ["--session-start-source", "clear", "--", "codex",
+                                       "resume", "current-session", "--model", "fixture"])
+
     def test_proven_embedded_sessionstart_keeps_reporting_with_the_v10_state_hook(self):
         path = ROOT / "adapters/codex/hooks/herdr_session_projection.py"
         spec = importlib.util.spec_from_file_location("codex_embedded_projection_test", path)
@@ -348,6 +363,29 @@ class PaneContinuityTest(unittest.TestCase):
                                           "FLEET_TITLE_STATE_DIR": str(self.root / "titles")}), \
              mock.patch.object(session_handle.os, "getcwd", return_value=str(self.repo)):
             self.assertEqual(session_handle.resolve_tag("claude", "current"), "4d")
+
+    def test_recipient_tag_uses_recipient_pane_and_cwd_across_resume(self):
+        self.record("claude", "sender-old", pane="w:sender", now=100)
+        self.record("claude", "current", pane="w:sender", now=200)
+        self.record("claude", "recipient-old", pane="w:recipient", now=100)
+        self.record("claude", "current", pane="w:recipient", now=200)
+        home = self.root / "claude-recipient"
+        sessions = home / "sessions"
+        sessions.mkdir(parents=True)
+        for pid, sid, name in (("11", "sender-old", "sender-4c"),
+                               ("12", "recipient-old", "recipient-3a")):
+            (sessions / f"{pid}.json").write_text(json.dumps(
+                {"sessionId": sid, "name": name, "nameSource": "derived"}),
+                encoding="utf-8")
+        with mock.patch.dict(os.environ, {
+                "HERDR_PANE_ID": "w:sender", "CLAUDE_CONFIG_DIR": str(home),
+                "FLEET_TITLE_STATE_DIR": str(self.root / "titles")}), \
+                mock.patch.object(session_handle.os, "getcwd", return_value=str(self.repo)):
+            # The compatibility API retains its caller-seat behavior.
+            self.assertEqual(session_handle.resolve_tag("claude", "current"), "4c")
+            # A recipient lookup follows only that recipient's resumed seat.
+            self.assertEqual(session_handle.resolve_recipient_tag(
+                "claude", "current", pane="w:recipient", cwd=str(self.repo)), "3a")
 
     def test_resume_source_is_in_the_actual_herdr_session_command_for_all_harnesses(self):
         for harness in ("claude", "codex", "opencode"):

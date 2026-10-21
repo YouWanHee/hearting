@@ -259,6 +259,52 @@ class CompletionReadinessProjectionTest(unittest.TestCase):
         self.assertEqual((result.state, result.outcome, result.reason),
                          ("pending", "succeeded", "registered-follow-through-pending"))
 
+    def test_parent_readiness_follows_exact_delivery_and_not_closure(self):
+        decision = POLICY.AttemptDecision(
+            "succeeded", "advance", "completion-controller", "registry-closed")
+        for delivery, expected in (("pending", "pending"), ("claimed", "pending"),
+                                   ("unverified", "pending"), ("acked", "ready"),
+                                   ("not-required", "ready"), ("unknown", "unknown")):
+            with self.subTest(delivery=delivery):
+                work = POLICY.RegisteredWorkObservation(
+                    "att-parent", decision, "quiescent", "terminal-settled",
+                    owner_completion_state="pending", cleanup_state="pending",
+                    pane_relation="parent", delivery_state=delivery)
+                result = POLICY.completion_readiness(work)
+                self.assertEqual(result.state, expected)
+                self.assertEqual(result.outcome, "succeeded")
+
+    def test_parent_running_and_failed_outcomes_keep_their_meaning(self):
+        running = POLICY.RegisteredWorkObservation(
+            "att-parent", POLICY.AttemptDecision("pending", "wait", "execution", "alive"),
+            "live", "unsettled", pane_relation="parent", delivery_state="unknown")
+        self.assertEqual(POLICY.completion_readiness(running).state, "pending")
+        failed = POLICY.RegisteredWorkObservation(
+            "att-parent", POLICY.AttemptDecision("failed", "inspect-failure", "owner", "failed"),
+            "quiescent", "terminal-settled", pane_relation="parent", delivery_state="acked")
+        result = POLICY.completion_readiness(failed)
+        self.assertEqual((result.state, result.outcome), ("ready", "failed"))
+
+    def test_parent_rejected_delivery_is_not_ack_and_settled_outcomes_are_preserved(self):
+        for delivery in ("rejected", "expired"):
+            with self.subTest(delivery=delivery):
+                work = POLICY.RegisteredWorkObservation(
+                    "att-parent",
+                    POLICY.AttemptDecision("succeeded", "advance", "completion", "settled"),
+                    "quiescent", "terminal-settled", pane_relation="parent",
+                    delivery_state=delivery)
+                result = POLICY.completion_readiness(self.pane(bound_work=(work,)))
+                self.assertEqual((result.state, result.outcome), ("unknown", None))
+        for outcome, action in (("review-blocked", "review"), ("cancelled", "inspect-failure")):
+            with self.subTest(outcome=outcome):
+                work = POLICY.RegisteredWorkObservation(
+                    "att-parent",
+                    POLICY.AttemptDecision(outcome, action, "completion", "settled"),
+                    "quiescent", "terminal-settled", pane_relation="parent",
+                    delivery_state="acked")
+                result = POLICY.completion_readiness(self.pane(bound_work=(work,)))
+                self.assertEqual((result.state, result.outcome), ("ready", outcome))
+
     def test_unavailable_binding_scan_is_not_an_empty_binding(self):
         result = POLICY.completion_readiness(self.pane(bindings_state="unknown"))
         self.assertEqual((result.state, result.reason),

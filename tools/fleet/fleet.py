@@ -69,6 +69,9 @@ def parse_args(argv):
                         "(per-route pipeline cards). Additive; the live TUI's `p` key toggles "
                         "the same state either way (plan §P3 — this is --once's ONLY entry "
                         "point into the process view, since `p` is a curses-live-only key).")
+    p.add_argument("--explorer", action="store_true",
+                   help="use the in-development B explorer screen (work ledger + output); "
+                        "`fleet2` launches this. --view does not apply to it.")
     return p.parse_args(argv)   # argparse exits 2 on bad args (matches PRD §3 exit codes)
 
 
@@ -344,12 +347,15 @@ def main(argv=None):
     render.set_show_all(args.show_all)
     render.set_api_disabled(disabled["api_disabled"])
     render.set_hearting(hearting)
+    # The B explorer is opt-in (`--explorer`, launched as `fleet2`) until it is ready to be
+    # the default; plain `fleet` keeps the group/process screen.
+    render.set_explorer_mode(args.explorer)
     # F-30 (v10, plan §P3/§9): --view is additive and honors the SAME single _PROCESS_VIEW
     # state the `p` key flips — never a second decision path. FLEET_VIEW env is the reduction
     # fallback the plan reserves in case --view itself is judged out of scope later (§9 note 1);
     # both stay best-effort no-ops when unset (default = the pre-v10 group view).
     view = args.view or os.environ.get("FLEET_VIEW")
-    if view:
+    if view and not args.explorer:
         render.set_process_view(view == "process")
     if args.once:
         try:
@@ -357,6 +363,7 @@ def main(argv=None):
                                       compute_hosts_refresh=compute_hosts.collect)
         finally:
             projected_collector.close()
+            render.set_explorer_mode(False)
     render.reset_scroll()   # fresh launch starts scrolled to top (belt-and-suspenders)
     if viewer_state is not None:
         render.restore_viewer_state(viewer_state)
@@ -403,7 +410,10 @@ def main(argv=None):
     live_collector.install_follower = install_follow.InstallFollower()
     live_collector.restart_argv = argv
 
-    return render.run_live(live_collector, hfilter, args.section, args.interval)
+    try:
+        return render.run_live(live_collector, hfilter, args.section, args.interval)
+    finally:
+        render.set_explorer_mode(False)
 
 
 if __name__ == "__main__":

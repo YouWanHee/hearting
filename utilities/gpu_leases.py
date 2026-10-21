@@ -618,3 +618,396 @@ def resource_admission(node, command, *, gpu_scoped=False, share=False, jobs=Non
     cleanup = _REMOTE_LEASE_CORE + "\nrelease(%r, %r)\n" % (str(path), lease)
     return path, lease, {"CUDA_VISIBLE_DEVICES": ",".join(lease["gpus"]),
                          "HEARTING_GPU_LEASE_RELEASE": "python3 -c " + shlex.quote(cleanup)}
+# BEGIN PATH_NAMESPACE EXTENSION
+def serialized_compute_source(namespaced=False):
+    """Return the unchanged legacy prefix, or the complete remote module."""
+    source = Path(__file__).read_bytes()
+    marker = b"# BEGIN PATH_NAMESPACE EXTENSION\n"
+    prefix, found, _suffix = source.partition(marker)
+    if not found:
+        raise GPUUnavailable("path namespace extension delimiter is missing")
+    return source.decode("utf-8") if namespaced else prefix.decode("utf-8")
+
+
+_PATH_NAMESPACE_SOURCE = r'''import ctypes as _ns_ctypes
+import errno as _ns_errno
+import json as _ns_json
+import os as _ns_os
+import re as _ns_re
+import stat as _ns_stat
+
+class _NamespaceRefusal(Exception):
+    def __init__(self, code, message):
+        super().__init__("path_namespace refused: " + message)
+        self.code = code
+
+def _ns_canonical(path):
+    return (isinstance(path, str) and path.startswith("/") and path != "/"
+            and "//" not in path and not path.endswith("/")
+            and not any(ord(c) < 32 or ord(c) == 127 for c in path)
+            and all(p not in ("", ".", "..") for p in path[1:].split("/")))
+
+def _ns_below(parent, child):
+    return child.startswith(parent.rstrip("/") + "/")
+
+def _ns_validate(mapping, run_root):
+    if not isinstance(mapping, dict) or not mapping:
+        raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: mapping")
+    pairs = []
+    for target, source in mapping.items():
+        if not _ns_canonical(target) or not _ns_canonical(source):
+            raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: " + repr(target))
+        if target == source:
+            raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: " + target)
+        pairs.append((target, source))
+    for i, (target, source) in enumerate(pairs):
+        for other_target, other_source in pairs[i + 1:]:
+            if (_ns_below(target, other_target) or _ns_below(other_target, target)):
+                raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: " + other_target)
+        if any(source == t or _ns_below(source, t) or _ns_below(t, source)
+               for t, _ in pairs):
+            raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: " + source)
+    covers = [(t, s) for t, s in pairs if _ns_below(t, run_root)]
+    if len(covers) != 1:
+        raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: " + run_root)
+    return pairs, covers[0]
+
+def _ns_mountinfo():
+    rows = []
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as handle:
+            for line in handle:
+                fields = line.rstrip("\n").split(" ")
+                if len(fields) < 10 or "-" not in fields:
+                    continue
+                sep = fields.index("-")
+                unescape = lambda x: _ns_re.sub(r"\\([0-7]{3})",
+                    lambda m: chr(int(m.group(1), 8)), x)
+                rows.append((int(fields[0]), unescape(fields[4]),
+                             unescape(fields[sep + 2])))
+    except OSError:
+        return []
+    return rows
+
+def _ns_errno_message(operation, err):
+    name = _ns_errno.errorcode.get(err, "ERRNO")
+    return operation + " failed: %s (%d)" % (name, err)
+
+def _ns_fail_errno(code, operation, err, extra=""):
+    message = _ns_errno_message(operation, err)
+    if extra:
+        message = extra + ": " + message
+    raise _NamespaceRefusal(code, message)
+
+def _ns_mount_id(path, rows):
+    candidates = [(index, mid, mount) for index, (mid, mount, _source) in enumerate(rows)
+                  if path == mount or _ns_below(mount, path)]
+    # Mountinfo lists stacked mounts in order; the last longest match is visible.
+    return max(candidates, key=lambda row: (len(row[2]), row[0]))[1] if candidates else None
+
+def _ns_enter(mapping, run_root, cwd=None, run_dir=None):
+    pairs, covered = _ns_validate(mapping, run_root)
+    uid, gid = _ns_os.getuid(), _ns_os.getgid()
+    if not uid or not gid or _ns_os.geteuid() != uid or _ns_os.getegid() != gid:
+        raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: effective identity")
+    captured = []
+    rows = _ns_mountinfo()
+    for target, source in pairs:
+        if not _ns_os.path.exists(source):
+            raise _NamespaceRefusal("source-missing", "source missing: " + source)
+        if not _ns_os.path.isdir(source) or _ns_os.path.realpath(source) != source:
+            raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: " + source)
+        if not _ns_os.path.ismount(source):
+            raise _NamespaceRefusal("source-not-mount", "source is not a mount point: " + source)
+        source_stat = _ns_os.stat(source, follow_symlinks=False)
+        mount_id = _ns_mount_id(source, rows)
+        if mount_id is None:
+            raise _NamespaceRefusal("source-not-mount", "source is not a mount point: " + source)
+        if (_ns_os.path.islink(target) or _ns_os.path.realpath(target) != target
+                or not _ns_os.path.isdir(target)):
+            raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: " + target)
+        captured.append((target, source, source_stat.st_dev, source_stat.st_ino, mount_id))
+    target, source = covered
+    physical_root = source + run_root[len(target):]
+    try:
+        root_stat = _ns_os.stat(physical_root, follow_symlinks=False)
+        if (_ns_os.path.realpath(physical_root) != physical_root
+                or not _ns_stat.S_ISDIR(root_stat.st_mode)
+                or _ns_mount_id(physical_root, rows) != _ns_mount_id(source, rows)):
+            raise OSError
+        root_fd = _ns_os.open(physical_root, _ns_os.O_RDONLY | _ns_os.O_DIRECTORY | _ns_os.O_NOFOLLOW | _ns_os.O_CLOEXEC)
+    except OSError:
+        raise _NamespaceRefusal("run-root-missing", "run_root is not an existing source directory: " + physical_root)
+    run_fd = None
+    if run_dir:
+        physical_run = source + run_dir[len(target):]
+        try:
+            run_stat = _ns_os.stat(physical_run, follow_symlinks=False)
+            if (_ns_os.path.realpath(physical_run) != physical_run
+                    or not _ns_stat.S_ISDIR(run_stat.st_mode)
+                    or _ns_mount_id(physical_run, rows) != _ns_mount_id(source, rows)):
+                raise OSError
+            run_fd = _ns_os.open(physical_run, _ns_os.O_RDONLY | _ns_os.O_DIRECTORY | _ns_os.O_NOFOLLOW | _ns_os.O_CLOEXEC)
+        except OSError:
+            _ns_os.close(root_fd)
+            raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: " + physical_run)
+    libc = _ns_ctypes.CDLL(None, use_errno=True)
+    libc.unshare.argtypes = [_ns_ctypes.c_int]
+    libc.unshare.restype = _ns_ctypes.c_int
+    if libc.unshare(0x10000000 | 0x00020000) != 0:
+        err = _ns_ctypes.get_errno()
+        _ns_os.close(root_fd)
+        if run_fd is not None: _ns_os.close(run_fd)
+        _ns_fail_errno("unshare", "unshare", err)
+    for path, content, code in (("/proc/self/setgroups", "deny\n", "setgroups"),
+                                ("/proc/self/uid_map", "%d %d 1\n" % (uid, uid), "uid-map"),
+                                ("/proc/self/gid_map", "%d %d 1\n" % (gid, gid), "gid-map")):
+        try:
+            with open(path, "w", encoding="ascii") as handle: handle.write(content)
+        except OSError as exc:
+            _ns_os.close(root_fd)
+            if run_fd is not None: _ns_os.close(run_fd)
+            _ns_fail_errno(code, code, exc.errno or 1)
+    libc.mount.argtypes = [_ns_ctypes.c_char_p, _ns_ctypes.c_char_p,
+                           _ns_ctypes.c_char_p, _ns_ctypes.c_ulong, _ns_ctypes.c_void_p]
+    libc.mount.restype = _ns_ctypes.c_int
+    if libc.mount(None, b"/", None, 16384 | 262144, None) != 0:
+        err = _ns_ctypes.get_errno()
+        _ns_os.close(root_fd)
+        if run_fd is not None: _ns_os.close(run_fd)
+        _ns_fail_errno("private-mount", "private mount", err)
+    for target, source, _dev, _ino, _mid in captured:
+        if libc.mount(source.encode(), target.encode(), None, 4096 | 16384, None) != 0:
+            err = _ns_ctypes.get_errno()
+            _ns_os.close(root_fd)
+            if run_fd is not None: _ns_os.close(run_fd)
+            errno_name = _ns_errno.errorcode.get(err, "ERRNO")
+            raise _NamespaceRefusal("bind-mount", "rbind failed: %s -> %s: %s (%d)" %
+                                    (source, target, errno_name, err))
+    visible_root = _ns_os.stat(run_root)
+    if not _ns_stat.S_ISDIR(visible_root.st_mode) or (visible_root.st_dev, visible_root.st_ino) != (root_stat.st_dev, root_stat.st_ino):
+        _ns_os.close(root_fd)
+        if run_fd is not None: _ns_os.close(run_fd)
+        raise _NamespaceRefusal("identity-mismatch", "run_root identity mismatch: " + run_root)
+    for target, source, dev, ino, _mount_id in captured:
+        visible = _ns_os.stat(target)
+        if (visible.st_dev, visible.st_ino) != (dev, ino):
+            _ns_os.close(root_fd)
+            if run_fd is not None: _ns_os.close(run_fd)
+            raise _NamespaceRefusal("identity-mismatch", "bound target identity mismatch: " + target)
+    if run_dir:
+        visible_run = _ns_os.stat(run_dir)
+        if (visible_run.st_dev, visible_run.st_ino) != (run_stat.st_dev, run_stat.st_ino):
+            _ns_os.close(root_fd)
+            if run_fd is not None: _ns_os.close(run_fd)
+            raise _NamespaceRefusal("identity-mismatch", "run_root identity mismatch: " + run_root)
+    desired = cwd or "/"
+    if not isinstance(desired, str) or not desired.startswith("/"):
+        _ns_os.close(root_fd)
+        if run_fd is not None: _ns_os.close(run_fd)
+        raise _NamespaceRefusal("cwd", "chdir failed: " + str(desired) + ": EINVAL (22)")
+    try: _ns_os.chdir(desired)
+    except OSError as exc:
+        _ns_os.close(root_fd)
+        if run_fd is not None: _ns_os.close(run_fd)
+        _ns_fail_errno("cwd", "chdir", exc.errno or 1, desired)
+    return root_fd, run_fd
+
+def _ns_safe_run_fd(mapping, run_root, run_dir):
+    pairs, _covered = _ns_validate(mapping, run_root)
+    target, source = next((t, s) for t, s in pairs if _ns_below(t, run_dir))
+    rows = _ns_mountinfo()
+    if not _ns_os.path.exists(source):
+        raise _NamespaceRefusal("source-missing", "source missing: " + source)
+    if (not _ns_os.path.isdir(source) or _ns_os.path.realpath(source) != source):
+        raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: " + source)
+    if not _ns_os.path.ismount(source):
+        raise _NamespaceRefusal("source-not-mount", "source is not a mount point: " + source)
+    physical = source + run_dir[len(target):]
+    source_mount_id = _ns_mount_id(source, rows)
+    if (source_mount_id is None or _ns_os.path.realpath(physical) != physical
+            or _ns_mount_id(physical, rows) != source_mount_id):
+        raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: " + physical)
+    try:
+        return _ns_os.open(physical, _ns_os.O_RDONLY | _ns_os.O_DIRECTORY
+                           | _ns_os.O_NOFOLLOW | _ns_os.O_CLOEXEC)
+    except OSError:
+        raise _NamespaceRefusal("unsafe-path", "unsafe source/target path: " + physical)
+
+def _ns_record_refusal(run_fd, error):
+    reason_fd = _ns_os.open("stop_reason", _ns_os.O_WRONLY | _ns_os.O_CREAT
+                            | _ns_os.O_EXCL | _ns_os.O_NOFOLLOW, 0o600,
+                            dir_fd=run_fd)
+    try:
+        _ns_os.write(reason_fd, ("path-namespace-" + error.code + "\n").encode())
+    finally:
+        _ns_os.close(reason_fd)
+    exit_fd = _ns_os.open("exit_code", _ns_os.O_WRONLY | _ns_os.O_CREAT
+                          | _ns_os.O_EXCL | _ns_os.O_NOFOLLOW, 0o600,
+                          dir_fd=run_fd)
+    try:
+        _ns_os.write(exit_fd, b"125\n")
+    finally:
+        _ns_os.close(exit_fd)
+
+def _ns_namespace_creation(mapping, run_root, run_dir, cwd):
+    read_fd, write_fd = _ns_os.pipe()
+    try:
+        pid = _ns_os.fork()
+    except OSError as exc:
+        _ns_os.close(read_fd); _ns_os.close(write_fd)
+        raise _NamespaceRefusal("child", "creation child failed: " + str(exc))
+    if pid == 0:
+        _ns_os.close(read_fd)
+        try:
+            root_fd, _ = _ns_enter(mapping, run_root, cwd)
+            try: _ns_os.mkdir(run_dir)
+            finally: _ns_os.close(root_fd)
+            receipt = {"ok": True}
+        except Exception as exc:
+            receipt = {"ok": False, "error": str(exc),
+                       "code": getattr(exc, "code", "child")}
+        try: _ns_os.write(write_fd, _ns_json.dumps(receipt).encode()[:2048])
+        finally:
+            _ns_os.close(write_fd); _ns_os._exit(0 if receipt.get("ok") else 1)
+    _ns_os.close(write_fd)
+    chunks = []
+    while True:
+        part = _ns_os.read(read_fd, 2048)
+        if not part: break
+        chunks.append(part)
+    _ns_os.close(read_fd)
+    _pid, status = _ns_os.waitpid(pid, 0)
+    try: receipt = _ns_json.loads(b"".join(chunks))
+    except Exception: receipt = {}
+    if not _ns_os.WIFEXITED(status):
+        raise _NamespaceRefusal("child", "creation child failed: abnormal exit")
+    child_status = _ns_os.WEXITSTATUS(status)
+    if child_status == 0 and receipt.get("ok") is True:
+        return
+    if (child_status == 1 and receipt.get("ok") is False
+            and isinstance(receipt.get("code"), str)
+            and isinstance(receipt.get("error"), str)
+            and receipt["error"].startswith("path_namespace refused: ")):
+        prefix = "path_namespace refused: "
+        raise _NamespaceRefusal(receipt["code"], receipt["error"][len(prefix):])
+    reason = "abnormal exit" if child_status != 0 else "missing or invalid receipt"
+    raise _NamespaceRefusal("child", "creation child failed: " + reason)
+
+def launch_compute_namespaced(options, payload_source):
+    path = options["state_path"]
+    lease = acquire(path, options["observation"], requested=options.get("requested"),
+                    share=options.get("share", False), owner=options.get("owner"),
+                    task=options["task"], run_id=options["run_id"])
+    devices = ",".join(lease["gpus"]) if lease else options.get("requested")
+    inner = options["inner"].replace("__HEARTING_GPU_SETUP__",
+        "export CUDA_VISIBLE_DEVICES=%s" % shlex.quote(devices) if devices is not None else ":")
+    mapping, run_root = options["path_namespace"], options["run_root"]
+    launch_cwd = "/" if options.get("cwd") is None else options["cwd"]
+    if not isinstance(launch_cwd, str) or not os.path.isabs(launch_cwd):
+        release(path, lease)
+        raise GPUUnavailable("compute launch directory must be absolute")
+    tmux_environment = options.get("tmux_environment", {})
+    if not isinstance(tmux_environment, dict):
+        release(path, lease)
+        raise GPUUnavailable("invalid tmux launch environment")
+    runner_created = False
+    try:
+        _ns_namespace_creation(mapping, run_root, options["run_dir"], options.get("cwd"))
+        runner_dir = Path(path).parent / "compute-runners"
+        runner_dir_resolved = os.path.realpath(str(runner_dir))
+        for target in mapping:
+            target_resolved = os.path.realpath(target)
+            if (runner_dir_resolved == target_resolved
+                    or runner_dir_resolved.startswith(target_resolved.rstrip(os.sep) + os.sep)):
+                raise GPUUnavailable("compute runner directory is inside a path_namespace target")
+        runner_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(runner_dir, 0o700)
+        runner_path = runner_dir / (options["run_id"] + ".py")
+        runner = ("import os as _runner_os; _runner_os.unlink(__file__)\n"
+                  + payload_source + "\n" + _PATH_NAMESPACE_SOURCE + "\n" + (
+            "\nrunner_args = %r\n"
+            "safe_fd = None\nroot_fd = run_fd = None\n"
+            "try:\n    safe_fd = _ns_safe_run_fd(*runner_args['safe_run'])\n"
+            "    root_fd, run_fd = _ns_enter(*runner_args['enter'])\n"
+            "    raise SystemExit(payload(*runner_args['payload']))\n"
+            "except _NamespaceRefusal as exc:\n"
+            "    if safe_fd is not None:\n"
+            "        try: _ns_record_refusal(safe_fd, exc)\n"
+            "        except OSError: pass\n"
+            "    release(*runner_args['release'])\n"
+            "    print(str(exc), file=__import__('sys').stderr)\n"
+            "    raise SystemExit(125)\n"
+            "except Exception as raw:\n"
+            "    exc = _NamespaceRefusal('runner', 'runner failed: ' + str(raw))\n"
+            "    if safe_fd is not None:\n"
+            "        try: _ns_record_refusal(safe_fd, exc)\n"
+            "        except OSError: pass\n"
+            "    try: release(*runner_args['release'])\n    except Exception: pass\n"
+            "    print(str(exc), file=__import__('sys').stderr)\n"
+            "    raise SystemExit(125)\n"
+            "finally:\n"
+            "    if root_fd is not None: _ns_os.close(root_fd)\n"
+            "    if run_fd is not None: _ns_os.close(run_fd)\n"
+            "    if safe_fd is not None: _ns_os.close(safe_fd)\n") % ({
+                "safe_run": (mapping, run_root, options["run_dir"]),
+                "enter": (mapping, run_root, options.get("cwd"), options["run_dir"]),
+                "payload": (path, lease, inner),
+                "release": (path, lease),
+            }))
+        fd = os.open(runner_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        runner_created = True
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(runner)
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                runner_path.unlink()
+            raise
+        command = "python3 " + shlex.quote(str(runner_path))
+        env = dict(os.environ)
+        tmux_environment = dict(tmux_environment)
+        for key in (*_TMUX_SESSION_ENV_KEYS, "AGENT_HOME", "AGENT_DISPATCH_ATTEMPT_ID",
+                    "HEARTING_COMPUTE_RUN_ID", "HEARTING_COMPUTE_HOST",
+                    "HEARTING_RESOURCE_RUN_ID", "HEARTING_GPU_LEASE_RELEASE"):
+            tmux_environment.setdefault(key, "")
+        for key, value in tmux_environment.items():
+            if (not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                    or not isinstance(value, str) or "\0" in value):
+                raise GPUUnavailable("invalid tmux launch environment")
+        for key in _TMUX_SERVER_PIN_KEYS | set(tmux_environment):
+            env.pop(key, None)
+        server = tmux_server_name(path)
+        if subprocess.call(["sh", "-c", "command -v tmux >/dev/null 2>&1"], env=env, cwd="/") == 0:
+            subprocess.check_call(["tmux", "-L", server, "start-server"], env=env, cwd="/")
+            cmd = ["tmux", "-L", server, "new-session", "-d", "-s", options["run_id"]]
+            for key, value in sorted(tmux_environment.items()):
+                cmd.extend(["-e", "%s=%s" % (key, value)])
+            cmd.extend(["-c", "/", command])
+            subprocess.check_call(cmd, env=env, cwd="/")
+            transport = {"kind": "hearting-tmux-v1", "server": server}
+        else:
+            with open(os.devnull, "rb") as stdin, open(os.devnull, "ab") as output:
+                subprocess.Popen(["python3", str(runner_path)], stdin=stdin, stdout=output,
+                                 stderr=output, start_new_session=True, cwd="/")
+            transport = {"kind": "nohup-v1"}
+        deadline = time.monotonic() + 5
+        while lease and time.monotonic() < deadline:
+            with locked(path) as data:
+                current = data["leases"].get(lease["token"])
+                if current is None or current["pid"] != lease["pid"]:
+                    break
+            time.sleep(.02)
+        else:
+            if lease:
+                raise GPUUnavailable("GPU launch did not establish its wrapper")
+        return {"gpus": devices, "gpu_lease": lease, "tmux_transport": transport}
+    except Exception:
+        if runner_created:
+            with contextlib.suppress(FileNotFoundError):
+                runner_path.unlink()
+        release(path, lease)
+        raise
+'''
+
+exec(_PATH_NAMESPACE_SOURCE, globals())

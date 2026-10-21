@@ -23,10 +23,12 @@ shared-utility-deferred	atomic_publish.py
 shared-utility-deferred	cairn-artifact-read.sh
 shared-utility-deferred	cairn-artifact-read.ts
 shared-utility-deferred	campaign_title_repair.py
+shared-utility-deferred	claude_process_identity.py
 shared-utility-deferred	directory_record_index.py
 shared-utility-deferred	codex_permission_profile.py
 shared-utility-deferred	compute-hosts
 shared-utility-deferred	context_alert.py
+shared-utility-deferred	conversation_reader.py
 shared-utility-deferred	dispatch-readiness.py
 shared-utility-deferred	dispatch_attempt_policy.py
 shared-utility-deferred	dispatch_capacity_evidence.py
@@ -35,6 +37,7 @@ shared-utility-deferred	dispatch_notice_state.py
 shared-utility-deferred	dispatch_owner_input.py
 shared-utility-deferred	dispatch_parent_completion.py
 shared-utility-deferred	dispatch_receipt_identity.py
+shared-utility-deferred	dispatch_recipient_receipt.py
 shared-utility-deferred	dispatch_replacement.py
 shared-utility-deferred	dispatch_resource_wait.py
 shared-utility-deferred	dispatch_replacement_batch.py
@@ -66,6 +69,7 @@ shared-utility-deferred	review_input.py
 shared-utility-deferred	review_watchdog.py
 shared-utility-deferred	session_tidy_idle.py
 shared-utility-deferred	session_tidy_policy.py
+shared-utility-deferred	session_history.py
 shared-utility-deferred	route_parent_close.py
 shared-utility-deferred	route_plan.py
 shared-utility-deferred	route_presence_gate.py
@@ -75,9 +79,12 @@ shared-utility-deferred	spec_merge.py
 shared-utility-deferred	ship-parent-deploy.py
 shared-utility-deferred	ship_parent_deploy.py
 shared-utility-deferred	transcript_turn.py
+shared-utility-deferred	terminal_surface.py
+shared-utility-deferred	pane.py
 shared-utility-deferred	verification-background-lease.py
 shared-utility-deferred	work_start.py
 shared-utility-deferred	start_receipt.py
+shared-utility-deferred	recipient_lifetime.py
 utility-deferred	artifact-root.test.sh
 utility-deferred	artifact-sink.sh
 utility-deferred	artifact-sink.test.sh
@@ -103,6 +110,8 @@ utility-deferred	artifact_relayout.py
 utility-deferred	artifact_residue.py
 utility-deferred	artifact_resplit.py
 utility-deferred	artifact_workflow_groups.py
+utility-deferred	attempt-view.py
+utility-deferred	attempt_view.py
 utility-deferred	capability-grounding.sh
 utility-deferred	capability-route.py
 utility-deferred	capability_route.test.py
@@ -234,6 +243,7 @@ utility-deferred	resource_run_registry.py
 utility-deferred	resource_run_evidence.py
 utility-deferred	resource_runner.test.py
 utility-deferred	runtime_observation.py
+utility-deferred	shared_readiness.py
 utility-deferred	review_batch_revision_fixture.py
 utility-deferred	review_round_cap.py
 utility-deferred	review_round_cap.test.py

@@ -122,6 +122,7 @@ LAUNCHERS = (
     ("hearting", "tools/install/harness.sh"),
     ("harness", "tools/install/harness.sh"),
     ("fleet", "tools/fleet/fleet.sh"),
+    ("fleet2", "tools/fleet/fleet2.sh"),
     ("mem", "tools/memory/mem.py"),
     ("compute-hosts", "utilities/compute-hosts"),
 )

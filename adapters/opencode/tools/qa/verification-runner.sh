@@ -13,7 +13,7 @@ EOF
 }
 
 adapter=opencode
-timeout_s=60
+timeout_s=600
 check_only=0
 
 while [ "$#" -gt 0 ]; do

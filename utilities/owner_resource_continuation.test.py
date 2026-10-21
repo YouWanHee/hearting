@@ -59,6 +59,7 @@ class OwnerResourceContinuationTest(unittest.TestCase):
         path.write_text(json.dumps({'provenance': {'attempt_id': meta['attempt_id'],
             'route': {'route_id': self.route['route_id'], 'route_file': str(self.path)}, **(binding or {})}}))
         compute = SimpleNamespace(load_config=lambda: {'run_root': run_root}, ConfigError=ValueError,
+            _namespace_self=lambda config: None,
             _run_state=lambda config, rid: {'stop_reason': None, 'state': 'running'},
             config_path=lambda: self.base / 'compute.yaml')
         patch = mock.patch.object(CLOSE, '_compute', return_value=compute)

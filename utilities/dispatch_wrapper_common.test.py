@@ -7,15 +7,24 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+import fcntl
 from contextlib import redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 import dispatch_wrapper_common as C  # noqa: E402
+import dispatch_resource_wait as WAIT  # noqa: E402
+
+_fixture_spec = importlib.util.spec_from_file_location(
+    "wrapper_resource_workflow_fixture", ROOT / "utilities" / "workflow_supervisor.test.py")
+FIX = importlib.util.module_from_spec(_fixture_spec)
+sys.modules[_fixture_spec.name] = FIX
+_fixture_spec.loader.exec_module(FIX)
 
 ALIASES = {
     "fail": "fail", "jobs_lock": "jobs_lock", "process_start_ticks": "process_start_ticks",
@@ -119,6 +128,142 @@ class WrapperCommonTest(unittest.TestCase):
             for old, new in ALIASES.items():
                 with self.subTest(harness=harness, name=old):
                     self.assertIs(getattr(wrapper, old), getattr(C, new))
+
+    def test_three_wrapper_route_start_settles_resource_and_readers_stay_read_only(self):
+        import dispatch_contract as DC
+        import dispatch_owner_input as INPUT
+        import route_authority as RA
+        from unittest import mock
+
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                fixture = FIX.TestSupervisorAdvance()
+                fixture.setUp()
+                lease_context = owner_input = None
+                try:
+                    route, route_file, jobs, registry, output = fixture._resume_fixture(ordinary=True)
+                    supervisor = FIX.SUP
+                    ledger = supervisor.ledger_for(route, jobs)
+                    wrapper = load(harness)
+                    owner_attempt = "att-owner-" + harness
+                    owner_slug = "fixture-owner"
+                    identity = supervisor.RR.proc_identity(os.getpid())
+                    lease_path = DC.supervisor_lease_path(jobs, owner_attempt)
+                    owner_metadata = {
+                        "attempt_schema_version": "2", "dispatch_depth": "1",
+                        "transport": "headless", "execution_surface": "registered-headless",
+                        "registered_worker": "1", "fallback_hop": "same-harness-headless",
+                        "worker_type": "owner", "unit": "_kernel/owner", "harness": "codex",
+                        "runtime_sandbox": "workspace-write", "completion_delivery": "app-server-supervised",
+                        "supervisor_lease": DC.SUPERVISOR_LEASE_KIND,
+                        "supervisor_lease_file": str(lease_path),
+                        "supervisor_lease_nonce": "d" * 64,
+                        "attempt_id": owner_attempt, "pid": str(identity["pid"]),
+                        "pid_start": identity["starttime"],
+                        "owner_route_id": route["route_id"], "owner_route_hash": route["route_hash"],
+                        "route_id": route["route_id"], "route_hash": route["route_hash"],
+                        "parent_sid": "fixture-parent-session",
+                        "capability": route["capability"], "capability_mode": route["capability_mode"],
+                        "intensity": route["effective_intensity"],
+                    }
+                    owner_row = "\t".join(("2026-10-20T00:00:00Z", "open", str(fixture.base),
+                        str(fixture.base), owner_slug,
+                        ",".join(f"{key}={value}" for key, value in owner_metadata.items())))
+                    with jobs.open("a", encoding="utf-8") as stream:
+                        stream.write(owner_row + "\n")
+                    lease_context = DC.hold_supervisor_lease(jobs, owner_attempt, lease_path)
+                    lease_context.__enter__()
+                    owner_input = INPUT.OwnerInput(
+                        jobs, owner_attempt, "same-native", "codex-active-turn", lambda _: None,
+                    )
+                    resource_data = json.loads(registry.read_text())
+                    resource_row = resource_data["runs"]["fixture-run"]
+                    resource_row["parent_attempt_id"] = owner_attempt
+                    resource_row["owner_wait"].update(
+                        parent_attempt_id=owner_attempt, session_id="same-native",
+                        route_id=route["route_id"], route_hash=route["route_hash"],
+                        jobs=str(jobs.resolve()), owner_pid=str(identity["pid"]),
+                        owner_start=identity["starttime"],
+                    )
+                    registry.write_text(json.dumps(resource_data))
+                    armed_path = ledger.root / "armed/full-run.json"
+                    armed = json.loads(armed_path.read_text())
+                    armed["resource_binding"] = WAIT.resource_body_digest(resource_row)
+                    armed_path.write_text(json.dumps(armed))
+                    prepared = b'{"state":"prepared","runs":[{"status":"prepared"}]}\n'
+                    (output / "run.json").write_bytes(prepared)
+                    self.assertEqual(supervisor.poll_once(route, ledger)[0]["action"], "wait-next-resource")
+
+                    node = next(row for row in route["nodes"] if row["id"] == "run-verify")
+                    args = argparse.Namespace(
+                        route_id=route["route_id"], route_hash=route["route_hash"],
+                        route_node="run-verify", registry_digest=route["registry_digest"],
+                        write_scope=";".join(node["write_scope"]), route_file=str(route_file),
+                        worktree=str(fixture.base), artifact_root=str(route["artifact_root"]),
+                        capability=route["capability"], capability_mode=route["capability_mode"],
+                        intensity=route["effective_intensity"], unit=node["unit"],
+                        model_role=node["role"], model_profile=node["model_profile"],
+                        attempt_id="att-child-" + harness, jobs=jobs, agent_home=fixture.agent_home,
+                        action="register", dispatch_depth=2, parent_slug=owner_slug,
+                        parent_attempt_id=owner_attempt, parent_harness="codex",
+                        parent_transport="headless", parent_sandbox="workspace-write",
+                        subsession_id=None,
+                    )
+                    marker_path = jobs.parent / "completion" / route["route_id"] / "full-run.json"
+                    def durable_snapshot():
+                        paths = [ledger.journal_path, ledger.state_path, *sorted(ledger.claims_dir.glob("*.claim"))]
+                        paths.append(marker_path)
+                        return {str(path): path.read_bytes() if path.is_file() else None for path in paths}
+                    before = durable_snapshot()
+
+                    def fake_run(command, **kwargs):
+                        return subprocess.CompletedProcess(command, 0, str(fixture.base) + "\n", "")
+
+                    with mock.patch.object(C, "validate_runtime_requirements"), \
+                         mock.patch.object(C, "validate_route_mode_axes"), \
+                         mock.patch.object(C.subprocess, "run", side_effect=fake_run), \
+                         mock.patch("subprocess.check_output", return_value=str(fixture.base)), \
+                         mock.patch("review_input.preview_request_nodes", return_value=frozenset()), \
+                         redirect_stdout(io.StringIO()):
+                        self.assertEqual(wrapper.validate_route_record(args), 0)
+                        self.assertEqual(durable_snapshot(), before)
+                        args.action = "dry-run"
+                        self.assertEqual(wrapper.validate_route_record(args), 65)
+                        self.assertEqual(durable_snapshot(), before)
+                        args.action = "start"
+                        self.assertEqual(wrapper.validate_route_record(args), 0)
+                        admitted_marker = marker_path.read_bytes()
+                        admitted_claims = ledger.claim_history()
+                        self.assertEqual(len(admitted_claims), 1)
+                        self.assertEqual(wrapper.validate_route_record(args), 0)
+                        self.assertEqual(marker_path.read_bytes(), admitted_marker)
+                        self.assertEqual(ledger.claim_history(), admitted_claims)
+                        self.assertIsNone(RA.completion_gate(
+                            args, "start", fixture.agent_home, jobs,
+                            gate=wrapper.completion_marker_gate,
+                        ))
+                        self.assertEqual(marker_path.read_bytes(), admitted_marker)
+                        self.assertEqual(ledger.claim_history(), admitted_claims)
+
+                        # This is the same read-only completion callback the
+                        # wrapper's jobs-lock preclaim uses.
+                        with Path(str(jobs) + ".lock").open("a", encoding="utf-8") as lock:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                            lines = jobs.read_text(encoding="utf-8").splitlines()
+                            wrapper.completion_marker_gate(
+                                args.route_file, args.route_node, "start", fixture.agent_home,
+                                jobs, registry_lines=lines, attempt_id=args.attempt_id,
+                            )
+                        self.assertEqual(marker_path.read_bytes(), admitted_marker)
+                        self.assertEqual(ledger.claim_history(), admitted_claims)
+                        self.assertEqual((output / "run.json").read_bytes(), prepared)
+                        self.assertEqual(ledger.state()["nodes"]["full-run"]["state"], "STAGE_SUCCEEDED")
+                finally:
+                    if owner_input is not None:
+                        owner_input.close()
+                    if lease_context is not None:
+                        lease_context.__exit__(None, None, None)
+                    fixture.doCleanups()
 
     def test_a_few_behaviors(self):
         out = io.StringIO()
@@ -736,6 +881,35 @@ class SameRowTest(unittest.TestCase):
         self.assertEqual(rows["opencode"]["completion_delivery"], "session-resume-supervised")
         self.assertEqual(rows["codex"]["reasoning"], "high")
         self.assertEqual(rows["claude"]["supervisor_lease_nonce"], "nonce")
+
+    def test_launch_records_all_or_no_main_runtime_fields(self):
+        from unittest import mock
+        with mock.patch.object(C, "_retention_main_identity",
+                               return_value=("codex", "431", "900", "pid:[4026531836]")):
+            fields = self.row("codex", runtime_sandbox="workspace-write", effort_key="reasoning")
+        self.assertEqual((fields["main_runtime_harness"], fields["main_runtime_pid"],
+                          fields["main_runtime_pid_start"], fields["main_runtime_ns"]),
+                         ("codex", "431", "900", "pid:[4026531836]"))
+        with mock.patch.object(C, "_retention_main_identity", return_value=None):
+            absent = self.row("claude", runtime_sandbox="adapter-default", effort_key="effort")
+        self.assertFalse(any(key.startswith("main_runtime_") for key in absent))
+
+    def test_nested_main_runtime_identity_follows_only_exact_parent_attempts(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        jobs = Path(self.tmp) / "jobs.log"
+        parent = "att-parent"
+        root = "att-root"
+        jobs.write_text(
+            "2026-01-01T00:00:00Z\tdone\t/repo\t/wt\troot\tattempt_id=att-root,dispatch_depth=1,main_runtime_harness=claude,main_runtime_pid=21,main_runtime_pid_start=32,main_runtime_ns=pid:[1]\n"
+            "2026-01-01T00:00:00Z\tdone\t/repo\t/wt\tchild\tattempt_id=att-parent,parent_attempt_id=att-root,dispatch_depth=2\n",
+            encoding="utf-8")
+        args = SimpleNamespace(dispatch_depth=3, parent_binding=SimpleNamespace(attempt_id=parent))
+        with mock.patch.object(C, "_interactive_main_identity", side_effect=AssertionError):
+            self.assertEqual(C._retention_main_identity(jobs, args, "opencode"),
+                             ("claude", "21", "32", "pid:[1]"))
+        jobs.write_text(jobs.read_text().replace("parent_attempt_id=att-root", "parent_attempt_id=att-missing"))
+        self.assertIsNone(C._retention_main_identity(jobs, args, "opencode"))
 
     def test_shared_start_path_checks_projection_before_seal_and_spawn(self):
         from unittest import mock

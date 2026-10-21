@@ -144,12 +144,70 @@ def _runtime(pid):
         if name == "claude" or "/claude/versions/" in words[0]:
             return "claude", any(w in {"daemon", "bg-pty-host", "bg-spare"} for w in words[1:3])
         if name == "codex" or name.startswith("codex-"):
-            return "codex", "app-server" in words[1:3] or name != "codex"
+            if name != "codex":
+                return "codex", True
+            # Codex accepts global options before the command. Skip each
+            # option and its value so a config value containing "app-server"
+            # cannot turn a TUI into a service, or hide the real command.
+            value_options = {"-c", "--config", "--profile", "--ask-for-approval",
+                             "-a", "--sandbox", "-s", "--cd", "-C", "--add-dir",
+                             "--model", "-m"}
+            index = 1
+            command = ""
+            while index < len(words):
+                word = words[index]
+                if word in value_options:
+                    index += 2
+                    continue
+                if any(word.startswith(option + "=") for option in value_options):
+                    index += 1
+                    continue
+                if word == "--oss":
+                    index += 1
+                    continue
+                if word.startswith("-"):
+                    index += 1
+                    continue
+                command = word
+                break
+            return "codex", command == "app-server"
         if name == "opencode":
             return "opencode", any(w in {"serve", "web"} for w in words[1:3])
     except (OSError, IndexError):
         pass
     return "", False
+
+
+def codex_caller_binding(session_id, *, pid=None, environ=None, executable=None):
+    """Return the one proved TUI binding for an interactive Codex daemon caller.
+
+    Inherited Herdr values are intentionally ignored. The runtime's own thread
+    id selects the binding; workers, service identities and ambiguous panes
+    fail closed.
+    """
+    env = os.environ if environ is None else environ
+    if (not _THREAD_ID_RE.fullmatch(session_id or "")
+            or env.get("CODEX_THREAD_ID") != session_id):
+        return None
+    caller_pid = os.getpid() if pid is None else int(pid)
+    if _registered_worker(caller_pid):
+        return None
+    caller, service = _caller_runtime(caller_pid, "codex")
+    if caller is None or not service:
+        return None
+    bindings = codex_tui_process_bindings(session_id, pane_hint=None, executable=executable)
+    if len(bindings) != 1:
+        return None
+    binding = bindings[0]
+    if not isinstance(binding, dict) or not all(
+            binding.get(key) for key in ("pid", "pid_start", "session_id", "pane")):
+        return None
+    if binding.get("session_id") != session_id or _registered_worker(binding["pid"]):
+        return None
+    record = _process(binding["pid"])
+    if not record or str(record[5]) != str(binding["pid_start"]):
+        return None
+    return dict(binding)
 
 
 def _caller_runtime(pid, harness):

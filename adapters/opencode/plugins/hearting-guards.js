@@ -70,6 +70,7 @@ const turnContextBySession = new Map()
 //     candidate probe) and the kept text is re-emitted on every model call of
 //     that turn, so a tool-loop continuation never consumes a second card.
 const cardBySession = new Map()
+const historyNoticeSettledBySession = new Set()
 const peerGuidanceBySession = new Map()
 // One threshold notice per native session, retained for the triggering turn so
 // an auxiliary title call cannot consume the answering model's system context.
@@ -207,6 +208,12 @@ function isWorkerSession() {
     Boolean(process.env.OPENCODE_DISPATCH_SLUG) ||
     process.env.FLEET_TITLE_REFRESH === "1"
   )
+}
+
+function mayReconnectPeerObligations() {
+  // Ordinary worker turns keep existing shared recovery available. A
+  // registered worker must not start the primary lifecycle runner from a hook.
+  return !isWorkerSession() || process.env.AGENT_DISPATCH_REGISTERED_WORKER !== "1"
 }
 
 function touchHeartbeat(slug) {
@@ -1453,17 +1460,50 @@ function createCompletionCarrier(ctx) {
     let timeout
     try {
       if (look && !(await owed(sid))) { log("skip", sid, "no-owed-record"); return }
-      const claimed = await command("deliver", sid)
+      // The shared courier checks native user-message evidence before claim.
+      // This read is scoped to the one session and its bounded recent history.
+      const beforeMessages = await compactMessages(ctx, sid)
+      const claimed = await command("deliver", sid, { messages: beforeMessages })
       if (!claimed?.text || !Array.isArray(claimed.records) || !claimed.records.length) {
         log("skip", sid, claimed === null ? "claim-unavailable" : "nothing-claimed"); return
       }
       log("claim", sid, "claimed", { deliveries: claimed.records.map(record => record.delivery_id) })
+      // A second native read is the final output/send recheck. If another
+      // carrier's exact receipt appeared after our first read, settle it here
+      // and never submit this copy to promptAsync.
+      const beforeSend = await command("settle", sid, {
+        records: claimed.records, messages: await compactMessages(ctx, sid), text: claimed.text,
+      })
+      if (!beforeSend) {
+        await command("release", sid, { records: claimed.records })
+        log("settle", sid, "native-recheck-unavailable-released")
+        return
+      }
+      if (!beforeSend.records?.length) {
+        log("settle", sid, "native-receipt-before-send", {
+          received: beforeSend?.received_ids?.length ?? null,
+          acked: beforeSend?.settled_count ?? null,
+        })
+        return
+      }
+      if (beforeSend.unknown_ids?.length && beforeSend.received_ids?.length) {
+        log("settle", sid, "partial-native-observation-held", {
+          received: beforeSend.received_ids.length, unknown: beforeSend.unknown_ids.length,
+        })
+        return
+      }
+      if (!beforeSend.text) {
+        await command("release", sid, { records: beforeSend.records })
+        log("settle", sid, "empty-context-released")
+        return
+      }
       let taken = false
       let promptReason = "not-accepted"
       let httpStatus
       try {
         const result = await Promise.race([
-          prompter().promptAsync({ path: { id: sid }, body: { parts: [{ type: "text", text: claimed.text }] } }),
+          prompter().promptAsync({ path: { id: sid },
+            body: { parts: [{ type: "text", text: beforeSend.text }] } }),
           new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("carrier-timeout")), 5000) }),
         ])
         taken = Boolean(result) && result.error == null && result.response?.ok !== false
@@ -1471,9 +1511,21 @@ function createCompletionCarrier(ctx) {
         promptReason = taken ? "accepted" : "not-accepted"
       } catch (error) { promptReason = error?.message === "carrier-timeout" ? "timeout" : "error" }
       log("prompt", sid, promptReason, { httpStatus })
-      // Taken: the session's next turn holds the receipt. Not taken: the next pass claims it again.
-      const settled = await command(taken ? "ack" : "release", sid, claimed)
-      log("settle", sid, taken ? "ack" : "release", { count: settled?.count ?? null })
+      // SDK acceptance and process completion are not receipt evidence. Settle
+      // only if this exact marker now exists in this native session's user
+      // history; otherwise release the claim for the existing fallback.
+      const observed = await command("settle", sid, {
+        records: beforeSend.records, messages: await compactMessages(ctx, sid), text: beforeSend.text,
+      })
+      const received = new Set(observed?.received_ids || [])
+      const releaseRecords = (beforeSend.records || []).filter(
+        record => !received.has(record.delivery_id))
+      const released = releaseRecords.length
+        ? await command("release", sid, { records: releaseRecords }) : { count: 0 }
+      log("settle", sid, received.size ? "native-receipt" : "release-fallback", {
+        received: received.size, acked: observed?.settled_count ?? null,
+        released: released?.count ?? null, prompt_accepted: taken,
+      })
     } catch (error) {
       log("skip", sid, "delivery-error", { error: String(error?.message || error).slice(0, 180) })
     } finally {
@@ -1534,6 +1586,33 @@ function collectCard(event, sid, cwd, prompt = "") {
   return (result.stdout || "").trim()
 }
 
+function collectCardPayload(event, sid, cwd, prompt = "") {
+  if (!sid || isWorkerSession()) return { additionalContext: "", humanNotice: "" }
+  const result = spawnSync("python3", [sessionTidy, "hook", "--harness", "opencode",
+    "--event", event, "--session-id", sid, "--cwd", cwd, "--format", "json", "--human-only"], {
+    cwd: root, env: { ...process.env, AGENT_HOME: root }, input: JSON.stringify({ prompt }),
+    encoding: "utf8", timeout: 4000, killSignal: "SIGKILL",
+  })
+  if (result.error || result.status !== 0) return { additionalContext: "", humanNotice: "" }
+  try {
+    const value = JSON.parse(result.stdout || "{}")
+    return { additionalContext: String(value.additionalContext || ""), humanNotice: String(value.humanNotice || "") }
+  } catch { return { additionalContext: "", humanNotice: "" } }
+}
+
+function showHistoryNotice(ctx, sid, notice) {
+  if (!notice || !sid || historyNoticeSettledBySession.has(sid)) return
+  historyNoticeSettledBySession.add(sid)
+  showContextAlert(ctx, notice)
+}
+
+function collectHistoryNotice(ctx, sid, cwd, prompt = "", settleEmpty = false) {
+  if (!sid || isWorkerSession() || historyNoticeSettledBySession.has(sid)) return
+  const payload = collectCardPayload("start", sid, cwd, prompt)
+  showHistoryNotice(ctx, sid, payload.humanNotice)
+  if (settleEmpty) historyNoticeSettledBySession.add(sid)
+}
+
 function appendContext(output, text) {
   if (!text) return
   if (!Array.isArray(output.system)) output.system = []
@@ -1545,7 +1624,7 @@ function appendContext(output, text) {
 // own `notice` peer_message_v1 under its exact session id (same record the Claude
 // hook and the Codex hook write). Detached, fail-soft, never blocks the turn.
 function spawnPeerNotice(sid, prompt, cwd) {
-  if (!sid || !prompt || !prompt.includes("peer-from:")) return
+  if (!sid || !prompt || (!prompt.includes("peer-from:") && !prompt.includes("runtime-from:"))) return
   const tool = path.join(root, "utilities", "peer-message.py")
   const args = [tool, "receive",
     "--from-project", path.basename(cwd || ""),
@@ -1584,6 +1663,15 @@ function pendingPeerTransition(sid, options) {
     cwd: root, env: { ...process.env, AGENT_HOME: root }, encoding: "utf8", timeout: 1500,
   })
   return result.status === 0
+}
+
+function pendingPeerProcessIdentity() {
+  try {
+    const stat = readFileSync("/proc/self/stat", "utf8")
+    const split = stat.lastIndexOf(") ")
+    const start = stat.slice(split + 2).trim().split(/\s+/)[19]
+    return split >= 0 && /^\d+$/.test(start) ? { pid: process.pid, start } : null
+  } catch { return null }
 }
 
 function reconnectPeerObligations() {
@@ -1809,8 +1897,53 @@ async function pendingPeerDelivery(ctx, sid) {
     })
     if (!Array.isArray(messages)) return "history-unavailable"
     if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
+    const dispatchReceiptIds = (text) => Array.from(String(text || "").matchAll(
+      /HEARTING_RECEIPT_V1\s+(delivery-[A-Za-z0-9._-]{1,128})\s+[0-9a-f]{64}/g),
+    match => match[1])
+    const expectedDispatchMessage = (row) => {
+      const binding = row?.dispatch_notice
+      if (!binding || binding.carrier !== CARRIER_KIND || binding.recipient_sid !== sid
+          || typeof row.text !== "string"
+          || ![binding.delivery_id, binding.storage_recipient, binding.claim_owner,
+            binding.duty_id, binding.jobs, binding.attempt_id].every(value => typeof value === "string" && value)
+          || !dispatchReceiptIds(row.text).includes(binding.delivery_id)
+          || !Array.isArray(row.refs) || !row.refs.includes(binding.duty_id)
+          || !binding.duty_id.startsWith("registered-batch-")
+          || binding.claim_owner !== `retained-rewake:${binding.duty_id}`
+          || !path.isAbsolute(binding.jobs)) return null
+      return { text: row.text, ...binding }
+    }
+    const expectedNativeMessages = rows.map(expectedDispatchMessage).filter(Boolean)
+    const nativeReceiptCheck = async (nativeRows, expected = []) => {
+      if (!Array.isArray(nativeRows)) return new Set()
+      const result = await carrierCommand("settle", sid, {
+        messages: nativeRows, expected_native_messages: expected,
+      })
+      return new Set(Array.isArray(result?.received_ids) ? result.received_ids : [])
+    }
+    const alreadyReceived = await nativeReceiptCheck(messages, expectedNativeMessages)
+    const recheckReceipt = async (row) => {
+      const expected = expectedDispatchMessage(row)
+      if (!expected) return false
+      let latest
+      try {
+        latest = pendingPeerSdkData(await bounded(client.messages({
+          path: { id: sid }, query: { directory },
+        })))
+      } catch { return false }
+      if (!Array.isArray(latest) || !pendingPeerRoot(ctx, sid)) return false
+      const received = await nativeReceiptCheck(latest, [expected])
+      return received.has(expected.delivery_id)
+    }
     for (const row of rows.slice(0, 3)) {
       if (!row || typeof row.ref !== "string" || !row.ref || typeof row.text !== "string") continue
+      const expectedDispatch = expectedDispatchMessage(row)
+      if (expectedDispatch && alreadyReceived.has(expectedDispatch.delivery_id)) {
+        pendingPeerTrace(ctx, sid, "dispatch-receipt", "already-received", {
+          refs: [row.ref],
+        })
+        continue
+      }
       const created = Number(row.created) * 1000
       const matches = messages.filter((m) => m?.info?.sessionID === sid && m.info.role === "user"
         && promptText(m) === row.text
@@ -1832,6 +1965,12 @@ async function pendingPeerDelivery(ctx, sid) {
         // Continue the already persisted noReply message by its native ID. The
         // exact text is never submitted a second time after an ambiguous result.
         if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
+        if (await recheckReceipt(row)) {
+          pendingPeerTrace(ctx, sid, "dispatch-receipt", "received-before-resume", {
+            refs: [row.ref], message_id_present: !!mid,
+          })
+          continue
+        }
         if (!pendingPeerTransition(sid, ["--resuming", row.ref, "--message-id", mid])) continue
         const resumed = await bounded(client.promptAsync({ path: { id: sid }, query: { directory },
           body: { messageID: mid, parts: [] } }))
@@ -1845,12 +1984,43 @@ async function pendingPeerDelivery(ctx, sid) {
         continue
       }
       if (row.state !== "pending") continue
-      const claimed = pendingPeerCommand(sid, ["--claim", row.ref])
-      if (!claimed) return "claim-unavailable"
-      if (claimed.ref !== row.ref) return "claim-ref-mismatch"
-      if (claimed.state !== "unverified") return "claim-state-mismatch"
-      if (claimed.text !== row.text) return "claim-body-mismatch"
-      if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
+      const identity = pendingPeerProcessIdentity()
+      if (!identity) return "claim-unavailable"
+      const reserveStarted = performance.now()
+      const reserved = pendingPeerCommand(sid, ["--reserve", row.ref,
+        "--claim-pid", String(identity.pid), "--claim-start", identity.start])
+      const reserveMs = performance.now() - reserveStarted
+      pendingPeerTrace(ctx, sid, "reserve", reserved ? "reserved" : "failed", {
+        elapsed_ms: reserveMs, timeout_ms: 1500,
+      })
+      if (!reserved) return "claim-unavailable"
+      const releaseReservation = () => pendingPeerTransition(sid, ["--release-reservation", row.ref,
+        "--claim-token", reserved.rpc_claim?.token || "",
+        "--claim-pid", String(identity.pid), "--claim-start", identity.start])
+      if (reserved.ref !== row.ref) { releaseReservation(); return "claim-ref-mismatch" }
+      if (reserved.state !== "pending") { releaseReservation(); return "claim-state-mismatch" }
+      if (reserved.text !== row.text) { releaseReservation(); return "claim-body-mismatch" }
+      if (!pendingPeerRoot(ctx, sid)) { releaseReservation(); return "native-origin-changed" }
+      if (await recheckReceipt(reserved)) {
+        releaseReservation()
+        pendingPeerTrace(ctx, sid, "dispatch-receipt", "received-before-write", {
+          refs: [row.ref],
+        })
+        continue
+      }
+      const beginStarted = performance.now()
+      const claimed = pendingPeerCommand(sid, ["--begin-write", row.ref,
+        "--claim-token", reserved.rpc_claim?.token || "",
+        "--claim-pid", String(identity.pid), "--claim-start", identity.start])
+      const beginMs = performance.now() - beginStarted
+      pendingPeerTrace(ctx, sid, "begin-write", claimed ? "authorized" : "failed", {
+        elapsed_ms: beginMs, timeout_ms: 1500,
+      })
+      if (!claimed || claimed.ref !== row.ref || claimed.state !== "unverified"
+          || claimed.rpc_claim?.token !== reserved.rpc_claim?.token) {
+        releaseReservation()
+        continue
+      }
       let accepted
       let persistenceResponseLost = false
       try {
@@ -2079,9 +2249,9 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
   if (initialize && paneBinding.ownsOrigin && paneNativeOrigin?.sid) {
     let activated = false
     try { activated = await completionCarrier.activate(paneNativeOrigin.sid) } catch {}
-    if (!activated) reconnectPeerObligations()
+    if (!activated && mayReconnectPeerObligations()) reconnectPeerObligations()
     scheduleInitialPaneProjection(ctx, paneBinding, paneNativeOrigin.sid)
-  } else if (initialize) {
+  } else if (initialize && mayReconnectPeerObligations()) {
     reconnectPeerObligations()
   }
 
@@ -2145,6 +2315,9 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
       const info = event.properties?.info
       const createdID = info?.id || event.properties?.sessionID || ""
       if (createdID && info && typeof info === "object") sessionInfoById.set(createdID, info)
+      if (createdID && !isWorkerSession()) {
+        collectHistoryNotice(ctx, createdID, baseDir(ctx))
+      }
     }
     if (event && event.type === "session.created") {
       const sid = event.properties?.info?.id || event.properties?.sessionID || ""
@@ -2152,7 +2325,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
       if (!isWorkerSession() && sid) {
         try { activated = await completionCarrier.activate(sid) } catch {}
       }
-      if (!activated) reconnectPeerObligations()
+      if (!activated && mayReconnectPeerObligations()) reconnectPeerObligations()
     }
     if (event && event.type === "session.compacted") {
       const sid = event.properties?.sessionID || ""
@@ -2227,6 +2400,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
         localEvidenceBySession.delete(sid)
         turnContextBySession.delete(sid)
         cardBySession.delete(sid)
+        historyNoticeSettledBySession.delete(sid)
         peerGuidanceBySession.delete(sid)
         contextAlertBySession.delete(sid)
         paneProjectionRetryAt.delete(sid)
@@ -2249,7 +2423,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
     if (prompt) promptBySession.set(sid, prompt)
     peerGuidanceBySession.delete(sid)
     // Actual peer receipt is observed after persistence, not callback rendering.
-    if (prompt && eventSid && prompt.includes("peer-from:")) {
+    if (prompt && eventSid && (prompt.includes("peer-from:") || prompt.includes("runtime-from:"))) {
       const guidance = spawnSync(
         "python3",
         ["-c", "import importlib.util, json, sys; s=importlib.util.spec_from_file_location('peer', 'utilities/peer-message.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); d=json.load(sys.stdin); print(m.receiver_guidance(d.get('prompt', ''), d.get('recipient'), cwd=d.get('cwd')))"],
@@ -2272,7 +2446,9 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
     }
     const cardTurn = turn || prompt
     if (eventSid && (!cardTurn || cardBySession.get(sid)?.turn !== cardTurn)) {
-      cardBySession.set(sid, { turn: cardTurn, text: collectCard("prompt", eventSid, baseDir(ctx), prompt) })
+      const cardText = collectCard("prompt", eventSid, baseDir(ctx), prompt)
+      collectHistoryNotice(ctx, eventSid, baseDir(ctx), prompt, true)
+      cardBySession.set(sid, { turn: cardTurn, text: cardText })
     }
   },
   "experimental.chat.messages.transform": async (_input, output) => {

@@ -507,7 +507,8 @@ def load_producer_binding(*, artifact_root: Path, route_id: str, owner_attempt_i
     return ProducerBindingResult("loaded", path, value, _digest(raw), True)
 
 
-def validate_owner_route(*, jobs: Path, route_file: Path, owner_attempt_id: str) -> owner_route_binding.OwnerRouteBinding:
+def validate_owner_route(*, jobs: Path, route_file: Path, owner_attempt_id: str,
+                         registry_rows=None) -> owner_route_binding.OwnerRouteBinding:
     """Verify the live registry owner before producer admission is locked."""
     # Route loading belongs to terminal proof, not import-time artifact guards.
     import owner_route_binding
@@ -515,12 +516,13 @@ def validate_owner_route(*, jobs: Path, route_file: Path, owner_attempt_id: str)
         raise TerminalCommitError("producer-binding-required", "owner-attempt")
     try:
         owner, _status = owner_route_binding.resolve_owner_route_lifecycle(
-            jobs, owner_attempt_id=owner_attempt_id)
+            jobs, owner_attempt_id=owner_attempt_id, registry_rows=registry_rows)
         if owner is None:
             # A registered quick one-shot already seals the complete node
             # tuple in route_* fields, without the standard owner's separate
             # launch/attachment fields. Verify that existing contract exactly.
-            fields, meta = owner_route_binding._owner_snapshot(Path(jobs), owner_attempt_id)
+            fields, meta = owner_route_binding._owner_snapshot(
+                Path(jobs), owner_attempt_id, rows=registry_rows)
             route = json.loads(Path(route_file).read_text())
             # Quick is a three-node route: `one-shot` plus two depth-1 frame
             # legs. Both worker types terminate through here, and the derived
@@ -553,30 +555,34 @@ def validate_owner_route(*, jobs: Path, route_file: Path, owner_attempt_id: str)
     return owner
 
 
-def verify_request_identity(request, route):
+def verify_request_identity(request, route, *, registry_rows=None):
     digest = route_identity.route_hash(route)
     if (route.get("route_hash") != digest or route.get("route_id") != route_identity.route_id_from_hash(digest)
             or Path(route.get("artifact_root", "")).resolve() != Path(request.artifact_root).resolve()):
         raise TerminalCommitError("route-identity-unverified", "canonical-route-identity")
-    from dispatch_registry_cache import registry_view
-    view = registry_view(Path(request.jobs))
-    if view.has_invalid_utf8 or view.has_partial_tail:
-        # Preserve the legacy reader's strict decoding and final-line behavior.
-        rows = []
-        for line in Path(request.jobs).read_text().splitlines():
-            fields = line.split("\t")
-            if len(fields) == 6:
-                rows.append((fields, dispatch_contract.parse_registry_metadata(fields[5])))
+    if registry_rows is not None:
+        rows = registry_rows
     else:
-        # Candidates are raw input, not a cached owner-completion decision.
-        selected = {record.order: record for record in view.completion_related(
-            request.owner_attempt_id, route["route_id"], "")}
-        selected.update((record.order, record) for record in
-                        view.completion_attempt_records(request.owner_attempt_id))
-        rows = [(selected[order].fields, selected[order].completion_metadata())
-                for order in sorted(selected)]
+        from dispatch_registry_cache import registry_view
+        view = registry_view(Path(request.jobs))
+        if view.has_invalid_utf8 or view.has_partial_tail:
+            # Preserve the legacy reader's strict decoding and final-line behavior.
+            rows = []
+            for line in Path(request.jobs).read_text().splitlines():
+                fields = line.split("\t")
+                if len(fields) == 6:
+                    rows.append((fields, dispatch_contract.parse_registry_metadata(fields[5])))
+        else:
+            # Candidates are raw input, not a cached owner-completion decision.
+            selected = {record.order: record for record in view.completion_related(
+                request.owner_attempt_id, route["route_id"], "")}
+            selected.update((record.order, record) for record in
+                            view.completion_attempt_records(request.owner_attempt_id))
+            rows = [(selected[order].fields, selected[order].completion_metadata())
+                    for order in sorted(selected)]
     binding = validate_owner_route(jobs=request.jobs, route_file=request.route_file,
-                                   owner_attempt_id=request.owner_attempt_id)
+                                   owner_attempt_id=request.owner_attempt_id,
+                                   registry_rows=registry_rows)
     owners = [(fields, meta) for fields, meta in rows if meta.get("worker_type") == "owner"
               and (meta.get("owner_route_id") == route["route_id"]
                    or meta.get("route_id") == route["route_id"]
@@ -691,18 +697,25 @@ def _valid_cycle_primary(candidate: Any, *, root: Path, binding: Mapping[str, An
     return path.resolve()
 
 
-def _exact_owner_handoff(jobs: Path, attempt: str, route: Mapping[str, Any]) -> Optional[dict[str, str]]:
+def _exact_owner_handoff(jobs: Path, attempt: str, route: Mapping[str, Any], *,
+                         registry_rows=None) -> Optional[dict[str, str]]:
     """Inspect the exact current owner log; never infer from directory recency."""
     try:
-        from dispatch_completion_join import exact_attempt_row
-        row = exact_attempt_row(Path(jobs), attempt)
-        meta = row.metadata
+        if registry_rows is None:
+            from dispatch_completion_join import exact_attempt_row
+            row = exact_attempt_row(Path(jobs), attempt)
+            fields, meta = row.raw.split("\t"), row.metadata
+        else:
+            matches = [(fields, meta) for fields, meta in registry_rows
+                       if meta.get("attempt_id") == attempt]
+            if len(matches) != 1:
+                return None
+            fields, meta = matches[0]
         if meta.get("worker_type") != "owner":
             return None
         log_file = meta.get("log_file")
         if not isinstance(log_file, str) or not log_file:
             return None
-        fields = row.raw.split("\t")
         from codex_dispatch_terminal import inspect_terminal_attempt
         inspected = inspect_terminal_attempt(
             log_file, worktree=fields[3], artifact_root_metadata=route.get("artifact_root"),
@@ -995,22 +1008,26 @@ def _related_route_identity(metadata, route):
     return True
 
 
-def _prove_route_children(request, route, gates):
+def _prove_route_children(request, route, gates, *, registry_rows=None):
     """Use the shared attempt policy for initial closure and every replay."""
     from route_authority import decide_continuation
     related = []
     seen_attempts = set()
-    from dispatch_registry_cache import registry_view
-    view = registry_view(request.jobs)
-    try:
-        view.require_complete_text()
-    except UnicodeError:
-        return _proof_failure("route-identity-unverified")
-    candidates = view.completion_related(
-        request.owner_attempt_id, route.get("route_id", ""), route.get("route_hash", ""))
-    for record in candidates:
-        row_index, fields = record.order, list(record.fields)
-        meta = record.completion_metadata()
+    if registry_rows is None:
+        from dispatch_registry_cache import registry_view
+        view = registry_view(request.jobs)
+        try:
+            view.require_complete_text()
+        except UnicodeError:
+            return _proof_failure("route-identity-unverified")
+        candidates = [(record.order, list(record.fields), record.completion_metadata())
+                      for record in view.completion_related(
+                          request.owner_attempt_id, route.get("route_id", ""),
+                          route.get("route_hash", ""))]
+    else:
+        candidates = [(index, list(fields), dict(metadata))
+                      for index, (fields, metadata) in enumerate(registry_rows)]
+    for row_index, fields, meta in candidates:
         try:
             same_route = _related_route_identity(meta, route)
         except (TypeError, ValueError):
@@ -1112,7 +1129,8 @@ def prove_terminal_authority(request: TerminalCommitRequest) -> TerminalProof:
 _EVIDENCE_MOVED_ON = frozenset({"completion-evidence-revised-unrecorded", "completion-evidence-unreadable"})
 
 
-def _settled_gate_rows(route_module, route, request, gates, *, historical=False):
+def _settled_gate_rows(route_module, route, request, gates, *, historical=False,
+                       registry_rows=None):
     """Replay the terminal rows already bound by the closed route outcome.
 
     The outcome/claim/commit identity remains authoritative. Live gate reads
@@ -1132,6 +1150,14 @@ def _settled_gate_rows(route_module, route, request, gates, *, historical=False)
                        and outcome.get("route_hash") == route.get("route_hash")
                        and outcome.get("terminal_gate_proven") is True
                        and isinstance(recorded, Mapping))
+    rows = {}
+    gate_kwargs = ({"registry_rows": registry_rows}
+                   if registry_rows is not None else {})
+    if registry_rows is not None:
+        gate_kwargs["exact_terminal"] = True
+        fresh_gates = route_module.terminal_gate_observation(
+            route, jobs=request.jobs, **gate_kwargs)
+        gates = fresh_gates
     rows = {}
     for node_id, row in gates.items():
         rebuilt = None
@@ -1747,11 +1773,13 @@ def owner_workflow_gaps(jobs, metadata, route):
     return missing  # The executor's own handoff can only be proved after it exits.
 
 
-def _completion_owner_choice(jobs, status, metadata, *, executing=False):
+def _completion_owner_choice(jobs, status, metadata, *, executing=False,
+                             selected_registry_rows=None):
     import route_parent_close
     from route_authority import decide_continuation
     return decide_continuation(action="completion-owner", status=status, metadata=metadata,
-        facts={"closing": route_parent_close.row_requested(metadata, jobs), "executing": executing})
+        facts={"closing": route_parent_close.row_requested(
+            metadata, jobs, registry_rows=selected_registry_rows), "executing": executing})
 
 
 def owner_workflow_continuation(jobs, owner_attempt_id, route_file):
@@ -1784,15 +1812,19 @@ def owner_workflow_continuation(jobs, owner_attempt_id, route_file):
     )
 
 
-def _historical_request(jobs, status, metadata):
+def _historical_request(jobs, status, metadata, *, selected_registry_rows=None):
     """Locate a past transaction without granting current launch authority."""
-    if not _completion_owner_choice(jobs, status, metadata).allowed:
+    if not _completion_owner_choice(
+            jobs, status, metadata,
+            selected_registry_rows=selected_registry_rows).allowed:
         return None
     import owner_route_binding
-    fields, meta = owner_route_binding._owner_snapshot(Path(jobs), metadata["attempt_id"])
+    fields, meta = owner_route_binding._owner_snapshot(
+        Path(jobs), metadata["attempt_id"], rows=selected_registry_rows)
     # Standard owners follow recorded route adoption. Quick owners seal route_*.
     owner, _ = owner_route_binding.resolve_owner_route_lifecycle(
-        Path(jobs), owner_attempt_id=metadata["attempt_id"])
+        Path(jobs), owner_attempt_id=metadata["attempt_id"],
+        registry_rows=selected_registry_rows)
     path = Path(owner.route_file if owner else meta.get("route_file", "")).resolve()
     route = json.loads(path.read_text())
     digest = route_identity.route_hash(route)
@@ -1812,12 +1844,13 @@ def _historical_request(jobs, status, metadata):
     return TerminalCommitRequest(path, metadata["attempt_id"], Path(jobs), root)
 
 
-def _observe_settled_transaction(request, state):
+def _observe_settled_transaction(request, state, *, selected_registry_rows=None):
     """Prove immutable history and current obligations without locks or repairs."""
     route = json.loads(request.route_file.read_text())
     module = _route_module()
     gates = _settled_gate_rows(module, route, request,
-        {n["id"]: {} for n in route.get("nodes", []) if n.get("terminal")}, historical=True)
+        {n["id"]: {} for n in route.get("nodes", []) if n.get("terminal")},
+        historical=True, registry_rows=selected_registry_rows)
     binding = (load_producer_binding(artifact_root=request.artifact_root,
         route_id=route["route_id"], owner_attempt_id=request.owner_attempt_id,
         historical=True) if producer_lifecycle_applies(route) else None)
@@ -1832,7 +1865,8 @@ def _observe_settled_transaction(request, state):
     if (commit_id != state.get("terminal_commit_id") or not isinstance(claim, Mapping)
             or (claim.get("proof") or {}).get("terminal_commit_id") != commit_id):
         raise TerminalCommitError("transaction-conflict", "historical-terminal-identity")
-    children = _prove_route_children(request, route, gates)
+    children = _prove_route_children(
+        request, route, gates, registry_rows=selected_registry_rows)
     if children.status != "proved":
         raise TerminalCommitError(children.reason or "child-not-quiescent", children.detail or "")
     value = binding.binding if binding else None
@@ -1850,16 +1884,21 @@ def _observe_settled_transaction(request, state):
     return envelope, publication, goal_pending
 
 
-def _completion_request(jobs, status, metadata):
+def _completion_request(jobs, status, metadata, *, selected_registry_rows=None):
     """The launch contract, not terminal words alone, assigns workflow closure."""
-    if not _completion_owner_choice(jobs, status, metadata).allowed:
+    if not _completion_owner_choice(
+            jobs, status, metadata,
+            selected_registry_rows=selected_registry_rows).allowed:
         return None
     import owner_route_binding
     binding, _ = owner_route_binding.resolve_owner_route_lifecycle(
-        Path(jobs), owner_attempt_id=metadata["attempt_id"])
+        Path(jobs), owner_attempt_id=metadata["attempt_id"],
+        registry_rows=selected_registry_rows)
     path = Path(binding.route_file if binding else metadata.get("route_file", ""))
     route = json.loads(path.read_text())
-    handoff = _exact_owner_handoff(Path(jobs), metadata["attempt_id"], route)
+    handoff = _exact_owner_handoff(
+        Path(jobs), metadata["attempt_id"], route,
+        registry_rows=selected_registry_rows)
     explicit_handoff = metadata.get("owner_handoff")
     if isinstance(explicit_handoff, Mapping) and isinstance(explicit_handoff.get("primary"), str):
         handoff = {"primary": explicit_handoff["primary"]}
@@ -1868,8 +1907,10 @@ def _completion_request(jobs, status, metadata):
     goal, _goal_source = read_owner_campaign_goal((handoff or {}).get("primary"))
     request = TerminalCommitRequest(path, metadata["attempt_id"], Path(jobs),
                                     Path(route["artifact_root"]), handoff, goal)
-    verify_request_identity(request, route)
-    validate_owner_route(jobs=request.jobs, route_file=path, owner_attempt_id=request.owner_attempt_id)
+    verify_request_identity(request, route, registry_rows=selected_registry_rows)
+    validate_owner_route(jobs=request.jobs, route_file=path,
+                         owner_attempt_id=request.owner_attempt_id,
+                         registry_rows=selected_registry_rows)
     return request
 
 
@@ -1890,12 +1931,22 @@ class CompletionState:
 from route_authority import PROVEN_BLOCKED_GATE_REASONS as _PROVEN_BLOCKED_GATE_REASONS
 
 
-def owner_completion_state(jobs, status, metadata) -> CompletionState:
+def owner_completion_state(jobs, status, metadata, *, selected_registry_rows=None) -> CompletionState:
     """Observe immutable settlement bytes; the common admission selects their state."""
+    import dispatch_registry_cache
+    with dispatch_registry_cache.registry_read_scope():
+        if selected_registry_rows is None:
+            return _owner_completion_state_scoped(jobs, status, metadata)
+        return _owner_completion_state_scoped(
+            jobs, status, metadata, selected_registry_rows=selected_registry_rows)
+
+
+def _owner_completion_state_scoped(jobs, status, metadata, *, selected_registry_rows=None) -> CompletionState:
     from route_authority import decide_continuation
     facts = {}
     try:
-        request = _historical_request(jobs, status, metadata)
+        request = _historical_request(
+            jobs, status, metadata, selected_registry_rows=selected_registry_rows)
         if request is None:
             return CompletionState("not-applicable")
         path = _commit_state_path(request)
@@ -1904,14 +1955,34 @@ def owner_completion_state(jobs, status, metadata) -> CompletionState:
             state = json.loads(path.read_text())
             facts["checkpoint"] = state.get("state")
             if facts["checkpoint"] == "owner-envelope-sealed":
-                _, publication, goal_pending = _observe_settled_transaction(request, state)
+                _, publication, goal_pending = _observe_settled_transaction(
+                    request, state, selected_registry_rows=selected_registry_rows)
                 facts["settlement_verified"] = True
                 facts["publication_pending"] = publication is not None and publication["status"] == "pending"
                 facts["goal_pending"] = goal_pending
         else:
-            request = _completion_request(jobs, status, metadata)
+            request = _completion_request(
+                jobs, status, metadata, selected_registry_rows=selected_registry_rows)
             route = json.loads(request.route_file.read_text())
-            facts["gates"] = _route_module().terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
+            import dispatch_registry_cache
+            snapshot = dispatch_registry_cache.registry_snapshot(request.jobs)
+            if not snapshot.matches_jobs(request.jobs):
+                facts["error"] = "registry-generation-changed"
+            elif not snapshot.complete:
+                facts["error"] = snapshot.reason or "registry-incomplete"
+            elif (selected_registry_rows is not None
+                    and not snapshot.contains_current_attempt(
+                        selected_registry_rows,
+                        attempt_id=str(metadata.get("attempt_id") or ""),
+                        status=status)):
+                # A bounded selection identifies the owner candidate only. It
+                # cannot be promoted to complete authority or mixed with a
+                # different current registry generation at the terminal gate.
+                facts["error"] = "registry-generation-changed"
+            else:
+                facts["gates"] = _route_module().terminal_gate_observation(
+                    route, jobs=request.jobs, exact_terminal=True,
+                    registry_snapshot=snapshot)
     except (OSError, ValueError, KeyError, TypeError, TerminalCommitError) as exc:
         facts["error"] = str(getattr(exc, "code", type(exc).__name__))
     choice = decide_continuation(action="completion-state", facts=facts)
