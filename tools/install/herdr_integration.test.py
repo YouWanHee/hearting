@@ -343,26 +343,13 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
                 "not os.environ.get('AGENT_DISPATCH_DEPTH'))\n",
                 encoding="utf-8",
             )
-            (tools / "process_identity.py").write_text(
-                "import json, os\n"
-                "def current_launch_context(harness, session_id):\n"
-                "    if (os.environ.get('REPORTER_LAUNCH_HARNESS') != harness or "
-                "os.environ.get('REPORTER_FIXTURE_SESSION') != session_id): return None\n"
-                "    return {'argv': json.loads(os.environ['REPORTER_LAUNCH_ARGV'])}\n"
-                "def is_native_resume_argv(argv, harness, session_id=None):\n"
-                "    if (harness not in {'claude','codex','opencode'} or not isinstance(argv,list) "
-                "or not argv or len(argv) > 64): return False\n"
-                "    if any(not isinstance(arg,str) or not arg or '\\0' in arg for arg in argv): return False\n"
-                "    if sum(len(arg.encode('utf-8','surrogatepass')) for arg in argv) > 8192: return False\n"
-                "    executable = argv[0]\n"
-                "    if not (executable == harness or os.path.isabs(executable) and "
-                "os.path.basename(executable) == harness): return False\n"
-                "    return session_id is None or isinstance(session_id,str) and session_id in argv\n"
-                "def native_resume_wire_argv(argv, harness, session_id=None):\n"
-                "    if not is_native_resume_argv(argv,harness,session_id): return None\n"
-                "    return [harness, *argv[1:]]\n",
-                encoding="utf-8",
-            )
+            shutil.copyfile(ROOT / "tools/fleet/process_identity.py", tools / "process_identity.py")
+            with (tools / "process_identity.py").open("a", encoding="utf-8") as module:
+                module.write("\nimport json, os\n"
+                             "def current_launch_context(harness, session_id):\n"
+                             "    if (os.environ.get('REPORTER_LAUNCH_HARNESS') != harness or "
+                             "os.environ.get('REPORTER_FIXTURE_SESSION') != session_id): return None\n"
+                             "    return {'argv': json.loads(os.environ['REPORTER_LAUNCH_ARGV'])}\n")
             if harness == "claude":
                 source = ROOT / "hooks" / "herdr-agent-state.sh"
                 script = source if source_asset else root / ".claude" / "hooks" / "herdr-agent-state.sh"
@@ -428,23 +415,22 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
 
     def test_native_hooks_forward_transcript_source_resume_argv_and_nanosecond_sequence(self):
         for harness, launch in (("claude", ["claude", "--resume", "ses-A"]),
-                                ("codex", ["codex", "--resume", "ses-A"])):
+                                ("codex", ["codex", "resume", "ses-A"])):
             for source in ("startup", "resume", "clear", "compact", "fork"):
                 with self.subTest(harness=harness, source=source):
                     request = self._run_hook(harness, {
-                        "hook_event_name": "SessionStart", "session_id": "ses-A",
+                        "hook_event_name": "SessionStart", "session_id": "ses-B",
                         "transcript_path": "/fixture/transcript.jsonl", "source": source,
-                    }, allowed=True, launch_argv=launch)
+                    }, allowed=True, launch_argv=launch,
+                        extra_env={"REPORTER_FIXTURE_SESSION": "ses-B"})
                     self.assertEqual(request["method"], "pane.report_agent_session")
                     params = request["params"]
                     self.assertEqual(params["agent"], harness)
-                    self.assertEqual(params["agent_session_id"], "ses-A")
+                    self.assertEqual(params["agent_session_id"], "ses-B")
                     self.assertEqual(params["agent_session_path"], "/fixture/transcript.jsonl")
                     self.assertEqual(params["session_start_source"], source)
-                    if source == "resume":
-                        self.assertEqual(params["resume_argv"], launch)
-                    else:
-                        self.assertNotIn("resume_argv", params)
+                    expected = [harness, "--resume", "ses-B"] if harness == "claude" else [harness, "resume", "ses-B"]
+                    self.assertEqual(params["resume_argv"], expected)
                     self.assertGreater(params["seq"], 10**18)
 
     def test_codex_source_and_runtime_copy_report_through_the_pinned_root_with_spaces(self):
@@ -452,7 +438,7 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
             "hook_event_name": "SessionStart", "session_id": "ses-A",
             "transcript_path": "/fixture/transcript.jsonl", "source": "resume",
         }
-        launch = ["codex", "--resume", "ses-A"]
+        launch = ["codex", "resume", "ses-A"]
         for source_asset in (True, False):
             with self.subTest(source_asset=source_asset):
                 request = self._run_hook("codex", payload, allowed=True, launch_argv=launch,
@@ -463,7 +449,8 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
     def test_native_hooks_translate_proven_absolute_launcher_argv_for_wire(self):
         for harness in ("claude", "codex"):
             launch = [f"/home/user/.local/bin/{harness}", "--color", "always",
-                      "--resume", "ses-A", "--model", "fixture", "--setting-sources", "user"]
+                      *( ["--resume", "ses-A"] if harness == "claude" else ["resume", "ses-A"]),
+                      "--model", "fixture", "--setting-sources", "user"]
             request = self._run_hook(harness, {
                 "hook_event_name": "SessionStart", "session_id": "ses-A",
                 "transcript_path": "/fixture/transcript.jsonl", "source": "resume",
@@ -478,7 +465,6 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
             for bad_argv in (["/usr/bin/env", harness, "--resume", "ses-A"],
                              ["/usr/bin/python3", f"/opt/{harness}", "--resume", "ses-A"],
                              [f"bin/{harness}", "--resume", "ses-A"],
-                             [f"/opt/{harness}", "--resume", "other-session"],
                              [f"/opt/{harness}", "--resume", "ses-A", "\0bad"],
                              [f"/opt/{harness}", "--resume", "ses-A", "x" * 8192]):
                 with self.subTest(harness=harness, argv=bad_argv[:3]):
@@ -493,7 +479,7 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
 
     def test_native_session_reporters_refuse_worker_and_mismatched_codex_identity(self):
         for harness, launch in (("claude", ["claude", "--resume", "ses-A"]),
-                                ("codex", ["codex", "--resume", "ses-A"])):
+                                ("codex", ["codex", "resume", "ses-A"])):
             with self.subTest(harness=harness, case="worker"):
                 self.assertIsNone(self._run_hook(harness, {
                     "hook_event_name": "SessionStart", "session_id": "ses-A",
@@ -503,19 +489,19 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
         self.assertIsNone(self._run_hook("codex", {
             "hook_event_name": "SessionStart", "session_id": "ses-A",
             "transcript_path": "/fixture/transcript.jsonl", "source": "resume",
-        }, allowed=True, launch_argv=["codex", "--resume", "ses-A"],
+        }, allowed=True, launch_argv=["codex", "resume", "ses-A"],
             extra_env={"CODEX_THREAD_ID": "other-session"}, expect_report=False))
 
     def test_native_hooks_respect_report_guard_and_omit_unproven_resume_argv(self):
         for harness, launch in (("claude", ["claude", "--resume", "ses-A"]),
-                                ("codex", ["codex", "--resume", "ses-A"])):
+                                ("codex", ["codex", "resume", "ses-A"])):
             with self.subTest(harness=harness, case="non-resume"):
                 request = self._run_hook(harness, {
                     "hook_event_name": "SessionStart", "session_id": "ses-A",
                     "transcript_path": "/fixture/transcript.jsonl", "source": "startup",
                 }, allowed=True, launch_argv=launch)
                 self.assertEqual(request["params"]["session_start_source"], "startup")
-                self.assertNotIn("resume_argv", request["params"])
+                self.assertEqual(request["params"]["resume_argv"], launch)
             with self.subTest(harness=harness, case="unsupported-source-shape"):
                 request = self._run_hook(harness, {
                     "hook_event_name": "SessionStart", "session_id": "ses-A",
@@ -609,17 +595,19 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 const base = process.env.HEARTING_TEST_ASSET_ROOT;
 const backend = await import(pathToFileURL(`${base}/plugins/herdr-agent-state.js`));
-const sid = "ses-A";
+const sid = "B";
+const cases = JSON.parse(fs.readFileSync(process.env.HEARTING_TEST_CASES, "utf8"))
+  .filter((item) => item.harness === "opencode");
 const stat = fs.readFileSync("/proc/self/stat", "utf8");
 const close = stat.lastIndexOf(") ");
 const start = stat.slice(close + 2).trim().split(/\s+/)[19];
-async function capture(index, identitySid, argv, identityStart = start) {
+async function capture(index, identitySid, argv, identityStart = start, startSource = "clear") {
   const state = `${base}/state-${index}`;
   const identityDir = `${state}/hearting/tui-identity`;
   fs.mkdirSync(identityDir, {recursive: true});
   fs.writeFileSync(`${identityDir}/${process.pid}-${start}.json`, JSON.stringify({
     schema: "hearting-tui-selection-v1", sessionID: identitySid, pid: process.pid,
-    start: identityStart, sessionSeq: 1700000000123, sessionStartSource: "resume",
+    start: identityStart, sessionSeq: 1700000000123, sessionStartSource: startSource,
   }));
   const socketPath = `${base}/plugin-${index}.sock`;
   process.env.HERDR_ENV = "1";
@@ -652,30 +640,36 @@ async function capture(index, identitySid, argv, identityStart = start) {
   await new Promise((resolve) => server.close(resolve));
   return {params: request.params, processArgv: process.argv.slice()};
 }
-const validArgv = ["/home/user/.local/bin/opencode", "/opt/opencode-cli.js", "run",
-  "--color", "always", "--resume", sid, "--model", "fixture", "--setting-sources", "user"];
+const validArgv = ["/home/user/.local/bin/opencode", "--session", "A", "--model", "fixture"];
 const valid = await capture(1, sid, validArgv);
-const expectedWireArgv = ["opencode", ...validArgv.slice(1)];
+const expectedWireArgv = ["opencode", "--session", sid, "--model", "fixture"];
 if (JSON.stringify(valid.params.resume_argv) !== JSON.stringify(expectedWireArgv)) throw Error("native wire argv was not canonicalized");
 if (JSON.stringify(valid.processArgv) !== JSON.stringify(validArgv)) throw Error("raw process argv was mutated");
-if (valid.params.agent_session_id !== sid || valid.params.session_start_source !== "resume" || valid.params.seq !== 1700000000123) {
+if (valid.params.agent_session_id !== sid || valid.params.session_start_source !== "clear" || valid.params.seq !== 1700000000123) {
   throw Error("native session metadata changed");
 }
 const rejected = [
-  [sid, ["/usr/bin/env", "opencode", "run", "--resume", sid]],
-  [sid, ["/usr/bin/python3", "/opt/opencode", "run", "--resume", sid]],
-  [sid, ["bin/opencode", "/opt/opencode-cli.js", "run", "--resume", sid]],
-  [sid, ["/opt/opencode", "/opt/opencode-cli.js", "run", "--resume", "other-session"]],
-  [sid, ["/opt/opencode", "/opt/opencode-cli.js", "run", "--resume", sid, "\0bad"]],
-  [sid, ["/opt/opencode", "/opt/opencode-cli.js", "run", "--resume", sid, "x".repeat(8192)]],
-  [sid, ["/opt/opencode", "/opt/opencode-cli.js", "run", ...Array(62).fill("x"), sid]],
+  [sid, ["/usr/bin/env", "opencode", "--session", sid]],
+  [sid, ["/usr/bin/python3", "/opt/opencode", "--session", sid]],
+  [sid, ["bin/opencode", "--session", sid]],
+  [sid, ["/opt/opencode", "--session"]],
+  [sid, ["/opt/opencode", "--session", sid, "\0bad"]],
+  [sid, ["/opt/opencode", "--session", sid, "x".repeat(8192)]],
+  [sid, ["/opt/opencode", ...Array(63).fill("x"), "--session", sid]],
 ];
 for (let index = 0; index < rejected.length; index += 1) {
   const [identitySid, argv] = rejected[index];
   const params = await capture(index + 2, identitySid, argv);
   if ("resume_argv" in params.params) throw Error(`unproven launcher argv accepted at ${index}`);
-  if (params.params.agent_session_id !== sid || params.params.session_start_source !== "resume"
+  if (params.params.agent_session_id !== sid || params.params.session_start_source !== "clear"
       || params.params.seq !== 1700000000123) throw Error(`optional argv erased session identity at ${index}`);
+}
+for (const [index, item] of cases.entries()) {
+  const result = await capture(40 + index, sid, item.argv, start, "startup");
+  if (JSON.stringify(result.params.resume_argv ?? null) !== JSON.stringify(item.expected)) {
+    throw Error(`shared OpenCode case mismatch: ${item.name}`);
+  }
+  if (result.params.session_start_source !== "startup") throw Error(`source gate remained at ${item.name}`);
 }
 const mismatched = await capture(20, "ses-other", validArgv);
 if ("resume_argv" in mismatched.params || "seq" in mismatched.params || "session_start_source" in mismatched.params) {
@@ -697,7 +691,8 @@ console.log("OpenCode state plugin canonicalized bounded proven native argv");
             result = subprocess.run(
                 ["node", "--input-type=module", "-e", script], cwd=ROOT,
                 env={**fixture_env.build_environment(asset_root, ROOT),
-                     "HEARTING_TEST_ASSET_ROOT": str(asset_root)},
+                     "HEARTING_TEST_ASSET_ROOT": str(asset_root),
+                     "HEARTING_TEST_CASES": str(ROOT / "tools/fleet/tests/native_resume_cases.json")},
                 text=True, capture_output=True, timeout=30, check=False,
             )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
@@ -711,7 +706,9 @@ import { pathToFileURL } from "node:url";
 const base = process.env.HEARTING_TEST_ASSET_ROOT;
 const tuiV1 = await import(pathToFileURL(`${base}/herdr-tui-session.js`));
 const tuiV2 = await import(pathToFileURL(`${base}/herdr-opencode/tui.js`));
-const sid = "ses-A";
+const sid = "B";
+const cases = JSON.parse(fs.readFileSync(process.env.HEARTING_TEST_CASES, "utf8"))
+  .filter((item) => item.harness === "opencode");
 const stat = fs.readFileSync("/proc/self/stat", "utf8");
 const close = stat.lastIndexOf(") ");
 const start = stat.slice(close + 2).trim().split(/\s+/)[19];
@@ -725,13 +722,13 @@ const api = {
     listen: () => () => {},
   },
 };
-async function capture(index, identitySid, argv, identityStart = start, entry = tuiV1) {
+async function capture(index, identitySid, argv, identityStart = start, entry = tuiV1, startSource = "clear") {
   const state = `${base}/state-${index}`;
   const identityDir = `${state}/hearting/tui-identity`;
   fs.mkdirSync(identityDir, {recursive: true});
   fs.writeFileSync(`${identityDir}/${process.pid}-${start}.json`, JSON.stringify({
     schema: "hearting-tui-selection-v1", sessionID: identitySid, pid: process.pid,
-    start: identityStart, sessionSeq: 1700000000123000, sessionStartSource: "resume",
+    start: identityStart, sessionSeq: 1700000000123000, sessionStartSource: startSource,
   }));
   const socketPath = `${base}/herdr-${index}.sock`;
   process.env.HERDR_ENV = "1";
@@ -765,30 +762,30 @@ async function capture(index, identitySid, argv, identityStart = start, entry = 
   await new Promise((resolve) => server.close(resolve));
   return {params: request.params, processArgv: process.argv.slice(), reportCount};
 }
-const rawArgv = ["/home/user/.local/bin/opencode", "--resume", sid, "--model", "fixture"];
+const rawArgv = ["/home/user/.local/bin/opencode", "--session", "A", "--model", "fixture"];
 const valid = await capture(1, sid, rawArgv);
 const validV2 = await capture(22, sid, rawArgv, start, tuiV2);
 if (valid.reportCount !== 1 || validV2.reportCount !== 1) throw Error("copied V1/V2 callback count");
-if (validV2.params.agent_session_id !== sid || validV2.params.session_start_source !== "resume") {
+if (validV2.params.agent_session_id !== sid || validV2.params.session_start_source !== "clear") {
   throw Error("copied V2 TUI callback missing");
 }
 const mismatched = await capture(2, "ses-other", rawArgv);
 const changedBirth = await capture(3, sid, rawArgv, "0");
 const invalidArgvs = [
-  ["bin/opencode", "--resume", sid],
-  ["/usr/bin/env", "opencode", "--resume", sid],
-  ["/home/user/.local/bin/opencode", "--resume", "other-session"],
-  ["/home/user/.local/bin/opencode", "--resume", sid, "\0bad"],
-  ["/home/user/.local/bin/opencode", "--resume", sid, "x".repeat(8192)],
-  ["/home/user/.local/bin/opencode", ...Array(64).fill("x"), sid],
+  ["bin/opencode", "--session", sid],
+  ["/usr/bin/env", "opencode", "--session", sid],
+  ["/home/user/.local/bin/opencode", "--session"],
+  ["/home/user/.local/bin/opencode", "--session", sid, "\0bad"],
+  ["/home/user/.local/bin/opencode", "--session", sid, "x".repeat(8192)],
+  ["/home/user/.local/bin/opencode", ...Array(63).fill("x"), "--session", sid],
 ];
 const invalidResults = [];
 for (let index = 0; index < invalidArgvs.length; index += 1) {
   invalidResults.push(await capture(index + 4, sid, invalidArgvs[index]));
 }
 if (valid.params.seq !== 1700000000123000 || valid.params.seq > Number.MAX_SAFE_INTEGER) throw Error("OpenCode seq compatibility");
-if (valid.params.session_start_source !== "resume") throw Error("native OpenCode source missing");
-if (JSON.stringify(valid.params.resume_argv) !== JSON.stringify(["opencode", ...rawArgv.slice(1)])) throw Error("native OpenCode wire argv missing");
+if (valid.params.session_start_source !== "clear") throw Error("native OpenCode source missing");
+if (JSON.stringify(valid.params.resume_argv) !== JSON.stringify(["opencode", "--session", sid, "--model", "fixture"])) throw Error("native OpenCode wire argv missing");
 if (JSON.stringify(valid.processArgv) !== JSON.stringify(rawArgv)) throw Error("TUI mutated its raw argv");
 if (mismatched.params.session_start_source !== "select" || "seq" in mismatched.params || "resume_argv" in mismatched.params
     || "resume_argv" in changedBirth.params) {
@@ -796,8 +793,15 @@ if (mismatched.params.session_start_source !== "select" || "seq" in mismatched.p
 }
 for (const [index, item] of invalidResults.entries()) {
   if ("resume_argv" in item.params) throw Error(`invalid TUI argv accepted at ${index}`);
-  if (item.params.agent_session_id !== sid || item.params.session_start_source !== "resume"
+  if (item.params.agent_session_id !== sid || item.params.session_start_source !== "clear"
       || item.params.seq !== 1700000000123000) throw Error(`optional TUI argv erased session identity at ${index}`);
+}
+for (const [index, item] of cases.entries()) {
+  const result = await capture(40 + index, sid, item.argv, start, tuiV1, "startup");
+  if (JSON.stringify(result.params.resume_argv ?? null) !== JSON.stringify(item.expected)) {
+    throw Error(`shared OpenCode TUI case mismatch: ${item.name}`);
+  }
+  if (result.params.session_start_source !== "startup") throw Error(`TUI source gate remained at ${item.name}`);
 }
 console.log(JSON.stringify({valid: valid.params, mismatched: mismatched.params,
   changedBirth: changedBirth.params, invalid: invalidResults.map(item => item.params)}));
@@ -813,7 +817,8 @@ console.log(JSON.stringify({valid: valid.params, mismatched: mismatched.params,
             result = subprocess.run(
                 ["node", "--input-type=module", "-e", script], cwd=ROOT,
                 env={**fixture_env.build_environment(asset_root, ROOT),
-                     "HEARTING_TEST_ASSET_ROOT": str(asset_root)},
+                     "HEARTING_TEST_ASSET_ROOT": str(asset_root),
+                     "HEARTING_TEST_CASES": str(ROOT / "tools/fleet/tests/native_resume_cases.json")},
                 text=True, capture_output=True, timeout=15, check=False,
             )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)

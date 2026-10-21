@@ -1216,12 +1216,23 @@ def session_start_context(harness: str, sid: str, pane: str, *, endpoint=None) -
         transcript = row.get("transcript")
         if isinstance(transcript, str) and transcript:
             context["transcript"] = transcript
+        wire = None
         resume_argv = row.get("resume_argv")
-        if source in {"resume", "select"} and isinstance(resume_argv, list) and resume_argv:
-            context["resume_argv"] = resume_argv
-        launch_cwd = row.get("launch_cwd")
-        if isinstance(launch_cwd, str) and launch_cwd:
-            context["launch_cwd"] = launch_cwd
+        if isinstance(resume_argv, list) and resume_argv:
+            try:
+                tools = str(Path(__file__).resolve().parents[1] / "tools")
+                if tools not in sys.path:
+                    sys.path.insert(0, tools)
+                from fleet.process_identity import native_resume_wire_argv
+                wire = native_resume_wire_argv(resume_argv, harness, sid)
+                if wire is not None:
+                    context["resume_argv"] = wire
+            except Exception:
+                wire = None
+        if wire is not None:
+            launch_cwd = row.get("launch_cwd")
+            if isinstance(launch_cwd, str) and launch_cwd:
+                context["launch_cwd"] = launch_cwd
         return context
     return {}
 
@@ -1246,13 +1257,17 @@ def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str 
         entry["source"] = source
     if event == "start" and source in {"startup", "resume", "select", "clear", "compact", "fork"}:
         entry["session_seq"] = max(1, int(now * 1_000_000))
-    if event == "start" and source in {"resume", "select"} and isinstance(resume_argv, list):
-        valid = (resume_argv and len(resume_argv) <= 64
-                 and resume_argv[0] in {"claude", "codex", "opencode"}
-                 and sid in resume_argv
-                 and all(isinstance(arg, str) and arg and "\0" not in arg for arg in resume_argv))
-        if valid and sum(len(arg.encode("utf-8", "surrogatepass")) for arg in resume_argv) <= 8192:
-            entry["resume_argv"] = list(resume_argv)
+    if event == "start" and isinstance(resume_argv, list):
+        try:
+            tools = str(Path(__file__).resolve().parents[1] / "tools")
+            if tools not in sys.path:
+                sys.path.insert(0, tools)
+            from fleet.process_identity import native_resume_wire_argv
+            wire = native_resume_wire_argv(resume_argv, harness, sid)
+        except Exception:
+            wire = None
+        if wire is not None:
+            entry["resume_argv"] = wire
             if isinstance(launch_cwd, str) and launch_cwd.startswith("/"):
                 entry["launch_cwd"] = launch_cwd
     if transcript:
@@ -1967,13 +1982,16 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         compacting = (event == "compact" or source == "compact") and not (
             prior and now - prior["last_compact_at"] < COMPACT_DEDUPE_SEC)
         launch = None
-        if event == "start" and source == "resume":
+        if event == "start" and source in {"startup", "resume", "select", "clear", "compact", "fork"}:
             try:
                 tools = str(Path(__file__).resolve().parents[1] / "tools")
                 if tools not in sys.path:
                     sys.path.insert(0, tools)
-                from fleet.process_identity import current_launch_context
+                from fleet.process_identity import current_launch_context, native_resume_wire_argv
                 launch = current_launch_context(harness, sid)
+                wire = native_resume_wire_argv((launch or {}).get("argv"), harness, sid)
+                if launch:
+                    launch = {**launch, "argv": wire}
             except Exception:
                 launch = None
         row = record_event(seat, harness, sid, event, source=source, transcript=transcript,

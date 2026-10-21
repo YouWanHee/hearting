@@ -2730,12 +2730,17 @@ Pane-scoped session history is keyed by the concrete Herdr socket when one is
 known, not by pane label alone. The OpenCode TUI selection record carries its
 native sequence and observed start source for the Python CLI projection and
 the state-plugin socket projection. Local launch/history metadata retains the
-process-proven executable and raw argv unchanged. The optional native
-`resume_argv` uses the proven harness executable as a plain command name and
-copies every remaining argument unchanged, only when the current native SID
-and foreground PID birth prove that launcher. Foreign executables, unsupported
-wrappers, relative paths, malformed argv, or mismatched current identity omit
-that optional field while retaining a valid session-only report. Absent transcript, cwd,
+process-proven executable and raw argv unchanged. On every accepted native
+session start or selection, re-report a proven by-id launch command for the
+current native SID. Preserve its unambiguous options while replacing only the
+session selector value. Fork selectors, ambiguous selectors, or positional
+prompts use Herdr's canonical resume form. Launches without an explicit
+session selector omit the field. The optional native `resume_argv` uses the
+proven harness executable as a plain command name; native identity and
+foreground PID birth must still prove that launcher. Foreign executables,
+unsupported wrappers, relative paths, malformed argv, or mismatched native
+identity omit that optional field while retaining a valid session-only report.
+Absent transcript, cwd,
 model, permission, or argv evidence stays omitted. The wire argv restores a
 session and grants no execution or owner authority. Clear checks OpenCode's
 current process-bound selection before using the pane record, and an older
