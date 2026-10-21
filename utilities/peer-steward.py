@@ -5634,7 +5634,7 @@ def _watch_transition_authority_lock(identity, server, *, deadline=None):
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     jobs_locked = False
     try:
-        while True:
+        while time.monotonic() < transition_deadline:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 jobs_locked = True
@@ -5645,8 +5645,12 @@ def _watch_transition_authority_lock(identity, server, *, deadline=None):
                     raise _WatchDeadlineExpired("watch-deadline") from exc
                 remaining = transition_deadline - now
                 if remaining <= 0:
-                    raise _WatchTransitionLockBusy("jobs-lock-busy") from exc
+                    break
                 time.sleep(min(0.05, remaining))
+        if not jobs_locked:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _WatchDeadlineExpired("watch-deadline")
+            raise _WatchTransitionLockBusy("jobs-lock-busy")
         now = time.monotonic()
         if deadline is not None and now >= deadline:
             raise _WatchDeadlineExpired("watch-deadline")
