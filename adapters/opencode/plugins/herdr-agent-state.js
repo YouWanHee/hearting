@@ -99,16 +99,13 @@ function stateFromSessionStatus(status) {
     : undefined;
 }
 
-function isNativeResumeArgv(argv, sessionID) {
-  if (!Array.isArray(argv) || argv.length === 0 || argv.length > 64) return false;
-  if (argv.some((arg) => typeof arg !== "string" || !arg || arg.includes("\0"))) return false;
-  if (argv.reduce((bytes, arg) => bytes + Buffer.byteLength(arg, "utf8"), 0) > 8192) return false;
-  const executable = argv[0];
-  return executable === AGENT || path.isAbsolute(executable) && path.basename(executable) === AGENT;
-}
-
 function nativeResumeWireArgv(argv, sessionID) {
-  if (!isNativeResumeArgv(argv, sessionID) || typeof sessionID !== "string" || !sessionID || sessionID.includes("\0")) return null;
+  if (!Array.isArray(argv) || argv.length === 0 || argv.length > 64
+      || argv.some((arg) => typeof arg !== "string" || !arg || arg.includes("\0"))
+      || argv.reduce((bytes, arg) => bytes + Buffer.byteLength(arg, "utf8"), 0) > 8192) return null;
+  const executable = argv[0];
+  if (executable !== AGENT && !(path.isAbsolute(executable) && path.basename(executable) === AGENT)) return null;
+  if (typeof sessionID !== "string" || !sessionID || sessionID.includes("\0")) return null;
   if (Buffer.byteLength(sessionID, "utf8") + Buffer.byteLength("opencode--session", "utf8") > 8192) return null;
   const args = argv.slice(1), found = [];
   const values = new Set(["--model", "-m", "--agent", "--variant", "--format", "--dir", "-D"]);
