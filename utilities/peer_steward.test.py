@@ -11025,6 +11025,84 @@ class NativeDispatchReceiptTest(unittest.TestCase):
             send.assert_not_called()
             self.assertEqual(store.get(duty["id"])["state"], "pending")
 
+    def test_registered_peer_courier_binds_projected_completion_to_its_stored_identity(self):
+        from types import SimpleNamespace
+        import dispatch_pending_delivery as pending
+        import dispatch_session_sweep as sweep
+
+        with tempfile.TemporaryDirectory(prefix="peer-native-projected-") as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs.log"
+            jobs.touch()
+            attempt, sid = "att-peer-projected", "claude-peer-session"
+            carrier = "claude-parent-runtime"
+            did = "delivery-" + "b" * 32
+            receipt = {"schema_version": 2, "state": "delivered", "job_registry": str(jobs),
+                       "parent_attempt_id": "att-parent", "delivery_classification": "attention",
+                       "children": [{"attempt_id": attempt, "status": "done", "readiness": "ready",
+                                     "reason": "terminal-failure-or-unclosed",
+                                     "required_action": "inspect-done-failure",
+                                     "delivery_classification": "attention"}]}
+            stored = pending.create(
+                root, recipient_kind=carrier, recipient_key=sid, delivery_id=did,
+                session_generation="", session_generation_supported="0",
+                attempt_ids=[attempt], parent_attempt_id="att-parent",
+                route_id="route-projected", route_node="execute", receipt=receipt,
+                receipt_digest=pending._canonical_receipt_digest(receipt),
+                row_revisions={attempt: "revision-projected"})
+            metadata = {"parent_sid": sid, "parent_harness": "claude",
+                        "parent_completion_delivery": carrier, "delivery_intent": "1",
+                        "delivery_id": did, "delivery_receipt_digest": stored["receipt_digest"],
+                        "delivery_row_revision": "revision-projected",
+                        "route_id": "route-projected", "route_node": "execute"}
+            row = SimpleNamespace(status="done", attempt_id=attempt, metadata=metadata)
+            store = peer_steward.peer_obligations.ObligationStore(root)
+            identity = {"jobs": str(jobs), "attempt_id": attempt, "session_id": sid,
+                        "harness": "claude", "server": "default"}
+            duty = store.create("registered-batch-projected-" + "b" * 20,
+                                "registered-batch", identity, {"carrier": carrier})
+            owner = "retained-rewake:" + duty["id"]
+
+            def project(_root, _recipient, _delivery_id, record, _owner, jobs=None):
+                record["receipt"] = dict(record["receipt"], delivery_classification="success",
+                    children=[dict(child, reason="cancelled-by-parent",
+                                   required_action="advance-completed",
+                                   delivery_classification="success")
+                              for child in record["receipt"]["children"]])
+                return True
+
+            agents = {"result": {"agents": [{"agent": "claude", "pane_id": "w1:p9",
+                      "agent_session": {"value": sid}}]}}
+            with mock.patch("dispatch_completion_join.current_attempt_row", return_value=row), \
+                 mock.patch("dispatch_completion_join.materialize_after_terminal_close"), \
+                 mock.patch("dispatch_seat_handover.effective_parent", return_value=sid), \
+                 mock.patch("dispatch_seat_handover.effective_parent_harness", return_value="claude"), \
+                 mock.patch.object(pending, "claim", return_value=dict(
+                     stored, state="claimed", claim_owner=owner, attempts=1)), \
+                 mock.patch.object(pending, "mark_sent_ambiguous"), \
+                 mock.patch.object(pending, "release_claim"), \
+                 mock.patch("dispatch_notice_state.keep_claim", side_effect=project), \
+                 mock.patch("dispatch_supervision.continue_for_parent", return_value=None), \
+                 mock.patch.object(peer_steward, "_settle_claude_native_dispatch_receipt",
+                                   return_value=False) as received, \
+                 mock.patch.object(sweep, "delivery_context", return_value="body") as render, \
+                 mock.patch.object(peer_steward.peer_message, "_valid_runtime_producer_binding",
+                                   return_value=True), \
+                 mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
+                     stdout=json.dumps(agents), returncode=0)), \
+                 mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", sid)), \
+                 mock.patch.object(peer_steward, "cmd_prompt", return_value=0) as send:
+                peer_steward._resume_registered_obligation(store.get(duty["id"]), store)
+            send.assert_called_once()
+            # Receipt evidence is checked against the stored record before and after the claim.
+            self.assertEqual([call.args[4]["receipt"] for call in received.call_args_list],
+                             [receipt, receipt])
+            (rendered,) = render.call_args.args[0][0][1]
+            self.assertEqual(rendered["receipt"]["children"][0]["required_action"],
+                             "advance-completed")
+            self.assertEqual(rendered[sweep.IDENTITY_KEY],
+                             pending.received_ack_identity(stored, sid, did))
+
 
 class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
     def setUp(self):

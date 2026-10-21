@@ -28,6 +28,9 @@ LEGACY_COMPLETION_RE = re.compile(
     r"marker_current=1 quiescent=[01] owned_children=\d+ advanced=[01] "
     r"reason=([^\s]+) required_action=([^\s.]+)\."
 )
+# Added to a carrier's in-memory copy only: the stored immutable identity
+# behind a view whose receipt the carrier projected (e.g. a settled parent close).
+IDENTITY_KEY = "_immutable_identity"
 SOURCE_BY_HARNESS = {
     "claude": "claude-transcript",
     "codex": "codex-native-queue",
@@ -53,7 +56,14 @@ def identity_binding(identity: dict) -> str:
 
 
 def receipt_marker(record: dict, storage_recipient: str) -> str:
-    """A transport annotation outside the canonical receipt payload."""
+    """A transport annotation outside the canonical receipt payload.
+
+    A carrier view whose receipt was projected in memory carries the stored
+    identity under ``IDENTITY_KEY``; the marker binds that identity.
+    """
+    identity = record.get(IDENTITY_KEY)
+    if isinstance(identity, dict) and identity.get("delivery_id") == record["delivery_id"]:
+        return receipt_marker_for_identity(record["delivery_id"], identity)
     return (f"HEARTING_RECEIPT_V1 {record['delivery_id']} "
             f"{binding_digest(record, storage_recipient)}")
 

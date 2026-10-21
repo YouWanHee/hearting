@@ -346,6 +346,15 @@ def _receipt(**overrides):
     return base
 
 
+def _project_settled_close(root, record, *, jobs=None):
+    """Stand-in for a settled parent close: the carrier's in-memory view only."""
+    receipt = record.get("receipt") or {}
+    children = [dict(child, status="done", readiness="ready", reason="cancelled-by-parent",
+                     required_action="advance-completed", delivery_classification="success")
+                for child in receipt.get("children", [])]
+    record["receipt"] = dict(receipt, children=children, delivery_classification="success")
+
+
 class SweepTest(IsolatedRootMixin, unittest.TestCase):
     def test_worker_hook_flushes_and_acks_before_requesting_global_recovery(self):
         self._seed()
@@ -419,6 +428,44 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(output.getvalue(), "")
         exact = PD.read(self.root, "sess-owner", did)
         self.assertEqual((exact["state"], exact["attempts"]), ("acked", 1))
+
+    def test_projected_parent_close_completion_is_delivered_with_its_stored_binding(self):
+        import dispatch_recipient_receipt as recipient_receipt
+        self._seed()
+        did = "delivery-" + "a" * 32
+        stored = PD.read(self.root, "sess-owner", did)
+        with mock.patch("dispatch_notice_state.project_parent_close",
+                        side_effect=_project_settled_close):
+            records, _ = SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-owner")
+        self.assertEqual(len(records), 1)
+        claimed = PD.read(self.root, "sess-owner", did)
+        self.assertEqual(claimed["receipt"], stored["receipt"])
+        self.assertEqual(records[0][SWEEP.IDENTITY_KEY],
+                         PD.received_ack_identity(claimed, "sess-owner", did))
+        text = SWEEP.delivery_context([(self.root, records)])
+        self.assertIn("required_action=advance-completed", text)
+        self.assertNotIn("inspect-done-failure", text)
+        # The prompt carrier marks the same binding the rewake carrier renders
+        # from the stored record, so either carrier's receipt settles the other.
+        self.assertIn("\n" + recipient_receipt.receipt_marker(claimed, "sess-owner"), text)
+
+    def test_prompt_carrier_delivers_and_acks_a_projected_parent_close_completion(self):
+        import dispatch_recipient_receipt as recipient_receipt
+        self._seed()
+        did = "delivery-" + "a" * 32
+        output = io.StringIO()
+        with mock.patch.object(HOOK, "resolve_agent_home", return_value=ROOT), \
+             mock.patch.object(HOOK, "dispatch_state_roots", return_value=(self.root,)), \
+             mock.patch("dispatch_notice_state.project_parent_close",
+                        side_effect=_project_settled_close), \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(HOOK._process_session(
+                {"hook_event_name": "UserPromptSubmit", "cwd": str(ROOT)}, "sess-owner"), 0)
+        context = json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("required_action=advance-completed", context)
+        acked = PD.read(self.root, "sess-owner", did)
+        self.assertEqual(acked["state"], "acked")
+        self.assertIn("\n" + recipient_receipt.receipt_marker(acked, "sess-owner"), context)
 
     def _seed(self, session_id="sess-owner", **overrides):
         receipt = overrides.pop("receipt", _receipt())
@@ -1498,6 +1545,54 @@ console.log(JSON.stringify({carrierEnv: globalThis.carrierEnv}));
         self.assertEqual(result["text"], "")
         self.assertEqual(PD.read(self.root, self.SID, did)["state"], "acked")
         self.assertEqual(PD.read(self.root, self.SID, did)["attempts"], 2)
+
+    def deliver_in_process(self, messages=None):
+        output = io.StringIO()
+        with mock.patch.object(SWEEP, "_state_roots", return_value=[self.root]), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"messages": messages or []}))), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(SWEEP.main([
+                "deliver", "--recipient-kind", "opencode-turn", "--session", self.SID,
+            ]), 0)
+        return json.loads(output.getvalue())
+
+    def test_projected_parent_close_body_survives_settle_and_its_native_receipt_settles(self):
+        self.seed_turn()
+        did = "delivery-" + "a" * 32
+        with mock.patch("dispatch_notice_state.project_parent_close",
+                        side_effect=_project_settled_close):
+            delivered = self.deliver_in_process()
+            self.assertEqual(len(delivered["records"]), 1)
+            claimed = PD.read(self.root, self.SID, did)
+            self.assertEqual(delivered["records"][0]["immutable_identity"],
+                             PD.received_ack_identity(claimed, self.SID, did))
+            self.assertIn("required_action=advance-completed", delivered["text"])
+            self.assertNotIn("inspect-done-failure", delivered["text"])
+            # No native receipt yet: the body re-rendered for the send is the same projected body.
+            before_send = self.settle_at(delivered, time.monotonic_ns())
+            self.assertEqual(before_send["text"], delivered["text"])
+            native = [{"info": {"sessionID": self.SID, "role": "user"},
+                       "parts": [{"type": "text", "text": before_send["text"]}]}]
+            observed = self.settle_at(before_send, time.monotonic_ns(), messages=native)
+        self.assertEqual(observed["received_ids"], [did])
+        self.assertEqual(self.state(), "acked")
+
+    def test_projected_historical_body_is_recognized_before_a_second_claim_sends(self):
+        self.seed_turn()
+        did = "delivery-" + "a" * 32
+        with mock.patch("dispatch_notice_state.project_parent_close",
+                        side_effect=_project_settled_close):
+            first_body = self.deliver_in_process()["text"]
+            self.assertIn("required_action=advance-completed", first_body)
+            self._expire_ambiguous([did])
+            PD.claim(self.root, self.SID, did, claim_owner="second-carrier",
+                     lease_seconds=30, require_generation_proof=False)
+            native = [{"info": {"sessionID": self.SID, "role": "user"},
+                       "parts": [{"type": "text", "text": first_body}]}]
+            result = self.deliver_in_process(messages=native)
+        self.assertEqual(result["records"], [])
+        current = PD.read(self.root, self.SID, did)
+        self.assertEqual((current["state"], current["attempts"]), ("acked", 2))
 
     def test_late_first_claim_receipt_settles_before_second_claim_prompt_async(self):
         self.seed_turn()

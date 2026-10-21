@@ -29,6 +29,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
+from dispatch_recipient_receipt import IDENTITY_KEY  # noqa: E402
 
 SWEEP_LEASE_SECONDS = 30.0
 LOG_FILENAME = "dispatch-session-sweep.log"
@@ -215,6 +216,22 @@ def activate(root: Path, recipient_kind: str, session_id: str, *,
     return records
 
 
+def carrier_view(root: Path, record: dict, storage_key: str, identity: dict) -> dict:
+    """The bound in-memory copy a carrier renders for one stored record.
+
+    The same parent-close projection as the original claim applies, so a
+    re-rendered or reconstructed body matches what that claim sent. An
+    unreadable registry keeps the stored view; a pending close still raises.
+    """
+    from dispatch_notice_state import project_parent_close
+    view = {**record, STORAGE_KEY: storage_key, IDENTITY_KEY: identity}
+    try:
+        project_parent_close(root, view, jobs=record_jobs(root, record))
+    except (OSError, ValueError):
+        pass
+    return view
+
+
 def _reconcile_canonical_dispatch_state(root: Path) -> None:
     """Request recovery without putting global settlement ahead of delivery."""
     try:
@@ -388,6 +405,10 @@ def sweep_deliver(
             )
         except pending_delivery.PendingDeliveryError:
             continue
+        # The stored identity, taken before keep_claim may project the
+        # carrier's in-memory receipt view.
+        expected_identity = pending_delivery.received_ack_identity(
+            record, storage_key, delivery_id)
         from dispatch_notice_state import keep_claim
         try:
             if not keep_claim(root, storage_key, delivery_id, record, claim_owner, jobs=jobs):
@@ -397,8 +418,6 @@ def sweep_deliver(
         # Native reads are outside the record lock. Recheck both immutable
         # identity and claim ownership after that read, immediately before this
         # carrier returns context for output.
-        expected_identity = pending_delivery.received_ack_identity(
-            record, storage_key, delivery_id)
         fresh = pending_delivery.read(root, storage_key, delivery_id)
         if (fresh is None or pending_delivery.received_ack_identity(
                 fresh, storage_key, delivery_id) != expected_identity
@@ -413,8 +432,9 @@ def sweep_deliver(
             continue
         # An answer another session sent: this session is the parent, so its carrier continues the route.
         from dispatch_supervision import CONTINUED_KEY, continue_for_parent
-        continued = continue_for_parent(final, session_id=session_id, recipient_kind=recipient_kind)
-        claimed.append({**final, STORAGE_KEY: storage_key, **({CONTINUED_KEY: continued} if continued else {})})
+        continued = continue_for_parent(record, session_id=session_id, recipient_kind=recipient_kind)
+        claimed.append({**record, STORAGE_KEY: storage_key, IDENTITY_KEY: expected_identity,
+                        **({CONTINUED_KEY: continued} if continued else {})})
     elapsed_ns = time.monotonic_ns() - start_ns
     _append_self_instrumentation(root, elapsed_ns, entry_count, len(claimed))
     return claimed, entry_count
@@ -668,8 +688,13 @@ def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
             if historical_attempts is None:
                 valid = False
                 break
-            rendered_record = (record if historical_attempts == record.get("attempts")
-                               else {**record, "attempts": historical_attempts})
+            try:
+                rendered_record = carrier_view(
+                    root, {**record, "attempts": historical_attempts},
+                    record.get(STORAGE_KEY) or session_id, identity)
+            except (OSError, ValueError, RuntimeError):
+                valid = False
+                break
             selected.append((root, rendered_record))
             identities.append((delivery_id, identity))
         if not valid:
@@ -910,9 +935,14 @@ def main(argv: list[str] | None = None) -> int:
                             or claim_deadline_ns <= time.monotonic_ns()):
                         unknown_ids.add(delivery_id)
                         continue
+                    try:
+                        view = carrier_view(root, fresh, storage, original_identity)
+                    except (OSError, ValueError, RuntimeError):
+                        unknown_ids.add(delivery_id)
+                        continue
                     item = dict(handed_record or {})
                     item.update(root=str(root), storage_key=storage, delivery_id=delivery_id)
-                    remaining_context.append((root, [{**fresh, STORAGE_KEY: storage}]))
+                    remaining_context.append((root, [view]))
                     remaining_handoffs.append(item)
             except (OSError, KeyError, TypeError, pending_delivery.PendingDeliveryError):
                 if isinstance(requested, list) and isinstance(handed_record, dict):
@@ -950,7 +980,8 @@ def main(argv: list[str] | None = None) -> int:
             "text": delivery_context(batches),
             "records": [{"root": str(root), "storage_key": record.get(STORAGE_KEY) or args.session,
                          "delivery_id": record["delivery_id"], "claim_owner": record.get("claim_owner"),
-                         "immutable_identity": pending_delivery.received_ack_identity(
+                         "immutable_identity": record.get(IDENTITY_KEY)
+                         or pending_delivery.received_ack_identity(
                              record, record.get(STORAGE_KEY) or args.session, record["delivery_id"])}
                         for root, records in batches for record in records],
         }, ensure_ascii=False), flush=True)

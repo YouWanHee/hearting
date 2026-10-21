@@ -6959,7 +6959,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
     import dispatch_pending_delivery as pending
     from dispatch_seat_handover import effective_parent, effective_parent_harness
     from dispatch_session_sweep import (
-        STORAGE_KEY, addressed_records, delivery_context, is_human_gate_record,
+        IDENTITY_KEY, STORAGE_KEY, addressed_records, delivery_context, is_human_gate_record,
     )
     spec = importlib.util.spec_from_file_location(
         "_retained_rewake", _UTILITIES_DIR.parent / "hooks/dispatch-owner-rewake.py")
@@ -7128,16 +7128,24 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                                claim_owner=owner, lease_seconds=30, require_generation_proof=False,
                                jobs=jobs,
                                retry_context=f"{recipient_harness}:{recipient_sid}:{pane}:{duty['id']}")
+        # keep_claim may project the in-memory receipt; receipt evidence and
+        # the rendered marker stay bound to the stored record.
+        stored = dict(record)
         if not keep_claim(jobs.parent, storage_recipient, delivery_id, record, owner, jobs=jobs):
             return
         if (recipient_harness == "claude"
                 and _settle_claude_native_dispatch_receipt(
-                    jobs.parent, storage_recipient, row, recipient_sid, record)):
+                    jobs.parent, storage_recipient, row, recipient_sid, stored)):
             return
         from dispatch_supervision import CONTINUED_KEY, continue_for_parent
         continued = continue_for_parent(record, session_id=recipient_sid,
                                         recipient_kind=intent["carrier"])
-        context_record = {**record, STORAGE_KEY: storage_recipient,
+        try:
+            bound = {IDENTITY_KEY: pending.received_ack_identity(
+                stored, storage_recipient, delivery_id)}
+        except pending.PendingDeliveryError:
+            bound = {}  # Sent without a marker; its receipt stays on the fallback path.
+        context_record = {**record, STORAGE_KEY: storage_recipient, **bound,
                           **({CONTINUED_KEY: continued} if continued else {})}
         message = delivery_context([(jobs.parent, [context_record])])
         producer_binding = {
