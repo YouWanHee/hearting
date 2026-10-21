@@ -316,6 +316,8 @@ def linked_resources(route, path, jobs, attempts, *, all_known=False):
         config = compute.load_config()
     except compute.ConfigError:
         return result
+    if compute._namespace_self(config):
+        return result
     for meta_path in config["run_root"].glob("*/meta.json"):
         try:
             meta = json.loads(meta_path.read_text())
