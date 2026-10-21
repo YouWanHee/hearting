@@ -6906,6 +6906,45 @@ def _native_continuation_message(*, thread_id, turn_id, source_turn_id,
     return bounded
 
 
+def _settle_claude_native_dispatch_receipt(root, storage_recipient, row,
+                                          recipient_sid, record) -> bool:
+    """Reuse only the exact Claude transcript bound to the registered cwd."""
+    cwd = row.metadata.get("parent_cwd")
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return False
+    runtime_home = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    try:
+        from claude_project_dir import resolve_session_transcript
+        from dispatch_recipient_receipt import (
+            claude_transcript_evidence, legacy_claude_receipt_bindings,
+            settle_native_receipt,
+        )
+        transcript, _reason = resolve_session_transcript(
+            recipient_sid, cwd, expected_cwd=cwd, runtime_home=runtime_home)
+        if transcript is None:
+            return False
+        evidence = claude_transcript_evidence(
+            transcript_path=transcript, session_id=recipient_sid, cwd=cwd,
+            expected_cwd=cwd, runtime_home=runtime_home)
+        if evidence is not None:
+            from dispatch_session_sweep import addressed_records
+            candidates, _count = addressed_records(
+                Path(root), record.get("recipient_kind", ""), recipient_sid)
+            legacy = legacy_claude_receipt_bindings(
+                root, record.get("recipient_kind", ""), recipient_sid,
+                candidates, evidence)
+            binding = legacy.get((storage_recipient, record.get("delivery_id")))
+            if binding is not None:
+                evidence = {**evidence,
+                            "bindings": [*(evidence.get("bindings") or []), binding]}
+        outcome = settle_native_receipt(
+            root, storage_recipient, "claude", recipient_sid, record, evidence,
+            acked_by=f"native-receipt:claude:{recipient_sid}")
+        return bool(outcome.get("received"))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _resume_registered_obligation(duty, store, *, read_context=None):
     """Wake an exact restored recipient through the existing durable peer courier."""
     intent = duty.get("intent") or {}
@@ -6919,7 +6958,9 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
     from dispatch_notice_state import keep_claim
     import dispatch_pending_delivery as pending
     from dispatch_seat_handover import effective_parent, effective_parent_harness
-    from dispatch_session_sweep import addressed_records, delivery_context, is_human_gate_record
+    from dispatch_session_sweep import (
+        IDENTITY_KEY, STORAGE_KEY, addressed_records, delivery_context, is_human_gate_record,
+    )
     spec = importlib.util.spec_from_file_location(
         "_retained_rewake", _UTILITIES_DIR.parent / "hooks/dispatch-owner-rewake.py")
     rewake = sys.modules.get(spec.name)
@@ -7069,6 +7110,10 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                 return
             storage_recipient = record.get("_storage_key") or storage_recipient
             delivery_id = record["delivery_id"]
+        if (record and recipient_harness == "claude"
+                and _settle_claude_native_dispatch_receipt(
+                    jobs.parent, storage_recipient, row, recipient_sid, record)):
+            return
         # Read-pass snapshots save parsing only. The exact identity and
         # recipient are read again immediately before claiming the delivery.
         fresh_row = fresh_recipient_row()
@@ -7083,13 +7128,26 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                                claim_owner=owner, lease_seconds=30, require_generation_proof=False,
                                jobs=jobs,
                                retry_context=f"{recipient_harness}:{recipient_sid}:{pane}:{duty['id']}")
+        # keep_claim may project the in-memory receipt; receipt evidence and
+        # the rendered marker stay bound to the stored record.
+        stored = dict(record)
         if not keep_claim(jobs.parent, storage_recipient, delivery_id, record, owner, jobs=jobs):
+            return
+        if (recipient_harness == "claude"
+                and _settle_claude_native_dispatch_receipt(
+                    jobs.parent, storage_recipient, row, recipient_sid, stored)):
             return
         from dispatch_supervision import CONTINUED_KEY, continue_for_parent
         continued = continue_for_parent(record, session_id=recipient_sid,
                                         recipient_kind=intent["carrier"])
-        message = delivery_context([(jobs.parent, [{**record, **(
-            {CONTINUED_KEY: continued} if continued else {})}])])
+        try:
+            bound = {IDENTITY_KEY: pending.received_ack_identity(
+                stored, storage_recipient, delivery_id)}
+        except pending.PendingDeliveryError:
+            bound = {}  # Sent without a marker; its receipt stays on the fallback path.
+        context_record = {**record, STORAGE_KEY: storage_recipient, **bound,
+                          **({CONTINUED_KEY: continued} if continued else {})}
+        message = delivery_context([(jobs.parent, [context_record])])
         producer_binding = {
             "schema": peer_message._RUNTIME_PRODUCER_SCHEMA,
             "duty_id": duty["id"], "jobs": str(jobs), "attempt_id": row.attempt_id,

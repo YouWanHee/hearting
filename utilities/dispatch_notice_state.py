@@ -363,6 +363,40 @@ def notice_is_current(record: dict, *, jobs: Path | None = None) -> bool:
     return current
 
 
+def project_parent_close(root, record, *, jobs=None) -> None:
+    """Show children whose parent-requested close settled as completed.
+
+    Only the carrier's in-memory view changes. The stored receipt,
+    identity/digest, lease and replay remain the original record. Raises
+    CompletionDeferred while that close is still terminating.
+    """
+    from dispatch_completion_join import CompletionDeferred
+    receipt = record.get("receipt") or {}
+    if receipt.get("kind") in {"human-gate", "supervision", "notice"}:
+        return
+    jobs = Path(receipt.get("job_registry") or jobs or Path(root) / "jobs.log")
+    from dispatch_supervision import _rows
+    import route_parent_close
+    rows = _rows(jobs)
+    children = []
+    projected = False
+    for child in receipt.get("children", []):
+        row = rows.get(child.get("attempt_id"))
+        settled = route_parent_close.cancellation_settled(row[1], jobs) if row else None
+        if settled is False:
+            raise CompletionDeferred("termination-pending")
+        if settled is True:
+            projected = True
+            child = dict(child, status="done", readiness="ready", reason="cancelled-by-parent",
+                         required_action="advance-completed", delivery_classification="success")
+            child.pop("next_leg", None)
+        children.append(child)
+    if projected:
+        record["receipt"] = dict(receipt, children=children,
+            delivery_classification=("attention" if any(c.get("delivery_classification") == "attention"
+                for c in children) else "success"))
+
+
 def keep_claim(root, recipient, delivery_id, record, claim_owner, *, jobs=None) -> bool:
     """Retire only proven obsolete notices; unknown evidence stays recoverable."""
     import dispatch_pending_delivery as pending
@@ -370,30 +404,7 @@ def keep_claim(root, recipient, delivery_id, record, claim_owner, *, jobs=None) 
     jobs = Path((record.get("receipt") or {}).get("job_registry") or jobs or Path(root) / "jobs.log")
     try:
         if notice_is_current(record, jobs=jobs):
-            # Only the carrier's in-memory view changes. The stored receipt,
-            # identity/digest, lease and replay remain the original record.
-            receipt = record.get("receipt") or {}
-            if receipt.get("kind") not in {"human-gate", "supervision", "notice"}:
-                from dispatch_supervision import _rows
-                import route_parent_close
-                rows = _rows(jobs)
-                children = []
-                projected = False
-                for child in receipt.get("children", []):
-                    row = rows.get(child.get("attempt_id"))
-                    settled = route_parent_close.cancellation_settled(row[1], jobs) if row else None
-                    if settled is False:
-                        raise CompletionDeferred("termination-pending")
-                    if settled is True:
-                        projected = True
-                        child = dict(child, status="done", readiness="ready", reason="cancelled-by-parent",
-                                     required_action="advance-completed", delivery_classification="success")
-                        child.pop("next_leg", None)
-                    children.append(child)
-                if projected:
-                    record["receipt"] = dict(receipt, children=children,
-                        delivery_classification=("attention" if any(c.get("delivery_classification") == "attention"
-                            for c in children) else "success"))
+            project_parent_close(root, record, jobs=jobs)
             return True
         pending.reject_claimed(root, recipient, delivery_id, claim_owner=claim_owner,
                                reason=("supervision-resolved" if record.get("receipt", {}).get("kind") == "supervision"
