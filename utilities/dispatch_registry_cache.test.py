@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 from pathlib import Path
 import sys
@@ -454,6 +455,79 @@ class RegistryLinesCacheTest(unittest.TestCase):
         first = CACHE.registry_lines(self.jobs)
         second = CACHE.registry_lines(other)
         self.assertNotEqual(first, second)
+
+    def test_scoped_full_observation_reuses_verified_prefix_after_append_growth(self):
+        original = b"a\topen\t/repo\t/wt\towner\tf=1\n"
+        suffix = b"b\topen\t/repo\t/wt\towner\tf=2\n"
+        self.jobs.write_bytes(original)
+        first = CACHE.registry_view(self.jobs)
+        first_record = first.records[0]
+
+        with CACHE.registry_read_scope():
+            pinned = CACHE.current_registry_view(self.jobs)
+            with self.jobs.open("ab") as stream:
+                stream.write(suffix)
+            self.assertIs(CACHE.current_registry_view(self.jobs), pinned)
+
+        with CACHE.registry_read_scope():
+            second = CACHE.current_registry_view(self.jobs)
+
+        self.assertIsNot(first, second)
+        self.assertIs(first._segments[0], second._segments[0])
+        self.assertIs(first_record, second.records[0])
+        self.assertEqual(second.lines, (original[:-1].decode(), suffix[:-1].decode()))
+        self.assertEqual(CACHE.metrics_snapshot()["delta_reads"], 1)
+        self.assertEqual(CACHE.metrics_snapshot()["metadata_rows_parsed"], 2)
+
+    def test_scoped_full_observation_rebuilds_on_prefix_rewrite_or_rotation(self):
+        self.jobs.write_bytes(b"a\topen\t/repo\t/wt\towner\tf=1\n")
+        first = CACHE.registry_view(self.jobs)
+        self.jobs.write_bytes(b"x\topen\t/repo\t/wt\towner\tf=1\ny\topen\t/repo\t/wt\towner\tf=2\n")
+
+        with CACHE.registry_read_scope():
+            second = CACHE.current_registry_view(self.jobs)
+
+        self.assertIsNot(first, second)
+        self.assertIsNot(first._segments[0], second._segments[0])
+        self.assertEqual(second.lines[0].split("\t", 1)[0], "x")
+        self.assertEqual(CACHE.metrics_snapshot()["delta_reads"], 0)
+
+    def test_fresh_full_rebuild_releases_cache_only_view_before_parsing(self):
+        self.jobs.write_bytes(b"a\topen\t/repo\t/wt\towner\tf=1\n")
+        CACHE.registry_view(self.jobs)
+        identity = str(self.jobs.absolute())
+        view_type = CACHE.RegistryView
+        self.jobs.write_bytes(b"x\topen\t/repo\t/wt\towner\tf=2\n")
+        constructed = []
+
+        def construct(*args, **kwargs):
+            retained = [item for item in gc.get_objects()
+                        if isinstance(item, view_type) and item.path_identity == identity]
+            constructed.append(len(retained))
+            return view_type(*args, **kwargs)
+
+        with mock.patch.object(CACHE, "RegistryView", side_effect=construct):
+            CACHE.registry_view(self.jobs)
+        self.assertEqual(constructed, [0])
+
+    def test_scoped_full_rebuild_releases_cache_only_view_before_parsing(self):
+        self.jobs.write_bytes(b"a\topen\t/repo\t/wt\towner\tf=1\n")
+        CACHE.registry_view(self.jobs)
+        identity = str(self.jobs.absolute())
+        view_type = CACHE.RegistryView
+        self.jobs.write_bytes(b"x\topen\t/repo\t/wt\towner\tf=2\n")
+        constructed = []
+
+        def construct(*args, **kwargs):
+            retained = [item for item in gc.get_objects()
+                        if isinstance(item, view_type) and item.path_identity == identity]
+            constructed.append(len(retained))
+            return view_type(*args, **kwargs)
+
+        with mock.patch.object(CACHE, "RegistryView", side_effect=construct):
+            with CACHE.registry_read_scope():
+                CACHE.current_registry_view(self.jobs)
+        self.assertEqual(constructed, [0])
 
 
 if __name__ == "__main__":

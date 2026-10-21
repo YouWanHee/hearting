@@ -215,6 +215,14 @@ refuse the normal ways work moves. When a recovery path still refuses, the
 refusal names what differs and the supported next step. A state with no
 supported way forward is a defect in the path, not a task for the operator.
 
+An attempt registration is not work that reached the launch fence. Only a
+never-started registration closed as cancelled under the registry lock is
+withdrawn from round censuses. An open registration reserves its round until
+claimed or closed, and an actual pre-launch failure remains a verdict-less
+round. Timeout cleanup closes only that exact row while the never-started proof
+still holds under the registry lock; claimed, identified, started, and
+unobservable rows remain with reconciliation.
+
 A caller-identity refusal records who may not launch; it does not settle the
 existing recovery duty. An explicit start may re-enter the same exact claim
 when its successor has no row or has launch-fence proof that it never started,

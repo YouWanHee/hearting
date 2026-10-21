@@ -49,7 +49,11 @@ def attempt_record(
     jobs: Path, attempt_id: str
 ) -> tuple[str | None, dict[str, str]]:
     try:
-        lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        import dispatch_registry_cache
+        with dispatch_registry_cache.registry_read_scope():
+            lines = dispatch_registry_cache.registry_text_lines(jobs)
+            if lines is None:
+                lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return None, {}
     for line in lines:
@@ -85,6 +89,11 @@ class RegistryObservation:
 
     def refresh(self, *, force: bool = False):
         import route_parent_close
+        import dispatch_registry_cache
+        with dispatch_registry_cache.registry_read_scope():
+            return self._refresh_scoped(force=force, route_parent_close=route_parent_close)
+
+    def _refresh_scoped(self, *, force: bool, route_parent_close):
         try:
             generation = file_generation(self.jobs)
         except OSError:

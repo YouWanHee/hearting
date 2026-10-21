@@ -23,6 +23,7 @@ shared-utility-deferred	atomic_publish.py
 shared-utility-deferred	cairn-artifact-read.sh
 shared-utility-deferred	cairn-artifact-read.ts
 shared-utility-deferred	campaign_title_repair.py
+shared-utility-deferred	claude_process_identity.py
 shared-utility-deferred	directory_record_index.py
 shared-utility-deferred	codex_permission_profile.py
 shared-utility-deferred	compute-hosts
@@ -80,6 +81,7 @@ shared-utility-deferred	pane.py
 shared-utility-deferred	verification-background-lease.py
 shared-utility-deferred	work_start.py
 shared-utility-deferred	start_receipt.py
+shared-utility-deferred	recipient_lifetime.py
 utility-deferred	artifact-root.test.sh
 utility-deferred	artifact-sink.sh
 utility-deferred	artifact-sink.test.sh

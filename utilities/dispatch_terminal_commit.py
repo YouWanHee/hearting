@@ -1933,6 +1933,15 @@ from route_authority import PROVEN_BLOCKED_GATE_REASONS as _PROVEN_BLOCKED_GATE_
 
 def owner_completion_state(jobs, status, metadata, *, selected_registry_rows=None) -> CompletionState:
     """Observe immutable settlement bytes; the common admission selects their state."""
+    import dispatch_registry_cache
+    with dispatch_registry_cache.registry_read_scope():
+        if selected_registry_rows is None:
+            return _owner_completion_state_scoped(jobs, status, metadata)
+        return _owner_completion_state_scoped(
+            jobs, status, metadata, selected_registry_rows=selected_registry_rows)
+
+
+def _owner_completion_state_scoped(jobs, status, metadata, *, selected_registry_rows=None) -> CompletionState:
     from route_authority import decide_continuation
     facts = {}
     try:

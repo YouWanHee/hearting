@@ -749,6 +749,7 @@ class DispatchJob:
     parallel_leg_index: Optional[int] = None
     parallel_leg_count: Optional[int] = None
     state_evidence: Optional[dict] = None  # F-25 classifier verdict + inputs (additive; --json via asdict)
+    attempt_decision: Optional[dict] = None  # shared continuation-policy decision from observed evidence
     # F-28a (v10, prd.md:302) — immutable route-record link, read-only. route_file is the
     # record's on-disk path (may be /tmp and already gone by the time fleet reads it — tolerant,
     # never an error); route_hash is absent for proc jobs (AGENT_ROUTE_HASH is not exported,

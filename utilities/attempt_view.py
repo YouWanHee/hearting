@@ -27,18 +27,79 @@ class Source(NamedTuple):
     label: str = ""
 
 
+# Optional read budget (Fleet's raw-output pane); the standalone command reads without one.
+TAIL_BYTES = 64 * 1024
+TAIL_RECORDS = 200
+MAX_RECORD_BYTES = 8 * 1024 * 1024      # one record longer than the byte budget is read whole up to here
+
+
 class Cursor:
-    """Small in-memory file cursor; no viewer state is persisted."""
+    """Small in-memory file cursor; no viewer state is persisted.
+
+    ``read_new`` without arguments reads everything new, as before. ``max_bytes`` / ``max_records``
+    bound one read (a single record longer than ``max_bytes`` is still read whole), ``tail`` starts
+    the first read at the last whole records of the file, and ``read_before`` walks back from the
+    start of what has been read so far.
+    """
     def __init__(self, path: Path):
         self.path = Path(path)
         self.offset = 0
         self.pending = b""
+        self.discarding = False        # inside the tail of a record over the size limit: drop to the newline
         self.identity = None
         self.head = b""
         self.notices: list[str] = []
-        self.reader_state = {"cursor": 0, "refresh": [], "rows": {}, "entities": {}}
+        self.reader_state = {"cursor": 0, "refresh": [], "rows": {}, "entities": {}, "start": None,
+                             "tailed": False, "generation": None}
+        self.start = 0                 # byte offset of the first record read so far
+        self.tailed = False
+        self.epoch = 0                 # +1 each time the file was truncated or replaced
+        self.error = None              # (state, reason) of the last failed read, else None
 
-    def read_new(self, *, final: bool = False) -> list[str]:
+    def _tail_offset(self, size, max_bytes, max_records):
+        """Offset of the first whole record of the last ``max_bytes`` / ``max_records`` of the file."""
+        begin = max(0, size - max(1, int(max_bytes)))
+        with self.path.open("rb") as stream:
+            if begin > 0:
+                stream.seek(begin - 1)
+                if stream.read(1) != b"\n":
+                    skipped, found = begin, False
+                    while skipped < size:
+                        block = stream.read(min(65536, size - skipped))
+                        if not block:
+                            break
+                        cut = block.find(b"\n")
+                        if cut >= 0 and skipped + cut + 1 < size:
+                            begin, found = skipped + cut + 1, True
+                            break
+                        if cut >= 0:
+                            break                   # nothing complete follows: the cut lies in the last record
+                        skipped += len(block)
+                    if not found:
+                        # The last record is longer than the budget: take it whole (up to the cap).
+                        back, cap = begin, max(0, size - MAX_RECORD_BYTES)
+                        begin = cap if cap else 0
+                        while back > cap:
+                            step = min(65536, back - cap)
+                            stream.seek(back - step)
+                            block = stream.read(step)
+                            cut = block.rfind(b"\n")
+                            if cut >= 0:
+                                begin = back - step + cut + 1
+                                break
+                            back -= step
+            if max_records is not None and size > begin:
+                stream.seek(begin)
+                data = stream.read(size - begin)
+                starts = [0] + [i + 1 for i, byte in enumerate(data) if byte == 10 and i + 1 < len(data)]
+                if len(starts) > max_records:
+                    begin += starts[-max(1, int(max_records))]
+        return begin
+
+    def read_entries(self, *, final: bool = False, max_bytes=None, max_records=None,
+                     tail: bool = False) -> list[tuple[int, str]]:
+        """New rows as ``(byte offset of the record, text)``; an unreadable file reads as nothing."""
+        self.error = None
         try:
             info = self.path.stat()
             identity = (info.st_dev, info.st_ino)
@@ -49,22 +110,112 @@ class Cursor:
             if identity != self.identity or info.st_size < self.offset or rewrite:
                 if self.identity is not None:
                     self.notices.append("source truncated or replaced; reopened")
+                    self.epoch += 1
                 self.offset, self.pending, self.identity = 0, b"", identity
+                self.discarding = False
+                self.start, self.tailed = 0, False
+            if tail and max_bytes and not self.tailed and self.offset == 0:
+                self.offset = self.start = self._tail_offset(info.st_size, max_bytes, max_records)
+            self.tailed = True
             with self.path.open("rb") as stream:
                 stream.seek(self.offset)
-                chunk = stream.read()
-                self.offset = stream.tell()
+                chunk = stream.read() if max_bytes is None else stream.read(max(1, int(max_bytes)))
+                if max_bytes is not None and len(chunk) >= int(max_bytes) and b"\n" not in chunk \
+                        and b"\n" not in self.pending and not self.discarding:
+                    while len(self.pending) + len(chunk) < MAX_RECORD_BYTES:
+                        more = stream.read(65536)
+                        if not more:
+                            break
+                        chunk += more
+                        if b"\n" in more:
+                            break
+                self.offset += len(chunk)
+                if self.discarding:
+                    # The rest of a record already dropped for its size: nothing of it becomes a row.
+                    cut = chunk.find(b"\n")
+                    if cut < 0:
+                        chunk = b""
+                    else:
+                        chunk, self.discarding = chunk[cut + 1:], False
+                base = self.offset - len(chunk) - len(self.pending)
             with self.path.open("rb") as probe:
                 self.head = probe.read(min(self.offset, 4096))
-        except OSError:
+        except OSError as exc:
+            self.error = ("missing" if isinstance(exc, FileNotFoundError) else "unreadable",
+                          type(exc).__name__)
             return []
         pieces = (self.pending + chunk).split(b"\n")
         self.pending = pieces.pop()
-        rows = [piece.decode("utf-8", "replace") for piece in pieces]
+        entries, position = [], base
+        for piece in pieces:
+            entries.append((position, piece.decode("utf-8", "replace")))
+            position += len(piece) + 1
+        if max_records is not None and len(entries) > max_records:
+            self.offset, self.pending = entries[max_records][0], b""
+            entries = entries[:max_records]
+        elif max_bytes is not None and len(self.pending) > MAX_RECORD_BYTES:
+            self.notices.append("record over the size limit skipped")
+            self.pending, self.discarding = b"", True
         if final and self.pending:
-            rows.append(self.pending.decode("utf-8", "replace"))
+            entries.append((position, self.pending.decode("utf-8", "replace")))
             self.pending = b""
-        return rows
+        return entries
+
+    def read_new(self, *, final: bool = False, max_bytes=None, max_records=None,
+                 tail: bool = False) -> list[str]:
+        return [text for _, text in self.read_entries(final=final, max_bytes=max_bytes,
+                                                      max_records=max_records, tail=tail)]
+
+    def read_before(self, *, max_bytes, max_records=None) -> list[tuple[int, str]]:
+        """The whole records just before the first one read so far, within the budget (oldest first)."""
+        self.error = None
+        if self.start <= 0:
+            return []
+        try:
+            want = max(0, self.start - max(1, int(max_bytes)))
+            with self.path.open("rb") as stream:
+                if want > 0:
+                    stream.seek(want - 1)
+                    first = stream.read(1)
+                    region = stream.read(self.start - want)
+                    if first != b"\n":
+                        cut = region.find(b"\n")
+                        if 0 <= cut < len(region):
+                            want, region = want + cut + 1, region[cut + 1:]
+                        else:                       # one record longer than the budget: take it whole
+                            floor = max(0, self.start - MAX_RECORD_BYTES)
+                            back = want
+                            while back > floor:
+                                step = min(65536, back - floor)
+                                stream.seek(back - step)
+                                block = stream.read(step)
+                                cut = block.rfind(b"\n")
+                                if cut >= 0:
+                                    back = back - step + cut + 1
+                                    break
+                                back -= step
+                            else:
+                                back = floor
+                            stream.seek(back)
+                            want, region = back, stream.read(self.start - back)
+                else:
+                    stream.seek(0)
+                    region = stream.read(self.start)
+        except OSError as exc:
+            self.error = ("missing" if isinstance(exc, FileNotFoundError) else "unreadable",
+                          type(exc).__name__)
+            return []
+        pieces = region.split(b"\n")
+        if pieces and pieces[-1] == b"":
+            pieces.pop()
+        entries, position = [], want
+        for piece in pieces:
+            entries.append((position, piece.decode("utf-8", "replace")))
+            position += len(piece) + 1
+        if max_records is not None and len(entries) > max_records:
+            entries = entries[-max_records:]
+        self.start = entries[0][0] if entries else self.start
+        return entries
 
 
 @dataclass
@@ -101,7 +252,9 @@ def _registry_rows(root, contains=None, *, force=False):
     return reader.read(contains, force=force)
 
 
-_URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s@]*@")
+# The look-behind starts a scheme only at the start of a run of scheme characters, so one long
+# run of letters (a very large record) is scanned once, not once per position.
+_URL_USERINFO = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s@]*@")
 _BEARER_TOKEN = re.compile(r"\b(Bearer)\s+[^\s]+", re.I)
 
 
@@ -151,7 +304,8 @@ def sanitize(value: object) -> str:
         out.append(" " if text[i] == "\t" else text[i])
         i += 1
     clean = "".join(out)
-    clean = _URL_USERINFO.sub(r"\1[redacted]@", clean)
+    if "://" in clean:
+        clean = _URL_USERINFO.sub(r"\1[redacted]@", clean)
     return _BEARER_TOKEN.sub(r"\1 [redacted]", clean)
 
 
@@ -605,13 +759,164 @@ def _sqlite_records(path: Path, sid: str):
         yield from normalize_opencode_db_row(row, snapshot["generation"])
 
 
-def read_new(source: Source, cursor: Cursor) -> tuple[list[object], Cursor]:
+def read_new(source: Source, cursor: Cursor, *, max_bytes=None, max_records=None,
+             tail: bool = False) -> tuple[list[object], Cursor]:
+    """New native rows after ``cursor``. The optional budget bounds one read (see ``Cursor``)."""
     if source.kind == "opencode-db":
         try:
             return _follow_db(source, cursor.reader_state), cursor
         except Exception as exc:
             return [Line("notice", sanitize(f"source unavailable: {exc}"))], cursor
-    return cursor.read_new(), cursor
+    return cursor.read_new(max_bytes=max_bytes, max_records=max_records, tail=tail), cursor
+
+
+class Entry(NamedTuple):
+    """One native record with a stable identity: an entry read again under the same ``key`` replaces
+    the earlier one (a streaming OpenCode row), anything else is new."""
+    key: tuple
+    record: object
+
+
+class ReadResult(NamedTuple):
+    entries: list
+    state: str = "ok"          # ok | missing (the source is gone) | unreadable (it is there but cannot be read)
+    reason: str = ""
+    reset: bool = False        # the file was truncated or replaced: drop what was read before
+
+
+_DB_STATE = {"missing": "missing", "unknown": "unreadable"}
+
+
+def _db_state(snapshot):
+    return _DB_STATE.get(snapshot.get("state"), "unreadable"), str(snapshot.get("reason", "unavailable"))
+
+
+def _row_bytes(row):
+    return len(_compact(row.get("data") if row.get("data") is not None else row.get("raw")))
+
+
+def _trim_rows(rows, max_bytes, newest):
+    """Keep whole rows within the byte budget: the newest ones for a tail, the oldest for a follow."""
+    if not max_bytes or not rows:
+        return rows
+    kept, total = [], 0
+    for row in (reversed(rows) if newest else rows):
+        size = _row_bytes(row)
+        if kept and total + size > max_bytes:
+            break
+        kept.append(row)
+        total += size
+    return kept[::-1] if newest else kept
+
+
+def _db_entries(source, state, *, max_bytes, max_records, tail, before=False):
+    first = tail and not state.get("tailed")
+    if before:
+        if state.get("start") is None:
+            return ReadResult([])
+        snapshot = read_session_parts_bounded(source, before_cursor=state["start"], limit=max_records)
+    elif first:
+        snapshot = read_session_parts_bounded(source, newest=True, limit=max_records)
+    else:
+        snapshot = read_session_parts_bounded(source, after_cursor=state["cursor"],
+                                              refresh=state["refresh"], limit=max_records)
+    if snapshot.get("state") != "observed":
+        return ReadResult([], *_db_state(snapshot))
+    generation = snapshot["generation"]
+    if state.get("generation") not in (None, generation):
+        # The session now lives in the other table generation: what was read before no longer applies.
+        state.update(cursor=0, refresh=[], rows={}, entities={}, start=None, tailed=False, generation=None)
+        again = _db_entries(source, state, max_bytes=max_bytes, max_records=max_records, tail=True)
+        return again._replace(reset=True)
+    state["generation"] = generation
+    rows = _trim_rows(snapshot["parts"], max_bytes, newest=first or before)
+    entries, pending = [], set(state["refresh"]) if not (first or before) else set()
+    for row in rows:
+        key = row["cursor"]
+        if not before:
+            if generation == "v2" and row.get("role") == "assistant":
+                data = row.get("data") if isinstance(row.get("data"), dict) else {}
+                time_data = data.get("time") if isinstance(data.get("time"), dict) else {}
+                parts = data.get("content", []) if isinstance(data.get("content"), list) else []
+                if not time_data.get("completed") or any(
+                        isinstance(part, dict) and part.get("type") == "tool"
+                        and isinstance(part.get("state"), dict)
+                        and part["state"].get("status") in ("running", "streaming") for part in parts):
+                    pending.add(key)
+            signature = _compact(row)
+            if state["rows"].get(key) == signature:
+                continue
+            state["rows"][key] = signature
+        for index, record in enumerate(normalize_opencode_db_row(row, generation)):
+            entries.append(Entry((key, index), record))
+    cursors = [row["cursor"] for row in rows]
+    if before:
+        if cursors:
+            state["start"] = min(cursors)
+        return ReadResult(entries)
+    if first:
+        state["tailed"] = True
+        state["start"] = min(cursors) if cursors else 0
+        state["cursor"] = max(cursors, default=0)
+    elif rows and len(rows) < len(snapshot["parts"]):
+        state["cursor"] = max(cursors)               # the budget stopped the read: continue from here
+    else:
+        state["cursor"] = max(state["cursor"], snapshot.get("cursor", state["cursor"]))
+    if generation == "v1" and state["cursor"]:
+        pending.add(state["cursor"])
+    state["refresh"] = sorted(pending)
+    return ReadResult(entries)
+
+
+def read_session_parts_bounded(source, *, after_cursor=0, refresh=(), limit=None, newest=False,
+                               before_cursor=None):
+    from opencode_runtime import read_session_parts
+    kwargs = {"after_cursor": after_cursor, "refresh_cursors": refresh}
+    if limit is not None or newest or before_cursor is not None:
+        kwargs.update(limit=limit, newest=newest, before_cursor=before_cursor)
+    return read_session_parts(source.session_id or "", db_path=source.path, **kwargs)
+
+
+def read_entries(source: Source, cursor: Cursor, *, max_bytes=None, max_records=None,
+                 tail: bool = False) -> ReadResult:
+    """New records of ``source`` as ``Entry`` values, within an optional budget, with the read's health.
+
+    ``tail`` starts the first read at the last records (a file's last ``max_bytes``, a database
+    session's newest ``max_records`` rows); afterwards each call continues from the cursor.
+    """
+    if source.kind == "opencode-db":
+        try:
+            return _db_entries(source, cursor.reader_state, max_bytes=max_bytes,
+                               max_records=max_records, tail=tail)
+        except Exception as exc:
+            return ReadResult([], "unreadable", type(exc).__name__)
+    epoch = cursor.epoch
+    rows = cursor.read_entries(max_bytes=max_bytes, max_records=max_records, tail=tail)
+    state, reason = cursor.error or ("ok", "")
+    return ReadResult([Entry((offset,), text) for offset, text in rows], state, reason,
+                      reset=cursor.epoch != epoch)
+
+
+def read_earlier(source: Source, cursor: Cursor, *, max_bytes=TAIL_BYTES,
+                 max_records=TAIL_RECORDS) -> ReadResult:
+    """The records just before the earliest one read so far (only when asked)."""
+    if source.kind == "opencode-db":
+        try:
+            return _db_entries(source, cursor.reader_state, max_bytes=max_bytes,
+                               max_records=max_records, tail=False, before=True)
+        except Exception as exc:
+            return ReadResult([], "unreadable", type(exc).__name__)
+    rows = cursor.read_before(max_bytes=max_bytes, max_records=max_records)
+    state, reason = cursor.error or ("ok", "")
+    return ReadResult([Entry((offset,), text) for offset, text in rows], state, reason)
+
+
+def has_earlier(source: Source, cursor: Cursor) -> bool:
+    """Whether records exist before the earliest one read (a file offset above 0, a database cursor above 1)."""
+    if source.kind == "opencode-db":
+        start = cursor.reader_state.get("start")
+        return bool(start) and start > 1
+    return cursor.start > 0
 
 
 def _follow_db(source, state):
@@ -685,8 +990,8 @@ def _present(lines, full=False):
         for chunk in chunks: print(sanitize(chunk))
 
 
-def _format_present(harness, raw_rows, state, full=False, prefix=""):
-    """Stateful Codex event presentation, preserving live command starts."""
+def format_stream(harness, raw_rows, state, full=False):
+    """Stateful presentation of native rows (a Codex command start is not shown twice); no printing."""
     lines = []
     state.setdefault("started", set())
     state.setdefault("messages", set())
@@ -707,10 +1012,14 @@ def _format_present(harness, raw_rows, state, full=False, prefix=""):
                     if ident is not None: state["started"].add(ident)
                     lines.extend(format_record(harness, item)); continue
                 if event.endswith("completed"):
-                    subset = {k: v for k, v in item.items()
-                              if k in ("aggregated_output", "aggregatedOutput", "output", "exit_code", "exitCode")}
-                    if subset: lines.extend(format_record(harness, {"type": item_type, **subset}))
-                    elif ident not in state["started"]: lines.extend(format_record(harness, item))
+                    # A command whose start was shown only adds its output and exit; one that completes
+                    # without a shown start (a tail read, an older log) shows the command with them.
+                    if ident is not None and ident in state["started"]:
+                        subset = {k: v for k, v in item.items()
+                                  if k in ("aggregated_output", "aggregatedOutput", "output", "exit_code", "exitCode")}
+                        if subset: lines.extend(format_record(harness, {"type": item_type, **subset}))
+                    else:
+                        lines.extend(format_record(harness, item))
                     continue
             if item_type in ("agent_message", "user_message", "userMessage"):
                 if ident is not None and ident in state["messages"]: continue
@@ -724,7 +1033,23 @@ def _format_present(harness, raw_rows, state, full=False, prefix=""):
                 lines.append(Line("output", sanitize("attachment payload: " + _compact(payload))))
             continue
         lines.extend(format_record(harness, record))
+    return lines
+
+
+def _format_present(harness, raw_rows, state, full=False, prefix=""):
+    """Stateful Codex event presentation, preserving live command starts."""
+    lines = format_stream(harness, raw_rows, state, full)
     _present([Line(line.kind, prefix + line.text) for line in lines], full)
+
+
+def announced_sessions(log, attempt):
+    """The ``(session id, cwd)`` pairs an attempt's supervisor log announced (whole-log read)."""
+    return _announced(log, attempt)
+
+
+def has_session_envelope(rows):
+    """Whether supervisor rows announce a native session (so a missing native source is a cleaned one)."""
+    return _has_session_envelope(rows)
 
 
 def _has_session_envelope(rows):

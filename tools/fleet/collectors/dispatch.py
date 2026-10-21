@@ -54,7 +54,7 @@ try:
 except Exception:  # a monitor must never fail to import over a bookkeeping helper
     _note_worker_home_view = None
 from dispatch_completion_join import read_supervisor_phase_state, read_join_observation  # noqa: E402
-from dispatch_attempt_policy import terminal_conflict_pending  # noqa: E402
+from dispatch_attempt_policy import decide_attempt, terminal_conflict_pending  # noqa: E402
 import dispatch_registry_cache as _dispatch_registry_cache  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
 from claude_project_dir import encode_project_dir  # noqa: E402
@@ -4053,6 +4053,44 @@ def _attach_execution_evidence(jobs, session_rows):
             job.exec_child = candidates[0]
 
 
+NO_PROCESS_PROOF_REASON = "no-exact-process-proof"
+
+
+def attempt_decision_payload(status, metadata, state_evidence=None):
+    """The one mapping from a registry row plus its observed evidence to ``attempt_decision``.
+
+    Process evidence is the row's ``observed_liveness``; without it the process state is
+    ``unknown`` (never inferred from the registry word), so a finished row still gets the
+    same outcome the policy gives a frozen record. Terminal observation and the result state
+    come from the same ``state_evidence`` the classifier read. ``None`` only when the
+    metadata is absent or the policy rejects it.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    evidence = state_evidence if isinstance(state_evidence, dict) else {}
+    inputs = evidence.get("inputs") or {}
+    observed = inputs.get("observed_liveness") or {}
+    process_state = observed.get("process_state")
+    if isinstance(process_state, str) and process_state:
+        process_reason = str(observed.get("process_reason") or "")
+    else:
+        process_state, process_reason = "unknown", NO_PROCESS_PROOF_REASON
+    try:
+        decision = decide_attempt(
+            str(status or ""), metadata, process_state=process_state,
+            process_reason=process_reason,
+            terminal_observed=bool(inputs.get("terminal_observation")),
+            result_state=evidence.get("result_state"))
+    except (TypeError, ValueError, KeyError):
+        # Preserve the Fleet row if historical metadata is incomplete.
+        return None
+    return {
+        "outcome": decision.outcome, "action": decision.action,
+        "responsible": decision.responsible, "reason": decision.reason,
+        "retry_kind": decision.retry_kind, "retry_allowed": decision.retry_allowed,
+    }
+
+
 def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False):
     """Return merged [DispatchJob]. harness_filter does not restrict dispatch — the section
     is cross-harness by design (jobs, not sessions).
@@ -4254,6 +4292,8 @@ def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fa
         now = time.time()
         for j in jobs:
             j.liveness = _dispatch_liveness(j, now, codex_index=codex_index)
+            j.attempt_decision = attempt_decision_payload(
+                str(j.status or ""), getattr(j, "_registry_metadata", None), j.state_evidence)
         jobs = _retain_dead_terminal_owners(jobs, now, jobs_path=jobs_path)
         _annotate_orphan_conductors(jobs, now, jobs_path=jobs_path)
     # Plan QA is display detail. Resolve it only after dedup/retention and the

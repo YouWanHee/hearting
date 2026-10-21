@@ -171,8 +171,18 @@ class LifecycleTest(unittest.TestCase):
                 if runtime.poll() is None:
                     L._bounded_group_stop(runtime, start or "", poll_interval=0.01)
 
+            tool_parent_code = (
+                "import subprocess,time\n"
+                "tool=subprocess.Popen(['/bin/sh','-c','while :; do :; done'])\n"
+                "try:\n"
+                " time.sleep(2.4)\n"
+                "finally:\n"
+                " if tool.poll() is None:\n"
+                "  tool.terminate()\n"
+                " tool.wait()\n"
+            )
             tool_parent = subprocess.Popen(
-                [sys.executable, "-c", "import subprocess; p=subprocess.Popen(['/bin/sh','-c','i=0; while [ $i -lt 2000000 ]; do i=$((i+1)); done']); p.wait()"],
+                [sys.executable, "-c", tool_parent_code],
                 start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             start = L.process_start_ticks(tool_parent.pid)

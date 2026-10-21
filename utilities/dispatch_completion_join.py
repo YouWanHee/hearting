@@ -3206,7 +3206,9 @@ def exact_attempt_row(jobs: Path, attempt_id: str, *,
     if not attempt_id:
         raise JoinContractError("attempt-id-missing")
     try:
-        view = registry_view(jobs, append_only=registry_append_only)
+        import dispatch_registry_cache
+        with dispatch_registry_cache.registry_read_scope():
+            view = registry_view(jobs, append_only=registry_append_only)
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
     matches: list[ChildRow] = []

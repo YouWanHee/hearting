@@ -1124,6 +1124,109 @@ class ReviewRoundCapTest(unittest.TestCase):
             prior = N.prior_round_attempts(jobs, "rt-fixture", "plan-check")
         self.assertEqual(len(prior), 2)
 
+    def test_unstarted_registration_residue_does_not_spend_or_bind_rounds(self):
+        registrations = "".join(
+            f"2026-10-01T00:00:0{i}Z\tdone\t/repo\t/wt\tstage\t"
+            "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+            "execution_surface=registered-headless,registered_worker=1,"
+            f"route_id=rt-fixture,route_node=plan-check,attempt_id=att-unstarted-{i},"
+            "launch_claimed=0,launch_outcome=never-launched,"
+            "failure_class=cancelled,note=cancelled-by-parent\n"
+            for i in (1, 2)
+        )
+        code, printed = self._run("plan-check", 0, rows=registrations)
+        self.assertEqual(code, 0, printed)
+        self.assertNotIn("review-round-budget-exhausted", "\n".join(printed))
+        self.assertNotIn("review-verdictless-bound", "\n".join(printed))
+
+        # The residue adds no rounds, while the real blocking verdict still
+        # consumes exactly one unit and opens the ordinary correction round.
+        rows = self._rows("plan-check", 1) + registrations
+        code, printed = self._run("plan-check", 1, rows=rows)
+        self.assertEqual(code, 0, printed)
+        self.assertIn("correction_round=2", printed)
+
+    def test_round_admission_distinguishes_live_withdrawn_and_failed_rows(self):
+        node = dict(make_node(depth=1, dispatch_fallback=[]), id="plan-check",
+                    kind="review-worker", unit="qa/custom-review",
+                    completion_gate="code-review-fixture")
+        route = make_route(node, tuples=[])
+        route["effective_intensity"] = "standard"
+        route = seal_route_hash(route)
+
+        def rows(status, attempt_prefix, extra):
+            return "".join(
+                f"2026-10-01T00:00:0{i}Z\t{status}\t/repo\t/wt\tstage\t"
+                "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+                "execution_surface=registered-headless,registered_worker=1,"
+                f"route_id={route['route_id']},route_node={node['id']},"
+                f"attempt_id={attempt_prefix}-{i},launch_claimed=0,"
+                f"launch_outcome=never-launched{extra}\n"
+                for i in (1, 2)
+            )
+
+        cells = (
+            (rows("open", "att-live", ""), "blocked-live", 0, 0),
+            (rows("done", "att-withdrawn", ",failure_class=cancelled"), "admit", 0, 0),
+            (rows("done", "att-failed", ""), "verdictless-bound", 0, 2),
+        )
+        for registry, state, verdicts, streak in cells:
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as td:
+                jobs = Path(td) / "jobs.log"
+                jobs.write_text(registry, encoding="utf-8")
+                result = N.admit_round(route, node, jobs, owner_attempt_id="att-owner").budget
+                self.assertEqual((result.state, result.verdict_rounds,
+                                  result.verdictless_streak), (state, verdicts, streak))
+
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            registry = rows("open", "att-live-exclusion", "")
+            jobs.write_text(registry, encoding="utf-8")
+            result = N.admit_round(route, node, jobs, owner_attempt_id="att-live-exclusion-1",
+                                   exclude_attempt="att-live-exclusion-1").budget
+            self.assertEqual(result.state, "blocked-live")
+
+    def test_real_adapter_close_failures_remain_verdictless_rounds(self):
+        import dispatch_wrapper_common as wrapper_common
+        import dispatch_contract as contract
+
+        route = {"route_id": "rt-real-close", "effective_intensity": "standard", "nodes": []}
+        node = {"id": "test", "kind": "pipeline-stage", "unit": "qa/test"}
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            rows = []
+            for index, reason in enumerate(("launch-error", "capacity"), start=1):
+                attempt = f"att-real-close-{index}"
+                metadata = (
+                    "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+                    "execution_surface=registered-headless,registered_worker=1,"
+                    "fallback_hop=same-harness-headless,"
+                    f"route_id={route['route_id']},route_node={node['id']},attempt_id={attempt},"
+                    "launch_claimed=0,launch_outcome=never-launched"
+                )
+                rows.append(f"now\topen\t/repo\t/wt\tstage-{index}\t{metadata}")
+            jobs.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            for index, reason in enumerate(("launch-error", "capacity"), start=1):
+                attempt = f"att-real-close-{index}"
+                self.assertTrue(wrapper_common.close_job_row(
+                    jobs, f"stage-{index}", "/wt", reason, "", attempt,
+                    materialize=lambda *_args: None,
+                ))
+                fields = next(line.split("\t") for line in jobs.read_text().splitlines()
+                              if attempt in line)
+                metadata = N.parse_registry_metadata(fields[5])
+                self.assertEqual(fields[1], "done")
+                self.assertEqual(metadata.get("launch_outcome"), "never-launched")
+                self.assertFalse(N.ROUTE.attempt_row_withdrawn_before_launch(fields))
+                self.assertFalse(contract.close_attempt_row(
+                    jobs, attempt, "cancelled-by-parent",
+                    evidence={"failure_class": "cancelled"},
+                ))
+
+            admitted = N.admit_round(route, node, jobs, owner_attempt_id="att-parent").budget
+            self.assertEqual((admitted.state, admitted.verdict_rounds,
+                              admitted.verdictless_streak), ("verdictless-bound", 0, 2))
+
     def test_exact_attempt_exclusion_keeps_older_rounds_with_the_same_slug(self):
         with tempfile.TemporaryDirectory() as td:
             jobs = Path(td) / "jobs.log"

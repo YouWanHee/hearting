@@ -1037,6 +1037,7 @@ class ManagedRuntimeAdoptionTest(unittest.TestCase):
         "hearting/utilities/compute-hosts": "#!/bin/sh\n",
         "hearting/utilities/compute-hosts.py": "#!/usr/bin/env python3\n",
         "hearting/tools/fleet/fleet.sh": "#!/bin/sh\n",
+        "hearting/tools/fleet/fleet2.sh": "#!/bin/sh\n",
         "hearting/tools/memory/mem.py": "#!/usr/bin/env python3\n",
         "hearting/tools/memory/protocol_v2.py": "#!/usr/bin/env python3\n",
         "hearting/tools/memory/git_exchange_v2.py": "#!/usr/bin/env python3\n",

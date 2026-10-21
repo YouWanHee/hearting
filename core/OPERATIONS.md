@@ -1166,9 +1166,10 @@ changes the settled result or grants another execution.
 An accepted Claude native wake is also retained as the existing outer manager's
 registered-batch duty. If its hook exits before delivery, that task runner checks
 the same current attempt and pending notice and hands it to the existing peer
-courier for the exact parent session. Native and recovery delivery share the
-notice claim; forms and busy turns use the courier's existing retained-message
-path. Codex and OpenCode keep their existing retained completion controllers.
+courier for the exact current `effective_parent` session. Native and recovery
+delivery share the notice claim; forms and busy turns use the courier's
+existing retained-message path. Codex and OpenCode keep their existing
+retained completion controllers.
 Confirmed session handover changes the recipient, while the signed notice stays
 under the registered parent's storage key. If an older outer observer cannot
 process this retained duty, its exact PID and existing lock identify a safe
@@ -2537,6 +2538,11 @@ changes to resource liveness. Runtime maintenance in a private snapshot
 repository is plumbing, not a user tool call.
 After a resource exits, an owner without a current model summary or tool shows
 the last resource result and log age in NOW.
+
+`fleet` keeps the group and process screen described above for both live use and `--once`.
+The B explorer compose (a work ledger and output view with navigation) is still in development
+and opens only through `fleet2` or `fleet --explorer`; it becomes the default only after it
+reads well on real sessions.
 For a live local resource, bounded reads of its exact process and descendants
 show GPU selection separately from use: `moving4:1 지정 · GPU 사용 전`.
 Observed GPU use takes precedence; selection alone creates no GPU usage
