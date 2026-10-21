@@ -43,6 +43,8 @@ hosts:
   #   hostname: gpu-a                    # output of `hostname` there; marks the entry as local when it matches
   #   workdir: /home/alice/projects      # optional default working directory for `run`
   #   conda: torch                       # optional conda environment activated before `run`
+  #   path_namespace:                    # optional: run payloads only; block mapping target: source
+  #     /home/shared: /srv/shared-nas    # expose the source mount at this target inside each run
   # gpu-b:
   #   ssh_host: 10.0.0.12
   #   hostname: gpu-b

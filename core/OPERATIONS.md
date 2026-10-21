@@ -1914,6 +1914,18 @@ enter Fleet's public process
 model. This bridge exists only while the direct SSH connection is live; it does
 not replace the detached-process claim below.
 
+An optional host `path_namespace` block mapping declares `target: source`
+absolute paths, for example `/home/nas: /home/nas_IIP`. For configured runs,
+Hearting verifies the source mount and run-root identity, then exposes those
+paths only inside the run-directory creation child and detached payload's
+user and mount namespaces; the shared tmux server, probes, claims, and stop
+commands stay in the host namespace. Any missing source, identity mismatch,
+or namespace permission error refuses the run before it starts. A launcher
+running on a host with this mapping refuses local run-root operations because
+its shared path still names the unmodified mount. Keep the mapping as an
+unquoted YAML block mapping; inline maps are not supported by the inventory
+parser.
+
 `claim <host> <pid> [--harness <runtime> --session <id>]` (default: the calling
 session, when it is one unique harness session) is the narrow bridge for
 an already detached `nohup`/`setsid` process whose runtime ancestor and session
