@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import select
+import threading
 from pathlib import Path
 import sys
 import tempfile
@@ -226,6 +227,36 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         request.assert_called_once_with(lifecycle_root=ROOT)
         self.assertEqual(output.getvalue(), "")
 
+    def test_claude_native_feedback_settles_exact_receipt_without_reexposure(self):
+        import dispatch_recipient_receipt as recipient_receipt
+        import claude_project_dir
+        self._seed()
+        did = "delivery-" + "a" * 32
+        PD.claim(self.root, "sess-owner", did, claim_owner="async-rewake",
+                 lease_seconds=30, require_generation_proof=False)
+        PD.mark_sent_ambiguous(self.root, "sess-owner", did, claim_owner="async-rewake")
+        current = PD.read(self.root, "sess-owner", did)
+        marker = recipient_receipt.receipt_marker(current, "sess-owner")
+        runtime_home = Path(self._tmp.name) / "claude-home"
+        project = runtime_home / "projects" / claude_project_dir.encode_project_dir(str(ROOT))
+        project.mkdir(parents=True)
+        transcript = project / "sess-owner.jsonl"
+        transcript.write_text(json.dumps({
+            "type": "user", "sessionId": "sess-owner", "summary": "Stop hook feedback",
+            "message": {"content": marker},
+        }) + "\n", encoding="utf-8")
+        payload = {"hook_event_name": "UserPromptSubmit", "cwd": str(ROOT),
+                   "transcript_path": str(transcript)}
+        output = io.StringIO()
+        with mock.patch.object(HOOK, "resolve_agent_home", return_value=ROOT), \
+             mock.patch.object(HOOK, "dispatch_state_roots", return_value=(self.root,)), \
+             mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(runtime_home)}), \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(HOOK._process_session(payload, "sess-owner"), 0)
+        self.assertEqual(output.getvalue(), "")
+        exact = PD.read(self.root, "sess-owner", did)
+        self.assertEqual((exact["state"], exact["attempts"]), ("acked", 1))
+
     def _seed(self, session_id="sess-owner", **overrides):
         receipt = overrides.pop("receipt", _receipt())
         self.root.mkdir(parents=True, exist_ok=True)
@@ -297,6 +328,55 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(again, [])
         state = PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)["state"]
         self.assertEqual(state, "acked")
+
+    def test_two_carriers_recheck_after_exact_receipt_at_final_output_barrier(self):
+        import dispatch_recipient_receipt as recipient_receipt
+        self._seed()
+        did = "delivery-" + "a" * 32
+        first_reads = threading.Barrier(2)
+        final_recheck = threading.Event()
+        receipt_written = threading.Event()
+        snapshots = []
+        local = threading.local()
+        marker = recipient_receipt.receipt_marker(
+            PD.read(self.root, "sess-owner", did), "sess-owner")
+
+        def observe(_root, storage, record):
+            count = getattr(local, "reads", 0) + 1
+            local.reads = count
+            if count == 1:
+                snapshots.append(PD.received_ack_identity(record, storage, did))
+                first_reads.wait(timeout=5)
+                return recipient_receipt.claude_feedback_evidence([], "sess-owner")
+            final_recheck.set()
+            if not receipt_written.wait(timeout=5):
+                return None
+            return recipient_receipt.claude_feedback_evidence([{
+                "type": "user", "sessionId": "sess-owner",
+                "summary": "Stop hook feedback", "message": {"content": marker},
+            }], "sess-owner")
+
+        results = [None, None]
+        def carrier(index):
+            results[index] = SWEEP.sweep_deliver(
+                self.root, "claude-parent-runtime", "sess-owner",
+                receipt_observer=observe)[0]
+
+        threads = [threading.Thread(target=carrier, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(final_recheck.wait(timeout=5))
+        # Native receipt is recorded after both carriers read the same exact
+        # identity and before the winner's final output recheck is released.
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(snapshots[0], snapshots[1])
+        receipt_written.set()
+        for thread in threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [[], []])
+        current = PD.read(self.root, "sess-owner", did)
+        self.assertEqual((current["state"], current["attempts"]), ("acked", 1))
 
     def test_deliver_retry_wait_survives_normal_release_and_new_recipient_progresses(self):
         self._seed(session_generation_supported="1")
@@ -1019,7 +1099,8 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
                      ROOT / "adapters" / "codex" / "hooks" / "userprompt-lifecycle.py"):
             self.assertIn("delivery_context", hook.read_text(encoding="utf-8"))
 
-    def run_plugin(self, body, *, prompt_async="accept", restored_selector=False, extra_env=None):
+    def run_plugin(self, body, *, prompt_async="accept", restored_selector=False,
+                   extra_env=None, native_messages=None):
         plugin = ROOT / "adapters/opencode/plugins/hearting-guards.js"
         if restored_selector:
             fixture = self.root.parent / "restored-plugin/adapters/opencode/plugins/hearting-guards.js"
@@ -1035,9 +1116,16 @@ import { writeFileSync } from "node:fs";
 const { AgentHarnessGuards } = await import(pathToFileURL(PLUGIN));
 const prompts = [];
 const logs = [];
+const nativeMessages = NATIVE_MESSAGES;
 const session = {
-  messages: async () => ({data: []}), prompt: async () => ({data: null}),
-  promptAsync: async (request) => { prompts.push(request); return MODE === "accept" ? {data: undefined, response: {ok: true, status: 204}} : {error: {name: "NotFound"}, response: {ok: false, status: 404}} },
+  messages: async () => ({data: nativeMessages}), prompt: async () => ({data: null}),
+  promptAsync: async (request) => {
+    prompts.push(request);
+    if (MODE === "accept") nativeMessages.push({
+      info: {sessionID: "ses-oc-parent", role: "user"}, parts: request.body.parts,
+    });
+    return MODE === "accept" ? {data: undefined, response: {ok: true, status: 204}} : {error: {name: "NotFound"}, response: {ok: false, status: 404}};
+  },
 };
 if (MODE === "absent") delete session.promptAsync;
 process.env.HERDR_PANE_ID = "";
@@ -1046,7 +1134,8 @@ const settle = async () => { for (let i = 0; i < 100 && !globalThis.done; i++) a
 BODY
 hooks.dispose();
 console.log(JSON.stringify({prompts, logs}));
-'''.replace("MODE", json.dumps(prompt_async)).replace("BODY", body).replace("PLUGIN", json.dumps(str(plugin)))
+'''.replace("MODE", json.dumps(prompt_async)).replace("BODY", body).replace("PLUGIN", json.dumps(str(plugin))).replace(
+            "NATIVE_MESSAGES", json.dumps(native_messages or []))
         env = self.env()
         if extra_env:
             env.update(extra_env)
@@ -1078,6 +1167,22 @@ console.log(JSON.stringify({carrierEnv: globalThis.carrierEnv}));
         self.assertIn(("claim", "claimed"), [(item["stage"], item["reason"]) for item in carrier])
         self.assertIn(("prompt", "accepted"), [(item["stage"], item["reason"]) for item in carrier])
         self.assertTrue(all("text" not in item for item in carrier))
+
+    def test_native_receipt_from_another_carrier_suppresses_prompt_async(self):
+        import dispatch_recipient_receipt as recipient_receipt
+        self.seed_turn()
+        did = "delivery-" + "a" * 32
+        PD.claim(self.root, self.SID, did, claim_owner="other-carrier", lease_seconds=30,
+                 require_generation_proof=False)
+        PD.mark_sent_ambiguous(self.root, self.SID, did, claim_owner="other-carrier")
+        current = PD.read(self.root, self.SID, did)
+        marker = recipient_receipt.receipt_marker(current, self.SID)
+        messages = [{"info": {"sessionID": self.SID, "role": "user"},
+                     "parts": [{"type": "text", "text": marker}]}]
+        result = self.run_plugin(self.IDLE_THEN_WAIT, native_messages=messages)
+        self.assertEqual(result["prompts"], [])
+        self.assertEqual(self.state(), "acked")
+        self.assertEqual(PD.read(self.root, self.SID, did)["attempts"], 1)
 
     def test_restored_session_creation_reconnects_then_idle_starts_one_turn(self):
         self.seed_turn()
@@ -1200,10 +1305,12 @@ await new Promise(r => setTimeout(r, 1500));
                 script = r'''
 import { pathToFileURL } from "node:url";
 const { AgentHarnessGuards } = await import(pathToFileURL(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js"));
-const prompts = [], logs = [];
+const prompts = [], logs = [], nativeMessages = [];
 process.env.HERDR_PANE_ID = "";
-const session = {messages: async () => ({data: []}), promptAsync: async (request) => {
-  prompts.push(request); return {response: {ok: true, status: 204}};
+const session = {messages: async () => ({data: nativeMessages}), promptAsync: async (request) => {
+  prompts.push(request);
+  nativeMessages.push({info: {sessionID: "ses-oc-parent", role: "user"}, parts: request.body.parts});
+  return {response: {ok: true, status: 204}};
 }};
 const hooks = await AgentHarnessGuards({client: {app: {log: async (entry) => {logs.push(entry.body)}}, session}, directory: process.cwd()});
 await hooks["shell.env"]({sessionID: "ses-oc-parent"}, {env: {}});
@@ -1235,7 +1342,7 @@ console.log(JSON.stringify({prompts, logs}));
                              if item["service"] == "hearting-completion-carrier"
                              and item["extra"]["reason"] == "root-fallback"]
                 self.assertIn("deliver", [item["action"] for item in fallbacks])
-                self.assertIn("ack", [item["action"] for item in fallbacks])
+                self.assertIn("settle", [item["action"] for item in fallbacks])
                 self.assertTrue(all(item["sessionID"] == self.SID for item in fallbacks))
                 self.assertTrue(all(item["root"] == str(current) for item in fallbacks))
                 shutil.rmtree(PD.record_directory(self.root, self.SID))
@@ -1246,9 +1353,13 @@ console.log(JSON.stringify({prompts, logs}));
         js = r'''
 import { pathToFileURL } from "node:url";
 const { AgentHarnessGuards } = await import(pathToFileURL(process.env.AGENT_HOME + "/adapters/opencode/plugins/hearting-guards.js"));
-const prompts = [];
-const session = {messages: async () => ({data: []}), prompt: async () => ({data: null}),
-  promptAsync: async (request) => { prompts.push(request); return {response: {ok: true, status: 204}} }};
+const prompts = [], nativeMessages = [];
+const session = {messages: async () => ({data: nativeMessages}), prompt: async () => ({data: null}),
+  promptAsync: async (request) => {
+    prompts.push(request);
+    nativeMessages.push({info: {sessionID: "ses-oc-parent", role: "user"}, parts: request.body.parts});
+    return {response: {ok: true, status: 204}};
+  }};
 process.env.HERDR_PANE_ID = "";
 const hooks = await AgentHarnessGuards({client: {app: {log: async () => {}}, session}, directory: process.cwd()});
 await hooks["shell.env"]({sessionID: "ses-oc-parent"}, {env: {}});

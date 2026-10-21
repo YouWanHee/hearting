@@ -1308,7 +1308,7 @@ def _open_gate_pending(launch: Launch) -> bool:
 
 
 def _gate_notices(
-    launch: Launch, *, attempt_only: bool = False, settle: str = "ack",
+    launch: Launch, *, attempt_only: bool = False, settle: str = "sent-ambiguous",
     announced: list[str] | None = None,
     supervision_claims: list[tuple[Path, str, str, str]] | None = None,
     announced_records: list[dict] | None = None,
@@ -1323,15 +1323,11 @@ def _gate_notices(
     that owner's hook's wake, and spending this process's single wake on it
     would lose this attempt's completion notice.
 
-    `settle` is how the announced record is left, and both call sites pass
-    `sent-ambiguous` (review round 1, M6): whether an exit-2 wake reaches the
-    session is unmeasured (SD-OPEN-29/32), and an acked record would have
-    spent the sweep fallback the contract still requires. The terminal caller
-    (`_emit_with_gates`) acks separately once its receipt has actually gone
-    out, so a gate folded into a delivered terminal receipt is not
-    re-announced (A59-3) while one whose receipt never went out still is. The
-    cost is bounded at-least-once: if the person has not released by the next
-    prompt the sweep shows the same gate once more.
+    `settle` remains a call-site compatibility argument. Hook output and exit
+    do not prove receipt, so every announced record stays recoverable until
+    the shared native-transcript path confirms its exact binding. A gate
+    folded into a terminal receipt carries its own delivery binding and can
+    settle independently from the completion receipt.
     """
 
     notices: list[str] = []
@@ -1370,7 +1366,13 @@ def _gate_notices(
         from dispatch_supervision import CONTINUED_KEY, continue_for_parent
         continued = continue_for_parent(record, session_id=launch.session_id,
                                         recipient_kind="claude-parent-runtime")
-        notices.append(_bounded_receipt_text({**record, CONTINUED_KEY: continued} if continued else record))
+        rendered = _bounded_receipt_text({**record, CONTINUED_KEY: continued} if continued else record)
+        try:
+            from dispatch_recipient_receipt import receipt_marker
+            rendered += "\n" + receipt_marker(record, recipient_key)
+        except (KeyError, TypeError, ValueError, pending_delivery.PendingDeliveryError):
+            pass
+        notices.append(rendered)
         if announced_records is not None:
             announced_records.append(record)
         if announced is not None:
@@ -1378,14 +1380,11 @@ def _gate_notices(
         if supervision_claims is not None and record.get("receipt", {}).get("kind") == "supervision":
             supervision_claims.append((root, recipient_key, delivery_id, claim_owner))
         try:
-            if settle == "sent-ambiguous":
-                pending_delivery.mark_sent_ambiguous(
-                    root, recipient_key, delivery_id, claim_owner=claim_owner
-                )
-            else:
-                pending_delivery.ack(
-                    root, recipient_key, delivery_id, acked_by=f"async-rewake:{launch.session_id}"
-                )
+            # Hook output/exit is ambiguous delivery. The native recipient
+            # transcript owns receipt confirmation and shared ack_received.
+            pending_delivery.mark_sent_ambiguous(
+                root, recipient_key, delivery_id, claim_owner=claim_owner
+            )
         except pending_delivery.PendingDeliveryError:
             pass
     return notices
@@ -1727,7 +1726,16 @@ def _run_carrier(launch, claim, payload, observation, holder) -> int:
         # and the recipient's gates are that carrier's (or the sweep's) too.
         observation["reason"] = "completion-claim-unavailable"
         return _ended(claim, 0, terminal=True)
-    exit_code = _emit_with_gates(launch, claim, state, message, block=False, owner_closed=True)
+    binding = None
+    try:
+        record = pending_delivery.read(win.root, win.recipient_key, win.delivery_id)
+        if record and record.get("claim_owner") == win.claim_owner:
+            from dispatch_recipient_receipt import receipt_marker
+            binding = receipt_marker(record, win.recipient_key)
+    except (OSError, ValueError, TypeError, pending_delivery.PendingDeliveryError):
+        binding = None
+    exit_code = _emit_with_gates(launch, claim, state, message, block=False,
+                                 owner_closed=True, receipt_binding=binding)
     try:
         pending_delivery.mark_sent_ambiguous(
             win.root, win.recipient_key, win.delivery_id, claim_owner=win.claim_owner,
@@ -1739,10 +1747,13 @@ def _run_carrier(launch, claim, payload, observation, holder) -> int:
 
 def _emit_with_gates(
     launch: Launch, claim: ArmClaim, state: str, message: str, *, block: bool,
-    owner_closed: bool = False,
+    owner_closed: bool = False, receipt_binding: str | None = None,
 ) -> int:
-    """Fold the recipient's open gates into the receipt about to go out, emit
-    it, and only then ack them; seal the claim after the emit."""
+    """Fold the recipient's open gates into a bound receipt and emit it.
+
+    The arm is sealed after output, while delivery remains recoverable until
+    exact native recipient evidence settles it through the shared CAS.
+    """
 
     # The owner's own outcome, read before any gate is folded in (top review
     # R2-M1): a gate belongs to whoever raised it and only changes what this
@@ -1753,8 +1764,7 @@ def _emit_with_gates(
     # receipt whose snapshot read the owner row past open/running, or a
     # readiness helper that proved terminal quiescence, seals `ended`.
     terminal = state in TERMINAL_STATES and (owner_closed or _owner_closed(message))
-    announced: list[str] = []
-    gates = _gate_notices(launch, settle="sent-ambiguous", announced=announced)
+    gates = _gate_notices(launch, settle="sent-ambiguous")
     if gates:
         state = "attention"
         message = (
@@ -1762,14 +1772,9 @@ def _emit_with_gates(
             + " Current runtime notices: "
             + " ".join(gates)
         )
+    if receipt_binding:
+        message += "\n" + receipt_binding
     exit_code = emit_receipt(state, message, block=block)
-    root = launch.jobs.resolve(strict=False).parent
-    recipient_key = _recipient_key(launch)
-    for delivery_id in announced:
-        try:
-            pending_delivery.ack(root, recipient_key, delivery_id, acked_by=f"async-rewake:{launch.session_id}")
-        except pending_delivery.PendingDeliveryError:
-            pass
     return _ended(claim, exit_code, terminal=terminal)
 
 

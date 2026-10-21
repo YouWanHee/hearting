@@ -289,7 +289,8 @@ def retain_receiving_turn(batches: list[tuple[Path, list[dict]]], session_id: st
 
 
 def sweep_deliver(
-    root: Path, recipient_kind: str, session_id: str, *, now_ns: int | None = None
+    root: Path, recipient_kind: str, session_id: str, *, now_ns: int | None = None,
+    native_evidence: dict | None = None, receipt_observer=None,
 ) -> tuple[list[dict], int]:
     """Claude carrier 2 -- deliver, not merely refuse (2026-08-29 decision,
     supersedes the A-21 "surface nothing" slice for Claude).
@@ -311,12 +312,35 @@ def sweep_deliver(
     start_ns = time.monotonic_ns()
     claimed: list[dict] = []
     addressed, entry_count = addressed_records(root, recipient_kind, session_id)
+    from dispatch_recipient_receipt import settle_native_receipt
+    harness = ("claude" if recipient_kind.startswith("claude") else
+               "codex" if recipient_kind.startswith("codex") else
+               "opencode" if recipient_kind.startswith("opencode") else "")
+
+    def settle_observed(record):
+        evidence = native_evidence
+        if receipt_observer is not None:
+            try:
+                evidence = receipt_observer(root, record.get(STORAGE_KEY) or session_id, record)
+            except Exception:
+                evidence = None
+        try:
+            return settle_native_receipt(
+                root, record.get(STORAGE_KEY) or session_id, harness, session_id,
+                record, evidence,
+                acked_by=f"native-receipt:{harness}:{session_id}")
+        except Exception:
+            return {"received": False, "settled": False,
+                    "reason": "native-receipt-unknown"}
+
     # The session's own records, then the records of a cleared predecessor at the same pane
     # that the seat handover bound to it. Those stay stored (and acked) under the registered
     # parent; only the receiving session differs.
     for current in addressed:
         storage_key = current[STORAGE_KEY]
         delivery_id = current["delivery_id"]
+        if settle_observed(current)["received"]:
+            continue
         state = current.get("state")
         if state in {"claimed", "sent-ambiguous"}:
             try:
@@ -352,10 +376,27 @@ def sweep_deliver(
                 continue
         except OSError:
             continue
+        # Native reads are outside the record lock. Recheck both immutable
+        # identity and claim ownership after that read, immediately before this
+        # carrier returns context for output.
+        expected_identity = pending_delivery.received_ack_identity(
+            record, storage_key, delivery_id)
+        fresh = pending_delivery.read(root, storage_key, delivery_id)
+        if (fresh is None or pending_delivery.received_ack_identity(
+                fresh, storage_key, delivery_id) != expected_identity
+                or fresh.get("claim_owner") != claim_owner):
+            continue
+        if settle_observed({**fresh, STORAGE_KEY: storage_key})["received"]:
+            continue
+        final = pending_delivery.read(root, storage_key, delivery_id)
+        if (final is None or pending_delivery.received_ack_identity(
+                final, storage_key, delivery_id) != expected_identity
+                or final.get("claim_owner") != claim_owner):
+            continue
         # An answer another session sent: this session is the parent, so its carrier continues the route.
         from dispatch_supervision import CONTINUED_KEY, continue_for_parent
-        continued = continue_for_parent(record, session_id=session_id, recipient_kind=recipient_kind)
-        claimed.append({**record, STORAGE_KEY: storage_key, **({CONTINUED_KEY: continued} if continued else {})})
+        continued = continue_for_parent(final, session_id=session_id, recipient_kind=recipient_kind)
+        claimed.append({**final, STORAGE_KEY: storage_key, **({CONTINUED_KEY: continued} if continued else {})})
     elapsed_ns = time.monotonic_ns() - start_ns
     _append_self_instrumentation(root, elapsed_ns, entry_count, len(claimed))
     return claimed, entry_count
@@ -425,9 +466,21 @@ def delivery_context(batches: list[tuple[Path, list[dict]]]) -> str:
     notice_lines: list[str] = []
     lines: list[str] = []
     followups: list[str] = []
+    from dispatch_recipient_receipt import receipt_marker
+
+    def bound_text(root, record):
+        text = _bounded_receipt_text(record)
+        storage_key = record.get(STORAGE_KEY)
+        if not isinstance(storage_key, str) or not storage_key:
+            return text
+        try:
+            return text + "\n" + receipt_marker(record, storage_key)
+        except (KeyError, TypeError, ValueError, pending_delivery.PendingDeliveryError):
+            return text
+
     for root, records in batches:
         for record in records:
-            text = _bounded_receipt_text(record)
+            text = bound_text(root, record)
             if is_human_gate_record(record):
                 gate_lines.append(text)
                 continue
@@ -549,7 +602,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     import argparse
     parser = argparse.ArgumentParser(description=main.__doc__)
-    parser.add_argument("action", choices=("roots", "activate", "deliver", "ack", "release"))
+    parser.add_argument("action", choices=("roots", "activate", "deliver", "ack", "release", "settle"))
     parser.add_argument("--recipient-kind", default="")
     parser.add_argument("--session", default="")
     args = parser.parse_args(argv)
@@ -561,14 +614,83 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--session is required")
     if args.recipient_kind not in pending_delivery.RECIPIENT_KINDS:
         parser.error(f"unknown recipient kind {args.recipient_kind}")
+    if args.action == "settle":
+        try:
+            handed = json.load(sys.stdin)
+        except (ValueError, TypeError):
+            handed = {}
+        from dispatch_recipient_receipt import opencode_messages_evidence, settle_native_receipt
+        evidence = opencode_messages_evidence(handed.get("messages"), args.session)
+        requested = handed.get("records")
+        roots = _state_roots()
+        allowed_roots = {Path(root).resolve() for root in roots}
+        targets = []
+        if isinstance(requested, list):
+            for item in requested:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    root = Path(item["root"]).resolve()
+                    if root in allowed_roots:
+                        targets.append((root, item["storage_key"], item["delivery_id"], item))
+                except (KeyError, TypeError):
+                    continue
+        else:
+            for root in roots:
+                records, _count = addressed_records(root, args.recipient_kind, args.session)
+                targets.extend((root, r.get(STORAGE_KEY) or args.session,
+                                r["delivery_id"], None) for r in records)
+        received_ids, unknown_ids, settled_count = set(), set(), 0
+        remaining_context, remaining_handoffs = [], []
+        for root, storage, delivery_id, handed_record in targets:
+            try:
+                current = pending_delivery.read(root, storage, delivery_id)
+                if current is None:
+                    continue
+                outcome = settle_native_receipt(
+                    root, storage, "opencode", args.session, current, evidence,
+                    acked_by=f"native-receipt:opencode:{args.session}")
+                if outcome["received"]:
+                    received_ids.add(delivery_id)
+                    settled_count += int(outcome["settled"])
+                elif isinstance(requested, list):
+                    item = dict(handed_record or {})
+                    item.update(root=str(root), storage_key=storage, delivery_id=delivery_id,
+                                claim_owner=current.get("claim_owner"))
+                    remaining_context.append((root, [{**current, STORAGE_KEY: storage}]))
+                    remaining_handoffs.append(item)
+            except (OSError, KeyError, TypeError, pending_delivery.PendingDeliveryError):
+                if isinstance(requested, list) and isinstance(handed_record, dict):
+                    item = dict(handed_record)
+                    item.update(root=str(root), storage_key=storage, delivery_id=delivery_id)
+                    remaining_handoffs.append(item)
+                    unknown_ids.add(delivery_id)
+                continue
+        fallback_text = handed.get("text") if isinstance(handed.get("text"), str) else ""
+        output_text = (fallback_text if unknown_ids and not received_ids
+                       else delivery_context(remaining_context))
+        print(json.dumps({"received_ids": sorted(received_ids), "settled_count": settled_count,
+                          "unknown_ids": sorted(unknown_ids), "text": output_text,
+                          "records": remaining_handoffs},
+                         ensure_ascii=False), flush=True)
+        return 0
     if args.action in {"activate", "deliver"}:
         batches = []
+        try:
+            handed = json.load(sys.stdin) if args.action == "deliver" else {}
+        except (ValueError, TypeError):
+            handed = {}
+        from dispatch_recipient_receipt import opencode_messages_evidence
+        native_evidence = (opencode_messages_evidence(handed.get("messages"), args.session)
+                           if args.action == "deliver" else None)
         for root in _state_roots():
             if args.action == "activate":
                 records = activate(root, args.recipient_kind, args.session,
                                    request_recovery=False)
             else:
-                records, _entries = sweep_deliver(root, args.recipient_kind, args.session)
+                records, _entries = sweep_deliver(
+                    root, args.recipient_kind, args.session,
+                    native_evidence=native_evidence)
             if records:
                 batches.append((root, records))
         print(json.dumps({

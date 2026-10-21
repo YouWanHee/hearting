@@ -1459,17 +1459,50 @@ function createCompletionCarrier(ctx) {
     let timeout
     try {
       if (look && !(await owed(sid))) { log("skip", sid, "no-owed-record"); return }
-      const claimed = await command("deliver", sid)
+      // The shared courier checks native user-message evidence before claim.
+      // This read is scoped to the one session and its bounded recent history.
+      const beforeMessages = await compactMessages(ctx, sid)
+      const claimed = await command("deliver", sid, { messages: beforeMessages })
       if (!claimed?.text || !Array.isArray(claimed.records) || !claimed.records.length) {
         log("skip", sid, claimed === null ? "claim-unavailable" : "nothing-claimed"); return
       }
       log("claim", sid, "claimed", { deliveries: claimed.records.map(record => record.delivery_id) })
+      // A second native read is the final output/send recheck. If another
+      // carrier's exact receipt appeared after our first read, settle it here
+      // and never submit this copy to promptAsync.
+      const beforeSend = await command("settle", sid, {
+        records: claimed.records, messages: await compactMessages(ctx, sid), text: claimed.text,
+      })
+      if (!beforeSend) {
+        await command("release", sid, { records: claimed.records })
+        log("settle", sid, "native-recheck-unavailable-released")
+        return
+      }
+      if (!beforeSend.records?.length) {
+        log("settle", sid, "native-receipt-before-send", {
+          received: beforeSend?.received_ids?.length ?? null,
+          acked: beforeSend?.settled_count ?? null,
+        })
+        return
+      }
+      if (beforeSend.unknown_ids?.length && beforeSend.received_ids?.length) {
+        log("settle", sid, "partial-native-observation-held", {
+          received: beforeSend.received_ids.length, unknown: beforeSend.unknown_ids.length,
+        })
+        return
+      }
+      if (!beforeSend.text) {
+        await command("release", sid, { records: beforeSend.records })
+        log("settle", sid, "empty-context-released")
+        return
+      }
       let taken = false
       let promptReason = "not-accepted"
       let httpStatus
       try {
         const result = await Promise.race([
-          prompter().promptAsync({ path: { id: sid }, body: { parts: [{ type: "text", text: claimed.text }] } }),
+          prompter().promptAsync({ path: { id: sid },
+            body: { parts: [{ type: "text", text: beforeSend.text }] } }),
           new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("carrier-timeout")), 5000) }),
         ])
         taken = Boolean(result) && result.error == null && result.response?.ok !== false
@@ -1477,9 +1510,21 @@ function createCompletionCarrier(ctx) {
         promptReason = taken ? "accepted" : "not-accepted"
       } catch (error) { promptReason = error?.message === "carrier-timeout" ? "timeout" : "error" }
       log("prompt", sid, promptReason, { httpStatus })
-      // Taken: the session's next turn holds the receipt. Not taken: the next pass claims it again.
-      const settled = await command(taken ? "ack" : "release", sid, claimed)
-      log("settle", sid, taken ? "ack" : "release", { count: settled?.count ?? null })
+      // SDK acceptance and process completion are not receipt evidence. Settle
+      // only if this exact marker now exists in this native session's user
+      // history; otherwise release the claim for the existing fallback.
+      const observed = await command("settle", sid, {
+        records: beforeSend.records, messages: await compactMessages(ctx, sid), text: beforeSend.text,
+      })
+      const received = new Set(observed?.received_ids || [])
+      const releaseRecords = (beforeSend.records || []).filter(
+        record => !received.has(record.delivery_id))
+      const released = releaseRecords.length
+        ? await command("release", sid, { records: releaseRecords }) : { count: 0 }
+      log("settle", sid, received.size ? "native-receipt" : "release-fallback", {
+        received: received.size, acked: observed?.settled_count ?? null,
+        released: released?.count ?? null, prompt_accepted: taken,
+      })
     } catch (error) {
       log("skip", sid, "delivery-error", { error: String(error?.message || error).slice(0, 180) })
     } finally {
@@ -1824,8 +1869,36 @@ async function pendingPeerDelivery(ctx, sid) {
     })
     if (!Array.isArray(messages)) return "history-unavailable"
     if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
+    const dispatchReceiptIds = (text) => Array.from(String(text || "").matchAll(
+      /HEARTING_RECEIPT_V1\s+(delivery-[A-Za-z0-9._-]{1,128})\s+[0-9a-f]{64}/g),
+    match => match[1])
+    const nativeReceiptCheck = async (rows) => {
+      if (!Array.isArray(rows)) return new Set()
+      const result = await carrierCommand("settle", sid, { messages: rows })
+      return new Set(Array.isArray(result?.received_ids) ? result.received_ids : [])
+    }
+    const alreadyReceived = await nativeReceiptCheck(messages)
+    const recheckReceipt = async (row) => {
+      const ids = dispatchReceiptIds(row?.text)
+      if (!ids.length) return false
+      let latest
+      try {
+        latest = pendingPeerSdkData(await bounded(client.messages({
+          path: { id: sid }, query: { directory },
+        })))
+      } catch { return false }
+      if (!Array.isArray(latest) || !pendingPeerRoot(ctx, sid)) return false
+      const received = await nativeReceiptCheck(latest)
+      return ids.some(id => received.has(id))
+    }
     for (const row of rows.slice(0, 3)) {
       if (!row || typeof row.ref !== "string" || !row.ref || typeof row.text !== "string") continue
+      if (dispatchReceiptIds(row.text).some(id => alreadyReceived.has(id))) {
+        pendingPeerTrace(ctx, sid, "dispatch-receipt", "already-received", {
+          refs: [row.ref],
+        })
+        continue
+      }
       const created = Number(row.created) * 1000
       const matches = messages.filter((m) => m?.info?.sessionID === sid && m.info.role === "user"
         && promptText(m) === row.text
@@ -1847,6 +1920,12 @@ async function pendingPeerDelivery(ctx, sid) {
         // Continue the already persisted noReply message by its native ID. The
         // exact text is never submitted a second time after an ambiguous result.
         if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
+        if (await recheckReceipt(row)) {
+          pendingPeerTrace(ctx, sid, "dispatch-receipt", "received-before-resume", {
+            refs: [row.ref], message_id_present: !!mid,
+          })
+          continue
+        }
         if (!pendingPeerTransition(sid, ["--resuming", row.ref, "--message-id", mid])) continue
         const resumed = await bounded(client.promptAsync({ path: { id: sid }, query: { directory },
           body: { messageID: mid, parts: [] } }))
@@ -1877,6 +1956,13 @@ async function pendingPeerDelivery(ctx, sid) {
       if (reserved.state !== "pending") { releaseReservation(); return "claim-state-mismatch" }
       if (reserved.text !== row.text) { releaseReservation(); return "claim-body-mismatch" }
       if (!pendingPeerRoot(ctx, sid)) { releaseReservation(); return "native-origin-changed" }
+      if (await recheckReceipt(reserved)) {
+        releaseReservation()
+        pendingPeerTrace(ctx, sid, "dispatch-receipt", "received-before-write", {
+          refs: [row.ref],
+        })
+        continue
+      }
       const beginStarted = performance.now()
       const claimed = pendingPeerCommand(sid, ["--begin-write", row.ref,
         "--claim-token", reserved.rpc_claim?.token || "",

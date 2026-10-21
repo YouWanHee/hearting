@@ -2423,7 +2423,7 @@ class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
         self.assertEqual(code, 0)
         self.assertEqual(rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))["state"], "lapsed")
 
-    def test_a_winning_carrier_acks_a_folded_gate_only_after_the_receipt_went_out(self):
+    def test_a_winning_carrier_keeps_a_folded_gate_ambiguous_after_output(self):
         self._open_row()
         self._close_and_materialize()
         gate_id = self._gate()
@@ -2431,7 +2431,10 @@ class LosingCarrierLeavesGatesTest(CarrierOneClaimGateTest):
             code, out, err = self._run_main()
         self.assertEqual(code, 2)
         self.assertIn("required_action=human-gate:frame-review", err)
-        self.assertEqual(rewake.pending_delivery.read(self.root, "session-1", gate_id)["state"], "acked")
+        gate = rewake.pending_delivery.read(self.root, "session-1", gate_id)
+        self.assertEqual(gate["state"], "sent-ambiguous")
+        from dispatch_recipient_receipt import receipt_marker
+        self.assertIn(receipt_marker(gate, "session-1"), err)
         # and when the emit itself fails, the gate stays retryable
         rewake.arm_path(self.jobs, "att-owner-1").unlink()   # a fresh claim for the second run
         self._open_row()
@@ -2660,7 +2663,7 @@ class CarrierExitRecordTest(unittest.TestCase):
             self.assertEqual(rewake._observe_carrier(rewake.Launch(claim.attempt_id, self.fixture.jobs, claim.session_id), claim, {}), 2)
         self.assertEqual(foreign.read_text(), "keep me")
 
-    def test_append_failure_preserves_completed_claim_and_folded_gate_ack(self):
+    def test_append_failure_preserves_completed_claim_and_folded_gate_recovery(self):
         self.fixture._open_row()
         record_path = self.fixture._close_and_materialize()
         gate_id = self.fixture._gate()
@@ -2672,7 +2675,10 @@ class CarrierExitRecordTest(unittest.TestCase):
         self.assertTrue(out)
         self.assertIn("required_action=human-gate:frame-review", err)
         self.assertEqual(json.loads(record_path.read_text())["state"], "sent-ambiguous")
-        self.assertEqual(rewake.pending_delivery.read(self.fixture.root, "session-1", gate_id)["state"], "acked")
+        gate = rewake.pending_delivery.read(self.fixture.root, "session-1", gate_id)
+        self.assertEqual(gate["state"], "sent-ambiguous")
+        from dispatch_recipient_receipt import receipt_marker
+        self.assertIn(receipt_marker(gate, "session-1"), err)
         self.assertEqual(rewake._read_arm(self.path)["state"], "ended")
 
     def test_term_and_hup_record_then_keep_native_signal_exit(self):
@@ -3468,6 +3474,109 @@ class SupervisionWakeRearmTest(unittest.TestCase):
         self.assertEqual(json.loads(completion.read_text())["state"], "sent-ambiguous")
         self.assertEqual(rewake._read_arm(claim.path)["state"], "ended")
         self.assertEqual(rewake.registry_launch(self._parent_call()).reason, "ended")
+
+    def test_native_supervision_receipt_settles_delivery_but_not_open_owner(self):
+        import dispatch_recipient_receipt as recipient_receipt
+        code, text = self._run("gate")
+        self.assertEqual(code, 2)
+        record = rewake.pending_delivery.read(
+            self.root, "session-1", self.notice["delivery_id"])
+        self.assertEqual(record["receipt"]["kind"], "supervision")
+        evidence = recipient_receipt.claude_feedback_evidence([{
+            "type": "user", "sessionId": "session-1", "summary": "Stop hook feedback",
+            "message": {"content": text},
+        }], "session-1")
+        settled = recipient_receipt.settle_native_receipt(
+            self.root, "session-1", "claude", "session-1", record, evidence,
+            acked_by="native-receipt:claude:session-1")
+        self.assertTrue(settled["received"])
+        self.assertTrue(settled["settled"])
+        self.assertEqual(rewake.pending_delivery.read(
+            self.root, "session-1", self.notice["delivery_id"])["state"], "acked")
+        from dispatch_session_sweep import sweep_deliver
+        self.assertEqual(sweep_deliver(
+            self.root, "claude-parent-runtime", "session-1")[0], [])
+        duty, = [item for item in rewake.peer_obligations.ObligationStore(self.root).list()
+                 if item["intent"]["identity"].get("attempt_id") == "att-owner-1"]
+        self.assertEqual(duty["state"], "pending")
+        owner = JOIN.current_attempt_row(self.jobs, "att-owner-1")
+        self.assertEqual(owner.status, "open")
+        self.assertEqual(json.loads(rewake.arm_path(
+            self.jobs, "att-owner-1").read_text())["state"], "gate-wake-sent")
+
+        self._dead_holder()
+        launch, claim = rewake.registry_launch(self._parent_call())
+        self.assertEqual(launch.armed, "registry-rearm")
+        self.assertEqual(claim.arms, 2)
+        self.assertEqual(JOIN.current_attempt_row(self.jobs, "att-owner-1").status, "open")
+        self._dead_holder()
+        completion = self._complete_owner()
+        self.assertNotEqual(completion.stem, self.notice["delivery_id"])
+        code, completion_text = self._run("ready", self._parent_call())
+        self.assertEqual(code, 2)
+        self.assertIn("state=success", completion_text)
+        completion_record = rewake.pending_delivery.read(
+            self.root, "session-1", completion.stem)
+        self.assertEqual(completion_record["state"], "sent-ambiguous")
+        self.assertIn(recipient_receipt.receipt_marker(completion_record, "session-1"),
+                      completion_text)
+
+    def test_supervision_ack_write_failure_keeps_watch_until_native_retry(self):
+        import dispatch_recipient_receipt as recipient_receipt
+        code, text = self._run("gate")
+        self.assertEqual(code, 2)
+        did = self.notice["delivery_id"]
+        record = rewake.pending_delivery.read(self.root, "session-1", did)
+        evidence = recipient_receipt.claude_feedback_evidence([{
+            "type": "user", "sessionId": "session-1", "summary": "Stop hook feedback",
+            "message": {"content": text},
+        }], "session-1")
+        with mock.patch.object(rewake.pending_delivery, "ack_received",
+                               side_effect=OSError("simulated receipt write failure")):
+            first = recipient_receipt.settle_native_receipt(
+                self.root, "session-1", "claude", "session-1", record, evidence,
+                acked_by="native-receipt:claude:session-1")
+        self.assertTrue(first["received"])
+        self.assertFalse(first["settled"])
+        self.assertEqual(rewake.pending_delivery.read(self.root, "session-1", did)["state"],
+                         "pending")
+        self.assertEqual(JOIN.current_attempt_row(self.jobs, "att-owner-1").status, "open")
+        duty, = [item for item in rewake.peer_obligations.ObligationStore(self.root).list()
+                 if item["intent"]["identity"].get("attempt_id") == "att-owner-1"]
+        self.assertEqual(duty["state"], "pending")
+        self._dead_holder()
+        self.assertEqual(rewake.registry_launch(self._parent_call()).reason, "gate-open")
+
+        retry = recipient_receipt.settle_native_receipt(
+            self.root, "session-1", "claude", "session-1", record, evidence,
+            acked_by="native-receipt:claude:session-1")
+        self.assertTrue(retry["received"])
+        self.assertTrue(retry["settled"])
+        self.assertEqual(rewake.pending_delivery.read(self.root, "session-1", did)["state"],
+                         "acked")
+        from dispatch_session_sweep import sweep_deliver
+        self.assertEqual(sweep_deliver(
+            self.root, "claude-parent-runtime", "session-1")[0], [])
+        self.assertEqual(JOIN.current_attempt_row(self.jobs, "att-owner-1").status, "open")
+        duty, = [item for item in rewake.peer_obligations.ObligationStore(self.root).list()
+                 if item["intent"]["identity"].get("attempt_id") == "att-owner-1"]
+        self.assertEqual(duty["state"], "pending")
+
+        self._dead_holder()
+        launch, claim = rewake.registry_launch(self._parent_call())
+        self.assertEqual(launch.armed, "registry-rearm")
+        self.assertEqual(claim.arms, 2)
+        self._dead_holder()
+        completion = self._complete_owner()
+        self.assertNotEqual(completion.stem, did)
+        code, completion_text = self._run("ready", self._parent_call())
+        self.assertEqual(code, 2)
+        self.assertIn("state=success", completion_text)
+        completion_record = rewake.pending_delivery.read(
+            self.root, "session-1", completion.stem)
+        self.assertEqual(completion_record["state"], "sent-ambiguous")
+        self.assertIn(recipient_receipt.receipt_marker(completion_record, "session-1"),
+                      completion_text)
 
     def test_lost_wake_is_not_acked_and_successor_claim_is_preserved(self):
         pending = rewake.pending_delivery

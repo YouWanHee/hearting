@@ -21,6 +21,7 @@ seen at the latest on the user's next prompt.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -77,6 +78,19 @@ def _process_session(payload: object, session_id: str) -> int:
         return 0
     seen: set[Path] = set()
     batches: list[tuple[Path, list[dict]]] = []
+    native_evidence = None
+    if _event_name(payload) == "UserPromptSubmit" and isinstance(payload, dict):
+        transcript_path = payload.get("transcript_path", payload.get("transcriptPath"))
+        cwd = payload.get("cwd")
+        if isinstance(transcript_path, str) and isinstance(cwd, str):
+            try:
+                from dispatch_recipient_receipt import claude_transcript_evidence
+                runtime_home = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+                native_evidence = claude_transcript_evidence(
+                    transcript_path=transcript_path, session_id=session_id, cwd=cwd,
+                    expected_cwd=os.getcwd(), runtime_home=runtime_home)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                native_evidence = None
     for root in roots:
         if root in seen:
             continue
@@ -89,7 +103,8 @@ def _process_session(payload: object, session_id: str) -> int:
             if _event_name(payload) == "SessionStart":
                 records = activate(root, RECIPIENT_KIND, session_id, request_recovery=False)
             else:
-                records, _entries = sweep_deliver(root, RECIPIENT_KIND, session_id)
+                records, _entries = sweep_deliver(
+                    root, RECIPIENT_KIND, session_id, native_evidence=native_evidence)
         except Exception:  # noqa: BLE001 -- fail-open (§13.33.1-(3))
             continue
         if records:

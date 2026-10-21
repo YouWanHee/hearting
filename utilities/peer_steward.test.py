@@ -10658,5 +10658,48 @@ class NativeReceivingTurnSettlementTests(unittest.TestCase):
             self.assertEqual(duty["observation"]["continuation_source_turn"], "turn-exact")
 
 
+class NativeDispatchReceiptTest(unittest.TestCase):
+    def test_peer_courier_settles_only_verified_claude_session_feedback(self):
+        import dispatch_pending_delivery as pending
+        import dispatch_recipient_receipt as recipient_receipt
+        import claude_project_dir
+
+        with tempfile.TemporaryDirectory(prefix="peer-native-receipt-") as tmp:
+            base = Path(tmp)
+            root = base / "dispatch"
+            cwd = base / "repo"
+            cwd.mkdir()
+            runtime_home = base / "claude-home"
+            sid = "claude-parent-session"
+            did = "delivery-" + "e" * 64
+            body = {"schema_version": 1, "kind": "supervision",
+                    "owner_attempt_id": "att-owner", "reason": "waiting"}
+            record = pending.create(
+                root, recipient_kind="claude-parent-runtime", recipient_key=sid,
+                delivery_id=did, session_generation="", session_generation_supported="0",
+                attempt_ids=["att-owner"], parent_attempt_id="att-owner",
+                route_id="route-peer", route_node="execute", receipt=body,
+                receipt_digest=pending._canonical_receipt_digest(body),
+                row_revisions={"att-owner": "revision-1"})
+            pending.claim(root, sid, did, claim_owner="rewake", lease_seconds=30,
+                          require_generation_proof=False)
+            pending.mark_sent_ambiguous(root, sid, did, claim_owner="rewake")
+            record = pending.read(root, sid, did)
+            receipt_token = recipient_receipt.receipt_marker(record, sid)
+            project = runtime_home / "projects" / claude_project_dir.encode_project_dir(str(cwd))
+            project.mkdir(parents=True)
+            transcript = project / f"{sid}.jsonl"
+            transcript.write_text(json.dumps({
+                "type": "user", "sessionId": sid, "summary": "Stop hook feedback",
+                "message": {"content": receipt_token},
+            }) + "\n", encoding="utf-8")
+            row = SimpleNamespace(metadata={"parent_cwd": str(cwd)})
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(runtime_home)}):
+                received = peer_steward._settle_claude_native_dispatch_receipt(
+                    root, sid, row, sid, record)
+            self.assertTrue(received)
+            self.assertEqual(pending.read(root, sid, did)["state"], "acked")
+
+
 if __name__ == "__main__":
     unittest.main()
