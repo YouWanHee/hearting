@@ -1723,15 +1723,17 @@ the cancelled row from its active set without granting successor readiness.
 (`utilities/verification-background-lease.py`) owns everything its command
 starts: it is the command's child subreaper and tags the command's environment,
 and when the command exits, expires or the lease is stopped it ends whatever is
-still in that scope, detached fixtures included. The scope's resident memory has
-one ceiling: 16 GiB, or a quarter of host memory when smaller, unless
-`--memory-budget SIZE` replaces it with the value an approved task or receipt
-names; the lease record and the 125 message name which one applied. Past it the
-lease ends the scope and returns 125, so a leaking check ends instead of other
-work on a shared host. The test runner likewise reaps each suite's fixtures when
-that suite ends, and ends its running suites when it is stopped. A peer
-obligation runner whose state root was removed or replaced ends on its next
-pass.
+still in that scope, detached fixtures included. The scope's memory, measured as
+its proportional set size (shared pages counted once; resident size where that
+is unreadable), has one ceiling: 16 GiB, or a quarter of host memory when
+smaller, unless `--memory-budget SIZE` replaces it with the value an approved
+task or receipt names; the lease record and the 125 message name which one
+applied. Past it the lease ends the scope and returns 125, so a leaking check
+ends instead of other work on a shared host. The lease prints the scope's peak,
+its measure and sampling interval on every exit. The test runner likewise reaps
+each suite's fixtures when that suite ends, and ends its running suites when it
+is stopped. A peer obligation runner whose state root was removed or replaced
+ends on its next pass.
 
 **Exact reconcile stays attempt-scoped.** A normal `dispatch-reconcile
 --attempt <id> --apply` covers that attempt, its process drain, and its
