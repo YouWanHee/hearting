@@ -46,8 +46,9 @@ seconds). The wait is not a promise about provider cache lifetime. Current adapt
 do not expose a verified request cache expiry, so the configured wait is used and
 `cache_margin_seconds` is recorded but not applied. Provider/request cache expiry stays
 unknown unless the actual configuration and request evidence establish it.
-When the exact idle request arrives, use this conversation to write the normal session card
-and run the existing enqueue command. Do not resume the work: after clear, the successor is
+When the exact idle or compact request arrives, answer it with the card itself between the
+two marker lines the request names, with no tool call; the turn-end hook stores it and queues
+the tidy. Do not resume the work: after clear, the successor is
 asked for a brief card-based status and to wait for the next user input. New input, a draft,
 form/approval, busy or unknown state, an unknown token count, or a different session cancels
 or withholds the automatic request. Duplicate events keep the original due time. Only a real
@@ -57,24 +58,22 @@ Modes: `정리` (default), `정리만` (same, but keep this window) and `인계 
 work, then pass the card to a peer session; only this calling window is cleared, never the
 target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
 
-For a new successor at this seat, replace the clear sequence below with `peer-steward.py start <name> --kind <harness>` (beside this pane by default) → `handoff` → `enqueue --no-clear`; after its ACK and the predecessor's final idle result, the successor uses `peer-steward.py retire <predecessor>` (§5.14).
+For a new successor at this seat, run `peer-steward.py start <name> --kind <harness>` (beside this pane by default), then the step-1 command with `--no-clear --handoff <name>`; after its ACK and the predecessor's final idle result, the successor uses `peer-steward.py retire <predecessor>` (§5.14).
 
 ## Steps
 
-1. **Card.** Write six fields yourself from the conversation you already hold, in
-   the user's language, and pipe them in (about 90 lines at most). Keep these four
-   continuation fields first: what is in progress, the decisions still waiting,
-   what to do next, and the related
-   paths, PRs and sessions (Fleet tag·pane, role in parentheses; herdr name·pane
-   when untagged). Then add a few lines for today's work, pointing to its PR,
-   installed version or result file, and short quotations of user instructions
-   marked finished, remaining or deferred. Point to artifacts rather than copying
-   their reports. The start preview still shows the bounded beginning; the rest
-   is in the card file. The memory worker's `일부만 읽음(범위)` describes its own
-   input, not the card you wrote.
+One tool call, then one short reply. Do not load anything else first.
+
+1. **Card + queue, in one command.** Write six fields yourself from the conversation you
+   already hold, in the user's language (about 90 lines at most). Keep these four
+   continuation fields first: what is in progress, the decisions still waiting, what to do
+   next, and the related paths, PRs and sessions (Fleet tag·pane, role in parentheses;
+   herdr name·pane when untagged). Then add a few lines for today's work, pointing to its
+   PR, installed version or result file, and short quotations of user instructions marked
+   finished, remaining or deferred. Point to artifacts rather than copying their reports.
 
    ```bash
-   python3 "$AGENT_HOME/utilities/session_tidy.py" card <<'CARD'
+   python3 "$AGENT_HOME/utilities/session_tidy.py" tidy <<'CARD'
    진행 중: …
    기다리는 결정: …
    다음 할 일: …
@@ -84,58 +83,32 @@ For a new successor at this seat, replace the clear sequence below with `peer-st
    CARD
    ```
 
-2. **Queue the tidy.** Do not wait for it. For `정리만` add `--no-clear`; when the user
-   asked to stop after tidying ("정리하고 끝"), add `--no-continue`.
+   Add `--no-clear` for `정리만`, `--no-continue` when the user asked to stop after tidying
+   ("정리하고 끝"), and `--handoff <받을 세션>` for `인계` to an already-running target.
+   The command writes the card and, only if the card was written, queues the memory tidy
+   and books this window's clear (the same `card` then `enqueue` meaning; both stay
+   available separately). It returns at once; nothing waits for the memory tidy.
 
-   ```bash
-   python3 "$AGENT_HOME/utilities/session_tidy.py" enqueue               # 정리 / 인계
-   python3 "$AGENT_HOME/utilities/session_tidy.py" enqueue --no-clear    # 정리만
-   python3 "$AGENT_HOME/utilities/session_tidy.py" enqueue --no-continue # 정리하고 끝
-   ```
+2. **Reply with its `say=` line only** and start no more work after a scheduled clear.
+   For `--handoff`, also report its `prompted=…` line as printed; do not retry or send the
+   card any other way. A failed handoff does not change the clear of this window.
 
-   It prints one line and returns. A detached runner reads the conversation after the
-   last tidy (plus recent untidied sessions of this seat), starts one registered memory
-   worker, applies its proposal through `mem tidy-apply`, and leaves one result line for
-   the next session of this seat — with the command that undoes it. A long conversation is
-   read from its recent end first; the line says `일부만 읽음(범위)` when an older part is
-   still waiting for the next tidy. A failure leaves the
-   card as it was and says so in one line; if some writes had landed or may have landed, that
-   line counts them and keeps the undo command.
-
-   Inside herdr the same call books the window's clear (`clear=scheduled`): once this turn
-   has ended and the window is idle, with no form open and an empty input box, the
-   harness's own new-conversation command is typed once (Claude `/clear`, Codex `/clear`,
-   OpenCode `/new`) and the new session receives the card. Once the clear is confirmed and
-   the new session waits with an empty box and no message yet, the same helper types
-   `이어서해` once, so it carries on from the card. Neither step waits for the memory tidy.
-   A prompt typed after the card cancels the clear (`clear=skipped`); a prompt typed into the
-   new session first, a new card or a handoff cancels the `이어서해` quietly. Anything else
-   the helper cannot decide leaves the window as it is plus one result line at the next prompt.
-
-3. **Handoff only.** For `인계 <받을 세션>` to an already-running target, after step 2:
-
-   ```bash
-   python3 "$AGENT_HOME/utilities/session_tidy.py" handoff <target>
-   ```
-
-   Report its one line as printed (`prompted=true|failed|queued|unverified` and the exit
-   code); do not retry or send the card any other way. A failed handoff does not change the
-   clear of this window; they are separate results. Confirmed/retained delivery marks this card handed off; failure retains it.
-   Ordinary peer messages and cards have no session-tidy accept command or
-   successor authority. A confirmed same-seat clear uses the existing seat
-   handover automatically. For a valid typed cross-seat handoff, read the card
-   and referenced documents, then run only the exact receiver command supplied
-   by shared guidance; do not reconstruct its ref or receiver identity.
-   Explicit acceptance schedules its reply and normal predecessor retire
-   reservation. Delivery/queue/ACK alone never accepts.
-
-4. **Report one line**, from the `clear=` word of step 2 (do not start more work after a
-   `clear=scheduled`):
-   `clear=scheduled` → "곧 이 창이 자동으로 비워지고, 새 세션이 카드를 받아 이어서 진행합니다.";
-   `clear=scheduled continue=off`, or `clear=scheduled` with a handoff → "곧 이 창이 자동으로 비워집니다.";
-   `clear=off` → "이 창은 그대로 둡니다. 이제 /clear 하거나 닫아도 됩니다.";
-   `clear=manual hint=<cmd>` or `clear=skipped` → "이제 <cmd> 하거나 닫아도 됩니다."
-   (`<cmd>` is the hint, or `/clear` after `skipped`; OpenCode's is `/new`).
+What happens behind it: a detached runner reads the conversation after the last tidy
+(plus recent untidied sessions of this seat), starts one registered memory worker, applies
+its proposal through `mem tidy-apply`, and leaves one result line — with its undo command —
+for the next session of this seat. A long conversation is read from its recent end first;
+the line says `일부만 읽음(범위)` when an older part still waits for the next tidy. Inside
+herdr, once this turn has ended and the window is idle with no form and an empty input box,
+the harness's own new-conversation command is typed once (Claude `/clear`, Codex `/clear`,
+OpenCode `/new`), the new session receives the card, and `이어서해` is typed once into it.
+A prompt typed after the card cancels the clear (`clear=skipped`); a prompt typed into the
+new session first, a new card or a handoff cancels the `이어서해` quietly. Anything else the
+helper cannot decide leaves the window as it is plus one result line at the next prompt.
+A handoff clears only this calling window, never the target. Confirmed/retained delivery
+marks this card handed off; failure retains it. Ordinary peer messages and cards have no
+session-tidy accept command or successor authority. For a valid typed cross-seat handoff,
+read the card and referenced documents, then run only the exact receiver command supplied
+by shared guidance; delivery/queue/ACK alone never accepts.
 
 A route that was still running when the window was cleared is taken over by the new session at
 the same pane: its card carries one line with the verified route and the usual resume command
