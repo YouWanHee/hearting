@@ -1171,6 +1171,40 @@ class TailFirstReadingTest(TidyCase):
 class CompactObservationTest(TidyCase):
     SID = "sid-compact"
 
+    def test_last_reply_priority_precedes_conflicting_summary(self):
+        summary = "요약 원문: 마지막 요청은 전달되지 않았고 결과도 미완료입니다."
+        priority = "위 마지막 답과 요약 뒤 그대로 남은 대화를 요약의 미전달·미완료 서술보다 우선하세요."
+        body = st._compact_body({
+            "summary": summary,
+            "last_reply": {"first_line": "요청을 처리했고 결과는 42입니다.",
+                           "timestamp": "2026-10-21T13:46:13.510Z"},
+            "recent_preserved": "[assistant] 요약 뒤 남은 확인 기록",
+            "recent_post": "[user] 확인 질문",
+        })
+        self.assertIn(priority, body)
+        self.assertLess(body.index("요청을 처리했고 결과는 42입니다."), body.index(priority))
+        self.assertLess(body.index(priority), body.index(summary))
+        self.assertIn(summary, body)
+        self.assertIn("[assistant] 요약 뒤 남은 확인 기록", body)
+
+    def test_compact_instructions_conditionally_account_for_preserved_tail(self):
+        instructions = st.COMPACT_CARD_INSTRUCTIONS
+        self.assertIn("may remain verbatim", instructions)
+        self.assertIn("Do not infer that an omitted request or reply was undelivered", instructions)
+        self.assertIn("which last turn this summary covers", instructions)
+        self.assertIn("preserved transcript needs checking", instructions)
+        self.assertIn("Do not assume a later turn is visible or available", instructions)
+        claude_before = st.run_hook("claude", "compact", self.SID, phase="before")
+        opencode_before = st.run_hook("opencode", "compact", self.SID, phase="before")
+        self.assertEqual(claude_before, instructions)
+        self.assertEqual(opencode_before, instructions)
+
+    def test_no_last_reply_has_no_last_reply_priority(self):
+        summary = "요약 원문: 작업 중입니다."
+        body = st._compact_body({"summary": summary, "recent_post": "[assistant] 뒤 답"})
+        self.assertTrue(body.startswith(summary))
+        self.assertNotIn("요약의 미전달·미완료", body)
+
     def append_claude(self, path, row):
         with path.open("ab") as handle:
             handle.write((json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))

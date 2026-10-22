@@ -114,6 +114,10 @@ COMPACT_CARD_INSTRUCTIONS = (
     "original identifier; preserve document/revision and checkpoint references when they "
     "affect meaning. Keep failed, interrupted and unfinished states with their next action, "
     "and leave unexplained identifiers unresolved."
+    " Some recent turns may remain verbatim after compaction, depending on the runtime. "
+    "Do not infer that an omitted request or reply was undelivered. When known, say which "
+    "last turn this summary covers; note when the preserved transcript needs checking. "
+    "Do not assume a later turn is visible or available."
 )
 
 
@@ -1581,7 +1585,9 @@ def _compact_body(compact: dict) -> str:
         reply_line = f"압축 직전 마지막 답 ({when}): {str(reply['first_line'])[:1024]}\n\n"
     caution = "\n\n이 요약이 보지 못한 최근 대화가 있을 수 있습니다. 이어서 진행하기 전에 확인하세요."
     path = f"\n원본 대화 기록: {source}" if source else "\n원본 대화 기록 경로를 확인할 수 없습니다."
-    result = reply_line + summary_text + caution + path + preserved_footer + footer
+    reply_priority = ("위 마지막 답과 요약 뒤 그대로 남은 대화를 요약의 미전달·미완료 "
+                      "서술보다 우선하세요.\n\n") if reply_line else ""
+    result = reply_line + reply_priority + summary_text + caution + path + preserved_footer + footer
     if len(result.encode("utf-8")) > COMPACT_CARD_BODY_MAX_BYTES:
         raise ValueError("compact card exceeds bounded size")
     return result
