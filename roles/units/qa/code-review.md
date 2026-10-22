@@ -96,6 +96,10 @@ gate must converge, not peel one layer per pass.
 - **Bug potential**: runtime errors, logic errors, type mismatches
 - **Performance**: unnecessary computation, memory waste, inefficient data loading
 - **Code quality**: duplication, unclear names, overly long functions, magic numbers
+- **Scope and cost**: compare actual changed files/lines with the plan estimate;
+  check whether existing assets were extended where practical, whether a parallel
+  path or verification duplicates existing work, and whether long checks fit the
+  attempt budget. Estimates inform review; they are not caps.
 - **Maintainability**: hardcoded paths, config/code separation, missing error handling
 - **Framework-specific pitfalls** (e.g. PyTorch: missing `.detach()`, memory leaks,
   device mismatches, in-place operations)

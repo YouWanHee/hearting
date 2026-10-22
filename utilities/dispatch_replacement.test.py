@@ -3219,6 +3219,100 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(sealed.read_bytes(), before_bytes)
 
 
+class StageRecoveryProgressTest(unittest.TestCase):
+    def test_timeout_and_no_progress_report_bounded_git_and_cycle_observations(self):
+        import artifact_context
+        from datetime import datetime, timedelta, timezone
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / 'repo'; repo.mkdir()
+            subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            subprocess.run(['git', '-C', str(repo), 'config', 'user.email', 'fixture@example.com'], check=True)
+            subprocess.run(['git', '-C', str(repo), 'config', 'user.name', 'Fixture'], check=True)
+            (repo / 'base.py').write_text('base\n')
+            subprocess.run(['git', '-C', str(repo), 'add', 'base.py'], check=True)
+            subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'launch base'], check=True)
+            launch_head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+            for name in ('first', 'second'):
+                (repo / f'{name}.py').write_text(name + '\n')
+                subprocess.run(['git', '-C', str(repo), 'add', f'{name}.py'], check=True)
+                subprocess.run(['git', '-C', str(repo), 'commit', '-qm', f'{name} commit'], check=True)
+            (repo / 'tests').mkdir()
+            (repo / 'tests' / 'original file.py').write_text('rename me\n')
+            subprocess.run(['git', '-C', str(repo), 'add', 'tests/original file.py'], check=True)
+            subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'add scoped path'], check=True)
+            (repo / 'tests' / 'original file.py').rename(repo / 'tests' / 'renamed\npath.py')
+            subprocess.run(['git', '-C', str(repo), 'add', '-A'], check=True)
+            (repo / 'tests' / 'left uncommitted.py').write_text('pending\n')
+            (repo / '.agent_reports').mkdir()
+            (repo / '.agent_reports' / 'foreign.md').write_text('artifact shadow\n')
+
+            output = root / 'cycle' / 'artifacts'
+            (output / 'dev_logs').mkdir(parents=True)
+            (output / 'dev_logs' / 'changed.md').write_text('metadata only\n')
+            (output / 'other').mkdir()
+            (output / 'other' / 'unscoped.md').write_text('ignore\n')
+            route = {
+                'route_id': 'rt-progress-fixture', 'route_hash': 'fixture',
+                'artifact_root': str(root), 'cwd': str(repo),
+                'nodes': [{'id': 'execute', 'outputs': ['dev_logs/**'],
+                           'write_scope': ['source/**', 'tests/**', 'dev_logs/**']}],
+            }
+            route_path = root / 'route.json'; route_path.write_text(json.dumps(route))
+            fixed_now = datetime.now(timezone.utc)
+            start = (fixed_now - timedelta(minutes=5)).isoformat()
+            jobs = root / 'jobs.log'; jobs.write_text('')
+            with mock.patch.object(D._route_module(), 'verify_route'), \
+                 mock.patch.object(artifact_context, 'resolve_context',
+                                   return_value=SimpleNamespace(output_dir=output)):
+                for note in ('dead-timeout', 'dead-no-progress'):
+                    meta = {'worker_type': 'stage', 'route_node': 'execute',
+                            'route_file': str(route_path), 'note': note,
+                            'failure_class': 'runtime', 'launch_head': launch_head}
+                    block = R._stage_progress_block(
+                        jobs, 'att-stage-failed', [start, 'done', '', '', '', ''], meta, [])
+                    self.assertIn('Observed prior-attempt progress', block)
+                    self.assertIn('end unavailable; observed at', block)
+                    self.assertIn('interval since recorded start', block)
+                    self.assertIn('first commit', block)
+                    self.assertIn('second commit', block)
+                    self.assertIn('tests/left uncommitted.py', block)
+                    self.assertIn('tests/original file.py', block)
+                    self.assertIn('tests/renamed\npath.py', block)
+                    self.assertNotIn('.agent_reports/foreign.md', block)
+                    self.assertIn('dev_logs/changed.md', block)
+                    self.assertNotIn('other/unscoped.md', block)
+                    self.assertIn('mtime is not authorship proof', block)
+                    jobs.write_text(
+                        f'{start}\tdone\t{repo}\t{repo}\tstage\t'
+                        + ','.join(f'{key}={value}' for key, value in {
+                            **meta, 'attempt_id': 'att-stage-failed',
+                            'route_id': route['route_id'],
+                        }.items()) + '\n')
+                    prompt_context = R.recovery_instructions(SimpleNamespace(
+                        automatic_retry_of='att-stage-failed', worker_type='stage',
+                        jobs_path=jobs, attempt_id='att-next-stage'))
+                    self.assertIn('Observed prior-attempt progress', prompt_context)
+                    self.assertIn('second commit', prompt_context)
+                self.assertEqual(R._stage_progress_block(
+                    jobs, 'att-stage-failed', ['now', 'done', '', '', '', ''],
+                    {'worker_type': 'stage', 'route_node': 'execute',
+                     'route_file': str(route_path), 'note': 'context-limit'}, []), '')
+                no_head = R._stage_progress_block(
+                    jobs, 'att-stage-failed', [start, 'done', '', '', '', ''],
+                    {'worker_type': 'stage', 'route_node': 'execute',
+                     'route_file': str(route_path), 'note': 'dead-timeout'}, [])
+                self.assertIn('launch_head unavailable; commit range not observed', no_head)
+                with mock.patch.object(R, '_git_readonly', return_value=None):
+                    unavailable = R._stage_progress_block(
+                        jobs, 'att-stage-failed', [start, 'done', '', '', '', ''],
+                        {'worker_type': 'stage', 'route_node': 'execute',
+                         'route_file': str(route_path), 'note': 'dead-timeout',
+                         'launch_head': launch_head}, [])
+                self.assertIn('current worktree HEAD unavailable', unavailable)
+                self.assertIn('scoped uncommitted paths unavailable', unavailable)
+
+
 class ReplacementReuseCurrencyTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

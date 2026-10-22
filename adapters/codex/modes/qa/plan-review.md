@@ -73,6 +73,12 @@ smaller budget.
    - Does every risky step have a concrete verification method and rollback boundary?
    - Does the Verification section contain **concrete, executable test commands**?
      Vague descriptions like "test later" or an empty section are 🔴.
+   - Does the plan extend the closest existing implementation and verification
+     assets by default? For a new parallel path, is the reason and rough size/time
+     tradeoff clear? Check whether long runs belong in a smoke/resource node or a
+     later leg, whether repeated checks duplicate evidence, and whether total
+     verification time fits the attempt budget when known. Use judgment; a missing
+     estimate/table alone is not a failure.
    - Are source ownership and stage write boundaries respected?
 4. If the working tree (or an ancestor) contains
    `<artifact-root>/spec/pipeline_state.yaml`, read `spec/prd.md` and check the plan

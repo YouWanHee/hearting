@@ -24,6 +24,79 @@ FAKE_WORKER_TIMEOUT="30"
 
 
 class AdapterV11Test(unittest.TestCase):
+ def test_stage_attempt_budget_prompt(self):
+  for harness in ADAPTERS:
+   with self.subTest(harness=harness), tempfile.TemporaryDirectory() as td:
+    wrapper=self.load_wrapper(harness)
+    args=wrapper.parser().parse_args([
+     "--worktree",td,"--slug","budget-fixture","--capability","autopilot-code",
+     "--capability-mode","dev","--worker-mode","dev/backend","--worker-type","stage",
+     "--dispatch-depth","2","--parent","owner","--owner","autopilot-code",
+     "--assigned-contract","code-execute","--route-node","execute","--unit","dev/backend",
+     "--attempt-id","att-budget-fixture","--foreground-timeout","600",
+     "--prompt-text","budget prompt fixture","--qa","standard",
+    ])
+    args.artifact_root=td
+    if harness == "opencode":
+     prompt,_=wrapper.prompt(args)
+    else:
+     prompt,_=wrapper.dispatch_prompt(args, ("budget prompt fixture", "inline"))
+    self.assertIn("600 seconds (10 minutes)",prompt)
+    self.assertIn("approximate deadline:",prompt)
+    self.assertIn("waiting with sleep, use this budget",prompt)
+
+ def test_stage_retry_progress_prompts(self):
+  import dispatch_replacement as recovery
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"
+   blocks=[]
+   observed=("\n\n## Observed prior-attempt progress\n"
+             "- prior attempt: att-progress\n- commits after launch_head: 2 observed\n"
+             "  - commit-one first commit\n  - commit-two second commit\n"
+             "  - M tests/pending.py\n  - dev_logs/changed.md\n")
+   source={"attempt_id":"att-progress","worker_type":"stage","route_node":"execute",
+           "note":"dead-timeout","failure_class":"runtime","route_file":str(root/"route.json"),
+           "route_id":"rt-fixture"}
+   (root/"route.json").write_text("{}")
+   jobs.write_text("2026-07-23T00:00:00Z\tdone\t"+str(repo)+"\t"+str(repo)+"\tstage\t"+
+                   ",".join(f"{k}={v}" for k,v in source.items())+"\n")
+   fake_claim={"replacement_attempt_id":"att-next","family_id":"family-fixture"}
+   with mock.patch.object(recovery,"_stage_progress_block",return_value=observed):
+    for harness in ADAPTERS:
+     wrapper=self.load_wrapper(harness)
+     for path_kind in ("hop","replacement"):
+      args=SimpleNamespace(automatic_retry_of="att-progress",worker_type="stage",
+                           jobs_path=jobs,attempt_id="att-next" if path_kind=="replacement" else "att-hop")
+      reservation=mock.patch.object(recovery,"source_reservation",
+                                    return_value=None if path_kind=="hop" else {"family_id":"family-fixture"})
+      family_path=mock.patch.object(recovery,"_record_path",return_value=root/"family.json")
+      checked=mock.patch.object(recovery,"_check_record",return_value=fake_claim)
+      replay=mock.patch.object(recovery,"launch_input",return_value={"retry_brief":""})
+      with reservation,family_path,checked,replay:
+       context=recovery.recovery_instructions(args)
+      prompt_args=wrapper.parser().parse_args([
+       "--worktree",str(repo),"--slug","retry-fixture","--capability","autopilot-code",
+       "--capability-mode","dev","--worker-mode","dev/backend","--worker-type","stage",
+       "--dispatch-depth","2","--parent","owner","--owner","autopilot-code",
+       "--assigned-contract","code-execute","--route-node","execute","--unit","dev/backend",
+       "--attempt-id","att-next","--foreground-timeout","600",
+       "--prompt-text","retry prompt fixture","--qa","standard",
+      ])
+      prompt_args.artifact_root=str(art)
+      if harness == "opencode":
+       assembled,_=wrapper.prompt(prompt_args)
+      else:
+       assembled,_=wrapper.dispatch_prompt(prompt_args,("retry prompt fixture","inline"))
+      assembled += context
+      self.assertIn("retry prompt fixture",assembled)
+      self.assertIn("Observed prior-attempt progress",assembled)
+      self.assertIn("first commit",context)
+      self.assertIn("tests/pending.py",context)
+      self.assertIn("dev_logs/changed.md",context)
+      blocks.append((harness,path_kind,context[context.index("## Observed prior-attempt progress"):]))
+   self.assertEqual(len(blocks),6)
+   self.assertEqual(len({block for _,_,block in blocks}),1)
+
  def test_owner_binding_tuple_refusal_details_reach_all_wrappers(self):
   for harness in ADAPTERS:
    for depth,worker,raw in ((2,"stage",False),(1,"stage",False),(1,"owner",True),(2,"stage",True)):

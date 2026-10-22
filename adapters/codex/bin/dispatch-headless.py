@@ -722,7 +722,7 @@ def dispatch_prompt(
         if args.route_file
         else "validated dispatch metadata"
     )
-    heartbeat = runtime_progress_prompt()
+    heartbeat = runtime_progress_prompt(args)
     no_commit_clause = commit_policy.prompt_clause(args)
     completion_delivery = getattr(args, "resolved_completion_delivery", "poll-fallback")
     supervised = completion_delivery == "app-server-supervised"
