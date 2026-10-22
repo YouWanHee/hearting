@@ -58,9 +58,10 @@ anything commits.
    alternative was rejected. If the honest verdict is "insufficient evidence to
    choose", say so explicitly and name the single missing fact — do not emit a
    survey without a verdict.
-   Treat extension of a relevant existing implementation or verification asset
-   as the default. If a new parallel path is preferable, explain why extension
-   does not fit and compare rough files/changed lines and time for both options.
+   Extending the closest existing implementation or verification asset of the
+   same function is the default. A new module or code path beside it explains
+   why extension does not fit and compares rough files/changed lines and time
+   for both options.
 5. **Write the direction brief** to the exact output path given in the prompt,
    using the schema below. Under producer cutover, a relative shard path is
    rooted at `AGENT_ARTIFACT_OUTPUT_DIR` (the open cycle's `artifacts/`), not

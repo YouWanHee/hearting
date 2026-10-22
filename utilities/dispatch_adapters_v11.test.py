@@ -46,24 +46,49 @@ class AdapterV11Test(unittest.TestCase):
     self.assertIn("waiting with sleep, use this budget",prompt)
 
  def test_stage_retry_progress_prompts(self):
+  import artifact_context
   import dispatch_replacement as recovery
+  from datetime import datetime, timedelta, timezone
   with tempfile.TemporaryDirectory() as td:
-   root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"
-   blocks=[]
-   observed=("\n\n## Observed prior-attempt progress\n"
-             "- prior attempt: att-progress\n- commits after launch_head: 2 observed\n"
-             "  - commit-one first commit\n  - commit-two second commit\n"
-             "  - M tests/pending.py\n  - dev_logs/changed.md\n")
+   root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; blocks=[]
+   launch_head=subprocess.check_output(["git","-C",str(repo),"rev-parse","HEAD"],text=True).strip()
+   expected_commits=[]
+   for subject in ("first commit","second commit"):
+    path=repo/(subject.split()[0]+".py"); path.write_text(subject+"\n")
+    subprocess.run(["git","-C",str(repo),"add",path.name],check=True)
+    subprocess.run(["git","-C",str(repo),"commit","-qm",subject],check=True)
+    commit=subprocess.check_output(["git","-C",str(repo),"rev-parse","HEAD"],text=True).strip()
+    expected_commits.append((commit,subject))
+   (repo/"source").mkdir()
+   (repo/"source/pending.py").write_text("uncommitted source\n")
+   output=root/"cycle"/"artifacts"; (output/"dev_logs").mkdir(parents=True)
+   changed_output=output/"dev_logs/changed.md"
+   changed_output.write_text("changed cycle output\n")
+   fixed_now=datetime.now(timezone.utc)
+   start=fixed_now-timedelta(minutes=5)
+   os.utime(changed_output,(start.timestamp()+10,start.timestamp()+10))
+   class FrozenDateTime(datetime):
+    @classmethod
+    def now(cls,tz=None): return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+   route={"route_id":"rt-retry-fixture","route_hash":"fixture","artifact_root":str(root),
+          "cwd":str(repo),"nodes":[{"id":"execute","outputs":["dev_logs/**"],
+          "write_scope":["source/**","dev_logs/**"]}]}
+   route_path=root/"route.json"; route_path.write_text(json.dumps(route))
    source={"attempt_id":"att-progress","worker_type":"stage","route_node":"execute",
-           "note":"dead-timeout","failure_class":"runtime","route_file":str(root/"route.json"),
-           "route_id":"rt-fixture"}
-   (root/"route.json").write_text("{}")
-   jobs.write_text("2026-07-23T00:00:00Z\tdone\t"+str(repo)+"\t"+str(repo)+"\tstage\t"+
+           "note":"dead-timeout","failure_class":"runtime","route_file":str(route_path),
+           "route_id":route["route_id"],"launch_head":launch_head}
+   jobs.write_text(start.isoformat()+"\tdone\t"+str(repo)+"\t"+str(repo)+"\tstage\t"+
+                   # The elapsed interval is fixed so the six real blocks compare byte-for-byte.
                    ",".join(f"{k}={v}" for k,v in source.items())+"\n")
    fake_claim={"replacement_attempt_id":"att-next","family_id":"family-fixture"}
-   with mock.patch.object(recovery,"_stage_progress_block",return_value=observed):
+   with mock.patch.object(recovery,"datetime",FrozenDateTime), \
+        mock.patch.object(recovery.DC._route_module(),"verify_route"), \
+        mock.patch.object(artifact_context,"resolve_context",
+                         return_value=SimpleNamespace(output_dir=output)):
     for harness in ADAPTERS:
      wrapper=self.load_wrapper(harness)
+     wrapper_source=Path(wrapper.__file__).read_text()
+     self.assertIn("prompt_text += recovery_instructions(args)",wrapper_source)
      for path_kind in ("hop","replacement"):
       args=SimpleNamespace(automatic_retry_of="att-progress",worker_type="stage",
                            jobs_path=jobs,attempt_id="att-next" if path_kind=="replacement" else "att-hop")
@@ -87,12 +112,16 @@ class AdapterV11Test(unittest.TestCase):
        assembled,_=wrapper.prompt(prompt_args)
       else:
        assembled,_=wrapper.dispatch_prompt(prompt_args,("retry prompt fixture","inline"))
+      # This is the same recovery append performed by each adapter's prompt assembly.
       assembled += context
       self.assertIn("retry prompt fixture",assembled)
       self.assertIn("Observed prior-attempt progress",assembled)
-      self.assertIn("first commit",context)
-      self.assertIn("tests/pending.py",context)
-      self.assertIn("dev_logs/changed.md",context)
+      for commit,subject in expected_commits:
+       self.assertIn(f"  - {commit} {subject}",assembled)
+      self.assertIn("source/pending.py",assembled)
+      self.assertIn("dev_logs/changed.md",assembled)
+      self.assertIn("- end unavailable; observed at",assembled)
+      self.assertIn("- interval since recorded start:",assembled)
       blocks.append((harness,path_kind,context[context.index("## Observed prior-attempt progress"):]))
    self.assertEqual(len(blocks),6)
    self.assertEqual(len({block for _,_,block in blocks}),1)
