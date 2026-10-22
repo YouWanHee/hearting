@@ -3233,14 +3233,21 @@ class StageRecoveryProgressTest(unittest.TestCase):
             subprocess.run(['git', '-C', str(repo), 'add', 'base.py'], check=True)
             subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'launch base'], check=True)
             launch_head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+            expected_commits = []
             for name in ('first', 'second'):
                 (repo / f'{name}.py').write_text(name + '\n')
                 subprocess.run(['git', '-C', str(repo), 'add', f'{name}.py'], check=True)
                 subprocess.run(['git', '-C', str(repo), 'commit', '-qm', f'{name} commit'], check=True)
+                commit = subprocess.check_output(
+                    ['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+                expected_commits.append((commit, f'{name} commit'))
             (repo / 'tests').mkdir()
             (repo / 'tests' / 'original file.py').write_text('rename me\n')
             subprocess.run(['git', '-C', str(repo), 'add', 'tests/original file.py'], check=True)
             subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'add scoped path'], check=True)
+            commit = subprocess.check_output(
+                ['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+            expected_commits.append((commit, 'add scoped path'))
             (repo / 'tests' / 'original file.py').rename(repo / 'tests' / 'renamed\npath.py')
             subprocess.run(['git', '-C', str(repo), 'add', '-A'], check=True)
             (repo / 'tests' / 'left uncommitted.py').write_text('pending\n')
@@ -3276,6 +3283,8 @@ class StageRecoveryProgressTest(unittest.TestCase):
                     self.assertIn('interval since recorded start', block)
                     self.assertIn('first commit', block)
                     self.assertIn('second commit', block)
+                    for commit, subject in reversed(expected_commits):
+                        self.assertIn(f'  - {commit} {subject}', block)
                     self.assertIn('tests/left uncommitted.py', block)
                     self.assertIn('tests/original file.py', block)
                     self.assertIn('tests/renamed\npath.py', block)
