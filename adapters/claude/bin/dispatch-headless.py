@@ -580,7 +580,7 @@ def dispatch_prompt(
         if args.profile
         else "profile=-"
     )
-    heartbeat = runtime_progress_prompt()
+    heartbeat = runtime_progress_prompt(args)
     completion_delivery = getattr(args, "resolved_completion_delivery", "poll-fallback")
     supervised = completion_delivery == "session-resume-supervised"
     owner_standard_plus = (

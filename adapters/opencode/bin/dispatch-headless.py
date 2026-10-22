@@ -1011,7 +1011,7 @@ def prompt(args: argparse.Namespace) -> tuple[str, str]:
         unit=args.unit,
         root=ROOT,
     )
-    heartbeat = runtime_progress_prompt()
+    heartbeat = runtime_progress_prompt(args)
     return (
         f"{bootstrap}\n"
         "Dispatch metadata:\n"
