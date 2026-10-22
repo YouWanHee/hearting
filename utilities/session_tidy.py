@@ -6,6 +6,11 @@ One entry point for the parts of ``session-tidy`` that a session touches directl
     session_tidy.py card [--harness H] [--session-id S] [--cwd D] [--file F | --text T]
         Write the calling session's card (body from stdin, a file or --text).
         Prints one line: ``card=<path> seat=<key>``.  Nothing is required.
+    session_tidy.py tidy [--harness H] [--session-id S] [--cwd D] [--file F | --text T]
+                         [--no-clear | --no-continue] [--handoff TARGET]
+        ``card`` then, only when the card was written, ``enqueue`` (and ``handoff``)
+        for the same caller in one process, so a tidy is one tool call.  The last
+        line ``say=<text>`` is the one line to show the user.
     session_tidy.py hook --harness H --event start|prompt|compact --session-id S
                          [--source X] [--transcript P] [--cwd D] [--reread]
         Record the session in the seat ledger and print the injection text for a
@@ -2504,11 +2509,8 @@ def resolve_caller(harness, sid, cwd: str) -> Optional[tuple[Seat, str, str]]:
     return seat, harness or detected or "unknown", sid or f"unknown-{secrets.token_hex(4)}"
 
 
-def cmd_card(args) -> int:
-    if is_worker():
-        print("card=none reason=worker")
-        return 0
-    cwd = args.cwd or os.getcwd()
+def _write_caller_card(args, cwd: str) -> tuple[Optional[tuple[Seat, str, str]], str]:
+    """Write the calling session's card; (caller, printed line), caller None when nothing was written."""
     if args.text is not None:
         body = args.text
     elif args.file:
@@ -2516,19 +2518,25 @@ def cmd_card(args) -> int:
     else:
         body = sys.stdin.read()
     if not sanitize_body(body):
-        print("card=none reason=empty-body")
-        return 0
+        return None, "card=none reason=empty-body"
     caller = resolve_caller(args.harness, args.session_id, cwd)
     if caller is None:
-        print("card=none reason=no-seat")
-        return 0
+        return None, "card=none reason=no-seat"
     seat, harness, sid = caller
     with seat_lock(seat.key):
         previous = read_latest_card(seat)
         generation = int(previous.get("generation", 0) or 0) + 1 if previous else 1
         record_event(seat, harness, sid, "card", cwd=cwd, card_generation=generation)
         write_card(seat, harness, sid, body, cwd=cwd, prompt_seq=read_prompt_seq(seat))
-    print(f"card={card_text_path(seat)} seat={seat.key}")
+    return caller, f"card={card_text_path(seat)} seat={seat.key}"
+
+
+def cmd_card(args) -> int:
+    if is_worker():
+        print("card=none reason=worker")
+        return 0
+    _caller, line = _write_caller_card(args, args.cwd or os.getcwd())
+    print(line)
     return 0
 
 
@@ -2569,6 +2577,19 @@ def _enqueue_tidy(seat: Seat, harness: str, sid: str, cwd: str, transcript: str 
     return item, booked
 
 
+def _enqueue_caller(caller: tuple[Seat, str, str], cwd: str, *, no_clear: bool,
+                    no_continue: bool) -> tuple[str, Optional[dict]]:
+    seat, harness, sid = caller
+    transcript = (session_summary(seat).get((harness, sid)) or {}).get("transcript", "")
+    import session_tidy_clear as clear
+    idle_context = clear.idle_context_for_enqueue(seat, harness, sid)
+    item, booked = _enqueue_tidy(seat, harness, sid, cwd, transcript,
+                                 opt_out=no_clear, no_continue=no_continue,
+                                 idle_context=idle_context,
+                                 operation_id=(idle_context or {}).get("identity"))
+    return f"enqueue={item['id']} seat={seat.key} status=queued {booked}", idle_context
+
+
 def cmd_enqueue(args) -> int:
     if is_worker():
         print("enqueue=none reason=worker")
@@ -2578,16 +2599,104 @@ def cmd_enqueue(args) -> int:
     if caller is None:
         print("enqueue=none reason=no-seat")
         return 0
-    seat, harness, sid = caller
-    transcript = (session_summary(seat).get((harness, sid)) or {}).get("transcript", "")
-    import session_tidy_clear as clear
-    idle_context = clear.idle_context_for_enqueue(seat, harness, sid)
-    item, booked = _enqueue_tidy(seat, harness, sid, cwd, transcript,
-                                 opt_out=bool(args.no_clear), no_continue=bool(args.no_continue),
-                                 idle_context=idle_context,
-                                 operation_id=(idle_context or {}).get("identity"))
-    print(f"enqueue={item['id']} seat={seat.key} status=queued {booked}")
+    line, _idle = _enqueue_caller(caller, cwd, no_clear=bool(args.no_clear),
+                                  no_continue=bool(args.no_continue))
+    print(line)
     return 0
+
+
+def tidy_report_line(booked: str, *, handoff: bool = False, origin: str = "", harness: str = "") -> str:
+    """The one line the session shows the user after a tidy, from the enqueue ``clear=`` words."""
+    fields = str(booked or "").split()
+    outcome = next((field for field in fields if field.startswith("clear=")), "")
+    if outcome == "clear=scheduled":
+        if handoff or origin == "idle" or "continue=off" in fields:
+            return "곧 이 창이 자동으로 비워집니다."
+        return "곧 이 창이 자동으로 비워지고, 새 세션이 카드를 받아 이어서 진행합니다."
+    command = "/new" if harness == "opencode" else "/clear"
+    if outcome == "clear=off":
+        return f"이 창은 그대로 둡니다. 이제 {command} 하거나 닫아도 됩니다."
+    hint = next((field.split("=", 1)[1] for field in fields if field.startswith("hint=")), "")
+    if outcome == "clear=manual":
+        return f"이제 {hint or command} 하거나 닫아도 됩니다."
+    if outcome == "clear=skipped":
+        return f"이제 {command} 하거나 닫아도 됩니다."
+    return "카드와 기억 정리 접수를 마쳤습니다. 창 비우기 결과는 다음 입력 때 한 줄로 알려 드립니다."
+
+
+def cmd_tidy(args) -> int:
+    """Card, memory-tidy queue (with its clear booking) and optional handoff in one call."""
+    if is_worker():
+        print("card=none reason=worker")
+        return 0
+    cwd = args.cwd or os.getcwd()
+    caller, line = _write_caller_card(args, cwd)
+    print(line)
+    if caller is None:
+        # No card means no queue and no clear booking, exactly as a failed card step did.
+        print("enqueue=none reason=no-card")
+        return 1
+    handoff = bool(args.handoff)
+    line, idle_context = _enqueue_caller(caller, cwd, no_clear=bool(args.no_clear),
+                                         no_continue=bool(args.no_continue))
+    print(line)
+    code = 0
+    if handoff:
+        import session_tidy_runner as runner
+        handoff_line, code = runner.handoff(caller[0], args.handoff)
+        print(handoff_line)
+    origin = str((idle_context or {}).get("origin") or "")
+    print("say=" + tidy_report_line(line, handoff=handoff, origin=origin, harness=caller[1]))
+    return code
+
+
+def reply_card_markers(nonce: str) -> tuple[str, str]:
+    """First and last line of a card written as the reply to one automatic tidy request."""
+    return f"[[session-tidy card {nonce}]]", f"[[session-tidy card end {nonce}]]"
+
+
+def reply_card_body(reply: str, nonce: str) -> Optional[str]:
+    """The card inside a complete marked reply, or None (unmarked, cut off or another request's)."""
+    if not nonce or not isinstance(reply, str):
+        return None
+    begin, end = reply_card_markers(nonce)
+    lines = reply.strip().splitlines()
+    if len(lines) < 3 or lines[0].strip() != begin or lines[-1].strip() != end:
+        return None
+    body = "\n".join(lines[1:-1]).strip()
+    return body if sanitize_body(body) else None
+
+
+def accept_reply_card(harness: str, sid: str, cwd: str, reply: str) -> str:
+    """At turn end, an automatic idle/compact tidy request answered with a complete marked card
+    becomes that card and the same enqueue ``tidy`` runs; anything else changes nothing."""
+    if is_worker():
+        return "reply-card=none reason=worker"
+    if not reply or "[[session-tidy card " not in reply:
+        return "reply-card=none"
+    caller = resolve_caller(harness, sid, cwd)
+    if caller is None:
+        return "reply-card=none reason=no-seat"
+    seat, harness, sid = caller
+    import session_tidy_clear as clear
+    context = clear.idle_context_for_enqueue(seat, harness, sid)
+    if not context or context.get("origin") not in ("idle", "compact"):
+        return "reply-card=none reason=no-request"
+    body = reply_card_body(reply, str(context.get("nonce") or ""))
+    if body is None:
+        return "reply-card=none reason=unmarked"
+    if context.get("eligible") is not True:
+        return "reply-card=skipped reason=request-not-eligible"
+    request = (clear.read_reservation(seat.key) or {}).get("idle_request")
+    if isinstance(request, dict) and request.get("state") == "accepted":
+        return "reply-card=skipped reason=already-accepted"       # the session ran ``tidy`` itself
+    with seat_lock(seat.key):
+        previous = read_latest_card(seat)
+        generation = int(previous.get("generation", 0) or 0) + 1 if previous else 1
+        record_event(seat, harness, sid, "card", cwd=cwd, card_generation=generation)
+        write_card(seat, harness, sid, body, cwd=cwd, prompt_seq=read_prompt_seq(seat))
+    line, _idle = _enqueue_caller((seat, harness, sid), cwd, no_clear=False, no_continue=False)
+    return "reply-card=accepted " + line
 
 
 def cmd_handoff(args) -> int:
@@ -2729,6 +2838,16 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--no-continue", action="store_true",
                          help="clear the window but type nothing after it (the user asked to stop after tidying)")
     enqueue.set_defaults(func=cmd_enqueue)
+    tidy = sub.add_parser("tidy", help="write the card, queue the memory tidy and book the clear in one call")
+    tidy.add_argument("--harness", choices=HARNESSES)
+    tidy.add_argument("--session-id")
+    tidy.add_argument("--cwd")
+    tidy.add_argument("--file")
+    tidy.add_argument("--text")
+    tidy.add_argument("--no-clear", action="store_true", help="as enqueue --no-clear (정리만)")
+    tidy.add_argument("--no-continue", action="store_true", help="as enqueue --no-continue (정리하고 끝)")
+    tidy.add_argument("--handoff", metavar="TARGET", help="then deliver the card to this peer (인계)")
+    tidy.set_defaults(func=cmd_tidy)
     handoff = sub.add_parser("handoff", help="deliver this seat's card to a peer session")
     handoff.add_argument("target")
     handoff.add_argument("transfer_ref", nargs="?")
