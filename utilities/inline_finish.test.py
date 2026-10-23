@@ -1132,6 +1132,41 @@ class PublicInlineFinishTest(unittest.TestCase):
 
 
 class NonGitInlineFinishTest(unittest.TestCase):
+    def test_non_git_finish_resumes_after_manifest_crash_without_git_probes(self):
+        fixture = PublicInlineFinishTest()
+        fixture.non_git = True
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        fake_bin = fixture.base / "fake-bin"
+        fake_bin.mkdir()
+        git_path = subprocess.check_output(["which", "git"], text=True).strip()
+        calls = fixture.base / "git-calls.log"
+        wrapper = fake_bin / "git"
+        wrapper.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_CALL_LOG\"\nexec "
+                          + git_path + " \"$@\"\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+        env = fixture.env.copy()
+        env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+        env["GIT_CALL_LOG"] = str(calls)
+        env["HEARTING_INLINE_FINISH_CRASH_AT"] = "after-manifest"
+        crashed = subprocess.run(fixture.command, cwd=fixture.repo, env=env,
+                                 capture_output=True, text=True)
+        self.assertNotEqual(crashed.returncode, 0)
+        self.assertIn("simulated crash after manifest publish", crashed.stderr)
+        env.pop("HEARTING_INLINE_FINISH_CRASH_AT")
+        resumed = subprocess.run(fixture.command, cwd=fixture.repo, env=env,
+                                 capture_output=True, text=True)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+        receipt = json.loads(resumed.stdout)
+        self.assertTrue(receipt["replay"])
+        outcome = json.loads(CAP.outcome_path(fixture.route_file).read_text(encoding="utf-8"))
+        self.assertTrue(outcome["terminal_gate_proven"])
+        self.assertIsNone(outcome["head_commit"])
+        self.assertIsNone(receipt["commit"])
+        self.assertFalse(calls.exists(), calls.read_text(encoding="utf-8") if calls.exists() else "")
+        self.assertEqual(artifact_producer.read_cycle_record(fixture.root, fixture.cycle["cycle_id"])["state"],
+                         "sealed")
+
     def test_public_non_git_compose_start_finishes_with_null_head_and_no_git_probe(self):
         fixture = PublicInlineFinishTest()
         fixture.non_git = True

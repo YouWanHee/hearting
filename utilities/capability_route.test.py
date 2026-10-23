@@ -7521,6 +7521,71 @@ class ComposeRouteTest(TestRoute):
   with self.assertRaisesRegex(ValueError, "dispatch-evidence-exact-worktree-reprobe-required.*worktree-not-found"):
    R._fallback_chain({"tuples":[failed],"native_subagent":[]}, expected_worktree=R.ROOT, require_scope=True)
 
+ def test_compose_git_diagnosis_uses_git_exhaustion_and_only_checks_cwd_metadata(self):
+  with tempfile.TemporaryDirectory(prefix="compose-git-diagnosis-") as tmp:
+   parent=Path(tmp); cwd=parent/"project"; cwd.mkdir()
+   (parent/".git").mkdir()
+   diagnosis=R._compose_git_diagnosis(cwd)
+   self.assertEqual(diagnosis["state"],"non-git",diagnosis)
+   (cwd/".git").mkdir()
+   diagnosis=R._compose_git_diagnosis(cwd)
+   decision=R._decide_non_git_compose({**diagnosis,"cwd":str(cwd)},None,False,0,False,None)
+   self.assertEqual(decision["kind"],"error")
+   self.assertIn(str(cwd),decision["detail"])
+
+ def test_compose_git_diagnosis_rejects_ancestor_gitfile_with_missing_gitdir(self):
+  with tempfile.TemporaryDirectory(prefix="compose-gitfile-diagnosis-") as tmp:
+   parent=Path(tmp); cwd=parent/"project"; cwd.mkdir()
+   (parent/".git").write_text("gitdir: /definitely-missing-hearting-gitdir\n")
+   diagnosis=R._compose_git_diagnosis(cwd)
+   decision=R._decide_non_git_compose({**diagnosis,"cwd":str(cwd)},None,False,0,False,None)
+   self.assertEqual(decision["kind"],"error",diagnosis)
+   self.assertIn(str(cwd),decision["detail"])
+   self.assertIn("/definitely-missing-hearting-gitdir",decision["detail"])
+
+ def test_compose_git_diagnosis_accepts_mount_boundary_exhaustion_message(self):
+  completed=subprocess.CompletedProcess(["git"],128,"",
+   "fatal: not a git repository (or any parent up to mount point /home)\n"
+   "Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n")
+  with tempfile.TemporaryDirectory(prefix="compose-mount-diagnosis-") as tmp, \
+       mock.patch.object(R.subprocess,"run",return_value=completed):
+   diagnosis=R._compose_git_diagnosis(tmp)
+  self.assertEqual(diagnosis["state"],"non-git",diagnosis)
+
+ def test_compose_git_probe_uses_c_locale_without_changing_parent_environment(self):
+  with tempfile.TemporaryDirectory(prefix="compose-locale-diagnosis-") as tmp, \
+       mock.patch.dict(os.environ,{"LC_ALL":"ko_KR.UTF-8","LANGUAGE":"ko"}):
+   before=(os.environ.get("LC_ALL"),os.environ.get("LANGUAGE"))
+   with mock.patch.object(R.subprocess,"run",return_value=subprocess.CompletedProcess(
+       ["git"],128,"","fatal: not a git repository (or any of the parent directories): .git\n")) as run:
+    R._compose_git_diagnosis(tmp)
+   self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"],"C")
+   self.assertNotIn("LANGUAGE",run.call_args.kwargs["env"])
+   self.assertEqual((os.environ.get("LC_ALL"),os.environ.get("LANGUAGE")),before)
+
+ def test_compose_start_with_empty_ancestor_git_marker_starts_direct(self):
+  import work_start
+  exact="git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작"
+  with tempfile.TemporaryDirectory(prefix="compose-ancestor-marker-") as tmp, \
+       mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
+   root=Path(tmp); parent=root/"parent"; cwd=parent/"project"
+   cwd.mkdir(parents=True); (parent/".git").mkdir()
+   artifacts=root/"artifacts"; prompt=root/"task.md"; prompt.write_text("Continue this task")
+   route=self.compose(shape="direct",graph=None,artifact_root=str(artifacts),
+                      work_request={"text":prompt.read_text(),"owner_harness":None})
+   argv=[str(P),"compose","--shape","direct","--campaign-key","ancestor-test","--slug","ancestor",
+         "--cwd",str(cwd),"--artifact-root",str(artifacts),"--start","--prompt-file",str(prompt),
+         "--jobs",str(root/"jobs.log")]
+   def start(*args,**kwargs):
+    return {"state":"inline","required_action":"execute-inline","route_id":route["route_id"]}
+   out,err=io.StringIO(),io.StringIO()
+   with mock.patch.object(sys,"argv",argv),mock.patch.object(R,"compose_route",return_value=route), \
+        mock.patch.object(work_start,"start_work",side_effect=start),mock.patch.object(R,"_record_route_chain"), \
+        mock.patch.object(R,"_route_autoclose"),contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+    self.assertEqual(R.main(),0)
+   self.assertEqual(json.loads(out.getvalue())["state"],"inline")
+   self.assertEqual(err.getvalue().count(exact),1)
+
  def test_non_git_classified_research_modes_compile_and_seal_as_direct(self):
   with tempfile.TemporaryDirectory() as tmp:
    for mode in ("academic","market","technology"):
@@ -8081,14 +8146,15 @@ class ComposeRouteTest(TestRoute):
  def test_compose_start_keeps_new_campaign_notice_before_its_own_cycle_creation(self):
   import artifact_producer, work_start
   with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
-   root=Path(tmp); artifacts=root/"artifacts"; prompt=root/"task.md"; prompt.write_text("One approved inline edit")
+   root=Path(tmp); git_root=root/"git-root"; git_root.mkdir(); subprocess.run(["git","init","-q",str(git_root)],check=True)
+   artifacts=root/"artifacts"; prompt=root/"task.md"; prompt.write_text("One approved inline edit")
    route=self.compose(shape="direct",graph=None,artifact_root=str(artifacts),campaign_key="new-start",
                       work_request={"text":prompt.read_text(),"owner_harness":None})
    def start(route,path,jobs,**kwargs):
     artifact_producer.prepare_route_artifact_env(path,start=True,jobs=jobs)
     return {"state":"inline","required_action":"execute-inline","route_id":route["route_id"]}
    argv=[str(P),"compose","--shape","direct","--campaign-key","new-start","--slug","notice",
-         "--cwd",str(R.ROOT),"--artifact-root",str(artifacts),"--start","--prompt-file",str(prompt),"--jobs",str(root/"jobs.log")]
+         "--cwd",str(git_root),"--artifact-root",str(artifacts),"--start","--prompt-file",str(prompt),"--jobs",str(root/"jobs.log")]
    notices=[]
    for _ in range(2):
     out,err=io.StringIO(),io.StringIO()
@@ -8601,14 +8667,15 @@ class ComposeRouteTest(TestRoute):
  def test_auto_consumer_notices_are_once_before_explain_and_start(self):
   import work_start
   with tempfile.TemporaryDirectory() as tmp,mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
-   root=Path(tmp);prompt=root/"task.md";prompt.write_text("Plan and test the change")
+   root=Path(tmp);git_root=root/"git-root";git_root.mkdir();subprocess.run(["git","init","-q",str(git_root)],check=True)
+   prompt=root/"task.md";prompt.write_text("Plan and test the change")
    route=self.compose(graph="plan,test,report",intensity="strong",artifact_root=str(root/"artifacts"))
    notice="strong group plan: auto-added plan-check (review-consumer-not-selected; registry consumer)"
    for harness in ("claude","codex","opencode"):
     for action in ("explain","start"):
      out,err=io.StringIO(),io.StringIO()
      argv=[str(P),"compose","--shape","staged","--intensity","strong","--capability","autopilot-code",
-      "--capability-mode","dev","--graph","plan,test,report","--cwd",str(R.ROOT),
+      "--capability-mode","dev","--graph","plan,test,report","--cwd",str(git_root),
       "--artifact-root",str(root/"artifacts"),"--unassigned","--parent-harness",harness,
       "--prompt-file",str(prompt),"--jobs",str(root/"jobs.log"),"--"+action]
      receipt={"state":"waiting-owner","parent_next":"end-turn"}

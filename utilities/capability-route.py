@@ -10520,35 +10520,28 @@ def _git(cwd, *args):
 
 def _compose_git_diagnosis(cwd):
     """Keep an explicit start-time distinction between a non-repository and Git failure."""
+    probe_env = os.environ.copy()
+    probe_env["LC_ALL"] = "C"
+    probe_env.pop("LANGUAGE", None)
     try:
         result = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
-                                text=True, capture_output=True, timeout=60)
+                                text=True, capture_output=True, timeout=60, env=probe_env)
     except (OSError, subprocess.SubprocessError) as exc:
         return {"state": "error", "detail": f"{type(exc).__name__}: {exc}"}
     if result.returncode == 0:
         try:
             bare = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--is-bare-repository"],
-                                  text=True, capture_output=True, timeout=60)
+                                  text=True, capture_output=True, timeout=60, env=probe_env)
         except (OSError, subprocess.SubprocessError) as exc:
             return {"state": "error", "detail": f"{type(exc).__name__}: {exc}"}
         if bare.returncode != 0 or bare.stdout.strip() == "true":
             return {"state": "error", "detail": (bare.stderr or "bare Git repository").strip()}
         return {"state": "git", "root": result.stdout.strip()}
-    stderr = (result.stderr or "").strip()
-    markers = []
-    current = Path(cwd).absolute()
-    ceilings = {os.path.realpath(value) for value in
-                os.environ.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep) if value}
-    for parent in (current, *current.parents):
-        marker = parent / ".git"
-        if os.path.lexists(marker):
-            markers.append(str(marker))
-        if os.path.realpath(parent) in ceilings:
-            break
-    if "not a git repository" in stderr.lower() and not markers:
+    stderr = result.stderr or ""
+    exhausted = "not a git repository (or any" in stderr.lower()
+    if exhausted and not os.path.lexists(Path(cwd) / ".git"):
         return {"state": "non-git", "detail": stderr}
-    return {"state": "error", "detail": stderr or f"git exited {result.returncode}",
-            "markers": markers}
+    return {"state": "error", "detail": stderr or f"git exited {result.returncode}"}
 
 
 def _decide_non_git_compose(cwd_diagnosis, requested_shape, route_plan_present,
@@ -10560,7 +10553,8 @@ def _decide_non_git_compose(cwd_diagnosis, requested_shape, route_plan_present,
     if state == "git":
         return {**common, "kind": "git"}
     if state != "non-git":
-        return {**common, "kind": "error", "detail": cwd_diagnosis.get("detail") or "git diagnosis unavailable"}
+        detail = cwd_diagnosis.get("detail") or "git diagnosis unavailable"
+        return {**common, "kind": "error", "detail": f"{common['cwd']}: {detail}"}
     cause = f"git 저장소 아님: {common['cwd']}"
     if dispatch_depth > 0 or registered_attempt:
         return {**common, "kind": "refuse", "cause": cause,
