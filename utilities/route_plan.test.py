@@ -41,6 +41,19 @@ def fenced(text):
 
 
 class ExtractionTest(unittest.TestCase):
+    def test_frame_leg_decision_defaults_guards_and_normalizes_reasons(self):
+        decide = RP.frame_leg_decision
+        self.assertEqual(decide(None), (2, "default", "기본"))
+        self.assertEqual(decide("strong"), (2, "explicit", "호출자 표시 --intensity strong"))
+        self.assertEqual(decide("quick", "utilities/x.py 확인"),
+                         (1, "explicit", "간단 표시 --intensity quick"))
+        self.assertEqual(decide("quick", "utilities/x.py 확인\ncore/WORKFLOW.md"),
+                         (2, "automatic", "--intensity quick이지만 경로 core/WORKFLOW.md"))
+        self.assertEqual(decide("direct", "adapters/claude/a.py adapters/codex/b.py")[0], 2)
+        self.assertEqual(decide("quick", "clean", {"capability": "autopilot-spec"})[0], 2)
+        self.assertEqual(decide("quick", "score/a.py hardcore/b.py adapters/codex-extra/a.py notprd.md")[0], 1)
+        self.assertEqual(decide("quick", "/tmp/work/prd.md")[0], 2)
+
     def parse(self, text):
         return RP.parse_proposal(text)
 

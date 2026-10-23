@@ -1003,8 +1003,8 @@ class FrameAllocationInheritanceTest(SourceRepoStartBase):
 
 
 class OneLegFramedTest(StartBase):
-    """User decision 2026-10-07: ordinary work frames with one leg, and the same decision follows."""
-    FRAME_INTENSITY = None
+    """Explicit simple quick requests keep one deep leg and follow the same decision."""
+    FRAME_INTENSITY = "quick"
 
     def test_one_leg_reads_one_brief_and_its_proposal_starts_the_first_leg(self):
         self.assertEqual(RP.frame_legs(self.route), ("frame",))

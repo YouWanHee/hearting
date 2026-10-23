@@ -133,8 +133,8 @@ class FramedBase(T.ProducerTestBase):
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
         self.activate()
 
-    # Both frame legs, as before the one-leg default: most tests here exercise the pair.
-    FRAME_INTENSITY = "strong"
+    # Exercise the default framed route unless a test asks for an explicit intensity.
+    FRAME_INTENSITY = None
 
     def compose(self, **kw):
         arguments = dict(
@@ -241,11 +241,10 @@ class FramedRouteCompileTest(FramedBase):
         self.assertEqual(self.compose(campaign_key=None, parent_cycle_id="cyc_" + "a" * 32)["parent_cycle_id"],
                          "cyc_" + "a" * 32)
 
-    def test_intensity_picks_one_frame_leg_or_both_top_legs(self):
-        """User decision 2026-10-07: one leg for ordinary work, both top legs for uncertain or
-        hard-to-reverse work. The framed route itself is sealed at standard either way."""
-        for intensity, ids in ((None, ONE_LEG_IDS), ("direct", ONE_LEG_IDS), ("quick", ONE_LEG_IDS),
-                               ("standard", ONE_LEG_IDS), ("strong", NODE_IDS), ("thorough", NODE_IDS)):
+    def test_intensity_picks_default_pair_and_guarded_quick_exception(self):
+        """Only an explicit quick/direct request without protected facts can narrow the frame."""
+        for intensity, ids in ((None, NODE_IDS), ("direct", ONE_LEG_IDS), ("quick", ONE_LEG_IDS),
+                               ("standard", NODE_IDS), ("strong", NODE_IDS), ("thorough", NODE_IDS)):
             with self.subTest(intensity=intensity):
                 route = self.compose(intensity=intensity)
                 self.assertEqual([n["id"] for n in route["nodes"]], ids)
@@ -260,7 +259,7 @@ class FramedRouteCompileTest(FramedBase):
                 self.assertEqual(RP.frame_legs(route), tuple(ids[:-1]))
         with self.assertRaisesRegex(ValueError, "invalid intensity"):
             self.compose(intensity="bogus")
-        one = self.compose(intensity=None)
+        one = self.compose(intensity="quick")
         self.assertFalse(RP.valid_frame_legs({"nodes": []}, ["frame"]))           # a lone leg only on a framed route
         self.assertTrue(RP.valid_frame_legs(one, ["frame"]))
         tampered = json.loads(json.dumps(one))
@@ -344,7 +343,7 @@ class FramedRouteCompileTest(FramedBase):
                 "--dispatch-evidence", str(evidence), "--prompt-file", str(task), "--slug", "cli-framed"]
         one = subprocess.run(base + ["--unassigned", "--explain"], text=True, capture_output=True, env=env, check=False)
         self.assertEqual(one.returncode, 0, one.stderr)
-        self.assertIn("비용: frame 한 갈래 · 방향 확인 질문 1회", one.stderr)
+        self.assertIn("비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회", one.stderr)
         base += ["--intensity", "strong"]
         done = subprocess.run(
             base + ["--campaign-key", "cli-key", "--capability", "autopilot-refine", "--graph", "review",
@@ -1123,9 +1122,16 @@ class FramedStartTest(FramedBase):
     def test_an_autoclosed_framed_route_composes_again_as_a_framed_route(self):
         command = W._compose_again(self.route)
         self.assertIn("--shape framed", command)
-        self.assertIn("--intensity strong", command)          # both frame legs again
+        self.assertNotIn("--intensity", command)              # preserve the original unspecified intensity
         self.assertNotIn("--capability", command)
         self.assertNotIn("route-frame", command)
+        explicit = json.loads(json.dumps(self.route))
+        explicit["selection"]["selection_basis"] = [
+            row for row in explicit["selection"]["selection_basis"]
+            if row.get("axis") != "compose-intensity"
+        ] + [{"axis": "compose-intensity", "signal": "quick", "source": "explicit"}]
+        command = W._compose_again(explicit)
+        self.assertIn("--intensity quick", command)
 
 
 if __name__ == "__main__":

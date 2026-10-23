@@ -487,7 +487,7 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual(error.exception.reason, 'replacement-batch-source-drift')
         path.write_text(json.dumps(payload))
 
-    def test_sd160_capacity_ratios_choose_healthy_same_harness_personas(self):
+    def test_capacity_ratios_choose_distinct_healthy_personas(self):
         for strategy in ("balanced", "capacity-aware"):
             for headroom in (71, 77):
                 with self.subTest(strategy=strategy, headroom=headroom):
@@ -1286,7 +1286,7 @@ class DispatchBatchTest(unittest.TestCase):
                 BATCH.replica_nodes(altered, "plan")
             self.assertEqual(ctx.exception.reason, reason)
 
-    def test_assignment_honors_declared_affinity_without_diversity_override(self):
+    def test_assignment_honors_declared_affinity_with_distinct_harnesses(self):
         with mock.patch.object(
             BATCH.DISPATCH_NODE, "resolve_checked_tuple", side_effect=resolve_side_effect
         ):
@@ -1297,7 +1297,7 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual([row[1] for row in rows], ["codex", "claude"])
         self.assertEqual(diagnostics["degradation_cause"], "")
 
-    def test_assignment_uses_recent_counts_to_share_parallel_legs_across_three(self):
+    def test_assignment_uses_distinct_families_when_multiple_are_eligible(self):
         route = json.loads(json.dumps(self.route))
         route["dispatch_allocation"] = {
             "strategy": "least-recent-attempts",
@@ -1325,7 +1325,8 @@ class DispatchBatchTest(unittest.TestCase):
                 route, route["nodes"], allow_degraded=False, jobs=self.jobs
             )
         self.assertEqual(independence, "persona")
-        self.assertEqual({row[1] for row in rows}, {"claude"})
+        self.assertEqual(len({row[1] for row in rows}), 2)
+        self.assertEqual(diagnostics["independence_axes"], ["persona", "harness"])
 
     def test_capacity_aware_batch_preserves_primary_quality_band(self):
         route = json.loads(json.dumps(self.route))
@@ -1354,7 +1355,7 @@ class DispatchBatchTest(unittest.TestCase):
                 route, route["nodes"], allow_degraded=False, jobs=self.jobs
             )
         self.assertEqual(independence, "persona")
-        self.assertEqual({row[1] for row in rows}, {"codex"})
+        self.assertEqual({row[1] for row in rows}, {"claude", "codex"})
 
     def _depth_affinity_route(self, strategy, *, weight=1.0, same_band=False,
                               affinity=True):
@@ -1410,7 +1411,7 @@ class DispatchBatchTest(unittest.TestCase):
             route, {"claude": 70.0, "codex": 80.0, "opencode": 60.0}
         )
         self.assertEqual(independence, "persona")
-        self.assertEqual({row[1] for row in rows}, {"codex"})
+        self.assertEqual({row[1] for row in rows}, {"claude", "codex"})
         # codex is now gated (headroom 10 <= 100-90); an ungated combination exists.
         rows, independence, _diag = self._assign(
             route, {"claude": 70.0, "codex": 10.0, "opencode": 60.0}
@@ -1437,9 +1438,9 @@ class DispatchBatchTest(unittest.TestCase):
                     self._depth_affinity_route(strategy, weight=0.65, same_band=True),
                     scores,
                 )
-                self.assertEqual({row[1] for row in without}, {"claude"})
+                self.assertEqual({row[1] for row in without}, {"claude", "opencode"})
                 self.assertEqual({row[1] for row in with_affinity},
-                                 {"codex"} if strategy == "balanced" else {"claude", "codex"})
+                                 {"claude", "codex"})
 
     def test_capacity_aware_depth_affinity_stops_outside_the_margin(self):
         """Weight 0.65 is a 30-point margin. codex trails the best gauge by 15
@@ -1454,13 +1455,13 @@ class DispatchBatchTest(unittest.TestCase):
         outside, _i, _d = self._assign(
             route, {"claude": 95.0, "codex": 55.0, "opencode": 60.0}
         )
-        self.assertEqual({row[1] for row in outside}, {"claude"})
+        self.assertEqual({row[1] for row in outside}, {"claude", "opencode"})
         # An unknown gauge is excluded by capacity-aware and cannot be hoisted
         # by a preference either -- the same rule, one oracle.
         unknown, _i, _d = self._assign(
             route, {"claude": 70.0, "codex": None, "opencode": 60.0}
         )
-        self.assertEqual({row[1] for row in unknown}, {"claude"})
+        self.assertEqual({row[1] for row in unknown}, {"claude", "opencode"})
 
     def test_balanced_batch_avoids_a_usage_gated_harness(self):
         # 2026-08-20 artifact-knowledge-index gen-1/gen-2: under balanced
@@ -1490,7 +1491,7 @@ class DispatchBatchTest(unittest.TestCase):
                 route, route["nodes"], allow_degraded=False, jobs=self.jobs
             )
         self.assertEqual(independence, "persona")
-        self.assertEqual({row[1] for row in rows}, {"claude"})
+        self.assertEqual({row[1] for row in rows}, {"claude", "opencode"})
 
     def test_balanced_batch_gate_outranks_the_quality_band(self):
         # B-1 framing's parallel falsifier: the gate must outrank aggregate
@@ -1863,7 +1864,7 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual(diagnostics["degradation_cause"], "")
         self.assertEqual(set(diagnostics["usable_families"]), {"codex", "claude"})
 
-    def test_single_usable_family_keeps_exclusion_diagnostics_without_degradation(self):
+    def test_single_usable_family_records_degradation_with_exclusion_diagnostics(self):
         # assign_harnesses is side-effect free (G2): it never writes the
         # ledger itself. Persistence is exercised separately by
         # test_persist_degradation_forwards_route_and_reason_fields and
@@ -1882,8 +1883,8 @@ class DispatchBatchTest(unittest.TestCase):
             "codex": ["dispatch-evidence-candidate-unsupported"],
             "opencode": ["dispatch-evidence-no-eligible-fallback"],
         })
-        self.assertEqual(diagnostics["degradation_cause"], "")
-        self.assertNotIn("degradation_detail", diagnostics)
+        self.assertEqual(diagnostics["degradation_cause"], "single-usable-family")
+        self.assertIn("degradation_detail", diagnostics)
 
     def test_single_usable_family_without_the_flag_is_normal(self):
         nodes = [single_family_node("plan"), single_family_node("plan-replica")]
@@ -1894,7 +1895,7 @@ class DispatchBatchTest(unittest.TestCase):
             rows, independence, diagnostics = BATCH.assign_harnesses(route, nodes, allow_degraded=False)
         self.assertEqual(independence, "persona")
         self.assertEqual({row[1] for row in rows}, {"claude"})
-        self.assertEqual(diagnostics["degradation_cause"], "")
+        self.assertEqual(diagnostics["degradation_cause"], "single-usable-family")
         self.assertEqual(diagnostics["family_exclusions"]["codex"],
                          ["dispatch-evidence-candidate-unsupported"])
 

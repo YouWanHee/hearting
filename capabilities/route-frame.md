@@ -10,12 +10,12 @@ This is the portable contract for `route-frame`, the compiler-internal capabilit
 | Identifier | `route-frame` |
 | Group | `sub` |
 | Supported modes | `none` |
-| Portable meaning | Compiler-internal framed front end: one frame leg (both top-tier legs for uncertain or hard-to-reverse work) and a model-less runtime terminal that fixes the route decision. |
+| Portable meaning | Compiler-internal framed front end: two independent top-tier frame legs by default; an explicit quick/direct request may use one deep leg when no protected path, multiple adapter paths, or spec/ship hint requires both; ends at a model-less route-decision terminal. |
 | Argument shape | `compose --start --prompt-file <task> [--shape framed]` |
 
 ## Shape
 
-A framed route is sealed at intensity `standard`. Ordinary work runs one frame leg; `compose --shape framed --intensity strong` (or higher) marks the work uncertain or hard to reverse and runs both legs:
+A framed route is sealed at intensity `standard`. With no intensity it runs two independent top-tier frame legs by default. Explicit `standard` or higher also runs both. Explicit `quick` or `direct` runs one deep leg only when the request has no protected repository path, multiple adapter paths, or spec/ship capability hint; otherwise it keeps both legs:
 
 | Node | Kind | Runs as | Model |
 |---|---|---|---|

@@ -7485,6 +7485,24 @@ class FixtureRegistryGuardTest(unittest.TestCase):
 
 class ComposeRouteTest(TestRoute):
  """SD-135: `compose` seals a preset-free shape/subgraph through the same sealer."""
+ def test_framed_card_marks_only_sealed_single_or_supported_pins_as_same_harness(self):
+  import copy
+  route = self.compose(shape="framed", graph=None, intensity=None)
+  one = copy.deepcopy(route)
+  one["dispatch_evidence"]["tuples"] = one["dispatch_evidence"]["tuples"][:1]
+  one["dispatch_evidence"]["tuples"][0]["child_harness"] = "claude"
+  one_line = "\n".join(R.compose_decision_lines(one))
+  self.assertIn("같은 하네스: 쓸 수 있는 하네스 claude 하나", one_line)
+  supported_pin = copy.deepcopy(route)
+  supported_pin["selection_pins"] = {"contract_version": 1,
+      "frame": {"harness": "codex", "model": None, "effort": None}}
+  self.assertIn("같은 하네스: 명시 frame 지정 codex",
+                "\n".join(R.compose_decision_lines(supported_pin)))
+  unsupported_pin = copy.deepcopy(route)
+  unsupported_pin["selection_pins"] = {"contract_version": 1,
+      "frame": {"harness": "opencode", "model": None, "effort": None}}
+  self.assertNotIn("같은 하네스", "\n".join(R.compose_decision_lines(unsupported_pin)))
+
  def test_automatic_depth_two_evidence_uses_enabled_prospective_owner_pool(self):
   readiness = self.evidence()
   enabled = ("claude", "codex", "opencode")

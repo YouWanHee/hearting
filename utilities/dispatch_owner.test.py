@@ -62,10 +62,10 @@ class FrameAlternativeSelectionTest(unittest.TestCase):
             {"claude": 80, "codex": 80, "opencode": 80},
             list(policy["primary"]), lambda rows: rows, lambda h: states[h] == "ok")
 
-    def test_frame_keeps_capacity_selection_in_both_directions(self):
+    def test_frame_alternative_excludes_the_first_harness_in_both_directions(self):
         for first, other in (("claude", "codex"), ("codex", "claude")):
             with self.subTest(first=first):
-                self.assertEqual(self.choose(first, first)[0], first)
+                self.assertEqual(self.choose(first, first)[0], other)
 
     def test_single_supported_harness_keeps_selection(self):
         self.assertEqual(self.choose("codex", "codex", policy={
@@ -82,7 +82,7 @@ class FrameAlternativeSelectionTest(unittest.TestCase):
             {}, {}, {}, {}, {}, [], lambda rows: rows, lambda h: True)
         self.assertEqual(selected, "claude")
 
-    def test_selector_preserves_capacity_selection_in_both_directions(self):
+    def test_selector_places_frame_alternative_on_the_other_eligible_harness(self):
         import artifact_producer
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -138,7 +138,7 @@ class FrameAlternativeSelectionTest(unittest.TestCase):
                          mock.patch("dispatch_degradation.record_degradation") as record:
                         self.assertEqual(OWNER.main([]), 0)
                         record.assert_not_called()
-                self.assertEqual(Path(launch.call_args.args[0][0]).parts[-3], first)
+                self.assertEqual(Path(launch.call_args.args[0][0]).parts[-3], other)
 
 class FrameTopDeclarationTest(unittest.TestCase):
     """Automatic frame-leg assignment chooses only harnesses whose runtime config declares `top`."""

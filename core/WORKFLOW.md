@@ -231,7 +231,7 @@ a mode retains its existing deployment/release behavior (`default`).
 Compose and start show intensity and its source, sealed node profiles, and the
 initial node/worker-dispatch/resource counts before launch. Unspecified intensity
 adds one nonblocking suggestion to consider `strong` for judgment or root-cause
-analysis; intensity does not change model profiles. These observations add no
+analysis, except framed routes which already start with two top-tier frame legs; intensity does not change model profiles. These observations add no
 approval or required input. New compose records retain the two input sources in
 the existing `selection_basis`; old routes display `sealed-route` when the
 original explicit/default choice was not recorded. Worker estimates count stage

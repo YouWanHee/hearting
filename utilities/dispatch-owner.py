@@ -14,7 +14,7 @@ import sys
 from owner_route_binding import OwnerRouteBindingError, validate_owner_route_binding, derive_quick_owner_binding, derive_frame_route_binding
 from dispatch_mode_contract import DispatchModeContractError, resolve_qa
 from dispatch_contract import (DispatchContractError, frame_harness_admission,
-                               parse_registry_metadata)
+                               parse_registry_metadata, record_frame_launch_degradation)
 from route_authority import pinned_launch_harness, route_in_force, sealed_pin_harness
 from dispatch_lifecycle import (
     FOREGROUND_NOTICE,
@@ -314,7 +314,23 @@ def _first_frame_attempt(route, jobs):
 def _prefer_other_frame_harness(first_harness, selected, explicit, config_version,
                                 policy, states, counts, allocation, capacity,
                                 configured, ranked, automatically_available):
-    """Compatibility helper: SD-160 never overrides capacity for diversity."""
+    """Re-run the existing capacity selector with the first frame family excluded."""
+    if explicit or config_version not in {3, 4} or not first_harness:
+        return selected, None, False
+    filtered = dict(states)
+    filtered[first_harness] = "limited(frame-sibling-already-placed)"
+    other, band, _ranks, promoted = _capacity.select(
+        policy, filtered, counts, allocation["harness_order"], capacity,
+        strategy=allocation["strategy"],
+        usage_gate_used_percent=allocation.get("usage_gate_used_percent", 90),
+        preferred=_capacity.preferred_for_depth(allocation, 1),
+        affinity_weight=allocation.get("depth_affinity_weight", 0.5),
+        headroom_exponent=allocation.get("usage_headroom_exponent", 1),
+        harness_weights=allocation.get("harness_weights"),
+        preference_order=allocation.get("owner_order"),
+    )
+    if other:
+        return other, band, promoted
     return selected, None, False
 
 
@@ -787,6 +803,7 @@ def run_owner_wrapper(argv: list[str], env: dict[str, str]) -> int:
 
 def main(argv):
     try:
+        frame_degradation = None
         explicit, values, forwarded, route_evidence, derived = _parse(argv)
         jobs = _authoritative_jobs(values, os.environ)
         profile = values["--model-profile"]
@@ -998,6 +1015,17 @@ def main(argv):
                 print("check=deferred\nreason=frame-first-attempt-pending\nchild_spawned=0")
                 return 75
             first_harness = first["harness"]
+            if not explicit:
+                alternate, alternate_band, alternate_promoted = _prefer_other_frame_harness(
+                    first_harness, selected, explicit, config_version, policy, states,
+                    counts, allocation, capacity, configured, ranked, automatically_available)
+                if alternate != selected:
+                    selected, quality_band = alternate, alternate_band
+                    source = "configured-" + allocation["strategy"]
+                    relief_promoted = alternate_promoted
+                elif not any(h != first_harness and h not in top_excluded for h in configured):
+                    reason = "frame-single-available-harness"
+                    frame_degradation = (route, first.get("attempt_id"), first_harness)
             try:
                 frame_harness_admission(
                     route, Path(jobs), lines, [first_harness, selected],
@@ -1097,7 +1125,16 @@ def main(argv):
                     raise OwnerError(f"{exc.code}:{exc.detail}") from exc
         if overridden:
             forwarded += ["--explicit-adapter", overridden]
-        return run_owner_wrapper([str(wrapper), *forwarded], child_env)
+        result = run_owner_wrapper([str(wrapper), *forwarded], child_env)
+        if result == 0 and frame_degradation and "--start" in forwarded:
+            route, first_attempt_id, first_harness = frame_degradation
+            if first_attempt_id:
+                try:
+                    record_frame_launch_degradation(
+                        route, Path(jobs), [], first_attempt_id, first_harness)
+                except Exception:
+                    pass
+        return result
     except (OwnerError, OwnerRouteBindingError, OSError) as exc:
         return _error(str(exc))
 

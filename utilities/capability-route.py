@@ -4005,6 +4005,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     if shape not in COMPOSE_SHAPES:
         raise ValueError(f"compose-shape-invalid:{shape}")
     routing_hints = None
+    frame_leg_choice = None
     if shape == "framed":
         # The shape itself picks the compiler-internal capability. Whatever was typed for the
         # ordinary shapes is only a hint for the work request: recorded, never sealed as the
@@ -4015,10 +4016,10 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         capability, capability_mode, graph, profile = ROUTE_FRAME_CAPABILITY, "default", None, None
         if intensity is not None and intensity not in ORDER:
             raise ValueError("invalid intensity")
-        # One frame leg for ordinary work; both top legs when the session marks the work uncertain
-        # or hard to reverse with a higher intensity (user decision 2026-10-07). The framed route
-        # itself is always sealed at `standard`.
-        frame_legs = 2 if intensity is not None and ORDER[intensity] > ORDER["standard"] else 1
+        # The framed route stays standard; its declared frame width is sealed separately.
+        request_text = work_request.get("text", "") if isinstance(work_request, dict) else ""
+        frame_leg_choice = RP.frame_leg_decision(intensity, request_text, routing_hints)
+        frame_legs = frame_leg_choice[0]
         intensity = None
     resume_graph = (shape in ("direct", "solo") and RESOURCE_RESUME.selected(
         capability, capability_mode or "setup", graph.split(",") if graph else None))
@@ -4209,6 +4210,11 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
          "source": "frame-shape" if shape == "framed" else
                    "explicit" if given_capability is not None else "compose-default"},
     ])
+    if shape == "framed":
+        route["selection"]["selection_basis"].append({
+            "axis": "frame-legs", "signal": str(frame_leg_choice[0]),
+            "source": frame_leg_choice[1], "reason": frame_leg_choice[2],
+        })
     if work_request is not None:
         from work_start import capture_request_context
         if routing_hints:
@@ -4858,9 +4864,9 @@ def compose_decision_lines(route):
     if requested and requested != route["effective_intensity"]:
         detail += f", requested={requested}"
     lines = [f"  intensity={route['effective_intensity']} (source={source}{detail})"]
-    if source == "shape-default":
-        lines.append("  강도 안내: 판정·원인 분석이면 --intensity strong 검토")
     shape = (route.get("selection") or {}).get("shape") or shape_for_intensity(route["effective_intensity"])
+    if source == "shape-default" and shape != "framed":
+        lines.append("  강도 안내: 판정·원인 분석이면 --intensity strong 검토")
     capability = basis.get("compose-capability", {})
     if capability.get("source") == "compose-default":
         lines.append(f"  capability={route['capability']} (source=compose-default, --capability 지정 안 됨; "
@@ -4883,8 +4889,24 @@ def compose_decision_lines(route):
     workers = sum(n.get("dispatch_depth") == 2 or _frame_node(n) for n in nodes)
     owners = int(shape != "framed" and route["effective_intensity"] != "direct")
     resources = [n["id"] for n in nodes if n.get("kind") == "resource-runner"]
-    lines.append(f"  규모: nodes={len(nodes)} worker_dispatches={workers} owner_dispatches={owners} "
-                 f"resource(측정)={','.join(resources) or '없음'} (초기 실행 예상, 재시도·후속 route 제외)")
+    size = f"  규모: nodes={len(nodes)} worker_dispatches={workers} owner_dispatches={owners} " \
+           f"resource(측정)={','.join(resources) or '없음'} (초기 실행 예상, 재시도·후속 route 제외)"
+    if shape == "framed":
+        frame_basis = basis.get("frame-legs")
+        if frame_basis:
+            size += f"; frame {frame_basis.get('signal')}갈래({frame_basis.get('source')}: {frame_basis.get('reason')})"
+        else:
+            count = len(RP.frame_legs(route))
+            size += f"; frame {count}갈래(이전 규칙으로 봉인, 출처 미기록)"
+        tuples = ((route.get("dispatch_evidence") or {}).get("tuples") or [])
+        supported = {row.get("child_harness") for row in tuples
+                     if row.get("status") == "supported" and row.get("child_harness")}
+        pin = (((route.get("selection_pins") or {}).get("frame") or {}).get("harness"))
+        if len(supported) == 1:
+            size += f" (같은 하네스: 쓸 수 있는 하네스 {next(iter(supported))} 하나)"
+        elif pin and pin in supported:
+            size += f" (같은 하네스: 명시 frame 지정 {pin})"
+    lines.append(size)
     for row in ((route.get("composed_recipe") or {}).get("compose") or {}).get("auto_completed_nodes", []):
         purpose = "owner closing summary" if row["reason"] == "terminal-anchor" else "registry consumer"
         lines.append(f"  {row['intensity']} group {','.join(row['anchors'])}: "
@@ -11654,12 +11676,12 @@ def main():
     cp.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
     cp.add_argument("--profile", choices=sorted(PROFILE.PORTABLE_PROFILES),
                     help="explicit model budget for owner and model nodes; node-specific --explicit-profiles takes precedence")
-    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered owner) | staged (capability recipe, optionally narrowed by --graph) | framed (two top frame legs propose the route; --capability, --capability-mode, --graph and --profile are recorded as hints only); default: framed; use --shape direct for inline work; --graph without --shape is a frame routing hint")
+    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered owner) | staged (capability recipe, optionally narrowed by --graph) | framed (two top frame legs propose the route by default; explicit quick/direct may use one deep leg for unprotected work; --capability, --capability-mode, --graph and --profile are recorded as hints only); default: framed; use --shape direct for inline work; --graph without --shape is a frame routing hint")
     cp.add_argument("--graph",default=None,help="optional staged subgraph in your order (see `capability-route.py stages --capability <cap>` for valid ids); incompatible inherited parallel presets are omitted; optional :unit override, e.g. execute,test,report")
     cp.add_argument("--execution-scope", choices=("complete", "report"), default=None,
                     help="optional scope already selected in the existing start confirmation; it is not approval evidence")
     cp.add_argument("--capability",default=None,help=f"default {COMPOSE_DEFAULT_CAPABILITY}; a hint only with --shape framed"); cp.add_argument("--capability-mode",default=None)
-    cp.add_argument("--intensity",default=None,help="default by shape: direct/quick/standard; staged accepts strong+")
+    cp.add_argument("--intensity",default=None,help="default by shape: direct/quick/standard; framed defaults to two frame legs, while explicit quick/direct may use one for unprotected work; staged accepts strong+")
     cp.add_argument("--cwd",default=None,help="default: current directory"); cp.add_argument("--artifact-root",default=None,help="default: utilities/artifact-root.sh for cwd")
     cp.add_argument("--signal",action="append",default=[],
                     help="promotion signal (repeatable), e.g. shared-contract: promotes shared spec/contract "
