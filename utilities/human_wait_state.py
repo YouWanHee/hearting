@@ -13,11 +13,15 @@ import sys
 import tempfile
 import time
 import fcntl
+import math
 
 
 _MARKER = re.compile(r"^\s*\[(?:답변 필요|결정 필요)\]\s*(.*)$")
 _MAX_QUESTION = 160
 _SAFE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+_CACHE_MAX_BYTES = 2 * 1024 * 1024
+_DISPLAY_TTL = 180.0
+_REQUEST_TTL = 60.0
 
 
 def state_root() -> Path:
@@ -147,7 +151,7 @@ def signal_is_current(value: dict) -> bool:
 def notify_signal(value: dict) -> None:
     """Run registration side effects after the caller has released seat locks."""
     _notify_item(value, boundary="registered")
-    _ensure_watcher({"items": [value]})
+    _request_producer()
 
 
 def open_signal(harness: str, session_id: str, seat_key: str, text: str, *,
@@ -212,77 +216,194 @@ def read_signals(*, now: float | None = None) -> list[dict]:
 
 
 def publish_cache(result: dict) -> bool:
-    """Publish a private derived view for fast display surfaces."""
+    """Publish a private v2 derived view; publication has no notification side effects."""
     if not isinstance(result, dict) or not isinstance(result.get("items"), list):
         return False
-    by_session: dict[str, int] = {}
+    by_session: dict[str, list[str]] = {}
+    items = []
     for item in result["items"]:
-        if item.get("stale"):
+        if not isinstance(item, dict):
             continue
         owner = item.get("owner") or {}
         harness, sid = owner.get("harness"), owner.get("session_id")
-        if harness and sid:
+        row = {key: item.get(key) for key in ("id", "source", "kind", "since", "route_id",
+               "attempt_id", "gate_id", "attribution", "stale")}
+        row["question"] = _clean(item.get("question") or "") or None
+        row["seat_key"] = owner.get("seat_key")
+        row["owner"] = {"harness": harness, "session_id": sid}
+        items.append(row)
+        if harness and sid and not item.get("stale"):
             key = str(harness) + "\0" + str(sid)
-            by_session[key] = by_session.get(key, 0) + 1
-    value = {"schema_version": 1, "observed_at": float(result.get("observed_at") or time.time()),
-             "complete": bool(result.get("complete")), "total": len(result["items"]),
-             "by_session": by_session}
+            by_session.setdefault(key, []).append(str(item.get("id") or ""))
+    stale_total = sum(bool(item.get("stale")) for item in items)
+    current_total = sum(not bool(item.get("stale")) for item in items)
+    value = {"schema_version": 2, "observed_at": float(result.get("observed_at") or time.time()),
+             "complete": bool(result.get("complete")), "total": current_total,
+             "stale_total": stale_total, "items": items, "by_session": by_session,
+             "unattributed": [item.get("id") for item in items
+                              if item.get("attribution") == "unattributed" and not item.get("stale")],
+             "health": [{"source": row.get("source"), "state": row.get("state")}
+                        for row in result.get("health", ()) if isinstance(row, dict)]}
     try:
         _write(_cache_path(), value)
-        _notify_result(result)
-        _ensure_watcher(result)
         return True
     except (OSError, ValueError, TypeError):
         return False
 
 
-def cached_count(harness: str, session_id: str, *, now: float | None = None,
-                 max_age: float = 60.0) -> tuple[int, int] | None:
-    """Return (global total, exact session count) from a fresh complete cache."""
+def _read_cache(*, now=None, max_age=_DISPLAY_TTL):
     path = _cache_path()
     try:
+        parent = os.lstat(path.parent)
+        if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid()
+                or stat.S_IMODE(parent.st_mode) & 0o077):
+            return None
         meta = os.lstat(path)
         if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid()
-                or stat.S_IMODE(meta.st_mode) & 0o077):
+                or stat.S_IMODE(meta.st_mode) & 0o077 or meta.st_size > _CACHE_MAX_BYTES):
             return None
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return None
     current = time.time() if now is None else float(now)
-    if (not isinstance(value, dict) or value.get("schema_version") != 1
+    if (not isinstance(value, dict) or value.get("schema_version") != 2
             or not isinstance(value.get("observed_at"), (int, float))
+            or isinstance(value.get("observed_at"), bool)
+            or not math.isfinite(float(value["observed_at"]))
+            or not isinstance(value.get("items"), list)
+            or not isinstance(value.get("by_session"), dict)
+            or not isinstance(value.get("total"), int) or isinstance(value.get("total"), bool)
+            or not isinstance(value.get("stale_total"), int) or isinstance(value.get("stale_total"), bool)
+            or current - float(value["observed_at"]) < 0
             or current - float(value["observed_at"]) > max_age):
         return None
+    for item in value["items"]:
+        if (not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                or not isinstance(item.get("source"), str)
+                or not isinstance(item.get("since"), (int, float))
+                or isinstance(item.get("since"), bool) or not math.isfinite(float(item["since"]))
+                or not isinstance(item.get("owner"), dict)):
+            return None
+    for session, ids in value["by_session"].items():
+        if not isinstance(session, str) or "\0" not in session or not isinstance(ids, list) \
+                or any(not isinstance(item_id, str) for item_id in ids):
+            return None
+    return value
+
+
+def cached_view(*, now=None, request=True):
+    value = _read_cache(now=now)
+    if request:
+        observed = value.get("observed_at") if value else None
+        if observed is None or (time.time() if now is None else float(now)) - float(observed) > _REQUEST_TTL:
+            _request_producer()
+    if value is None:
+        return None
+    indexed = {tuple(key.split("\0", 1)): ids for key, ids in value.get("by_session", {}).items()
+               if isinstance(key, str) and "\0" in key and isinstance(ids, list)}
+    return {"items": value["items"], "by_session": indexed, "total": value.get("total", 0),
+            "stale_total": value.get("stale_total", 0), "unattributed": value.get("unattributed", []),
+            "health": value.get("health", []), "complete": bool(value.get("complete")),
+            "observed_at": value["observed_at"]}
+
+
+def cached_count(harness: str, session_id: str, *, now: float | None = None,
+                 max_age: float = _DISPLAY_TTL) -> tuple[int, int] | None:
+    """Return (global current total, exact session count) from a display-valid cache."""
+    value = _read_cache(now=now, max_age=max_age)
+    if value is None:
+        if max_age == _DISPLAY_TTL:
+            _request_producer()
+        return None
+    current = time.time() if now is None else float(now)
+    if max_age == _DISPLAY_TTL and current - float(value["observed_at"]) > _REQUEST_TTL:
+        _request_producer()
+    key = str(harness) + "\0" + str(session_id)
     counts = value.get("by_session") if isinstance(value.get("by_session"), dict) else {}
     key = str(harness) + "\0" + str(session_id)
     total = int(value.get("total", 0)) if value.get("complete") else -1
-    return total, int(counts.get(key, 0))
+    return total, len(counts.get(key, ()))
 
 
-def _refresh_cache() -> bool:
+def _request_producer():
     root = state_root()
     try:
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        lock_path = root / ".projection.lock"
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        root_meta = os.lstat(root)
+        if not stat.S_ISDIR(root_meta.st_mode) or root_meta.st_uid != os.getuid():
+            return
+        os.chmod(root, 0o700)
+        marker = root / ".demand"
+        demand_lock = os.open(root / ".demand.lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
-            os.fchmod(fd, 0o600)
+            os.fchmod(demand_lock, 0o600)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(demand_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                return False
-            import sys
-            project_root = str(Path(__file__).resolve().parents[1])
-            if project_root not in sys.path:
-                sys.path.insert(0, project_root)
-            from tools.fleet.collectors import dispatch
-            import human_gate_observation
-            result = human_gate_observation.read_answer_waits(
-                jobs_paths=dispatch.human_gate_registry_paths())
-            return publish_cache(result)
+                return
+            try:
+                age = time.time() - marker.stat().st_mtime
+            except OSError:
+                age = _REQUEST_TTL
+            if age >= _REQUEST_TTL:
+                marker.touch(exist_ok=True)
         finally:
-            os.close(fd)
+            os.close(demand_lock)
+        now = time.time()
+        cache = _read_cache(now=now)
+        fresh = cache is not None and now - float(cache["observed_at"]) <= _REQUEST_TTL
+        if not fresh:
+            _ensure_producer()
+    except OSError:
+        return
+
+
+def _ensure_producer():
+    root = state_root()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root_meta = os.lstat(root)
+    if not stat.S_ISDIR(root_meta.st_mode) or root_meta.st_uid != os.getuid():
+        return False
+    os.chmod(root, 0o700)
+    fd = os.open(root / ".projection.lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    os.fchmod(fd, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    try:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--refresh-cache", "--lock-fd", str(fd)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True, pass_fds=(fd,),
+                         start_new_session=True)
+    except (OSError, subprocess.SubprocessError):
+        os.close(fd)
+        return False
+    os.close(fd)
+    return True
+
+
+def _refresh_cache() -> bool:
+    """Run one observational refresh. Caller owns the single-flight lock."""
+    try:
+        project_root = str(Path(__file__).resolve().parents[1])
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from tools.fleet.collectors import dispatch
+        import human_gate_observation
+        result = human_gate_observation.read_answer_waits(
+            jobs_paths=dispatch.human_gate_registry_paths())
+        if not publish_cache(result):
+            failure = {"items": [], "complete": False, "observed_at": time.time(),
+                       "health": [{"source": "producer", "state": "unknown"}]}
+            publish_cache(failure)
+            return False
+        _notify_result(result)
+        return True
     except Exception:
+        publish_cache({"items": [], "complete": False, "observed_at": time.time(),
+                       "health": [{"source": "producer", "state": "unknown"}]})
         return False
 
 
@@ -339,7 +460,10 @@ def _notify_item(item: dict, *, boundary: str, sound: bool = False) -> bool:
 def _notify_result(result: dict) -> None:
     now = float(result.get("observed_at") or time.time())
     for item in result.get("items", ()):
-        if not isinstance(item, dict) or now - float(item.get("since") or now) >= 7 * 86400:
+        if (not isinstance(item, dict) or item.get("stale")
+                or now - float(item.get("since") or now) >= 72 * 3600
+                   and item.get("source") in {"S2", "S3"}
+                or now - float(item.get("since") or now) >= 7 * 86400):
             continue
         _notify_item(item, boundary="registered")
         age = now - float(item.get("since") or now)
@@ -350,52 +474,56 @@ def _notify_result(result: dict) -> None:
             _notify_item(item, boundary="1h", sound=True)
 
 
-def _ensure_watcher(result: dict) -> None:
-    if not shutil.which("herdr") or not any(
-            float(item.get("since") or time.time()) + 6 * 3600 > time.time()
-            for item in result.get("items", ()) if isinstance(item, dict)):
-        return
+def _notification_delay(items, now, *, enabled):
+    """Seconds to the next 1h/6h boundary, or None when no producer is needed."""
+    if not enabled:
+        return None
+    deadlines = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("stale"):
+            continue
+        try:
+            since = float(item["since"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        maximum = 72 * 3600 if item.get("source") in {"S2", "S3"} else 7 * 86400
+        age = now - since
+        if age < 0 or age >= maximum:
+            continue
+        for boundary in (3600, 6 * 3600):
+            remaining = since + boundary - now
+            if remaining > 0:
+                deadlines.append(remaining)
+    return min(deadlines) if deadlines else None
+
+
+def _producer_loop(fd: int) -> None:
     root = state_root()
     try:
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        lock_path = root / ".watch.lock"
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        os.fchmod(fd, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(fd)
-            return
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--watch-fd", str(fd)],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, close_fds=True, pass_fds=(fd,),
-                         start_new_session=True)
-        os.close(fd)  # the child inherited the locked open description
-    except (OSError, subprocess.SubprocessError):
-        try:
-            os.close(fd)
-        except (OSError, UnboundLocalError):
-            pass
-
-
-def _watch(fd: int) -> None:
-    try:
-        project_root = str(Path(__file__).resolve().parents[1])
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
-        from tools.fleet.collectors import dispatch
-        import human_gate_observation
+        _refresh_cache()
         while True:
             now = time.time()
-            result = human_gate_observation.read_answer_waits(
-                jobs_paths=dispatch.human_gate_registry_paths(), now=now)
-            publish_cache(result)
-            future = [float(item.get("since") or now) + 6 * 3600 - now
-                      for item in result.get("items", ()) if isinstance(item, dict)
-                      and now - float(item.get("since") or now) < 6 * 3600]
-            if not future:
-                return
-            time.sleep(max(1, min(60, min(future))))
+            try:
+                demand = (root / ".demand").stat().st_mtime
+            except OSError:
+                demand = 0
+            cached = _read_cache(now=now, max_age=float("inf")) or {}
+            boundary = _notification_delay(cached.get("items", ()), now,
+                                           enabled=bool(shutil.which("herdr")))
+            idle = now - demand
+            if idle >= 600 and boundary is None:
+                try:
+                    latest_demand = (root / ".demand").stat().st_mtime
+                except OSError:
+                    latest_demand = 0
+                if latest_demand <= demand and time.time() - latest_demand >= 600:
+                    return
+                continue
+            delay = min(30.0, max(1.0, 600.0 - idle))
+            if boundary is not None:
+                delay = min(delay, max(1.0, boundary))
+            time.sleep(delay)
+            _refresh_cache()
     except Exception:
         return
     finally:
@@ -410,14 +538,23 @@ def main(argv=None) -> int:
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--refresh-cache", action="store_true")
-    parser.add_argument("--watch-fd", type=int)
+    parser.add_argument("--lock-fd", type=int)
     parser.add_argument("--count", nargs=2, metavar=("HARNESS", "SESSION"))
     args = parser.parse_args(argv)
     if args.refresh_cache:
-        _refresh_cache()
-        return 0
-    if args.watch_fd is not None:
-        _watch(args.watch_fd)
+        if args.lock_fd is not None:
+            _producer_loop(args.lock_fd)
+        else:
+            # Direct internal invocation participates in the same single flight.
+            try:
+                root = state_root()
+                root.mkdir(mode=0o700, parents=True, exist_ok=True)
+                fd = os.open(root / ".projection.lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                os.fchmod(fd, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _producer_loop(fd)
+            except (OSError, BlockingIOError):
+                pass
         return 0
     if args.count:
         value = cached_count(*args.count)

@@ -500,14 +500,6 @@ if [ -n "$S_SID" ] && command -v python3 >/dev/null 2>&1; then
     wait_helper="$(dirname "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")/../../utilities/human_wait_state.py"
   fi
   if [ -f "$wait_helper" ]; then
-    wait_root="${XDG_STATE_HOME:-$HOME/.local/state}/hearting/human-waits"
-    wait_cache="$wait_root/projection.json"
-    wait_mtime=$(stat -c %Y "$wait_cache" 2>/dev/null || echo 0)
-    wait_now=$(date +%s)
-    case "$wait_mtime" in ''|*[!0-9]*) wait_mtime=0 ;; esac
-    if [ "$wait_mtime" -gt 0 ] && [ $((wait_now - wait_mtime)) -gt 60 ]; then
-      ( setsid python3 "$wait_helper" --refresh-cache >/dev/null 2>&1 </dev/null & ) >/dev/null 2>&1 || true
-    fi
     wait_counts=$(python3 "$wait_helper" --count claude "$S_SID" 2>/dev/null || true)
     set -- $wait_counts
     if [ "$#" -eq 2 ] && [ "${2:-0}" -gt 0 ] 2>/dev/null; then

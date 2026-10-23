@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sys
 from collections import OrderedDict
 from datetime import datetime
@@ -15,7 +16,7 @@ if str(ROOT / "utilities") not in sys.path:
 import frame_interview as FI
 import workflow_state as WS
 
-_CACHE_LIMIT = 256
+_CACHE_LIMIT = 2048
 _JOURNAL_CACHE = OrderedDict()
 _JSON_CACHE = OrderedDict()
 _OBSERVATION_CACHE = OrderedDict()
@@ -249,10 +250,6 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
     health = []
     items = []
     by_session = defaultdict(list)
-    known_sessions = {
-        (str(getattr(sess, "harness", "") or ""), str(getattr(sess, "session_id", "") or ""))
-        for sess in sessions
-    }
     sessions_by_key = {
         (str(getattr(sess, "harness", "") or ""), str(getattr(sess, "session_id", "") or "")): sess
         for sess in sessions
@@ -266,7 +263,7 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
         items.append(item)
         owner = item.get("owner") or {}
         key = (owner.get("harness"), owner.get("session_id"))
-        if key in known_sessions:
+        if key[0] and key[1]:
             by_session[key].append(item["id"])
 
     def epoch(value, fallback):
@@ -340,35 +337,49 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                     health.append({"source": "registry", "path": str(path),
                                    "state": "unknown", "reason": snapshot.reason})
                     continue
+                view = snapshot.view
+                try:
+                    from dispatch_seat_handover import effective_parent, effective_parent_harness
+                    from peer_read_context import PeerReadContext
+                    read_context = PeerReadContext()
+                except ImportError:
+                    effective_parent = effective_parent_harness = None
+                    read_context = None
                 latest = {}
-                all_records = snapshot.view.records
-                for row in all_records:
-                    fields = row.fields
-                    if len(fields) != 6:
-                        continue
+                first_order = {}
+                owner_records = view.answer_wait_owner_candidates()
+                for row in owner_records:
                     meta = row.completion_metadata()
                     attempt = meta.get("attempt_id")
                     if attempt:
-                        latest[attempt] = (row.status, meta, fields)
+                        first_order.setdefault(attempt, row.order)
+                        latest[attempt] = (row.status, meta, row.fields, row.order)
                 successor_sources = set()
-                for row in all_records:
+                for row in owner_records:
                     meta = row.completion_metadata()
                     for key in ("automatic_retry_of", "replacement_original_attempt_id",
                                 "prior_attempt_id"):
                         if meta.get(key):
                             successor_sources.add(meta[key])
-                for attempt, (status, meta, fields) in latest.items():
+                import route_authority
+                for attempt, (status, meta, fields, row_order) in latest.items():
                     if meta.get("worker_type") != "owner" or attempt in successor_sources:
                         continue
-                    import route_authority
-                    if not route_authority.answerable_owner_end(status, meta):
+                    if route_authority.answerable_owner_end(status, meta) != "BLOCKED":
                         continue
                     route_file = meta.get("owner_route_file") or meta.get("route_file")
                     route_id = meta.get("owner_route_id") or meta.get("route_id")
                     route_digest = meta.get("owner_route_hash") or meta.get("route_hash")
                     if not route_file or not route_id or not route_digest:
-                        health.append({"source": "S3", "attempt_id": attempt,
-                                       "state": "unknown", "reason": "route-unproven"})
+                        continue
+                    # The same jobs identity and exact route binding must have no
+                    # later owner attempt. Children and different route/hash rows do not close it.
+                    registered_order = first_order.get(attempt, row_order)
+                    later = any(other_id != attempt and first_order.get(other_id, other_order) > registered_order
+                                and (other_meta.get("owner_route_id") or other_meta.get("route_id")) == route_id
+                                and (other_meta.get("owner_route_hash") or other_meta.get("route_hash")) == route_digest
+                                for other_id, (_s, other_meta, _f, other_order) in latest.items())
+                    if later:
                         continue
                     try:
                         project_root = str(Path(__file__).resolve().parents[1])
@@ -379,6 +390,15 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                         route_record = route_module.load(route_file, route_digest, route_id)
                         if route_record is None:
                             continue
+                        started = epoch(meta.get("ended_at") or fields[0], float("nan"))
+                        if not math.isfinite(started):
+                            health.append({"source": "S3", "attempt_id": attempt,
+                                           "state": "unknown", "reason": "invalid-timestamp"})
+                            continue
+                        age = instant - started
+                        if age < 0 or age > 7 * 86400:
+                            continue
+                        folded = age > 72 * 3600
                         outcome = route_module.load_outcome(route_file, route_id, route_digest)
                         if outcome and outcome.get("closed_at") and outcome.get("match") is True:
                             continue
@@ -396,42 +416,76 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                                         blocker = " ".join(str(raw).split())[:160]
                             except Exception:
                                 pass
+                        try:
+                            if effective_parent is None:
+                                raise ImportError("lineage reader unavailable")
+                            parent = effective_parent(meta, path, read_context=read_context)
+                            parent_harness = effective_parent_harness(meta, path, read_context=read_context)
+                        except Exception:
+                            parent, parent_harness = meta.get("parent_sid"), meta.get("parent_harness")
                         add({"id": "S3:" + str(attempt), "source": "S3",
                              "kind": "decision", "question": blocker, "choices": [],
                              "recommendation": None, "route_id": route_id,
                              "route_hash": route_digest, "attempt_id": attempt,
-                             "gate_id": None, "since": epoch(meta.get("ended_at") or fields[0], instant),
-                             "owner": {"harness": meta.get("harness") or fields[2],
-                                       "session_id": meta.get("parent_sid") or None,
+                             "gate_id": None, "since": started, "stale": folded,
+                             "owner": {"harness": parent_harness or None,
+                                       "session_id": parent or None,
                                        "seat_key": None},
-                             "attribution": "lineage" if meta.get("parent_sid") else "unattributed"})
+                             "attribution": "lineage" if parent and parent_harness else "unattributed"})
                     except (OSError, ValueError, TypeError, KeyError, ImportError) as exc:
                         health.append({"source": "S3", "attempt_id": attempt,
                                        "state": "unknown", "reason": type(exc).__name__})
                 # S2 is independent of owner terminal state and uses the same
                 # exact route/journal reader as the established Fleet enrichment.
-                seen_routes = set()
                 project_root = str(Path(__file__).resolve().parents[1])
                 if project_root not in sys.path:
                     sys.path.insert(0, project_root)
                 from tools.fleet import route as route_module
-                for row in all_records:
+                route_candidates = {}
+                for row in view.records:
                     fields = row.fields
                     meta = row.completion_metadata()
                     route_file = meta.get("owner_route_file") or meta.get("route_file")
                     route_id = meta.get("owner_route_id") or meta.get("route_id")
                     route_digest = meta.get("owner_route_hash") or meta.get("route_hash")
                     key = (route_id, route_digest, route_file)
-                    if not route_file or not route_id or not route_digest or key in seen_routes:
+                    if not route_file or not route_id or not route_digest:
                         continue
-                    seen_routes.add(key)
+                    activity = max(epoch(fields[0], float("nan")),
+                                   epoch(meta.get("ended_at"), float("nan")))
+                    route_candidates.setdefault(key, []).append((row, activity))
+                for (route_id, route_digest, route_file), candidates in route_candidates.items():
+                    route_activity = max((activity for _row, activity in candidates
+                                          if math.isfinite(activity)), default=float("nan"))
+                    if not math.isfinite(route_activity):
+                        health.append({"source": "S2", "route_id": route_id,
+                                       "state": "unknown", "reason": "invalid-timestamp"})
+                        continue
+                    if instant - route_activity > 8 * 86400:
+                        continue
                     try:
+                        row = candidates[-1][0]
+                        fields = row.fields
+                        meta = row.completion_metadata()
                         route_record = route_module.load(route_file, route_digest, route_id)
                         if route_record is None:
                             continue
                         outcome = route_module.load_outcome(route_file, route_id, route_digest)
                         for wait in pending_human_waits(route_record, jobs=path, outcome=outcome):
                             parent_sid = meta.get("parent_sid")
+                            parent_harness = meta.get("parent_harness")
+                            if effective_parent is not None:
+                                try:
+                                    parent_sid = effective_parent(meta, path, read_context=read_context)
+                                    parent_harness = effective_parent_harness(meta, path,
+                                                                              read_context=read_context)
+                                except Exception:
+                                    pass
+                            since = float(wait["waiting_since"])
+                            age = instant - since
+                            if age < 0 or age > 7 * 86400:
+                                continue
+                            stale = age > 72 * 3600
                             question, choices, recommendation = (
                                 _frame_question_detail(route_record, path, wait["gate_id"])
                                 if wait["gate_id"] == "frame-review" else (None, [], None))
@@ -440,10 +494,10 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                                  "source": "S2", "kind": wait["kind"], "question": question,
                                  "choices": choices, "recommendation": recommendation, "route_id": route_id,
                                  "route_hash": route_digest, "attempt_id": meta.get("attempt_id"),
-                                 "gate_id": wait["gate_id"], "since": wait["waiting_since"],
-                                 "owner": {"harness": meta.get("harness") or fields[2],
+                                 "gate_id": wait["gate_id"], "since": since, "stale": stale,
+                                 "owner": {"harness": parent_harness or None,
                                            "session_id": parent_sid or None},
-                                 "attribution": "lineage" if parent_sid else "unattributed"})
+                                 "attribution": "lineage" if parent_sid and parent_harness else "unattributed"})
                     except (OSError, ValueError, TypeError, KeyError, ImportError) as exc:
                         health.append({"source": "S2", "route_id": route_id,
                                        "state": "unknown", "reason": type(exc).__name__})
@@ -451,12 +505,22 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
             health.append({"source": "registry", "path": str(path),
                            "state": "unknown", "reason": type(exc).__name__})
 
+    current_total = 0
+    stale_total = 0
     for item in items:
         try:
-            item["stale"] = bool(item.get("stale")) or instant - float(item.get("since", instant)) >= 7 * 86400
+            old = instant - float(item.get("since", instant))
+            item["stale"] = bool(item.get("stale")) or old >= 7 * 86400
         except (TypeError, ValueError, OverflowError):
-            item["stale"] = False
-    unattributed = [item["id"] for item in items if item.get("attribution") == "unattributed"]
+            item["stale"] = True
+        if item["stale"]:
+            stale_total += 1
+        else:
+            current_total += 1
+    current_ids = {item["id"] for item in items if not item.get("stale")}
+    by_session = {key: [item_id for item_id in values if item_id in current_ids]
+                  for key, values in by_session.items()}
+    unattributed = [item["id"] for item in items if item.get("attribution") == "unattributed" and not item.get("stale")]
     return {"items": items, "by_session": dict(by_session), "unattributed": unattributed,
-            "total": len(items), "health": health, "observed_at": instant,
+            "total": current_total, "stale_total": stale_total, "health": health, "observed_at": instant,
             "complete": not any(row.get("state") == "unknown" for row in health)}

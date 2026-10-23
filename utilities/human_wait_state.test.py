@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import fcntl
 import stat
+import sys
 import tempfile
 import threading
 import unittest
@@ -23,6 +24,9 @@ class HumanWaitStateTests(unittest.TestCase):
         self.path = mock.patch.dict(os.environ, {"PATH": str(Path(self.tmp.name) / "empty-bin")})
         self.path.start()
         self.addCleanup(self.path.stop)
+        demand = mock.patch.object(state, "_request_producer")
+        demand.start()
+        self.addCleanup(demand.stop)
         self.addCleanup(self.tmp.cleanup)
 
     def test_only_explicit_first_line_markers_open_private_signal(self):
@@ -78,7 +82,7 @@ class HumanWaitStateTests(unittest.TestCase):
                   "question": "사용자 답을 기다림"}]}
         with mock.patch.dict(os.environ, {"PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
                                           "HERDR_TEST_LOG": str(calls)}), \
-             mock.patch.object(state, "_ensure_watcher"):
+             mock.patch.object(state, "_request_producer"):
             state._notify_result(result)
             state._notify_result(result)
         lines = calls.read_text(encoding="utf-8").splitlines()
@@ -93,6 +97,15 @@ class HumanWaitStateTests(unittest.TestCase):
             self.assertFalse(state._notify_item({"id": "S4:missing", "question": "확인"},
                                                 boundary="registered"))
         self.assertFalse((state.state_root() / "notifications").exists())
+
+    def test_producer_stays_only_for_future_current_notification_boundaries(self):
+        now = 10_000.0
+        item = {"source": "S3", "since": now - 1800, "stale": False}
+        self.assertEqual(state._notification_delay([item], now, enabled=True), 1800)
+        self.assertIsNone(state._notification_delay([item], now, enabled=False))
+        self.assertIsNone(state._notification_delay([dict(item, stale=True)], now, enabled=True))
+        self.assertIsNone(state._notification_delay(
+            [{"source": "S3", "since": now - 73 * 3600, "stale": False}], now, enabled=True))
 
     def test_notification_claim_is_single_under_concurrent_refresh(self):
         bin_dir = Path(self.tmp.name) / "race-bin"
@@ -117,36 +130,47 @@ class HumanWaitStateTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), 1)
 
-    def test_watcher_is_singleton_and_rechecks_without_real_sleep(self):
-        import time
-        import human_gate_observation
-        from tools.fleet.collectors import dispatch
+    def test_producer_is_single_flight_before_spawn(self):
         fd_holder = []
         spawner = mock.Mock(side_effect=lambda _cmd, **kw: (
             fd_holder.append(os.dup(kw["pass_fds"][0])) or SimpleNamespace()))
-        future = {"items": [{"id": "S3:watch", "since": time.time(), "question": "확인"}],
-                  "observed_at": time.time(), "complete": True}
-        no_wait = {"items": [], "observed_at": time.time(), "complete": True}
-        with mock.patch("human_wait_state.shutil.which", return_value="/fake/herdr"), \
-             mock.patch.object(state.subprocess, "Popen", spawner):
-            state._ensure_watcher(future)
-            state._ensure_watcher(future)
+        with mock.patch.object(state.subprocess, "Popen", spawner):
+            self.assertTrue(state._ensure_producer())
+            self.assertFalse(state._ensure_producer())
             self.assertEqual(len(fd_holder), 1)
-            with mock.patch.object(human_gate_observation, "read_answer_waits",
-                                   side_effect=[future, no_wait]) as reader, \
-                 mock.patch.object(dispatch, "human_gate_registry_paths", return_value=[]), \
-                 mock.patch.object(state.time, "sleep"), \
-                 mock.patch.object(state, "publish_cache"), \
-                 mock.patch.object(state, "_notify_result"), \
-                 mock.patch.object(state, "_ensure_watcher"):
-                fd = os.open(state.state_root() / ".watch.lock",
-                             os.O_CREAT | os.O_RDWR, 0o600)
-                state._watch(fd)
-                self.assertEqual(reader.call_count, 2)
-                self.assertGreaterEqual(reader.call_args_list[1].kwargs["now"],
-                                        reader.call_args_list[0].kwargs["now"])
         for held_fd in fd_holder:
             os.close(held_fd)
+
+    def test_spawn_failure_releases_projection_lock_for_next_demand(self):
+        with mock.patch.object(state.subprocess, "Popen", side_effect=OSError("fixture spawn failure")):
+            self.assertFalse(state._ensure_producer())
+        with mock.patch.object(state.subprocess, "Popen", return_value=SimpleNamespace()):
+            self.assertTrue(state._ensure_producer())
+
+    def test_projection_failure_publishes_fresh_incomplete_unknown(self):
+        import human_gate_observation
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+        from fleet.collectors import dispatch
+        with mock.patch.object(dispatch, "human_gate_registry_paths", return_value=[]), \
+             mock.patch.object(human_gate_observation, "read_answer_waits",
+                               side_effect=RuntimeError("fixture failure")):
+            self.assertFalse(state._refresh_cache())
+        value = state._read_cache()
+        self.assertIsNotNone(value)
+        self.assertFalse(value["complete"])
+        self.assertEqual(value["items"], [])
+        self.assertGreater(value["observed_at"], 0)
+
+    def test_v1_and_malformed_projection_are_unknown(self):
+        path = state._cache_path()
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text('{"schema_version":1,"observed_at":100,"complete":true,'
+                        '"total":9,"by_session":{}}', encoding="utf-8")
+        path.chmod(0o600)
+        self.assertIsNone(state._read_cache(now=101))
+        path.write_text('{"schema_version":2,"observed_at":100,"items":[{}],'
+                        '"by_session":{},"total":0,"stale_total":0}', encoding="utf-8")
+        self.assertIsNone(state._read_cache(now=101))
 
 
 if __name__ == "__main__":

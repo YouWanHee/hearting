@@ -477,31 +477,18 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
     except Exception:
         pass
 
-    # The journal wait joins after exact resume aliases and before the one liveness pass.
-    try:
-        from . import interaction as _interaction
-        for failed_session, reason in _interaction.enrich_human_gates(sessions, jobs_path=jobs_path) or ():
-            identity = "%s:%s" % (getattr(failed_session, "harness", "unknown"),
-                                   getattr(failed_session, "session_id", "unknown"))
-            observations["human-gates:" + identity] = _observation_health(
-                identity, "human-gates", reason)
-    except Exception as exc:
-        observations["human-gates"] = _observation_health(
-            job_key, "human-gates", "%s: %s" % (type(exc).__name__, str(exc)[:160]))
-
     answer_waits = None
     fleet_answer_waits = None
     try:
         utilities = str(Path(__file__).resolve().parents[3] / "utilities")
         if utilities not in sys.path:
             sys.path.insert(0, utilities)
-        import human_gate_observation
-        from . import dispatch as _dispatch
-        answer_waits = human_gate_observation.read_answer_waits(
-            jobs_paths=_dispatch.human_gate_registry_paths(jobs_path),
-            sessions=sessions, now=_time.time())
         import human_wait_state
-        human_wait_state.publish_cache(answer_waits)
+        answer_waits = human_wait_state.cached_view(now=_time.time())
+        if answer_waits is None:
+            answer_waits = {"items": [], "by_session": {}, "complete": False,
+                            "total": 0, "stale_total": 0, "health": [
+                                {"source": "cache", "state": "unknown"}]}
         from ..refresh import fleet_answer_wait_view
         fleet_answer_waits = fleet_answer_wait_view(answer_waits)
         for session in sessions:
@@ -514,7 +501,7 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
                 for item in answer_waits.get("items", ())
                 if item.get("id") in ids and not item.get("stale"))
         if not answer_waits.get("complete", False):
-            reasons = ";".join(str(item.get("reason", "unknown"))
+            reasons = ";".join(str(item.get("state", "unknown"))
                                 for item in answer_waits.get("health", ()))
             observations["answer-waits"] = _observation_health(
                 job_key, "answer-waits", reasons[:160] or "observation-incomplete")

@@ -69,7 +69,11 @@ class AnswerWaitSurfaceTests(unittest.TestCase):
     def test_cached_status_count_is_global_and_exact_session_from_same_items(self):
         self.assertTrue(human_wait_state.publish_cache(self.result()))
         self.assertEqual(human_wait_state.cached_count("claude", "sid-a", now=101), (1, 1))
-        self.assertIsNone(human_wait_state.cached_count("claude", "sid-a", now=200))
+        with mock.patch.object(human_wait_state, "_request_producer") as request:
+            self.assertEqual(human_wait_state.cached_count("claude", "sid-a", now=200), (1, 1))
+            request.assert_called_once_with()
+        with mock.patch.object(human_wait_state, "_request_producer"):
+            self.assertIsNone(human_wait_state.cached_count("claude", "sid-a", now=300))
         partial = self.result()
         partial["complete"] = False
         self.assertTrue(human_wait_state.publish_cache(partial))
@@ -79,7 +83,9 @@ class AnswerWaitSurfaceTests(unittest.TestCase):
         with mock.patch.object(herdr_projection, "session_title", return_value="기존 제목"), \
              mock.patch.object(herdr_projection, "_formatter_overrides", return_value=(None, None)), \
              mock.patch.object(herdr_projection, "compose", return_value=("claude", "기존 제목")), \
-             mock.patch("human_gate_observation.read_answer_waits", return_value=self.result()):
+             mock.patch("human_wait_state.cached_view", return_value={
+                 "items": self.result()["items"],
+                 "by_session": {("claude", "sid-a"): ["S4:fixture"]}}):
             command = herdr_projection._metadata_command("herdr", "claude", "sid-a", "pane-a")
         self.assertIn("--title", command)
         title = command[command.index("--title") + 1]

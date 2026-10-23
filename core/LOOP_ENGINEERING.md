@@ -316,12 +316,18 @@ assigned number; a changed or unconfirmed target receives no old metadata.
 Answer waits are one read-only projection of existing sources: exact native
 interaction sidecars (S1), raised human gates (S2), ended owners whose result
 already waits for a person (S3), and explicitly marked final replies (S4).
-Each source closes only through its existing answer, gate, successor, or exact
-seat-input rule. Unknown seat attribution remains in the global total. Reading
-does not claim, resume, settle, or mutate a job; the existing lease observation's
-short non-blocking advisory flock is acceptable. S4 signals and derived caches
-are observational, private state; after seven days they may be folded from
-surfaces while the source wait remains intact.
+Display surfaces read only the private derived cache; one demand-driven producer
+refreshes it from the existing sources. A missing or expired cache is unknown,
+not a confirmed zero, and S4 on the current seat is read directly so an exact
+prompt close is visible. Each source closes only through its existing answer,
+gate, successor, or exact seat-input rule. S3 includes only route-bound BLOCKED
+owners without a later owner attempt on that same route. S2/S3 are current for
+72 hours, folded through seven days, then omitted from the projection; S1/S4
+retain their seven-day fold. Totals, session indexes and notifications count
+current items only. Unknown seat attribution remains in the global current
+total. Reading does not claim, resume, settle, or mutate a job. S4 signals and
+derived caches are observational, private state; folding never changes source
+state and adds no hook, gate, or user setting.
 
 Fleet's interactive view keeps shared status, usage, compute/GPU observations,
 and its controls outside the scrolling work-list viewport. The list body owns

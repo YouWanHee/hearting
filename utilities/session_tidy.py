@@ -1965,18 +1965,22 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
     answer_wait_lines = []
     if event in ("start", "prompt"):
         with contextlib.suppress(BaseException):
-            project_root = str(Path(__file__).resolve().parents[1])
-            if project_root not in sys.path:
-                sys.path.insert(0, project_root)
             utilities = str(Path(__file__).resolve().parent)
             if utilities not in sys.path:
                 sys.path.insert(0, utilities)
-            from tools.fleet.collectors import dispatch
-            import human_gate_observation
-            from types import SimpleNamespace
-            projected = human_gate_observation.read_answer_waits(
-                jobs_paths=dispatch.human_gate_registry_paths(),
-                sessions=[SimpleNamespace(harness=harness, session_id=sid)], now=now)
+            import human_wait_state
+            projected = human_wait_state.cached_view(now=now)
+            projected = projected or {"items": [], "by_session": {}}
+            # The caller's own S4 is exact and cheap; replace its possibly older
+            # producer copy so a just-closed prompt cannot be resurrected.
+            own = human_wait_state._read(human_wait_state._path(seat.key))
+            if own:
+                projected["items"] = [item for item in projected["items"]
+                                       if not (item.get("source") == "S4"
+                                               and (item.get("owner") or {}).get("seat_key") == seat.key)] + [
+                    {"id": own["id"], "source": "S4", "question": own.get("question"),
+                     "since": own.get("since"), "stale": False,
+                     "owner": {"harness": harness, "session_id": sid, "seat_key": seat.key}}]
             ids = set(projected.get("by_session", {}).get((harness, sid), ()))
             for item in projected.get("items", ()):
                 owner = item.get("owner") or {}

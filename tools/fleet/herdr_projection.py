@@ -711,12 +711,10 @@ def _metadata_command(herdr, harness, session_id, pane):
         utilities = str(Path(__file__).resolve().parents[2] / "utilities")
         if utilities not in sys.path:
             sys.path.insert(0, utilities)
-        import human_gate_observation
-        from .collectors import dispatch
-        from types import SimpleNamespace
-        waits = human_gate_observation.read_answer_waits(
-            jobs_paths=dispatch.human_gate_registry_paths(),
-            sessions=[SimpleNamespace(harness=harness, session_id=session_id)])
+        import human_wait_state
+        waits = human_wait_state.cached_view()
+        if waits is None:
+            waits = {"items": [], "by_session": {}}
         waiting_ids = set(waits.get("by_session", {}).get((harness, session_id), ()))
         if any(item.get("id") in waiting_ids and not item.get("stale")
                for item in waits.get("items", ())):

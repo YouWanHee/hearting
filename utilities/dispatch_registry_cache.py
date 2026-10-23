@@ -113,6 +113,7 @@ class _RegistrySegment:
                  "completion_errors", "completion_all", "completion_children",
                  "completion_by_parent_sid",
                  "completion_by_route_alias", "settlement_owners",
+                 "observation_owners",
                  "handover_latest", "handover_by_parent", "handover_by_binding",
                  "headless_owner_rows", "selection_by_parent", "selection_by_slug",
                  "selection_by_attempt", "selection_by_parent_slug")
@@ -127,6 +128,7 @@ class _RegistrySegment:
         completion_by_parent_sid = {}
         completion_by_route_alias = {}
         settlement_owners = []
+        observation_owners = []
         handover_latest = {}
         selection_by_parent = {}
         selection_by_slug = {}
@@ -171,6 +173,8 @@ class _RegistrySegment:
                     and completion_meta.get("launch_started") == "1"
                     and completion_meta.get("supervisor_lease") == "flock-v1"):
                 settlement_owners.append(record)
+            if completion_meta.get("worker_type") == "owner":
+                observation_owners.append(record)
             handover_attempt = handover_meta.get("attempt_id")
             if handover_attempt:
                 handover_latest[handover_attempt] = (fields[1], record)
@@ -186,6 +190,7 @@ class _RegistrySegment:
             key: tuple(value) for key, value in completion_by_route_alias.items()
         }
         self.settlement_owners = tuple(settlement_owners)
+        self.observation_owners = tuple(observation_owners)
         self.handover_latest = handover_latest
         self.selection_by_parent = {key: tuple(value) for key, value in selection_by_parent.items()}
         self.selection_by_slug = {key: tuple(value) for key, value in selection_by_slug.items()}
@@ -264,6 +269,8 @@ class _RegistrySegment:
         }
         result.settlement_owners = tuple(record for segment in segments
                                         for record in segment.settlement_owners)
+        result.observation_owners = tuple(record for segment in segments
+                                          for record in segment.observation_owners)
         result.selection_by_parent = {key: tuple(value) for key, value in selection_by_parent.items()}
         result.selection_by_slug = {key: tuple(value) for key, value in selection_by_slug.items()}
         result.selection_by_attempt = {key: tuple(value) for key, value in selection_by_attempt.items()}
@@ -451,6 +458,20 @@ class RegistryView:
 
     def settlement_owner_candidates(self):
         return tuple(record for segment in self._segments for record in segment.settlement_owners)
+
+    def answer_wait_owner_candidates(self):
+        """All owner rows for observational wait projection (no lease filter)."""
+        return tuple(record for segment in self._segments for record in segment.observation_owners)
+
+    def route_alias_candidates(self, *aliases):
+        """Return every row matching aliases; callers must validate full route identity."""
+        selected = {}
+        for segment in self._segments:
+            for alias in aliases:
+                if alias:
+                    for record in segment.completion_by_route_alias.get(alias, ()):
+                        selected[record.order] = record
+        return tuple(selected[key] for key in sorted(selected))
 
     def completion_parent_records(self, parent_sid: str) -> tuple[RegistryRecord, ...]:
         return tuple(record for segment in self._segments

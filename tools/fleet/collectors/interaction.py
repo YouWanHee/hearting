@@ -121,8 +121,8 @@ def enrich_human_gates(sessions, *, jobs_path=None, now=None):
                 continue
             gate = (owner, wait["route_id"], wait["gate_id"])
             observation = {name: wait[name] for name in ("kind", "source", "waiting_since")}
-            current = found.get(gate)
-            if current is None or observation["waiting_since"] < current["waiting_since"]:
+            previous = found.get(gate)
+            if previous is None or observation["waiting_since"] < previous["waiting_since"]:
                 found[gate] = observation
     for (index, _route_id, _gate_id), observation in found.items():
         sessions[index].interaction_observations.append(observation)

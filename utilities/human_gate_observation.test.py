@@ -84,13 +84,13 @@ class PendingWaitTest(unittest.TestCase):
             "owner_route_id=" + route["route_id"], "owner_route_hash=" + route["route_hash"],
             "owner_route_file=" + str(route_file),
         ))
-        self.jobs.write_text("now\topen\t/repo\t/wt\towner\t" + metadata + "\n", encoding="utf-8")
+        self.jobs.write_text("100\topen\t/repo\t/wt\towner\t" + metadata + "\n", encoding="utf-8")
         return route, attempt, lease, metadata
 
     def test_dead_blocked_owner_wait_closes_on_real_retained_answer_and_successor(self):
         _route, attempt, lease, metadata = self._blocked_owner_fixture()
         owner_input.initialize_owner_input(self.jobs, attempt, "codex-next-turn")
-        self.jobs.write_text("now\tdone\t/repo\t/wt\towner\t" + metadata +
+        self.jobs.write_text("300\tdone\t/repo\t/wt\towner\t" + metadata +
                              ",note=dead-worker-blocked,failure_class=blocked\n", encoding="utf-8")
         before = self.jobs.read_bytes()
         first = H.read_answer_waits(jobs_paths=[self.jobs], now=300)
@@ -123,12 +123,40 @@ class PendingWaitTest(unittest.TestCase):
         held = hold_supervisor_lease(self.jobs, attempt, lease)
         held.__enter__()
         self.addCleanup(held.__exit__, None, None, None)
-        self.jobs.write_text("now\tdone\t/repo\t/wt\towner\t" + metadata +
+        self.jobs.write_text("300\tdone\t/repo\t/wt\towner\t" + metadata +
                              ",note=dead-worker-blocked,failure_class=blocked\n", encoding="utf-8")
         result = H.read_answer_waits(jobs_paths=[self.jobs], now=300)
         self.assertTrue(result["complete"])
         self.assertEqual(result["total"], 1)
         self.assertEqual(result["items"][0]["source"], "S3")
+
+    def test_blocked_owner_72_hour_and_seven_day_projection_boundaries(self):
+        self._blocked_owner_fixture()
+        terminal = self.jobs.read_text(encoding="utf-8").splitlines()[0].split("\t")[-1]
+        terminal += ",note=dead-worker-blocked,failure_class=blocked"
+        self.jobs.write_text("300\tdone\t/repo\t/wt\towner\t" + terminal + "\n", encoding="utf-8")
+        current = H.read_answer_waits(jobs_paths=[self.jobs], now=300 + 72 * 3600)
+        self.assertEqual((current["total"], current["stale_total"]), (1, 0))
+
+        self.jobs.write_text("299\tdone\t/repo\t/wt\towner\t" +
+                             terminal + "\n", encoding="utf-8")
+        folded = H.read_answer_waits(jobs_paths=[self.jobs], now=300 + 72 * 3600)
+        self.assertEqual((folded["total"], folded["stale_total"]), (0, 1))
+        self.assertTrue(folded["items"][0]["stale"])
+
+        self.jobs.write_text("299\tdone\t/repo\t/wt\towner\t" +
+                             terminal + "\n", encoding="utf-8")
+        dropped = H.read_answer_waits(jobs_paths=[self.jobs], now=300 + 7 * 86400)
+        self.assertEqual((dropped["items"], dropped["total"], dropped["stale_total"]), ([], 0, 0))
+
+    def test_unbound_legacy_blocked_owner_is_not_an_unknown_wait(self):
+        self.jobs.write_text("100\tdone\t/repo\t/wt\towner\t"
+                             "attempt_schema_version=2,worker_type=owner,attempt_id=att-legacy,"
+                             "note=dead-worker-blocked,failure_class=blocked\n", encoding="utf-8")
+        result = H.read_answer_waits(jobs_paths=[self.jobs], now=300)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["health"], [])
 
 
 if __name__ == "__main__":
