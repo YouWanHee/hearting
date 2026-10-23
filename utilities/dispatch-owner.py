@@ -1023,9 +1023,20 @@ def main(argv):
                     selected, quality_band = alternate, alternate_band
                     source = "configured-" + allocation["strategy"]
                     relief_promoted = alternate_promoted
-                elif not any(h != first_harness and h not in top_excluded for h in configured):
-                    reason = "frame-single-available-harness"
-                    frame_degradation = (route, first.get("attempt_id"), first_harness)
+                if selected == first_harness:
+                    alternatives = [h for h in configured if h != first_harness]
+                    if alternatives:
+                        reason = "frame-other-harness-unusable"
+                        detail = json.dumps({
+                            "excluded_harnesses": alternatives,
+                            "states": {h: states.get(h, "unknown") for h in alternatives},
+                            "capacity": {h: capacity.get(h) for h in alternatives},
+                        }, sort_keys=True)
+                    else:
+                        reason = "frame-single-available-harness"
+                        detail = json.dumps({"configured_alternatives": []})
+                    frame_degradation = (
+                        route, first.get("attempt_id"), first_harness, reason, detail)
             try:
                 frame_harness_admission(
                     route, Path(jobs), lines, [first_harness, selected],
@@ -1052,6 +1063,8 @@ def main(argv):
                                   reason=reason, capacity=capacity, capacity_sources=capacity_sources,
                                   quality_band=quality_band,
                                   relief_promoted=relief_promoted, top_excluded=top_excluded)), flush=True)
+        if frame_degradation:
+            print(f"reason={reason}", flush=True)
         if explicit_policy and source == "explicit":
             print(f"explicit_policy={explicit_policy}", flush=True)
         print(f"route_defaults={','.join(derived) or 'none'}", flush=True)
@@ -1127,11 +1140,12 @@ def main(argv):
             forwarded += ["--explicit-adapter", overridden]
         result = run_owner_wrapper([str(wrapper), *forwarded], child_env)
         if result == 0 and frame_degradation and "--start" in forwarded:
-            route, first_attempt_id, first_harness = frame_degradation
+            route, first_attempt_id, first_harness, degradation_reason, detail = frame_degradation
             if first_attempt_id:
                 try:
                     record_frame_launch_degradation(
-                        route, Path(jobs), [], first_attempt_id, first_harness)
+                        route, Path(jobs), [], first_attempt_id, first_harness,
+                        reason=degradation_reason, detail=detail)
                 except Exception:
                     pass
         return result

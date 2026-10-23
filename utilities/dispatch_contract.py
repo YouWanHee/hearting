@@ -7270,7 +7270,9 @@ def frame_harness_admission(route: dict, jobs: Path, lines: list[str],
 
 
 def record_frame_launch_degradation(route: dict, jobs: Path, proof_ids: list[str],
-                                    first_attempt: str, harness: str) -> None:
+                                    first_attempt: str, harness: str,
+                                    reason: str = "frame-single-available-harness",
+                                    detail: str | None = None) -> None:
     """Record launch-time frame degradation through the existing contract writer.
 
     SD-93d makes this observation best effort; admission remains authoritative.
@@ -7279,9 +7281,9 @@ def record_frame_launch_degradation(route: dict, jobs: Path, proof_ids: list[str
     record_degradation(route_id=route["route_id"], route_hash=route["route_hash"],
         route_node="frame-alternative", dispatch_depth=1, writer="dispatch_contract.py",
         jobs=jobs, fallback_hop="same-harness-headless",
-        execution_surface="registered-headless", reason="frame-single-available-harness",
+        execution_surface="registered-headless", reason=reason,
         prior_attempt_ids=proof_ids, attempt_trace=[first_attempt], harness=harness,
-        detail=json.dumps({"proof_ids": proof_ids}))
+        detail=detail or json.dumps({"proof_ids": proof_ids}))
 
 
 def _frame_pair_attempt_gate(route: dict, node: dict, markers: dict,
