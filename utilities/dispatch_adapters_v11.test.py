@@ -662,6 +662,22 @@ class AdapterV11Test(unittest.TestCase):
   self.assertIn("--skip-git-repo-check",command)
   self.assertIn('default_permissions="hearting_non_git_record"',command)
   self.assertNotIn("--sandbox workspace-write",command)
+ def test_codex_non_git_enclosing_child_reuses_parent_sandbox_without_profile(self):
+  wrapper=self.load_wrapper("codex")
+  args=type("Args",(),{
+   "worktree":"/docs","artifact_root":"/artifacts","nested_headless_network":False,
+   "agent_home":ROOT,"dispatch_depth":2,"route_id":"rt-1","attempt_id":"att-stage-1",
+   "command_attempt_id":"att-stage-1","jobs_path":Path("/state/jobs.log"),
+   "sandbox":"workspace-write","repository_kind":"non-git","route_file":"/sealed/route.json",
+   "launch_lifecycle":"foreground-scoped","parent_harness":"codex",
+   "parent_transport":"headless","parent_sandbox":"workspace-write",
+   "resolved_model_settings":{"source":"inherit","context_window":"800000"},"approval":"inherit"})()
+  with mock.patch.dict(os.environ,{"AGENT_DISPATCH_CHILD":"1"},clear=False), \
+       mock.patch.object(wrapper,"recordish_profile_config",side_effect=AssertionError("profile must be inherited")):
+   command=wrapper.shell_command(args,Path("/prompt"),Path("/log"))
+  self.assertIn("--sandbox danger-full-access",command)
+  self.assertIn("--skip-git-repo-check",command)
+  self.assertNotIn("default_permissions",command)
  def test_foreground_codex_child_reuses_checked_outer_sandbox(self):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td);repo,_art=self.fixture(root)

@@ -1170,14 +1170,20 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             cmd += ["--add-dir", str(writable_dir)]
     write_roots = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--add-dir"]
     if getattr(args, "repository_kind", "git") == "non-git":
-        profile = recordish_profile_config(
-            args.worktree, write_roots,
-            args.route_file or os.environ.get("AGENT_OWNER_ROUTE_FILE"),
-            network=args.nested_headless_network,
-        )
-        if profile is None:
-            raise RuntimeError("codex-non-git-recordish-profile-unsupported")
-        cmd += ["--skip-git-repo-check", *config_arguments(profile)]
+        if uses_enclosing_codex_sandbox(args):
+            # The non-git parent already runs inside its checked recordish OS sandbox.
+            # This child inherits that boundary, so it can reuse the git branch's sandbox mode.
+            cmd += ["--skip-git-repo-check", "--sandbox", "danger-full-access"]
+            profile = None
+        else:
+            profile = recordish_profile_config(
+                args.worktree, write_roots,
+                args.route_file or os.environ.get("AGENT_OWNER_ROUTE_FILE"),
+                network=args.nested_headless_network,
+            )
+            if profile is None:
+                raise RuntimeError("codex-non-git-recordish-profile-unsupported")
+            cmd += ["--skip-git-repo-check", *config_arguments(profile)]
     else:
         profile = commit_profile_config(
             args.worktree, write_roots,

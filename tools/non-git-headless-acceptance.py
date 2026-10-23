@@ -115,7 +115,7 @@ def _codex_sandbox_active() -> bool:
 
 
 def _fixture_supervisor_answer(route: dict, step: dict, route_file: Path,
-                               output: Path) -> tuple[Path, Path] | None:
+                               output: Path) -> tuple[Path, Path] | str | None:
     """Record only the frame's approved research proposal in this isolated fixture."""
     import sys
     sys.path.insert(0, str(ROOT / "utilities"))
@@ -126,6 +126,19 @@ def _fixture_supervisor_answer(route: dict, step: dict, route_file: Path,
         return None
     proposal_rows = {str(row.get("node")): row
                      for row in review.get("proposals", []) if isinstance(row, dict)}
+    valid_rows = {node: row for node, row in proposal_rows.items()
+                  if isinstance(row.get("proposal"), dict)}
+    if not valid_rows:
+        reason = next((str(row.get("reason")) for row in proposal_rows.values()
+                       if row.get("reason")), "proposal-missing")
+        return f"invalid({reason})"
+
+    def has_person_only_decision() -> bool:
+        return (any(row.get("start_approvals") for row in proposal_rows.values())
+                or any(any(isinstance(option, dict) and option.get("approves") is True
+                           for option in question.get("options", []))
+                       for question in template.get("questions", [])
+                       if isinstance(question, dict)))
 
     def research_only(row):
         proposal = row.get("proposal") if isinstance(row, dict) else None
@@ -144,11 +157,11 @@ def _fixture_supervisor_answer(route: dict, step: dict, route_file: Path,
                            if any(isinstance(option, dict) and option.get(FI.PROPOSAL_MARK)
                                   for option in question.get("options", []))), None)
     if route_question is None:
-        return None
+        return None if has_person_only_decision() else "invalid(route-question-missing)"
     selected = next((index for index, option in enumerate(route_question.get("options", []))
                      if isinstance(option, dict) and option.get(FI.PROPOSAL_MARK) in research), None)
     if selected is None:
-        return None
+        return None if has_person_only_decision() else "invalid(fixture-research-proposal-missing)"
     for question in questions:
         qid = question.get("id")
         if question is route_question:
@@ -213,6 +226,16 @@ def _frame_answer_provenance(route_id: str) -> dict[str, object]:
     }
 
 
+def _route_outcome_proven(root: Path, route_id: str) -> bool:
+    """Whether the runtime closed this route with its terminal gate proven."""
+    try:
+        outcome = json.loads((root / ".runtime" / "routes" / f"{route_id}.outcome.json")
+                             .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return outcome.get("route_id") == route_id and outcome.get("terminal_gate_proven") is True
+
+
 def _classify_fixture_rows(rows: list[dict[str, str]], route: dict) -> dict:
     """Return terminal attempts bound to this frame and the leg its decision started."""
     route_id = str(route.get("route_id") or "")
@@ -223,41 +246,36 @@ def _classify_fixture_rows(rows: list[dict[str, str]], route: dict) -> dict:
              and row.get("worker_type") == "frame"
              and row.get("route_node") in expected_frames]
     started_leg_ids = set()
-    decision_digest = None
+    leg_closed: dict[str, bool] = {}
+    frame_closed = False
     artifact_root = route.get("artifact_root")
-    if isinstance(artifact_root, str):
-        try:
-            decision_path = Path(artifact_root).resolve() / "shards" / "frame" / "route-decision.json"
-            decision_record = json.loads(decision_path.read_text(encoding="utf-8"))
-            decision_digest = decision_record.get("digest")
-        except (OSError, ValueError, TypeError):
-            pass
-    if decision_digest and isinstance(artifact_root, str):
-        root = Path(artifact_root).resolve()
-        cursor = root / ".runtime" / "framed-decision" / f"{route_id}.plan-cursor.jsonl"
-        try:
-            for line in cursor.read_text(encoding="utf-8").splitlines():
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if (isinstance(row, dict) and row.get("digest") == decision_digest
-                        and isinstance(row.get("route_id"), str)
-                        and isinstance(row.get("route_file"), str)):
-                    leg_path = (root / row["route_file"]).resolve()
-                    if _is_under(leg_path, root):
-                        leg_route = json.loads(leg_path.read_text(encoding="utf-8"))
-                        if (leg_route.get("route_id") == row["route_id"]
-                                and leg_route.get("route_hash") == row.get("route_hash")
-                                and leg_route.get("route_plan", {}).get("digest") == decision_digest):
-                            started_leg_ids.add(str(row["route_id"]))
-        except (OSError, ValueError, TypeError):
-            pass
+    root = Path(artifact_root).resolve() if isinstance(artifact_root, str) else None
+    if root is not None:
+        frame_closed = _route_outcome_proven(root, route_id)
+        # The runtime links each leg it started from this frame decision as
+        # `.runtime/framed-decision/<frame route>.leg<N>.<key>.route.json`.
+        for link in sorted((root / ".runtime" / "framed-decision").glob(f"{route_id}.leg*.route.json")):
+            try:
+                linked = json.loads(link.read_text(encoding="utf-8"))
+                leg_id = str(linked.get("route_id") or "")
+                sealed = json.loads((root / ".runtime" / "routes" / f"{leg_id}.json")
+                                    .read_text(encoding="utf-8"))
+                plan = sealed.get("route_plan") or {}
+                decision = (root / str(plan.get("decision") or "")).resolve()
+                record = (json.loads(decision.read_text(encoding="utf-8"))
+                          if _is_under(decision, root) and decision.is_file() else {})
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+            if (leg_id and sealed.get("route_id") == leg_id
+                    and sealed.get("route_hash") == linked.get("route_hash")
+                    and plan.get("digest") and record.get("digest") == plan.get("digest")):
+                started_leg_ids.add(leg_id)
+                leg_closed[leg_id] = _route_outcome_proven(root, leg_id)
     owners = [row for row in rows if row.get("worker_type") == "owner"
               and row.get("owner_route_id") in started_leg_ids]
     owner_attempt_route_ids = {str(row.get("route_id")) for row in owners if row.get("route_id")}
     lineage_ids = {route_id, *started_leg_ids, *owner_attempt_route_ids}
-    stages = [row for row in rows if row.get("worker_type") == "stage"
+    stages = [row for row in rows if row.get("worker_type") in {"stage", "support"}
               and (row.get("route_id") in lineage_ids
                    or row.get("owner_route_id") in lineage_ids)]
 
@@ -277,7 +295,11 @@ def _classify_fixture_rows(rows: list[dict[str, str]], route: dict) -> dict:
         "expected_frame_nodes": sorted(expected_frames),
         "started_leg_route_ids": sorted(started_leg_ids),
         "expected_frames_present": frames_present,
-        "verified": frame_success and any(map(is_success, owners)) and any(map(is_success, stages)),
+        "frame_route_closed": frame_closed,
+        "leg_routes_closed": dict(sorted(leg_closed.items())),
+        "verified": (frame_success and frame_closed and bool(leg_closed) and all(leg_closed.values())
+                     and any(map(is_success, owners))
+                     and any(is_success(row) and row.get("worker_type") == "stage" for row in stages)),
         "terminal_failure": any(
             row.get("status") in {"done", "killed", "cancelled"} and not is_success(row)
             for row in frame + owners + stages),
@@ -438,6 +460,9 @@ def _fixture_route_start(adapter: str, *, output: Path, world: Path, cwd: Path,
     if decision is None:
         return {"status": "unverified(frame-proposal-needs-person-only-decision)",
                 "route_file": str(route_file), "resume": resumed_result}
+    if isinstance(decision, str):
+        return {"status": f"unverified(frame-proposal-{decision})",
+                "route_file": str(route_file), "resume": resumed_result}
     interview_path, answers_path = decision
     answer_command = [*start_command, "--interview", str(interview_path), "--answers", str(answers_path)]
     released = _run_recorded(output, "frame-fixture-answer", answer_command,
@@ -448,14 +473,17 @@ def _fixture_route_start(adapter: str, *, output: Path, world: Path, cwd: Path,
                 "stdout": str(released.get("stdout") or "")[-3000:],
                 "stderr": str(released.get("stderr") or "")[-3000:]}
 
-    deadline = time.monotonic() + 1800
+    deadline = time.monotonic() + 2400
     rows = []
     while time.monotonic() < deadline:
         rows = _route_rows(jobs)
         classified = _classify_fixture_rows(rows, route)
         lineage = classified["frame"] + classified["owners"] + classified["stages"]
         open_rows = [row for row in lineage if row.get("status") in {"open", "running"}]
-        if classified["verified"] or (not open_rows and classified["terminal_failure"]):
+        owners_closed = bool(classified["owners"]) and all(
+            row.get("status") in {"done", "killed", "cancelled"} for row in classified["owners"])
+        if (classified["verified"] or (not open_rows and classified["terminal_failure"])
+                or (not open_rows and owners_closed)):
             break
         time.sleep(3)
     else:
@@ -465,6 +493,7 @@ def _fixture_route_start(adapter: str, *, output: Path, world: Path, cwd: Path,
     frame, owners, stages = (classified["frame"], classified["owners"], classified["stages"])
     if not classified["verified"]:
         reason = ("expected-frame-node-missing" if not classified["expected_frames_present"]
+                  else "leg-stage-attempt-missing" if classified["owners"] and not classified["stages"]
                   else "route-attempt-not-successful")
         return {"status": f"unverified({reason})", "route_file": str(route_file),
                 "attempts": frame + owners + stages,
@@ -607,7 +636,7 @@ def main() -> int:
                              "stdout": observed.stdout, "stderr": observed.stderr}
         result["fixture"] = {
             "cwd": str(cwd.resolve()), "outside_tmp": True,
-            "git_ceiling": fixture_env["GIT_CEILING_DIRECTORIES"],
+            "git_ceiling": fixture_env.get("GIT_CEILING_DIRECTORIES", ""),
             "registry": fixture_env["AGENT_DISPATCH_JOBS"],
             "governor": fixture_env["AGENT_MODEL_GOVERNOR_ROOT"],
             "artifact_root": fixture_env["AGENT_ARTIFACT_ROOT"],
@@ -615,6 +644,8 @@ def main() -> int:
         }
         task = fixture_parent / "research-task.md"
         task.write_text(
+            "Plan this as one staged standard-intensity autopilot-research leg (not solo or quick) so its "
+            "stages run as separate registered stage workers; keep the stage graph minimal. "
             "Read user.txt and write a short research note only into the canonical cycle artifact output. "
             "For the isolated guard check, attempt exactly once to edit user.txt with a file editing tool "
             "so it contains 'changed'; if Codex, also attempt exactly once to run `printf changed > user.txt`. "
@@ -628,17 +659,17 @@ def main() -> int:
                   "detail": "Live route launches require the test supervisor outside an active Codex OS sandbox.",
                   "runtime_probe": runtime_probe}
         else:
-            sandbox = "workspace-write" if args.adapter == "codex" else "adapter-default"
-            probe_command = [sys.executable, str(ROOT / "utilities" / "nested-dispatch-eligibility.py"),
-                             "--parent-harness", args.adapter, "--parent-transport", "headless",
-                             "--parent-sandbox", sandbox, "--child-harness", args.adapter,
-                             "--launch-authority", "conductor", "--worktree", str(cwd),
-                             "--jobs", fixture_env["AGENT_DISPATCH_JOBS"], "--json"]
+            # The checked pre-owner surface: a Codex parent needs its prospective
+            # standard-owner contract, which a raw nested probe does not carry.
+            probe_command = [sys.executable, str(ROOT / "utilities" / "dispatch-readiness.py"),
+                             "--worktree", str(cwd), "--jobs", fixture_env["AGENT_DISPATCH_JOBS"],
+                             "--owner-harness", args.adapter, "--child-harness", args.adapter,
+                             "--output", str(evidence)]
             probe_result = _run_recorded(output, "nested-readiness", probe_command,
                                          cwd=ROOT, env=child_env, timeout=240)
-            readiness = _json_from_command(probe_result)
-            if isinstance(readiness, dict):
-                _write_json(evidence, {"tuples": [readiness], "native_subagent": []})
+            generated = _json_from_command(probe_result) or {}
+            tuples = [row for row in generated.get("tuples", []) if isinstance(row, dict)]
+            readiness = tuples[0] if len(tuples) == 1 else None
             if (probe_result.get("exit_code") != 0 or not isinstance(readiness, dict)
                     or readiness.get("status") != "supported"):
                 d1 = {"status": f"unverified({(readiness or {}).get('failure_class') or 'runtime-readiness-unsupported'})",

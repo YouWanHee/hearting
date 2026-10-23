@@ -16,24 +16,26 @@ class FixtureAcceptanceClassificationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.artifact_root = Path(self.tmp.name) / "artifacts"
-        (self.artifact_root / "shards/frame").mkdir(parents=True)
+        decision_rel = "campaigns/c/frame-cycle/artifacts/shards/frame/route-decision.json"
+        (self.artifact_root / decision_rel).parent.mkdir(parents=True)
         self.route_id = "rt-" + "a" * 16
         self.leg_id = "rt-" + "b" * 16
         self.digest = "sha256:" + "c" * 64
-        (self.artifact_root / "shards/frame/route-decision.json").write_text(
+        (self.artifact_root / decision_rel).write_text(
             json.dumps({"digest": self.digest}), encoding="utf-8")
-        leg_file = self.artifact_root / ".runtime/routes" / f"{self.leg_id}.json"
-        leg_file.parent.mkdir(parents=True)
-        leg_file.write_text(json.dumps({
+        routes = self.artifact_root / ".runtime/routes"
+        routes.mkdir(parents=True)
+        (routes / f"{self.leg_id}.json").write_text(json.dumps({
             "route_id": self.leg_id, "route_hash": "sha256:leg",
-            "route_plan": {"digest": self.digest},
+            "route_plan": {"decision": decision_rel, "digest": self.digest, "index": 0},
         }), encoding="utf-8")
-        cursor = self.artifact_root / ".runtime/framed-decision" / f"{self.route_id}.plan-cursor.jsonl"
-        cursor.parent.mkdir(parents=True)
-        cursor.write_text(json.dumps({
-            "schema": 1, "digest": self.digest, "index": 0, "route_id": self.leg_id,
-            "route_hash": "sha256:leg", "route_file": f".runtime/routes/{self.leg_id}.json",
-        }) + "\n", encoding="utf-8")
+        link = self.artifact_root / ".runtime/framed-decision" / f"{self.route_id}.leg0.k.route.json"
+        link.parent.mkdir(parents=True)
+        link.write_text(json.dumps({"route_id": self.leg_id, "route_hash": "sha256:leg"}),
+                        encoding="utf-8")
+        for rid in (self.route_id, self.leg_id):
+            (routes / f"{rid}.outcome.json").write_text(json.dumps({
+                "route_id": rid, "terminal_gate_proven": True}), encoding="utf-8")
         self.route = {
             "route_id": self.route_id, "artifact_root": str(self.artifact_root),
             "nodes": [
@@ -86,6 +88,17 @@ class FixtureAcceptanceClassificationTest(unittest.TestCase):
         self.assertEqual(len(classified["owners"]), 1)
         self.assertEqual(len(classified["stages"]), 1)
 
+    def test_unclosed_leg_route_cannot_verify(self):
+        (self.artifact_root / ".runtime/routes" / f"{self.leg_id}.outcome.json").unlink()
+        classified = M._classify_fixture_rows(self.rows(), self.route)
+        self.assertEqual(classified["leg_routes_closed"], {self.leg_id: False})
+        self.assertFalse(classified["verified"])
+
+    def test_leg_with_only_support_workers_cannot_verify(self):
+        rows = [dict(row, worker_type="support") if row.get("worker_type") == "stage" else row
+                for row in self.rows()]
+        self.assertFalse(M._classify_fixture_rows(rows, self.route)["verified"])
+
     def test_fixture_answer_provenance_is_explicit_and_nonhuman(self):
         provenance = M._frame_answer_provenance(self.route_id)
         self.assertEqual(provenance, {
@@ -94,6 +107,15 @@ class FixtureAcceptanceClassificationTest(unittest.TestCase):
             "person_or_real_supervisor": False,
             "scope": f"isolated fixture route {self.route_id}",
         })
+
+    def test_invalid_missing_proposal_is_not_misclassified_as_person_decision(self):
+        result = M._fixture_supervisor_answer(
+            {"route_id": self.route_id},
+            {"interview_template": {"questions": []},
+             "route_proposal_review": {"proposals": [
+                 {"node": "frame", "proposal": None, "reason": "block-missing"}]}},
+            Path(self.tmp.name) / "route.json", Path(self.tmp.name))
+        self.assertEqual(result, "invalid(block-missing)")
 
     def test_fixture_governor_uses_canonical_artifact_runtime_path(self):
         output = Path(self.tmp.name) / "acceptance-output"
