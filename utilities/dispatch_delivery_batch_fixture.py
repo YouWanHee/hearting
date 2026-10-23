@@ -41,7 +41,7 @@ def _child(source_root: Path, output: Path) -> int:
 
     rows = []
     real_monotonic_ns = time.monotonic_ns
-    fake_clock = [real_monotonic_ns()]
+    fake_clock = [SEED * 1_000_000_000]
     time.monotonic_ns = lambda: fake_clock[0]
     with tempfile.TemporaryDirectory(prefix="delivery-batch-fixture-") as temporary:
         base = Path(temporary)
@@ -155,6 +155,9 @@ def _child(source_root: Path, output: Path) -> int:
                                  "injected_characters": len(body),
                                  "fixed_instruction_characters": _fixed_instruction_length(body),
                                  "ack_transitions": transitions,
+                                 "ack_sources": {transition["delivery_id"]: "fixture-ack"
+                                                 for transition in transitions
+                                                 if transition["to"] == "acked"},
                                  "delivered_ids": [item["delivery_id"] for item in delivered],
                                  "batch_decision": ({"held": decision.get("held"),
                                      "delivery_ids": list(decision.get("delivery_ids", ())),
@@ -181,7 +184,9 @@ def _child(source_root: Path, output: Path) -> int:
                 "timeline": timeline,
             }
             rows.append({"carrier": "shared_sweep", "variant": variant,
-                         "observed": total, "status": "measured"})
+                         "observed": total, "status": "measured",
+                         "ack_source": "fixture-ack via sweep.ack_delivered",
+                         "seams": []})
 
             rows.append(_measure_rewake(source_root, variant))
             rows.append(_measure_codex_queue(source_root, variant))
@@ -255,9 +260,89 @@ def _write_sibling_route(root: Path, variant: str, index: int) -> str:
     return route_id
 
 
+def _carrier_scenario(root: Path, variant: str, recipient_kind: str,
+                      carrier: str):
+    """Build the same route-bound sibling registry for a native carrier."""
+    import dispatch_pending_delivery as pending
+    from route_identity import route_hash
+
+    recipient = "ses-measurement-parent"
+    jobs = root / "jobs.log"
+    records, members = {}, []
+    cycle = f"cycle-measure-{variant}"
+    raw_rows = []
+    for index in range(SIBLINGS):
+        attempt = f"att-measure-{index:032x}"
+        delivery_id = f"delivery-measure-{variant}-{index:02d}"
+        route_id = f"rt-measure-{variant}-{index:02d}"
+        route = {"route_id": route_id, "parent_cycle_id": cycle,
+                 "nodes": [{"id": "execute"}]}
+        route["route_hash"] = route_hash(route)
+        route_file = root / f"{route_id}.json"
+        route_file.write_text(json.dumps(route, sort_keys=True), encoding="utf-8")
+        failed = variant == "two_failures" and index in FAILURE_INDICES
+        classification = "attention" if failed else "success"
+        receipt = {"schema_version": 2, "state": "ready",
+                   "parent_attempt_id": PARENT, "job_registry": str(jobs),
+                   "parent_cycle_id": cycle, "delivery_classification": classification,
+                   "children": [{"attempt_id": attempt, "status": "done", "readiness": "ready",
+                                 "reason": "terminal-failure-or-unclosed" if failed else "terminal-complete",
+                                 "required_action": "inspect-done-failure" if failed else "advance-completed",
+                                 "harness": "claude" if carrier == "claude_async_rewake" else "codex",
+                                 "delivery_classification": classification}]}
+        row_revision = f"revision-{index:02d}"
+        fields = ["2026-10-23T00:00:00Z", "running", str(root), str(root), "execute", ""]
+        metadata = {
+            "attempt_id": attempt, "dispatch_depth": "1", "registered_worker": "1",
+            "worker_type": "execute", "parent_sid": recipient,
+            "parent_attempt_id": PARENT, "parent_harness": "claude",
+            "route_file": str(route_file), "route_id": route_id,
+            "route_hash": route["route_hash"], "route_node": "execute",
+            "delivery_intent": "1", "delivery_intent_at_ns": str(SEED * 1_000_000_000),
+            "failure_class": "pass", "note": "completed-marker",
+            "delivery_id": delivery_id, "parent_completion_delivery": recipient_kind,
+            "delivery_recipient_kind": recipient_kind,
+            "delivery_row_revision": row_revision,
+            "delivery_receipt_digest": pending._canonical_receipt_digest(receipt),
+        }
+        if carrier == "codex_native_queue":
+            metadata.update({"attempt_schema_version": "2",
+                             "execution_surface": "registered-headless",
+                             "launch_claimed": "1", "harness": "codex"})
+        fields[5] = ",".join(f"{key}={value}" for key, value in metadata.items())
+        raw_rows.append(fields)
+        record = pending.create(
+            root, recipient_kind=recipient_kind, recipient_key=recipient,
+            delivery_id=delivery_id, session_generation="",
+            session_generation_supported="0", attempt_ids=[attempt],
+            parent_attempt_id=PARENT, route_id=route_id, route_node="execute",
+            receipt=receipt, receipt_digest=metadata["delivery_receipt_digest"],
+            row_revisions={attempt: row_revision})
+        records[delivery_id] = record
+        members.append({"attempt_id": attempt, "delivery_id": delivery_id,
+                        "failed": failed, "receipt": receipt, "row": fields})
+    jobs.write_text("\n".join("\t".join(row) for row in raw_rows) + "\n", encoding="utf-8")
+    return jobs, recipient, records, members
+
+
+def _terminalize(jobs: Path, member: dict, completion: int):
+    """Move one real registry row over its terminal edge in the fake timeline."""
+    from dispatch_contract import parse_registry_metadata
+    rows = jobs.read_text(encoding="utf-8").splitlines()
+    fields = rows[completion - 1].split("\t")
+    fields[1] = "done"
+    fields[0] = f"2026-10-23T00:00:{completion - 1:02d}Z"
+    metadata = parse_registry_metadata(fields[5])
+    metadata["failure_class"] = "fail" if member["failed"] else "pass"
+    metadata["note"] = "dead-worker-fail" if member["failed"] else "completed-marker"
+    fields[5] = ",".join(f"{key}={value}" for key, value in metadata.items())
+    rows[completion - 1] = "\t".join(fields)
+    jobs.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
 def _measure_rewake(source_root: Path, variant: str) -> dict:
     import dispatch_pending_delivery as pending
-    import dispatch_notice_state
+    import dispatch_recipient_receipt as recipient_receipt
 
     spec = importlib.util.spec_from_file_location(
         "dispatch_owner_rewake_fixture", source_root / "hooks" / "dispatch-owner-rewake.py")
@@ -267,65 +352,28 @@ def _measure_rewake(source_root: Path, variant: str) -> dict:
     recipient = "ses-measurement-parent"
     with tempfile.TemporaryDirectory(prefix="delivery-rewake-fixture-") as temporary:
         root = Path(temporary)
-        jobs = root / "jobs.log"
-        jobs.write_text("", encoding="utf-8")
-        records: dict[str, dict] = {}
-        members = []
-        success_total = SIBLINGS - (len(FAILURE_INDICES) if variant == "two_failures" else 0)
-        for index in range(SIBLINGS):
-            attempt = f"att-rewake-{index:032x}"
-            delivery_id = f"delivery-rewake-{variant}-{index:02d}"
-            route_id = _write_sibling_route(root, variant, index)
-            failed = variant == "two_failures" and index in FAILURE_INDICES
-            classification = "attention" if failed else "success"
-            receipt = {"schema_version": 2, "state": "ready", "parent_attempt_id": PARENT,
-                       "job_registry": str(jobs), "parent_cycle_id": f"cycle-measure-{variant}",
-                       "delivery_classification": classification,
-                       "children": [{"attempt_id": attempt, "status": "done", "readiness": "ready",
-                                     "reason": "terminal-failure-or-unclosed" if failed else "terminal-complete",
-                                     "required_action": "inspect-done-failure" if failed else "advance-completed",
-                                     "harness": "claude", "delivery_classification": classification}]}
-            record = pending.create(
-                root, recipient_kind="claude-parent-runtime", recipient_key=recipient,
-                delivery_id=delivery_id, session_generation="", session_generation_supported="0",
-                attempt_ids=[attempt], parent_attempt_id=PARENT,
-                route_id=route_id, route_node="execute", receipt=receipt,
-                receipt_digest=pending._canonical_receipt_digest(receipt),
-                row_revisions={attempt: f"revision-{index:02d}"})
-            records[delivery_id] = record
-            members.append((attempt, delivery_id, failed))
-
-        timeline, held, completed_ids = [], [], set()
-        known = {delivery_id: failed for _attempt, delivery_id, failed in members}
-        for index, (attempt, delivery_id, failed) in enumerate(members):
-            completed_ids.add(delivery_id)
-            candidates = [delivery_id] + list(held)
+        jobs, recipient, records, members = _carrier_scenario(
+            root, variant, "claude-parent-runtime", "claude_async_rewake")
+        timeline, held = [], []
+        known = {member["delivery_id"]: member["failed"] for member in members}
+        for index, member in enumerate(members):
+            attempt, delivery_id, failed = (member["attempt_id"], member["delivery_id"],
+                                            member["failed"])
+            _terminalize(jobs, member, index + 1)
+            candidates = [member] + list(held)
             held = []
             before = {key: pending.read(root, recipient, key)["state"] for key in records}
             completion_texts = []
             wakes = chars = fixed = 0
-            failed_carrier = failed
-            for candidate_id in candidates:
-                candidate_attempt = next(a for a, d, _f in members if d == candidate_id)
+            ack_sources = {}
+            for candidate in candidates:
+                candidate_id = candidate["delivery_id"]
+                candidate_attempt = candidate["attempt_id"]
                 candidate_launch = rewake.Launch(attempt_id=candidate_attempt, jobs=jobs,
                                                   session_id=recipient, armed="registry")
                 metadata = {"delivery_id": candidate_id, "parent_sid": recipient}
-                ready_successes = [d for d, is_failure in known.items()
-                                   if not is_failure
-                                   and pending.read(root, recipient, d)["state"]
-                                   not in {"acked", "rejected", "expired"}]
-                completed_successes = sum(1 for _a, d, is_failure in members
-                                          if d in completed_ids and not is_failure)
-                held_now = (not known[candidate_id] and completed_successes < success_total
-                            and "members" in getattr(rewake.ClaimWin, "__dataclass_fields__", {}))
-                def resolve(_jobs, record, **_kwargs):
-                    if record.get("receipt", {}).get("delivery_classification") != "success":
-                        return None
-                    return {"delivery_ids": tuple(ready_successes), "held": held_now}
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with mock.patch.object(rewake, "_incarnation_binding_matches", return_value=True), \
-                     mock.patch("dispatch_notice_state.resolve_delivery_batch", side_effect=resolve,
-                                create=True), \
                      mock.patch.object(rewake, "classified_receipt", side_effect=lambda l, st, r, _root:
                                        ("attention" if known[candidate_id] else "success",
                                         f"RECEIPT {l.attempt_id} state={'attention' if known[candidate_id] else 'success'}")), \
@@ -336,7 +384,7 @@ def _measure_rewake(source_root: Path, variant: str) -> dict:
                      mock.patch.object(rewake.sys, "stderr", stderr):
                     win = rewake._carrier_one_claim(candidate_launch, metadata)
                     if isinstance(win, getattr(rewake, "ClaimHeld", ())):
-                        held.append(candidate_id)
+                        held.append(candidate)
                         continue
                     if win is None:
                         continue
@@ -356,33 +404,72 @@ def _measure_rewake(source_root: Path, variant: str) -> dict:
                         wakes += 1
                         chars += len(output)
                         fixed += _carrier_fixed_instruction_length("claude_async_rewake", output)
-                        for member_id in (item_id for item_id, _record in win.members) \
-                                if getattr(win, "members", ()) else (win.delivery_id,):
+                        win_members = getattr(win, "members", ())
+                        for member_id, claimed_record in (win_members if win_members
+                                                          else ((win.delivery_id,
+                                                                 pending.read(root, recipient,
+                                                                              win.delivery_id)),)):
                             try:
                                 pending.mark_sent_ambiguous(root, recipient, member_id,
                                                             claim_owner=win.claim_owner)
-                                # The captured native receipt marker is consumed exactly once.
-                                pending.ack(root, recipient, member_id,
-                                            acked_by="fixture-claude-exact-marker")
+                                current = pending.read(root, recipient, member_id)
+                                marker = recipient_receipt.receipt_marker(current, recipient)
+                                notification_body = "<task-notification><task-id>fixture</task-id>" \
+                                    "<summary>Stop hook feedback</summary>" + output
+                                if marker not in notification_body:
+                                    notification_body += "\n" + marker
+                                event = {"type": "user", "sessionId": recipient,
+                                         "origin": {"kind": "task-notification",
+                                                    "producer": "session-task"},
+                                         "promptSource": "system", "turnOrigin": "task_notification",
+                                         "message": {"content": notification_body +
+                                                      "</task-notification>"}}
+                                transcript = root / f"transcript-{member_id}.jsonl"
+                                transcript.write_text(json.dumps(event) + "\n", encoding="utf-8")
+                                transcript_events = [json.loads(line) for line in
+                                                     transcript.read_text(encoding="utf-8").splitlines()]
+                                evidence = recipient_receipt.claude_feedback_evidence(
+                                    transcript_events, recipient)
+                                settled = recipient_receipt.settle_native_receipt(
+                                    root, recipient, "claude", recipient, current, evidence,
+                                    acked_by="claude-transcript:" + recipient)
+                                if settled["settled"]:
+                                    ack_sources[member_id] = "claude-task-notification-transcript"
+                                else:
+                                    # Frozen pre-batching Claude has no native marker path;
+                                    # preserve its singleton before/after ACK observation.
+                                    pending.ack(root, recipient, member_id,
+                                                acked_by="fixture-ack-legacy-claude")
+                                    ack_sources[member_id] = "fixture-ack"
                             except pending.PendingDeliveryError:
                                 pass
             after = {key: pending.read(root, recipient, key)["state"] for key in records}
             transitions = [{"delivery_id": key, "from": before[key], "to": value}
                            for key, value in after.items() if before[key] != value]
             body = "\n".join(completion_texts)
-            timeline.append({"completion": index + 1, "attempt_id": attempt, "failed": failed_carrier,
+            timeline.append({"completion": index + 1, "attempt_id": attempt, "failed": failed,
                              "wakes": wakes, "emissions": wakes, "injected_characters": chars,
                              "fixed_instruction_characters": fixed,
                              "ack_transitions": transitions,
+                             "ack_sources": ack_sources,
                              "delivered_ids": [t["delivery_id"] for t in transitions if t["to"] == "acked"],
                              "captured_text": body})
-        return _measurement_row("claude_async_rewake", variant, timeline, records,
-                                pending, root, recipient)
+        result = _measurement_row("claude_async_rewake", variant, timeline, records,
+                                  pending, root, recipient)
+        result["seams"] = [
+            "_incarnation_binding_matches: fixture supplies the already-registered native session binding; it does not select siblings.",
+            "classified_receipt: fixture supplies captured receipt wording; claim_ready_batch and resolve_delivery_batch read the real registry and routes.",
+            "_gate_notices: suppresses unrelated UI gates after the completion claim; it does not affect batch membership.",
+            "settle_arm: avoids a live arm-ledger write; it runs after the batch claim and does not affect sibling selection.",
+            "_ended: captures exit status without ending a real hook process; it runs after claim/render.",
+            "stdout/stderr: captures emitted text and wake count; transport observation only.",
+        ]
+        result["ack_source"] = "claude task-notification settlement; fixture-ack only when the frozen baseline has no marker binding"
+        return result
 
 
 def _measure_codex_queue(source_root: Path, variant: str) -> dict:
     import dispatch_pending_delivery as pending
-    import dispatch_notice_state
 
     spec = importlib.util.spec_from_file_location(
         "codex_managed_completion_fixture", source_root / "utilities" / "codex-managed-completion.py")
@@ -392,99 +479,40 @@ def _measure_codex_queue(source_root: Path, variant: str) -> dict:
     recipient = "ses-measurement-parent"
     with tempfile.TemporaryDirectory(prefix="delivery-codex-queue-fixture-") as temporary:
         root = Path(temporary)
-        jobs = root / "jobs.log"
-        jobs.write_text("", encoding="utf-8")
-        records, members, rows_by_attempt = {}, [], {}
-        success_total = SIBLINGS - (len(FAILURE_INDICES) if variant == "two_failures" else 0)
-        for index in range(SIBLINGS):
-            attempt = f"att-codex-{index:032x}"
-            delivery_id = f"delivery-codex-{variant}-{index:02d}"
-            route_id = _write_sibling_route(root, variant, index)
-            failed = variant == "two_failures" and index in FAILURE_INDICES
-            classification = "attention" if failed else "success"
-            receipt = {"schema_version": 2, "state": "ready", "parent_attempt_id": PARENT,
-                       "job_registry": str(jobs), "parent_cycle_id": f"cycle-measure-{variant}",
-                       "delivery_classification": classification,
-                       "children": [{"attempt_id": attempt, "status": "done", "readiness": "ready",
-                                     "reason": "terminal-failure-or-unclosed" if failed else "terminal-complete",
-                                     "required_action": "inspect-done-failure" if failed else "advance-completed",
-                                     "delivery_classification": classification}]}
-            record = pending.create(
-                root, recipient_kind="codex-native-queue", recipient_key=recipient,
-                delivery_id=delivery_id, session_generation="", session_generation_supported="0",
-                attempt_ids=[attempt], parent_attempt_id=PARENT, route_id=route_id,
-                route_node="execute", receipt=receipt,
-                receipt_digest=pending._canonical_receipt_digest(receipt),
-                row_revisions={attempt: f"revision-{index:02d}"})
-            records[delivery_id] = record
-            row = SimpleNamespace(attempt_id=attempt, metadata={
-                "delivery_id": delivery_id, "delivery_recipient_kind": "codex-native-queue",
-                "delivery_row_revision": f"revision-{index:02d}",
-                "delivery_receipt_digest": record["receipt_digest"]})
-            rows_by_attempt[attempt] = row
-            members.append((attempt, delivery_id, receipt, failed))
+        jobs, recipient, records, members = _carrier_scenario(
+            root, variant, "codex-native-queue", "codex_native_queue")
 
         sent, timeline, held = [], [], []
-        success_ids = {delivery_id for _attempt, delivery_id, _receipt, failed in members if not failed}
-        def resolve(_jobs, record, **_kwargs):
-            if record.get("receipt", {}).get("delivery_classification") != "success":
-                return None
-            open_ids = tuple(sorted(d for d in success_ids if pending.read(root, recipient, d)["state"]
-                                    not in {"acked", "rejected", "expired"}))
-            completed_successes = sum(1 for _a, d, _r, failed in members[:len(done_indices)]
-                                      if not failed and d in records)
-            return {"delivery_ids": open_ids, "held": completed_successes < success_total}
-
-        done_indices = []
         def send(_path, **kwargs):
             sent.append(kwargs)
             return {"status": "consumed", "turn_id": f"turn-{len(sent)}", "turn_status": "completed"}
-        def exact_evidence(**kwargs):
-            return {"session_id": kwargs.get("session_id"),
-                    "client_message_id": kwargs.get("client_message_id"),
-                    "confirmed_client_message_id": kwargs.get("client_message_id"),
-                    "expected_message": kwargs.get("expected_message")}
-        def settle_exact(storage_root, session_id, harness, native_thread, record, evidence, *, acked_by):
-            if evidence.get("expected_message") not in [item.get("message") for item in sent]:
-                return {"received": False, "settled": False}
-            pending.ack(storage_root, session_id, record["delivery_id"], acked_by=acked_by,
-                        expected_states=("pending", "claimed", "sent-ambiguous"))
-            return {"received": True, "settled": True}
 
-        for index, (attempt, delivery_id, receipt, failed) in enumerate(members):
-            done_indices.append(index + 1)
+        for index, member in enumerate(members):
+            attempt, delivery_id, receipt, failed = (member["attempt_id"], member["delivery_id"],
+                                                       member["receipt"], member["failed"])
+            _terminalize(jobs, member, index + 1)
             before = {key: pending.read(root, recipient, key)["state"] for key in records}
             args = SimpleNamespace(queue_socket=Path("/tmp/app-server.sock"), thread_id=recipient,
                                    jobs=jobs, timeout=2.0, delivery_retry_interval=0.01)
-            candidates = [index] + list(held)
+            candidates = [member] + list(held)
             held = []
             sends_before = len(sent)
-            for candidate_index in candidates:
-                candidate_attempt, candidate_id, candidate_receipt, _failed = members[candidate_index]
+            for candidate in candidates:
+                candidate_attempt, candidate_id, candidate_receipt = (
+                    candidate["attempt_id"], candidate["delivery_id"], candidate["receipt"])
                 with mock.patch.object(module.codex_queue_delivery, "_rpc", return_value={
                         "thread": {"id": recipient, "cwd": "/tmp/repo"}}), \
-                     mock.patch.object(module, "current_session_children",
-                                       side_effect=lambda _jobs, _thread, attempts, _kind:
-                                       [rows_by_attempt[a] for a in sorted(attempts)]), \
-                     mock.patch.object(module, "_queue_target_from_rows", return_value=recipient), \
-                     mock.patch("dispatch_notice_state.resolve_delivery_batch", side_effect=resolve,
-                                create=True), \
-                     mock.patch("dispatch_notice_state.notice_is_current", return_value=True), \
-                     mock.patch.object(module.pending_delivery, "_replacement_disposition", return_value=""), \
-                     mock.patch.object(module.codex_queue_delivery, "send_at_least_once", side_effect=send), \
-                     mock.patch("peer_obligations.retain_registered_completion", return_value=True), \
-                     mock.patch("dispatch_recipient_receipt.codex_consumed_evidence", side_effect=exact_evidence), \
-                     mock.patch("dispatch_recipient_receipt.settle_native_receipt", side_effect=settle_exact):
+                     mock.patch.object(module.codex_queue_delivery, "send_at_least_once", side_effect=send):
                     try:
                         result = module._native_queue_delivery_once(
                             args, candidate_receipt, {candidate_attempt})
                     except pending.PendingDeliveryError as exc:
                         if exc.detail == "batch-hold":
-                            held.append(candidate_index)
+                            held.append(candidate)
                             continue
                         raise
                 if result.get("status") == "sent-ambiguous" and result.get("reason") == "native-queue-batch-held":
-                    held.append(candidate_index)
+                    held.append(candidate)
             after = {key: pending.read(root, recipient, key)["state"] for key in records}
             transitions = [{"delivery_id": key, "from": before[key], "to": value}
                            for key, value in after.items() if before[key] != value]
@@ -496,10 +524,18 @@ def _measure_codex_queue(source_root: Path, variant: str) -> dict:
                              "fixed_instruction_characters": _carrier_fixed_instruction_length(
                                  "codex_native_queue", relevant),
                              "ack_transitions": transitions,
+                             "ack_sources": {t["delivery_id"]: "codex-consumed-evidence"
+                                             for t in transitions if t["to"] == "acked"},
                              "delivered_ids": [t["delivery_id"] for t in transitions if t["to"] == "acked"],
                              "captured_text": relevant})
-        return _measurement_row("codex_native_queue", variant, timeline, records,
-                                pending, root, recipient)
+        result = _measurement_row("codex_native_queue", variant, timeline, records,
+                                  pending, root, recipient)
+        result["seams"] = [
+            "codex_queue_delivery._rpc: returns the requested temporary recipient thread identity; network transport only.",
+            "codex_queue_delivery.send_at_least_once: captures the queue item and returns a consumed turn; transport only; production codex_consumed_evidence and settle_native_receipt process it.",
+        ]
+        result["ack_source"] = "codex_consumed_evidence + settle_native_receipt"
+        return result
 
 
 def main() -> int:

@@ -42,7 +42,27 @@ class DeliveryBatchMeasurementTest(unittest.TestCase):
                 self.assertEqual(observation["unsettled_record_ids"], [], (carrier, variant))
             self.assertEqual(sorted(mixed["failure_delivery_completion"].values()), [8, 19], carrier)
 
-        print("carrier | variant | wakes | emissions | injected chars | fixed chars | ACKs | unsettled")
+        for carrier in carriers:
+            for variant in ("all_success", "two_failures"):
+                row = next(item for item in result["measurements"]
+                           if item["carrier"] == carrier and item["variant"] == variant)
+                if carrier == "shared_sweep":
+                    self.assertEqual(row["seams"], [])
+                else:
+                    self.assertTrue(row["seams"], carrier)
+                    self.assertFalse(any("patch dispatch_notice_state.resolve_delivery_batch" in seam
+                                         for seam in row["seams"]))
+                observation = row["observed"]
+                self.assertTrue(row["ack_source"])
+                self.assertEqual(
+                    {source for item in observation["timeline"]
+                     for source in item.get("ack_sources", {}).values()},
+                    {"fixture-ack"} if carrier == "shared_sweep" else
+                    ({"claude-task-notification-transcript"} if carrier == "claude_async_rewake"
+                     else {"codex-consumed-evidence"}),
+                    (carrier, variant))
+
+        print("carrier | variant | wakes | emissions | injected chars | fixed chars | ACKs | unsettled | ACK source")
         for carrier in sorted(carriers):
             for variant in ("all_success", "two_failures"):
                 observation = measured[(carrier, variant)]
@@ -50,7 +70,8 @@ class DeliveryBatchMeasurementTest(unittest.TestCase):
                       f"{observation['emissions']} | {observation['injected_characters']} | "
                       f"{observation['fixed_instruction_characters']} | "
                       f"{sum(observation['ack_transition_count_by_record'].values())} | "
-                      f"{len(observation['unsettled_record_ids'])}")
+                      f"{len(observation['unsettled_record_ids'])} | "
+                      f"{next(row['ack_source'] for row in result['measurements'] if row['carrier'] == carrier and row['variant'] == variant)}")
 
 
 if __name__ == "__main__":
