@@ -98,6 +98,47 @@ class IdleObserverTests(unittest.TestCase):
             self.assertEqual(booking["idle"]["due_at"], 1010)
             self.assertEqual(booking["idle"]["cache_ttl"], "unknown")
 
+    def test_marked_final_reply_opens_wait_even_when_usage_is_unknown(self):
+        import human_wait_state
+        sid = "sid-marked"
+        payload = {"hook_event_name": "Stop", "session_id": sid, "cwd": str(self.cwd),
+                   "last_assistant_message": "[답변 필요] 계속 진행할까요?",
+                   "transcript_path": self.transcript(sid, None), "turn_id": "turn-marked"}
+        with self.iso.patched_environ(self.extra):
+            result = idle.observe_payload("claude", payload, now=2000)
+            self.assertEqual(result, "booking=skipped reason=usage-unknown")
+            waits = human_wait_state.read_signals(now=2000)
+            self.assertEqual(len(waits), 1)
+            self.assertEqual(waits[0]["question"], "계속 진행할까요?")
+
+    def test_next_user_prompt_clears_marked_wait_for_each_harness(self):
+        import human_wait_state
+        with self.iso.patched_environ(self.extra):
+            for harness in ("claude", "codex", "opencode"):
+                sid = "sid-clear-" + harness
+                seat = st.resolve_seat(harness, str(self.cwd), os.environ, sid)
+                self.assertTrue(human_wait_state.open_signal(
+                    harness, sid, seat.key, "[결정 필요] A 또는 B", sequence=0, now=3000))
+                projected = __import__("human_gate_observation").read_answer_waits(
+                    jobs_paths=(), sessions=[type("Session", (), {"harness": harness,
+                        "session_id": sid, "started_at": None})()], now=3001)
+                self.assertEqual(projected["total"], 1)
+                reader = sys.modules["human_gate_observation"]
+                observed = []
+                original_reader = reader.read_answer_waits
+                def capture(**kwargs):
+                    result = original_reader(**kwargs)
+                    observed.append(result)
+                    return result
+                with mock.patch.object(reader, "read_answer_waits", side_effect=capture):
+                    card = st.run_hook(harness, "start", sid, source="clear", cwd=str(self.cwd), now=3001)
+                self.assertIn("[답변 필요] A 또는 B", card,
+                              (seat.key, observed, human_wait_state.read_signals(now=3001), card))
+                self.assertEqual(len(human_wait_state.read_signals(now=3001)), 1)
+                st.run_hook(harness, "prompt", sid, cwd=str(self.cwd), prompt_text="B로 진행",
+                            now=3002)
+                self.assertEqual(human_wait_state.read_signals(now=3002), [])
+
     def test_opencode_session_idle_reads_latest_completed_message_and_provider(self):
         con = sqlite3.connect(self.iso.opencode_db)
         con.execute("CREATE TABLE message (id TEXT, session_id TEXT, data TEXT, time_updated INTEGER)")

@@ -1,6 +1,7 @@
 """Neutral Fleet interaction-wait enrichment (read-only, fail open)."""
 
 from pathlib import Path
+import time
 
 from .. import interaction
 
@@ -18,6 +19,9 @@ def enrich(sess, now=None):
         now=now,
     )
     if not record:
+        return
+    current = time.time() if now is None else float(now)
+    if current - float(record["waiting_since"]) >= 7 * 86400:
         return
     candidate = {
         "kind": record["kind"],
@@ -57,6 +61,7 @@ def enrich_human_gates(sessions, *, jobs_path=None, now=None):
     import human_gate_observation
     from . import dispatch
 
+    current = time.time() if now is None else float(now)
     registries = dispatch.human_gate_registry_paths(jobs_path)
     health = []
     by_route = {}
@@ -109,6 +114,8 @@ def enrich_human_gates(sessions, *, jobs_path=None, now=None):
         if len(matches) != 1:
             continue
         for wait in matches[0]:
+            if current - float(wait["waiting_since"]) >= 7 * 86400:
+                continue
             owner = _gate_owner(entries, wait["waiting_since"])
             if owner is None:
                 continue

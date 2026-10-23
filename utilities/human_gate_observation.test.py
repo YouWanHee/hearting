@@ -6,10 +6,13 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import human_gate_observation as H  # noqa: E402
 from route_identity import route_hash, route_id_from_hash  # noqa: E402
+from dispatch_contract import hold_supervisor_lease, supervisor_lease_path  # noqa: E402
+import dispatch_owner_input as owner_input  # noqa: E402
 
 
 class PendingWaitTest(unittest.TestCase):
@@ -60,6 +63,72 @@ class PendingWaitTest(unittest.TestCase):
             parsed = H._journal(ledger)
             self.assertEqual(loads.call_count, 1)
             self.assertEqual(parsed[0]["workflow_state"], "CANCELLED_________")
+
+    def _blocked_owner_fixture(self):
+        route = {"artifact_root": str(self.artifacts), "nodes": []}
+        route["route_hash"] = route_hash(route)
+        route["route_id"] = route_id_from_hash(route["route_hash"])
+        route_file = self.root / "owner.route.json"
+        route_file.write_text(json.dumps(route), encoding="utf-8")
+        attempt = "att-owner"
+        lease = supervisor_lease_path(self.jobs, attempt)
+        metadata = ",".join((
+            "attempt_schema_version=2", "dispatch_depth=1", "worker_type=owner",
+            "transport=headless", "execution_surface=registered-headless", "registered_worker=1",
+            "completion_delivery=app-server-supervised", "harness=codex", "attempt_id=" + attempt,
+            "supervisor_lease=flock-v1",
+            "supervisor_lease_nonce=" + "d" * 64, "supervisor_lease_file=" + str(lease),
+            "parent_sid=old-parent", "route_id=" + route["route_id"],
+            "parent_completion_delivery=opencode-turn", "managed_sealed_batch_id=batch-owner",
+            "route_hash=" + route["route_hash"], "route_file=" + str(route_file),
+            "owner_route_id=" + route["route_id"], "owner_route_hash=" + route["route_hash"],
+            "owner_route_file=" + str(route_file),
+        ))
+        self.jobs.write_text("now\topen\t/repo\t/wt\towner\t" + metadata + "\n", encoding="utf-8")
+        return route, attempt, lease, metadata
+
+    def test_dead_blocked_owner_wait_closes_on_real_retained_answer_and_successor(self):
+        _route, attempt, lease, metadata = self._blocked_owner_fixture()
+        owner_input.initialize_owner_input(self.jobs, attempt, "codex-next-turn")
+        self.jobs.write_text("now\tdone\t/repo\t/wt\towner\t" + metadata +
+                             ",note=dead-worker-blocked,failure_class=blocked\n", encoding="utf-8")
+        before = self.jobs.read_bytes()
+        first = H.read_answer_waits(jobs_paths=[self.jobs], now=300)
+        self.assertEqual([item["source"] for item in first["items"]], ["S3"])
+        self.assertEqual(first["items"][0]["owner"]["session_id"], "old-parent")
+        self.assertEqual(self.jobs.read_bytes(), before)
+
+        owner_input.submit(self.jobs, attempt, "answer from person", "answer-1")
+        answered = H.read_answer_waits(jobs_paths=[self.jobs], now=301)
+        self.assertEqual(answered["total"], 0)
+        import dispatch_supervision as supervision
+        notice = supervision.materialize(
+            self.jobs, {attempt}, reason=supervision.ANSWER_AWAITING_PARENT)[0]
+        import dispatch_pending_delivery as pending_delivery
+        self.assertEqual((notice["recipient_kind"], notice["recipient_digest"]),
+                         ("opencode-turn", pending_delivery.recipient_digest("old-parent")))
+        self.assertTrue(supervision.notice_is_current(notice))
+        self.assertIn("answer is kept", supervision.render_text(notice["receipt"]))
+        self.jobs.write_text(self.jobs.read_text(encoding="utf-8") +
+            "now\topen\t/repo\t/wt\towner\t"
+            f"attempt_schema_version=2,dispatch_depth=1,worker_type=owner,attempt_id=att-successor,"
+            f"automatic_retry_of={attempt},route_id={_route['route_id']},"
+            f"route_hash={_route['route_hash']},route_file={self.root / 'owner.route.json'}\n",
+            encoding="utf-8")
+        successor = H.read_answer_waits(jobs_paths=[self.jobs], now=302)
+        self.assertEqual(successor["total"], 0)
+
+    def test_advisory_lease_contention_keeps_reader_safe_and_unknown(self):
+        _route, attempt, lease, metadata = self._blocked_owner_fixture()
+        held = hold_supervisor_lease(self.jobs, attempt, lease)
+        held.__enter__()
+        self.addCleanup(held.__exit__, None, None, None)
+        self.jobs.write_text("now\tdone\t/repo\t/wt\towner\t" + metadata +
+                             ",note=dead-worker-blocked,failure_class=blocked\n", encoding="utf-8")
+        result = H.read_answer_waits(jobs_paths=[self.jobs], now=300)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["items"][0]["source"], "S3")
 
 
 if __name__ == "__main__":

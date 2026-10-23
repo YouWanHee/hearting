@@ -47,8 +47,18 @@ def liveness_counts(snapshot):
 def job_summary(snapshot):
     counts = liveness_counts(snapshot)
     parts = [f"{word} {counts[key]}" for key, word in _JOB_WORDS]
-    if counts["blocked"]:
-        parts.insert(2, f"◑답 대기 {counts['blocked']}")
+    answer_waits = _get(snapshot, "answer_waits")
+    if answer_waits is None:
+        wait_count = counts["blocked"]
+        wait_label = str(wait_count)
+    elif not _get(answer_waits, "complete", False):
+        wait_count = None
+        wait_label = "?"
+    else:
+        wait_count = int(_get(answer_waits, "total", 0) or 0)
+        wait_label = str(wait_count)
+    if wait_count is None or wait_count:
+        parts.insert(2, f"◑답 대기 {wait_label}")
     return " · ".join(parts)
 
 
@@ -263,6 +273,22 @@ def system_lines(snapshot):
     running = " · ".join(f"{HARNESS_ABBR[h]} {counts[h]}" for h in HARNESS_ORDER)
     lines = ["시스템 · 사용량 / 배분 / host > GPU", usage_text(snapshot, spaced=True),
              f"실행 {running} / 동시 {governor_text(snapshot)}"]
+    answer_waits = _get(snapshot, "answer_waits")
+    if answer_waits is not None:
+        if not _get(answer_waits, "complete", False):
+            lines.append("답 대기 ? · 관측 미완료")
+        else:
+            lines.append(f"답 대기 {int(_get(answer_waits, 'total', 0) or 0)}")
+            if _get(answer_waits, "unattributed", ()):
+                unattributed = set(answer_waits["unattributed"])
+                lines.append(f"귀속 못 한 항목 {len(unattributed)}")
+                for item in (_get(answer_waits, "items", ()) or ()):
+                    if _get(item, "id") in unattributed:
+                        lines.append("  · " + str(_get(item, "question") or "질문 내용 확인 불가")[:100])
+            stale = [item for item in (_get(answer_waits, "items", ()) or ())
+                     if _get(item, "stale", False)]
+            if stale:
+                lines.append(f"오래된 대기 {len(stale)}")
     views = host_views(snapshot)
     if views is None:
         lines.append("host > GPU ? · 읽지 못함")

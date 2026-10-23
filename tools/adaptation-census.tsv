@@ -52,6 +52,7 @@ shared-utility-deferred	herdr_integration_live.py
 shared-utility-deferred	herdr_observation.py
 shared-utility-deferred	herdr_opencode_live.py
 shared-utility-deferred	human_gate_observation.py
+shared-utility-deferred	human_wait_state.py
 shared-utility-deferred	interactive-main-recovery.py
 shared-utility-deferred	memory-store.sh
 shared-utility-deferred	merge-line.py

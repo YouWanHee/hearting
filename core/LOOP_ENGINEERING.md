@@ -313,6 +313,16 @@ session's number must not wait for pane metadata writes before basic publication
 Delayed display writes check the pane's current exact session identity and
 assigned number; a changed or unconfirmed target receives no old metadata.
 
+Answer waits are one read-only projection of existing sources: exact native
+interaction sidecars (S1), raised human gates (S2), ended owners whose result
+already waits for a person (S3), and explicitly marked final replies (S4).
+Each source closes only through its existing answer, gate, successor, or exact
+seat-input rule. Unknown seat attribution remains in the global total. Reading
+does not claim, resume, settle, or mutate a job; the existing lease observation's
+short non-blocking advisory flock is acceptable. S4 signals and derived caches
+are observational, private state; after seven days they may be folded from
+surfaces while the source wait remains intact.
+
 Fleet's interactive view keeps shared status, usage, compute/GPU observations,
 and its controls outside the scrolling work-list viewport. The list body owns
 its offset, selection-follow, page movement, and wheel movement; the flat line

@@ -55,6 +55,7 @@ class LiveSnapshot:
     memory: object = None
     governor: object = None
     hearting: dict = None
+    answer_waits: object = None
 
     def __iter__(self):
         # Keep the existing sessions, jobs unpacking surface for CLI readers.

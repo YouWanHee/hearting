@@ -1962,6 +1962,35 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             session_tidy_runner.reconcile_queued(seat, harness, sid)
             if event == "start":
                 session_tidy_runner.reconcile_reservation_queue(seat)
+    answer_wait_lines = []
+    if event in ("start", "prompt"):
+        with contextlib.suppress(BaseException):
+            project_root = str(Path(__file__).resolve().parents[1])
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            utilities = str(Path(__file__).resolve().parent)
+            if utilities not in sys.path:
+                sys.path.insert(0, utilities)
+            from tools.fleet.collectors import dispatch
+            import human_gate_observation
+            from types import SimpleNamespace
+            projected = human_gate_observation.read_answer_waits(
+                jobs_paths=dispatch.human_gate_registry_paths(),
+                sessions=[SimpleNamespace(harness=harness, session_id=sid)], now=now)
+            ids = set(projected.get("by_session", {}).get((harness, sid), ()))
+            for item in projected.get("items", ()):
+                owner = item.get("owner") or {}
+                if item.get("stale"):
+                    continue
+                if item.get("id") not in ids and owner.get("seat_key") != seat.key:
+                    continue
+                if (event == "prompt" and item.get("source") == "S4"
+                        and owner.get("seat_key") == seat.key):
+                    continue
+                question = item.get("question") or "사용자 답 대기"
+                answer_wait_lines.append("[답변 필요] " + str(question)[:160])
+                if len(answer_wait_lines) == 3:
+                    break
     with seat_lock(seat.key):
         if reread:
             saved = read_json(_reread_path(harness, sid))
@@ -1976,6 +2005,12 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             request_origin = _current_request_origin(prompt_text, harness, sid)
             if request_origin:
                 record_prompt_origin(seat, harness, sid, sequence, request_origin)
+            else:
+                # A physical user prompt closes this exact seat's marked wait.
+                # Transfer/automatic prompts are not answers from the user.
+                with contextlib.suppress(BaseException):
+                    import human_wait_state
+                    human_wait_state.close_signal(seat.key, sequence=sequence)
             with contextlib.suppress(BaseException):
                 import session_tidy_clear as clear
                 if not clear.observe_prompt_locked(seat, harness, sid, prompt_text, now, sequence):
@@ -2098,6 +2133,7 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             resume_text = handover.resume_line(seat, harness, sid)
             if resume_text:
                 parts.append(resume_text)
+        parts.extend(answer_wait_lines)
         text = "\n".join(parts)
         if event == "start" and emit_human:
             with contextlib.suppress(BaseException):

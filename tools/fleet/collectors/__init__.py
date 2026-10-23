@@ -489,6 +489,36 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
         observations["human-gates"] = _observation_health(
             job_key, "human-gates", "%s: %s" % (type(exc).__name__, str(exc)[:160]))
 
+    answer_waits = None
+    try:
+        utilities = str(Path(__file__).resolve().parents[3] / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        import human_gate_observation
+        from . import dispatch as _dispatch
+        answer_waits = human_gate_observation.read_answer_waits(
+            jobs_paths=_dispatch.human_gate_registry_paths(jobs_path),
+            sessions=sessions, now=_time.time())
+        import human_wait_state
+        human_wait_state.publish_cache(answer_waits)
+        for session in sessions:
+            key = (getattr(session, "harness", None), getattr(session, "session_id", None))
+            ids = set(answer_waits.get("by_session", {}).get(key, ()))
+            if ids:
+                session.interaction_observations.extend(
+                    {"kind": item.get("kind"), "source": item.get("source"),
+                 "waiting_since": item.get("since"), "item_id": item.get("id")}
+                for item in answer_waits.get("items", ())
+                if item.get("id") in ids and not item.get("stale"))
+        if not answer_waits.get("complete", False):
+            reasons = ";".join(str(item.get("reason", "unknown"))
+                                for item in answer_waits.get("health", ()))
+            observations["answer-waits"] = _observation_health(
+                job_key, "answer-waits", reasons[:160] or "observation-incomplete")
+    except Exception as exc:
+        observations["answer-waits"] = _observation_health(
+            job_key, "answer-waits", "%s: %s" % (type(exc).__name__, str(exc)[:160]))
+
     # One shared live assignment pass; peer trailers and Herdr read the same snapshot.
     tag_metadata = []
     try:
@@ -656,6 +686,18 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
         jobs = dispatch.collect(jobs_path=jobs_path, harness_filter=harness_filter,
                                 session_rows=sessions,
                                 **({"fast_first": True} if fast_first else {}))
+        if answer_waits is not None:
+            by_attempt = {}
+            for item in answer_waits.get("items", ()):
+                attempt = item.get("attempt_id")
+                if attempt and not item.get("stale"):
+                    by_attempt.setdefault(attempt, []).append(
+                        {"kind": item.get("kind"), "source": item.get("source"),
+                         "waiting_since": item.get("since"), "item_id": item.get("id")})
+            for job in jobs:
+                values = by_attempt.get(getattr(job, "attempt_id", None), ())
+                if values:
+                    job.interaction_observations.extend(values)
         # Capture the collector's output at its boundary, never in render or
         # from the independent detail worker. Older readers keep the attributes.
         node_evidence = copy.deepcopy(getattr(dispatch.collect, "last_route_nodes", {}) or {})
@@ -800,6 +842,7 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
         resource_diagnostics=copy.deepcopy(resource_diagnostics),
         observations=observations, tag_metadata=copy.deepcopy(tag_metadata),
         display_snapshot=display_snapshot,
+        answer_waits=answer_waits,
     )
     if not sessions and not jobs and node_evidence:
         from ..projection import terminal_route_entities

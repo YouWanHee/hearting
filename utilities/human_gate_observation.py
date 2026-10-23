@@ -120,6 +120,50 @@ def _valid_frame_answer(interview_path, route, answer_path):
         return False
 
 
+def _frame_question_detail(route, jobs, gate_id):
+    """Read only the first still-unanswered public question of a sealed interview."""
+    try:
+        ledger_root, _ = WS.ledger_root_for(jobs)
+        ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], root=ledger_root)
+        journal = [row for row in _journal(ledger)
+                   if row.get("route_id") == route["route_id"]
+                   and row.get("route_hash") == route["route_hash"]]
+        resolution = WS.human_gate_resolution(journal, gate_id)
+        artifact = resolution.get("artifact")
+        if not artifact or not route.get("artifact_root") or not _inside(artifact, route["artifact_root"]):
+            return None, [], None
+        path = Path(artifact).resolve(strict=True)
+        digest = resolution.get("artifact_sha256")
+        if digest and hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            return None, [], None
+        interview = _json_file(path)
+        if not FI.is_interview(interview):
+            return None, [], None
+        answers = _json_file(path.parent / "answers.native.json")
+        if answers is None:
+            answers = _json_file(path.parent / "answers.json")
+        given = answers.get("answers") if isinstance(answers, dict) else {}
+        given = given if isinstance(given, dict) else {}
+        for question in interview.get("questions") or ():
+            if not isinstance(question, dict):
+                continue
+            qid = question.get("id")
+            answer = given.get(qid)
+            if isinstance(answer, dict) and (answer.get("choice") is not None or answer.get("note")):
+                continue
+            options = question.get("options") if isinstance(question.get("options"), list) else []
+            choices = [str(option.get("label", ""))[:40] for option in options if isinstance(option, dict)]
+            recommendation = None
+            recommended = question.get("recommended")
+            if isinstance(recommended, int) and not isinstance(recommended, bool) \
+                    and 0 <= recommended < len(options) and isinstance(options[recommended], dict):
+                recommendation = str(options[recommended].get("label", ""))[:40]
+            return str(question.get("question", ""))[:160], choices, recommendation
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return None, [], None
+
+
 def pending_human_waits(route, *, jobs, outcome=None):
     """Return unresolved raised gates as private route/gate ids and public-safe fields.
 
@@ -186,3 +230,233 @@ def pending_human_waits(route, *, jobs, outcome=None):
         gates.append({"gate_id": gate, "kind": "decision", "source": "hearting-ledger",
                       "waiting_since": waiting_since, "route_id": route["route_id"]})
     return gates
+
+
+def read_answer_waits(*, jobs_paths, sessions=(), now=None):
+    """Project current answer waits from existing sources without changing them.
+
+    A damaged or partial registry is reported as unknown and is never used to
+    prove that an owner has no successor. The existing owner-input reader may
+    briefly take its advisory lease flock; contention simply omits that source
+    for this pass. No answer bodies are returned.
+    """
+    from collections import defaultdict
+    from time import time as _time
+
+    from dispatch_registry_cache import registry_read_scope, registry_snapshot
+
+    instant = _time() if now is None else float(now)
+    health = []
+    items = []
+    by_session = defaultdict(list)
+    known_sessions = {
+        (str(getattr(sess, "harness", "") or ""), str(getattr(sess, "session_id", "") or ""))
+        for sess in sessions
+    }
+    sessions_by_key = {
+        (str(getattr(sess, "harness", "") or ""), str(getattr(sess, "session_id", "") or "")): sess
+        for sess in sessions
+    }
+    seen = set()
+
+    def add(item):
+        if item["id"] in seen:
+            return
+        seen.add(item["id"])
+        items.append(item)
+        owner = item.get("owner") or {}
+        key = (owner.get("harness"), owner.get("session_id"))
+        if key in known_sessions:
+            by_session[key].append(item["id"])
+
+    def epoch(value, fallback):
+        try:
+            return float(value)
+        except (TypeError, ValueError, OverflowError):
+            try:
+                return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                return float(fallback)
+
+    # S1 stores only exact identity and timing. Native question text is private
+    # to the runtime and is never recovered from a prompt or sidecar.
+    try:
+        project_root = str(Path(__file__).resolve().parents[1])
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from tools.fleet import interaction
+        root = Path(interaction.state_root())
+        for harness in ("claude", "codex", "opencode"):
+            directory = root / harness
+            try:
+                children = tuple(directory.iterdir())
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                health.append({"source": "S1", "state": "unknown", "reason": type(exc).__name__})
+                continue
+            for path in children:
+                if path.suffix != ".json" or path.is_symlink():
+                    continue
+                sid = path.stem
+                sess = sessions_by_key.get((harness, sid))
+                record = interaction.pending_wait(
+                    sid, harness,
+                    session_start=getattr(sess, "started_at", None) if sess is not None else None,
+                    activity_since=getattr(sess, "_interaction_activity", None) if sess is not None else None,
+                    now=instant)
+                if not record:
+                    continue
+                add({"id": "S1:" + harness + ":" + sid + ":" + str(int(record["waiting_since"] * 1000)),
+                     "source": "S1",
+                     "kind": record["kind"], "question": None, "choices": [],
+                     "recommendation": None, "route_id": None, "route_hash": None,
+                     "attempt_id": None, "gate_id": None, "since": record["waiting_since"],
+                     "owner": {"harness": harness, "session_id": sid},
+                     "attribution": "exact"})
+    except Exception as exc:
+        health.append({"source": "S1", "state": "unknown", "reason": type(exc).__name__})
+
+    # S4's writer owns its private file format; importing is lazy to keep the
+    # legacy S1/S2 API independent from the new producer.
+    try:
+        import human_wait_state
+        for record in human_wait_state.read_signals(now=instant):
+            add({"id": record["id"], "source": "S4", "kind": "decision",
+                 "question": record.get("question"), "choices": [], "recommendation": None,
+                 "route_id": None, "route_hash": None, "attempt_id": None, "gate_id": None,
+                 "since": record["since"], "owner": {"harness": record.get("harness"),
+                 "session_id": record.get("session_id"), "seat_key": record.get("seat_key")},
+                 "attribution": "exact", "stale": bool(record.get("stale"))})
+    except Exception as exc:
+        health.append({"source": "S4", "state": "unknown", "reason": type(exc).__name__})
+
+    for jobs in jobs_paths:
+        path = Path(jobs)
+        try:
+            with registry_read_scope():
+                snapshot = registry_snapshot(path)
+                if not snapshot.complete:
+                    health.append({"source": "registry", "path": str(path),
+                                   "state": "unknown", "reason": snapshot.reason})
+                    continue
+                latest = {}
+                all_records = snapshot.view.records
+                for row in all_records:
+                    fields = row.fields
+                    if len(fields) != 6:
+                        continue
+                    meta = row.completion_metadata()
+                    attempt = meta.get("attempt_id")
+                    if attempt:
+                        latest[attempt] = (row.status, meta, fields)
+                successor_sources = set()
+                for row in all_records:
+                    meta = row.completion_metadata()
+                    for key in ("automatic_retry_of", "replacement_original_attempt_id",
+                                "prior_attempt_id"):
+                        if meta.get(key):
+                            successor_sources.add(meta[key])
+                for attempt, (status, meta, fields) in latest.items():
+                    if meta.get("worker_type") != "owner" or attempt in successor_sources:
+                        continue
+                    import route_authority
+                    if not route_authority.answerable_owner_end(status, meta):
+                        continue
+                    route_file = meta.get("owner_route_file") or meta.get("route_file")
+                    route_id = meta.get("owner_route_id") or meta.get("route_id")
+                    route_digest = meta.get("owner_route_hash") or meta.get("route_hash")
+                    if not route_file or not route_id or not route_digest:
+                        health.append({"source": "S3", "attempt_id": attempt,
+                                       "state": "unknown", "reason": "route-unproven"})
+                        continue
+                    try:
+                        project_root = str(Path(__file__).resolve().parents[1])
+                        if project_root not in sys.path:
+                            sys.path.insert(0, project_root)
+                        from tools.fleet import route as route_module
+                        from dispatch_owner_input import blocked_owner_answers
+                        route_record = route_module.load(route_file, route_digest, route_id)
+                        if route_record is None:
+                            continue
+                        outcome = route_module.load_outcome(route_file, route_id, route_digest)
+                        if outcome and outcome.get("closed_at") and outcome.get("match") is True:
+                            continue
+                        if blocked_owner_answers(path, attempt):
+                            continue
+                        blocker = "owner가 답을 기다림"
+                        log_file = meta.get("log_file")
+                        if log_file:
+                            try:
+                                import codex_dispatch_terminal
+                                terminal = codex_dispatch_terminal.inspect_terminal_log(log_file)
+                                if terminal:
+                                    raw = terminal.get("blocker") or terminal.get("failure_note")
+                                    if raw:
+                                        blocker = " ".join(str(raw).split())[:160]
+                            except Exception:
+                                pass
+                        add({"id": "S3:" + str(attempt), "source": "S3",
+                             "kind": "decision", "question": blocker, "choices": [],
+                             "recommendation": None, "route_id": route_id,
+                             "route_hash": route_digest, "attempt_id": attempt,
+                             "gate_id": None, "since": epoch(meta.get("ended_at") or fields[0], instant),
+                             "owner": {"harness": meta.get("harness") or fields[2],
+                                       "session_id": meta.get("parent_sid") or None,
+                                       "seat_key": None},
+                             "attribution": "lineage" if meta.get("parent_sid") else "unattributed"})
+                    except (OSError, ValueError, TypeError, KeyError, ImportError) as exc:
+                        health.append({"source": "S3", "attempt_id": attempt,
+                                       "state": "unknown", "reason": type(exc).__name__})
+                # S2 is independent of owner terminal state and uses the same
+                # exact route/journal reader as the established Fleet enrichment.
+                seen_routes = set()
+                project_root = str(Path(__file__).resolve().parents[1])
+                if project_root not in sys.path:
+                    sys.path.insert(0, project_root)
+                from tools.fleet import route as route_module
+                for row in all_records:
+                    fields = row.fields
+                    meta = row.completion_metadata()
+                    route_file = meta.get("owner_route_file") or meta.get("route_file")
+                    route_id = meta.get("owner_route_id") or meta.get("route_id")
+                    route_digest = meta.get("owner_route_hash") or meta.get("route_hash")
+                    key = (route_id, route_digest, route_file)
+                    if not route_file or not route_id or not route_digest or key in seen_routes:
+                        continue
+                    seen_routes.add(key)
+                    try:
+                        route_record = route_module.load(route_file, route_digest, route_id)
+                        if route_record is None:
+                            continue
+                        outcome = route_module.load_outcome(route_file, route_id, route_digest)
+                        for wait in pending_human_waits(route_record, jobs=path, outcome=outcome):
+                            parent_sid = meta.get("parent_sid")
+                            question, choices, recommendation = (
+                                _frame_question_detail(route_record, path, wait["gate_id"])
+                                if wait["gate_id"] == "frame-review" else (None, [], None))
+                            add({"id": "S2:" + route_id + ":" + wait["gate_id"] + ":" +
+                                 str(int(wait["waiting_since"] * 1000)),
+                                 "source": "S2", "kind": wait["kind"], "question": question,
+                                 "choices": choices, "recommendation": recommendation, "route_id": route_id,
+                                 "route_hash": route_digest, "attempt_id": meta.get("attempt_id"),
+                                 "gate_id": wait["gate_id"], "since": wait["waiting_since"],
+                                 "owner": {"harness": meta.get("harness") or fields[2],
+                                           "session_id": parent_sid or None},
+                                 "attribution": "lineage" if parent_sid else "unattributed"})
+                    except (OSError, ValueError, TypeError, KeyError, ImportError) as exc:
+                        health.append({"source": "S2", "route_id": route_id,
+                                       "state": "unknown", "reason": type(exc).__name__})
+        except (OSError, ValueError, UnicodeError) as exc:
+            health.append({"source": "registry", "path": str(path),
+                           "state": "unknown", "reason": type(exc).__name__})
+
+    for item in items:
+        try:
+            item["stale"] = bool(item.get("stale")) or instant - float(item.get("since", instant)) >= 7 * 86400
+        except (TypeError, ValueError, OverflowError):
+            item["stale"] = False
+    unattributed = [item["id"] for item in items if item.get("attribution") == "unattributed"]
+    return {"items": items, "by_session": dict(by_session), "unattributed": unattributed,
+            "total": len(items), "health": health, "observed_at": instant,
+            "complete": not any(row.get("state") == "unknown" for row in health)}
