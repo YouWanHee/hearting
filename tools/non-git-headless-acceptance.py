@@ -28,6 +28,33 @@ def _is_under(path: Path, parent: Path) -> bool:
     return path == parent or parent in path.parents
 
 
+def _resolve_fixture_base(raw: str | None) -> Path:
+    if not raw:
+        return ROOT
+    base = Path(raw).expanduser().resolve()
+    if not base.is_dir():
+        raise ValueError("--fixture-root must name an existing directory")
+    probe = subprocess.run(["git", "-C", str(base), "rev-parse", "--show-toplevel"],
+                           text=True, capture_output=True, check=False)
+    if probe.returncode == 0:
+        raise ValueError("--fixture-root must be outside any Git checkout")
+    return base
+
+
+def _d3_compose_command(capability: str, mode: str, prompt: Path, cwd: Path,
+                        fixture_env: dict[str, str], evidence: Path, adapter: str) -> list[str]:
+    command = [sys.executable, str(ROOT / "utilities" / "capability-route.py"),
+               "compose", "--start", "--shape", "staged", "--intensity", "standard",
+               "--capability", capability, "--pin", f"owner={adapter}", "--pin", f"worker={adapter}",
+               "--prompt-file", str(prompt), "--cwd", str(cwd),
+               "--artifact-root", fixture_env["AGENT_ARTIFACT_ROOT"], "--unassigned",
+               "--dispatch-evidence", str(evidence), "--jobs", fixture_env["AGENT_DISPATCH_JOBS"],
+               "--slug", capability]
+    if mode:
+        command += ["--capability-mode", mode]
+    return command
+
+
 def _write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -187,21 +214,49 @@ def _frame_answer_provenance(route_id: str) -> dict[str, object]:
 
 
 def _classify_fixture_rows(rows: list[dict[str, str]], route: dict) -> dict:
-    """Return terminal attempts bound to this frame and its owner lineage."""
+    """Return terminal attempts bound to this frame and the leg its decision started."""
     route_id = str(route.get("route_id") or "")
     nodes = [node for node in route.get("nodes", []) if isinstance(node, dict)]
     expected_frames = {str(node.get("id")) for node in nodes
                        if node.get("unit") == "plan/frame" and node.get("id")}
-    expected_owners = {str(node.get("id")) for node in nodes
-                       if node.get("worker_type") == "owner" and node.get("id")}
     frame = [row for row in rows if row.get("route_id") == route_id
              and row.get("worker_type") == "frame"
              and row.get("route_node") in expected_frames]
+    started_leg_ids = set()
+    decision_digest = None
+    artifact_root = route.get("artifact_root")
+    if isinstance(artifact_root, str):
+        try:
+            decision_path = Path(artifact_root).resolve() / "shards" / "frame" / "route-decision.json"
+            decision_record = json.loads(decision_path.read_text(encoding="utf-8"))
+            decision_digest = decision_record.get("digest")
+        except (OSError, ValueError, TypeError):
+            pass
+    if decision_digest and isinstance(artifact_root, str):
+        root = Path(artifact_root).resolve()
+        cursor = root / ".runtime" / "framed-decision" / f"{route_id}.plan-cursor.jsonl"
+        try:
+            for line in cursor.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(row, dict) and row.get("digest") == decision_digest
+                        and isinstance(row.get("route_id"), str)
+                        and isinstance(row.get("route_file"), str)):
+                    leg_path = (root / row["route_file"]).resolve()
+                    if _is_under(leg_path, root):
+                        leg_route = json.loads(leg_path.read_text(encoding="utf-8"))
+                        if (leg_route.get("route_id") == row["route_id"]
+                                and leg_route.get("route_hash") == row.get("route_hash")
+                                and leg_route.get("route_plan", {}).get("digest") == decision_digest):
+                            started_leg_ids.add(str(row["route_id"]))
+        except (OSError, ValueError, TypeError):
+            pass
     owners = [row for row in rows if row.get("worker_type") == "owner"
-              and row.get("route_node") in expected_owners
-              and row.get("owner_route_id") == route_id]
-    owner_route_ids = {str(row.get("route_id")) for row in owners if row.get("route_id")}
-    lineage_ids = {route_id, *owner_route_ids}
+              and row.get("owner_route_id") in started_leg_ids]
+    owner_attempt_route_ids = {str(row.get("route_id")) for row in owners if row.get("route_id")}
+    lineage_ids = {route_id, *started_leg_ids, *owner_attempt_route_ids}
     stages = [row for row in rows if row.get("worker_type") == "stage"
               and (row.get("route_id") in lineage_ids
                    or row.get("owner_route_id") in lineage_ids)]
@@ -220,6 +275,7 @@ def _classify_fixture_rows(rows: list[dict[str, str]], route: dict) -> dict:
         "owners": owners,
         "stages": stages,
         "expected_frame_nodes": sorted(expected_frames),
+        "started_leg_route_ids": sorted(started_leg_ids),
         "expected_frames_present": frames_present,
         "verified": frame_success and any(map(is_success, owners)) and any(map(is_success, stages)),
         "terminal_failure": any(
@@ -233,18 +289,21 @@ def prepare_fixture(output: Path) -> tuple[Path, dict[str, str]]:
     real_jobs = os.environ.get("AGENT_DISPATCH_JOBS", "")
     real_governor = os.environ.get("AGENT_MODEL_GOVERNOR_ROOT", "")
     world = Path(tempfile.mkdtemp(prefix="fixture-world-", dir=output))
-    for name in ("registry", "dispatch-state", "governor", "artifacts"):
+    for name in ("registry", "dispatch-state", "artifacts"):
         (world / name).mkdir(parents=True, exist_ok=True)
+    artifact_root = (world / "artifacts").resolve()
+    governor_root = artifact_root / ".runtime" / "model-worker-governor"
+    governor_root.mkdir(parents=True, exist_ok=True)
     jobs = (world / "registry" / "jobs.log").resolve()
     if real_jobs and jobs == Path(real_jobs).resolve(strict=False):
         raise RuntimeError("fixture-registry-resolves-to-live-registry")
-    if real_governor and Path(real_governor).resolve(strict=False) in (world / "governor").resolve().parents:
+    if real_governor and Path(real_governor).resolve(strict=False) == governor_root:
         raise RuntimeError("fixture-governor-resolves-to-live-governor")
     jobs.write_text("", encoding="utf-8")
     env = {
         "AGENT_HOME": str(ROOT),
         "AGENT_DISPATCH_JOBS": str(jobs),
-        "AGENT_MODEL_GOVERNOR_ROOT": str((world / "governor").resolve()),
+        "AGENT_MODEL_GOVERNOR_ROOT": str(governor_root),
         "AGENT_DISPATCH_STATE_ROOT": str((world / "dispatch-state").resolve()),
         "AGENT_ARTIFACT_ROOT": str((world / "artifacts").resolve()),
         "GIT_CEILING_DIRECTORIES": str(world.resolve()),
@@ -338,8 +397,8 @@ def _fixture_route_start(adapter: str, *, output: Path, world: Path, cwd: Path,
         return {"status": "unverified(compose-sealed-route-mismatch)", "route_file": str(route_file)}
     frame_nodes = [node for node in route.get("nodes", [])
                    if isinstance(node, dict) and node.get("unit") == "plan/frame"]
-    if len(frame_nodes) < 2:
-        return {"status": "unverified(compiled-frame-pair-missing)", "route_file": str(route_file)}
+    if not frame_nodes:
+        return {"status": "unverified(compiled-frame-node-missing)", "route_file": str(route_file)}
     frame_ids = {str(node.get("id")) for node in frame_nodes}
     jobs = Path(fixture_env["AGENT_DISPATCH_JOBS"])
     deadline = time.monotonic() + 1200
@@ -442,15 +501,8 @@ def _attempt_d3(adapter: str, *, output: Path, fixture_env: dict[str, str],
     ):
         prompt = fixture_parent / f"{capability}-task.md"
         prompt.write_text(request + "\n", encoding="utf-8")
-        command = [sys.executable, str(ROOT / "utilities" / "capability-route.py"),
-                   "compose", "--start", "--shape", "solo", "--intensity", "standard",
-                   "--capability", capability, "--pin", f"owner={adapter}", "--pin", f"worker={adapter}",
-                   "--prompt-file", str(prompt), "--cwd", str(cwd),
-                   "--artifact-root", fixture_env["AGENT_ARTIFACT_ROOT"], "--unassigned",
-                   "--dispatch-evidence", str(evidence), "--jobs", fixture_env["AGENT_DISPATCH_JOBS"],
-                   "--slug", capability]
-        if mode:
-            command += ["--capability-mode", mode]
+        command = _d3_compose_command(capability, mode, prompt, cwd,
+                                     fixture_env, evidence, adapter)
         response = _run_recorded(output, f"d3-{capability}", command,
                                  cwd=ROOT, env=child_env, timeout=180)
         text = str(response.get("stderr") or "") + str(response.get("stdout") or "")
@@ -462,7 +514,9 @@ def _attempt_d3(adapter: str, *, output: Path, fixture_env: dict[str, str],
         }
     after_rows = len(_route_rows(jobs))
     after_routes = set(route_dir.glob("*.json")) if route_dir.is_dir() else set()
-    no_route_side_effect = before_rows == after_rows and before_routes == after_routes
+    worktree_side_effects = list(cwd.parent.glob(f"{cwd.name}-wt*"))
+    no_route_side_effect = (before_rows == after_rows and before_routes == after_routes
+                            and not worktree_side_effects)
 
     direct_task = fixture_parent / "direct-compatibility.md"
     direct_task.write_text("Write a short research note in the cycle artifact output.\n", encoding="utf-8")
@@ -482,6 +536,7 @@ def _attempt_d3(adapter: str, *, output: Path, fixture_env: dict[str, str],
         and no_route_side_effect and direct_ok else "unverified(compiled-route-evidence-incomplete)",
         "routes": refusals, "registry_rows_unchanged": before_rows == after_rows,
         "route_files_unchanged": before_routes == after_routes,
+        "worktree_side_effects": [str(path) for path in worktree_side_effects],
         "direct_compatibility": direct_receipt or {"exit_code": direct.get("exit_code")},
     }
 
@@ -490,11 +545,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--adapter", choices=sorted(ADAPTERS), required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--fixture-root", help="existing parent directory for a non-Git fixture outside this checkout")
     args = parser.parse_args()
     output = Path(args.output_dir).expanduser().resolve(strict=False)
     if not output.is_absolute():
         parser.error("--output-dir must resolve to an absolute path")
-    fixture_parent = Path(tempfile.mkdtemp(prefix="hearting-non-git-acceptance-", dir=ROOT))
+    try:
+        fixture_base = _resolve_fixture_base(args.fixture_root)
+    except ValueError as exc:
+        parser.error(str(exc))
+    fixture_parent = Path(tempfile.mkdtemp(prefix="hearting-non-git-acceptance-", dir=fixture_base))
     result = {
         "schema_version": 1,
         "adapter": args.adapter,
@@ -507,14 +567,17 @@ def main() -> int:
         if _is_under(fixture_parent.resolve(), Path("/tmp").resolve()) or _is_under(
                 fixture_parent.resolve(), Path(os.environ.get("TMPDIR", "/tmp")).resolve()):
             raise RuntimeError("fixture-parent-is-under-temporary-root")
-        if not _is_under(fixture_parent.resolve(), ROOT.resolve()):
+        if not args.fixture_root and not _is_under(fixture_parent.resolve(), ROOT.resolve()):
             raise RuntimeError("fixture-parent-not-under-source-checkout")
         world, fixture_env = prepare_fixture(output)
         cwd = fixture_parent / "docs"
         cwd.mkdir()
         (cwd / "user.txt").write_bytes(b"keep\n")
         before = hashlib.sha256((cwd / "user.txt").read_bytes()).hexdigest()
-        fixture_env["GIT_CEILING_DIRECTORIES"] = str(fixture_parent.resolve())
+        if not args.fixture_root:
+            fixture_env["GIT_CEILING_DIRECTORIES"] = str(fixture_parent.resolve())
+        else:
+            fixture_env.pop("GIT_CEILING_DIRECTORIES", None)
         child_env = {key: value for key, value in os.environ.items()
                      if not key.startswith(("AGENT_DISPATCH_", "AGENT_ROUTE_",
                                             "AGENT_OWNER_ROUTE_", "AGENT_ARTIFACT_"))}
