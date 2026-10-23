@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import fcntl
+import json
 import stat
 import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 from types import SimpleNamespace
 
@@ -141,6 +143,66 @@ class HumanWaitStateTests(unittest.TestCase):
             self.assertIn(missing_sid, {item["owner"]["session_id"]
                                         for item in still_pending["items"]})
 
+    def test_producer_closes_codex_sidecar_after_later_task_started(self):
+        from tools.fleet import interaction
+        now = 2_000_100
+        sid = "12345678-1234-1234-1234-123456789abc"
+        state_dir = Path(self.tmp.name) / "interactions"
+        codex_home = Path(self.tmp.name) / "codex-home"
+        rollout = codex_home / "sessions" / "2026" / "10" / "23" / ("rollout-session-" + sid + ".jsonl")
+        rollout.parent.mkdir(parents=True)
+        timestamp = datetime.fromtimestamp(now - 50, timezone.utc).isoformat().replace("+00:00", "Z")
+        rollout.write_text(json.dumps({"type": "event_msg", "timestamp": timestamp,
+                                       "payload": {"type": "task_started", "turn_id": "new-turn"}}) + "\n",
+                           encoding="utf-8")
+        with mock.patch.dict(os.environ, {"FLEET_INTERACTION_STATE_DIR": str(state_dir),
+                                          "CODEX_HOME": str(codex_home)}):
+            self.assertTrue(interaction.set_wait(sid, "codex", "decision", "codex-rollout", now=now - 100))
+            result = observation.read_answer_waits(jobs_paths=(), now=now)
+        self.assertNotIn(sid, {item["owner"]["session_id"] for item in result["items"]})
+
+    def test_producer_keeps_codex_permission_wait_after_same_turn_records(self):
+        from tools.fleet import interaction
+        now = 2_000_100
+        sid = "22345678-1234-1234-1234-123456789abc"
+        state_dir = Path(self.tmp.name) / "interactions"
+        codex_home = Path(self.tmp.name) / "codex-home"
+        rollout = codex_home / "sessions" / "2026" / "10" / "23" / ("rollout-session-" + sid + ".jsonl")
+        rollout.parent.mkdir(parents=True)
+        timestamp = datetime.fromtimestamp(now - 50, timezone.utc).isoformat().replace("+00:00", "Z")
+        rows = [
+            {"type": "event_msg", "timestamp": timestamp,
+             "payload": {"type": "token_count", "info": {"total_tokens": 12}}},
+            {"type": "response_item", "timestamp": timestamp,
+             "payload": {"type": "function_call", "name": "request_permission"}},
+        ]
+        rollout.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"FLEET_INTERACTION_STATE_DIR": str(state_dir),
+                                          "CODEX_HOME": str(codex_home)}):
+            self.assertTrue(interaction.set_wait(sid, "codex", "permission",
+                                                 "codex-permissionrequest", now=now - 100))
+            result = observation.read_answer_waits(jobs_paths=(), now=now)
+        self.assertIn(sid, {item["owner"]["session_id"] for item in result["items"]})
+
+    def test_producer_keeps_codex_wait_when_turn_proof_is_beyond_tail_cap(self):
+        from tools.fleet import interaction
+        now = 2_000_100
+        sid = "32345678-1234-1234-1234-123456789abc"
+        state_dir = Path(self.tmp.name) / "interactions"
+        codex_home = Path(self.tmp.name) / "codex-home"
+        rollout = codex_home / "sessions" / "2026" / "10" / "23" / ("rollout-session-" + sid + ".jsonl")
+        rollout.parent.mkdir(parents=True)
+        timestamp = datetime.fromtimestamp(now - 50, timezone.utc).isoformat().replace("+00:00", "Z")
+        proof = json.dumps({"type": "event_msg", "timestamp": timestamp,
+                            "payload": {"type": "task_started", "turn_id": "old"}})
+        rollout.write_text(proof + "\n" + ("{}\n" * 100), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"FLEET_INTERACTION_STATE_DIR": str(state_dir),
+                                          "CODEX_HOME": str(codex_home)}), \
+             mock.patch.object(observation, "_S1_LOG_TAIL_MAX_BYTES", 64):
+            self.assertTrue(interaction.set_wait(sid, "codex", "decision", "codex-rollout", now=now - 100))
+            result = observation.read_answer_waits(jobs_paths=(), now=now)
+        self.assertIn(sid, {item["owner"]["session_id"] for item in result["items"]})
+
     def test_producer_keeps_claude_sidecar_pending_after_transcript_write_without_sessions(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from tools.fleet import interaction
@@ -159,6 +221,48 @@ class HumanWaitStateTests(unittest.TestCase):
             # Transcript metadata can be appended while the user is still deciding.
             pending = observation.read_answer_waits(jobs_paths=(), now=now)
             self.assertIn(sid, {item["owner"]["session_id"] for item in pending["items"]})
+
+    def test_producer_closes_claude_sidecar_after_later_user_turn(self):
+        from tools.fleet import interaction
+        now = 2_000_100
+        sid = "fedcba98-7654-4321-8765-abcdefabcdef"
+        state_dir = Path(self.tmp.name) / "interactions"
+        claude_home = Path(self.tmp.name) / "claude-home"
+        transcript = claude_home / "projects" / "project" / (sid + ".jsonl")
+        transcript.parent.mkdir(parents=True)
+        timestamp = datetime.fromtimestamp(now - 50, timezone.utc).isoformat().replace("+00:00", "Z")
+        transcript.write_text(json.dumps({"type": "user", "timestamp": timestamp,
+                                          "message": {"content": "A later user reply"}}) + "\n",
+                              encoding="utf-8")
+        with mock.patch.dict(os.environ, {"FLEET_INTERACTION_STATE_DIR": str(state_dir),
+                                          "CLAUDE_CONFIG_DIR": str(claude_home)}):
+            self.assertTrue(interaction.set_wait(sid, "claude", "decision", "claude-asktool", now=now - 100))
+            result = observation.read_answer_waits(jobs_paths=(), now=now)
+        self.assertNotIn(sid, {item["owner"]["session_id"] for item in result["items"]})
+
+    def test_producer_keeps_claude_wait_after_metadata_attachment_and_tool_result(self):
+        from tools.fleet import interaction
+        now = 2_000_100
+        sid = "cedcba98-7654-4321-8765-abcdefabcdef"
+        state_dir = Path(self.tmp.name) / "interactions"
+        claude_home = Path(self.tmp.name) / "claude-home"
+        transcript = claude_home / "projects" / "project" / (sid + ".jsonl")
+        transcript.parent.mkdir(parents=True)
+        timestamp = datetime.fromtimestamp(now - 50, timezone.utc).isoformat().replace("+00:00", "Z")
+        rows = [
+            {"type": "user", "timestamp": timestamp, "isMeta": True},
+            {"type": "attachment", "timestamp": timestamp, "content": "image"},
+            {"type": "user", "timestamp": timestamp,
+             "message": {"content": [{"type": "tool_result", "content": "tool output"}]}},
+            {"type": "user", "timestamp": timestamp,
+             "message": {"content": [{"type": "image", "source": {"type": "base64"}}]}},
+        ]
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"FLEET_INTERACTION_STATE_DIR": str(state_dir),
+                                          "CLAUDE_CONFIG_DIR": str(claude_home)}):
+            self.assertTrue(interaction.set_wait(sid, "claude", "decision", "claude-asktool", now=now - 100))
+            result = observation.read_answer_waits(jobs_paths=(), now=now)
+        self.assertIn(sid, {item["owner"]["session_id"] for item in result["items"]})
 
     def test_fake_herdr_gets_quiet_registration_and_only_six_hour_sound(self):
         import time

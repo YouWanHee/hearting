@@ -7,7 +7,7 @@ import math
 import os
 import sys
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +32,8 @@ _OBSERVATION_META_KEYS = frozenset((
     "harness", "log_file", "note", "failure_class", "classifier_source", "process_exit",
     "reconcile_reason", "terminal_event",
 ))
+_S1_LOG_TAIL_MAX_BYTES = 2 * 1024 * 1024
+_S1_LOG_CHUNK_BYTES = 64 * 1024
 
 
 def _stamp(path):
@@ -192,6 +194,106 @@ def _json_file(path):
         except (ValueError, TypeError):
             return None
     return _cached(_OBSERVATION_CACHE, key, parse)
+
+
+def _record_epoch(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        result = float(value)
+        return result if math.isfinite(result) else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (ValueError, OverflowError):
+        return None
+
+
+def _tail_json_records(path):
+    """Yield JSON object records newest-first from a fixed-size file tail."""
+    try:
+        size = Path(path).stat().st_size
+        lower_bound = max(0, size - _S1_LOG_TAIL_MAX_BYTES)
+        position = size
+        partial = b""
+        with Path(path).open("rb") as handle:
+            while position > lower_bound:
+                start = max(lower_bound, position - _S1_LOG_CHUNK_BYTES)
+                handle.seek(start)
+                chunk = handle.read(position - start)
+                pieces = (chunk + partial).split(b"\n")
+                partial = pieces[0]
+                for raw in reversed(pieces[1:]):
+                    try:
+                        value = json.loads(raw)
+                    except (ValueError, UnicodeError):
+                        continue
+                    if isinstance(value, dict):
+                        yield value
+                position = start
+            if lower_bound == 0 and partial:
+                try:
+                    value = json.loads(partial)
+                except (ValueError, UnicodeError):
+                    return
+                if isinstance(value, dict):
+                    yield value
+    except (OSError, ValueError):
+        return
+
+
+def _session_log_path(harness, session_id):
+    """Find the exact native log for one sidecar; ambiguity proves nothing."""
+    if harness == "codex":
+        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        pattern = "rollout-*-" + str(session_id) + ".jsonl"
+        root = home / "sessions"
+    elif harness == "claude":
+        home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+        pattern = str(session_id) + ".jsonl"
+        root = home / "projects"
+    else:
+        return None
+    try:
+        matches = [path for path in root.rglob(pattern) if not path.is_symlink() and path.is_file()]
+    except OSError:
+        return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def _later_session_turn(harness, session_id, waiting_since):
+    """Use exact later-turn records only; unknown or capped logs do not close."""
+    path = _session_log_path(harness, session_id)
+    if path is None:
+        return False
+    for record in _tail_json_records(path):
+        timestamp = _record_epoch(record.get("timestamp"))
+        if timestamp is None:
+            continue
+        if timestamp < waiting_since:
+            return False
+        if harness == "codex":
+            payload = record.get("payload")
+            if (record.get("type") == "event_msg" and isinstance(payload, dict)
+                    and payload.get("type") == "task_started" and timestamp > waiting_since):
+                return True
+        elif harness == "claude" and timestamp > waiting_since:
+            if record.get("type") != "user" or record.get("isMeta") is True:
+                continue
+            message = record.get("message")
+            content = message.get("content") if isinstance(message, dict) else record.get("content")
+            if isinstance(content, str) and content.strip():
+                return True
+            if isinstance(content, list):
+                # A user turn is textual input. Tool results, attachments, and
+                # metadata-only blocks are not evidence that a person replied.
+                if any(isinstance(block, dict) and block.get("type") == "text"
+                       and isinstance(block.get("text"), str) and block["text"].strip()
+                       for block in content):
+                    return True
+    return False
 
 def _inside(path, root):
     try:
@@ -398,6 +500,9 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                 if sidecar and sidecar.get("source") != "codex-appserver":
                     activity_since = (getattr(sess, "_interaction_activity", None)
                                       if sess is not None else None)
+                    if (activity_since is None and harness in ("codex", "claude")
+                            and _later_session_turn(harness, sid, sidecar["waiting_since"])):
+                        activity_since = instant
                 record = interaction.pending_wait(
                     sid, harness,
                     session_start=getattr(sess, "started_at", None) if sess is not None else None,
