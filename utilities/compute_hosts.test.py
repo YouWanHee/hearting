@@ -1341,9 +1341,13 @@ class ComputeHostsTest(unittest.TestCase):
     def test_stop_records_sigterm_exit_and_reason(self):
         # `stop` kills the tmux session before the run shell can write its
         # own exit code; the stop itself must leave 143 + a reason behind.
-        self.skipTest("the isolated fake tmux transport does not model persistent server stop")
+        env = {**self.env, "PATH": os.pathsep.join(
+            entry for entry in self.env["PATH"].split(os.pathsep)
+            if Path(entry) != self.fakebin)}
+        if shutil.which("tmux", path=env["PATH"]) is None:
+            self.skipTest("tmux is not installed")
         result = self.run_tool("run", "here", "--name", "stopme", "--",
-                               "bash", "-c", "sleep 30")
+                               "bash", "-c", "sleep 30", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         run_id = result.stdout.split()[1]
         meta = json.loads((self.run_root / run_id / "meta.json").read_text())
@@ -1354,11 +1358,11 @@ class ComputeHostsTest(unittest.TestCase):
             for _ in range(50):
                 check = subprocess.run(
                     ["tmux", "-L", server, "has-session", "-t", run_id],
-                    capture_output=True, timeout=5)
+                    capture_output=True, timeout=5, env=env)
                 if check.returncode == 0:
                     break
                 time.sleep(0.1)
-            stopped = self.run_tool("stop", run_id)
+            stopped = self.run_tool("stop", run_id, env=env)
             self.assertEqual(stopped.returncode, 0, stopped.stderr)
             self.assertIn("stopped", stopped.stdout)
             run_dir = self.run_root / run_id
@@ -1372,20 +1376,20 @@ class ComputeHostsTest(unittest.TestCase):
             self.assertEqual(
                 (run_dir / "stop_reason").read_text(encoding="utf-8").strip(),
                 "stopped")
-            listed = self.run_tool("runs")
+            listed = self.run_tool("runs", env=env)
             self.assertIn("exit 143 (stopped)", listed.stdout)
-            payload = json.loads(self.run_tool("runs", "--json").stdout)
+            payload = json.loads(self.run_tool("runs", "--json", env=env).stdout)
             row = next(item for item in payload if item["run_id"] == run_id)
             self.assertEqual(row["exit_code"], 143)
             self.assertEqual(row["stop_reason"], "stopped")
             self.assertEqual(row["state"], "finished")
-            tail = self.run_tool("tail", run_id)
+            tail = self.run_tool("tail", run_id, env=env)
             self.assertIn("exit 143 (stopped)", tail.stdout)
         finally:
             subprocess.run(["tmux", "-L", server, "kill-session", "-t", run_id],
-                           capture_output=True, timeout=5)
+                           capture_output=True, timeout=5, env=env)
             subprocess.run(["tmux", "-L", server, "kill-server"],
-                           capture_output=True, timeout=5)
+                           capture_output=True, timeout=5, env=env)
 
     def test_tmux_transport_probes_only_the_recorded_managed_server(self):
         module = load_module()
