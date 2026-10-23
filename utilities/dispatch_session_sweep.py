@@ -403,15 +403,20 @@ def sweep_deliver(
             continue
         try:
             from dispatch_notice_state import resolve_delivery_batch
-            batch = resolve_delivery_batch(jobs, current, recipient_key=storage_key) if jobs is not None else None
+            batch = resolve_delivery_batch(jobs, current, recipient_key=storage_key,
+                                           delivery_root=root) if jobs is not None else None
             batch_ids = tuple(batch.get("delivery_ids", ())) if batch else ()
+            if batch and batch.get("held"):
+                visited_batch_ids.update(batch.get("member_delivery_ids", ()))
+                continue
             if (batch and len(batch_ids) > 1
                     and time.monotonic_ns() - start_ns > DELIVER_BUDGET_SECONDS * 1_000_000_000):
                 continue
-            group_claims = pending_delivery.claim_ready_batch(
+            group_claims = pending_delivery._claim_ready_batch_snapshot(
                 root, storage_key, delivery_id, claim_owner=claim_owner,
                 lease_seconds=DELIVER_LEASE_SECONDS, require_generation_proof=False,
                 jobs=jobs, retry_context=_retry_context(recipient_kind, session_id, storage_key, current),
+                seed=current, batch=batch,
             )
         except pending_delivery.PendingDeliveryError:
             continue
@@ -499,6 +504,55 @@ COMPLETION_DELIVERY_HEADER = (
     "Tracked-Workflow Continuation. Keep new failures/conflicts, unfinished work, questions; "
     "no Monitor/dispatch-wait/polling."
 )
+_LEGACY_COMPLETION_DELIVERY_HEADER = (
+    "Hearting runtime delivery (SD-111 durable pending records for this session). "
+    "Follow each receipt's required_action. advance-completed confirms that attempt's "
+    "completion: read its exact result and perform already approved parent review/follow-through "
+    "this turn or its existing registered continuation. Receipt, queue consumption and ACK are not execution. "
+    "On the first user-facing close of material work, explain what changed and why, observed before/after, "
+    "checks actually run (including reused, skipped, and unrun checks), applicable commit/PR/deployment/serving, "
+    "and limits or remaining work; do not invent deployment or operating results. Follow the owning "
+    "route's next-action receipt for any remaining stages. Runtime-v1 owners have "
+    "runtime-owned close/finalize; a closed route needs no restart. "
+    "inspect-recovery is a runtime diagnostic, not a request for a user decision. "
+    "For other unresolved actions use the exact checked recovery surface. "
+    "An automatic repeat of the same exact result or cleanup-only notice after follow-through was handled "
+    "does not repeat the action or request a new user ACK; preserve new failures, conflicts, unfinished work, "
+    "and direct user questions. "
+    "Do not start Monitor, dispatch-wait, or a polling loop."
+)
+_CURRENT_RUNTIME_V1_FOLLOWUP_PREFIX = (
+    "Original request/format apply. Review result; do approved follow-through or existing "
+    "continuation. First close: changes/why, before/after, checks run/reused/skipped/unrun, "
+    "commit/PR/deployment/serving, limits. No harvest/restart/manual finalize. "
+    "Receipt/ACK isn't execution; handled exact repeats need no ACK."
+)
+_LEGACY_RUNTIME_V1_FOLLOWUP = (
+    "The requested work is complete, including its declared stages and runtime workflow/route/cycle settlement. "
+    "Continue and complete the original user task itself, preserving every explicit content and output-format "
+    "requirement from that request; this receipt supplements the task and does not replace it with a receipt-only response. "
+    "Read the exact result and perform the already approved parent review/follow-through in this turn, "
+    "or run its existing registered continuation. On the first user-facing close, explain what changed and why, "
+    "the observed before/after, checks actually run (including reused, skipped, and unrun checks), applicable "
+    "commit/PR/deployment/serving state, and limits or remaining work. Do not invent deployment or operating "
+    "results. Receipt, queue consumption and ACK are not execution. No harvest, route restart, or manual "
+    "finalization is required. An automatic repeat of this exact result or a cleanup-only notice after the "
+    "follow-through is handled does not call for the same action or a new user ACK; preserve a new failure, "
+    "conflict, unfinished work, or direct user question."
+)
+
+
+def _legacy_opencode_completion_body(text: str, roots: list[Path], records: list[dict]) -> str:
+    """Render the exact previous full body for receipt recovery only."""
+    legacy = text.replace(COMPLETION_DELIVERY_HEADER,
+                          _LEGACY_COMPLETION_DELIVERY_HEADER, 1)
+    for root, record in zip(roots, records):
+        follow = _followup(root, record)
+        if follow.startswith(_CURRENT_RUNTIME_V1_FOLLOWUP_PREFIX):
+            replacement = _LEGACY_RUNTIME_V1_FOLLOWUP + follow[
+                len(_CURRENT_RUNTIME_V1_FOLLOWUP_PREFIX):]
+            legacy = legacy.replace(follow, replacement, 1)
+    return legacy
 
 
 def _followup(root: Path, record: dict) -> str:
@@ -724,10 +778,16 @@ def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
             identities.append((delivery_id, identity))
         if not valid:
             continue
-        rendered = delivery_context([(root, [record]) for root, record in selected])
-        if not rendered or rendered != native_text:
+        grouped_selected: dict[Path, list[dict]] = {}
+        for root, record in selected:
+            grouped_selected.setdefault(root, []).append(record)
+        rendered = delivery_context(list(grouped_selected.items()))
+        legacy_rendered = _legacy_opencode_completion_body(
+            rendered, [root for root, _record in selected],
+            [record for _root, record in selected]) if rendered else ""
+        if not rendered or native_text not in {rendered, legacy_rendered}:
             continue
-        candidate = _opencode_expected_message(rendered, identities)
+        candidate = _opencode_expected_message(native_text, identities)
         key = (candidate["text"], tuple(candidate["bindings"]))
         if candidate["bindings"] and key not in seen:
             seen.add(key)
@@ -785,6 +845,7 @@ def sweep(
     start_ns = time.monotonic_ns()
     entries: list[Path] = []
     claimed = 0
+    settled_batch_ids: set[str] = set()
     try:
         directory = pending_delivery.record_directory(root, session_id)
         entries = sorted(
@@ -792,6 +853,8 @@ def sweep(
         )
         for entry in entries:
             delivery_id = entry.stem
+            if delivery_id in settled_batch_ids:
+                continue
             claim_owner = (
                 f"session-sweep:{recipient_kind}:{os.getpid()}:{time.monotonic_ns()}"
             )
@@ -800,7 +863,7 @@ def sweep(
             if jobs is None and record is not None and not (record.get("receipt") or {}).get("job_registry"):
                 continue
             try:
-                pending_delivery.claim(
+                group = pending_delivery.claim_ready_batch(
                     root,
                     session_id,
                     delivery_id,
@@ -812,7 +875,8 @@ def sweep(
                 )
             except pending_delivery.PendingDeliveryError:
                 continue
-            claimed += 1
+            settled_batch_ids.update(member["delivery_id"] for member in group)
+            claimed += len(group)
     except OSError:
         pass
     elapsed_ns = time.monotonic_ns() - start_ns

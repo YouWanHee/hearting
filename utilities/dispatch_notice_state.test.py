@@ -6,6 +6,8 @@ import importlib.util
 import os
 from pathlib import Path
 import tempfile
+import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -67,6 +69,87 @@ class NoticeTest(unittest.TestCase):
         # A shared sealed string without the exact sealed membership is not authority.
         self.assertIsNone(notice.delivery_batch_key(
             **base, sealed_batch_id="same-string", sealed_attempt_ids=["att-other"]))
+
+    def _success_batch_fixture(self, *, materialize_sibling=True):
+        self.route["parent_cycle_id"] = "cycle-shared"
+        self.route["route_hash"] = route_hash(self.route)
+        self.path.write_text(json.dumps(self.route))
+        self.jobs.write_text("")
+        ids = ["att-batch-a", "att-batch-b"]
+        delivery_ids = ["delivery-batch-a", "delivery-batch-b"]
+        created = []
+        for index, (attempt_id, delivery_id) in enumerate(zip(ids, delivery_ids)):
+            receipt = {"schema_version": 2, "state": "ready", "parent_attempt_id": "",
+                       "job_registry": str(self.jobs), "delivery_classification": "success",
+                       "children": [{"attempt_id": attempt_id, "required_action": "advance-completed"}]}
+            if index == 0 or materialize_sibling:
+                created.append(pending.create(
+                    self.root, delivery_id=delivery_id, recipient_kind="claude-parent-runtime",
+                    recipient_key="parent", session_generation="", session_generation_supported="0",
+                    attempt_ids=[attempt_id], parent_attempt_id="att-parent", route_id="rt-notice",
+                    route_node="frame", receipt=receipt,
+                    receipt_digest=pending._canonical_receipt_digest(receipt),
+                    row_revisions={attempt_id: "revision-" + str(index)}))
+            stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            meta = {"attempt_id": attempt_id, "dispatch_depth": "1", "registered_worker": "1",
+                    "worker_type": "frame", "parent_sid": "parent", "delivery_intent": "1",
+                    "delivery_intent_at_ns": str(time.monotonic_ns()),
+                    "delivery_id": delivery_id, "failure_class": "pass", "note": "completed-marker",
+                    "route_file": str(self.path), "route_id": "rt-notice",
+                    "route_hash": self.route["route_hash"], "route_node": "frame"}
+            self.jobs.write_text(self.jobs.read_text() + stamp + "\tdone\t/r\t/w\ttask\t" +
+                                 ",".join(f"{key}={value}" for key, value in meta.items()) + "\n")
+        return created, delivery_ids
+
+    def _resolve_success_batch(self, seed, now_ns=None):
+        from types import SimpleNamespace
+        with mock.patch("dispatch_attempt_policy.committed_outcome", return_value="succeeded"), \
+             mock.patch("dispatch_contract.observed_attempt_liveness",
+                        return_value=SimpleNamespace(state="terminal")):
+            return notice.resolve_delivery_batch(self.jobs, seed, recipient_key="parent",
+                                                 delivery_root=self.root, now_ns=now_ns)
+
+    def test_resolver_excludes_acknowledged_sibling_from_sequential_continuation(self):
+        records, ids = self._success_batch_fixture()
+        prior = pending.claim(self.root, "parent", ids[1], claim_owner="prior", lease_seconds=30)
+        pending.ack(self.root, "parent", ids[1], acked_by="prior-recipient")
+        batch = self._resolve_success_batch(records[0])
+        self.assertEqual(batch["delivery_ids"], (ids[0],))
+        self.assertFalse(batch["held"])
+
+    def test_missing_materialization_holds_only_for_wall_clock_grace(self):
+        records, ids = self._success_batch_fixture(materialize_sibling=False)
+        lines = self.jobs.read_text().splitlines()
+        now = time.monotonic_ns()
+        fields = lines[1].split("\t")
+        for age, expected in ((899, True), (901, False)):
+            metadata = fields[5].split(",")
+            fields[5] = ",".join(
+                "delivery_intent_at_ns=" + str(now - age * 1_000_000_000)
+                if part.startswith("delivery_intent_at_ns=") else part
+                for part in metadata)
+            self.jobs.write_text(lines[0] + "\n" + "\t".join(fields) + "\n")
+            seed = records[0]
+            batch = self._resolve_success_batch(seed, now_ns=now)
+            self.assertEqual(batch["held"], expected)
+            self.assertEqual(batch["delivery_ids"], (ids[0],))
+        fields = self.jobs.read_text().splitlines()[1].split("\t")
+        fields[5] = ",".join("delivery_intent_at_ns=unreadable" if part.startswith(
+            "delivery_intent_at_ns=") else part for part in fields[5].split(","))
+        self.jobs.write_text(lines[0] + "\n" + "\t".join(fields) + "\n")
+        self.assertFalse(self._resolve_success_batch(records[0], now_ns=now)["held"])
+
+    def test_unreadable_route_binding_fails_open(self):
+        records, _ids = self._success_batch_fixture(materialize_sibling=False)
+        self.path.write_text("{}", encoding="utf-8")
+        self.assertIsNone(self._resolve_success_batch(records[0]))
+
+    def test_unreadable_sibling_record_fails_open_to_seed_delivery(self):
+        records, ids = self._success_batch_fixture()
+        pending.record_path(self.root, "parent", ids[1]).write_text("{broken", encoding="utf-8")
+        batch = self._resolve_success_batch(records[0])
+        self.assertFalse(batch["held"])
+        self.assertEqual(batch["delivery_ids"], (ids[0],))
 
     def test_hyphenated_capability_route_fallback_is_loaded_once(self):
         original_import = builtins.__import__
