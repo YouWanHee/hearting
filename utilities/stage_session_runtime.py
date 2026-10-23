@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -18,6 +19,11 @@ from dispatch_contract import DispatchContractError, validate_attempt_metadata
 from route_authority import declared_subsession as declared  # noqa: F401
 
 STATE_BUCKET = (".runtime", "stage-sessions")
+_BRIEF_PATH_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9._~+*/?{}\[\]!@#$%^&=:-])"
+    r"[A-Za-z0-9._~+*/?{}\[\]!@#$%^&=:-]*"
+    r"/[A-Za-z0-9._~+*/?{}\[\]!@#$%^&=:-]*"
+)
 
 
 def _artifact_fence(args, worktree: Path) -> tuple[list[str], list[str]] | None:
@@ -81,19 +87,23 @@ def _artifact_fence(args, worktree: Path) -> tuple[list[str], list[str]] | None:
         return found
 
     brief = Path(args.phase_brief).read_text(encoding="utf-8")
-    tokens = []
-    for token in brief.split():
-        token = token.strip("`_\"'([{ ")
-        token = token.rstrip("`.,;:!?)]}\"'")
-        if token.startswith("**") and token.endswith("**"):
-            token = token[2:-2]
-        if "/" in token and not token.startswith(("http://", "https://")):
-            tokens.append(token)
+    tokens = [match.group(0).rstrip(".") for match in _BRIEF_PATH_TOKEN.finditer(brief)]
     outputs = exact_outputs(tokens)
     declared_outputs = exact_outputs(args.fixed_file)
     effective = outputs | declared_outputs
     if not effective:
         effective = exact_outputs(scope.outputs)
+    if not effective:
+        # With no concrete brief or output paths, carry the node's declared
+        # artifact write patterns into the ledger as bounded directory fences.
+        effective = {
+            str(output_dir / value)
+            for value in artifact_scopes
+            if (not artifact_context.is_semantic_output(value)
+                and not value.endswith("/")
+                and (value.endswith("/**")
+                     or not any(char in value for char in "*?[]<>{}")))
+        }
     effective = sorted(effective)
     readonly = sorted(set(args.fixed_file) - declared_outputs)
     return effective, readonly
@@ -196,7 +206,12 @@ def bind(args: argparse.Namespace, *, artifact_root: str | Path, action: str) ->
     args.fixed_files_sha256 = _sha_files(args.fixed_file)
     args.narrow_verify_sha256 = _sha_text(args.narrow_verify)
     args.phase_brief_sha256 = hashlib.sha256(phase_brief.read_bytes()).hexdigest()
-    fence = _artifact_fence(args, worktree)
+    try:
+        fence = _artifact_fence(args, worktree)
+    except (OSError, ValueError, KeyError, TypeError, DispatchContractError):
+        # Fence derivation is optional. Preserve the pre-existing declared-file
+        # behavior if route loading or its scope resolver cannot complete.
+        fence = None
     args.effective_fixed_files, args.readonly_input_files = fence or (args.fixed_file, [])
     axes = {
         "attempt_schema_version": 2,

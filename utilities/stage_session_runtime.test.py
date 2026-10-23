@@ -149,11 +149,12 @@ class StageSessionStateDirTests(unittest.TestCase):
             runtime.bind(args, artifact_root=self.root, action=action)
 
     def test_artifact_only_fence_uses_brief_outputs_and_keeps_declaration_identity(self):
-        brief = ("Outputs: `reviews/claims/voter3.json`, reviews/claims/voter3-evidence.md, "
-                 "reviews/claims/voter3-handoff.md and reviews/claim-verdict.json. "
-                 "Scope reviews/claims/**. Do not read reviews/claims/claim-verify.md. "
-                 "Ignore reports/other.md, ../escape.json, https://example.test/out.json, "
-                 "reviews/claims/voter*.json, reviews/claims/, and reviews/claims/<filename>.md.\n")
+        brief = ("사건 문장: `reviews/claims/voter3.json`, `reviews/claims/voter3-evidence.md`, "
+                 "`reviews/claims/voter3-handoff.md`를 기록한다. `reviews/claim-verdict.json을` "
+                 "확인하고 읽지 말 경로는 `reviews/claims/claim-verify.md·x/voter1-*를` 포함한다. "
+                 "연결 경로 a/b.json·reviews/claims/**, glob reviews/claims/voter*.json, "
+                 "디렉터리 reviews/claims/, URL https://example.test/out.json, "
+                 "범위 밖 reports/other.md, ../escape.json, placeholder reviews/claims/<filename>.md.\n")
         args, route, cycle, output_dir = self._artifact_args(brief_text=brief)
         declarations = sorted(str((self.worktree / name).resolve()) for name in [
             "pyproject.toml", "sr_corrnet_sd/diar.py", "sr_corrnet_sd/paths.py", "uv.lock"])
@@ -214,11 +215,14 @@ class StageSessionStateDirTests(unittest.TestCase):
                 self._bind_artifact(args, route, cycle, output_dir)
                 self.assertEqual(args.effective_fixed_files, args.fixed_file)
 
-    def test_unbound_and_nonconcrete_outputs_keep_their_existing_fence(self):
+    def test_nonconcrete_outputs_fall_back_to_declared_scope_and_unbound_keeps_declarations(self):
         args, route, cycle, output_dir = self._artifact_args(brief_text="Only reviews/claims/** is named.\n",
                                                               outputs=["reviews/claims/**", "revised-artifact"])
         self._bind_artifact(args, route, cycle, output_dir)
-        self.assertEqual(args.effective_fixed_files, [])
+        self.assertEqual(args.effective_fixed_files, sorted([
+            str(output_dir / "reviews/claims/**"),
+            str(output_dir / "reviews/claim-verdict.json"),
+        ]))
         import artifact_producer
         args, route, cycle, output_dir = self._artifact_args()
         with mock.patch.dict("os.environ", {}, clear=True), \
@@ -226,6 +230,52 @@ class StageSessionStateDirTests(unittest.TestCase):
              mock.patch.object(artifact_producer, "route_cycle_for", return_value=None):
             runtime.bind(args, artifact_root=self.root, action="dry-run")
         self.assertEqual(args.effective_fixed_files, args.fixed_file)
+
+    def test_glob_only_artifact_fallback_is_a_component_bounded_ledger_fence(self):
+        args, route, cycle, output_dir = self._artifact_args(
+            brief_text="이 노드 범위: reviews/claims/**만 다룬다.\n",
+            outputs=["reviews/claims/**"],
+            scope=["reviews/claims/**"],
+        )
+        self._bind_artifact(args, route, cycle, output_dir, action="start")
+        pattern = str(output_dir / "reviews/claims/**")
+        self.assertEqual(args.effective_fixed_files, [pattern])
+
+        def check(candidate):
+            return subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("worker-state-ledger.py")),
+                 "check", "--path", args.state_ledger, "--attempt-id", args.attempt_id,
+                 "--file", str(candidate)], text=True, capture_output=True,
+            )
+
+        self.assertEqual(check(output_dir / "reviews/claims/new-evidence.md").returncode, 0)
+        foreign = check(output_dir / "reviews/claims-foreign/new-evidence.md")
+        self.assertEqual(foreign.returncode, 65)
+        self.assertIn("file-outside-fixed-list", foreign.stderr)
+        source = check(self.worktree / "pyproject.toml")
+        self.assertEqual(source.returncode, 65)
+        self.assertIn("file-outside-fixed-list", source.stderr)
+
+    def test_route_derivation_failures_fall_back_to_declared_files(self):
+        for failure in ("missing", "malformed", "resolver"):
+            with self.subTest(failure=failure):
+                args, route, cycle, output_dir = self._artifact_args(brief_text="reviews/claims/item.md\n")
+                declared = sorted(str((self.worktree / name).resolve()) for name in [
+                    "pyproject.toml", "sr_corrnet_sd/diar.py", "sr_corrnet_sd/paths.py", "uv.lock"])
+                if failure == "missing":
+                    args.route_file = str(self.root / "missing-route.json")
+                    self._bind_artifact(args, route, cycle, output_dir, action="start")
+                elif failure == "malformed":
+                    Path(args.route_file).write_text("{broken", encoding="utf-8")
+                    self._bind_artifact(args, route, cycle, output_dir, action="start")
+                else:
+                    import worker_bootstrap
+                    with mock.patch.object(worker_bootstrap, "resolve_node_scope",
+                                           side_effect=ValueError("resolver fixture failure")):
+                        self._bind_artifact(args, route, cycle, output_dir, action="start")
+                self.assertEqual(args.effective_fixed_files, declared)
+                self.assertEqual(args.readonly_input_files, [])
+                self.assertTrue(Path(args.state_ledger).is_file())
 
     def test_declared_artifact_is_merged_before_worktree_readonly_classification(self):
         args, route, cycle, output_dir = self._artifact_args(worktree=self.root)
