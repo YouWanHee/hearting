@@ -4570,6 +4570,18 @@ class SlicesOneCommandTest(unittest.TestCase):
                 rc, out = self.run_slices(self.plan(self.GOOD), extra=extra, env={"AGENT_DISPATCH_ATTEMPT_ID": None})
                 self.assert_single_session(rc, out, "parent-attempt-id-absent", ledger=False)
 
+    def test_non_object_slice_entries_keep_the_typed_fallback(self):
+        for invalid in (None, 42, "not-a-slice"):
+            with self.subTest(invalid=invalid):
+                slices = [invalid, json.loads(self.GOOD)[1]]
+                try:
+                    rc, out = self.run_slices(self.plan(json.dumps(slices)))
+                except AttributeError as exc:
+                    self.fail(f"malformed slice escaped the typed fallback: {exc}")
+                receipt = self.assert_single_session(
+                    rc, out, "subdivision-disjointness-unproven", ledger=True)
+                self.assertIn("plan-slice-invalid:1", receipt["detail"])
+
     def test_slices_gates_on_linked_worktree_falls_back_to_single_session(self):
         linked = self.base / "linked"
         self.git("worktree", "add", "-q", "-b", "linked-s", str(linked), cwd=self.primary)

@@ -626,6 +626,7 @@ def slice_chain_id(route_id: str, node_id: str, slices: list[dict[str, Any]],
         owner_attempt_id = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
     fixed_files = [
         sorted(map(str, item.get("files", item.get("fixed_files")) or []))
+        if isinstance(item, dict) else []
         for item in slices
     ]
     seed_parts = [route_id, node_id, fixed_files]
