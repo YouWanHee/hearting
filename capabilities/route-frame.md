@@ -25,6 +25,11 @@ A framed route is sealed at intensity `standard`. With no intensity it runs two 
 
 Two legs never read each other's brief. The terminal depends on every frame leg and carries the one `frame-review` human gate at its entry. There is no owner node and no owner launch.
 
+An owner pin applies only to the owner, not to frame legs; automatically
+selected two-leg frames prefer different harnesses, using one harness only
+when it is the only usable family or the person explicitly pins the frame,
+with that reason shown on the card.
+
 ## What the runtime does
 
 1. Before `start` launches the frame legs as separate registrations, it prepares

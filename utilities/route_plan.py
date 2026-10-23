@@ -103,18 +103,18 @@ def frame_leg_decision(given_intensity, request_text="", routing_hints=None):
     if given_intensity not in {"direct", "quick", "standard", "strong", "thorough", "adversarial"}:
         raise ValueError("invalid intensity")
     if given_intensity not in {"direct", "quick"}:
-        return 2, "explicit", f"호출자 표시 --intensity {given_intensity}"
+        return 2, "explicit", f"--intensity {given_intensity} 표시"
     text = str(request_text or "")
     match = _FRAME_PATH.search(text)
     if match:
-        reason = "경로 " + re.sub(r"[`\n\r]+", "", match.group(0))[:72]
-        return 2, "automatic", f"--intensity {given_intensity}이지만 {reason}"
+        reason = re.sub(r"[`\n\r]+", "", match.group(0))[:72]
+        return 2, "automatic", f"자동 지킴: --intensity {given_intensity}이지만 과제에 {reason}"
     adapters = list(dict.fromkeys(_ADAPTER_PATH.findall(text)))
     if len(adapters) >= 2:
-        return 2, "automatic", f"--intensity {given_intensity}이지만 여러 어댑터 경로"
+        return 2, "automatic", f"자동 지킴: --intensity {given_intensity}이지만 과제에 어댑터 둘 이상"
     hints = routing_hints or {}
     if hints.get("capability") in {"autopilot-spec", "autopilot-ship"}:
-        return 2, "automatic", f"--intensity {given_intensity}이지만 {hints['capability']} 경로"
+        return 2, "automatic", f"자동 지킴: --intensity {given_intensity}이지만 과제에 {hints['capability']} 작업"
     return 1, "explicit", f"간단 표시 --intensity {given_intensity}"
 
 

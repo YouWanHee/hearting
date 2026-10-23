@@ -4894,18 +4894,24 @@ def compose_decision_lines(route):
     if shape == "framed":
         frame_basis = basis.get("frame-legs")
         if frame_basis:
-            size += f"; frame {frame_basis.get('signal')}갈래({frame_basis.get('source')}: {frame_basis.get('reason')})"
+            count = frame_basis.get("signal")
+            source = frame_basis.get("source")
+            reason = frame_basis.get("reason")
+            label = "기본" if source == "default" else reason
+            size_word = "한" if str(count) == "1" else "두"
+            size += f"; frame {size_word} 갈래({label})"
         else:
             count = len(RP.frame_legs(route))
-            size += f"; frame {count}갈래(이전 규칙으로 봉인, 출처 미기록)"
+            size_word = "한" if count == 1 else "두"
+            size += f"; frame {size_word} 갈래(이전 규칙으로 만든 경로)"
         tuples = ((route.get("dispatch_evidence") or {}).get("tuples") or [])
         supported = {row.get("child_harness") for row in tuples
                      if row.get("status") == "supported" and row.get("child_harness")}
         pin = (((route.get("selection_pins") or {}).get("frame") or {}).get("harness"))
         if len(supported) == 1:
-            size += f" (같은 하네스: 쓸 수 있는 하네스 {next(iter(supported))} 하나)"
+            size += f" · 같은 하네스(쓸 수 있는 하네스가 {next(iter(supported))} 하나)"
         elif pin and pin in supported:
-            size += f" (같은 하네스: 명시 frame 지정 {pin})"
+            size += f" · 같은 하네스(frame 지정 {pin})"
     lines.append(size)
     for row in ((route.get("composed_recipe") or {}).get("compose") or {}).get("auto_completed_nodes", []):
         purpose = "owner closing summary" if row["reason"] == "terminal-anchor" else "registry consumer"

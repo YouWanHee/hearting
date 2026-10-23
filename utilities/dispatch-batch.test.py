@@ -3522,6 +3522,70 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertIn("subdivision-manifest-session-count-mismatch", out)
 
 
+class CompiledStrongGroupPlacementTest(unittest.TestCase):
+    def test_compiled_strong_width_two_groups_choose_distinct_harnesses(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            repo = base / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "fixture@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
+            (repo / "README.md").write_text("compiled strong route\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+
+            artifact_root = base / ".agent_reports"
+            artifact_root.mkdir()
+            jobs = base / "jobs.log"
+            evidence_path = base / "dispatch-evidence.json"
+            evidence_path.write_text(json.dumps({
+                "tuples": [
+                    {
+                        "parent_harness": "codex", "parent_transport": "headless",
+                        "parent_sandbox": "workspace-write", "child_harness": child,
+                        "launch_authority": "conductor", "status": "supported",
+                        "probe_source": "integration-fixture", "probe_time": "2026-07-24T00:00:00Z",
+                        "failure_class": "", "checked_worktree": str(repo.resolve()),
+                        "failure_scope": "none",
+                        "codex_command": "ok" if child == "codex" else "not-applicable",
+                        "retry_on_isolated_worktree": 0,
+                    }
+                    for child in ("codex", "claude", "opencode")
+                ],
+                "native_subagent": [],
+            }, sort_keys=True), encoding="utf-8")
+            env = {
+                **{key: value for key, value in os.environ.items()
+                   if not key.startswith(("AGENT_DISPATCH_", "AGENT_OWNER_ROUTE_", "AGENT_ROUTE_", "AGENT_ARTIFACT_"))},
+                "AGENT_HOME": str(ROOT), "AGENT_DISPATCH_JOBS": str(jobs),
+            }
+            compiled = subprocess.run([
+                sys.executable, str(ROOT / "utilities" / "capability-route.py"),
+                "compile", "--slug", "strong-placement", "--capability", "autopilot-code",
+                "--capability-mode", "dev", "--intensity", "strong", "--cwd", str(repo),
+                "--artifact-root", str(artifact_root), "--signal", "shared-contract",
+                "--transport", "headless", "--tracking", "tracked",
+                "--dispatch-evidence", str(evidence_path), "--spec-read", "integration-fixture",
+                "--drift-verdict", "within-spec", "--workflow-mode", "tracked",
+                "--artifact-guard", "integration-fixture",
+            ], text=True, capture_output=True, check=False, env=env)
+            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+            route = json.loads(compiled.stdout)
+            parent = {
+                "parent_harness": "codex", "parent_transport": "headless",
+                "parent_sandbox": "workspace-write",
+            }
+            for group in ("plan", "plan-check", "impl-review"):
+                nodes = [node for node in route["nodes"]
+                         if (node.get("parallel_group") or node.get("replica_group")) == group]
+                self.assertEqual(len(nodes), 2, group)
+                assignments, _independence, _diagnostics = BATCH.assign_harnesses(
+                    route, nodes, allow_degraded=False, parent_identity=parent,
+                )
+                self.assertEqual(len({row[1] for row in assignments}), 2, group)
+
+
 class DispatchBatchIntegrationTest(unittest.TestCase):
     """Exercise the full checked two-way launch path with local fake CLIs."""
 

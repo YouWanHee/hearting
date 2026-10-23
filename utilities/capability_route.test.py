@@ -7492,11 +7492,11 @@ class ComposeRouteTest(TestRoute):
   one["dispatch_evidence"]["tuples"] = one["dispatch_evidence"]["tuples"][:1]
   one["dispatch_evidence"]["tuples"][0]["child_harness"] = "claude"
   one_line = "\n".join(R.compose_decision_lines(one))
-  self.assertIn("같은 하네스: 쓸 수 있는 하네스 claude 하나", one_line)
+  self.assertIn("같은 하네스(쓸 수 있는 하네스가 claude 하나)", one_line)
   supported_pin = copy.deepcopy(route)
   supported_pin["selection_pins"] = {"contract_version": 1,
       "frame": {"harness": "codex", "model": None, "effort": None}}
-  self.assertIn("같은 하네스: 명시 frame 지정 codex",
+  self.assertIn("같은 하네스(frame 지정 codex)",
                 "\n".join(R.compose_decision_lines(supported_pin)))
   unsupported_pin = copy.deepcopy(route)
   unsupported_pin["selection_pins"] = {"contract_version": 1,
