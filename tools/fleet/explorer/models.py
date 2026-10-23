@@ -1,10 +1,22 @@
 """Read-only model configuration view and viewer-local selection controls."""
 from collections.abc import Mapping
 
-from .grid import CellGrid
+from .grid import CellGrid, cell_width
 
 X = 34
 GAP = 3
+
+
+def _cut(text, width):
+    """``text`` cut to ``width`` cells (no ellipsis): the part that would be drawn off the screen is not asked for."""
+    used, out = 0, []
+    for char in str(text):
+        w = cell_width(char)
+        if used + w > width:
+            break
+        out.append(char)
+        used += w
+    return "".join(out)
 
 
 def _dict(value):
@@ -23,7 +35,7 @@ def _section(grid, x, width, y, title, meta=""):
     cursor = grid.put(x, y, "── ", "line")
     cursor = grid.put(cursor, y, title, "head")
     if meta:
-        cursor = grid.put(cursor, y, "  " + meta, "dim")
+        cursor = grid.put(cursor, y, _cut("  " + meta, grid.cols - cursor), "dim")
     grid.put(cursor, y, " ", "branch_s")
     for col in range(cursor + 1, min(grid.cols, x + width + 1)):
         grid.put(col, y, "─", "dim")
@@ -146,11 +158,18 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
     slim = grid.cols - x - 2 < 150
     pool_width = 0 if slim else 44
     c_claude = 19
+    # Under ~90 cells the three harness columns do not fit: one column shows the picked harness and
+    # the harness names above it pick another.
+    one_column = grid.cols - x - 2 < 90
     col_width = max(16, min(30, (grid.cols - x - 2 - c_claude - pool_width - 15) // 3))
     columns = {"claude": c_claude, "codex": c_claude + col_width + GAP,
                "opencode": c_claude + 2 * (col_width + GAP)}
     pool_col = columns["opencode"] + col_width + 6 + GAP
     left = min(grid.cols - x - 2, pool_col + pool_width)
+    if one_column:
+        col_width = max(8, grid.cols - x - 2 - c_claude - 1)
+        columns = {harness: c_claude}
+        left = grid.cols - x - 2
     right = x + left
     cursor = grid.put(x, y, "── ", "line")
     cursor = grid.put(cursor, y, "MODEL PROFILE", "head")
@@ -160,22 +179,33 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
         grid.put(col, y, "─", "line")
     y += 1
     grid.fill(x, right + 1, y, " ", tint=234)
-    for col, name in ((3, "PROFILE"), (columns["claude"], "CLAUDE"),
-                      (columns["codex"], "CODEX"), (columns["opencode"], "OPENCODE")):
-        grid.put(x + col, y, name, "head", tint=234, limit=right)
+    if one_column:
+        grid.put(x + 3, y, "PROFILE", "head", tint=234, limit=right)
+        tab_x = x + c_claude
+        for name in ("claude", "codex", "opencode"):
+            tab_end = grid.put(tab_x, y, name.upper(), "hb_" + name if name == harness else "head",
+                               tint=234, limit=right)
+            grid.add_hit(y, tab_x - 1, tab_end + 1, ("ui", "sel", f"{profile}/{name}"))
+            tab_x = tab_end + 2
+    else:
+        for col, name in ((3, "PROFILE"), (columns["claude"], "CLAUDE"),
+                          (columns["codex"], "CODEX"), (columns["opencode"], "OPENCODE")):
+            grid.put(x + col, y, name, "head", tint=234, limit=right)
     if not slim:
         grid.put(x + pool_col, y, "DISPATCH POOL", "head", tint=234, limit=right)
     y += 1
     for prof in profiles:
         grid.put(x + 3, y, prof, "soft" if prof != "top" else "dim")
         for h, col in columns.items():
+            h = harness if one_column else h
             current = _dict(profile_map.get(h)).get(prof)
             hit_left, hit_right = x + col - 1, min(right, x + col + col_width)
             grid.add_hit(y, hit_left, hit_right, ("ui", "sel", f"{prof}/{h}"))
             if (prof, h) == (profile, harness):
                 grid.fill(hit_left, min(right, hit_right + 1), y, " ", tint=236)
                 grid.put(x + col - 2, y, "▶", "soft")
-            _model_cell(grid, x + col, y, h, current, shown, effort_keys, col_width + (6 if h == "opencode" else 0))
+            _model_cell(grid, x + col, y, h, current, shown, effort_keys,
+                        col_width + (6 if h == "opencode" and not one_column else 0))
             if (prof, h) == (profile, harness):
                 for tint_x in range(max(0, hit_left), min(grid.cols, hit_right + 1)):
                     glyph, key, _tint = grid.cells[y][tint_x]
@@ -195,7 +225,10 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
             else:
                 grid.put(x + pool_col, y, "route-sealed explicit choice only", "dim", limit=right)
         y += 1
-    grid.put(x + 3, y, "main session only, never dispatched:  claude Fable 5.1  ·  codex gpt-6-astra", "dim", limit=right)
+    main_only = _dict(data.get("main_only"))
+    if main_only:
+        names = "  ·  ".join(f"{name} {shown.get(model, model)}" for name, model in main_only.items())
+        grid.put(x + 3, y, "main session only, never dispatched:  " + names, "dim", limit=right)
     y += 2
     current = _dict(profile_map.get(harness)).get(profile)
     model_choice = values.get("ui:model")
@@ -234,12 +267,16 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
     _chips(grid, box_left + 12, y + 4, effort_options, current_effort, values.get("ui:effort"), "effort", right - 2)
     command = f"hearting model set {harness} profile/{profile} {model_choice}@{effort_choice}"
     grid.put(box_left + 3, y + 6, "$ ", "line")
-    cursor = grid.put(box_left + 5, y + 6, command, "soft" if changed else "dim")
+    edge = right - 1 if one_column else grid.cols
+    cursor = grid.put(box_left + 5, y + 6, _cut(command, edge - (box_left + 5)), "soft" if changed else "dim")
     if changed:
-        cursor = grid.put(cursor + 3, y + 6, "[ dry-run ]", "title_dim")
-        grid.add_hit(y + 6, cursor - 11, cursor, ("ui", "apply", "dry-run: " + command + " --dry-run (시안이라 실행 안 함)"))
-        cursor = grid.put(cursor + 2, y + 6, "[ apply ]", "chip_on")
-        grid.add_hit(y + 6, cursor - 9, cursor, ("ui", "apply", "적용: " + command + " (시안이라 실행 안 함)"))
+        # the two buttons follow the command, or take the free row above it when it does not fit
+        buttons_y = y + 6 if cursor + 3 + 11 + 2 + 9 < edge else y + 5
+        cursor = cursor + 3 if buttons_y == y + 6 else box_left + 5
+        cursor = grid.put(cursor, buttons_y, "[ dry-run ]", "title_dim", limit=edge)
+        grid.add_hit(buttons_y, cursor - 11, cursor, ("ui", "apply", "dry-run: " + command + " --dry-run (시안이라 실행 안 함)"))
+        cursor = grid.put(cursor + 2, buttons_y, "[ apply ]", "chip_on", limit=edge)
+        grid.add_hit(buttons_y, cursor - 9, cursor, ("ui", "apply", "적용: " + command + " (시안이라 실행 안 함)"))
     y += 10
     if slim:
         grid.put(box_left + 3, box_top + 7, "pool", "label")
@@ -267,7 +304,8 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
         grid.put(x + 3, y, label, "dim")
         cursor = x + 20
         for fragment, key in fragments:
-            cursor = grid.put(cursor, y, fragment, "branch_s" if fragment.isspace() else key)
+            cursor = grid.put(cursor, y, _cut(fragment, grid.cols - cursor),
+                              "branch_s" if fragment.isspace() else key)
         y += 1
     if allocation:
         grid.put(x + 3, y, allocation.get("note", "·"), "dim", limit=right)

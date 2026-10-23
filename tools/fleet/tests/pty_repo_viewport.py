@@ -803,10 +803,12 @@ class PtyRun:
         start_reducers = len(self.read_jsonl("effects.jsonl"))
         self.send(b"\tu", "batched-tab-usage")
         batched = self.wait_for("both batched keys reach the input loop",
-                                lambda _s: len([row for row in self.read_events()[start_index:]
-                                                if row.get("kind") == "decoded-key-read"
-                                                and row.get("key") in ("tab", "u")]) >= 2 and
-                                len(self.read_jsonl("effects.jsonl")) >= start_reducers + 2)
+                                lambda s: len([row for row in self.read_events()[start_index:]
+                                               if row.get("kind") == "decoded-key-read"
+                                               and row.get("key") in ("tab", "u")]) >= 2 and
+                                len(self.read_jsonl("effects.jsonl")) >= start_reducers + 2 and
+                                s.get("explorer", {}).get("state", {}).get("usage_open")
+                                != initial["usage_open"])
         keys = [row.get("key") for row in self.read_events()[start_index:]
                 if row.get("kind") == "decoded-key-read"]
         self.check("batched tab and usage keys preserve order", keys[:2] == ["tab", "u"], keys)
@@ -917,6 +919,32 @@ class PtyRun:
                    {"wheel_back": rawoff(back), "wheel_forward": rawoff(forward),
                     "drag": rawoff(dragged), "drag_more": rawoff(further),
                     "after_release": rawoff(self.state())})
+
+        # Clipped content: this page is longer than the pane, so what falls below the pane rule is
+        # cut and the feed, key and status lines own those rows. A click there has no hit, no effect
+        # and changes no state.
+        settled = self.state()
+        height = settled["size"][0]
+        pane_x = strip[1] + 6
+        clipped = [("pane rule / overflow marker", pane_x, height - 4), ("feed line", pane_x, height - 3),
+                   ("key line", 10, height - 2), ("status line", 10, height - 1)]
+        covered = [name for name, x, y in clipped
+                   if any(hit[0] == y and hit[1] <= x < hit[2] for hit in settled["explorer"]["hits"])]
+        self.check("nothing is clickable on the rows below the pane", covered == [], covered)
+        def requested():
+            return [row for row in self.read_jsonl("effects.jsonl") if row.get("effects")]
+        effects_before = len(requested())
+        frames_before = settled["frame"]
+        for name, x, y in clipped:
+            self.send(b"\x1b[<0;%d;%dM\x1b[<0;%d;%dm" % (x + 1, y + 1, x + 1, y + 1),
+                      "explorer-click-clipped-" + name.split()[0])
+        self.drain(0.5)
+        after = self.state()
+        self.check("a click on clipped content changes no state and requests no effect",
+                   after["explorer"]["state"] == settled["explorer"]["state"] and
+                   len(requested()) == effects_before,
+                   {"before": settled["explorer"]["state"], "after": after["explorer"]["state"],
+                    "frames": [frames_before, after["frame"]]})
 
     def read_jsonl(self, name):
         try:

@@ -352,7 +352,8 @@ def _fixture_values(renderer):
         "hosts": hosts, "usage": usage, "census": {},
         "repos": projects, "sessions": sessions, "routes": routes,
         "nodes": _jsonable(_scrub(renderer.ROUTE_NODES, renderer.width)),
-        "attempts": _jsonable(_redact_blob(getattr(renderer, "_RAW", {}), renderer.width)),
+        # The reference draws one owner's raw output, on the f5 route page: the record names it.
+        "attempts": {**_jsonable(_redact_blob(getattr(renderer, "_RAW", {}), renderer.width)), "route": "f5"},
         "questions": _scrub(renderer.mock4.QUESTIONS, renderer.width),
         "answered": _safe_answered(renderer.mock4.ANSWERED, renderer.width),
         "seats": seats,
@@ -410,7 +411,8 @@ def _fixture_values(renderer):
                 ["cnn", 0, "python", 20.2, "3d 16h"],
                 ["moving4", 1, "python", 19.7, "19h"],
                 ["mpwav", 0, "python", 19.7, "3h"]],
-            "unregistered_gpu_summary": {"count": 11, "remaining": 7},
+            "unregistered_gpu_summary": {"count": 11, "remaining": 7, "owner": "a3"},
+            "obligations": [{"tag": "a3", "text": "↻ pending msg 1", "age": "4d old"}],
         },
         "events": [list(item[:-1]) + [_same_width(str(item[-1]), renderer.width)]
                    for item in renderer.mock3.FEED],
@@ -847,7 +849,11 @@ def build(reference: Path, output: Path) -> dict:
                 "--check with the external approved reference directory re-verifies provenance using "
                 "the input hashes in manifest.json. The reference renderer and PNGs are intentionally "
                 "external; no private absolute path is stored here. default-once.json is captured "
-                "separately from the archived base CLI."
+                "separately from the archived base CLI.\n\n"
+                "The `attempts` record carries the route it belongs to (`route`: f5). The reference draws "
+                "one owner's raw output, on that route's page; the live builder names the route of the "
+                "owner output the selection reader returned, so a route page never shows another "
+                "route's lines."
             ),
         },
     }

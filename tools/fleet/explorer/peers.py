@@ -1,13 +1,12 @@
 """Peer graph and filtered LINKS list."""
 
-from .tables import _clip, _tint_row
+from .tables import _clip, _tint_row, repo_rule_label
 
 
 def draw_peers(grid, vm, state, x=34, y=3):
     use = max(0, grid.cols - x - 2)
     right, bottom = x + use + 1, grid.rows - 4
     grid.fill(x, grid.cols - 1, y, " ", tint=234)
-    grid.put(1, y, "PEERS", "head", tint=236)
     grid.put(x - 2, y, "┃", "line")
     y += 1
     nodes = tuple(vm.peer_nodes or ())
@@ -29,7 +28,7 @@ def draw_peers(grid, vm, state, x=34, y=3):
         if by + box_height >= bottom - 2:
             break
         box_right = min(right, bx + box_width)
-        name = _clip(str(repo) + "/", max(0, box_width - 7))
+        name = _clip(repo_rule_label(repo), max(0, box_width - 7))
         grid.put(bx, by, "┌─ " + name + " " + "─" * max(0, box_width - len(name) - 5) + "┐", "line", limit=box_right)
         for row, tag in enumerate(sessions, 1):
             yy = by + row

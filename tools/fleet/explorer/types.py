@@ -49,6 +49,7 @@ class FocusRequest:
     epoch: int
     snapshot_generation: int
     expanded_sessions: Tuple[str, ...] = ()
+    wants: Tuple[str, ...] = ()        # extra bounded reads for what is open: seat, pane, cards, dialogue:<i>, raw:<route>
 
 
 @dataclass(frozen=True)
@@ -86,3 +87,18 @@ class SelectionReader:
                            events=tuple(result.get("events", ())),
                            health=Health("success"),
                            source_records=result.get("source_records", {}))
+
+
+@dataclass(frozen=True)
+class ExplorerDetail:
+    """What the explorer feed hands the view-model builder: the newest accepted read of each kind.
+
+    ``focus`` is the selected session's result; ``seats`` maps ``harness:sid`` to that session's seat
+    history (the list views), ``panes`` maps a session id to its herdr pane, ``config`` is the cached
+    model/dispatch observation. Every part is the
+    last good value; a part that was never read stays ``None``/empty.
+    """
+    focus: Optional[FocusResult] = None
+    seats: Mapping[str, Any] = field(default_factory=dict, compare=False)
+    config: Optional[Mapping[str, Any]] = field(default=None, compare=False)
+    panes: Mapping[str, str] = field(default_factory=dict, compare=False)

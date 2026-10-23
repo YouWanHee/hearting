@@ -1,7 +1,7 @@
 """Seat and generation list for the HISTORY view."""
 
 from collections.abc import Mapping
-from .tables import _clip, _tint_row
+from .tables import _clip, _tint_row, repo_label, repo_rule_label
 
 
 def draw_history(grid, vm, state, x=34, y=3):
@@ -16,6 +16,7 @@ def draw_history(grid, vm, state, x=34, y=3):
     c_h, c_gen = c_id + 4 + 3, c_id + 4 + 3 + 8 + 3
     gen_width = min(24, max((len((vm.generations or {}).get(str(seat[0]), ())) for seat in seats), default=0),
                     max(8, use - c_gen - 3 - 3 - 14 - 3 - 16))
+    gen_width = max(gen_width, len("GENERATIONS"))
     c_last = c_gen + 3 + gen_width + 3
     c_card = c_last + 14 + 3
     for off, label in ((2, "REPO"), (c_id, "ID"), (c_h, "HARNESS"), (c_gen, "GENERATIONS"),
@@ -38,7 +39,7 @@ def draw_history(grid, vm, state, x=34, y=3):
             grid.fill(x - 1, right, y, " ", tint=236)
             grid.put(x, y, "▶", "soft")
         if repo != previous_repo:
-            grid.put(x + 2, y, _clip(repo + "/", 13), "title_dim")
+            grid.put(x + 2, y, repo_rule_label(repo, 13), "title_dim")
             previous_repo = repo
         session = next((item for item in vm.sessions if item.get("tag") == tag), {})
         harness = str(session.get("harness") or "·")
@@ -91,8 +92,11 @@ def draw_seat_expand(grid, vm, state, tag, x, use, y, bottom, seat, harness):
         count = int(seat[2]) if len(seat) > 2 else 0
         last_clear = str(seat[3] if len(seat) > 3 else "·").split(" · ")[0]
         cursor = grid.put(x0, y, f"{count} generations", "soft", limit=x + use + 1)
-        grid.put(cursor, y, f"  · last clear {last_clear}   22:53 전에 남은 카드 본문이 없습니다.",
-                 "dim", limit=x + use + 1)
+        usage = (vm.system or {}).get("usage_api") if isinstance(vm.system, Mapping) else None
+        stamp = usage.get("freshness") if isinstance(usage, Mapping) else None
+        note = f"{stamp} 전에 남은 카드 본문이 없습니다." if stamp else "읽은 카드 본문이 없습니다."
+        grid.put(cursor, y, _clip(f"  · last clear {last_clear}   {note}", max(0, x + use - cursor)), "dim",
+                 limit=x + use + 1)
         return y + 1
     right = x + use + 1
     selected_generation = state.opened_for("ui:gen:" + tag)
@@ -125,9 +129,14 @@ def draw_seat_expand(grid, vm, state, tag, x, use, y, bottom, seat, harness):
         grid.put(x0 + 20, y, {"new": "●", "cont": "○", "existing": "◆"}.get(kind, "●"), (hue, 1, 0))
         cursor = grid.put(x0 + 22, y, h, "hb_" + h)
         grid.put(cursor + 1, y, sid, "dim")
-        grid.put(x0 + 42, y, _clip(connection, 30), "blocked" if kind == "existing" else "dim")
-        grid.put(x0 + 75, y, _clip(title, max(0, use - 75 - 6)),
-                 "soft" if isinstance(gen, Mapping) and gen.get("card") else "dim", limit=right)
+        # A narrow pane has no room for both: the card title takes the connection's place.
+        wide = right - x0 >= 75 + 12
+        if wide:
+            grid.put(x0 + 42, y, _clip(connection, 30), "blocked" if kind == "existing" else "dim")
+        title_x = x0 + (75 if wide else 42)
+        if title_x < right - 1:
+            grid.put(title_x, y, _clip(title, max(0, (use - 75 - 6) if wide else right - title_x - 1)),
+                     "soft" if isinstance(gen, Mapping) and gen.get("card") else "dim", limit=right)
         if index == selected:
             _tint_row(grid, y, x0 - 1, right, 234)
         y += 1
@@ -151,11 +160,12 @@ def _draw_history_compact(grid, vm, state, x, y, use, right, bottom):
             return
         tag, repo = str(seat[0]), str(seat[1])
         if repo != last_repo:
-            grid.put(x + 1, y, "┈ ", "line")
-            end = grid.put(x + 3, y, repo + "/", "title_dim")
-            for xx in range(end + 1, right):
-                grid.put(xx, y, "┈", "line")
-            y += 1
+            if repo_label(repo):
+                grid.put(x + 1, y, "┈ ", "line")
+                end = grid.put(x + 3, y, repo + "/", "title_dim")
+                for xx in range(end + 1, right):
+                    grid.put(xx, y, "┈", "line")
+                y += 1
             last_repo = repo
         selected = opened == tag
         action = ("fold", "hopen:" + state.view, tag)

@@ -6646,6 +6646,7 @@ _EXPLORER_FRAME = None
 _EXPLORER_NAV_ROWS = ()
 _EXPLORER_ALL_ROWS = ()      # every navigation row, folded or not: the s/x target map is built from these
 _EXPLORER_RESULT = None      # the accepted selected-scope result; never one read for another session
+_EXPLORER_MODEL = None       # the view model of the last frame: it names the session a route page belongs to
 _EXPLORER_ORDER = []         # main-session ids in first-seen order, so the navigation does not reshuffle
 _EXPLORER_SIZE = None
 _EXPLORER_EARLIER = False    # the output pane was scrolled past its first row: read further back once
@@ -6698,6 +6699,8 @@ def _explorer_view(snapshot):
     display = getattr(snapshot, "display_snapshot", None)
     if display is not None and getattr(snapshot, "project_of", None) is None:
         extras["project_of"] = lambda cwd: _project_for_display(cwd, display)
+    if getattr(snapshot, "hearting", None) is None and isinstance(_HEARTING, dict):
+        extras["hearting"] = dict(_HEARTING)         # the install info the default board's header uses
     return _ExplorerView(snapshot, **extras) if extras else snapshot
 
 
@@ -6726,6 +6729,178 @@ def _explorer_targets(nav_rows):
     return targets
 
 
+def _explorer_output_reader():
+    """The raw-output reader of the live view: the shared viewer, with the registry home as its fallback."""
+    from .explorer.output import OutputReader
+    try:
+        from .collectors import dispatch
+        return OutputReader(fallback_home=dispatch._registry_home())
+    except Exception:
+        return OutputReader()
+
+
+_EXPLORER_INTERVALS = {"session": None, "seats": 20.0, "models": 60.0, "panes": 5.0}
+
+
+def _explorer_lite_view(snapshot):
+    """The snapshot with the explorer's pure project resolver and nothing else added (no host work)."""
+    display = getattr(snapshot, "display_snapshot", None)
+    if display is None or getattr(snapshot, "project_of", None) is not None:
+        return snapshot
+    return _ExplorerView(snapshot, project_of=lambda cwd: _project_for_display(cwd, display))
+
+
+def _explorer_requests(snapshot, state, model):
+    """What the open screen needs read, as ``{kind: (FocusKey, expanded refs, wants)}``.
+
+    Only what is open is read: the open session's own seat, cards, visible pane and conversation; an open
+    route's owner output; the seats of the list being looked at; the model configuration on MODELS; and
+    the pane of every session (one cheap list).
+    """
+    from .explorer import live
+    from .explorer.types import FocusKey
+    state = _explorer_state_for(state, 0)
+    snapshot = _explorer_lite_view(snapshot)
+    index = live.session_index(snapshot)
+    kind, _, ident = str(state.scope or "-").partition(":")
+    requests = {"panes": (FocusKey("*", "panes"), (), ())}
+
+    def ref(tag):
+        info = index.get(tag)
+        return f"{info['harness']}:{info['sid']}" if info and info["sid"] else None
+
+    def session_request(tag, wants):
+        info, tag_ref = index.get(tag), ref(tag)
+        if tag_ref:
+            requests["session"] = (FocusKey(info["harness"], info["sid"]), (tag_ref,), tuple(wants))
+
+    def generation_want(tag):
+        picked = state.opened_for("ui:gen:" + tag)
+        return "dialogue:" + (picked if picked.isdigit() else "last")
+
+    if kind == "session":
+        session_request(ident, ("seat", "cards", "pane", generation_want(ident)))
+    elif kind == "route":
+        route = next((r for r in (getattr(_EXPLORER_MODEL, "routes", ()) or ())
+                      if str(r.get("id")) == ident), None)
+        if route is not None and route.get("session_tag"):
+            gathered = live._collect_routes(snapshot).get(ident)
+            owner = live._owner_job(gathered["jobs"]) if gathered else None
+            attempt = getattr(owner, "attempt_id", None) or ""
+            session_request(str(route["session_tag"]), (f"raw:{ident}:{attempt}",))
+    elif kind == "repo":
+        refs = tuple(r for tag, info in index.items() if info["repo"] == ident for r in (ref(tag),) if r)
+        if refs:
+            requests["seats"] = (FocusKey("*", "seats"), refs, ())
+    elif state.view == "HISTORY":
+        refs = tuple(r for tag in index for r in (ref(tag),) if r)
+        if refs:
+            requests["seats"] = (FocusKey("*", "seats"), refs, ())
+        opened = state.opened_for("hopen:HISTORY")
+        if opened:
+            session_request(opened, ("seat", "cards", generation_want(opened)))
+    elif state.view == "MODELS":
+        requests["models"] = (FocusKey("*", "models"), (), ())
+    return requests
+
+
+class _ExplorerFeed:
+    """Viewer state -> the selection pumps. Each kind of read has one single-flight pump; a changed
+    request selects and forces a read, every tick polls, the curses thread never waits. The newest
+    accepted result of each kind stays until a newer one arrives (last good)."""
+
+    def __init__(self, reader, interval):
+        self.reader, self.interval = reader, interval
+        self.pumps, self.selected, self.results, self.marks = {}, {}, {}, {}
+        self.token, self.last = None, None
+
+    @property
+    def pump(self):
+        return self._pump("session")
+
+    def _pump(self, kind):
+        from .explorer.focus import SelectionPump
+        if kind not in self.pumps:
+            self.pumps[kind] = SelectionPump(self.reader, _EXPLORER_INTERVALS[kind] or self.interval)
+        return self.pumps[kind]
+
+    def update(self, state, generation, now_mono, snapshot=None):
+        from .explorer.types import ExplorerDetail
+        requests = _explorer_requests(snapshot, state, _EXPLORER_MODEL) if snapshot is not None else {}
+        for kind in _EXPLORER_INTERVALS:
+            request = requests.get(kind)
+            if request is None:
+                if kind == "session":
+                    self.selected.pop(kind, None)
+                    self.results["session"] = None
+                continue
+            pump = self._pump(kind)
+            if self.selected.get(kind) != request:
+                self.selected[kind] = request
+                key, expanded, wants = request
+                pump.select(key, generation, expanded, wants)
+                pump.request(force=True)
+            else:
+                pump.request_due(now=now_mono)
+            result = pump.poll()
+            if result is not None:
+                self.results[kind] = result
+        token = tuple(self._mark(kind) for kind in _EXPLORER_INTERVALS)
+        changed = token != self.token
+        self.token = token
+        if changed:
+            def records(kind, name, default):
+                result = self.results.get(kind)
+                value = (result.source_records or {}).get(name) if result is not None else None
+                return default if value is None else value
+            self.last = ExplorerDetail(
+                focus=self.results.get("session"), seats=records("seats", "seats", {}),
+                config=records("models", "models", None), panes=records("panes", "panes", {}))
+        return self.last, changed
+
+    def _mark(self, kind):
+        """What identifies the content of a kind's newest result: a read that found the same thing again
+        is not a change (it would drop the click map for nothing)."""
+        result = self.results.get(kind)
+        if result is None:
+            return None
+        known = self.marks.get(kind)
+        if known is None or known[0] is not result:
+            records = result.source_records or {}
+            shown = {name: (dict(value, at=None) if name == "pane_read" and isinstance(value, dict) else value)
+                     for name, value in records.items()
+                     if name in ("seat", "dialogue", "pane_read", "raw", "seats", "models", "panes")}
+            known = self.marks[kind] = (result, hash((result.key, repr(shown), repr(result.events),
+                                                      result.health.state)))
+        return known[1]
+
+    def stop(self):
+        for pump in self.pumps.values():
+            pump.stop()
+
+
+def explorer_read_detail(snapshot, state):
+    """The same reads the live feed would do for ``state``, made one after the other (``--once`` and the
+    capture tool): it asks the reader directly, so the screen shows what the live view shows."""
+    from .explorer.focus import FocusReader
+    from .explorer.types import ExplorerDetail, FocusRequest
+    reader = FocusReader(live_jobs=lambda: list(getattr(snapshot, "jobs", ()) or ()),
+                         snapshot=lambda: snapshot, output_reader=_explorer_output_reader())
+    results = {}
+    for kind, (key, expanded, wants) in _explorer_requests(snapshot, state, _EXPLORER_MODEL).items():
+        try:
+            results[kind] = reader(FocusRequest(key, 1, 0, tuple(expanded), tuple(wants)))
+        except Exception:
+            results[kind] = None
+
+    def records(kind, name, default):
+        result = results.get(kind)
+        value = (result.source_records or {}).get(name) if result is not None else None
+        return default if value is None else value
+    return ExplorerDetail(focus=results.get("session"), seats=records("seats", "seats", {}),
+                          config=records("models", "models", None), panes=records("panes", "panes", {}))
+
+
 def _explorer_state_for(state, cols):
     from .explorer.state import NavState
     return NavState.from_value(state)
@@ -6739,6 +6914,8 @@ def _explorer_compose(snapshot, cols, rows, state=None, focus_result=None, last_
     state = _explorer_state_for(state, cols)
     view = _explorer_view(snapshot)
     model = live.build_view_model(view, accepted_detail=focus_result, now=now)
+    global _EXPLORER_MODEL
+    _EXPLORER_MODEL = model
     _EXPLORER_STATE = state
     frame = explorer_frame.draw(model, state, cols, rows, beat=int(_BLINK_ON))
     _EXPLORER_NAV_ROWS = _EXPLORER_ALL_ROWS = ()
@@ -6833,7 +7010,7 @@ def _draw_explorer(stdscr, snapshot):
         return
     state = _explorer_state_for(_EXPLORER_STATE, w)
     _EXPLORER_SIZE = (h, w)
-    frame = _explorer_compose(snapshot, w, h, state)
+    frame = _explorer_compose(snapshot, w, h, state, _EXPLORER_RESULT)
     _EXPLORER_FRAME = frame
     stdscr.erase()
     if frame.cells:
@@ -9198,12 +9375,17 @@ def _snapshot_line(segs, colored=False, colors=256):
     return "".join(out)
 
 
-def _explorer_once_frame(snapshot, cols, rows, state=None, reader=None):
-    """The once screen uses the same snapshot-to-cells projection as the live view."""
+def _explorer_once_frame(snapshot, cols, rows, state=None, reader=None, detail=False):
+    """The once screen uses the same snapshot-to-cells projection as the live view. ``detail`` also
+    makes the reads the live view would do for this state (never for the hermetic ``--demo`` rows)."""
     global _EXPLORER_RESULT
     state = _explorer_state_for(state if state is not None else _EXPLORER_STATE, cols)
     _EXPLORER_RESULT = None
-    return _explorer_compose(snapshot, cols, rows, state)
+    frame = _explorer_compose(snapshot, cols, rows, state)
+    if detail and not os.environ.get("FLEET_DEMO"):
+        _EXPLORER_RESULT = explorer_read_detail(snapshot, state)
+        frame = _explorer_compose(snapshot, cols, rows, state, _EXPLORER_RESULT)
+    return frame
 
 
 def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
@@ -9247,7 +9429,8 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
         import shutil
         size = shutil.get_terminal_size((100, 45))
         snapshot.governor, snapshot.memory = governor_snapshot, mem_snapshot
-        frame = _explorer_once_frame(snapshot, size.columns, size.lines)
+        gitinfo.enrich_entities(list(sessions) + list(jobs), schedule_ahead=False)
+        frame = _explorer_once_frame(snapshot, size.columns, size.lines, detail=True)
         sys.stdout.write("\n".join(frame.text_rows()).rstrip() + "\n")
         return 0
     gitinfo.enrich_entities(list(sessions) + list(jobs), schedule_ahead=False)
@@ -10871,6 +11054,11 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         compute_host_pump.start()
     latest_view = [snapshot]
     selection_feed = None
+    if _EXPLORER_ENABLED:
+        from .explorer.focus import FocusReader
+        selection_feed = _ExplorerFeed(
+            FocusReader(live_jobs=lambda: list(getattr(latest_view[0], "jobs", ()) or ()),
+                        snapshot=lambda: latest_view[0], output_reader=_explorer_output_reader()), interval)
     sessions, jobs = snapshot.sessions, snapshot.jobs
     resources = snapshot.resources
     usage_snapshots = snapshot.usage_snapshots
@@ -10942,7 +11130,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _HIT_VALID = False
             _BLINK_ON = _blink_phase(now)
             if selection_feed is not None:
-                focus_result, focus_changed = selection_feed.update(_EXPLORER_STATE, generation, now_mono)
+                focus_result, focus_changed = selection_feed.update(
+                    _EXPLORER_STATE, generation, now_mono, latest_view[0])
                 if focus_changed:
                     _EXPLORER_RESULT = focus_result
                     _HIT_VALID = False

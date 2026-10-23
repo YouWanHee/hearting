@@ -1,7 +1,7 @@
 """Read-only COMPUTE, MEMORY, and SYSTEM projections for Fleet explorer."""
 from collections.abc import Mapping
 
-from .grid import CellGrid
+from .grid import CellGrid, cell_width, put_fit
 from .output import clip
 
 
@@ -38,8 +38,9 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
     """Display collected host/GPU facts; absent measurements stay visibly unknown."""
     use = max(0, grid.cols - x - 2)
     hosts = tuple(vm.compute or ())
+    users_col = x + 64 + len("USED BY") <= grid.cols - 1
     y = _table_head(grid, x, use, y, ((1, "HOST"), (11, "GPU"), (16, "MODEL"),
-                                      (31, "UTIL"), (38, "VRAM"), (64, "USED BY")))
+                                      (31, "UTIL"), (38, "VRAM")) + (((64, "USED BY"),) if users_col else ()))
     labels = tuple(vm.hosts or ())
     for host_index, record in enumerate(hosts):
         if host_index:
@@ -65,7 +66,14 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
             grid.put(x + 16, y, "·" if model is None else str(model), gpu_styles.get(model_key, model_key or "dim"))
             grid.put(x + 31, y, " · " if util is None else f"{int(util):3d}%",
                      "soft" if status == "working" else "dim")
-            if used is None or total in (None, 0):
+            if x + 38 + 10 + 11 > grid.cols - 1:
+                # No room for the gauge and the GB text: the percentage alone.
+                if used is None or total in (None, 0):
+                    grid.put(x + 38, y, "·", "dim")
+                else:
+                    pct = 100 * float(used) / float(total)
+                    grid.put(x + 38, y, f"{pct:3.0f}%", _pct_key(pct))
+            elif used is None or total in (None, 0):
                 _gauge(grid, x + 38, y, 10, None)
                 grid.put(x + 51, y, "·", "dim")
             else:
@@ -73,7 +81,7 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
                 _gauge(grid, x + 38, y, max(1, round(float(total) / 4)), percent)
                 grid.put(x + 51, y, (f"{used:g}/{total:g} GB").rjust(10), "dim")
             cursor = x + 64
-            for user in users or ():
+            for user in (users or ()) if users_col else ():
                 cursor = grid.put(cursor, y, "[", "dim")
                 cursor = grid.put(cursor, y, user, "soft")
                 cursor = grid.put(cursor, y, "]", "dim") + 1
@@ -81,16 +89,19 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
         if cpu or mem or swap:
             for label, values, width, unit in (("CPU", cpu, 10, "thr"), ("MEM", mem, 8, "GB"),
                                                ("SWP", swap, 8, "GB")):
-                cursor = grid.put(x + 11 if label == "CPU" else cursor + 3, y, label + " ", "label")
+                start = x + 11 if label == "CPU" else cursor + 3
                 if values and len(values) >= 2 and values[1]:
-                    amount = 100 * float(values[0]) / float(values[1])
-                    _gauge(grid, cursor, y, width, amount)
-                    cursor += width + 1
                     value = f"{values[0]:g}/{values[1]:g} {unit}"
                 else:
-                    _gauge(grid, cursor, y, width, None)
-                    cursor += width + 1
                     value = "·"
+                if start + len(label) + 1 + width + 1 + len(value) > grid.cols - 1:
+                    break                      # a block that does not fit is left out, never cut
+                cursor = grid.put(start, y, label + " ", "label")
+                if value != "·":
+                    _gauge(grid, cursor, y, width, 100 * float(values[0]) / float(values[1]))
+                else:
+                    _gauge(grid, cursor, y, width, None)
+                cursor += width + 1
                 cursor = grid.put(cursor, y, value, "dim")
             y += 1
     if not hosts:
@@ -108,7 +119,9 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
         summary = data.get("unregistered_gpu_summary") or {}
         cursor = grid.put(x, y, "── ", "line")
         cursor = grid.put(cursor, y, "unregistered GPU processes", "head")
-        cursor = grid.put(cursor, y, "  " + str(summary.get("count", len(extras))) + " · owner [a3]", "dim")
+        owner = summary.get("owner")
+        cursor = grid.put(cursor, y, "  " + str(summary.get("count", len(extras))) +
+                          (f" · owner [{owner}]" if owner else ""), "dim")
         grid.put(cursor, y, " ", "branch_s")
         for col in range(cursor + 1, grid.cols - 1):
             grid.put(col, y, "─", "line")
@@ -132,8 +145,10 @@ def draw_memory(grid: CellGrid, vm, state=None, x=34, y=3):
     if records is None:
         grid.put(x + 1, y, "·", "dim")
         return
-    y = _table_head(grid, x, use, y, ((1, "PROJECT"), (14, "TIME"), (21, "ACTION"),
-                                      (32, "TYPE"), (55, "RECORD")))
+    narrow = use < 75           # the TYPE column is the one a narrow screen gives up
+    c_time, c_action, c_type, c_record = (12, 18, None, 27) if narrow else (14, 21, 32, 55)
+    y = _table_head(grid, x, use, y, ((1, "PROJECT"), (c_time, "TIME"), (c_action, "ACTION")) +
+                    (((c_type, "TYPE"),) if c_type else ()) + ((c_record, "RECORD"),))
     for project_index, project in enumerate(records):
         if project_index:
             y = _group_sep(grid, x, use, y)
@@ -144,19 +159,22 @@ def draw_memory(grid: CellGrid, vm, state=None, x=34, y=3):
         for row_index, row in enumerate(rows or ()):
             when, action, kind, text = (tuple(row) + (None,) * 4)[:4]
             if row_index == 0:
-                grid.put(x + 1, y, clip(str(name), 12), "soft")
-            grid.put(x + 14, y, "·" if when is None else str(when), "dim")
-            grid.put(x + 21, y, "+ saved" if action == "saved" else "· changed", "done" if action == "saved" else "dim")
-            grid.put(x + 32, y, "·" if kind is None else str(kind), "dim")
-            grid.put(x + 55, y, "·" if text is None else clip(str(text), max(0, use - 55)),
+                grid.put(x + 1, y, clip(str(name), min(12, c_time - 2)), "soft")
+            grid.put(x + c_time, y, "·" if when is None else str(when), "dim")
+            grid.put(x + c_action, y, "+ saved" if action == "saved" else "· changed", "done" if action == "saved" else "dim")
+            if c_type:
+                grid.put(x + c_type, y, "·" if kind is None else str(kind), "dim")
+            grid.put(x + c_record, y, "·" if text is None else clip(str(text), max(0, use - c_record)),
                      "soft" if action == "saved" else "now_sub", limit=x + use)
             y += 1
     summary = (vm.system or {}).get("memory_summary") if isinstance(vm.system, Mapping) else None
     if isinstance(summary, Mapping):
-        grid.put(x + 1, y, (f"{summary.get('added_today', '·')} added today · "
-                            f"{summary.get('projects', '·')} projects · "
-                            f"{summary.get('expired', '·')} expired at {summary.get('expired_at', '·')} "
-                            f"(lifecycle) · {summary.get('latest', '·')} latest shown"), "dim")
+        expired_at = summary.get("expired_at")
+        text = (f"{summary.get('added_today', '·')} added today · "
+                f"{summary.get('projects', '·')} projects · "
+                f"{summary.get('expired', '·')} expired" + (f" at {expired_at}" if expired_at else "") +
+                f" (lifecycle) · {summary.get('latest', '·')} latest shown")
+        grid.put(x + 1, y, clip(text, max(0, use - 1)), "dim")
 
 
 def draw_system(grid: CellGrid, vm, state=None, x=34, y=3):
@@ -180,9 +198,7 @@ def draw_system(grid: CellGrid, vm, state=None, x=34, y=3):
         nonlocal y
         for label, parts in values:
             cursor = grid.put(x + 3, y, label, "label")
-            cursor = x + 3 + lab_width
-            for text, key in parts:
-                cursor = grid.put(cursor, y, text, key)
+            put_fit(grid, x + 3 + lab_width, y, parts, limit=grid.cols - 1)
             y += 1
     section("hearting", "install")
     y += 1
@@ -199,9 +215,12 @@ def draw_system(grid: CellGrid, vm, state=None, x=34, y=3):
         if index:
             collector_parts.append(("  ", "dim"))
         collector_parts.extend(((str(collector) + " ", "dim"), ("✓", "done")))
-    collector_parts.extend((("  disabled ", "dim"), ("none", "dim")))
+    if collectors:
+        collector_parts.extend((("  disabled ", "dim"), ("none", "dim")))
+    marks = "/".join(name for name in ("managed", "pinned") if install.get(name))
+    flags = " · ".join(part for part in (marks, "distribution" if install.get("distribution") else "") if part)
     version_parts = [(str(install.get("version", "·")), "ver"),
-                     (" · managed/pinned · distribution" if install else "", "dim")]
+                     (" · " + flags if flags else "", "dim")]
     fields((("version:", version_parts), ("runtimes:", runtimes_text or [("·", "dim")]),
             ("usage api:", api_parts), ("collectors:", collector_parts)), 13)
     y += 1
@@ -218,14 +237,24 @@ def draw_system(grid: CellGrid, vm, state=None, x=34, y=3):
     section("peer delivery")
     y += 1
     pending = [(str(delivery.get("pending", "·")), "lvl_y"), (" awaiting recipient", "dim")]
-    obligations = [("[", "dim"), ("a3", "soft"), ("]", "dim"), ("  ", "soft"),
-                   ("↻ pending msg 1", "soft"), ("  · 4d old", "dim")]
+    obligations = []
+    for entry in data.get("obligations") or ():
+        if obligations:
+            obligations.append(("   ", "soft"))
+        obligations += [("[", "dim"), (str(entry.get("tag") or "·"), "soft"), ("]", "dim"),
+                        ("  ", "soft"), (str(entry.get("text") or "·"), "soft")]
+        if entry.get("age"):
+            obligations.append(("  · " + str(entry["age"]), "dim"))
     records = [(str(delivery.get("records", "·")), "soft"), (" in the last window", "dim")]
-    fields((("pending:", pending), ("obligations:", obligations), ("records:", records)), 13)
+    fields((("pending:", pending),) + ((("obligations:", obligations),) if obligations else ()) +
+           (("records:", records),), 13)
     y += 1
     extra = data.get("unregistered_gpu_processes")
     if extra:
-        section("unregistered GPU processes", "11 · owner [a3] · see COMPUTE")
+        info = data.get("unregistered_gpu_summary") or {}
+        owner = info.get("owner")
+        section("unregistered GPU processes",
+                f"{info.get('count', len(extra))}" + (f" · owner [{owner}]" if owner else "") + " · see COMPUTE")
         y += 1
         for item in extra[:2]:
             host, index, command, memory, age = (tuple(item) + (None,) * 5)[:5]

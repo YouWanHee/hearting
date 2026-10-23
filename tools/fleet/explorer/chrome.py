@@ -1,16 +1,19 @@
 """Header, navigation rail, feed, key legend and status rows."""
 from collections.abc import Mapping
 from .grid import CellGrid
+from .tables import repo_label
 
 NAV_WIDTH = 32
 
 
+def count_word(count, word, plural=None):
+    """``1 question`` / ``2 questions``: the reference's ``nof`` for every count word on the screen."""
+    return f"{count} {word if count == 1 else (plural or word + 's')}"
+
+
 def _clip(text, width):
-    text = str(text)
-    width = max(0, int(width))
-    if len(text) <= width:
-        return text
-    return "…" if width == 1 else text[:width - 1] + "…"
+    from .output import clip
+    return clip(str(text), max(0, int(width)))
 
 
 def draw_chrome(grid: CellGrid, vm, state, beat=1):
@@ -56,7 +59,7 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
         separator = " " if index == len(hosts) - 1 else "  "
         x = grid.put(x, 0, separator, "dim" if len(separator) == 1 else "branch_s",
                      limit=max(x, census_x - 2))
-    if x + 4 < census_x:
+    if hosts and x + 4 < census_x:
         x = grid.put(x, 0, f"{len(hosts)}/{len(hosts)}", "dim", limit=census_x - 1)
     cx = max(x + 1, width - 1 - census_width)
     for text, key in census_parts:
@@ -78,6 +81,7 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
             if week is None:
                 continue
             label, percent, reset = week
+            reset = "·" if reset is None else reset
             extras = [(window[0], int(window[1])) for window in item.get("windows", ())
                       if window and window[0] != "week" and int(window[1]) >= 80]
             extra_width = sum(3 + len(name) + len(str(value)) + 2 for name, value in extras)
@@ -102,7 +106,18 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
         for index, item in enumerate(usage[:3]):
             y = 1 + index
             grid.put(1, y, str(item.get("text", "")), item.get("key", "dim"))
-            for win_index, window in enumerate(item.get("windows", ())):
+            windows = list(item.get("windows", ()))
+
+            def window_end(slot, window):
+                return 14 + slot * 40 + 5 + 1 + 1 + 12 + 5 + 1 + (
+                    2 + len(str(window[2])) + 1 if window[2] else 0)
+            if any(window and window_end(slot, window) > width - 10 for slot, window in enumerate(windows)):
+                # A narrow screen shows the windows it has room for, the week first.
+                present = sorted((window for window in windows if window),
+                                 key=lambda window: {"week": 0, "5h": 1}.get(str(window[0]), 2))
+                windows = [window for slot, window in enumerate(present)
+                           if window_end(slot, window) <= width - 10]
+            for win_index, window in enumerate(windows):
                 if not window:
                     continue
                 name, percent, reset = window
@@ -128,9 +143,10 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
         grid.put(NAV_WIDTH + 1, title_y, "━", "line")
         grid.put(NAV_WIDTH + 2, title_y, " ", "dim")
         grid.put(NAV_WIDTH + 3, title_y, "{ ", "dim")
-        grid.put(NAV_WIDTH + 5, title_y, str(state.title or state.view), "head",
-                 limit=width - 1)
-        title_end = NAV_WIDTH + 5 + len(str(state.title or state.view))
+        title_text = _clip(str(state.title or state.view), max(1, width - 1 - (NAV_WIDTH + 5) - 3))
+        grid.put(NAV_WIDTH + 5, title_y, title_text, "head", limit=width - 1)
+        from .grid import cell_width
+        title_end = NAV_WIDTH + 5 + cell_width(title_text)
         grid.put(title_end, title_y, " ", "dim", limit=width - 1)
         grid.put(title_end + 1, title_y, "} ", "dim", limit=width - 1)
         grid.put(title_end + 3, title_y, "━" * max(0, width - title_end - 4), "line", limit=width - 1)
@@ -153,33 +169,37 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
             mine = tuple(item for item in sessions
                          if item.get("repo_id", item.get("repo")) == scope_id)
             mine_routes = tuple(item for item in routes if str(item.get("repo") or "") == scope_id)
-            status = (f"{len(mine)} sessions · "
+            status = (f"{count_word(len(mine), 'session')} · "
                       f"{sum(1 for item in mine_routes if item.get('state') != 'done')} open · "
                       f"{sum(1 for item in mine_routes if item.get('state') == 'done')} done")
         elif scope_kind in ("session", "route"):
             status = "esc: back up"
         elif state.view == "OVERVIEW" and state.scope == "-":
-            status = (f"{len(sessions)} sessions · "
-                      f"{sum(1 for item in routes if item.get('state') != 'done')} routes · "
-                      f"{len(questions)} question")
+            status = (f"{count_word(len(sessions), 'session')} · "
+                      f"{count_word(sum(1 for item in routes if item.get('state') != 'done'), 'route')} · "
+                      f"{count_word(len(questions), 'question')}")
         elif state.view == "ROUTES":
             status = (f"{sum(1 for item in routes if item.get('state') != 'done')} open · "
-                      f"{sum(1 for item in routes if item.get('state') == 'dead')} stopped legs")
+                      f"{count_word(sum(1 for item in routes if item.get('state') == 'dead'), 'stopped leg')}")
         elif state.view == "QUESTIONS":
             total = (system.get("answered_total") if isinstance(system, Mapping) else None)
-            status = f"{len(questions)} waiting · {total if total is not None else len(questions)} decision records today"
+            records = total if total is not None else len(questions)
+            status = f"{len(questions)} waiting · {count_word(records, 'decision record')} today"
         elif state.view == "HISTORY":
             seats = tuple(vm.seats or ())
-            status = f"{len(seats)} seats · {sum(int(seat[2]) for seat in seats if len(seat) > 2)} generations"
+            status = (f"{count_word(len(seats), 'seat')} · "
+                      f"{count_word(sum(int(seat[2]) for seat in seats if len(seat) > 2), 'generation')}")
         elif state.view == "PEERS":
             edges = tuple(vm.peer_edges.get("links", ())) if isinstance(vm.peer_edges, Mapping) else ()
-            status = f"{len(edges)} links · {sum(1 for item in sessions if item.get('steward'))} stewards · {sum(1 for edge in edges if len(edge) > 2 and edge[2] == 'handover')} handovers"
+            status = (f"{count_word(len(edges), 'link')} · "
+                      f"{count_word(sum(1 for item in sessions if item.get('steward')), 'steward')} · "
+                      f"{count_word(sum(1 for edge in edges if len(edge) > 2 and edge[2] == 'handover'), 'handover')}")
         elif state.view == "COMPUTE":
             hosts = tuple(vm.compute or ())
             busy = sum(1 for host in hosts for gpu in (host[5] if len(host) > 5 else ())
                        if len(gpu) > 1 and gpu[1] == "working")
             total = sum(len(host[5]) for host in hosts if len(host) > 5)
-            status = f"{len(hosts)} hosts · GPU {busy}/{total}"
+            status = f"{count_word(len(hosts), 'host')} · GPU {busy}/{total}"
         elif state.view == "MEMORY":
             summary = system.get("memory_summary", {}) if isinstance(system, Mapping) else {}
             if isinstance(summary, Mapping):
@@ -192,11 +212,15 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
             fields = tuple((models.get("allocation") or {}).get("fields", ()))
             strategy = next((str(parts[0][0]) for label, parts in fields
                              if label == "strategy:" and parts), "balanced")
-            status = f"{profile_count} profiles × {harness_count} harnesses · {strategy} allocation"
+            status = (f"{count_word(profile_count, 'profile')} × "
+                      f"{count_word(harness_count, 'harness', 'harnesses')} · {strategy} allocation")
         elif state.view == "SYSTEM":
             install = system.get("install", {}) if isinstance(system, Mapping) else {}
             delivery = system.get("peer_delivery", {}) if isinstance(system, Mapping) else {}
-            status = f"{install.get('version', '·')} · {delivery.get('pending', '·')} deliveries pending"
+            pending = delivery.get("pending", "·")
+            waiting = (count_word(pending, "delivery", "deliveries") if isinstance(pending, int)
+                       else f"{pending} deliveries")
+            status = f"{install.get('version', '·')} · {waiting} pending"
         else:
             status = ""
         grid.fill(0, width, height - 1, " ")
@@ -222,14 +246,38 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
     if height >= 2:
         grid.fill(0, width, height - 2, " ")
     x = 1
-    for key, label in (("↑↓", "move"), ("←→", "focus"), ("⏎", "go to pane"),
-                       ("Tab", "next view"), ("/", "filter"), ("u", "usage"),
-                       ("F", "feed"), ("q", "quit")):
+    legend = [("↑↓", "move"), ("←→", "focus"), ("⏎", "go to pane"), ("Tab", "next view"),
+              ("/", "filter"), ("u", "usage"), ("F", "feed"), ("q", "quit")]
+    # A narrow screen drops the hint-only keys first, then the rest from the right, never a half word.
+    for drop in ("F", "/", "⏎", "←→", "Tab"):
+        if sum(len(k) + 1 + len(l) for k, l in legend) + 3 * (len(legend) - 1) + 1 <= width:
+            break
+        legend = [item for item in legend if item[0] != drop]
+    for key, label in legend:
         if x > 1:
             x = grid.put(x, height - 2, " · ", "line")
         x = grid.put(x, height - 2, key, "hearting")
         x = grid.put(x + 1, height - 2, label, "dim")
     return grid
+
+
+def _tree_row_count(vm, sessions):
+    """Rows the session tree needs when nothing is cut: repos, their sessions, open routes, workers."""
+    total = 0
+    for repo in vm.repos:
+        repo_id = repo.get("id", repo.get("name", "·"))
+        if not any(session.get("repo_id", session.get("repo")) == repo_id for session in sessions):
+            continue                                    # a repo with no session has no row in the tree
+        total += 1 if repo_label(repo.get("name", "·")) else 0     # the nameless group has no repo row
+        for session in sessions:
+            if session.get("repo_id", session.get("repo")) != repo_id:
+                continue
+            total += 1
+            tag = session.get("tag")
+            for route in vm.routes:
+                if route.get("session_tag") == tag and route.get("state") not in ("done", "dead"):
+                    total += 2 if route.get("subworker") else 1
+    return total
 
 
 def draw_explorer(grid: CellGrid, vm, state):
@@ -290,6 +338,13 @@ def draw_explorer(grid: CellGrid, vm, state):
     grid.put(31, y, "━", "line")
     y += 1
     tree_bottom = min(height - 1, 34)
+    tree_total = _tree_row_count(vm, sessions)
+    cut, tree_top = tree_bottom, y
+    if y + tree_total > tree_bottom:
+        # A tree taller than its pane stops above COMPUTE and says so on its last row; the rows
+        # it hides are neither drawn nor clickable.
+        cut = tree_bottom - 1
+        hidden_rows = y + tree_total - cut
     route_scope = (next((item for item in vm.routes if str(item.get("id")) == scope_id), None)
                    if scope_kind == "route" else None)
     listed = {str(route.get("id")) for session in sessions for route in vm.routes
@@ -297,28 +352,35 @@ def draw_explorer(grid: CellGrid, vm, state):
     # An ended route is not in the tree: light the session that ran it, or its repo.
     hidden = route_scope is not None and str(route_scope.get("id")) not in listed
     lit_tag = str((route_scope or {}).get("session_tag") or "")
-    for repo_index, repo in enumerate(vm.repos):
-        name = str(repo.get("name", "·"))
-        repo_id = repo.get("id", name)
+    tree_repos = [repo for repo in vm.repos
+                  if any(session.get("repo_id", session.get("repo")) == repo.get("id", repo.get("name", "·"))
+                         for session in sessions)]
+    for repo_index, repo in enumerate(tree_repos):
+        name = repo_label(repo.get("name", "·"))
+        repo_id = repo.get("id", repo.get("name", "·"))
         children = [session for session in sessions
                     if session.get("repo_id", session.get("repo")) == repo_id]
-        last_repo = repo_index == len(vm.repos) - 1
-        if y >= tree_bottom:
+        last_repo = repo_index == len(tree_repos) - 1
+        if y >= cut:
             break
-        grid.add_hit(y, 0, width, ("scope", "repo:" + str(repo_id)))
-        repo_lit = ((scope_kind == "repo" and str(repo_id) == scope_id) or
-                    (hidden and not lit_tag and str(repo_id) == str((route_scope or {}).get("repo"))))
-        if repo_lit:
-            grid.fill(0, width, y, " ", tint=236)
-        grid.put(1, y, "┗━ " if last_repo else "┣━ ", "line")
-        grid.put(4, y, _clip(name + "/", width - 6), "soft", limit=width - 1)
-        if repo_lit:
-            for col in range(width):
-                glyph, key, _tint = grid.cells[y][col]
-                grid.cells[y][col] = (glyph, key, 236)
-        y += 1
+        # The nameless group draws no repo row: its sessions sit at the repo level (three cells left).
+        flat = not name
+        shift = 3 if flat else 0
+        if not flat:
+            grid.add_hit(y, 0, width, ("scope", "repo:" + str(repo_id)))
+            repo_lit = ((scope_kind == "repo" and str(repo_id) == scope_id) or
+                        (hidden and not lit_tag and str(repo_id) == str((route_scope or {}).get("repo"))))
+            if repo_lit:
+                grid.fill(0, width, y, " ", tint=236)
+            grid.put(1, y, "┗━ " if last_repo else "┣━ ", "line")
+            grid.put(4, y, _clip(name + "/", width - 6), "soft", limit=width - 1)
+            if repo_lit:
+                for col in range(width):
+                    glyph, key, _tint = grid.cells[y][col]
+                    grid.cells[y][col] = (glyph, key, 236)
+            y += 1
         for session_index, session in enumerate(children):
-            if y >= tree_bottom:
+            if y >= cut:
                 break
             tag = str(session.get("tag") or "·")
             last_session = session_index == len(children) - 1
@@ -327,13 +389,18 @@ def draw_explorer(grid: CellGrid, vm, state):
             session_lit = (scope_kind == "session" and tag == scope_id) or (hidden and tag == lit_tag)
             if session_lit:
                 grid.fill(0, width, y, " ", tint=236)
-            grid.put(1, y, stem, "line")
-            grid.put(4, y, "┗━ " if last_session else "┣━ ", "line")
-            grid.put(7, y, "[", "dim")
-            grid.put(8, y, tag, "steward" if session.get("steward") else "soft")
-            grid.put(8 + len(tag), y, "]", "dim")
+            if flat:
+                last_session = last_session and last_repo
+                stem = "   " if last_session else "┃  "
+                grid.put(1, y, "┗━ " if last_session else "┣━ ", "line")
+            else:
+                grid.put(1, y, stem, "line")
+                grid.put(4, y, "┗━ " if last_session else "┣━ ", "line")
+            grid.put(7 - shift, y, "[", "dim")
+            grid.put(8 - shift, y, tag, "steward" if session.get("steward") else "soft")
+            grid.put(8 - shift + len(tag), y, "]", "dim")
             harness = str(session.get("harness") or "·")
-            hx = grid.put(12, y, harness, "hb_" + harness)
+            hx = grid.put(12 - shift, y, harness, "hb_" + harness)
             status = session.get("state")
             marker, marker_key = {"working": ("⠏", "g_spin_dim"), "blocked": ("●", "lvl_r_dim"),
                                   "dead": ("✕", "dead"), "done": ("✓", "done")}.get(
@@ -349,13 +416,15 @@ def draw_explorer(grid: CellGrid, vm, state):
                  and route.get("state") not in ("done", "dead")),
                 key=lambda route: route.get("state") != "working")
             for route_index, route in enumerate(session_routes):
-                if y >= tree_bottom:
+                if y >= cut:
                     break
                 grid.add_hit(y, 0, width, ("route", route.get("id"), tag))
                 if scope_kind == "route" and str(route.get("id")) == scope_id:
                     grid.fill(0, width, y, " ", tint=236)
                 grid.put(1, y, stem, "line")
-                if last_session:
+                if flat:
+                    branch_x = 9 - shift
+                elif last_session:
                     grid.put(4, y, "   ", "line")
                     grid.put(7, y, "  ", None)
                     branch_x = 9
@@ -380,19 +449,22 @@ def draw_explorer(grid: CellGrid, vm, state):
                         grid.cells[y][col] = (glyph, key, 236)
                 y += 1
                 subworker = route.get("subworker")
-                if subworker and y < tree_bottom:
+                if subworker and y < cut:
                     name, who, activity = subworker
                     grid.add_hit(y, 0, width, ("route", route.get("id"), tag))
                     grid.put(1, y, stem, "line")
-                    grid.put(4, y, "   " if last_session else "┃  ", "line")
-                    grid.put(9, y, "   ", "line")
-                    grid.put(12, y, "┗━ ", "line")
+                    if not flat:
+                        grid.put(4, y, "   " if last_session else "┃  ", "line")
+                    grid.put(9 - shift, y, "   ", "line")
+                    grid.put(12 - shift, y, "┗━ ", "line")
                     sub_label = str(name) + ": "
-                    grid.put(15, y, sub_label, "dim", limit=width - 1)
-                    grid.put(15 + len(sub_label), y, str(who), "h_" + str(who), limit=width - 1)
+                    grid.put(15 - shift, y, sub_label, "dim", limit=width - 1)
+                    grid.put(15 - shift + len(sub_label), y, str(who), "h_" + str(who), limit=width - 1)
                     sub_mark = "g_spin_dim" if activity == "running" else "g_work_off"
-                    grid.put(15 + len(sub_label) + len(str(who)) + 1, y, "⠏" if activity == "running" else "●", sub_mark)
+                    grid.put(15 - shift + len(sub_label) + len(str(who)) + 1, y, "⠏" if activity == "running" else "●", sub_mark)
                     y += 1
+    if cut < tree_bottom and cut >= tree_top:
+        grid.put(4, cut, f"… {hidden_rows} more rows", "dim", limit=width - 1)
 
     # COMPUTE is a fixed explorer section. Percentages are source facts; draw the
     # compact host summary from the immutable fixture without probing resources.
@@ -417,22 +489,28 @@ def draw_explorer(grid: CellGrid, vm, state):
             row_y = compute_y + 2 + offset
             if row_y >= grid.rows - 4:
                 break
-            _name, base, cpu, _memory, _disk, gpus = host
+            _name, base, cpu, _memory, _disk, gpus = (tuple(host) + (None,) * 6)[:6]
+            gpus = tuple(gpus or ())
             host_record = host_labels[offset] if offset < len(host_labels) else {}
             name = host_record.get("name", _name) if isinstance(host_record, Mapping) else _name
-            cpu_load, cpu_total = cpu
-            cpu_pct = round(100 * float(cpu_load) / max(1, float(cpu_total)))
-            cpu_key = "g_blocked" if cpu_pct >= 80 else "g_idle" if cpu_pct >= 50 else "grp_live"
+            cpu_pct = None
+            if cpu and len(cpu) > 1 and cpu[0] is not None and cpu[1]:
+                cpu_pct = round(100 * float(cpu[0]) / max(1, float(cpu[1])))
+            cpu_key = ("dim" if cpu_pct is None else "g_blocked" if cpu_pct >= 80
+                       else "g_idle" if cpu_pct >= 50 else "grp_live")
             busy = any(gpu[1] == "working" for gpu in gpus)
             grid.put(1, row_y, str(name), "work" if base else "soft", limit=12)
-            grid.put(13, row_y, f" {cpu_pct:2d}%", cpu_key)
+            grid.put(13, row_y, "  ·" if cpu_pct is None else f" {cpu_pct:2d}%", cpu_key)
             grid.put(18, row_y, "●", "spin" if busy else "idle")
             for gpu_index, gpu in enumerate(gpus[:2]):
-                _, gpu_state, _model, _gpu_key, _util, used, total, _sessions = gpu
-                pct = round(100 * float(used) / max(1, float(total)))
+                _, gpu_state, _model, _gpu_key, _util, used, total, _sessions = (tuple(gpu) + (None,) * 8)[:8]
                 gx = 20 + gpu_index * 7
-                key = ("dim" if pct == 0 else "g_blocked" if pct >= 80
-                       else "g_idle" if pct >= 50 else "grp_live")
-                grid.put(gx, row_y, f" {pct:2d}%", key)
+                if used is None or not total:
+                    grid.put(gx, row_y, "  ·", "dim")
+                else:
+                    pct = round(100 * float(used) / max(1, float(total)))
+                    key = ("dim" if pct == 0 else "g_blocked" if pct >= 80
+                           else "g_idle" if pct >= 50 else "grp_live")
+                    grid.put(gx, row_y, f" {pct:2d}%", key)
                 if gpu_index == 0:
                     grid.put(gx + 5, row_y, "●", "spin" if gpu_state == "working" else "idle")

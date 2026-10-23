@@ -38,6 +38,8 @@ def normalize_style(key=None, tint=None):
     if isinstance(key, (tuple, list)) and len(key) == 3:
         key = REFERENCE_STYLES.get((str(key[0]), int(bool(key[1])), int(bool(key[2]))), "unknown")
     canonical = KEY_ALIASES.get(str(key), str(key))
+    if canonical.startswith("hb_") and canonical[3:] not in ("claude", "codex", "opencode", "other"):
+        canonical = "hb_other"          # a harness Fleet does not name wears the neutral hue
     return canonical, tint
 
 

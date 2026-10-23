@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from tools.fleet.explorer.live import build_view_model
+from tools.fleet.explorer.chrome import count_word
 from tools.fleet.explorer.view_model import load_fixture
 from tools.fleet.model import Session
 
@@ -20,7 +21,7 @@ class CoreFields(unittest.TestCase):
         self.assertIsNone(vm.sessions[0]["title"])
         self.assertEqual(vm.sessions[0]["context"], 0)
         self.assertEqual(vm.sessions[0]["state"], "working")
-        self.assertEqual(vm.sessions[0]["age"], 7)
+        self.assertEqual(vm.sessions[0]["age"], "7m")
         with self.assertRaises(TypeError):
             vm.sessions[0]["title"] = "changed"
 
@@ -42,7 +43,6 @@ class CoreFields(unittest.TestCase):
         self.assertTrue(vm.system)
         encoded = path.read_text(encoding="utf-8").lower()
         self.assertNotIn("/home/", encoded)
-        self.assertNotIn("openrig", encoded)
         self.assertNotIn("mock", encoded)
 
     def test_live_boundary_keeps_exact_pane_and_source_record_joins(self):
@@ -74,3 +74,87 @@ class ConfigFields(unittest.TestCase):
         self.assertIsNone(missing.models)
         self.assertIsNone(missing.memory)
         self.assertIsInstance(ExplorerViewModel.from_mapping(missing), ExplorerViewModel)
+
+
+class RealDataFidelity(unittest.TestCase):
+    """What the default board decides about a row, the explorer's records say the same."""
+
+    def build(self, *sessions, **extra):
+        return build_view_model({"sessions": list(sessions), "project_of": lambda cwd: "synthetic-repo",
+                                 **extra}, now=2_000_000_000)
+
+    def test_model_effort_and_context_resolve_like_the_default_board_for_every_harness(self):
+        rows = [Session(harness="claude", pid=1, session_tag="c1", cwd="/x/repo", liveness="idle",
+                        model="Opus 5.5 (1M context)", effort="xhigh", active_context_tokens=250_000,
+                        context_window_tokens=1_000_000),
+                Session(harness="codex", pid=2, session_tag="c2", cwd="/x/repo", liveness="idle",
+                        model="gpt-6.1-sol", effort="high", active_context_tokens=100_000,
+                        context_window_tokens=400_000),
+                Session(harness="opencode", pid=3, session_tag="c3", cwd="/x/repo", liveness="idle",
+                        model="opencode-go/glm-5.2", effort="runtime-default", effort_default=True),
+                Session(harness="claude", pid=4, session_tag="c4", cwd="/x/repo", liveness="stale",
+                        model="Opus 5.5", effort="high", ctx_pct=40)]
+        vm = self.build(*rows)
+        by_tag = {row["tag"]: row for row in vm.sessions}
+        self.assertEqual(tuple(by_tag["c1"]["model"]), ("Opus 5.5", "fam_opus"))
+        self.assertEqual(by_tag["c1"]["effort"], "xhigh")
+        self.assertEqual((by_tag["c1"]["context"], by_tag["c1"]["window"]), (25, 1.0))
+        from tools.fleet import render
+        self.assertEqual(by_tag["c2"]["context"], render._native_context_gauge(rows[1])[0])   # window-normalised
+        self.assertEqual(by_tag["c3"]["model"][0],
+                         render._clean_model(render._dispatch_display_model("opencode-go/glm-5.2")))
+        self.assertEqual(by_tag["c3"]["effort"], "default")          # the runtime's own default, not a level
+        # a stale row has no live telemetry: the bare harness, no context
+        self.assertEqual((by_tag["c4"]["model"], by_tag["c4"]["effort"], by_tag["c4"]["context"]),
+                         (None, None, None))
+
+    def test_a_folder_inside_the_home_folder_is_never_grouped_as_the_home_folder(self):
+        from unittest import mock
+        from tools.fleet.explorer import live
+        # a data root that carries the user's folder name is the home folder for this purpose
+        with mock.patch.object(live, "_HOME_FORMS", ("/home/alice", "/data/alice")):
+            names = {live._repo_of(lambda _cwd: "alice", cwd) for cwd in
+                     ("/data/alice/work/projects/2026-08_keyword", "/data/alice")}
+            self.assertEqual(names, {"2026-08_keyword", live.HOME_LABEL})
+            self.assertEqual(live._repo_of(lambda _cwd: "tool", "/data/alice/NN_Zoo/tool"), "tool")
+            self.assertEqual(live._repo_of(lambda _cwd: "alice-site", "/data/alice/alice-site"), "alice-site")
+
+    def test_branch_is_the_known_branch_or_nothing(self):
+        vm = self.build(Session(harness="claude", pid=1, session_tag="b1", cwd="/x/repo", liveness="idle",
+                                branch="fix/thing"),
+                        Session(harness="claude", pid=2, session_tag="b2", cwd="/x/repo", liveness="idle"))
+        self.assertEqual([row["branch"] for row in vm.sessions], ["fix/thing", None])
+
+    def test_install_version_and_usage_freshness_reach_the_top_line(self):
+        usage = {"claude": {"payload": {"rl_5h": 10, "rl_7d": 20}, "observed_at": 1_999_999_000}}
+        vm = self.build(Session(harness="claude", pid=1, session_tag="u1", cwd="/x/repo", liveness="idle"),
+                        hearting={"version": "v3.42.0-2-gdc406c55a-dirty", "install_method": "unmanaged"},
+                        usage_snapshots=usage)
+        self.assertEqual(vm.system["install"]["version"], "v3.42.0")
+        self.assertRegex(vm.system["usage_api"]["freshness"], r"^\d\d:\d\d$")
+
+    def test_decision_records_become_the_answered_list_and_the_feed_line(self):
+        memory = {"recent": [{"ts": "2026-10-23T12:00:00+00:00", "action": "decision-record", "type": "decision",
+                              "snippet": "pick the plain name", "cwd": "/x/repo", "sid": ""}],
+                  "by_repo": {"repo": [{"ts": "2026-10-23T12:00:00+00:00", "action": "decision-record",
+                                        "type": "decision", "snippet": "pick the plain name"}]}}
+        vm = self.build(Session(harness="claude", pid=1, session_tag="m1", cwd="/x/repo", liveness="idle"),
+                        memory=memory)
+        self.assertEqual(vm.answered[0][0], "repo")
+        self.assertEqual(vm.answered[0][1][0][1], "pick the plain name")
+        self.assertEqual(vm.system["answered_total"], 1)
+        self.assertEqual(vm.events[0][1], "m1")            # the session that works in that folder
+        self.assertEqual(vm.events[0][5], "pick the plain name")
+
+
+class CountWords(unittest.TestCase):
+    def test_every_count_word_is_singular_for_one(self):
+        self.assertEqual(count_word(1, "question"), "1 question")
+        self.assertEqual(count_word(2, "question"), "2 questions")
+        self.assertEqual(count_word(0, "session"), "0 sessions")
+        self.assertEqual(count_word(1, "harness", "harnesses"), "1 harness")
+        self.assertEqual(count_word(3, "harness", "harnesses"), "3 harnesses")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -14,17 +14,19 @@ def _scope_title(vm, state):
     if kind == "repo":
         repo = next((item for item in vm.repos
                      if str(item.get("id", item.get("name", ""))) == ident), None)
-        return str((repo or {}).get("name") or ident) + "/"
+        return tables.repo_rule_label((repo or {}).get("name") or ident) or state.view
     if kind == "session":
         session = next((item for item in vm.sessions if str(item.get("tag")) == ident), None)
         if session:
-            return f"{session.get('repo') or '·'}/ › [{ident}]"
+            head = tables.repo_rule_label(session.get("repo"))
+            return f"{head + ' › ' if head else ''}[{ident}]"
     if kind == "route":
         route = next((item for item in vm.routes if str(item.get("id")) == ident), None)
         if route:
             parent = f"[{route['session_tag']}] › " if route.get("session_tag") else ""
             title = clip(str(route.get("title") or "·"), 32)
-            return f"{route.get('repo') or '·'}/ › {parent}{route.get('tree_label') or ident} · {title}"
+            head = tables.repo_rule_label(route.get("repo"))
+            return f"{head + ' › ' if head else ''}{parent}{route.get('tree_label') or ident} · {title}"
     return state.view
 
 
@@ -84,6 +86,7 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
             for col in range(grid.cols):
                 grid.cells[row_index][col] = ((" ", None, None) if row_index < 5 or col < pane
                                               else prior[row_index - 2][col])
+        grid.mark_moved()
         view_hits = [Hit(hit.y + 2, hit.x0, hit.x1, hit.action) if 3 <= hit.y else hit
                      for hit in grid.hits if hit.x0 >= pane or hit.y < 0]
         grid.hits = []
@@ -102,7 +105,7 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
         tag = state.scope.partition(":")[2]
         session = next((item for item in vm.sessions if str(item.get("tag")) == tag), None)
         repo = (session or {}).get("repo_id", (session or {}).get("repo"))
-        if repo is not None:
+        if tables.repo_label(repo):
             parent = "repo:" + str(repo)
     elif state.scope.startswith("route:"):
         ident = state.scope.partition(":")[2]

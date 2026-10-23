@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 from .grid import cell_width
 from .output import clip
+from .tables import repo_rule_label
 from .tables import _clip, _tint_row, draw_overview, draw_routes
 
 
@@ -67,7 +68,7 @@ def _session_page(grid, vm, tag, x, right, bottom, state=None):
     harness = str(session.get("harness") or "·")
     branch = session.get("branch") or "·"
     y = _section(grid, x, right, 3, "[" + tag + "] " + str(session.get("title") or "·"),
-                 str(session.get("repo") or "·") + "/ · " + str(branch))
+                 " · ".join(part for part in (repo_rule_label(session.get("repo")), str(branch)) if part))
     model = tuple(session.get("model") or ())
     grid.put(x + 3, y, "harness:", "label", limit=right)
     cursor = grid.put(x + 16, y, harness, "hb_" + harness, limit=right)
@@ -125,8 +126,10 @@ def _session_page(grid, vm, tag, x, right, bottom, state=None):
                  sum(1 for route in vm.routes if route.get("session_tag") == tag) or "none")
     routes = tuple(route for route in vm.routes if route.get("session_tag") == tag)
     if routes:
-        _draw_route_subset(grid, vm, routes, x, y, bottom, view_key=tag, state=state)
-        y += len(routes) * 2 + 2
+        end = _draw_route_subset(grid, vm, routes, x, y, bottom, view_key=tag, state=state)
+        # An opened route unfolds its detail in place, so the next section starts below what was drawn.
+        fixed = y + len(routes) * 2 + 2
+        y = end + 1 if end and end > fixed else fixed
     if y < bottom:
         links = tuple(edge for edge in tuple((vm.peer_edges or {}).get("links", ()))
                       if any(isinstance(end, (list, tuple)) and str(end[0]) == tag
@@ -136,6 +139,9 @@ def _session_page(grid, vm, tag, x, right, bottom, state=None):
         for edge in links[:4]:
             if y >= bottom:
                 break
+            if right - x < 75:
+                y = _link_compact(grid, vm, edge, x, right, y, bottom)
+                continue
             for edge_x, endpoint in ((x + 3, edge[0]), (x + 19, edge[1])):
                 if isinstance(endpoint, (list, tuple)):
                     session_tag, endpoint_harness = str(endpoint[0]), str(endpoint[1])
@@ -190,6 +196,29 @@ def _session_page(grid, vm, tag, x, right, bottom, state=None):
                          harness)
 
 
+def _link_compact(grid, vm, edge, x, right, y, bottom):
+    """A link on a narrow page: ends and arrow on one row, kind · when · note under them."""
+    cursor = x + 3
+    for index, endpoint in enumerate(edge[:2]):
+        if index:
+            cursor = grid.put(cursor, y, " → ", "soft", limit=right)
+        if isinstance(endpoint, (list, tuple)):
+            tag, harness = str(endpoint[0]), str(endpoint[1])
+            steward = any(str(item.get("tag")) == tag and item.get("steward") for item in vm.sessions)
+            cursor = grid.put(cursor, y, "[", "dim", limit=right)
+            cursor = grid.put(cursor, y, tag, "steward" if steward else "soft", limit=right)
+            cursor = grid.put(cursor, y, "]", "dim", limit=right)
+            cursor = grid.put(cursor, y, " " + harness, "hb_" + harness, limit=right)
+        else:
+            cursor = grid.put(cursor, y, _clip(str(endpoint), 14), "dim", limit=right)
+    y += 1
+    if y < bottom:
+        detail = " · ".join(str(part) for part in edge[2:5] if part not in (None, ""))
+        grid.put(x + 5, y, _clip(detail, max(0, right - x - 6)), "dim", limit=right)
+        y += 1
+    return y
+
+
 def _route_page(grid, vm, ident, x, right, bottom, state):
     route = next((item for item in vm.routes if str(item.get("id")) == ident), None)
     if route is None:
@@ -219,7 +248,7 @@ def _draw_route_subset(grid, vm, routes, x, y, bottom, opened="", no_repo_group=
     # Reuse the exact corrected table renderer with a view-model carrying only these routes.
     from dataclasses import replace
     subset = replace(vm, routes=tuple(routes))
-    draw_routes(grid, subset, _SubsetState(state, view_key, opened, no_repo_group), x=x, y=y)
+    return draw_routes(grid, subset, _SubsetState(state, view_key, opened, no_repo_group), x=x, y=y)
 
 
 _BAND_W, _BAND_H, _BAND_GAP = 44, 4, 4
@@ -386,6 +415,8 @@ def _stage_grid(grid, x0, y, stages, room, bottom, loops=()):
     if avail - (nrows - 1) < 6 * nrows:
         pitch_gap = 0
     h = max(4, min(10, (avail - pitch_gap * (nrows - 1)) // nrows))
+    if any("group" in stage for stage in stages):
+        h = max(h, 9)          # two stacked boxes need their own rows; what falls below is cut, not overlapped
     pos = []
     hh = (h - 1) // 2
     for index, stage in enumerate(stages):
@@ -575,11 +606,12 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
     for (xx, yy), glyph in (((x, y), "╔"), ((right, y), "╗"), ((x, bottom), "╚"), ((right, bottom), "╝")):
         grid.put(xx, yy, glyph, frame_key)
     if not nodes:
-        grid.put(x + 3, y + 2, "이 route의 stage 기록은 시안 데이터에 넣지 않았습니다 — "
-                 "SR_CorrNet [f5]의 lab 줄과 hearting의 cpu-kst 줄을 눌러 보세요.", "dim")
+        grid.put(x + 3, y + 2, clip("이 route의 stage 기록을 읽지 못했습니다 (route 기록 없음)", max(0, use - 6)),
+                 "dim", limit=right)
         return bottom + 1
     tag = route.get("session_tag")
-    head = [(" ", None), (str(route.get("repo") or "·") + "/", "title_dim"), (" › ", "line")]
+    repo_text = repo_rule_label(route.get("repo"))
+    head = [(" ", None), *(((repo_text, "title_dim"), (" › ", "line")) if repo_text else ())]
     if tag:
         head += [("[", "tag_b"), (str(tag), "soft"), ("]", "tag_b"), (" › ", "line")]
     leg_count = sum(1 for item in route.get("legs") or () if str(item[0]) != "frame")
@@ -674,7 +706,9 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
     if len(stages) < 3:
         stage_room = min(stage_room, 64 * len(stages))
     stage_bottom = bottom
-    raw_lines = tuple((vm.attempts or {}).get("lines", ())) if ident == "f5" and node.get("kind") == "leg" else ()
+    attempts = vm.attempts or {}
+    raw_lines = (tuple(attempts.get("lines", ()))
+                 if str(attempts.get("route") or "") == ident and node.get("kind") == "leg" else ())
     if raw_lines:
         per = min(len(stages), max(3, min(6, (stage_room + 4) // 40)))
         need = ((len(stages) - 1) // per + 1) * 4
