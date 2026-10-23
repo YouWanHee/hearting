@@ -8204,12 +8204,13 @@ def _revision_consumers(route, upstream_id, revision, *, directory, registry, re
                 currency = gate_currency(route, node, canonical_path, marker, observe=True, jobs=registry)
                 if currency.state != "superseded":
                     return None
-                ev = marker.get("evidence") or {}
-                if evidence_digest(ev.get("path")) != ev.get("sha256"):
-                    return None
-                import review_source_subject
-                subject = review_source_subject.marker_currency(route, node, marker, Path(directory), jobs=registry)
-                if subject not in (None, "current"):
+                # A tombstone copies its predecessor. Read that original marker's
+                # evidence and source half through the one shared reader rather
+                # than recomputing its digest here (A-SD154-8).
+                from dispatch_contract import _superseded_marker_predecessor
+                prior_path, prior = _superseded_marker_predecessor(route, node, canonical_path, marker)
+                if evidence_currency(route, node, prior_path, prior, observe=True,
+                                     jobs=registry).state != "current":
                     return None
             elif gate_currency(route, node, canonical_path, marker, observe=True, jobs=registry).state != "current":
                 return None

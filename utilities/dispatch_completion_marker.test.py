@@ -736,6 +736,115 @@ class CompletionMarkerTest(unittest.TestCase):
         marker_path = self.stable_dispatch / "completion" / route["route_id"] / "plan.json"
         return route, route_path, evidence, marker_path
 
+    def _consumed_incident_route(self, name, *, registered_after_observation=True):
+        """SR_CorrNet rt-a2361c0d97558824 shape, through the real writers: `plan`
+        completes, its evidence is edited and that edit is observed, then
+        `plan-check` and `execute` register and complete on the edited plan."""
+        from datetime import datetime, timezone
+        # Keep the registry in the fixture's state root so every writer and
+        # reader below resolves the same completion directory.
+        self.jobs = self.stable_dispatch / "jobs.log"
+        self.jobs.parent.mkdir(parents=True, exist_ok=True)
+        self.jobs.parent.chmod(0o700)
+        route, route_path, evidence, marker_path = self._gates_off_cycle_route(name)
+        nodes = {node["id"]: node for node in route["nodes"]}
+        evidence.write_text("plan v2, owner amendment before the smoke run\n", encoding="utf-8")
+        D.note_evidence_change(route, nodes["plan"], marker_path)
+        launched = (datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    if registered_after_observation else "2026-07-19T00:00:00Z")
+        review = evidence.parent / "_internal" / "plan_reviews" / "round_1.md"
+        review.parent.mkdir(parents=True, exist_ok=True)
+        review.write_text("plan-check passes the amended plan\n", encoding="utf-8")
+        self.write_row("open", "plan-check-r1", "att-consumed-pc", "worker_type=review",
+                       node_id="plan-check", ts=launched)
+        ROUTE.complete_node(route, nodes["plan-check"], "plan-check", review, self.jobs, "att-consumed-pc")
+        log = evidence.parent / "dev_logs" / "implementation.md"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("implemented the amended plan\n", encoding="utf-8")
+        self.write_row("open", "execute", "att-consumed-ex", node_id="execute", ts=launched)
+        completed = self.complete(route_path, "execute", log, jobs=self.jobs, attempt_id="att-consumed-ex")
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        return route, route_path, evidence, marker_path.parent
+
+    def test_revise_keeps_downstream_that_started_after_the_revised_evidence(self):
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "off"}, clear=True):
+            route, route_path, evidence, directory = self._consumed_incident_route("route-consumed-kept.json")
+            result = self.revise(route_path, "plan", evidence, basis="owner-correction",
+                                 reason="fixture: record the observed amendment", jobs=self.jobs)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("tombstoned=-", result.stderr)
+        self.assertIn("kept=execute,plan-check", result.stderr)
+        for node_id in ("plan-check", "execute"):
+            marker = json.loads((directory / f"{node_id}.json").read_text())
+            self.assertEqual(marker["sequence"], 1)
+            self.assertNotIn("state", marker)
+
+    def test_revise_still_tombstones_downstream_registered_before_the_observation(self):
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "off"}, clear=True):
+            route, route_path, evidence, directory = self._consumed_incident_route(
+                "route-consumed-early.json", registered_after_observation=False)
+            result = self.revise(route_path, "plan", evidence, basis="owner-correction",
+                                 reason="fixture: downstream started on the old plan", jobs=self.jobs)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("tombstoned=execute,plan-check", result.stderr)
+        self.assertIn("kept=-", result.stderr)
+
+    def test_start_restores_a_consumed_tombstone_and_a_later_revise_supersedes_it_again(self):
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "off"}, clear=True):
+            route, route_path, evidence, directory = self._consumed_incident_route("route-consumed-restore.json")
+            nodes = {node["id"]: node for node in route["nodes"]}
+            # The pre-fix writer: the same revise without the consumer proof.
+            with mock.patch.object(ROUTE, "_revision_consumers", return_value={}):
+                old = ROUTE.publish_revision_locked(
+                    route, "plan", evidence, basis="owner-correction", reason="fixture: old writer",
+                    author_attempt_id="att-old-writer", jobs=self.jobs)
+            self.assertEqual(sorted(old["tombstoned"]), ["execute", "plan-check"])
+            restored = ROUTE.restore_consumed_tombstones(route, jobs=self.jobs)
+            self.assertEqual(restored["errors"], [])
+            self.assertEqual([row["node"] for row in restored["restored"]], ["plan-check", "execute"])
+            for node_id in ("plan-check", "execute"):
+                marker = json.loads((directory / f"{node_id}.json").read_text())
+                self.assertEqual((marker["sequence"], marker["stage_authority"]), (3, "revision"))
+                self.assertEqual((marker["revision"]["basis"], marker["revision"]["of_sequence"]),
+                                 ("upstream-revision-consumed", 2))
+                self.assertEqual(marker["revision"]["recorded_by"], "runtime-auto")
+                for gates in ("on", "off"):
+                    for observe in (True, False):
+                        with self.subTest(node=node_id, gates=gates, observe=observe), \
+                                mock.patch.dict(os.environ, {"HEARTING_GATES": gates}):
+                            currency = D.gate_currency(route, nodes[node_id], directory / f"{node_id}.json",
+                                                       marker, observe=observe, jobs=self.jobs)
+                            self.assertEqual(currency.state, "current", currency)
+            self.assertFalse([record for record in ROUTE._dependency_revisions(route, nodes["impl-review"], self.jobs)
+                              if record.get("supersedes")])
+            self.assertEqual(ROUTE.restore_consumed_tombstones(route, jobs=self.jobs),
+                             {"restored": [], "errors": []})
+            evidence.write_text("plan v3, a later correction nobody has read\n", encoding="utf-8")
+            later = self.revise(route_path, "plan", evidence, basis="owner-correction",
+                                reason="fixture: a later correction", jobs=self.jobs)
+            self.assertEqual(later.returncode, 0, later.stdout + later.stderr)
+            self.assertIn("tombstoned=execute,plan-check", later.stderr)
+            for node_id in ("plan-check", "execute"):
+                marker = json.loads((directory / f"{node_id}.json").read_text())
+                self.assertEqual((marker["sequence"], marker["state"]), (4, "superseded-by-upstream-revision"))
+                currency = D.gate_currency(route, nodes[node_id], directory / f"{node_id}.json",
+                                           marker, observe=True, jobs=self.jobs)
+                self.assertEqual(currency.state, "superseded", currency)
+
+    def test_restore_keeps_a_tombstone_whose_own_evidence_changed(self):
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "off"}, clear=True):
+            route, _route_path, evidence, directory = self._consumed_incident_route("route-consumed-own-edit.json")
+            with mock.patch.object(ROUTE, "_revision_consumers", return_value={}):
+                ROUTE.publish_revision_locked(
+                    route, "plan", evidence, basis="owner-correction", reason="fixture: old writer",
+                    author_attempt_id="att-old-writer", jobs=self.jobs)
+            log = evidence.parent / "dev_logs" / "implementation.md"
+            log.write_text("implementation log edited after the tombstone\n", encoding="utf-8")
+            restored = ROUTE.restore_consumed_tombstones(route, jobs=self.jobs)
+        self.assertEqual([row["node"] for row in restored["restored"]], ["plan-check"])
+        execute = json.loads((directory / "execute.json").read_text())
+        self.assertEqual((execute["sequence"], execute["state"]), (2, "superseded-by-upstream-revision"))
+
     def test_gates_off_an_evidence_edit_is_history_and_revise_still_records_it(self):
         """The BC deadlock (2026-10-02): with gates off, continuation read the edited
         evidence as current while `revise` refused it as unchanged. Both now read the
@@ -1324,14 +1433,14 @@ class CompletionMarkerTest(unittest.TestCase):
 
 
     # SD-70 fixtures -------------------------------------------------------
-    def write_row(self, status, slug, attempt_id, extra="", node_id="plan"):
+    def write_row(self, status, slug, attempt_id, extra="", node_id="plan", ts="2026-07-19T00:00:00Z"):
         contract = (
             "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
             "execution_surface=registered-headless,registered_worker=1,"
             "fallback_hop=same-harness-headless"
         )
         line = (
-            f"2026-07-19T00:00:00Z\t{status}\t{self.repo}\t{self.repo}\t{slug}\t"
+            f"{ts}\t{status}\t{self.repo}\t{self.repo}\t{slug}\t"
             f"attempt_id={attempt_id},{contract},route_id={self.current_route['route_id']},"
             f"route_hash={self.current_route['route_hash']},"
             f"registry_digest={self.current_route['registry_digest']},route_node={node_id},"
