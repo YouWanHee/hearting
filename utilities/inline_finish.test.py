@@ -109,6 +109,7 @@ class PublicInlineFinishTest(unittest.TestCase):
     CAPABILITY = "autopilot-code"
     CAPABILITY_MODE = "dev"
     CAMPAIGN_ARGUMENTS = ("--campaign-key", "inline-finish-test")
+    non_git = False
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="inline-finish-test-")
@@ -123,21 +124,24 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.home = ROOT
         self.jobs = self.base / "jobs.log"
         self.jobs.write_text("", encoding="utf-8")
-        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
-        subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "test@example.com"], check=True)
-        subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "Inline Finish Test"], check=True)
-        (self.repo / "README.md").write_text("base\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(self.repo), "add", "README.md"], check=True)
-        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "base"], check=True)
+        if not self.non_git:
+            subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+            subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "Inline Finish Test"], check=True)
+            (self.repo / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(self.repo), "add", "README.md"], check=True)
+            subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "base"], check=True)
         self.old_env = {key: os.environ.get(key) for key in (
             "AGENT_HOME", "AGENT_DISPATCH_JOBS", "AGENT_DISPATCH_DEPTH",
             "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_ROUTE_FILE", "AGENT_ROUTE_ID",
             "AGENT_ROUTE_NODE", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID",
+            "AGENT_DISPATCH_REGISTERED_WORKER",
             "OPENCODE_SESSION_ID", "AGENT_DISPATCH_CALLER_HARNESS", "XDG_STATE_HOME",
             "HEARTING_INLINE_FINISH_CRASH_AT", "AGENT_ARTIFACT_CHECKPOINT",
-            "HEARTING_WORKFLOW_GROUP_REVIEW")}
+            "HEARTING_WORKFLOW_GROUP_REVIEW", "GIT_CEILING_DIRECTORIES")}
         os.environ.update({
             "AGENT_HOME": str(self.home), "AGENT_DISPATCH_JOBS": str(self.jobs),
+            "GIT_CEILING_DIRECTORIES": str(self.base),
             "AGENT_DISPATCH_DEPTH": "0", "CODEX_THREAD_ID": "inline-finish-test-session",
             "XDG_STATE_HOME": str(self.base / "state"),
             # Isolate compose/start as well as finish: automatic detached
@@ -149,6 +153,7 @@ class PublicInlineFinishTest(unittest.TestCase):
         })
         for key in ("AGENT_DISPATCH_ATTEMPT_ID", "AGENT_ROUTE_FILE", "AGENT_ROUTE_ID",
                     "AGENT_ROUTE_NODE", "CLAUDE_CODE_SESSION_ID", "OPENCODE_SESSION_ID",
+                    "AGENT_DISPATCH_REGISTERED_WORKER",
                     "AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS",
                     "HEARTING_INLINE_FINISH_CRASH_AT"):
             os.environ.pop(key, None)
@@ -165,6 +170,7 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.prompt = self.base / "task.md"
         self.prompt.write_text("Exercise the direct inline finish transaction.\n", encoding="utf-8")
         compose = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose",
+                   *( ["--start"] if self.non_git else [] ),
                    "--slug", "inline-finish-test", *self.CAMPAIGN_ARGUMENTS,
                    "--shape", "direct", "--capability", self.CAPABILITY, "--capability-mode", self.CAPABILITY_MODE,
                    "--intensity", "direct", "--cwd", str(self.repo),
@@ -175,14 +181,22 @@ class PublicInlineFinishTest(unittest.TestCase):
         composed = subprocess.run(compose, cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
         self.assertEqual(composed.returncode, 0, composed.stderr)
         route_receipt = json.loads(composed.stdout)
-        self.route_file = Path(route_receipt["route_file"])
+        if self.non_git:
+            route_path_line = next((line for line in composed.stderr.splitlines() if line.startswith("route_file=")), None)
+            self.assertIsNotNone(route_path_line, composed.stderr)
+            self.route_file = Path(route_path_line.split("=", 1)[1])
+        else:
+            self.route_file = Path(route_receipt["route_file"])
         self.route = json.loads(self.route_file.read_text(encoding="utf-8"))
-        started = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), "start",
-                                  "--route", str(self.route_file), "--jobs", str(self.jobs)],
-                                 cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
-        self.assertEqual(started.returncode, 0, started.stderr)
+        start_output = composed.stdout + composed.stderr
+        if not self.non_git:
+            started = subprocess.run([sys.executable, str(ROOT / "utilities/capability-route.py"), "start",
+                                      "--route", str(self.route_file), "--jobs", str(self.jobs)],
+                                     cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
+            self.assertEqual(started.returncode, 0, started.stderr)
+            start_output = started.stdout + started.stderr
         self.cycle = artifact_producer.route_cycle_for(self.root, self.route)
-        self.assertIsNotNone(self.cycle, started.stdout + started.stderr + repr(artifact_producer.status(self.root)))
+        self.assertIsNotNone(self.cycle, start_output + repr(artifact_producer.status(self.root)))
         self.cycle_dir = artifact_producer.cycle_dir(
             self.root, self.cycle["campaign_id"], self.cycle["cycle_id"], self.cycle)
         self.evidence = self.cycle_dir / "artifacts/documents/evidence.md"
@@ -1114,6 +1128,73 @@ class PublicInlineFinishTest(unittest.TestCase):
         refused = self.finish()
         self.assertNotEqual(refused.returncode, 0)
         self.assertFalse((self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json").exists())
+
+
+class NonGitInlineFinishTest(unittest.TestCase):
+    def test_non_git_finish_resumes_after_manifest_crash_without_git_probes(self):
+        fixture = PublicInlineFinishTest()
+        fixture.non_git = True
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        fake_bin = fixture.base / "fake-bin"
+        fake_bin.mkdir()
+        git_path = subprocess.check_output(["which", "git"], text=True).strip()
+        calls = fixture.base / "git-calls.log"
+        wrapper = fake_bin / "git"
+        wrapper.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_CALL_LOG\"\nexec "
+                          + git_path + " \"$@\"\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+        env = fixture.env.copy()
+        env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+        env["GIT_CALL_LOG"] = str(calls)
+        env["HEARTING_INLINE_FINISH_CRASH_AT"] = "after-manifest"
+        crashed = subprocess.run(fixture.command, cwd=fixture.repo, env=env,
+                                 capture_output=True, text=True)
+        self.assertNotEqual(crashed.returncode, 0)
+        self.assertIn("simulated crash after manifest publish", crashed.stderr)
+        env.pop("HEARTING_INLINE_FINISH_CRASH_AT")
+        resumed = subprocess.run(fixture.command, cwd=fixture.repo, env=env,
+                                 capture_output=True, text=True)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+        receipt = json.loads(resumed.stdout)
+        self.assertTrue(receipt["replay"])
+        outcome = json.loads(CAP.outcome_path(fixture.route_file).read_text(encoding="utf-8"))
+        self.assertTrue(outcome["terminal_gate_proven"])
+        self.assertIsNone(outcome["head_commit"])
+        self.assertIsNone(receipt["commit"])
+        self.assertFalse(calls.exists(), calls.read_text(encoding="utf-8") if calls.exists() else "")
+        self.assertEqual(artifact_producer.read_cycle_record(fixture.root, fixture.cycle["cycle_id"])["state"],
+                         "sealed")
+
+    def test_public_non_git_compose_start_finishes_with_null_head_and_no_git_probe(self):
+        fixture = PublicInlineFinishTest()
+        fixture.non_git = True
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        self.assertEqual(fixture.route.get("source_commit"), "unversioned")
+        self.assertFalse((fixture.repo / ".git").exists())
+        fixture.command.extend(["--commit", "not-a-commit"])
+        fake_bin = fixture.base / "fake-bin"
+        fake_bin.mkdir()
+        git_path = subprocess.check_output(["which", "git"], text=True).strip()
+        calls = fixture.base / "git-calls.log"
+        git_wrapper = fake_bin / "git"
+        git_wrapper.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_CALL_LOG\"\nexec "
+                              + git_path + " \"$@\"\n", encoding="utf-8")
+        git_wrapper.chmod(0o755)
+        env = fixture.env.copy()
+        env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+        env["GIT_CALL_LOG"] = str(calls)
+        finished = subprocess.run(fixture.command, cwd=fixture.repo, env=env, capture_output=True, text=True)
+        self.assertEqual(finished.returncode, 0, finished.stderr + finished.stdout)
+        receipt = json.loads(finished.stdout)
+        outcome = json.loads(CAP.outcome_path(fixture.route_file).read_text(encoding="utf-8"))
+        self.assertTrue(outcome["terminal_gate_proven"])
+        self.assertIsNone(outcome["head_commit"])
+        self.assertIsNone(receipt["commit"])
+        self.assertFalse(calls.exists(), calls.read_text(encoding="utf-8") if calls.exists() else "")
+        sealed = artifact_producer.read_cycle_record(fixture.root, fixture.cycle["cycle_id"])
+        self.assertEqual(sealed["state"], "sealed")
 
 
 class SpecInlinePublicationTest(unittest.TestCase):
