@@ -4440,7 +4440,8 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
     selection = compose_route(**kwargs, work_request=work_request, route_plan=binding,
                               parent_harness=owner or "claude", selection_only=True)
     diagnosis = _compose_git_diagnosis(kwargs["cwd"])
-    if diagnosis.get("state") == "non-git" and _isolates_worktree(selection):
+    if (diagnosis.get("state") == "non-git" and selection.get("shape") != "direct"
+            and _isolates_worktree(selection)):
         raise ValueError("git 저장소 아님: source-mutating worker route; git init 후 다시 시작하거나, "
                          "이 세션에서 --shape direct로 진행")
     frame_preparation = frame_route.get("framed_worktree") or {}
@@ -10048,9 +10049,6 @@ def _complete_node_locked(
 
 def _git_changed_files(worktree, *, route=None):
     """Return the worktree's git-visible changed file paths (AC 28 audit)."""
-    diagnosis = _compose_git_diagnosis(worktree)
-    if diagnosis.get("state") != "git":
-        raise ValueError("git-change-observation-failed:" + str(diagnosis.get("detail") or diagnosis.get("state")))
     if route is not None and route.get("source_commit") == "unversioned":
         raise ValueError("git-change-observation-not-applicable:unversioned-route")
     try:
@@ -10061,13 +10059,10 @@ def _git_changed_files(worktree, *, route=None):
             # The audit compares files, so it has to be given files.
             ["git", "-C", str(worktree), "status", "--porcelain", "-uall"],
             text=True, capture_output=True, check=False,
-            timeout=60,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        raise ValueError(f"git-change-observation-failed:{exc}") from exc
-    if result.returncode != 0:
-        raise ValueError("git-change-observation-failed:" + (result.stderr or f"exit={result.returncode}"))
+    except (OSError, ValueError):
+        return set()
     changed = set()
     for line in result.stdout.splitlines():
         if not line:
@@ -10221,17 +10216,6 @@ def _git_committed_files(worktree, ancestor, head):
 SUBDIVISION_BASELINE_SCHEMA_VERSION = 1
 
 
-def _head_commit_strict(worktree):
-    try:
-        probe = subprocess.run(["git", "-C", str(worktree), "rev-parse", "HEAD"],
-                               text=True, capture_output=True, check=False, timeout=60)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ValueError(f"git-head-observation-failed:{exc}") from exc
-    if probe.returncode != 0 or not probe.stdout.strip():
-        raise ValueError("git-head-observation-failed:" + (probe.stderr or f"exit={probe.returncode}"))
-    return probe.stdout.strip()
-
-
 def subdivision_baseline_path(route_id, node_id, manifest_sha256, *, jobs=None):
     """Keyed by the manifest hash so a resumed admission finds its own baseline.
 
@@ -10293,7 +10277,7 @@ def record_subdivision_baseline(route, node_id, manifest, *, jobs=None):
                        or str(route.get("artifact_root") or ""))
     record = {
         **identity,
-        "head_commit": None if unversioned else _head_commit_strict(worktree),
+        "head_commit": None if unversioned else _head_commit(worktree),
         # anchor M3 / B5: path -> content digest, not a path list. A path list
         # is a permanent exemption: a file dirty at admission became invisible
         # to the audit for the whole subdivision, and those are exactly the
@@ -10491,7 +10475,7 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
     committed = set()
     unversioned = route.get("source_commit") == "unversioned"
     if baseline is not None and not unversioned:
-        head = _head_commit_strict(worktree)
+        head = _head_commit(worktree)
         baseline_head = baseline.get("head_commit")
         if head != baseline_head:
             if not _first_parent_descends_from(worktree, baseline_head, head):

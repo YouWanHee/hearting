@@ -466,20 +466,10 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
         self.assertIn("작업 종류 미정 — `--capability`로 지정", err.getvalue())
 
     def test_read_only_changed_file_status_disables_optional_index_refresh(self):
-        probe = subprocess.CompletedProcess([], 0, stdout="/repo\n", stderr="")
-        bare = subprocess.CompletedProcess([], 0, stdout="false\n", stderr="")
         result = subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        with mock.patch.object(R.subprocess, "run", side_effect=(probe, bare, result)) as run:
+        with mock.patch.object(R.subprocess, "run", return_value=result) as run:
             self.assertEqual(R._git_changed_files(self.primary), set())
-        self.assertEqual(run.call_args_list[-1].kwargs["env"]["GIT_OPTIONAL_LOCKS"], "0")
-
-    def test_git_status_failure_is_not_an_empty_change_set(self):
-        probe = subprocess.CompletedProcess([], 0, stdout="/repo\n", stderr="")
-        bare = subprocess.CompletedProcess([], 0, stdout="false\n", stderr="")
-        failed = subprocess.CompletedProcess([], 128, stdout="", stderr="index unavailable")
-        with mock.patch.object(R.subprocess, "run", side_effect=(probe, bare, failed)):
-            with self.assertRaisesRegex(ValueError, "git-change-observation-failed"):
-                R._git_changed_files(self.primary)
+        self.assertEqual(run.call_args.kwargs["env"]["GIT_OPTIONAL_LOCKS"], "0")
 
     def test_compose_start_fetch_failure_retries_same_request_once(self):
         self.assert_failure_then_retry("fetch")

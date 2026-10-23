@@ -260,11 +260,11 @@ def _owner_row_proof(fields: list[str], meta: dict[str, str], *, route: dict,
         raise OwnerRouteBindingError("owner-route-owner-worktree-mismatch")
     expected_worktree = str(Path(raw_worktree).resolve(strict=False))
     expected_repo = ""
+    from dispatch_contract import DispatchContractError, work_root_identity
     try:
-        from dispatch_contract import work_root_identity
         expected_repo = work_root_identity(
             expected_worktree, route=route, allow_sealed_repo_fallback=True)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, DispatchContractError):
         # Hermetic callers may provide an explicit sealed repository identity.
         expected_repo = str(route.get("repo") or "")
     if fields[3] != expected_worktree:

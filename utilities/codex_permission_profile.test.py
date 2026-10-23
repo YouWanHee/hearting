@@ -25,15 +25,10 @@ import fixture_processes  # noqa: E402
 
 def require_native_runtime(testcase):
     reason = None
-    if (os.environ.get("HEARTING_TEST_NATIVE_CODEX") != "1"
-            or os.environ.get("HEARTING_ENV_LAYOUT") == "github-runner"):
-        reason = "native Codex payload tests run in the headless acceptance leg; unit suites use profile/argv assertions"
     try:
         sandbox_init = Path("/proc/1/cmdline").read_bytes()
     except OSError:
         sandbox_init = b""
-    if reason:
-        testcase.skipTest(reason)
     if (os.environ.get("CODEX_PERMISSION_PROFILE") or b"codex-linux-sandbox" in sandbox_init):
         reason = "native Codex sandbox tests cannot nest inside an active Codex permission sandbox"
     elif sys.platform != "linux":
