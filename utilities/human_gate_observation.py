@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import sys
 from collections import OrderedDict
 from datetime import datetime
@@ -370,6 +371,30 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
             except (TypeError, ValueError, OverflowError):
                 return float(fallback)
 
+    def sidecar_activity_since(harness, session_id):
+        """Newest exact transcript/rollout mtime already available on disk."""
+        if harness == "codex":
+            home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+            candidates = home.glob("sessions/**/rollout-*-%s.jsonl" % session_id)
+        elif harness == "claude":
+            home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+            candidates = home.glob("projects/*/%s.jsonl" % session_id)
+        else:
+            return None
+        newest = None
+        try:
+            for candidate in candidates:
+                try:
+                    if candidate.is_symlink() or not candidate.is_file():
+                        continue
+                    mtime = candidate.stat().st_mtime
+                except OSError:
+                    continue
+                newest = mtime if newest is None else max(newest, mtime)
+        except OSError:
+            return None
+        return newest
+
     # S1 stores only exact identity and timing. Native question text is private
     # to the runtime and is never recovered from a prompt or sidecar.
     try:
@@ -392,10 +417,20 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                     continue
                 sid = path.stem
                 sess = sessions_by_key.get((harness, sid))
+                sidecar = interaction.read_wait(sid, harness)
+                activity_since = None
+                if sidecar and sidecar.get("source") != "codex-appserver":
+                    activity_since = (getattr(sess, "_interaction_activity", None)
+                                      if sess is not None else None)
+                    transcript_activity = sidecar_activity_since(harness, sid)
+                    if transcript_activity is not None:
+                        activity_since = max(
+                            (value for value in (activity_since, transcript_activity)
+                             if isinstance(value, (int, float))), default=None)
                 record = interaction.pending_wait(
                     sid, harness,
                     session_start=getattr(sess, "started_at", None) if sess is not None else None,
-                    activity_since=getattr(sess, "_interaction_activity", None) if sess is not None else None,
+                    activity_since=activity_since,
                     now=instant)
                 if not record:
                     continue

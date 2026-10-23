@@ -115,6 +115,32 @@ class HumanWaitStateTests(unittest.TestCase):
             self.assertNotIn("s1-current", {item["owner"]["session_id"]
                                             for item in closed["items"]})
 
+    def test_producer_closes_codex_sidecar_from_later_rollout_mtime_without_sessions(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from tools.fleet import interaction
+        now = 2_000_000
+        sid = "12345678-1234-1234-1234-123456789abc"
+        state_dir = Path(self.tmp.name) / "interactions"
+        codex_home = Path(self.tmp.name) / "codex-home"
+        rollout = codex_home / "sessions" / "2026" / "10" / "23" / ("rollout-2026-10-23T00-00-00-" + sid + ".jsonl")
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text('{"type":"event_msg"}\n', encoding="utf-8")
+        os.utime(rollout, (now - 10, now - 10))
+        with mock.patch.dict(os.environ, {"FLEET_INTERACTION_STATE_DIR": str(state_dir),
+                                          "CODEX_HOME": str(codex_home)}):
+            self.assertTrue(interaction.set_wait(sid, "codex", "decision",
+                                                 "codex-rollout", now=now - 100))
+            # This is the detached producer path: no Fleet session objects supplied.
+            closed = observation.read_answer_waits(jobs_paths=(), now=now)
+            self.assertEqual(closed["total"], 0)
+
+            missing_sid = "abcdefab-1234-1234-1234-123456789abc"
+            self.assertTrue(interaction.set_wait(missing_sid, "codex", "decision",
+                                                 "codex-rollout", now=now - 100))
+            still_pending = observation.read_answer_waits(jobs_paths=(), now=now)
+            self.assertIn(missing_sid, {item["owner"]["session_id"]
+                                        for item in still_pending["items"]})
+
     def test_fake_herdr_gets_quiet_registration_and_only_six_hour_sound(self):
         import time
         bin_dir = Path(self.tmp.name) / "bin"
