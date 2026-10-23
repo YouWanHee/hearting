@@ -56,9 +56,18 @@ def _child_main(evidence_dir, explorer=False):
 
     evidence_dir = Path(evidence_dir)
     render.set_explorer_mode(explorer)
+    if explorer:
+        # The synthetic explorer reads the frozen redacted view model, so a route
+        # page with an owner-raw scroll strip exists without any host discovery.
+        from fleet.explorer import live as explorer_live
+        from fleet.explorer.view_model import load_fixture
+        fixture_vm = load_fixture(Path(__file__).parent / "fixtures" / "explorer" / "view_model.json")
+        explorer_live.build_view_model = lambda *_args, **_kwargs: fixture_vm
     event_path = evidence_dir / "events.jsonl"
     state_path = evidence_dir / "state.json"
+    reducer_path = evidence_dir / "effects.jsonl"
     event_path.write_text("", encoding="utf-8")
+    reducer_path.write_text("", encoding="utf-8")
     cfg = {"requested_mask": None, "supported_mask": None, "mouseinterval": None}
 
     def event(kind, **fields):
@@ -76,6 +85,15 @@ def _child_main(evidence_dir, explorer=False):
                         session_id="pty-fixture-sid-%02d" % i,
                         liveness="working", elapsed_min=i + 1)
                 for i in range(24)]
+
+    if explorer:
+        # Session order and the frozen view model must name the same sessions.
+        sessions = [Session(harness=str(item.get("harness") or "codex"), pid=61001 + i,
+                            proc_start="pty-fixture-start-%02d" % i,
+                            cwd="/tmp/fleet-pty-fixture", slug="fixture-%02d" % i,
+                            title="synthetic session %02d" % i, session_id=str(item["tag"]),
+                            liveness="working", elapsed_min=i + 1)
+                    for i, item in enumerate(fixture_vm.sessions)]
 
     def collect_all(**_kwargs):
         return LiveSnapshot(sessions=list(sessions))
@@ -169,6 +187,8 @@ def _child_main(evidence_dir, explorer=False):
                            "folds": [list(item) for item in explorer_state.folds],
                            "scroll": [list(item) for item in explorer_state.scroll]}
                           if explorer_state is not None else None),
+                "hits": ([[hit.y, hit.x0, hit.x1, list(hit.action)]
+                          for hit in getattr(frame, "hits", ())] if frame is not None else []),
             }
         _write_json(state_path, state)
         return result
@@ -197,6 +217,23 @@ def _child_main(evidence_dir, explorer=False):
         return result
 
     render._CursesInput.read = capture_input_read
+    from fleet.explorer import state as explorer_state_module
+    original_reduce = explorer_state_module.reduce
+
+    def capture_reduce(*args, **kwargs):
+        result = original_reduce(*args, **kwargs)
+        row = {"utc": _utc(), "type": args[1].get("type") if len(args) > 1 and
+               isinstance(args[1], dict) else "key", "event": args[1] if len(args) > 1 and
+               isinstance(args[1], dict) else str(args[1]),
+               "state": {"view": result[0].view, "scope": result[0].scope,
+                         "usage_open": result[0].usage_open,
+                         "scroll": [list(item) for item in result[0].scroll]},
+               "effects": [list(item) for item in result[1]]}
+        with reducer_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        return result
+
+    explorer_state_module.reduce = capture_reduce
     original_mouse_event = render._handle_mouse_event
 
     def capture_mouse_event(x, y, bstate):
@@ -763,16 +800,19 @@ class PtyRun:
 
         # Multiple complete inputs in one write remain ordered and each reaches the live loop.
         start_index = len(self.read_events())
+        start_reducers = len(self.read_jsonl("effects.jsonl"))
         self.send(b"\tu", "batched-tab-usage")
         batched = self.wait_for("both batched keys reach the input loop",
                                 lambda _s: len([row for row in self.read_events()[start_index:]
                                                 if row.get("kind") == "decoded-key-read"
-                                                and row.get("key") in ("tab", "u")]) >= 2)
+                                                and row.get("key") in ("tab", "u")]) >= 2 and
+                                len(self.read_jsonl("effects.jsonl")) >= start_reducers + 2)
         keys = [row.get("key") for row in self.read_events()[start_index:]
                 if row.get("kind") == "decoded-key-read"]
         self.check("batched tab and usage keys preserve order", keys[:2] == ["tab", "u"], keys)
         self.check("batched tab and usage keys both change explorer state",
-                   batched["explorer"]["state"]["view"] != initial["view"] and
+                   batched["explorer"]["state"]["view"] == initial["view"] and
+                   batched["explorer"]["state"]["scope"] == "-" and
                    batched["explorer"]["state"]["usage_open"] != initial["usage_open"],
                    batched["explorer"]["state"])
 
@@ -784,6 +824,107 @@ class PtyRun:
         self.check("usage toggles in live explorer",
                    changed["explorer"]["state"]["usage_open"] != before_f["usage_open"],
                    changed["explorer"]["state"])
+
+        # Arrow navigation, Enter's advisory focus request, and both parent steps
+        # are exercised through the real PTY reader/reducer/draw loop.
+        entered = changed["explorer"]["state"]
+        self.send(b"\x1b[A", "explorer-up-session")
+        up_state = self.wait_for("up key selects a session page",
+                                 lambda s: s.get("explorer", {}).get("state", {}).get("scope")
+                                 not in (None, "-"))
+        self.check("up key changes the selected session page",
+                   up_state["explorer"]["state"]["scope"] != entered.get("scope"),
+                   up_state["explorer"]["state"])
+        self.send(b"\r", "explorer-enter-pane")
+        effects = self.wait_for("Enter emits an advisory pane request",
+                                lambda _s: any(row.get("effects") for row in
+                                               self.read_jsonl("effects.jsonl")))
+        effect_rows = self.read_jsonl("effects.jsonl")
+        self.check("Enter requests pane focus without executing a command",
+                   any(item[:1] == ["focus"] for row in effect_rows
+                       for item in row.get("effects", [])) and
+                   not any(item[:1] == ["command"] for row in effect_rows
+                           for item in row.get("effects", [])),
+                   effect_rows[-3:])
+        before_escape = effects["explorer"]["state"]["scope"]
+        self.send(b"\x1b", "explorer-escape-parent")
+        parent = self.wait_for("Escape returns to the session parent",
+                               lambda s: s.get("explorer", {}).get("state", {}).get("scope")
+                               != before_escape)
+        parent_scope = parent["explorer"]["state"]["scope"]
+        self.send(b"\x7f", "explorer-backspace-parent")
+        root = self.wait_for("Backspace returns to the list",
+                             lambda s: s.get("explorer", {}).get("state", {}).get("scope")
+                             == "-")
+        self.check("Escape and Backspace walk page parents",
+                   parent_scope != "-" and root["explorer"]["state"]["scope"] == "-",
+                   {"session": before_escape, "parent": parent_scope,
+                    "list": root["explorer"]["state"]})
+
+        # Several complete packets in one PTY write retain order; wheel and
+        # button-1 drag packets are decoded even when this synthetic page has no
+        # scrollable record to move.
+        start = len(self.read_events())
+        self.send(b"\x1b[<64;10;5M\x1b[<65;10;5M", "explorer-wheel-both-directions")
+        self.send(b"\x1b[<0;10;5M\x1b[<32;10;8M\x1b[<0;10;8m",
+                  "explorer-drag-press-motion-release")
+        mouse_rows = self.wait_for("wheel and drag packets reach the decoder",
+                                   lambda _s: len([row for row in self.read_events()[start:]
+                                                   if row.get("kind") == "decoded-mouse-read"]) >= 5)
+        decoded_mouse = [row for row in self.read_events()[start:]
+                         if row.get("kind") == "decoded-mouse-read"]
+        self.check("wheel packets and drag motion are decoded in order",
+                   len(decoded_mouse) >= 5 and
+                   any(row.get("bstate") & getattr(curses, "BUTTON4_PRESSED", 0)
+                       for row in decoded_mouse) and
+                   any(row.get("bstate") & getattr(curses, "BUTTON5_PRESSED", 0)
+                       for row in decoded_mouse) and
+                   any(row.get("bstate") & (1 << 30) for row in decoded_mouse),
+                   decoded_mouse)
+
+        # Open a route page whose owner-raw strip scrolls, then move it by wheel and drag.
+        route_hit = next((hit for hit in root["explorer"]["hits"] if hit[3][:1] == ["route"]
+                          and hit[3][1] == "f5"), None)
+        self.check("list offers the f5 route row", route_hit is not None, root["explorer"]["hits"][:12])
+        row_y, x0 = route_hit[0], route_hit[1]
+        self.send(b"\x1b[<0;%d;%dM\x1b[<0;%d;%dm" % (x0 + 4, row_y + 1, x0 + 4, row_y + 1),
+                  "explorer-click-route-row")
+        page = self.wait_for("route page with a scroll strip opens",
+                             lambda s: s.get("explorer", {}).get("state", {}).get("scope") == "route:f5" and
+                             any(hit[3][:2] == ["scroll", "rawoff"] for hit in s["explorer"]["hits"]))
+        strip = next(hit for hit in page["explorer"]["hits"] if hit[3][:2] == ["scroll", "rawoff"])
+        strip_y, strip_x, top = strip[0] + 1, strip[1] + 4, strip[3][2]
+        self.check("owner raw strip can scroll", top >= 6, strip)
+
+        def rawoff(state):
+            return dict((k, v) for k, v in state["explorer"]["state"]["scroll"]).get("rawoff", 0)
+
+        self.send(b"\x1b[<64;%d;%dM" % (strip_x + 1, strip_y + 1), "explorer-strip-wheel-back")
+        back = self.wait_for("wheel moves the strip back three rows", lambda s: rawoff(s) == 3)
+        self.send(b"\x1b[<65;%d;%dM" % (strip_x + 1, strip_y + 1), "explorer-strip-wheel-forward")
+        forward = self.wait_for("opposite wheel returns it", lambda s: rawoff(s) == 0)
+        self.send(b"\x1b[<0;%d;%dM" % (strip_x + 1, strip_y + 1), "explorer-strip-drag-press")
+        self.send(b"\x1b[<32;%d;%dM" % (strip_x + 1, strip_y + 3), "explorer-strip-drag-motion")
+        dragged = self.wait_for("drag motion follows the pointer", lambda s: rawoff(s) == 2)
+        self.send(b"\x1b[<32;%d;%dM" % (strip_x + 1, strip_y + 5), "explorer-strip-drag-further")
+        further = self.wait_for("drag keeps following", lambda s: rawoff(s) == 4)
+        self.send(b"\x1b[<0;%d;%dm" % (strip_x + 1, strip_y + 5), "explorer-strip-drag-release")
+        self.send(b"\x1b[<32;%d;%dM" % (strip_x + 1, strip_y + 7), "explorer-strip-motion-after-release")
+        self.drain(0.3)
+        self.check("wheel and drag change the strip's scroll offset",
+                   rawoff(back) == 3 and rawoff(forward) == 0 and rawoff(dragged) == 2 and
+                   rawoff(further) == 4 and rawoff(self.state()) == 4,
+                   {"wheel_back": rawoff(back), "wheel_forward": rawoff(forward),
+                    "drag": rawoff(dragged), "drag_more": rawoff(further),
+                    "after_release": rawoff(self.state())})
+
+    def read_jsonl(self, name):
+        try:
+            path = self.evidence_dir / name
+            return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+        except (OSError, json.JSONDecodeError):
+            return []
 
 
 def main():

@@ -228,17 +228,18 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
         grid.put(box_left + 56, y + 1, "→", "line")
         _model_cell(grid, box_left + 59, y + 1, harness, (model_choice, effort_choice), shown, effort_keys, 40)
     grid.put(box_left + 3, y + 3, "model", "label")
-    _chips(grid, box_left + 12, y + 3, choices.get(harness, ()), current_model, values.get("ui:model"), "model", right - 1, shown)
+    _chips(grid, box_left + 12, y + 3, choices.get(harness, ()), current_model, values.get("ui:model"), "model", right - 2, shown)
     grid.put(box_left + 3, y + 4, "effort", "label")
     effort_options = tuple(data.get("efforts", ())) + (("runtime-default",) if harness == "opencode" else ())
-    _chips(grid, box_left + 12, y + 4, effort_options, current_effort, values.get("ui:effort"), "effort", right - 1)
+    _chips(grid, box_left + 12, y + 4, effort_options, current_effort, values.get("ui:effort"), "effort", right - 2)
     command = f"hearting model set {harness} profile/{profile} {model_choice}@{effort_choice}"
-    grid.put(box_left + 3, y + 6, "$ " + command, "soft" if changed else "dim", limit=right - 15)
+    grid.put(box_left + 3, y + 6, "$ ", "line")
+    cursor = grid.put(box_left + 5, y + 6, command, "soft" if changed else "dim")
     if changed:
-        grid.add_hit(y + 6, right - 11, right - 2, ("ui", "apply", "dry-run: " + command + " --dry-run (시안이라 실행 안 함)"))
-        grid.add_hit(y + 6, right - 2, right - 1, ("ui", "apply", "적용: " + command + " (시안이라 실행 안 함)"))
-        grid.put(right - 11, y + 6, "[ dry-run ]", "title_dim", limit=right - 2)
-        grid.put(right - 2, y + 6, "[ apply ]", "chip_on", limit=right - 1)
+        cursor = grid.put(cursor + 3, y + 6, "[ dry-run ]", "title_dim")
+        grid.add_hit(y + 6, cursor - 11, cursor, ("ui", "apply", "dry-run: " + command + " --dry-run (시안이라 실행 안 함)"))
+        cursor = grid.put(cursor + 2, y + 6, "[ apply ]", "chip_on")
+        grid.add_hit(y + 6, cursor - 9, cursor, ("ui", "apply", "적용: " + command + " (시안이라 실행 안 함)"))
     y += 10
     if slim:
         grid.put(box_left + 3, box_top + 7, "pool", "label")
@@ -246,9 +247,11 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
         if pool:
             order, note = pool
             pool_order = order[0] if order and isinstance(order[0], (list, tuple)) else order
-            grid.put(box_left + 12, box_top + 7, " › ".join(pool_order) + ("  " + note if note else ""), "soft", limit=right - 1)
+            cursor = grid.put(box_left + 12, box_top + 7, " › ".join(pool_order), "soft", limit=right - 2)
+            if note:
+                grid.put(cursor, box_top + 7, "  " + note, "dim", limit=right - 2)
         else:
-            grid.put(box_left + 12, box_top + 7, "route-sealed explicit choice only", "dim", limit=right - 1)
+            grid.put(box_left + 12, box_top + 7, "route-sealed explicit choice only", "dim", limit=right - 2)
     foot = "models.conf → .bak backup · new sessions and launches only · sealed routes keep their choice"
     grid.put(box_left + 2, box_bottom, " ", "branch_s")
     grid.put(box_left + 3, box_bottom, foot, "dim", limit=right)

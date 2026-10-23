@@ -86,73 +86,135 @@ def card_rows(lines, width):
     return result
 
 
-def dialogue_rows(lines, width, harness="claude"):
-    """Render structured or legacy dialogue records with harness-native prompt marks."""
-    marks = {"claude": (">", "●", "⎿"), "codex": ("›", "•", "└"),
-             "opencode": (">", "●", "⎿")}.get(str(harness), (">", "●", "⎿"))
-    user_mark, agent_mark, elbow = marks
-    role_pattern = re.compile(r"^(user|assistant|thinking|tool output|tool [^:]{1,32}|description|attachment|runtime_wait|supervisor): ?(.*)$")
+_ROLE = re.compile(r"^(user|assistant|thinking|tool output|tool [^:]{1,32}|description|attachment|"
+                   r"runtime_wait|supervisor): ?(.*)$")
+_OUT_ROWS = 3
+_DESC_INLINE = ("Bash", "Agent", "Task", "Monitor")
+_LOOK = {"claude": (">", "●", "●", "⎿"), "codex": ("›", "•", "•", "└"),
+         "opencode": (">", "●", "●", "⎿")}
+_CODEX_VERB = {"exec_command": "Ran", "shell": "Ran", "wait": "Waited", "apply_patch": "Edited"}
+_ERR = re.compile(r"(^|\b)(error|Error|ERROR|Traceback|exit code [1-9]|Exit code [1-9])|<tool_use_error>")
+_ST_USER, _ST_AGENT, _ST_CODE = ("v", 0, 0), ("w", 0, 0), ("l", 0, 0)
+_ST_DIM, _ST_NAME, _ST_ARG = ("d", 0, 1), ("w", 1, 0), ("d", 0, 0)
+
+
+def _md_spans(text, base):
+    spans = []
+    for index, part in enumerate(re.split(r"(`[^`]+`)", text)):
+        if index % 2:
+            spans.append((part[1:-1], _ST_CODE))
+            continue
+        for offset, piece in enumerate(part.split("**")):
+            if piece:
+                spans.append((piece, (base[0], 1, base[2]) if offset % 2 else base))
+    return spans
+
+
+def _clip_spans(spans, width):
+    rows = wrap_spans(spans, width)
+    return rows[0] if len(rows) == 1 else wrap_spans(spans, width - 1)[0] + [("…", _ST_DIM)]
+
+
+def _log_events(lines):
     events, current = [], None
     for item in lines:
         if isinstance(item, dict):
-            head, body = str(item.get("role", "assistant")), str(item.get("text", ""))
-        else:
-            raw = str(item)
-            match = role_pattern.match(raw)
-            head, body = match.groups() if match else ("", raw)
-        if not head:
+            item = f"{item.get('role', 'assistant')}: {item.get('text', '')}"
+        line = str(item)
+        match = _ROLE.match(line)
+        if not match:
             if current is None:
                 current = {"kind": "assistant", "text": [], "out": None, "cont": True}
                 events.append(current)
-            target = current["out"] if current["kind"] == "tool" and current["out"] is not None else current["text"]
-            target.append(body)
+            (current["out"] if current["kind"] == "tool" and current["out"] is not None
+             else current["text"]).append(line)
             continue
-        if current and current["kind"] == "tool" and current["out"] is None and head in ("description", "tool output"):
+        head, text = match.groups()
+        if current and current["kind"] == "tool" and current["out"] is None and head in (
+                "description", "tool output"):
             if head == "description":
-                current["desc"] = body
+                current["desc"] = text
             else:
-                current["out"] = [body]
+                current["out"] = [text]
+            continue
+        if head == "supervisor" and current and current["kind"] == "supervisor":
+            current["text"].append(text)
             continue
         if head.startswith("tool ") and head != "tool output":
-            current = {"kind": "tool", "name": head[5:], "text": [body] if body else [], "out": None}
+            name = head[5:]
+            desc_only = name in _DESC_INLINE and text
+            current = {"kind": "tool", "name": name, "text": [] if desc_only or not text else [text],
+                       "desc": text if desc_only else "", "out": None}
         else:
-            current = {"kind": head, "text": [body], "out": None}
+            current = {"kind": head, "text": [text], "out": None}
         events.append(current)
+    return events
 
+
+def dialogue_rows(lines, width, harness="claude"):
+    """Raw lines drawn the way the harness's own screen draws its transcript, in Fleet colours."""
+    from .output import clip
+    you, said, called, elbow = _LOOK.get(str(harness), _LOOK["claude"])
     rows = []
 
-    def paragraph(prefix, texts, base, tint=None):
+    def para(lead, texts, base, tint=None):
+        indent = [(" " * sum(cell_width(text) for text, _key in lead), None)]
         first = True
-        indent = " " * sum(cell_width(text) for text, _key in prefix)
         for text in texts:
-            wrapped = wrap_spans(markdown_spans(text, base), max(8, width - cell_width(indent)))
-            for row in wrapped:
-                rows.append(((prefix if first else [(indent, None)]) + row, tint))
+            spans = _md_spans(text, base)
+            if text.lstrip().startswith("#"):
+                spans = [(text.lstrip("# ").replace("**", ""), (base[0], 1, base[2]))]
+            for part in wrap_spans(spans, max(8, width - sum(cell_width(t) for t, _k in indent))):
+                rows.append(((lead if first else indent) + part, tint))
                 first = False
 
-    for event in events:
+    for event in _log_events(lines):
         kind = event["kind"]
         if kind in ("attachment", "description"):
             continue
         if rows:
             rows.append(([], None))
         if kind == "user":
-            paragraph([(user_mark + " ", "dim")], event["text"], "v", 234)
+            para([(you + " ", _ST_DIM)], event["text"], _ST_USER, 234)
         elif kind == "assistant":
-            prefix = [("  ", None)] if event.get("cont") else [(agent_mark + " ", "soft")]
-            paragraph(prefix, event["text"], "soft")
+            para([("  ", None)] if event.get("cont") else [(said + " ", _ST_AGENT)],
+                 event["text"], _ST_AGENT)
         elif kind == "thinking":
-            rows.append(([('✻ Thinking…', "dim")], None))
+            rows.append(([("✻ Thinking…", _ST_DIM)], None))
         elif kind == "tool":
-            output = [str(value) for value in (event.get("out") or [])]
-            for index, value in enumerate(output[:3]):
-                prefix = "  " + elbow + "  " if index == 0 else "     "
-                rows.extend(([(prefix, "dim")] + row, None) for row in
-                            wrap_spans([(_strip_token(value), "dim")], max(8, width - 5)))
-            if len(output) > 3:
-                rows.append(([('     … +%d lines' % (len(output) - 3), "dim")], None))
+            out = [text for text in (event["out"] or [])
+                   if text.strip() not in ("<persisted-output>", "</persisted-output>")]
+            dot = ("r", 0, 0) if any(_ERR.search(text) for text in out[:2]) else ("g", 0, 0)
+            arg = next((text.strip() for text in event["text"] if text.strip()), "")
+            arg = re.sub(r"^(file_path|path|pattern|url|query|command|prompt): ", "", arg)
+            name = _CODEX_VERB.get(event["name"], event["name"]) if harness == "codex" else event["name"]
+            head = [(called + " ", dot), (name, _ST_NAME)]
+            room = width - sum(cell_width(text) for text, _key in head) - 2
+            if arg and event.get("desc"):
+                arg = clip(arg, max(20, room * 3 // 5))
+            if arg:
+                head += [(" " + arg, _ST_ARG)] if harness == "codex" else [("(" + arg + ")", _ST_ARG)]
+            if event.get("desc"):
+                head.append(("  " + event["desc"], _ST_DIM if arg else _ST_ARG))
+            rows.append((_clip_spans(head, width), None))
+            for index, text in enumerate(out[:_OUT_ROWS]):
+                lead = "  %s  " % elbow if index == 0 else "     "
+                rows.append(([(lead, _ST_DIM)] + _clip_spans([(text, _ST_DIM)], width - 5), None))
+            if len(out) > _OUT_ROWS:
+                rows.append(([("     … +%d lines" % (len(out) - _OUT_ROWS), _ST_DIM)], None))
+        elif kind == "runtime_wait":
+            rows.append(([("⏸ waiting · " + " ".join(event["text"]), _ST_DIM)], None))
+        elif kind == "supervisor":
+            seen = []
+            for text in (text.replace("event ", "") for text in event["text"]):
+                if not seen or seen[-1][0] != text:
+                    seen.append([text, 1])
+                else:
+                    seen[-1][1] += 1
+            line = " · ".join(text + (" ×%d" % count if count > 1 else "") for text, count in seen)
+            rows.append((_clip_spans([("⋯ runtime  ", _ST_DIM), (line, _ST_DIM)], width), None))
         else:
-            paragraph([(agent_mark + " ", "dim")], event["text"], "dim")
+            para([("  ", None)], event["text"], _ST_DIM)
     return rows
 
 

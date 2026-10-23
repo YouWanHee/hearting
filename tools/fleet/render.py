@@ -10012,9 +10012,10 @@ class _CursesInput:
     _SGR_TIMEOUT = 0.20
     _MAX_SEQUENCE = 64
 
-    def __init__(self, curses_mod, mouse_enabled=True):
+    def __init__(self, curses_mod, mouse_enabled=True, explorer_mode=False):
         self.curses = curses_mod
         self.mouse_enabled = mouse_enabled
+        self.explorer_mode = bool(explorer_mode)
         self.pending = bytearray()
         self.pending_since = None
         self.discarding_sgr = False
@@ -10067,7 +10068,10 @@ class _CursesInput:
         # xterm SGR supports button 0..2, modifiers 4/8/16, motion 32,
         # vertical wheel 64/65, and release through the `m` final. Fleet
         # intentionally acts only on buttons 0..2 and vertical wheel presses.
-        if button < 0 or button & ~0x5f or button & 32:
+        motion = bool(button & 32)
+        if button < 0 or button & ~0x7f:
+            return 0
+        if motion and (button & 64 or not self.explorer_mode):
             return 0
         if button & 64:
             if released or (button & 3) not in (0, 1):
@@ -10078,6 +10082,12 @@ class _CursesInput:
             number = button & 3
             if number == 3:
                 return 0
+            if motion:
+                if number != 0 or released:
+                    return 0
+                state = getattr(self.curses, "BUTTON1_PRESSED", 0)
+                state |= _EXPLORER_MOUSE_MOTION
+                return state
             if released:
                 state = getattr(self.curses, "BUTTON%d_RELEASED" % (number + 1), 0)
             else:
@@ -10703,6 +10713,7 @@ def _configure_input(curses_mod, env):
 
 
 _EXPLORER_TEXT = bytearray()   # a partly received UTF-8 character typed into the / search
+_EXPLORER_MOUSE_MOTION = 1 << 30  # private marker carried beside curses' button state
 
 
 def _explorer_searching():
@@ -10736,15 +10747,30 @@ def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
     if ch == curses.KEY_MOUSE:
         mx, my, bstate = mouse_event if mouse_event is not None else _getmouse_event()
         if mx is not None and size is not None and _explorer_click_current(size, snapshot):
-            hit = next((item for item in getattr(_EXPLORER_FRAME, "hits", ())
-                        if item.y == my and item.x0 <= mx < item.x1), None)
-            if hit is not None:
-                _EXPLORER_STATE, _effects = reduce(state, {"type": "click", "action": hit.action},
-                                                    _EXPLORER_FRAME)
+            if bstate & getattr(curses, "BUTTON4_PRESSED", 0):
+                event = {"type": "wheel", "direction": 1, "x": mx, "y": my}
+            elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
+                event = {"type": "wheel", "direction": -1, "x": mx, "y": my}
+            elif bstate & _EXPLORER_MOUSE_MOTION:
+                event = {"type": "mouse", "phase": "press", "button": 0,
+                         "motion": True, "x": mx, "y": my}
+            elif bstate & (getattr(curses, "BUTTON1_RELEASED", 0)):
+                event = {"type": "mouse", "phase": "release", "button": 0,
+                         "x": mx, "y": my}
+            elif bstate & (getattr(curses, "BUTTON1_PRESSED", 0) |
+                           getattr(curses, "BUTTON1_CLICKED", 0)):
+                event = {"type": "mouse", "phase": "press", "button": 0,
+                         "x": mx, "y": my}
+            else:
+                return
+            order = tuple("session:" + str(item) for item in _EXPLORER_ORDER)
+            _EXPLORER_STATE, _effects = reduce(state, {**event, "order": order}, _EXPLORER_FRAME)
         return
     key = _explorer_key_name(ch)
     if key:
-        _EXPLORER_STATE, _effects = reduce(state, key, _EXPLORER_FRAME)
+        order = tuple("session:" + str(item) for item in _EXPLORER_ORDER)
+        _EXPLORER_STATE, _effects = reduce(state, {"type": "key", "key": key,
+                                                    "order": order}, _EXPLORER_FRAME)
 
 
 def _explorer_note_earlier(before, key):
@@ -10774,7 +10800,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     keypad = getattr(stdscr, "keypad", None)
     if callable(keypad):
         keypad(False)
-    input_reader = _CursesInput(curses, mouse_enabled=mouse_enabled)
+    input_reader = _CursesInput(curses, mouse_enabled=mouse_enabled,
+                                explorer_mode=_EXPLORER_ENABLED)
 
     from . import details
     latest_basic = [None]

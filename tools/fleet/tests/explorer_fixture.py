@@ -14,7 +14,8 @@ def load_source():
     source = json.loads((FIXTURE_DIR / "source.json").read_text(encoding="utf-8"))
     if "view_model" in source:
         view_model = json.loads((FIXTURE_DIR / source["view_model"]).read_text(encoding="utf-8"))
-        return {**source, "sources": [view_model["values"]]}
+        from tools.fleet.explorer.view_model import decode_fixture_values
+        return {**source, "sources": [decode_fixture_values(view_model["values"])]}
     return source
 
 

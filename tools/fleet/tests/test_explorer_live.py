@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from tools.fleet.explorer.live import build_view_model
+from tools.fleet.explorer.view_model import load_fixture
 from tools.fleet.model import Session
 
 
@@ -25,8 +26,7 @@ class CoreFields(unittest.TestCase):
 
     def test_reference_fixture_has_complete_scrubbed_core_records(self):
         path = Path(__file__).parent / "fixtures" / "explorer" / "view_model.json"
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        vm = build_view_model(payload)
+        vm = load_fixture(path)
         self.assertGreater(len(vm.hosts), 0)
         self.assertGreater(len(vm.sessions), 0)
         self.assertGreater(len(vm.routes), 0)

@@ -24,9 +24,8 @@ def draw_history(grid, vm, state, x=34, y=3):
     y += 1
     previous_repo = None
     for seat in seats:
-        if y >= bottom:
-            grid.put(right - 18, bottom, "↓ more below", "dim", limit=right)
-            return
+        if y > bottom:
+            break
         tag = str(seat[0])
         repo = str(seat[1])
         generation_count = int(seat[2]) if len(seat) > 2 else 0
@@ -69,54 +68,8 @@ def draw_history(grid, vm, state, x=34, y=3):
         if is_open:
             _tint_row(grid, y, x - 1, right, 236)
         y += 1
-        if not is_open:
-            continue
-        generations = tuple((vm.generations or {}).get(tag, ()))
-        has_history_detail = any(isinstance(item, Mapping) and item.get("detail") for item in generations)
-        if generations and not has_history_detail:
-            grid.put(x + 6, y, f"{generation_count} generations · last clear {last_clear.split(' · ')[0]} · card history begins after snapshot",
-                     "dim", limit=right)
-            y += 1
-            continue
-        selected_generation = state.opened_for("ui:gen:" + tag)
-        card_indices = [i for i, item in enumerate(generations)
-                        if isinstance(item, Mapping) and item.get("card")]
-        default_generation = card_indices[-1] if card_indices else len(generations) - 1
-        selected_y = None
-        for index in range(len(generations) - 1, -1, -1):
-            if y >= bottom:
-                grid.put(right - 18, bottom, "↓ more below", "dim", limit=right)
-                return
-            gen = generations[index]
-            selected = selected_generation == str(index) or (not selected_generation and index == default_generation)
-            grid.add_hit(y, x + 6, right, ("ui", "gen:" + tag, index))
-            if selected:
-                grid.fill(x + 6, right, y, " ", tint=234)
-                grid.put(x + 4, y, "▶", "soft")
-                selected_y = y
-            h = str(gen.get("harness") or harness) if isinstance(gen, Mapping) else harness
-            at = str(gen.get("at") or "") if isinstance(gen, Mapping) else ""
-            kind = str(gen.get("kind") or "new") if isinstance(gen, Mapping) else "new"
-            sid = str(gen.get("sid") or "") if isinstance(gen, Mapping) else ""
-            connection = str(gen.get("connection") or "seat start") if isinstance(gen, Mapping) else "seat start"
-            title = str(gen.get("title") or "") if isinstance(gen, Mapping) else ""
-            grid.put(x + 6, y, "now" if at == "now" else f"{index + 1:3d}", "soft")
-            grid.put(x + 12, y, at if at != "now" else "", "dim")
-            hue = {"claude": "c", "codex": "m", "opencode": "l"}.get(h, "d")
-            grid.put(x + 26, y, {"new": "●", "cont": "○", "existing": "◆"}.get(kind, "●"),
-                     (hue, 1, 0))
-            cursor = grid.put(x + 28, y, h, "hb_" + h)
-            grid.put(cursor + 1, y, sid, "dim")
-            grid.put(x + 48, y, _clip(connection, 30), "blocked" if kind == "existing" else "dim")
-            grid.put(x + 81, y, _clip(title, max(0, use - 75 - 6)),
-                     "soft" if isinstance(gen, Mapping) and gen.get("card") else "dim", limit=right)
-            if selected:
-                _tint_row(grid, y, x + 5, right, 234)
-            y += 1
-        if selected_y is not None and y < bottom:
-            from .pages import draw_history_detail
-            y = draw_history_detail(grid, vm, state, tag, x + 6, right, y, bottom)
-            return
+        if is_open:
+            y = draw_seat_expand(grid, vm, state, tag, x, use, y, bottom, seat, harness) + 1
     if y + 3 <= bottom:
         footer_end = x + use
         cursor = grid.put(x + 2, y + 1, "●", "soft", limit=footer_end)
@@ -127,6 +80,62 @@ def draw_history(grid, vm, state, x=34, y=3):
         cursor = grid.put(cursor, y + 1, " a running session took over (retire)   ", "dim", limit=footer_end)
         cursor = grid.put(cursor, y + 1, "colour", "soft", limit=footer_end)
         grid.put(cursor, y + 1, " = harness   ·   click a row: its generations here", "dim", limit=footer_end)
+
+
+def draw_seat_expand(grid, vm, state, tag, x, use, y, bottom, seat, harness):
+    """A seat's generations newest first, then the picked card and conversation; returns the next row."""
+    x0 = x + 6
+    generations = tuple((vm.generations or {}).get(tag, ()))
+    has_history_detail = any(isinstance(item, Mapping) and item.get("detail") for item in generations)
+    if not generations or not has_history_detail:
+        count = int(seat[2]) if len(seat) > 2 else 0
+        last_clear = str(seat[3] if len(seat) > 3 else "·").split(" · ")[0]
+        cursor = grid.put(x0, y, f"{count} generations", "soft", limit=x + use + 1)
+        grid.put(cursor, y, f"  · last clear {last_clear}   22:53 전에 남은 카드 본문이 없습니다.",
+                 "dim", limit=x + use + 1)
+        return y + 1
+    right = x + use + 1
+    selected_generation = state.opened_for("ui:gen:" + tag)
+    card_indices = [i for i, item in enumerate(generations)
+                    if isinstance(item, Mapping) and item.get("card")]
+    default_generation = card_indices[-1] if card_indices else len(generations) - 1
+    selected = default_generation
+    if selected_generation.isdigit() and 0 <= int(selected_generation) < len(generations):
+        selected = int(selected_generation)
+    for index in range(len(generations) - 1, -1, -1):
+        if y > bottom:
+            return y
+        gen = generations[index]
+        grid.add_hit(y, x0, right, ("ui", "gen:" + tag, index))
+        if index == selected:
+            grid.fill(x0, right, y, " ", tint=234)
+            grid.put(x0 - 2, y, "▶", "soft")
+        h = str(gen.get("harness") or harness) if isinstance(gen, Mapping) else harness
+        at = str(gen.get("at") or "") if isinstance(gen, Mapping) else ""
+        kind = str(gen.get("kind") or "new") if isinstance(gen, Mapping) else "new"
+        sid = str(gen.get("sid") or "") if isinstance(gen, Mapping) else ""
+        connection = str(gen.get("connection") or "seat start") if isinstance(gen, Mapping) else "seat start"
+        title = str(gen.get("title") or "") if isinstance(gen, Mapping) else ""
+        if not title:
+            title = ("from another seat" if isinstance(gen, Mapping) and gen.get("note") else
+                     "no card" if at != "now" else "current generation · no card yet")
+        grid.put(x0, y, "now" if at == "now" else f"{index + 1:3d}", "soft")
+        grid.put(x0 + 6, y, at if at != "now" else "", "dim")
+        hue = {"claude": "c", "codex": "m", "opencode": "l"}.get(h, "d")
+        grid.put(x0 + 20, y, {"new": "●", "cont": "○", "existing": "◆"}.get(kind, "●"), (hue, 1, 0))
+        cursor = grid.put(x0 + 22, y, h, "hb_" + h)
+        grid.put(cursor + 1, y, sid, "dim")
+        grid.put(x0 + 42, y, _clip(connection, 30), "blocked" if kind == "existing" else "dim")
+        grid.put(x0 + 75, y, _clip(title, max(0, use - 75 - 6)),
+                 "soft" if isinstance(gen, Mapping) and gen.get("card") else "dim", limit=right)
+        if index == selected:
+            _tint_row(grid, y, x0 - 1, right, 234)
+        y += 1
+    if bottom - y < 4:
+        grid.put(x0, min(y, bottom), "↓ card · conversation need a taller pane", "dim")
+        return y + 1
+    from .pages import draw_history_detail
+    return draw_history_detail(grid, vm, state, tag, x0, right, y, bottom)
 
 
 def _draw_history_compact(grid, vm, state, x, y, use, right, bottom):

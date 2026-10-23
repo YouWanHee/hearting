@@ -15,7 +15,7 @@ KEY_ALIASES = {
     "colhead": "section_head", "sect": "section_head",
     "lvl_g": "grp_live", "lvl_y": "g_idle", "lvl_r": "g_dead",
     "chip_on": "hearting_name", "eff_medium": "branch_s",
-    "bold": "section_head", "code": "hb_opencode", "tool": "g_work",
+    "fam_opus": "hb_claude", "fam_gpt": "g_idle", "bold": "section_head", "code": "hb_opencode", "tool": "g_work",
 }
 
 REFERENCE_STYLES = {

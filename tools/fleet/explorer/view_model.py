@@ -25,6 +25,20 @@ def thaw(value):
     return value
 
 
+def decode_fixture_values(value):
+    """Expand the compact long-string encoding used by the checked JSON fixture."""
+    if isinstance(value, Mapping):
+        if set(value) == {"__fixture_zlib_b85__"}:
+            import base64
+            import zlib
+            raw = base64.b85decode(value["__fixture_zlib_b85__"].encode("ascii"))
+            return zlib.decompress(raw).decode("utf-8")
+        return {str(key): decode_fixture_values(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [decode_fixture_values(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class ExplorerViewModel:
     """Typed, deeply immutable projection; absent fields stay absent/unknown."""
@@ -82,5 +96,5 @@ def load_fixture(path):
 
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(data, Mapping) and "values" in data:
-        data = data["values"]
+        data = decode_fixture_values(data["values"])
     return ExplorerViewModel.from_mapping(data)

@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import copy
 import hashlib
 import importlib.util
 import json
 import sys
+import types
+import zlib
 from pathlib import Path
+from unittest import mock
 
 
 def digest(path: Path) -> str:
@@ -60,7 +65,7 @@ _STYLE_KEYS.update({
     "done", "work", "idle", "spin", "g_spin", "g_spin_dim", "g_work", "g_work_off",
     "g_blocked", "g_dead", "grp_live", "grp_hot", "grp_cool", "g_idle", "lvl_y",
     "lvl_y_dim", "lvl_r", "lvl_r_dim", "blocked", "steward", "accent", "hearting",
-    "gpu_ada", "eff_medium", "eff_xhigh", "version_release", "fam_gpt", "code",
+    "gpu_ada", "eff_medium", "eff_xhigh", "version_release", "fam_gpt", "fam_opus", "code",
     "stg0_on", "stg1_on", "stg2_on", "stg3_on", "stg4_on", "stg0_off", "stg1_off",
     "stg2_off", "stg3_off", "stg4_off", "unknown",
 })
@@ -412,7 +417,7 @@ def _fixture_values(renderer):
     }
 
 
-def capture(reference: Path, cols: int, view="OVERVIEW", ui=None, scope=None) -> dict:
+def capture(reference: Path, cols: int, view="OVERVIEW", ui=None, scope=None, uopen=False) -> dict:
     renderer = load_reference(reference)
     renderer.path = reference
     sanitize_reference(renderer)
@@ -460,7 +465,7 @@ def capture(reference: Path, cols: int, view="OVERVIEW", ui=None, scope=None) ->
                     function.__globals__["section"] = scrubbed_section
                     function.__globals__["card_title"] = renderer.card_title
     renderer.grammar = scrubbed_grammar
-    grid, hits = renderer.render_state(scope, view, cols, 45, False)
+    grid, hits = renderer.render_state(scope, view, cols, 45, bool(uopen))
     if view == "MEMORY":
         # Public fixture records keep their original display width but do not
         # publish memory project names or record bodies from the live source.
@@ -562,6 +567,213 @@ def _compact_states(states):
     return states
 
 
+def _pack_fixture_strings(value):
+    """Compress long redacted fixture strings while leaving short fields readable."""
+    if isinstance(value, str) and len(value) >= 96:
+        packed = base64.b85encode(zlib.compress(value.encode("utf-8"), 9)).decode("ascii")
+        if len(packed) + 32 < len(value):
+            return {"__fixture_zlib_b85__": packed}
+    if isinstance(value, dict):
+        return {key: _pack_fixture_strings(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_pack_fixture_strings(item) for item in value]
+    return value
+
+
+class _TraceDone(Exception):
+    pass
+
+
+def run_viewer_trace(reference: Path, cols: int, chunks: list[bytes]) -> list[dict]:
+    """Run the approved view.py main loop with scripted terminal I/O and its own renderer."""
+    viewer_path = reference / "view.py"
+    spec = importlib.util.spec_from_file_location("fleet_reference_viewer", viewer_path)
+    viewer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(viewer)
+    pending = list(chunks)
+    trace = []
+    stdout = types.SimpleNamespace(write=lambda _value: None, flush=lambda: None)
+    stdin = types.SimpleNamespace(fileno=lambda: 41)
+
+    def read(_fd, _size):
+        if not pending:
+            raise _TraceDone()
+        return pending.pop(0)
+
+    def select_ready(_r, _w, _x, _timeout=None):
+        if pending:
+            return ([41], [], [])
+        raise _TraceDone()
+
+    def render_state(st, beat):
+        snap = copy.deepcopy(st)
+        rendered = capture(reference, cols, str(st["tab"]), ui=st["ui"], scope=st["scope"],
+                           uopen=st["uopen"])
+        trace.append({"st": snap, "frame": _compact_capture(copy.deepcopy(rendered))})
+        rows = ["".join(cell[0] for cell in row) for row in rendered["cells"]]
+        result = types.SimpleNamespace(returncode=0,
+                                       stdout=json.dumps({"hits": rendered["hits"], "rows": rows}),
+                                       stderr="")
+        return result, cols, 46
+
+    session_order = list(load_reference(reference).SESS_ORDER)
+    fake_subprocess = types.SimpleNamespace(
+        run=lambda *_a, **_kw: types.SimpleNamespace(returncode=0,
+            stdout=json.dumps(session_order), stderr=""))
+    fake_os = types.SimpleNamespace(**{name: getattr(viewer.os, name) for name in dir(viewer.os)
+                                       if not name.startswith("_")})
+    fake_os.read = read
+    fake_os.get_terminal_size = lambda *_a, **_kw: types.SimpleNamespace(columns=cols, lines=46)
+    fake_time = types.SimpleNamespace(time=lambda: 1000.0)
+    viewer.os, viewer.select, viewer.subprocess = fake_os, types.SimpleNamespace(select=select_ready), fake_subprocess
+    viewer.termios = types.SimpleNamespace(tcgetattr=lambda _fd: [], tcsetattr=lambda *_a: None,
+                                           TCSADRAIN=0)
+    viewer.tty = types.SimpleNamespace(setcbreak=lambda _fd: None)
+    viewer.signal = types.SimpleNamespace(SIGWINCH=28, signal=lambda *_a: None)
+    viewer.time = fake_time
+    viewer.sys = types.SimpleNamespace(stdin=stdin, stdout=stdout, executable=sys.executable,
+                                       path=sys.path)
+    viewer.draw = render_state
+    try:
+        viewer.main()
+    except _TraceDone:
+        pass
+    return trace
+
+
+def _trace_cases(reference: Path) -> tuple[list[dict], list[dict]]:
+    """Freeze viewer-main input paths and intern identical cell frames across cases."""
+    cases, frames, frame_ids, rows, row_ids = [], [], {}, [], {}
+
+    def click(cols, action, view="OVERVIEW", scope=None, ui=None):
+        frame = capture(reference, cols, view, scope=scope, ui=ui or {})
+        hit = next((row for row in frame["hits"] if tuple(row[3][:len(action)]) == action), None)
+        if hit is None:
+            raise RuntimeError(f"reference hit missing: {view} {action}")
+        x = hit[1] + max(0, (hit[2] - hit[1] - 1) // 2)
+        return f"\x1b[<0;{x + 1};{hit[0] + 1}M".encode()
+
+    def add(name, cols, chunks):
+        trace = run_viewer_trace(reference, cols, chunks)
+        compact = []
+        for step in trace:
+            frame = step["frame"]
+            cell_rows = []
+            for row in frame["cells"]:
+                row_token = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+                row_index = row_ids.get(row_token)
+                if row_index is None:
+                    row_index = len(rows)
+                    row_ids[row_token] = row_index
+                    rows.append(row)
+                cell_rows.append(row_index)
+            frame["cells"] = cell_rows
+            token = json.dumps(frame, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            index = frame_ids.get(token)
+            if index is None:
+                index = len(frames)
+                frame_ids[token] = index
+                frames.append(frame)
+            compact.append({"st": step["st"], "frame": index})
+        cases.append({"name": name, "cols": cols,
+                      "chunks": [chunk.decode("latin1") for chunk in chunks], "trace": compact})
+
+    for cols in (140, 168):
+        # Four established families remain, now with the full navigation and interaction matrix.
+        base = [
+            ("tab-cycle", [b"\t", b"\x1b[Z", b"\x1b[C", b"\x1b[D", b"q"]),
+            ("split-down", [b"\x1b", b"[B", b"q"]),
+            ("usage-filter-feed", [b"u", b"/F", b"q"]),
+        ]
+        for name, chunks in base:
+            add(name, cols, chunks)
+
+        for label, action in (("repo-row", ("scope", "repo:xxxxxxxx")),
+                              ("session-row", ("scope", "f5")),
+                              ("route-row", ("route", "row1")),
+                              ("hidden-ended-route-highlight", ("route", "f5")),
+                              ("view-row", ("tab", "HISTORY")),
+                              ("memory-row", ("tab", "MEMORY")),
+                              ("models-row", ("tab", "MODELS")),
+                              ("system-row", ("tab", "SYSTEM")),
+                              ("compute-row", ("root", "COMPUTE"))):
+            add(label, cols, [click(cols, action), b"q"])
+
+        # Page navigation, parent traversal, return-to-list, and focused session cycling.
+        add("route-session-repo-list", cols, [click(cols, ("route", "f5")), b"\x1b", b"\x1b", b"\x1b", b"q"])
+        add("backspace-parent-chain", cols, [click(cols, ("route", "f5")), b"\x7f", b"\x1b", b"\x7f", b"q"])
+        add("session-enter-tab-return", cols, [click(cols, ("scope", "f5")), b"\r", b"\t", b"q"])
+        add("session-cycle-wrap", cols, [click(cols, ("scope", "f5")), b"\x1b[B", b"\x1b[A", b"q"])
+        add("tab-arrows", cols, [b"\x1b[C", b"\x1b[D", b"\x1b[Z", b"q"])
+
+        # One fold control per list, with independent screen-local state.
+        for label, view, action in (
+            ("overview-session-fold", "OVERVIEW", ("fold", "sopen:OVERVIEW")),
+            ("overview-route-expand", "OVERVIEW", ("root", "ROUTES")),
+            ("routes-fold", "ROUTES", ("fold", "ropen:ROUTES")),
+            ("questions-toggle", "QUESTIONS", ("fold", "qshut:QUESTIONS")),
+            ("questions-answer-fold", "QUESTIONS", ("fold", "aopen:QUESTIONS")),
+            ("history-seat-fold", "HISTORY", ("fold", "hopen:HISTORY")),
+            ("history-generation", "HISTORY", ("ui", "gen:0c")),
+            ("peers-box-fold", "PEERS", ("fold", "pfocus:PEERS")),
+        ):
+            if label == "questions-answer-fold" and cols == 168:
+                # No answered row clips at this width in the approved source data.
+                continue
+            if label == "history-generation":
+                seat = click(cols, ("fold", "hopen:HISTORY"), view=view)
+                generation = click(cols, action, view=view, ui={"hopen:HISTORY": "0c"})
+                add(label, cols, [click(cols, ("tab", view)), seat, generation, b"q"])
+            else:
+                hit = click(cols, action, view=view)
+                add(label, cols, [click(cols, ("tab", view)), hit, b"q"])
+
+        # Fold state belongs to its view and survives a round trip without bleeding.
+        add("fold-view-isolation", cols, [
+            click(cols, ("tab", "OVERVIEW")),
+            click(cols, ("fold", "sopen:OVERVIEW")),
+            click(cols, ("tab", "ROUTES")),
+            click(cols, ("fold", "ropen:ROUTES"), view="ROUTES"),
+            click(cols, ("tab", "OVERVIEW")),
+            click(cols, ("tab", "ROUTES")), b"q"])
+
+        # A single read checks that the second click uses the just-created ROUTES hit map.
+        route_toggle = click(cols, ("fold", "ropen:ROUTES"), view="ROUTES")
+        add("fresh-hit-same-read", cols, [click(cols, ("root", "ROUTES")) + route_toggle, b"q"])
+
+        # Wheel over the raw-output strip, split SGR, reverse direction, then drag 32 motion.
+        route_page = capture(reference, cols, scope="route:f5")
+        scroll_hit = next(hit for hit in route_page["hits"] if hit[3][0] == "scroll")
+        wx, wy = scroll_hit[1] + 3, scroll_hit[0]
+        route_click = click(cols, ("route", "f5"))
+        add("route-scroll-split-sgr", cols, [
+            route_click,
+            f"\x1b[<64;{wx + 1}".encode(), f";{wy + 1}M".encode(),
+            f"\x1b[<65;{wx + 1};{wy + 1}M".encode(), b"q"])
+        add("route-drag-motion32", cols, [route_click,
+            f"\x1b[<0;{wx + 1};{wy + 1}M".encode(),
+            f"\x1b[<32;{wx + 1};{wy + 33}M".encode(),
+            f"\x1b[<0;{wx + 1};{wy + 33}m".encode(), b"q"])
+        add("clipped-click-noop", cols, [click(cols, ("route", "f5")),
+            f"\x1b[<0;{cols};{wy + 1}M".encode(), b"q"])
+        history_open = capture(reference, cols, "HISTORY", ui={"hopen:HISTORY": "0c"})
+        card_hit = next(hit for hit in history_open["hits"] if hit[3][0] == "scroll" and
+                        str(hit[3][1]).startswith("card:"))
+        dialogue_hit = next(hit for hit in history_open["hits"] if hit[3][0] == "scroll" and
+                            str(hit[3][1]).startswith("log:"))
+        chunks = [click(cols, ("tab", "HISTORY")),
+                  click(cols, ("fold", "hopen:HISTORY"), view="HISTORY")]
+        for hit in (card_hit, dialogue_hit):
+            sx, sy = hit[1] + 2, hit[0]
+            chunks.extend((f"\x1b[<64;{sx + 1};{sy + 1}M".encode(),
+                           f"\x1b[<65;{sx + 1};{sy + 1}M".encode()))
+        chunks.append(b"q")
+        add("card-dialogue-scroll-sign", cols, chunks)
+        add("split-escape-and-arrows", cols, [b"\x1b", b"[B", b"\x1b[<0;10", b";5M", b"q"])
+
+    return cases, frames, rows
+
+
 def build(reference: Path, output: Path) -> dict:
     required = ["README.md", "BRIEF.md", "mock13.py", "view.py", "state.json",
                 "raw_f5.json", "logs_hist.json", "history_data.json"]
@@ -597,15 +809,20 @@ def build(reference: Path, output: Path) -> dict:
     renderer.path = reference
     sanitize_reference(renderer)
     values = _fixture_values(renderer)
+    transition_cases, transition_frames, transition_rows = _trace_cases(reference)
     return {
         "manifest.json": manifest,
         "cells-140.json": {**_compact_capture(capture(reference, 140)),
                            "list_states": _compact_states(list_captures(reference, 140))},
         "cells-168.json": {**_compact_capture(capture(reference, 168)),
                            "list_states": _compact_states(list_captures(reference, 168))},
-        "view_model.json": {"schema": 1, "fixture": "synthetic-core", "values": values},
+        "view_model.json": {"schema": 1, "fixture": "synthetic-core",
+                            "encoding": "zlib-b85-long-strings-v1",
+                            "values": _pack_fixture_strings(values)},
         "source.json": {"schema": 1, "fixture": "synthetic-core", "view_model": "view_model.json"},
-        "transitions.json": {"schema": 1, "cases": []},
+        "transitions.json": {"schema": 2, "rows": transition_rows,
+                             "frames": transition_frames,
+                             "cases": transition_cases},
         "README.md": {
             "schema": 1,
             "text": (
@@ -613,11 +830,19 @@ def build(reference: Path, output: Path) -> dict:
                 "cells-140.json and cells-168.json store each cell row as exact "
                 "[glyph, colour_key, tint, count] runs; the oracle expands them and compares every cell "
                 "and ordered hit array for every state. source.json points to view_model.json, which "
-                "contains the same source values; test helpers derive the source wrapper from it.\n\n"
+                "contains the same source values; long redacted strings use the fixture's transparent "
+                "zlib/base85 encoding and test helpers decode them on load.\n\n"
                 "PEERS is checked structurally because the approved reference hand-places repository "
                 "frames and link lanes. The check asserts visible link lanes, every graph node and edge "
                 "kind, non-empty full-state hits, fewer hits after selecting f5, the selected link count, "
                 "and its selection tint. It covers PEERS-pick-f5 at both 140 and 168 columns.\n\n"
+                "transitions.json is compact unindented JSON: cases store each viewer-main input chunk "
+                "and a trace of state/frame references; shared frames intern identical frames, while "
+                "the rows pool interns repeated cell rows stored as exact run-length records. Transition "
+                "PEERS frames use the same "
+                "structural node, edge, selection, and hit assertions as the PEERS screen oracle because "
+                "the approved reference hand-places its graph lanes. Other transition frames compare all "
+                "cells and ordered hits exactly.\n\n"
                 "Repository-only test runs compare the committed goldens. Running freeze_explorer.py "
                 "--check with the external approved reference directory re-verifies provenance using "
                 "the input hashes in manifest.json. The reference renderer and PNGs are intentionally "
@@ -645,7 +870,7 @@ def main() -> int:
     mismatches = []
     for name, value in generated.items():
         target = args.output / name
-        indent = None if name in ("cells-140.json", "cells-168.json") else 2
+        indent = None if name in ("cells-140.json", "cells-168.json", "transitions.json", "view_model.json") else 2
         data = (json.dumps(value, ensure_ascii=False, indent=indent, separators=(",", ":") if indent is None else None) + "\n").encode() if name.endswith(".json") else (value["text"] + "\n").encode()
         if args.check:
             if not target.is_file() or target.read_bytes() != data:

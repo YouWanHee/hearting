@@ -63,61 +63,81 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
         grid.put(cx, 0, text, key)
         cx += len(text)
     usage = tuple(vm.usage or ())
-    if state.usage_open:
-        usage = usage[:3]
-    else:
+    if not state.usage_open:
         more_x = width - 9
         grid.put(more_x, 1, "u", "hearting", limit=width - 1)
         grid.put(more_x + 1, 1, " more ▸", "dim", limit=width - 1)
-    x = 1
-    grid.put(x, 1, "usage(week)", "label")
-    x = 14
-    for item in usage:
-        text = item.get("text", "")
-        key = item.get("key", "dim")
-        week = next((window for window in item.get("windows", ())
-                     if window and window[0] == "week"), None)
-        if week is None:
-            continue
-        label, percent, reset = week
-        extras = [(window[0], int(window[1])) for window in item.get("windows", ())
-                  if window and window[0] != "week" and int(window[1]) >= 80]
-        extra_width = sum(3 + len(name) + len(str(value)) + 2 for name, value in extras)
-        fragment_width = len(str(text)) + 1 + 10 + 1 + 4 + 3 + len(str(reset)) + extra_width
-        if x + fragment_width >= width - 12:
-            continue
-        x = grid.put(x, 1, str(text) + " ", key, limit=width - 12)
-        filled = max(1, min(10, round(10 * int(percent) / 100))) if int(percent) else 0
-        x = grid.put(x, 1, "━" * filled, "done", limit=width - 12)
-        x = grid.put(x, 1, "─" * (10 - filled), "dim", limit=width - 12)
-        x = grid.put(x, 1, f" {int(percent):3d}%", "done", limit=width - 12)
-        x = grid.put(x, 1, " ↻ " + str(reset), "dim", limit=width - 12)
-        if extras:
-            x = grid.put(x, 1, "  ", "dim", limit=width - 12)
-            x = grid.put(x, 1, "·", "dim", limit=width - 12)
-            x = grid.put(x, 1, " ", "dim", limit=width - 12)
-            for name, value in extras:
-                x = grid.put(x, 1, f"{name} {value}%", "blocked", limit=width - 12)
-        else:
-            x += 4
+        x = 1
+        grid.put(x, 1, "usage(week)", "label")
+        x = 14
+        for item in usage:
+            text = item.get("text", "")
+            key = item.get("key", "dim")
+            week = next((window for window in item.get("windows", ())
+                         if window and window[0] == "week"), None)
+            if week is None:
+                continue
+            label, percent, reset = week
+            extras = [(window[0], int(window[1])) for window in item.get("windows", ())
+                      if window and window[0] != "week" and int(window[1]) >= 80]
+            extra_width = sum(3 + len(name) + len(str(value)) + 2 for name, value in extras)
+            fragment_width = len(str(text)) + 1 + 10 + 1 + 4 + 3 + len(str(reset)) + extra_width
+            if x + fragment_width >= width - 12:
+                continue
+            x = grid.put(x, 1, str(text) + " ", key, limit=width - 12)
+            filled = max(1, min(10, round(10 * int(percent) / 100))) if int(percent) else 0
+            x = grid.put(x, 1, "━" * filled, "done", limit=width - 12)
+            x = grid.put(x, 1, "─" * (10 - filled), "dim", limit=width - 12)
+            x = grid.put(x, 1, f" {int(percent):3d}%", "done", limit=width - 12)
+            x = grid.put(x, 1, " ↻ " + str(reset), "dim", limit=width - 12)
+            if extras:
+                x = grid.put(x, 1, "  ", "dim", limit=width - 12)
+                x = grid.put(x, 1, "·", "dim", limit=width - 12)
+                x = grid.put(x, 1, " ", "dim", limit=width - 12)
+                for name, value in extras:
+                    x = grid.put(x, 1, f"{name} {value}%", "blocked", limit=width - 12)
+            else:
+                x += 4
+    else:
+        for index, item in enumerate(usage[:3]):
+            y = 1 + index
+            grid.put(1, y, str(item.get("text", "")), item.get("key", "dim"))
+            for win_index, window in enumerate(item.get("windows", ())):
+                if not window:
+                    continue
+                name, percent, reset = window
+                x = 14 + win_index * 40
+                x = grid.put(x, y, str(name).rjust(5), "label")
+                x = grid.put(x + 1, y, "[", "dim")
+                filled = max(1, min(12, round(12 * int(percent) / 100))) if int(percent) else 0
+                gauge_key = "g_blocked" if int(percent) >= 80 else "lvl_y" if int(percent) >= 50 else "lvl_g"
+                x = grid.put(x, y, "━" * filled, gauge_key)
+                x = grid.put(x, y, "─" * (12 - filled), "dim")
+                x = grid.put(x, y, f"{int(percent):4d}%", gauge_key)
+                x = grid.put(x, y, "]", "dim")
+                if reset:
+                    grid.put(x + 1, y, "↻ " + str(reset), "dim")
+        grid.put(width - 9, 1, "u", "hearting", limit=width - 1)
+        grid.put(width - 8, 1, " less ▾", "dim", limit=width - 1)
     if height >= 3:
-        grid.fill(0, width, 2, "━", "line")
-        grid.put(0, 2, "━", "line")
-        grid.put(1, 2, " EXPLORER ", "title_dim")
-        grid.put(NAV_WIDTH, 2, "┳", "line")
-        grid.put(NAV_WIDTH + 1, 2, "━", "line")
-        grid.put(NAV_WIDTH + 2, 2, " ", "dim")
-        grid.put(NAV_WIDTH + 3, 2, "{ ", "dim")
-        grid.put(NAV_WIDTH + 5, 2, str(state.title or state.view), "head",
+        title_y = 4 if state.usage_open else 2
+        grid.fill(0, width, title_y, "━", "line")
+        grid.put(0, title_y, "━", "line")
+        grid.put(1, title_y, " EXPLORER ", "title_dim")
+        grid.put(NAV_WIDTH, title_y, "┳", "line")
+        grid.put(NAV_WIDTH + 1, title_y, "━", "line")
+        grid.put(NAV_WIDTH + 2, title_y, " ", "dim")
+        grid.put(NAV_WIDTH + 3, title_y, "{ ", "dim")
+        grid.put(NAV_WIDTH + 5, title_y, str(state.title or state.view), "head",
                  limit=width - 1)
         title_end = NAV_WIDTH + 5 + len(str(state.title or state.view))
-        grid.put(title_end, 2, " ", "dim", limit=width - 1)
-        grid.put(title_end + 1, 2, "} ", "dim", limit=width - 1)
-        grid.put(title_end + 3, 2, "━" * max(0, width - title_end - 4), "line", limit=width - 1)
-        for row in range(3, max(3, height - 4)):
+        grid.put(title_end, title_y, " ", "dim", limit=width - 1)
+        grid.put(title_end + 1, title_y, "} ", "dim", limit=width - 1)
+        grid.put(title_end + 3, title_y, "━" * max(0, width - title_end - 4), "line", limit=width - 1)
+        for row in range(title_y + 1, max(title_y + 1, height - 4)):
             grid.put(NAV_WIDTH, row, "┃", "line")
         if height > 9:
-            grid.put(NAV_WIDTH, 9, "┫", "line")
+            grid.put(NAV_WIDTH, 11 if state.usage_open else 9, "┫", "line")
         if height > 34:
             grid.put(NAV_WIDTH, 34, "┫", "line")
         grid.fill(0, width, height - 4, "━", "line")
@@ -169,8 +189,10 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
             profile_count = len(models.get("profiles", ()))
             profile_map = models.get("profile_map", {})
             harness_count = len(profile_map) if isinstance(profile_map, Mapping) else 0
-            selected = dict(state.folds).get("ui:sel", "balanced/claude").split("/", 1)[0]
-            status = f"{profile_count} profiles × {harness_count} harnesses · {selected} allocation"
+            fields = tuple((models.get("allocation") or {}).get("fields", ()))
+            strategy = next((str(parts[0][0]) for label, parts in fields
+                             if label == "strategy:" and parts), "balanced")
+            status = f"{profile_count} profiles × {harness_count} harnesses · {strategy} allocation"
         elif state.view == "SYSTEM":
             install = system.get("install", {}) if isinstance(system, Mapping) else {}
             delivery = system.get("peer_delivery", {}) if isinstance(system, Mapping) else {}
@@ -219,7 +241,7 @@ def draw_explorer(grid: CellGrid, vm, state):
               "ROUTES": sum(1 for route in vm.routes if route.get("state") != "done"),
               "QUESTIONS": len(vm.questions or ()), "HISTORY": len(vm.seats or ())}
     views = ("OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY")
-    y = 3
+    y = 5 if getattr(state, "usage_open", False) else 3
     for view in views:
         page_scope = getattr(state, "scope", "-") != "-"
         selected = not page_scope and getattr(state, "view", "OVERVIEW") == view
@@ -268,6 +290,13 @@ def draw_explorer(grid: CellGrid, vm, state):
     grid.put(31, y, "━", "line")
     y += 1
     tree_bottom = min(height - 1, 34)
+    route_scope = (next((item for item in vm.routes if str(item.get("id")) == scope_id), None)
+                   if scope_kind == "route" else None)
+    listed = {str(route.get("id")) for session in sessions for route in vm.routes
+              if route.get("session_tag") == session.get("tag") and route.get("state") not in ("done", "dead")}
+    # An ended route is not in the tree: light the session that ran it, or its repo.
+    hidden = route_scope is not None and str(route_scope.get("id")) not in listed
+    lit_tag = str((route_scope or {}).get("session_tag") or "")
     for repo_index, repo in enumerate(vm.repos):
         name = str(repo.get("name", "·"))
         repo_id = repo.get("id", name)
@@ -277,10 +306,16 @@ def draw_explorer(grid: CellGrid, vm, state):
         if y >= tree_bottom:
             break
         grid.add_hit(y, 0, width, ("scope", "repo:" + str(repo_id)))
-        if scope_kind == "repo" and str(repo_id) == scope_id:
+        repo_lit = ((scope_kind == "repo" and str(repo_id) == scope_id) or
+                    (hidden and not lit_tag and str(repo_id) == str((route_scope or {}).get("repo"))))
+        if repo_lit:
             grid.fill(0, width, y, " ", tint=236)
         grid.put(1, y, "┗━ " if last_repo else "┣━ ", "line")
         grid.put(4, y, _clip(name + "/", width - 6), "soft", limit=width - 1)
+        if repo_lit:
+            for col in range(width):
+                glyph, key, _tint = grid.cells[y][col]
+                grid.cells[y][col] = (glyph, key, 236)
         y += 1
         for session_index, session in enumerate(children):
             if y >= tree_bottom:
@@ -289,7 +324,8 @@ def draw_explorer(grid: CellGrid, vm, state):
             last_session = session_index == len(children) - 1
             stem = "   " if last_repo else "┃  "
             grid.add_hit(y, 0, width, ("scope", tag))
-            if scope_kind == "session" and tag == scope_id:
+            session_lit = (scope_kind == "session" and tag == scope_id) or (hidden and tag == lit_tag)
+            if session_lit:
                 grid.fill(0, width, y, " ", tint=236)
             grid.put(1, y, stem, "line")
             grid.put(4, y, "┗━ " if last_session else "┣━ ", "line")
@@ -303,7 +339,7 @@ def draw_explorer(grid: CellGrid, vm, state):
                                   "dead": ("✕", "dead"), "done": ("✓", "done")}.get(
                                       status, ("●", "idle"))
             grid.put(hx + 1, y, marker, marker_key)
-            if scope_kind == "session" and tag == scope_id:
+            if session_lit:
                 for col in range(width):
                     glyph, key, _tint = grid.cells[y][col]
                     grid.cells[y][col] = (glyph, key, 236)
@@ -347,8 +383,6 @@ def draw_explorer(grid: CellGrid, vm, state):
                 if subworker and y < tree_bottom:
                     name, who, activity = subworker
                     grid.add_hit(y, 0, width, ("route", route.get("id"), tag))
-                    if scope_kind == "route" and str(route.get("id")) == scope_id:
-                        grid.fill(0, width, y, " ", tint=236)
                     grid.put(1, y, stem, "line")
                     grid.put(4, y, "   " if last_session else "┃  ", "line")
                     grid.put(9, y, "   ", "line")
