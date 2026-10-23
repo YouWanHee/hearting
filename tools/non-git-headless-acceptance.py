@@ -163,6 +163,7 @@ def _fixture_supervisor_answer(route: dict, step: dict, route_file: Path,
         return None
     answers = FI.answers_template(interview)
     answers.update(actor_kind="supervisor", understanding_confirmed=True)
+    answers["frame_answer"] = _frame_answer_provenance(route["route_id"])
     for question in questions:
         answers["answers"][question["id"]] = {
             "choice": selected if question is route_question else 0, "note": ""
@@ -176,11 +177,62 @@ def _fixture_supervisor_answer(route: dict, step: dict, route_file: Path,
     return interview_path, answers_path
 
 
+def _frame_answer_provenance(route_id: str) -> dict[str, object]:
+    return {
+        "source": "fixture-driver",
+        "fixture_gate_actor_kind": "supervisor",
+        "person_or_real_supervisor": False,
+        "scope": f"isolated fixture route {route_id}",
+    }
+
+
+def _classify_fixture_rows(rows: list[dict[str, str]], route: dict) -> dict:
+    """Return terminal attempts bound to this frame and its owner lineage."""
+    route_id = str(route.get("route_id") or "")
+    nodes = [node for node in route.get("nodes", []) if isinstance(node, dict)]
+    expected_frames = {str(node.get("id")) for node in nodes
+                       if node.get("unit") == "plan/frame" and node.get("id")}
+    expected_owners = {str(node.get("id")) for node in nodes
+                       if node.get("worker_type") == "owner" and node.get("id")}
+    frame = [row for row in rows if row.get("route_id") == route_id
+             and row.get("worker_type") == "frame"
+             and row.get("route_node") in expected_frames]
+    owners = [row for row in rows if row.get("worker_type") == "owner"
+              and row.get("route_node") in expected_owners
+              and row.get("owner_route_id") == route_id]
+    owner_route_ids = {str(row.get("route_id")) for row in owners if row.get("route_id")}
+    lineage_ids = {route_id, *owner_route_ids}
+    stages = [row for row in rows if row.get("worker_type") == "stage"
+              and (row.get("route_id") in lineage_ids
+                   or row.get("owner_route_id") in lineage_ids)]
+
+    latest_frames = {}
+    for row in frame:
+        latest_frames[row.get("route_node")] = row
+    frames_present = bool(expected_frames) and expected_frames <= set(latest_frames)
+
+    def is_success(row):
+        return row.get("status") == "done" and row.get("failure_class", "") in ("", "pass")
+
+    frame_success = frames_present and all(is_success(row) for row in latest_frames.values())
+    return {
+        "frame": frame,
+        "owners": owners,
+        "stages": stages,
+        "expected_frame_nodes": sorted(expected_frames),
+        "expected_frames_present": frames_present,
+        "verified": frame_success and any(map(is_success, owners)) and any(map(is_success, stages)),
+        "terminal_failure": any(
+            row.get("status") in {"done", "killed", "cancelled"} and not is_success(row)
+            for row in frame + owners + stages),
+    }
+
+
 def prepare_fixture(output: Path) -> tuple[Path, dict[str, str]]:
     output.mkdir(parents=True, exist_ok=True)
     real_jobs = os.environ.get("AGENT_DISPATCH_JOBS", "")
     real_governor = os.environ.get("AGENT_MODEL_GOVERNOR_ROOT", "")
-    world = output / "fixture-world"
+    world = Path(tempfile.mkdtemp(prefix="fixture-world-", dir=output))
     for name in ("registry", "dispatch-state", "governor", "artifacts"):
         (world / name).mkdir(parents=True, exist_ok=True)
     jobs = (world / "registry" / "jobs.log").resolve()
@@ -341,23 +393,23 @@ def _fixture_route_start(adapter: str, *, output: Path, world: Path, cwd: Path,
     rows = []
     while time.monotonic() < deadline:
         rows = _route_rows(jobs)
-        open_rows = [row for row in rows if row.get("status") in {"open", "running"}]
-        frame = [row for row in rows if row.get("worker_type") == "frame"]
-        owners = [row for row in rows if row.get("worker_type") == "owner"]
-        stages = [row for row in rows if row.get("worker_type") == "stage"]
-        if not open_rows and frame and owners and stages:
+        classified = _classify_fixture_rows(rows, route)
+        lineage = classified["frame"] + classified["owners"] + classified["stages"]
+        open_rows = [row for row in lineage if row.get("status") in {"open", "running"}]
+        if classified["verified"] or (not open_rows and classified["terminal_failure"]):
             break
         time.sleep(3)
     else:
         return {"status": "unverified(route-attempts-still-active)", "route_file": str(route_file),
                 "attempts": rows}
-    frame = [row for row in rows if row.get("worker_type") == "frame"]
-    owners = [row for row in rows if row.get("worker_type") == "owner"]
-    stages = [row for row in rows if row.get("worker_type") == "stage"]
-    if any(row.get("status") != "done" or row.get("failure_class") not in ("", "pass")
-           for row in (frame + owners + stages)):
-        return {"status": "unverified(route-attempt-not-successful)", "route_file": str(route_file),
-                "attempts": rows}
+    classified = _classify_fixture_rows(rows, route)
+    frame, owners, stages = (classified["frame"], classified["owners"], classified["stages"])
+    if not classified["verified"]:
+        reason = ("expected-frame-node-missing" if not classified["expected_frames_present"]
+                  else "route-attempt-not-successful")
+        return {"status": f"unverified({reason})", "route_file": str(route_file),
+                "attempts": frame + owners + stages,
+                "expected_frame_nodes": classified["expected_frame_nodes"]}
     outputs = [path for path in (Path(fixture_env["AGENT_ARTIFACT_ROOT"]).rglob("*") )
                if path.is_file() and not path.is_symlink()
                and ".runtime" not in path.parts and path not in {jobs}]
@@ -368,7 +420,8 @@ def _fixture_route_start(adapter: str, *, output: Path, world: Path, cwd: Path,
             "route_id": route["route_id"], "source_commit": route["source_commit"],
             "frame_attempts": frame, "owner_attempts": owners, "stage_attempts": stages,
             "artifact_outputs": [str(path) for path in outputs],
-            "fixture_answer_actor_kind": "supervisor", "fixture_answer_path": str(answers_path),
+            "frame_answer": _frame_answer_provenance(route["route_id"]),
+            "fixture_answer_path": str(answers_path),
             "resume_result": release_result}
 
 
