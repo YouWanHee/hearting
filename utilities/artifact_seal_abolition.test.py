@@ -1642,6 +1642,10 @@ class B1RefreshTest(B1RefreshBase):
         lines = self.history.published[history_before:]
         self.assertEqual([row["field"] for row in lines], ["excluded_payload"])
         self.assertEqual(lines[0]["target_path"].rsplit("/", 1)[-1], "checkout")
+        self.assertEqual(lines[0]["before"]["value"], {
+            "kind": "runtime", "rows": 1, "declared_bytes": len(b"payload remains on disk\n")})
+        self.assertEqual(lines[0]["after"]["value"], {
+            "kind": "runtime", "rows": 0, "declared_bytes": 0})
 
     def test_b1_first_close_records_one_line_or_leaves_it_pending(self):
         self.activate()
