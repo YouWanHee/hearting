@@ -7488,16 +7488,16 @@ class ComposeRouteTest(TestRoute):
  def test_non_git_decision_is_single_and_conservative_classifier_is_purpose_based(self):
   cwd="/tmp/non-git-project"
   diagnosis={"state":"non-git","cwd":cwd,"detail":"fatal: not a git repository"}
-  direct=R._decide_non_git_compose(diagnosis,None,False,0,False,None)
+  direct=R._decide_non_git_compose(diagnosis,None,0,False,None)
   self.assertEqual(direct["kind"],"direct")
-  for request_shape,route_plan,depth,attempt in (("framed",False,0,False),(None,True,0,False),
-                                                 (None,False,1,False),("direct",False,0,True)):
-   result=R._decide_non_git_compose(diagnosis,request_shape,route_plan,depth,attempt,"autopilot-code")
+  for request_shape,depth,attempt in (("framed",0,False),("solo",0,False),
+                                      (None,1,False),("direct",0,True)):
+   result=R._decide_non_git_compose(diagnosis,request_shape,depth,attempt,"autopilot-code")
    self.assertEqual(result["kind"],"refuse")
    self.assertTrue(result["cause"].startswith("git 저장소 아님: "+cwd))
    self.assertIn("depth-0",result["next"])
-  self.assertEqual(R._decide_non_git_compose({"state":"git"},None,False,0,False,None)["kind"],"git")
-  self.assertEqual(R._decide_non_git_compose({"state":"error","detail":"permission denied"},None,False,0,False,None)["kind"],"error")
+  self.assertEqual(R._decide_non_git_compose({"state":"git"},None,0,False,None)["kind"],"git")
+  self.assertEqual(R._decide_non_git_compose({"state":"error","detail":"permission denied"},None,0,False,None)["kind"],"error")
   cases={
    "기술 동향 조사 후 핵심 내용을 정리한다.":("autopilot-research","technology"),
    "시장 조사 결과를 정리한다.":("autopilot-research","market"),
@@ -7529,7 +7529,7 @@ class ComposeRouteTest(TestRoute):
    self.assertEqual(diagnosis["state"],"non-git",diagnosis)
    (cwd/".git").mkdir()
    diagnosis=R._compose_git_diagnosis(cwd)
-   decision=R._decide_non_git_compose({**diagnosis,"cwd":str(cwd)},None,False,0,False,None)
+   decision=R._decide_non_git_compose({**diagnosis,"cwd":str(cwd)},None,0,False,None)
    self.assertEqual(decision["kind"],"error")
    self.assertIn(str(cwd),decision["detail"])
 
@@ -7538,10 +7538,11 @@ class ComposeRouteTest(TestRoute):
    parent=Path(tmp); cwd=parent/"project"; cwd.mkdir()
    (parent/".git").write_text("gitdir: /definitely-missing-hearting-gitdir\n")
    diagnosis=R._compose_git_diagnosis(cwd)
-   decision=R._decide_non_git_compose({**diagnosis,"cwd":str(cwd)},None,False,0,False,None)
+   decision=R._decide_non_git_compose({**diagnosis,"cwd":str(cwd)},None,0,False,None)
    self.assertEqual(decision["kind"],"error",diagnosis)
    self.assertIn(str(cwd),decision["detail"])
-   self.assertIn("/definitely-missing-hearting-gitdir",decision["detail"])
+   # Git versions differ on naming the missing gitdir (some print "(null)"); keep the raw error.
+   self.assertIn("not a git repository",decision["detail"])
 
  def test_compose_git_diagnosis_accepts_mount_boundary_exhaustion_message(self):
   completed=subprocess.CompletedProcess(["git"],128,"",

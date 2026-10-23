@@ -206,8 +206,8 @@ capability when clear; an explicit `--capability` and mode take precedence, and 
 purpose is shown as unresolved while retaining the existing storage fallback. The session
 performs that capability's work and can close it through the normal inline `finish` path.
 The start card says `git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작`.
-An explicit worker shape or route plan remains a worker request and is refused in a non-Git
-folder with the reason and next action. A later compose in a Git repository follows the
+An explicit worker shape, including a route-plan leg whose own shape is not direct, remains a
+worker request and is refused in a non-Git folder with the reason and next action. A later compose in a Git repository follows the
 existing Git behavior.
 Likewise, code review within an implementation/debug cycle belongs to
 `autopilot-code --mode audit`; independent inspection of completed work belongs

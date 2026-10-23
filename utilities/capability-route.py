@@ -10544,9 +10544,12 @@ def _compose_git_diagnosis(cwd):
     return {"state": "error", "detail": stderr or f"git exited {result.returncode}"}
 
 
-def _decide_non_git_compose(cwd_diagnosis, requested_shape, route_plan_present,
+def _decide_non_git_compose(cwd_diagnosis, requested_shape,
                             dispatch_depth, registered_attempt, capability_hint):
-    """The single compose-start decision for Git, non-Git direct, and non-Git refusal."""
+    """The single compose-start decision for Git, non-Git direct, and non-Git refusal.
+
+    `requested_shape` is the shape the start will run: a readable route-plan leg's own
+    shape, else `--shape`. Only a direct (or omitted) shape runs without a worker."""
     common = {"cwd": str(cwd_diagnosis.get("cwd") or ""),
               "capability_hint": capability_hint}
     state = cwd_diagnosis.get("state")
@@ -10559,7 +10562,7 @@ def _decide_non_git_compose(cwd_diagnosis, requested_shape, route_plan_present,
     if dispatch_depth > 0 or registered_attempt:
         return {**common, "kind": "refuse", "cause": cause,
                 "next": "git init 후 다시 시작하거나, depth-0 부모에서 같은 compose를 --shape 없이 또는 --shape direct로 실행"}
-    if route_plan_present or requested_shape not in (None, "direct"):
+    if requested_shape not in (None, "direct"):
         return {**common, "kind": "refuse", "cause": cause,
                 "next": "git init 후 다시 시작하거나, depth-0에서 같은 compose를 --shape 없이 또는 --shape direct로 실행"}
     return {**common, "kind": "direct", "cause": cause}
@@ -11959,8 +11962,10 @@ def main():
             if dispatch_depth < 0:
                 diagnosis = {"state": "error", "cwd": str(Path(cwd).resolve()),
                              "detail": "invalid AGENT_DISPATCH_DEPTH"}
+            requested_shape = (route_plan_binding["leg"].get("shape")
+                               if route_plan_binding is not None else a.shape)
             non_git_decision = _decide_non_git_compose(
-                diagnosis, a.shape, bool(a.route_plan), dispatch_depth,
+                diagnosis, requested_shape, dispatch_depth,
                 bool(os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
                      or os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER", "").lower() in {"1", "true"}),
                 a.capability)

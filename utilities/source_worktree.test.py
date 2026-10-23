@@ -53,7 +53,7 @@ class SourceWorktreeFixture(unittest.TestCase):
             "HOME": str(fixture_home), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CEILING_DIRECTORIES": str(base),
-            "AGENT_HOME": str(fixture_home), "AGENT_DISPATCH_JOBS": str(base / "jobs.log"),
+            "AGENT_HOME": str(ROOT), "AGENT_DISPATCH_JOBS": str(base / "jobs.log"),
             "AGENT_ARTIFACT_CHECKPOINT": "off",
         })
         self.env = mock.patch.dict(os.environ, fixture_env, clear=True)
@@ -385,8 +385,7 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
         project.mkdir()
         prompt = Path(self.tmp.name) / "non-git-refusal.md"
         prompt.write_text("Implement a reusable driver.\n", encoding="utf-8")
-        cases = (["--shape", "framed"], ["--shape", "solo"], ["--shape", "staged"],
-                 ["--shape", "direct", "--route-plan", str(Path(self.tmp.name) / "missing#0")])
+        cases = (["--shape", "framed"], ["--shape", "solo"], ["--shape", "staged"])
         for extra in cases:
             with self.subTest(extra=extra):
                 argv = ["capability-route.py", "compose", "--start", "--slug", "refused",

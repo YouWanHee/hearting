@@ -121,8 +121,7 @@ class PublicInlineFinishTest(unittest.TestCase):
         # The public compiler seals the harness source root as its runtime
         # identity. Keep that real source root while isolating mutable session
         # data with unique ids.
-        self.home = self.base / "agent-home"
-        self.home.mkdir()
+        self.home = ROOT
         self.jobs = self.base / "jobs.log"
         self.jobs.write_text("", encoding="utf-8")
         if not self.non_git:
