@@ -107,6 +107,24 @@ class HumanWaitStateTests(unittest.TestCase):
         self.assertIsNone(state._notification_delay(
             [{"source": "S3", "since": now - 73 * 3600, "stale": False}], now, enabled=True))
 
+    def test_idle_producer_sleeps_until_notification_boundary(self):
+        demand = state.state_root() / ".demand"
+        demand.parent.mkdir(parents=True, exist_ok=True)
+        demand.touch()
+        os.utime(demand, (0, 0))
+        now = 10_000.0
+        cached = {"items": [{"source": "S3", "since": now, "stale": False}]}
+        class Slept(Exception):
+            pass
+        with mock.patch.object(state, "_refresh_cache"), \
+             mock.patch.object(state, "_read_cache", return_value=cached), \
+             mock.patch.object(state.shutil, "which", return_value="/bin/herdr"), \
+             mock.patch.object(state.time, "time", return_value=now), \
+             mock.patch.object(state.time, "sleep", side_effect=Slept) as sleep, \
+             mock.patch.object(state.fcntl, "flock"), mock.patch.object(state.os, "close"):
+            state._producer_loop(123)
+        sleep.assert_called_once_with(3600.0)
+
     def test_notification_claim_is_single_under_concurrent_refresh(self):
         bin_dir = Path(self.tmp.name) / "race-bin"
         bin_dir.mkdir()

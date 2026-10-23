@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only before/after answer-wait audit for the real dispatch registry."""
+"""Read-only before/after answer-wait audit for a dispatch registry."""
 from __future__ import annotations
 
 import hashlib
@@ -15,7 +15,9 @@ sys.path.insert(0, str(ROOT / "tools"))
 import route_authority
 from dispatch_registry_cache import registry_read_scope, registry_snapshot
 from fleet.collectors import dispatch
+from fleet import route as route_module
 import human_gate_observation
+from dispatch_owner_input import blocked_owner_answers
 
 
 def _stat(path):
@@ -31,88 +33,121 @@ def _hash(path):
     return digest.hexdigest()
 
 
+def _epoch(value, fallback):
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+
+
+def _binding(meta):
+    return (meta.get("owner_route_id") or meta.get("route_id"),
+            meta.get("owner_route_hash") or meta.get("route_hash"),
+            meta.get("owner_route_file") or meta.get("route_file"))
+
+
 def audit(path: Path):
     as_of = datetime.now(timezone.utc).timestamp()
-    before_stat = _stat(path)
-    before_hash = _hash(path)
+    before_stat, before_hash = _stat(path), _hash(path)
     with registry_read_scope():
         snap = registry_snapshot(path)
     if not snap.complete:
         print(f"registry_complete=false reason={snap.reason}")
         return 2
-    rows = snap.view.answer_wait_owner_candidates()
-    latest, first = {}, {}
-    for row in rows:
+
+    latest, first, successor_sources = {}, {}, set()
+    all_ends = {"BLOCKED": 0, "FAIL": 0}
+    for row in snap.view.records:
         meta = row.completion_metadata()
         attempt = meta.get("attempt_id")
         if attempt:
             first.setdefault(attempt, row.order)
             latest[attempt] = (row.status, meta, row.fields, row.order)
-    blocked, fail = {}, {}
-    for attempt, (status, meta, fields, order) in latest.items():
-        kind = route_authority.answerable_owner_end(status, meta)
-        if kind:
-            (blocked if kind == "BLOCKED" else fail)[attempt] = (meta, fields, order)
-    after = human_gate_observation.read_answer_waits(jobs_paths=[path], now=as_of)
-    after_ids = {item.get("attempt_id"): item for item in after.get("items", ())
-                 if item.get("source") == "S3"}
-
-    reasons = {"non-BLOCKED": 0, "unbound": 0, "existing-closure": 0,
-               "later-same-route-owner": 0, ">7d-drop": 0, "72h-7d-fold": 0,
-               "current": 0}
-    after_details = []
-    for attempt, (meta, fields, order) in blocked.items():
-        route_file = meta.get("owner_route_file") or meta.get("route_file")
-        route_id = meta.get("owner_route_id") or meta.get("route_id")
-        digest = meta.get("owner_route_hash") or meta.get("route_hash")
-        if not route_file or not route_id or not digest:
-            reasons["unbound"] += 1
+        successor_sources.update(meta[key] for key in
+            ("automatic_retry_of", "replacement_original_attempt_id", "prior_attempt_id")
+            if meta.get(key))
+    for status, meta, _fields, _order in latest.values():
+        if meta.get("worker_type") != "owner":
             continue
-        if attempt in after_ids:
-            item = after_ids[attempt]
-            if item.get("stale"):
-                reasons["72h-7d-fold"] += 1
-            else:
-                reasons["current"] += 1
-                after_details.append((attempt, item))
+        kind = route_authority.answerable_owner_end(status, meta)
+        if kind in all_ends:
+            all_ends[kind] += 1
+
+    # Reproduce the previous reader's S3 display: BLOCKED and FAIL owner ends,
+    # successor-link suppression, verified route, open outcome, and no retained answer.
+    old_displayed, old_unbound = {}, {}
+    for attempt, (status, meta, fields, order) in latest.items():
+        if meta.get("worker_type") != "owner" or attempt in successor_sources:
+            continue
+        kind = route_authority.answerable_owner_end(status, meta)
+        if not kind:
+            continue
+        route_id, digest, route_file = _binding(meta)
+        if not route_id or not digest or not route_file:
+            old_unbound[attempt] = (kind, meta, fields, order)
+            continue
+        route_record = route_module.load(route_file, digest, route_id)
+        if route_record is None:
+            continue
+        outcome = route_module.load_outcome(route_file, route_id, digest)
+        if outcome and outcome.get("closed_at") and outcome.get("match") is True:
+            continue
+        if blocked_owner_answers(path, attempt):
+            continue
+        old_displayed[attempt] = (kind, meta, fields, order)
+
+    after = human_gate_observation.read_answer_waits(jobs_paths=[path], now=as_of)
+    current = {item.get("attempt_id"): item for item in after.get("items", ())
+               if item.get("source") == "S3"}
+    reasons = {"FAIL": 0, "later-same-route-owner": 0, ">7d-drop": 0,
+               "72h-7d-fold": 0, "current": 0, "closure-changed-or-unexplained": 0}
+    old_details = []
+    for attempt, (kind, meta, fields, order) in old_displayed.items():
+        if kind != "BLOCKED":
+            reasons["FAIL"] += 1
+            continue
+        route_id, digest, route_file = _binding(meta)
+        later = any(other != attempt and first.get(other, info[3]) > first.get(attempt, order)
+                    and info[1].get("worker_type") == "owner"
+                    and _binding(info[1]) == (route_id, digest, route_file)
+                    for other, info in latest.items())
+        if later:
+            reasons["later-same-route-owner"] += 1
             continue
         finished = meta.get("ended_at") or fields[0]
-        try:
-            epoch = float(finished)
-        except (ValueError, TypeError):
-            try:
-                epoch = datetime.fromisoformat(str(finished).replace("Z", "+00:00")).timestamp()
-            except Exception:
-                epoch = as_of
-        age = as_of - epoch
+        age = as_of - _epoch(finished, as_of)
         if age > 7 * 86400:
             reasons[">7d-drop"] += 1
-            continue
-        later = any(other != attempt and first.get(other, info[3]) > first.get(attempt, order)
-                    and (info[1].get("owner_route_id") or info[1].get("route_id")) == route_id
-                    and (info[1].get("owner_route_hash") or info[1].get("route_hash")) == digest
-                    and (info[1].get("owner_route_file") or info[1].get("route_file")) == route_file
-                    for other, info in latest.items())
-        reasons["later-same-route-owner" if later else "existing-closure"] += 1
+        elif attempt in current and current[attempt].get("stale"):
+            reasons["72h-7d-fold"] += 1
+        elif attempt in current:
+            reasons["current"] += 1
+            old_details.append((attempt, current[attempt]))
+        else:
+            reasons["closure-changed-or-unexplained"] += 1
 
-    for _ in fail:
-        reasons["non-BLOCKED"] += 1
-    after_stat = _stat(path)
-    after_hash = _hash(path)
+    after_stat, after_hash = _stat(path), _hash(path)
     print("Answer-wait S3 audit (read-only)")
     print(f"as_of_utc={datetime.fromtimestamp(as_of, timezone.utc).isoformat()}")
     print(f"registry={path} dev={before_stat[0]} ino={before_stat[1]} bytes={before_stat[2]} "
           f"mtime_ns={before_stat[3]} sha256={before_hash} rows={snap.view.line_count}")
     print("stage\tcount")
-    print(f"before-answerable-owner\t{len(blocked) + len(fail)}")
-    print(f"before-unbound-unknown\t{reasons['unbound']}")
-    for reason in ("non-BLOCKED", "unbound", "existing-closure", "later-same-route-owner",
-                   ">7d-drop", "72h-7d-fold", "current"):
+    print(f"previous-reader-displayed-S3\t{len(old_displayed)}")
+    print(f"previous-reader-route-unproven-unknown\t{len(old_unbound)}")
+    print(f"before-including-route-unproven-unknown\t{len(old_displayed) + len(old_unbound)}")
+    print("reconciliation-old-displayed-S3")
+    for reason in ("FAIL", "later-same-route-owner", ">7d-drop", "72h-7d-fold",
+                   "current", "closure-changed-or-unexplained"):
         print(f"{reason}\t{reasons[reason]}")
-    print(f"after-reconciliation\t{sum(reasons[k] for k in ('current','72h-7d-fold','>7d-drop','existing-closure','later-same-route-owner'))}")
+    print(f"reconciled-displayed-total\t{sum(reasons.values())}")
+    print(f"route-unproven-unknown-to-unbound\t{len(old_unbound)}")
+    print(f"secondary-all-owner-end-census\tBLOCKED={all_ends['BLOCKED']}\tFAIL={all_ends['FAIL']}\t"
+          f"total={sum(all_ends.values())}")
     print("remaining_current\tattempt\troute\tage_hours\towner\tblocker")
-    for attempt, item in after_details:
-        meta = latest[attempt][1]
+    for attempt, item in old_details:
         owner = item.get("owner") or {}
         age = max(0, (as_of - float(item.get("since") or as_of)) / 3600)
         blocker = " ".join(str(item.get("question") or "BLOCKED owner").split())[:160]

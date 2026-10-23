@@ -51,7 +51,9 @@ class HumanWaitPerformanceTests(unittest.TestCase):
             for index in range(6398):
                 route_index = index % len(route_rows)
                 route_id, digest, route_file = route_rows[route_index]
-                route_time = now - (3600 if route_index < 120 else 30 * 86400)
+                route_time = now - (3600 if route_index < 380 else 30 * 86400)
+                (routes / (route_id + ".outcome.json")).write_text(json.dumps({
+                    "route_id": route_id, "route_hash": digest}), encoding="utf-8")
                 metadata = ",".join(("attempt_schema_version=2", "dispatch_depth=2",
                     "worker_type=child", "attempt_id=att-fixture-%d" % index,
                     "route_id=" + route_id, "route_hash=" + digest, "route_file=" + str(route_file),
@@ -180,20 +182,25 @@ class HumanWaitPerformanceTests(unittest.TestCase):
                             raw[event].append(time.perf_counter() - started)
                 latency[case] = {surface: (raw[surface], baseline[surface]) for surface in raw}
 
-            child_code = ("import os,sys; sys.path[:0]=[" + repr(str(ROOT / "utilities")) + "," +
-                          repr(str(ROOT / "tools")) + "]; import human_gate_observation as h; "
-                          "h.read_answer_waits(jobs_paths=[sys.argv[1]]); "
+            child_code = ("import sys; sys.path.insert(0," + repr(str(ROOT / "utilities")) + "); "
+                          "import human_wait_state as h\noriginal=h._refresh_cache\n"
+                          "def refresh():\n original(); result=original(); "
                           "s=open('/proc/self/status').read().splitlines(); "
-                          "print(' '.join(next(x.split()[1] for x in s if x.startswith(k+':')) "
-                          "for k in ('VmRSS','VmHWM')))" )
-            child_env = dict(os.environ, XDG_STATE_HOME=str(state), AGENT_DISPATCH_JOBS=str(jobs),
+                          "print('producer_rss_kb='+' '.join(next(x.split()[1] for x in s "
+                          "if x.startswith(k+':')) for k in ('VmRSS','VmHWM')),flush=True); "
+                          "return result\nh._refresh_cache=refresh\n"
+                          "raise SystemExit(h.main(['--refresh-cache']))")
+            child_state = root / "producer-measure-state"
+            child_state.mkdir()
+            child_env = dict(os.environ, XDG_STATE_HOME=str(child_state), HOME=str(root / "producer-home"),
+                             AGENT_DISPATCH_JOBS=str(jobs), PATH=str(empty_bin),
                              PYTHONDONTWRITEBYTECODE="1")
             child_rss = subprocess.check_output(
-                [sys.executable, "-c", child_code, str(jobs)], env=child_env, text=True).strip()
-            rss_kb, hwm_kb = (int(value) for value in child_rss.split())
+                [sys.executable, "-c", child_code], env=child_env, text=True).strip().splitlines()[-1]
+            rss_kb, hwm_kb = (int(value) for value in child_rss.split("=", 1)[1].split())
             print("case\tfixture_bytes\trows\troutes\tcandidates\tcurrent\twarm_p50_s\twarm_p95_s\twarm_max_s\tappend_s\tprocess_rss_mib\tprocess_hwm_mib")
             p95 = sorted(unchanged)[int(0.95 * (len(unchanged) - 1))]
-            print(f"producer-warm\t{size}\t{len(rows)}\t1067\t120\t{result['total']}\t"
+            print(f"producer-warm\t{size}\t{len(rows)}\t1067\t380\t{result['total']}\t"
                   f"{statistics.median(unchanged):.6f}\t{p95:.6f}\t{max(unchanged):.6f}\t"
                   f"{append:.6f}\t{rss_kb / 1024:.2f}\t{hwm_kb / 1024:.2f}")
             print(f"registry-metrics\tcold_full_parses={after_cold['full_metadata_parses']}\t"
@@ -215,7 +222,9 @@ class HumanWaitPerformanceTests(unittest.TestCase):
                     print(f"{surface}\t{case}\t" + "\t".join(f"{v:.6f}" for group in
                           (bstats, rstats, dstats) for v in group))
             print(f"registry\tdetached_cold_pass_s={cold:.6f}\tparent_prime_s={parent_cold:.6f}\t"
-                  f"bytes={size} rows={len(rows)} routes=1067 candidates=120 current={result['total']}")
+                  f"bytes={size} rows={len(rows)} routes=1067 candidates=380 current={result['total']}")
+
+            print(f"actual-producer-steady\tVmRSS_MiB={rss_kb / 1024:.2f}\tVmHWM_MiB={hwm_kb / 1024:.2f}")
 
             # Cold concurrent Claude statuslines exercise the real shell caller,
             # cache request helper, inherited flock and detached producer.

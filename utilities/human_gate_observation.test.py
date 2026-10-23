@@ -118,6 +118,57 @@ class PendingWaitTest(unittest.TestCase):
         successor = H.read_answer_waits(jobs_paths=[self.jobs], now=302)
         self.assertEqual(successor["total"], 0)
 
+    def test_later_owner_on_different_route_file_does_not_close_wait(self):
+        route, _attempt, _lease, metadata = self._blocked_owner_fixture()
+        route_file = self.root / "same-route-other-file.json"
+        route_file.write_text(json.dumps(route), encoding="utf-8")
+        old = metadata + ",note=dead-worker-blocked,failure_class=blocked"
+        later = ("attempt_schema_version=2,dispatch_depth=1,worker_type=owner,"
+                 "attempt_id=att-other-file,owner_route_id=" + route["route_id"] +
+                 ",owner_route_hash=" + route["route_hash"] +
+                 ",owner_route_file=" + str(route_file))
+        self.jobs.write_text("100\tdone\t/repo\t/wt\towner\t" + old + "\n" +
+                             "200\topen\t/repo\t/wt\towner\t" + later + "\n",
+                             encoding="utf-8")
+        result = H.read_answer_waits(jobs_paths=[self.jobs], now=300)
+        self.assertEqual([item["attempt_id"] for item in result["items"] if item["source"] == "S3"],
+                         ["att-owner"])
+
+    def test_unchanged_route_and_outcome_are_reused_and_new_outcome_invalidates(self):
+        route, attempt, _lease, metadata = self._blocked_owner_fixture()
+        self.jobs.write_text("300\tdone\t/repo\t/wt\towner\t" + metadata +
+                             ",note=dead-worker-blocked,failure_class=blocked\n", encoding="utf-8")
+        from tools.fleet import route as routes
+        with mock.patch.object(routes, "load", wraps=routes.load) as route_load, \
+             mock.patch.object(routes, "load_outcome", wraps=routes.load_outcome) as outcome_load:
+            self.assertEqual(H.read_answer_waits(jobs_paths=[self.jobs], now=301)["total"], 1)
+            first_counts = (route_load.call_count, outcome_load.call_count)
+            self.assertEqual(H.read_answer_waits(jobs_paths=[self.jobs], now=302)["total"], 1)
+            self.assertEqual((route_load.call_count, outcome_load.call_count), first_counts)
+            outcome_file = Path(self.root / "owner.route.outcome.json")
+            outcome_file.write_text(json.dumps({"route_id": route["route_id"],
+                "route_hash": route["route_hash"], "closed_at": "fixture", "match": True}),
+                encoding="utf-8")
+            self.assertEqual(H.read_answer_waits(jobs_paths=[self.jobs], now=303)["total"], 0)
+            self.assertEqual((route_load.call_count, outcome_load.call_count),
+                             (first_counts[0] + 1, first_counts[1] + 1))
+
+    def test_candidate_metadata_is_reused_for_an_unchanged_registry_generation(self):
+        self._blocked_owner_fixture()
+        import dispatch_registry_cache as registry_cache
+        with registry_cache.registry_read_scope():
+            view = registry_cache.registry_snapshot(self.jobs).view
+        H._GENERATION_CACHE.clear()
+        original = registry_cache.RegistryRecord.completion_metadata
+        with mock.patch.object(registry_cache.RegistryRecord, "completion_metadata",
+                               autospec=True, side_effect=original) as metadata_parse:
+            first = H._generation_candidates(view)
+            first_parse_count = metadata_parse.call_count
+            second = H._generation_candidates(view)
+            self.assertIs(first, second)
+            self.assertGreater(first_parse_count, 0)
+            self.assertEqual(metadata_parse.call_count, first_parse_count)
+
     def test_advisory_lease_contention_keeps_reader_safe_and_unknown(self):
         _route, attempt, lease, metadata = self._blocked_owner_fixture()
         held = hold_supervisor_lease(self.jobs, attempt, lease)

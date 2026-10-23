@@ -20,6 +20,17 @@ _CACHE_LIMIT = 2048
 _JOURNAL_CACHE = OrderedDict()
 _JSON_CACHE = OrderedDict()
 _OBSERVATION_CACHE = OrderedDict()
+_GENERATION_CACHE = OrderedDict()
+_ROUTE_OUTCOME_CACHE = OrderedDict()
+_GENERATION_LIMIT = 2
+_ROUTE_CACHE_LIMIT = 2048
+_OBSERVATION_META_KEYS = frozenset((
+    "attempt_id", "worker_type", "automatic_retry_of", "replacement_original_attempt_id",
+    "prior_attempt_id", "owner_route_file", "owner_route_id", "owner_route_hash",
+    "route_file", "route_id", "route_hash", "ended_at", "parent_sid", "parent_harness",
+    "harness", "log_file", "note", "failure_class", "classifier_source", "process_exit",
+    "reconcile_reason", "terminal_event",
+))
 
 
 def _stamp(path):
@@ -41,6 +52,89 @@ def _cached(cache, key, loader):
     while len(cache) > _CACHE_LIMIT:
         cache.popitem(last=False)
     return value
+
+
+def _generation_candidates(view):
+    """Compile only indexed route/owner candidates once per registry generation."""
+    generation_key = (view.path_identity, view.signature)
+    cached = _GENERATION_CACHE.get(generation_key)
+    if cached is not None:
+        _GENERATION_CACHE.move_to_end(generation_key)
+        return cached
+    owners = {}
+    first_order = {}
+    successors = set()
+    for row in view.answer_wait_owner_candidates():
+        parsed = row.completion_metadata()
+        meta = {key: parsed[key] for key in _OBSERVATION_META_KEYS if key in parsed}
+        attempt = meta.get("attempt_id")
+        if not attempt:
+            continue
+        first_order.setdefault(attempt, row.order)
+        owners[attempt] = (row.status, meta, row.fields, row.order)
+        successors.update(meta[name] for name in
+                          ("automatic_retry_of", "replacement_original_attempt_id", "prior_attempt_id")
+                          if meta.get(name))
+    routes = {}
+    for row in view.route_alias_candidates():
+        parsed = row.completion_metadata()
+        meta = {key: parsed[key] for key in _OBSERVATION_META_KEYS if key in parsed}
+        route_file = meta.get("owner_route_file") or meta.get("route_file")
+        route_id = meta.get("owner_route_id") or meta.get("route_id")
+        digest = meta.get("owner_route_hash") or meta.get("route_hash")
+        if not route_file or not route_id or not digest:
+            continue
+        activity_values = []
+        for value in (row.fields[0], meta.get("ended_at")):
+            try:
+                activity_values.append(float(value))
+            except (TypeError, ValueError, OverflowError):
+                try:
+                    activity_values.append(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        activity = max(activity_values, default=float("nan"))
+        route_key = (route_id, digest, route_file)
+        previous = routes.get(route_key)
+        if previous:
+            old_activity = previous[2]
+            activity = (old_activity if not math.isfinite(activity) else activity
+                        if not math.isfinite(old_activity) else max(activity, old_activity))
+        routes[route_key] = (row, (meta.get("parent_sid"), meta.get("parent_harness"),
+                                   meta.get("attempt_id")), activity)
+    result = (owners, first_order, successors, routes)
+    _GENERATION_CACHE[generation_key] = result
+    _GENERATION_CACHE.move_to_end(generation_key)
+    while len(_GENERATION_CACHE) > _GENERATION_LIMIT:
+        _GENERATION_CACHE.popitem(last=False)
+    return result
+
+
+def _route_outcome(route_module, route_file, route_id, route_digest):
+    """Reuse route and closure data while all three source stamps stay unchanged."""
+    route_path = Path(route_file)
+    outcome_path = route_path.with_name(route_path.stem + ".outcome.json")
+    key = (str(route_path.absolute()), route_id, route_digest)
+    cached = _ROUTE_OUTCOME_CACHE.get(key)
+    route_record = cached[1] if cached else None
+    artifact_root = route_record.get("artifact_root") if route_record else None
+    finish_path = (Path(artifact_root) / ".runtime" / "inline-finish" / "v1" /
+                   str(route_id) / "finish.json") if artifact_root else None
+    stamps = (_stamp(route_path), _stamp(outcome_path), _stamp(finish_path) if finish_path else None)
+    if cached and cached[0] == stamps:
+        _ROUTE_OUTCOME_CACHE.move_to_end(key)
+        return cached[1], cached[2]
+    route_record = route_module.load(route_file, route_digest, route_id)
+    outcome = route_module.load_outcome(route_file, route_id, route_digest) if route_record else None
+    if route_record:
+        finish_path = (Path(route_record.get("artifact_root", "")) / ".runtime" /
+                       "inline-finish" / "v1" / str(route_id) / "finish.json")
+        stamps = (_stamp(route_path), _stamp(outcome_path), _stamp(finish_path))
+    _ROUTE_OUTCOME_CACHE[key] = (stamps, route_record, outcome)
+    _ROUTE_OUTCOME_CACHE.move_to_end(key)
+    while len(_ROUTE_OUTCOME_CACHE) > _ROUTE_CACHE_LIMIT:
+        _ROUTE_OUTCOME_CACHE.popitem(last=False)
+    return route_record, outcome
 
 
 def _stable_read(path, cache):
@@ -345,22 +439,7 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                 except ImportError:
                     effective_parent = effective_parent_harness = None
                     read_context = None
-                latest = {}
-                first_order = {}
-                owner_records = view.answer_wait_owner_candidates()
-                for row in owner_records:
-                    meta = row.completion_metadata()
-                    attempt = meta.get("attempt_id")
-                    if attempt:
-                        first_order.setdefault(attempt, row.order)
-                        latest[attempt] = (row.status, meta, row.fields, row.order)
-                successor_sources = set()
-                for row in owner_records:
-                    meta = row.completion_metadata()
-                    for key in ("automatic_retry_of", "replacement_original_attempt_id",
-                                "prior_attempt_id"):
-                        if meta.get(key):
-                            successor_sources.add(meta[key])
+                latest, first_order, successor_sources, route_candidates = _generation_candidates(view)
                 import route_authority
                 for attempt, (status, meta, fields, row_order) in latest.items():
                     if meta.get("worker_type") != "owner" or attempt in successor_sources:
@@ -378,6 +457,7 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                     later = any(other_id != attempt and first_order.get(other_id, other_order) > registered_order
                                 and (other_meta.get("owner_route_id") or other_meta.get("route_id")) == route_id
                                 and (other_meta.get("owner_route_hash") or other_meta.get("route_hash")) == route_digest
+                                and (other_meta.get("owner_route_file") or other_meta.get("route_file")) == route_file
                                 for other_id, (_s, other_meta, _f, other_order) in latest.items())
                     if later:
                         continue
@@ -387,9 +467,6 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                             sys.path.insert(0, project_root)
                         from tools.fleet import route as route_module
                         from dispatch_owner_input import blocked_owner_answers
-                        route_record = route_module.load(route_file, route_digest, route_id)
-                        if route_record is None:
-                            continue
                         started = epoch(meta.get("ended_at") or fields[0], float("nan"))
                         if not math.isfinite(started):
                             health.append({"source": "S3", "attempt_id": attempt,
@@ -398,8 +475,12 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                         age = instant - started
                         if age < 0 or age > 7 * 86400:
                             continue
+                        route_record, outcome = _route_outcome(route_module, route_file,
+                                                               route_id, route_digest)
+                        if route_record is None:
+                            continue
+                        started = epoch(meta.get("ended_at") or fields[0], float("nan"))
                         folded = age > 72 * 3600
-                        outcome = route_module.load_outcome(route_file, route_id, route_digest)
                         if outcome and outcome.get("closed_at") and outcome.get("match") is True:
                             continue
                         if blocked_owner_answers(path, attempt):
@@ -441,22 +522,7 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                 if project_root not in sys.path:
                     sys.path.insert(0, project_root)
                 from tools.fleet import route as route_module
-                route_candidates = {}
-                for row in view.records:
-                    fields = row.fields
-                    meta = row.completion_metadata()
-                    route_file = meta.get("owner_route_file") or meta.get("route_file")
-                    route_id = meta.get("owner_route_id") or meta.get("route_id")
-                    route_digest = meta.get("owner_route_hash") or meta.get("route_hash")
-                    key = (route_id, route_digest, route_file)
-                    if not route_file or not route_id or not route_digest:
-                        continue
-                    activity = max(epoch(fields[0], float("nan")),
-                                   epoch(meta.get("ended_at"), float("nan")))
-                    route_candidates.setdefault(key, []).append((row, activity))
-                for (route_id, route_digest, route_file), candidates in route_candidates.items():
-                    route_activity = max((activity for _row, activity in candidates
-                                          if math.isfinite(activity)), default=float("nan"))
+                for (route_id, route_digest, route_file), (row, parent_meta, route_activity) in route_candidates.items():
                     if not math.isfinite(route_activity):
                         health.append({"source": "S2", "route_id": route_id,
                                        "state": "unknown", "reason": "invalid-timestamp"})
@@ -464,13 +530,13 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                     if instant - route_activity > 8 * 86400:
                         continue
                     try:
-                        row = candidates[-1][0]
                         fields = row.fields
-                        meta = row.completion_metadata()
-                        route_record = route_module.load(route_file, route_digest, route_id)
+                        meta = {key: value for key, value in zip(
+                            ("parent_sid", "parent_harness", "attempt_id"), parent_meta) if value}
+                        route_record, outcome = _route_outcome(route_module, route_file,
+                                                               route_id, route_digest)
                         if route_record is None:
                             continue
-                        outcome = route_module.load_outcome(route_file, route_id, route_digest)
                         for wait in pending_human_waits(route_record, jobs=path, outcome=outcome):
                             parent_sid = meta.get("parent_sid")
                             parent_harness = meta.get("parent_harness")

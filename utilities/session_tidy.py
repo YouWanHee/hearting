@@ -1974,13 +1974,14 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             # The caller's own S4 is exact and cheap; replace its possibly older
             # producer copy so a just-closed prompt cannot be resurrected.
             own = human_wait_state._read(human_wait_state._path(seat.key))
+            projected["items"] = [item for item in projected["items"]
+                                   if not (item.get("source") == "S4"
+                                           and (item.get("owner") or {}).get("seat_key") == seat.key)]
             if own:
-                projected["items"] = [item for item in projected["items"]
-                                       if not (item.get("source") == "S4"
-                                               and (item.get("owner") or {}).get("seat_key") == seat.key)] + [
+                projected["items"].append(
                     {"id": own["id"], "source": "S4", "question": own.get("question"),
                      "since": own.get("since"), "stale": False,
-                     "owner": {"harness": harness, "session_id": sid, "seat_key": seat.key}}]
+                     "owner": {"harness": harness, "session_id": sid, "seat_key": seat.key}})
             ids = set(projected.get("by_session", {}).get((harness, sid), ()))
             for item in projected.get("items", ()):
                 owner = item.get("owner") or {}

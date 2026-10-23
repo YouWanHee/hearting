@@ -519,9 +519,15 @@ def _producer_loop(fd: int) -> None:
                 if latest_demand <= demand and time.time() - latest_demand >= 600:
                     return
                 continue
-            delay = min(30.0, max(1.0, 600.0 - idle))
-            if boundary is not None:
-                delay = min(delay, max(1.0, boundary))
+            if idle >= 600 and boundary is not None:
+                # With no live display demand, a notification is the only
+                # reason to retain the producer. Sleep until that boundary;
+                # the 30 second refresh cadence is for live demand only.
+                delay = max(1.0, boundary)
+            else:
+                delay = min(30.0, max(1.0, 600.0 - idle))
+                if boundary is not None:
+                    delay = min(delay, max(1.0, boundary))
             time.sleep(delay)
             _refresh_cache()
     except Exception:
