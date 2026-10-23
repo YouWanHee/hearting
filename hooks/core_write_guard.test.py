@@ -56,6 +56,16 @@ class CoreWriteGuardTest(unittest.TestCase):
         reason = G.violation(str(self.primary / ".agent_runtime-cache" / "run.py"), str(self.worktree))
         self.assertIn("shared checkout", reason)
 
+    def test_runtime_write_exception_remains_narrow_and_external_targets_are_allowed(self):
+        target = self.tmp / "external-runtime" / "job.py"
+        self.assertFalse(G._runtime_override_allowed(self.home / "cache", self.primary))
+        self.assertFalse(G._runtime_override_allowed(self.primary / "cache", self.primary))
+        self.assertTrue(G._runtime_override_allowed(target.parent, self.primary))
+        self.assertEqual(G.violation(str(self.primary / ".agent_runtime/job.py"),
+                                     str(self.worktree)), "")
+        with mock.patch.dict(os.environ, {"AGENT_RUNTIME_DIR": str(target.parent)}, clear=False):
+            self.assertEqual(G.violation(str(target), str(self.worktree)), "")
+
     def test_hook_modes(self):
         payload = {"tool_name": "Edit", "cwd": str(self.worktree),
                    "tool_input": {"file_path": str(self.primary / "core/CORE.md")}}

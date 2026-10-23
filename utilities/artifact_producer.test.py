@@ -1901,6 +1901,9 @@ class SelfExclusionPayloadTest(ProducerTestBase):
         self.assertEqual(len(events), len(expected_roots))
         self.assertEqual({root for event in events for root in expected_roots
                           if event["target"]["path"].endswith("/" + root)}, expected_roots)
+        for event in events:
+            self.assertEqual(event["before"]["value"], {"kind": "runtime"})
+            self.assertEqual(event["after"]["value"], {"kind": "runtime"})
         self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, cycle), ())
 
     def test_marker_below_raw_results_prevents_bundle_bypass_but_keeps_sibling_leaf(self):

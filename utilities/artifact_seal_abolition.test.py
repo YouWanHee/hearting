@@ -1212,6 +1212,74 @@ class B1RefreshBase(SealAbolitionBase):
 
 
 class B1RefreshTest(B1RefreshBase):
+    def test_b1_compaction_keeps_strict_multievent_streams_through_later_refresh(self):
+        for publication in ("bounded", "full"):
+            with self.subTest(publication=publication):
+                result = self.closed(f"b1-closure-{publication}", {
+                    "dev_logs/runtime/checkout/a.py": b"a\n",
+                    "dev_logs/runtime/checkout/b.py": b"b\n",
+                    "dev_logs/runtime/checkout/c.py": b"c\n",
+                    "plans/cycle/report.md": b"report\n",
+                })
+                cycle_id = result["cycle_id"]
+                manifest_path = self.manifest_path(result)
+                original = json.loads(manifest_path.read_text(encoding="utf-8"))
+                paths = {row["artifact_id"]: row["locator"]["path"]
+                         for row in original["artifact_revisions"]}
+                recordings = {event["target_id"]: event for event in original["events"]
+                              if event.get("event_type") == "artifact.revision.recorded"}
+                a_id = next(key for key, path in paths.items() if path.endswith("/checkout/a.py"))
+                b_id = next(key for key, path in paths.items() if path.endswith("/checkout/b.py"))
+                c_id = next(key for key, path in paths.items() if path.endswith("/checkout/c.py"))
+                report_id = next(key for key, path in paths.items() if path.endswith("/report.md"))
+                stream = "strm_" + "c" * 32
+                recordings[a_id].update(stream_id=stream, stream_sequence=1)
+                recordings[b_id].update(stream_id=stream, stream_sequence=2)
+                recordings[report_id].update(stream_id=stream, stream_sequence=3,
+                                             evidence_ids=[recordings[a_id]["event_id"]])
+                original["manifest_revision_id"] = P.artifact_identity.IdAllocator().allocate("manifest_revision")
+                raw = M.canonical_bytes(original)
+                L.preserve_manifest_snapshot(self.root, cycle_id, raw)
+                P._write_atomic(manifest_path, raw)
+                digest = M.manifest_digest(original)
+                record = P.read_cycle_record(self.root, cycle_id)
+                index = adm.load_index(self.root)
+                updated_index = P.artifact_index.apply(
+                    index, original, cycle_path=os.path.relpath(str(manifest_path.parent), str(self.root)),
+                    manifest_digest=digest, idempotency_key=cycle_id)
+                adm._write_index(self.root, updated_index)
+                record["manifest_digest"] = digest
+                P._write_cycle_record(self.root, record, exclusive=False)
+
+                checkout = manifest_path.parent / "artifacts/dev_logs/runtime/checkout"
+                (checkout / ".git").mkdir()
+                if publication == "bounded":
+                    first = self.refresh(result)
+                    self.assertEqual(first["status"], "emitted", first)
+                else:
+                    first = P.finalize(self.root, cycle_id=cycle_id)
+                    self.assertTrue(first.get("refreshed"), first)
+                compacted = json.loads(manifest_path.read_text(encoding="utf-8"))
+                compacted_ids = {event["event_id"] for event in compacted["events"]}
+                self.assertIn(recordings[a_id]["event_id"], compacted_ids)  # evidence closure
+                self.assertIn(recordings[b_id]["event_id"], compacted_ids)  # gap-free prefix
+                self.assertNotIn(recordings[c_id]["event_id"], compacted_ids)  # dispensable singleton
+                self.assertTrue(M.validate_update(compacted, published=True).ok)
+
+                self.edit(result, "plans/cycle/report.md", b"report edited after compaction\n")
+                second = self.refresh(result)
+                self.assertEqual(second["status"], "emitted", second)
+                current = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertTrue(M.validate_update(current, published=True).ok)
+                P.artifact_locator.rebuild_indexes(self.root)
+                P.recover(self.root)
+                record = P.read_cycle_record(self.root, cycle_id)
+                binding = {key: record[key] for key in
+                           ("campaign_id", "cycle_id", "producer_id", "route_hash")}
+                binding["cycle_record_digest"] = P.dispatch_terminal_commit.cycle_identity_digest(record)
+                self.assertEqual(P.verify_finalized_cycle(self.root, cycle_id=cycle_id,
+                                 expected_binding=binding)["status"], "already-sealed")
+
     # -- A28-3 -----------------------------------------------------------
     def test_b1_taslp_25_plus26_modified4_and_noop(self):
         files = {f"plans/cycle/declared_{i:02d}.md": f"declared {i}\n".encode() for i in range(25)}

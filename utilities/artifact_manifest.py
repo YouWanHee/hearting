@@ -869,6 +869,38 @@ def validate_shape(document: Any) -> ValidationReport:
     return _report(violations)
 
 
+def dispensable_retired_recording_ids(events: Sequence[Mapping[str, Any]],
+                                      retired_artifact_ids: Iterable[str]) -> set[str]:
+    """Return retired recording IDs removable without breaking evidence or stream prefixes."""
+    retired = set(retired_artifact_ids)
+    rows = [row for row in events if isinstance(row, Mapping)]
+    removable = {row.get("event_id") for row in rows
+                 if row.get("event_type") == "artifact.revision.recorded"
+                 and row.get("target_id") in retired}
+    by_stream: Dict[Any, List[Mapping[str, Any]]] = {}
+    for row in rows:
+        by_stream.setdefault(row.get("stream_id"), []).append(row)
+    while True:
+        restore = {event_id for row in rows if row.get("event_id") not in removable
+                   for event_id in (row.get("evidence_ids") or []) if event_id in removable}
+        # Keep a stream's earlier events whenever a later event survives.
+        for stream_rows in by_stream.values():
+            retained_sequences = [row.get("stream_sequence") for row in stream_rows
+                                  if row.get("event_id") not in removable
+                                  and isinstance(row.get("stream_sequence"), int)
+                                  and not isinstance(row.get("stream_sequence"), bool)]
+            if retained_sequences:
+                last = max(retained_sequences)
+                restore.update(row.get("event_id") for row in stream_rows
+                               if row.get("event_id") in removable
+                               and isinstance(row.get("stream_sequence"), int)
+                               and not isinstance(row.get("stream_sequence"), bool)
+                               and row.get("stream_sequence") < last)
+        if not restore:
+            return removable
+        removable.difference_update(restore)
+
+
 # ---------------------------------------------------------------------------
 # locator safety
 # ---------------------------------------------------------------------------
@@ -1355,7 +1387,7 @@ def _check_no_transition_out_of_terminal(events, label, violations) -> None:
 # ---------------------------------------------------------------------------
 
 
-def validate_events(document: Mapping[str, Any], *, allow_sequence_gaps: bool = False) -> ValidationReport:
+def validate_events(document: Mapping[str, Any]) -> ValidationReport:
     violations: List[Violation] = []
     if not isinstance(document, dict):
         return _ok()
@@ -1381,7 +1413,7 @@ def validate_events(document: Mapping[str, Any], *, allow_sequence_gaps: bool = 
                     )
                 )
         distinct_sorted = sorted(set(int_seqs))
-        if distinct_sorted and not allow_sequence_gaps:
+        if distinct_sorted:
             if distinct_sorted[0] != 1:
                 violations.append(
                     Violation(
@@ -1599,7 +1631,7 @@ def validate_update(
     for old in preserved:
         earlier |= set(declared_ids(old).keys())
     lineage = validate_lineage(document, resolvable_ids=earlier, first_close=False)
-    events = validate_events(document, allow_sequence_gaps=bool(retired_artifact_ids) or published)
+    events = validate_events(document)
     report = shape.merged(locators).merged(lineage).merged(events)
     if published:
         kept = tuple(v for v in report.violations
@@ -1617,9 +1649,9 @@ def validate_update(
         after = [r for r in document.get(key, []) or []]
         retained_before = before
         if key == "events" and retired_ids:
+            dispensable = dispensable_retired_recording_ids(before, retired_ids)
             retained_before = [row for row in before if not (
-                isinstance(row, dict) and row.get("event_type") == "artifact.revision.recorded"
-                and row.get("target_id") in retired_ids)]
+                isinstance(row, dict) and row.get("event_id") in dispensable)]
         if after[: len(retained_before)] != retained_before and not (key == "routes" and provisional_completion):
             violations.append(Violation(
                 "update-earlier-%s-changed" % key, "$.%s" % key,

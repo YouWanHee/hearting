@@ -6314,17 +6314,8 @@ def _refreshed_document(root: Path, record: Mapping[str, Any], document: Mapping
                  if isinstance(row, dict) and row.get("artifact_id") not in (gone_artifacts | retired_artifacts)]
     revisions: List[Dict[str, Any]] = []
     candidate_events = [dict(row) for row in document.get("events", []) or []]
-    removed_event_ids = {row.get("event_id") for row in candidate_events
-                         if row.get("event_type") == "artifact.revision.recorded"
-                         and row.get("target_id") in retired_artifacts}
-    # A retained event may cite an old recording as evidence. Keep that event
-    # and its transitive evidence closure; only dispensable recordings vanish.
-    while True:
-        restore = {event_id for row in candidate_events if row.get("event_id") not in removed_event_ids
-                   for event_id in (row.get("evidence_ids") or []) if event_id in removed_event_ids}
-        if not restore:
-            break
-        removed_event_ids.difference_update(restore)
+    removed_event_ids = artifact_manifest.dispensable_retired_recording_ids(
+        candidate_events, retired_artifacts)
     events = [row for row in candidate_events if row.get("event_id") not in removed_event_ids]
     for row in document.get("artifact_revisions", []) or []:
         rel = row.get("locator", {}).get("path")
@@ -8041,9 +8032,10 @@ def _commit_sealed(
             root_lines.append({
                 "kind": "artifact", "target_type": "cycle", "target_id": record["cycle_id"],
                 "target_path": f"{cycle_rel}/{rel_root}", "operation": "update",
-                "field": "excluded_payload", "before": {"value": {"kind": "runtime", "rows": 0, "declared_bytes": 0}},
-                "after": {"value": {"kind": "runtime", "rows": 0, "declared_bytes": 0}},
+                "field": "excluded_payload", "before": {"value": {"kind": "runtime"}},
+                "after": {"value": {"kind": "runtime"}},
                 "reason": "finalize", "transaction_id": _history_id("htxn", "excluded-payload", record["cycle_id"]),
+                # Stable cycle+root identity intentionally records one line per root across reclassification.
                 "event_id": _history_id("hevt", "excluded-payload", record["cycle_id"], rel_root),
                 "now": now, **_history_actor("rule")})
         pending = _merge_pending(sealed.get("history_pending") or [], [line, *root_lines])

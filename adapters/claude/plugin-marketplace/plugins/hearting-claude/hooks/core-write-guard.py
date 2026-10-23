@@ -37,6 +37,13 @@ def _within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _runtime_override_allowed(candidate: Path, primary: Path) -> bool:
+    """Keep explicit runtime overrides outside shared, home, and release trees."""
+    return (candidate != primary and not _within(candidate, primary)
+            and not _within(candidate, Path.home())
+            and not any(_within(candidate, release) for release in _release_roots()))
+
+
 def _real(raw: str, base: Path) -> Path:
     path = Path(raw).expanduser()
     return Path(os.path.realpath(path if path.is_absolute() else base / path))
@@ -100,9 +107,7 @@ def violation(target: str, cwd: str) -> str:
         if override:
             try:
                 candidate = Path(os.path.realpath(Path(override).expanduser()))
-                if (Path(override).is_absolute() and candidate != primary
-                        and not _within(candidate, primary) and not _within(candidate, Path.home())
-                        and not any(_within(candidate, release) for release in _release_roots())
+                if (Path(override).is_absolute() and _runtime_override_allowed(candidate, primary)
                         and _within(path, candidate)):
                     return ""
             except (OSError, RuntimeError, ValueError):

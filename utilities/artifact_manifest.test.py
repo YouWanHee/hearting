@@ -1083,19 +1083,53 @@ class TestUpdateDocument(unittest.TestCase):
 
     def test_only_explicitly_retired_artifact_recordings_may_be_compacted(self):
         before, after = self._pair()
-        artifact_id = before["artifact_revisions"][0]["artifact_id"]
-        after["events"] = [event for event in after["events"]
-                           if not (event["event_type"] == "artifact.revision.recorded"
-                                   and event["target_id"] == artifact_id)]
+        artifact_ids = {row["artifact_id"] for row in before["artifact_revisions"]}
+        after["events"] = []
         self.assertIn("update-earlier-events-changed",
                       _codes(m.validate_update(after, preserved=[before], previous=before)))
         self.assertTrue(m.validate_update(after, preserved=[before], previous=before,
-                                          retired_artifact_ids={artifact_id}).ok)
-        tampered = json.loads(json.dumps(before))
-        tampered["events"] = [event for event in tampered["events"] if event["event_type"] != "cycle.completed"]
+                                          retired_artifact_ids=artifact_ids).ok)
+        changed_survivor = json.loads(json.dumps(before))
+        changed_survivor["events"][1]["payload"] = {"modified": True}
         self.assertIn("update-earlier-events-changed",
-                      _codes(m.validate_update(tampered, preserved=[before], previous=before,
-                                               retired_artifact_ids={artifact_id})))
+                      _codes(m.validate_update(changed_survivor, preserved=[before], previous=before,
+                                               retired_artifact_ids={"art_" + "f" * 32})))
+        tampered = json.loads(json.dumps(before))
+        tampered["events"][1]["event_type"] = "cycle.completed"
+        self.assertTrue(
+            _codes(m.validate_update(tampered, preserved=[before], previous=before,
+                                     retired_artifact_ids={before["events"][1]["target_id"]}))
+            & {"update-earlier-events-changed", "update-event-type-not-allowed"})
+
+    def test_retired_recording_survives_evidence_closure_and_stream_prefix(self):
+        before, after = self._pair()
+        retired = before["artifact_revisions"][0]["artifact_id"]
+        first, second = before["events"][:2]
+        first.update(stream_id="strm_" + "a" * 32, stream_sequence=1, target_id=retired)
+        second.update(stream_id=first["stream_id"], stream_sequence=2,
+                      evidence_ids=[first["event_id"]])
+        after["events"] = json.loads(json.dumps(before["events"]))
+        dispensable = m.dispensable_retired_recording_ids(before["events"], {retired})
+        self.assertNotIn(first["event_id"], dispensable)
+        after["events"] = [row for row in after["events"] if row["event_id"] not in dispensable]
+        self.assertTrue(m.validate_update(after, preserved=[before], previous=before,
+                                          retired_artifact_ids={retired}).ok)
+
+    def test_compaction_keeps_prefix_needed_to_prevent_later_sequence_gap(self):
+        before, after = self._pair()
+        retired = before["artifact_revisions"][0]["artifact_id"]
+        first, second = before["events"][:2]
+        first.update(stream_id="strm_" + "b" * 32, stream_sequence=1, target_id=retired)
+        second.update(stream_id=first["stream_id"], stream_sequence=2, evidence_ids=[])
+        before["events"] = json.loads(json.dumps(before["events"]))
+        after["events"] = json.loads(json.dumps(before["events"]))
+        dispensable = m.dispensable_retired_recording_ids(before["events"], {retired})
+        self.assertNotIn(first["event_id"], dispensable)
+        self.assertTrue(m.validate_update(after, preserved=[before], previous=before,
+                                          retired_artifact_ids={retired}).ok)
+        broken = json.loads(json.dumps(after))
+        broken["events"] = [row for row in broken["events"] if row["event_id"] != first["event_id"]]
+        self.assertIn("event-sequence-gap", _codes(m.validate_update(broken, published=True)))
 
     def test_only_revision_or_later_terminal_records_may_follow(self):
         before, after = self._pair()

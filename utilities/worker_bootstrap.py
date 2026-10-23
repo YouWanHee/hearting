@@ -240,6 +240,11 @@ def runtime_dir_candidate(artifact_root, environ=None) -> str:
             if not supplied.is_absolute():
                 return ""
             candidate = supplied.resolve(strict=False)
+            default = (root.parent / ".agent_runtime").resolve(strict=False)
+            # Nested dispatch inherits this generated default as an override.
+            # Preserve exactly that path while keeping user overrides fenced.
+            if candidate == default:
+                return str(candidate)
             home = Path.home().resolve(strict=False)
             project = root.parent
             if (candidate == Path("/") or candidate == home or candidate == project

@@ -223,7 +223,7 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         self.assertNotIn("--add-dir", command)
 
     def test_runtime_directory_appears_in_each_adapter_write_projection(self) -> None:
-        runtime = self.root / "project-runtime"
+        runtime = self.artifact.parent / ".agent_runtime"
         runtime.mkdir()
         prompt, log = self.root / "prompt.txt", self.root / "launch.log"
         for delivery in ("one-shot", "session-resume-supervised"):
