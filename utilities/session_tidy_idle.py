@@ -237,6 +237,7 @@ def observe_payload(harness: str, payload: dict, *, now: float | None = None,
             sequence=expected_sequence, now=now)
         if signal is not None:
             registered = False
+            fallback = False
             try:
                 # Prompt closure uses this same lock. Keep the sequence fence and
                 # private atomic write together, and leave subprocess work outside.
@@ -246,6 +247,7 @@ def observe_payload(harness: str, payload: dict, *, now: float | None = None,
             except BlockingIOError:
                 # A busy seat must not discard a real wait. Write optimistically,
                 # then retract only our own signal if prompt closure won the race.
+                fallback = True
                 if human_wait_state.write_signal(signal):
                     if tidy.read_prompt_seq(seat) == expected_sequence:
                         registered = True
@@ -257,7 +259,14 @@ def observe_payload(harness: str, payload: dict, *, now: float | None = None,
                         except BlockingIOError:
                             human_wait_state.remove_signal_if_current(signal)
             if registered:
-                human_wait_state.notify_signal(signal)
+                current = human_wait_state.signal_is_current(signal)
+                sequence_matches = (not fallback or
+                                    tidy.read_prompt_seq(seat) == expected_sequence)
+                if current and sequence_matches:
+                    # A prompt can still close after this check and before herdr starts; at most one silent registration notice is lost.
+                    human_wait_state.notify_signal(signal)
+                elif current:
+                    human_wait_state.remove_signal_if_current(signal)
     except Exception:
         pass
     from session_tidy import accept_reply_card, reconcile_compact_frontier

@@ -136,6 +136,14 @@ def remove_signal_if_current(value: dict) -> bool:
         return False
 
 
+def signal_is_current(value: dict) -> bool:
+    """Return whether this exact S4 item is still open for its seat."""
+    if not isinstance(value, dict) or not value.get("seat_key") or not value.get("id"):
+        return False
+    current = _read(_path(str(value["seat_key"])))
+    return current is not None and current.get("id") == value.get("id")
+
+
 def notify_signal(value: dict) -> None:
     """Run registration side effects after the caller has released seat locks."""
     _notify_item(value, boundary="registered")
