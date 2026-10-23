@@ -484,22 +484,26 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
         if utilities not in sys.path:
             sys.path.insert(0, utilities)
         import human_wait_state
-        answer_waits = human_wait_state.cached_view(now=_time.time())
+        answer_waits = human_wait_state.cached_fleet_view(now=_time.time())
         if answer_waits is None:
             answer_waits = {"items": [], "by_session": {}, "complete": False,
-                            "total": 0, "stale_total": 0, "health": [
+                            "total": 0, "older": 0, "health": [
                                 {"source": "cache", "state": "unknown"}]}
         from ..refresh import fleet_answer_wait_view
         fleet_answer_waits = fleet_answer_wait_view(answer_waits)
         for session in sessions:
             key = (getattr(session, "harness", None), getattr(session, "session_id", None))
-            ids = set(answer_waits.get("by_session", {}).get(key, ()))
+            ids = {item.get("id") for item in answer_waits.get("items", ())
+                   if item.get("session_id") == key[1] and item.get("harness") == key[0]
+                   and item.get("stale") == "current"}
             if ids:
                 session.interaction_observations.extend(
-                    {"kind": item.get("kind"), "source": item.get("source"),
+                    {"kind": {"human gate": "decision", "blocked owner": "decision",
+                              "marker": "decision"}.get(item.get("kind"), item.get("kind")),
+                 "source": item.get("source"),
                  "waiting_since": item.get("since"), "item_id": item.get("id")}
                 for item in answer_waits.get("items", ())
-                if item.get("id") in ids and not item.get("stale"))
+                if item.get("id") in ids)
         if not answer_waits.get("complete", False):
             reasons = ";".join(str(item.get("state", "unknown"))
                                 for item in answer_waits.get("health", ()))
@@ -680,9 +684,11 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
             by_attempt = {}
             for item in answer_waits.get("items", ()):
                 attempt = item.get("attempt_id")
-                if attempt and not item.get("stale"):
+                if attempt and item.get("stale") == "current":
                     by_attempt.setdefault(attempt, []).append(
-                        {"kind": item.get("kind"), "source": item.get("source"),
+                        {"kind": {"human gate": "decision", "blocked owner": "decision",
+                                  "marker": "decision"}.get(item.get("kind"), item.get("kind")),
+                         "source": item.get("source"),
                          "waiting_since": item.get("since"), "item_id": item.get("id")})
             for job in jobs:
                 values = by_attempt.get(getattr(job, "attempt_id", None), ())

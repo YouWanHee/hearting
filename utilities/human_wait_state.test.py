@@ -66,8 +66,54 @@ class HumanWaitStateTests(unittest.TestCase):
         path = next(Path(self.tmp.name).rglob("*.json"))
         before = path.read_bytes()
         result = observation.read_answer_waits(jobs_paths=(), now=10 + 8 * 86400)
-        self.assertTrue(result["items"][0].get("stale", False))
+        self.assertEqual(result["items"], [])
+        self.assertEqual((result["total"], result["stale_total"]), (0, 0))
         self.assertEqual(path.read_bytes(), before)
+
+    def test_s4_current_older_and_expired_windows_match_shared_policy(self):
+        now = 10 * 86400
+        for sid, seat, since in (("s-current", "seat-current", now - 72 * 3600 + 1),
+                                 ("s-older", "seat-older", now - 72 * 3600),
+                                 ("s-expired", "seat-expired", now - 7 * 86400 - 1)):
+            self.assertTrue(state.open_signal("claude", sid, seat,
+                                              "[답변 필요] fixture", now=since))
+        result = observation.read_answer_waits(jobs_paths=(), now=now)
+        by_id = {item["owner"]["session_id"]: item for item in result["items"]}
+        self.assertEqual(set(by_id), {"s-current", "s-older"})
+        self.assertFalse(by_id["s-current"]["stale"])
+        self.assertTrue(by_id["s-older"]["stale"])
+        self.assertEqual((result["total"], result["stale_total"]), (1, 1))
+
+    def test_s1_windows_kind_mapping_and_stale_activity_fixture(self):
+        from tools.fleet import interaction
+        now = 20 * 86400
+        interactions = Path(self.tmp.name) / "interactions"
+        with mock.patch.dict(os.environ, {"FLEET_INTERACTION_STATE_DIR": str(interactions)}):
+            for sid, kind, since in (("s1-current", "approval", now - 1),
+                                     ("s1-older", "permission", now - 72 * 3600),
+                                     ("s1-expired", "decision", now - 7 * 86400 - 1)):
+                self.assertTrue(interaction.set_wait(sid, "codex", kind,
+                                                     "codex-rollout", now=since))
+            result = observation.read_answer_waits(jobs_paths=(), now=now)
+            by_session = {item["owner"]["session_id"]: item for item in result["items"]}
+            self.assertEqual(set(by_session), {"s1-current", "s1-older"})
+            self.assertEqual((result["total"], result["stale_total"]), (1, 1))
+            self.assertEqual(by_session["s1-current"]["kind"], "approval")
+            self.assertEqual(by_session["s1-older"]["kind"], "permission")
+            self.assertTrue(state.publish_cache(result))
+            fleet = state.cached_fleet_view(now=now, request=False)
+            mapped = {item["session_id"]: item for item in fleet["items"]}
+            self.assertEqual(mapped["s1-current"]["source"], "S1-approval")
+            self.assertEqual(mapped["s1-current"]["kind"], "approval")
+            self.assertEqual(mapped["s1-older"]["source"], "S1-approval")
+            self.assertEqual(mapped["s1-older"]["stale"], "older")
+            # A real later session activity closes a stale rollout sidecar; an empty
+            # producer session set cannot establish that closure (investigated below).
+            active = SimpleNamespace(harness="codex", session_id="s1-current",
+                                     started_at=1, _interaction_activity=now)
+            closed = observation.read_answer_waits(jobs_paths=(), sessions=(active,), now=now)
+            self.assertNotIn("s1-current", {item["owner"]["session_id"]
+                                            for item in closed["items"]})
 
     def test_fake_herdr_gets_quiet_registration_and_only_six_hour_sound(self):
         import time

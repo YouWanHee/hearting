@@ -38,6 +38,10 @@ def _cache_path() -> Path:
     return state_root() / "projection.json"
 
 
+def _fleet_cache_path() -> Path:
+    return state_root() / "fleet.json"
+
+
 def _clean(value: str) -> str:
     value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(value))
     value = " ".join("".join(ch for ch in value if ch >= " " and ch != "\x7f").split())
@@ -216,7 +220,7 @@ def read_signals(*, now: float | None = None) -> list[dict]:
 
 
 def publish_cache(result: dict) -> bool:
-    """Publish a private v2 derived view; publication has no notification side effects."""
+    """Publish private and question-free Fleet views atomically per projection."""
     if not isinstance(result, dict) or not isinstance(result.get("items"), list):
         return False
     by_session: dict[str, list[str]] = {}
@@ -237,15 +241,46 @@ def publish_cache(result: dict) -> bool:
             by_session.setdefault(key, []).append(str(item.get("id") or ""))
     stale_total = sum(bool(item.get("stale")) for item in items)
     current_total = sum(not bool(item.get("stale")) for item in items)
-    value = {"schema_version": 2, "observed_at": float(result.get("observed_at") or time.time()),
+    observed_at = float(result.get("observed_at") or time.time())
+    value = {"schema_version": 3, "observed_at": observed_at,
              "complete": bool(result.get("complete")), "total": current_total,
-             "stale_total": stale_total, "items": items, "by_session": by_session,
+             "older": stale_total, "stale_total": stale_total, "items": items, "by_session": by_session,
              "unattributed": [item.get("id") for item in items
                               if item.get("attribution") == "unattributed" and not item.get("stale")],
              "health": [{"source": row.get("source"), "state": row.get("state")}
                         for row in result.get("health", ()) if isinstance(row, dict)]}
     try:
         _write(_cache_path(), value)
+        fleet_items = []
+        for item in items:
+            source = item.get("source")
+            kind = item.get("kind")
+            if source == "S1":
+                source = "S1-approval" if kind in {"approval", "permission"} else "S1-question"
+                kind = "approval" if source == "S1-approval" else "decision"
+            elif source == "S2":
+                kind = "human gate"
+            elif source == "S3":
+                kind = "blocked owner"
+            elif source == "S4":
+                kind = "marker"
+            owner = item.get("owner") or {}
+            fleet_items.append({
+                "id": item.get("id"), "source": source, "kind": kind,
+                "session_id": owner.get("session_id"), "harness": owner.get("harness"),
+                "pane_id": None, "route_id": item.get("route_id"),
+                "node": item.get("gate_id"), "attempt_id": item.get("attempt_id"),
+                "since": item.get("since"),
+                "stale": "older" if item.get("stale") else "current",
+            })
+        fleet_value = {"schema_version": 1, "observed_at": observed_at,
+                       "complete": bool(result.get("complete")), "total": current_total,
+                       "older": stale_total, "items": fleet_items,
+                       "unattributed": [item["id"] for item in fleet_items
+                                        if not item["session_id"] or not item["harness"]],
+                       "health": [{"source": row.get("source"), "state": row.get("state")}
+                                  for row in result.get("health", ()) if isinstance(row, dict)]}
+        _write(_fleet_cache_path(), fleet_value)
         return True
     except (OSError, ValueError, TypeError):
         return False
@@ -266,14 +301,14 @@ def _read_cache(*, now=None, max_age=_DISPLAY_TTL):
     except (OSError, ValueError, TypeError):
         return None
     current = time.time() if now is None else float(now)
-    if (not isinstance(value, dict) or value.get("schema_version") != 2
+    if (not isinstance(value, dict) or value.get("schema_version") != 3
             or not isinstance(value.get("observed_at"), (int, float))
             or isinstance(value.get("observed_at"), bool)
             or not math.isfinite(float(value["observed_at"]))
             or not isinstance(value.get("items"), list)
             or not isinstance(value.get("by_session"), dict)
             or not isinstance(value.get("total"), int) or isinstance(value.get("total"), bool)
-            or not isinstance(value.get("stale_total"), int) or isinstance(value.get("stale_total"), bool)
+            or not isinstance(value.get("older"), int) or isinstance(value.get("older"), bool)
             or current - float(value["observed_at"]) < 0
             or current - float(value["observed_at"]) > max_age):
         return None
@@ -288,6 +323,31 @@ def _read_cache(*, now=None, max_age=_DISPLAY_TTL):
         if not isinstance(session, str) or "\0" not in session or not isinstance(ids, list) \
                 or any(not isinstance(item_id, str) for item_id in ids):
             return None
+    return value
+
+
+def cached_fleet_view(*, now=None, request=True):
+    """Return the question-free Fleet projection and request its shared producer."""
+    path = _fleet_cache_path()
+    try:
+        parent = os.lstat(path.parent)
+        meta = os.lstat(path)
+        if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid()
+                or stat.S_IMODE(parent.st_mode) & 0o077
+                or not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid()
+                or stat.S_IMODE(meta.st_mode) & 0o077 or meta.st_size > _CACHE_MAX_BYTES):
+            raise OSError("invalid Fleet cache permissions or type")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        value = None
+    current = time.time() if now is None else float(now)
+    if (not isinstance(value, dict) or value.get("schema_version") != 1
+            or not isinstance(value.get("observed_at"), (int, float))
+            or current - float(value["observed_at"]) < 0
+            or current - float(value["observed_at"]) > _DISPLAY_TTL):
+        value = None
+    if request and (value is None or current - float(value["observed_at"]) > _REQUEST_TTL):
+        _request_producer()
     return value
 
 

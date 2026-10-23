@@ -321,13 +321,17 @@ refreshes it from the existing sources. A missing or expired cache is unknown,
 not a confirmed zero, and S4 on the current seat is read directly so an exact
 prompt close is visible. Each source closes only through its existing answer,
 gate, successor, or exact seat-input rule. S3 includes only route-bound BLOCKED
-owners without a later owner attempt on that same route. S2/S3 are current for
-72 hours, folded through seven days, then omitted from the projection; S1/S4
-retain their seven-day fold. Totals, session indexes and notifications count
-current items only. Unknown seat attribution remains in the global current
-total. Reading does not claim, resume, settle, or mutate a job. S4 signals and
-derived caches are observational, private state; folding never changes source
-state and adds no hook, gate, or user setting.
+owners without a later owner attempt on that same route. Every source is current
+for 72 hours, older through seven days, then omitted; `total` counts current
+items and `older` counts the older window. The private session projection may
+retain question text for its intended session and notification consumers. Fleet
+reads a separate derived projection whose schema contains no question, choices,
+recommendation, seat key, or free-form health reason. Incomplete health remains
+unknown in both projections, never a confirmed zero. Totals, session indexes and
+notifications count current items only. Unknown seat attribution remains in the
+global current total. Reading does not claim, resume, settle, or mutate a job.
+S4 signals and derived caches are observational, private state; folding never
+changes source state and adds no hook, gate, or user setting.
 
 Fleet's interactive view keeps shared status, usage, compute/GPU observations,
 and its controls outside the scrolling work-list viewport. The list body owns

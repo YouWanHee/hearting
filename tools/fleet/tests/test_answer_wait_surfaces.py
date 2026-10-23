@@ -40,14 +40,16 @@ class AnswerWaitSurfaceTests(unittest.TestCase):
         raw = self.result()
         raw["unattributed"] = ["S3:old-owner"]
         raw["total"] = 2
-        raw["items"].append({"id": "S3:old-owner", "source": "S3", "kind": "decision",
+        raw["items"].append({"id": "S3:old-owner", "source": "S3", "kind": "blocked owner",
                              "question": "PRIVATE-BLOCKER-SENTINEL", "choices": ["SECRET"],
                              "route_id": "route-123456789", "attempt_id": "attempt-abcdefgh",
                              "since": 91, "owner": {"harness": "claude", "session_id": None},
-                             "attribution": "unattributed"})
+                             "attribution": "unattributed", "stale": "current"})
+        raw["items"][0]["stale"] = "current"
         view = fleet_answer_wait_view(raw)
         snapshot = SimpleNamespace(jobs=[], sessions=[], answer_waits=view, compute_hosts=None)
-        self.assertIn("◑답 대기 2", job_summary(snapshot))
+        self.assertIn("답변 필요 2", job_summary(snapshot))
+        self.assertNotIn("◑답 대기", job_summary(snapshot))
         lines = system_lines(snapshot)
         self.assertIn("답 대기 2", lines)
         self.assertIn("귀속 못 한 항목 1", lines)
@@ -61,6 +63,48 @@ class AnswerWaitSurfaceTests(unittest.TestCase):
         self.assertNotIn("SECRET", rendered)
         self.assertNotIn("PRIVATE-BLOCKER-SENTINEL", repr(snapshot.answer_waits))
         self.assertNotIn("question", repr(view["items"][1]))
+
+    def test_fleet_projection_has_no_private_fields_and_summary_reserves_half_for_s2(self):
+        result = {"items": [
+            {"id": "s1", "source": "S1", "kind": "approval", "since": 100,
+             "owner": {"harness": "codex", "session_id": "a", "seat_key": "PRIVATE-SEAT"},
+             "question": "PRIVATE-QUESTION", "choices": ["PRIVATE-CHOICE"],
+             "recommendation": "PRIVATE-REC", "stale": False},
+            {"id": "s1q", "source": "S1", "kind": "elicitation", "since": 100,
+             "owner": {"harness": "opencode", "session_id": "q"},
+             "question": "PRIVATE-QUESTION", "stale": False},
+            {"id": "s2", "source": "S2", "kind": "decision", "since": 100,
+             "route_id": "route", "gate_id": "gate", "owner": {"harness": None,
+             "session_id": None}, "question": "PRIVATE-QUESTION", "stale": False},
+            {"id": "s3", "source": "S3", "kind": "decision", "since": 100,
+             "attempt_id": "att", "owner": {"harness": "claude", "session_id": "b"},
+             "question": "PRIVATE-BLOCKER", "stale": True},
+        ], "complete": True, "observed_at": 101}
+        self.assertTrue(human_wait_state.publish_cache(result))
+        payload = human_wait_state._fleet_cache_path().read_bytes()
+        self.assertNotIn(b'"question"', payload)
+        self.assertNotIn(b'"choices"', payload)
+        self.assertNotIn(b'"recommendation"', payload)
+        self.assertNotIn(b'"seat_key"', payload)
+        for sentinel in (b"PRIVATE-QUESTION", b"PRIVATE-CHOICE", b"PRIVATE-REC",
+                         b"PRIVATE-SEAT", b"PRIVATE-BLOCKER"):
+            self.assertNotIn(sentinel, payload)
+        view = human_wait_state.cached_fleet_view(now=101, request=False)
+        self.assertEqual([item["source"] for item in view["items"]],
+                         ["S1-approval", "S1-question", "S2", "S3"])
+        self.assertEqual([item["kind"] for item in view["items"]],
+                         ["approval", "decision", "human gate", "blocked owner"])
+        self.assertEqual([item["stale"] for item in view["items"]],
+                         ["current", "current", "current", "older"])
+        ids_before = [item["id"] for item in view["items"]]
+        self.assertTrue(human_wait_state.publish_cache(result))
+        second = human_wait_state.cached_fleet_view(now=101, request=False)
+        self.assertEqual([item["id"] for item in second["items"]], ids_before)
+        snapshot = SimpleNamespace(jobs=[], sessions=[], answer_waits=fleet_answer_wait_view(view),
+                                   compute_hosts=None)
+        summary = job_summary(snapshot)
+        self.assertIn("◑답 대기 1", summary)
+        self.assertIn("답변 필요 2", summary)
 
     def test_dispatch_owner_row_uses_the_shared_wait_item_chip(self):
         job = SimpleNamespace(interaction_observations=[{"kind": "decision", "item_id": "S3:a"}])

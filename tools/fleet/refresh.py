@@ -86,13 +86,19 @@ def fleet_answer_wait_view(result):
     for item in result.get("items", ()) or ():
         if not isinstance(item, dict):
             continue
+        allowed = ("id", "source", "kind", "route_id", "node", "attempt_id", "since", "stale",
+                   "session_id", "harness", "pane_id")
+        row = {key: item[key] for key in allowed if key in item}
         owner = item.get("owner") if isinstance(item.get("owner"), dict) else {}
-        items.append({key: item[key] for key in (
-            "id", "source", "kind", "route_id", "attempt_id", "gate_id", "since",
-            "attribution", "stale") if key in item})
-        if owner:
-            items[-1]["owner"] = {key: owner[key] for key in ("harness", "session_id")
-                                   if key in owner}
+        for key in ("harness", "session_id"):
+            if key not in row and key in owner:
+                row[key] = owner[key]
+        if isinstance(row.get("stale"), bool):
+            row["stale"] = "older" if row["stale"] else "current"
+        items.append(row)
+        if "session_id" in row or "harness" in row:
+            items[-1]["owner"] = {key: row[key] for key in ("harness", "session_id")
+                                   if key in row}
     health = []
     for item in result.get("health", ()) or ():
         if isinstance(item, dict):
@@ -102,6 +108,7 @@ def fleet_answer_wait_view(result):
         "by_session": dict(result.get("by_session", {}) or {}),
         "unattributed": list(result.get("unattributed", ()) or ()),
         "total": int(result.get("total", 0) or 0),
+        "older": int(result.get("older", 0) or 0),
         "health": health,
         "observed_at": result.get("observed_at"),
         "complete": bool(result.get("complete", False)),

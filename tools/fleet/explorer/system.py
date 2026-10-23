@@ -77,16 +77,19 @@ def job_summary(snapshot):
     parts = [f"{word} {counts[key]}" for key, word in _JOB_WORDS]
     answer_waits = _get(snapshot, "answer_waits")
     if answer_waits is None:
-        wait_count = counts["blocked"]
-        wait_label = str(wait_count)
+        if counts["blocked"]:
+            parts.insert(2, f"◑답 대기 {counts['blocked']}")
     elif not _get(answer_waits, "complete", False):
-        wait_count = None
-        wait_label = "?"
+        parts.insert(2, "◑답 대기 ?")
     else:
-        wait_count = int(_get(answer_waits, "total", 0) or 0)
-        wait_label = str(wait_count)
-    if wait_count is None or wait_count:
-        parts.insert(2, f"◑답 대기 {wait_label}")
+        current = [item for item in (_get(answer_waits, "items", ()) or ())
+                   if _get(item, "stale") == "current"]
+        gates = sum(_get(item, "source") == "S2" for item in current)
+        other_waits = len(current) - gates
+        if gates:
+            parts.insert(2, f"◑답 대기 {gates}")
+        if other_waits:
+            parts.insert(3 if gates else 2, f"답변 필요 {other_waits}")
     return " · ".join(parts)
 
 
@@ -314,7 +317,7 @@ def system_lines(snapshot):
                     if _get(item, "id") in unattributed:
                         lines.append(_unattributed_wait_line(item, _get(answer_waits, "observed_at")))
             stale = [item for item in (_get(answer_waits, "items", ()) or ())
-                     if _get(item, "stale", False)]
+                     if _get(item, "stale") == "older"]
             if stale:
                 lines.append(f"오래된 대기 {len(stale)}")
     views = host_views(snapshot)

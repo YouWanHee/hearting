@@ -578,12 +578,26 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
 
     current_total = 0
     stale_total = 0
+    retained = []
     for item in items:
         try:
             old = instant - float(item.get("since", instant))
-            item["stale"] = bool(item.get("stale")) or old >= 7 * 86400
+            if old < 0 or old > 7 * 86400:
+                continue
+            item["stale"] = old >= 72 * 3600
         except (TypeError, ValueError, OverflowError):
-            item["stale"] = True
+            continue
+        retained.append(item)
+    items = retained
+    by_session = defaultdict(list)
+    for item in items:
+        owner = item.get("owner") or {}
+        key = (owner.get("harness"), owner.get("session_id"))
+        if key[0] and key[1] and not item.get("stale"):
+            by_session[key].append(item["id"])
+    current_total = 0
+    stale_total = 0
+    for item in items:
         if item["stale"]:
             stale_total += 1
         else:

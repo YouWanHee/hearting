@@ -237,7 +237,7 @@ class PendingWaitTest(unittest.TestCase):
         terminal = self.jobs.read_text(encoding="utf-8").splitlines()[0].split("\t")[-1]
         terminal += ",note=dead-worker-blocked,failure_class=blocked"
         self.jobs.write_text("300\tdone\t/repo\t/wt\towner\t" + terminal + "\n", encoding="utf-8")
-        current = H.read_answer_waits(jobs_paths=[self.jobs], now=300 + 72 * 3600)
+        current = H.read_answer_waits(jobs_paths=[self.jobs], now=300 + 72 * 3600 - 1)
         self.assertEqual((current["total"], current["stale_total"]), (1, 0))
 
         self.jobs.write_text("299\tdone\t/repo\t/wt\towner\t" +
@@ -250,6 +250,29 @@ class PendingWaitTest(unittest.TestCase):
                              terminal + "\n", encoding="utf-8")
         dropped = H.read_answer_waits(jobs_paths=[self.jobs], now=300 + 7 * 86400)
         self.assertEqual((dropped["items"], dropped["total"], dropped["stale_total"]), ([], 0, 0))
+
+    def test_s2_72_hour_and_seven_day_projection_boundaries(self):
+        route, _attempt, _lease, metadata = self._blocked_owner_fixture()
+        self.jobs.write_text("100\topen\t/repo\t/wt\towner\t" + metadata + "\n",
+                             encoding="utf-8")
+        instant = 1000.0
+
+        def pending(_route, *, jobs, outcome=None):
+            del jobs, outcome
+            return [{"gate_id": "fixture-gate", "kind": "decision", "source": "hearting-ledger",
+                     "waiting_since": pending.since, "route_id": route["route_id"]}]
+
+        with mock.patch.object(H, "pending_human_waits", side_effect=pending):
+            pending.since = instant - 72 * 3600 + 1
+            current = H.read_answer_waits(jobs_paths=[self.jobs], now=instant)
+            self.assertEqual((current["total"], current["stale_total"]), (1, 0))
+            pending.since = instant - 72 * 3600
+            older = H.read_answer_waits(jobs_paths=[self.jobs], now=instant)
+            self.assertEqual((older["total"], older["stale_total"]), (0, 1))
+            pending.since = instant - 7 * 86400 - 1
+            expired = H.read_answer_waits(jobs_paths=[self.jobs], now=instant)
+            self.assertEqual((expired["items"], expired["total"], expired["stale_total"]),
+                             ([], 0, 0))
 
     def test_unbound_legacy_blocked_owner_is_not_an_unknown_wait(self):
         self.jobs.write_text("100\tdone\t/repo\t/wt\towner\t"
