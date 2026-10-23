@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -123,6 +124,44 @@ class FixtureAcceptanceClassificationTest(unittest.TestCase):
         self.assertEqual(Path(env["AGENT_MODEL_GOVERNOR_ROOT"]),
                          Path(env["AGENT_ARTIFACT_ROOT"]) / ".runtime/model-worker-governor")
         self.assertTrue(Path(env["AGENT_MODEL_GOVERNOR_ROOT"]).is_dir())
+
+    def test_terminal_fixture_owner_is_joined_once_before_rows_are_reloaded(self):
+        attempt_id = "att-fixture-owner"
+        jobs = Path(self.tmp.name) / "fixture-jobs.log"
+        owner = {"attempt_id": attempt_id, "worker_type": "owner", "status": "done"}
+        refreshed = [{**owner, "joined": "yes"}]
+        env = {"AGENT_DISPATCH_JOBS": str(jobs)}
+        events = []
+
+        def run_recorded(output, name, command, **kwargs):
+            events.append("join")
+            self.assertEqual(name, f"dispatch-wait-{attempt_id}")
+            self.assertEqual(command[-8:], [
+                "--attempt-id", attempt_id, "--jobs", str(jobs),
+                "--interval", "5", "--max", "120"])
+            self.assertIs(kwargs["env"], env)
+            self.assertEqual(kwargs["timeout"], 650)
+            return {"exit_code": 0}
+
+        def route_rows(path):
+            events.append("reload")
+            self.assertEqual(events, ["join", "reload"])
+            self.assertEqual(path, jobs)
+            return refreshed
+
+        joined = set()
+        with mock.patch.object(M, "_run_recorded", side_effect=run_recorded), \
+             mock.patch.object(M, "_route_rows", side_effect=route_rows):
+            result = M._join_terminal_fixture_owners(
+                [owner], joined=joined, output=Path(self.tmp.name), jobs=jobs,
+                fixture_env=env, child_env=env)
+            again = M._join_terminal_fixture_owners(
+                [owner], joined=joined, output=Path(self.tmp.name), jobs=jobs,
+                fixture_env=env, child_env=env)
+        self.assertEqual(result, refreshed)
+        self.assertEqual(again, [owner])
+        self.assertEqual(joined, {attempt_id})
+        self.assertEqual(events, ["join", "reload"])
 
     def test_d3_uses_supported_staged_standard_compose_for_each_mutating_capability(self):
         prompt = Path(self.tmp.name) / "task.md"

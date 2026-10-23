@@ -1075,7 +1075,10 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
                 command += ["--route-file", route[0], "--route-id", route[1], "--route-hash", route[2]]
             if getattr(args, "max_continuations", None) is not None:
                 command += ["--max-continuations", str(args.max_continuations)]
-        elif args.route_file:
+        elif args.route_file and not (
+            getattr(args, "repository_kind", None) == "non-git"
+            and uses_enclosing_codex_sandbox(args)
+        ):
             command += ["--route-file", args.route_file,
                         "--route-id", getattr(args, "route_id", "") or "",
                         "--route-hash", getattr(args, "route_hash", "") or ""]

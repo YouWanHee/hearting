@@ -369,6 +369,28 @@ def _route_rows(jobs: Path) -> list[dict[str, str]]:
     return rows
 
 
+def _join_terminal_fixture_owners(rows: list[dict[str, str]], *, joined: set[str],
+                                  output: Path, jobs: Path,
+                                  fixture_env: dict[str, str], child_env: dict[str, str]
+                                  ) -> list[dict[str, str]]:
+    """Run the depth-0 parent join once for each terminal fixture owner attempt."""
+    terminal = {"done", "killed", "cancelled"}
+    new_join = False
+    for row in rows:
+        attempt_id = str(row.get("attempt_id") or "")
+        if (row.get("worker_type") != "owner" or row.get("status") not in terminal
+                or not attempt_id or attempt_id in joined):
+            continue
+        command = [str(ROOT / "utilities" / "dispatch-wait.sh"),
+                   "--attempt-id", attempt_id, "--jobs", fixture_env["AGENT_DISPATCH_JOBS"],
+                   "--interval", "5", "--max", "120"]
+        _run_recorded(output, f"dispatch-wait-{attempt_id}", command,
+                      cwd=ROOT, env=child_env, timeout=650)
+        joined.add(attempt_id)
+        new_join = True
+    return _route_rows(jobs) if new_join else rows
+
+
 def _last_object(result: dict) -> dict | None:
     for line in reversed(str(result.get("stdout") or "").splitlines()):
         try:
@@ -475,8 +497,12 @@ def _fixture_route_start(adapter: str, *, output: Path, world: Path, cwd: Path,
 
     deadline = time.monotonic() + 2400
     rows = []
+    joined_owner_attempts: set[str] = set()
     while time.monotonic() < deadline:
         rows = _route_rows(jobs)
+        rows = _join_terminal_fixture_owners(
+            rows, joined=joined_owner_attempts, output=output, jobs=jobs,
+            fixture_env=fixture_env, child_env=child_env)
         classified = _classify_fixture_rows(rows, route)
         lineage = classified["frame"] + classified["owners"] + classified["stages"]
         open_rows = [row for row in lineage if row.get("status") in {"open", "running"}]
