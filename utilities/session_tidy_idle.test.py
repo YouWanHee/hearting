@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import contextlib
 from pathlib import Path
 import runpy
 import sqlite3
@@ -110,6 +111,83 @@ class IdleObserverTests(unittest.TestCase):
             waits = human_wait_state.read_signals(now=2000)
             self.assertEqual(len(waits), 1)
             self.assertEqual(waits[0]["question"], "계속 진행할까요?")
+
+    def test_prompt_between_observation_and_signal_write_cannot_reopen_wait(self):
+        import human_wait_state
+        sid = "sid-racing-prompt"
+        payload = {"hook_event_name": "Stop", "session_id": sid, "cwd": str(self.cwd),
+                   "last_assistant_message": "[답변 필요] 계속 진행할까요?",
+                   "transcript_path": self.transcript(sid, None), "turn_id": "turn-racing",
+                   "_answer_wait_prompt_seq": 0}
+        original_lock = st.seat_lock
+        injected = [False]
+
+        @contextlib.contextmanager
+        def prompt_before_observer_lock(seat_key, *, wait=None):
+            if not injected[0]:
+                injected[0] = True
+                st.run_hook("claude", "prompt", sid, cwd=str(self.cwd),
+                            prompt_text="다음 입력", now=2001)
+            with original_lock(seat_key, wait=wait):
+                yield
+
+        notifications = []
+        with self.iso.patched_environ(self.extra), \
+             mock.patch.object(st, "seat_lock", side_effect=prompt_before_observer_lock), \
+             mock.patch.object(human_wait_state, "notify_signal", side_effect=notifications.append):
+            seat = st.resolve_seat("claude", str(self.cwd), os.environ, sid)
+            self.assertEqual(st.read_prompt_seq(seat), 0)
+            idle.observe_payload("claude", payload, now=2000)
+            self.assertTrue(injected[0])
+            self.assertEqual(st.read_prompt_seq(seat), 1)
+            self.assertEqual(human_wait_state.read_signals(now=2002), [])
+            self.assertEqual(notifications, [])
+
+    def test_lock_timeout_fallback_rechecks_after_optimistic_write(self):
+        import human_wait_state
+        sid = "sid-fallback-race"
+        payload = {"hook_event_name": "Stop", "session_id": sid, "cwd": str(self.cwd),
+                   "last_assistant_message": "[답변 필요] 계속 진행할까요?",
+                   "transcript_path": self.transcript(sid, None), "turn_id": "turn-fallback",
+                   "_answer_wait_prompt_seq": 0}
+        original_lock = st.seat_lock
+        original_write = human_wait_state.write_signal
+        allow_prompt_lock = [False]
+        injected = [False]
+
+        @contextlib.contextmanager
+        def busy_seat_lock(seat_key, *, wait=None):
+            if allow_prompt_lock[0]:
+                with original_lock(seat_key, wait=wait):
+                    yield
+            else:
+                raise BlockingIOError("fixture lock contention")
+                yield
+
+        def write_then_prompt(value):
+            written = original_write(value)
+            if written and not injected[0]:
+                injected[0] = True
+                allow_prompt_lock[0] = True
+                try:
+                    st.run_hook("claude", "prompt", sid, cwd=str(self.cwd),
+                                prompt_text="다음 입력", now=2001)
+                finally:
+                    allow_prompt_lock[0] = False
+            return written
+
+        notifications = []
+        with self.iso.patched_environ(self.extra), \
+             mock.patch.object(st, "seat_lock", side_effect=busy_seat_lock), \
+             mock.patch.object(human_wait_state, "write_signal", side_effect=write_then_prompt), \
+             mock.patch.object(human_wait_state, "notify_signal", side_effect=notifications.append):
+            seat = st.resolve_seat("claude", str(self.cwd), os.environ, sid)
+            self.assertEqual(st.read_prompt_seq(seat), 0)
+            idle.observe_payload("claude", payload, now=2000)
+            self.assertTrue(injected[0])
+            self.assertEqual(st.read_prompt_seq(seat), 1)
+            self.assertEqual(human_wait_state.read_signals(now=2002), [])
+            self.assertEqual(notifications, [])
 
     def test_next_user_prompt_clears_marked_wait_for_each_harness(self):
         import human_wait_state

@@ -231,10 +231,33 @@ def observe_payload(harness: str, payload: dict, *, now: float | None = None,
         current_sequence = tidy.read_prompt_seq(seat)
         expected_sequence = payload.get("_answer_wait_prompt_seq",
                                        os.environ.get("HEARTING_ANSWER_WAIT_PROMPT_SEQ", current_sequence))
-        if int(expected_sequence) == current_sequence:
-            human_wait_state.open_signal(harness, sid, seat.key,
-                                         last_reply(harness, payload, sid),
-                                         sequence=current_sequence, now=now)
+        expected_sequence = int(expected_sequence)
+        signal = human_wait_state.signal_value(
+            harness, sid, seat.key, last_reply(harness, payload, sid),
+            sequence=expected_sequence, now=now)
+        if signal is not None:
+            registered = False
+            try:
+                # Prompt closure uses this same lock. Keep the sequence fence and
+                # private atomic write together, and leave subprocess work outside.
+                with tidy.seat_lock(seat.key, wait=0.1):
+                    if tidy.read_prompt_seq(seat) == expected_sequence:
+                        registered = human_wait_state.write_signal(signal)
+            except BlockingIOError:
+                # A busy seat must not discard a real wait. Write optimistically,
+                # then retract only our own signal if prompt closure won the race.
+                if human_wait_state.write_signal(signal):
+                    if tidy.read_prompt_seq(seat) == expected_sequence:
+                        registered = True
+                    else:
+                        try:
+                            with tidy.seat_lock(seat.key, wait=0.05):
+                                if tidy.read_prompt_seq(seat) != expected_sequence:
+                                    human_wait_state.remove_signal_if_current(signal)
+                        except BlockingIOError:
+                            human_wait_state.remove_signal_if_current(signal)
+            if registered:
+                human_wait_state.notify_signal(signal)
     except Exception:
         pass
     from session_tidy import accept_reply_card, reconcile_compact_frontier

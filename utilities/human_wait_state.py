@@ -90,30 +90,66 @@ def _write(path: Path, value: dict) -> None:
         raise
 
 
-def open_signal(harness: str, session_id: str, seat_key: str, text: str, *,
-                sequence: int = 0, now: float | None = None) -> bool:
+def signal_value(harness: str, session_id: str, seat_key: str, text: str, *,
+                 sequence: int = 0, now: float | None = None) -> dict | None:
+    """Build a validated private signal without writing or notifying."""
     question = marked_question(text)
     if (not question or harness not in {"claude", "codex", "opencode"}
             or not _SAFE.fullmatch(str(session_id)) or not seat_key):
-        return False
+        return None
     moment = time.time() if now is None else float(now)
     generation = max(0, int(sequence))
     item_id = hashlib.sha256((harness + "\0" + session_id + "\0" + seat_key +
                               "\0" + question + "\0" + str(generation)).encode()).hexdigest()
-    path = _path(seat_key)
-    prior = _read(path)
+    prior = _read(_path(seat_key))
     if prior and prior.get("id") == "S4:" + item_id and prior.get("question") == question:
         moment = float(prior.get("since", moment))
     value = {"schema_version": 1, "id": "S4:" + item_id, "source": "S4",
              "harness": harness, "session_id": session_id, "seat_key": str(seat_key),
              "question": question, "since": moment, "sequence": generation}
+    return value
+
+
+def write_signal(value: dict) -> bool:
+    """Write a previously validated signal without running notification work."""
+    if not isinstance(value, dict) or not value.get("seat_key") or not value.get("id"):
+        return False
     try:
-        _write(path, value)
-        _notify_item(value, boundary="registered")
-        _ensure_watcher({"items": [value]})
+        _write(_path(str(value["seat_key"])), value)
         return True
     except (OSError, ValueError, TypeError):
         return False
+
+
+def remove_signal_if_current(value: dict) -> bool:
+    """Remove this exact observer's signal, preserving any replacement."""
+    if not isinstance(value, dict) or not value.get("seat_key") or not value.get("id"):
+        return False
+    path = _path(str(value["seat_key"]))
+    try:
+        current = _read(path)
+        if current is None or current.get("id") != value.get("id"):
+            return False
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def notify_signal(value: dict) -> None:
+    """Run registration side effects after the caller has released seat locks."""
+    _notify_item(value, boundary="registered")
+    _ensure_watcher({"items": [value]})
+
+
+def open_signal(harness: str, session_id: str, seat_key: str, text: str, *,
+                sequence: int = 0, now: float | None = None) -> bool:
+    """Unconditional convenience writer for callers without a sequence fence."""
+    value = signal_value(harness, session_id, seat_key, text, sequence=sequence, now=now)
+    if value is None or not write_signal(value):
+        return False
+    notify_signal(value)
+    return True
 
 
 def close_signal(seat_key: str, *, sequence: int | None = None) -> bool:
