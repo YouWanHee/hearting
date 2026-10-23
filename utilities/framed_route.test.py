@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -162,6 +163,20 @@ class FramedBase(T.ProducerTestBase):
         (output / "shards/frame/intent.md").write_text(intent + "\n", encoding="utf-8")
 
 
+def legacy_framed_route(base, intensity):
+    """Build a historical sealed fixture from today's route, then remove only the newer basis row."""
+    route = base.compose(intensity=intensity)
+    basis = route["selection"]["selection_basis"]
+    basis[:] = [row for row in basis if row.get("axis") != "frame-legs"]
+    if intensity == "quick":
+        # The old no-intensity default was one deep leg, even though quick is today's one-leg recipe.
+        intensity_row = next(row for row in basis if row.get("axis") == "compose-intensity")
+        intensity_row.update(signal="standard", source="shape-default")
+    route["route_hash"] = R.route_hash(route)
+    route["route_id"] = R.ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
+    return route
+
+
 class FramedRouteCompileTest(FramedBase):
     def test_a164_1_compose_without_a_capability_seals_the_internal_route(self):
         route = self.compose()
@@ -280,6 +295,34 @@ class FramedRouteCompileTest(FramedBase):
             slug="other", cwd=R.ROOT, artifact_root=self.root, spec_read="fixture", unassigned=True,
             dispatch_evidence={"tuples": [T.nested("claude", "codex")]})
         self.assertNotIn("frame이 방향과 경로를 조립해", R.compose_card(staged))
+
+    def test_basis_free_historical_framed_routes_verify_and_keep_the_old_card_label(self):
+        """Fixture method: strip frame-legs from today's sealed compose result and reseal with existing hash/id."""
+        for intensity, legs, expected_intensity in (
+                ("quick", ("frame",), None), ("strong", tuple(FRAME_IDS), "strong")):
+            with self.subTest(intensity=intensity):
+                route = legacy_framed_route(self, intensity)
+                basis = {row.get("axis"): row for row in route["selection"]["selection_basis"]}
+                self.assertNotIn("frame-legs", basis)
+                self.assertEqual((basis["compose-intensity"].get("source"),
+                                  basis["compose-intensity"].get("signal")),
+                                 ("shape-default", "standard") if intensity == "quick"
+                                 else ("explicit", "strong"))
+                verified = R.verify_route(json.loads(json.dumps(route)), R.ROOT)
+                self.assertEqual(RP.frame_legs(verified), legs)
+                nodes = {node["id"]: node for node in verified["nodes"]}
+                self.assertEqual({nodes[node]["model_profile"] for node in legs},
+                                 {"deep"} if len(legs) == 1 else {"top"})
+                lines = R.compose_decision_lines(verified)
+                size = next(line for line in lines if line.startswith("  규모:"))
+                count_word = "한" if len(legs) == 1 else "두"
+                self.assertIn(f"frame {count_word} 갈래(이전 규칙으로 만든 경로)", size)
+                self.assertFalse(any("강도 안내" in line for line in lines))
+                command = shlex.split(W._compose_again(verified))
+                if expected_intensity is None:
+                    self.assertNotIn("--intensity", command)
+                else:
+                    self.assertEqual(command[command.index("--intensity") + 1], expected_intensity)
 
     def test_the_internal_capability_is_reachable_only_through_the_framed_shape(self):
         for shape, graph in (("direct", None), ("solo", None), ("staged", None), ("staged", "frame,route-decision")):

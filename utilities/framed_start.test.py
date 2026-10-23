@@ -1027,6 +1027,33 @@ class OneLegFramedTest(StartBase):
         self.assertEqual([row["node"] for row in self.record()["decision"]["proposals"]], ["frame"])
 
 
+class LegacyFramedStartTest(StartBase):
+    """Starting a basis-free historical route uses its sealed frame node count."""
+
+    run_fake = F.FramedStartTest.run_fake
+
+    def start(self, **kw):
+        return W.start_work(self.route, self.path, self.jobs, run=self.run_fake, **kw)
+
+    def start_legacy(self, intensity, expected_nodes):
+        route = F.legacy_framed_route(self, intensity)
+        self.route = R.verify_route(route, R.ROOT)
+        self.path = Path(L.admit_runtime_route(self.root, self.route).route_file)
+        self.calls = []
+        with mock.patch.object(W, "join_selected_attempts", return_value={"state": "timeout", "children": []}):
+            result = self.start()
+        self.assertEqual(result["state"], "preparing", result)
+        launched = [command[command.index("--route-node") + 1] for command in self.calls]
+        self.assertEqual(launched, expected_nodes)
+        self.assertEqual(len(self.calls), len(expected_nodes))
+
+    def test_basis_free_historical_one_leg_route_starts_only_frame(self):
+        self.start_legacy("quick", ["frame"])
+
+    def test_basis_free_historical_two_leg_route_starts_both_frames(self):
+        self.start_legacy("strong", F.FRAME_IDS)
+
+
 class LegPlanTest(StartBase):
     """The plan fields the frame wrote reach the owner and every stage worker, sealed, never copied."""
 

@@ -4855,6 +4855,8 @@ def compose_omission_lines(route):
 
 def compose_decision_lines(route):
     """Read only the sealed selection/nodes; same display for every harness."""
+    import route_plan as RP
+
     basis = {row.get("axis"): row for row in
              (route.get("selection") or {}).get("selection_basis", [])}
     intensity = basis.get("compose-intensity", {})
