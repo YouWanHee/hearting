@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+from types import SimpleNamespace
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,36 @@ class CoreWriteGuardTest(unittest.TestCase):
         self.assertEqual(G.violation(str(self.primary / ".agent_reports/r.md"), str(self.worktree)), "")
         self.assertEqual(G.violation(str(self.primary / "utilities/a.py"), str(self.primary)), "")
         self.assertEqual(G.violation("relative.py", str(self.worktree)), "")
+
+    def test_registered_unversioned_worker_only_edits_canonical_artifact_root(self):
+        cwd = self.tmp / "recordish"
+        artifact = cwd / ".agent_reports"
+        artifact.mkdir(parents=True)
+        route_file = self.tmp / "route.json"
+        route_file.write_text("{}\n")
+        user_file = cwd / "user.txt"
+        user_file.write_text("keep\n")
+        artifact_file = artifact / "result.md"
+        artifact_file.write_text("result\n")
+        outside_link = cwd / "artifact-link.md"
+        outside_link.symlink_to(artifact_file)
+        outside_target = self.tmp / "outside.md"
+        outside_target.write_text("outside\n")
+        artifact_link = artifact / "escape.md"
+        artifact_link.symlink_to(outside_target)
+        route = {"artifact_root": str(artifact.resolve()), "source_commit": "unversioned"}
+        module = SimpleNamespace(validated_unversioned_route=lambda path: route)
+        with mock.patch.dict(sys.modules, {"dispatch_contract": module}), \
+             mock.patch.dict(os.environ, {
+                 "AGENT_HOME": str(Path(__file__).resolve().parents[1]),
+                 "AGENT_ROUTE_FILE": str(route_file),
+                 "AGENT_DISPATCH_REGISTERED_WORKER": "1",
+                 "AGENT_ROUTE_ID": "rt-fixture",
+             }):
+            self.assertIn("이번 cycle 출력", G.violation(str(user_file), str(cwd)))
+            self.assertIn("이번 cycle 출력", G.violation(str(outside_link), str(cwd)))
+            self.assertIn("이번 cycle 출력", G.violation(str(artifact_link), str(cwd)))
+            self.assertEqual(G.violation(str(artifact_file), str(cwd)), "")
 
     def test_hook_modes(self):
         payload = {"tool_name": "Edit", "cwd": str(self.worktree),

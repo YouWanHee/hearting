@@ -645,6 +645,23 @@ class AdapterV11Test(unittest.TestCase):
   self.assertIn(f"--add-dir {DC.dispatch_state_root(args.jobs_path)}",command)
   self.assertNotIn(f"--add-dir {ROOT / '.dispatch'}",command)
   self.assertNotIn("network_access=true",command)
+ def test_codex_non_git_exec_uses_read_only_named_profile_and_skips_git_check(self):
+  wrapper=self.load_wrapper("codex")
+  profile={"default_permissions":"hearting_non_git_record",
+           "permissions":{"hearting_non_git_record":{"extends":":read-only",
+           "filesystem":{"/artifacts":"write","/state":"write"},
+           "network":{"enabled":False}}}}
+  args=type("Args",(),{
+   "worktree":"/docs","artifact_root":"/artifacts","nested_headless_network":False,
+   "agent_home":ROOT,"dispatch_depth":2,"route_id":"rt-1","attempt_id":"att-stage-1",
+   "command_attempt_id":"att-stage-1","jobs_path":Path("/state/jobs.log"),
+   "sandbox":"workspace-write","repository_kind":"non-git","route_file":"/sealed/route.json",
+   "resolved_model_settings":{"source":"inherit","context_window":"800000"},"approval":"inherit"})()
+  with mock.patch.object(wrapper,"recordish_profile_config",return_value=profile):
+   command=wrapper.shell_command(args,Path("/prompt"),Path("/log"))
+  self.assertIn("--skip-git-repo-check",command)
+  self.assertIn('default_permissions="hearting_non_git_record"',command)
+  self.assertNotIn("--sandbox workspace-write",command)
  def test_foreground_codex_child_reuses_checked_outer_sandbox(self):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td);repo,_art=self.fixture(root)

@@ -261,10 +261,9 @@ def _owner_row_proof(fields: list[str], meta: dict[str, str], *, route: dict,
     expected_worktree = str(Path(raw_worktree).resolve(strict=False))
     expected_repo = ""
     try:
-        expected_repo = subprocess.check_output(
-            ["git", "-C", expected_worktree, "rev-parse", "--show-toplevel"],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip()
+        from dispatch_contract import work_root_identity
+        expected_repo = work_root_identity(
+            expected_worktree, route=route, allow_sealed_repo_fallback=True)
     except (OSError, subprocess.SubprocessError):
         # Hermetic callers may provide an explicit sealed repository identity.
         expected_repo = str(route.get("repo") or "")

@@ -81,6 +81,35 @@ def violation(target: str, cwd: str) -> str:
             if _within(path, root):
                 return (f"hearting: {path} is an installed release copy; edit the source "
                         f"checkout and reinstall instead.")
+        route_file = os.environ.get("AGENT_ROUTE_FILE") or os.environ.get("AGENT_OWNER_ROUTE_FILE")
+        registered = os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER", "").lower() in {"1", "true"}
+        if route_file and registered:
+            try:
+                agent_home = Path(os.environ.get("AGENT_HOME") or Path(__file__).resolve().parents[1])
+                sys.path.insert(0, str(agent_home / "utilities"))
+                from dispatch_contract import validated_unversioned_route
+                route = validated_unversioned_route(base)
+            except Exception:
+                route = None
+                if os.environ.get("AGENT_ROUTE_ID") or os.environ.get("AGENT_OWNER_ROUTE_ID"):
+                    return "hearting: 등록된 route를 검증할 수 없어 원본 편집을 막았습니다. " \
+                           "현재 cycle 출력 경로를 확인하고 다시 시작하세요."
+            if route is not None:
+                artifact = Path(os.path.realpath(route.get("artifact_root", "")))
+                lexical = Path(os.path.abspath(
+                    Path(target).expanduser() if Path(target).expanduser().is_absolute()
+                    else base / Path(target).expanduser()
+                ))
+                lexical_in_artifact = _within(lexical, artifact)
+                resolved_in_artifact = _within(path, artifact)
+                if ((lexical_in_artifact != resolved_in_artifact)
+                        or (_within(lexical, base) and not lexical_in_artifact)
+                        or (_within(path, base) and not resolved_in_artifact)):
+                    output = (os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR")
+                              or os.environ.get("AGENT_ARTIFACT_CYCLE_DIR")
+                              or str(artifact))
+                    return (f"hearting: non-Git 기록형 route에서는 원본을 편집할 수 없습니다: {path}. "
+                            f"이번 cycle 출력에 쓰세요: {output}")
         linked = _linked_worktree(base)
         if not linked:
             return ""
