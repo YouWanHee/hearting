@@ -1593,6 +1593,7 @@ class LauncherProvenanceTest(unittest.TestCase):
         (source / "adapters/codex/utilities").mkdir()
         (source / "utilities").mkdir()
         (source / "roles").mkdir()
+        (source / "claude_setting").mkdir()
         (source / "core/CORE.md").write_text("# fixture root\n", encoding="utf-8")
         for name, payload in (("harness-manifest.json", "{}\n"),
                               ("manifest.json", "{}\n"),
@@ -1605,6 +1606,8 @@ class LauncherProvenanceTest(unittest.TestCase):
         (source / "utilities/agent-home.sh").chmod(0o755)
         (source / "adapters/codex/utilities/agent-home.sh").symlink_to(
             "../../../utilities/agent-home.sh")
+        (source / "claude_setting/commands").symlink_to(
+            "../adapters/claude/commands")
         (source / "utilities/artifact-root.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         (source / "utilities/artifact-root.sh").chmod(0o755)
         (source / "RELEASE_VERSION").write_text("vfixture.1\n", encoding="utf-8")
@@ -1633,6 +1636,8 @@ class LauncherProvenanceTest(unittest.TestCase):
         self.assertEqual(module._verified_release_identity(copied), identity)
         self.assertEqual((copied / "adapters/codex/utilities/agent-home.sh").readlink(),
                          (source / "adapters/codex/utilities/agent-home.sh").readlink())
+        self.assertEqual((copied / "claude_setting/commands").readlink(),
+                         Path("../adapters/claude/commands"))
         self.assertEqual((copied / "utilities/agent-home.sh").stat().st_mode & 0o777,
                          (source / "utilities/agent-home.sh").stat().st_mode & 0o777)
         reused, reuse_status, _ = module._publish_managed_agent_home(source, self.run_root)
@@ -1650,6 +1655,22 @@ class LauncherProvenanceTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(list(campaign.iterdir()), [])
         hidden.rename(source)
+
+        # Absolute and escaping links are rejected by real and dry-run paths.
+        for name, target in (("absolute", str(source / "core/CORE.md")),
+                             ("escaping", "../../outside")):
+            bad_link = source / f"unsafe-{name}"
+            bad_link.symlink_to(target)
+            rejected_run_root = self.root / f"runs-{name}"
+            with mock.patch.object(module, "_verified_release_identity", return_value=identity):
+                dry_home, dry_status, dry_reason = module._select_payload_agent_home(
+                    provenance, non_self, rejected_run_root, dry_run=True)
+                payload, publish_status, publish_reason = module._publish_managed_agent_home(
+                    source, rejected_run_root)
+            self.assertEqual((dry_home, dry_status), ("", "publish-failed"), dry_reason)
+            self.assertEqual((payload, publish_status), ("", "publish-failed"), publish_reason)
+            self.assertFalse(rejected_run_root.exists())
+            bad_link.unlink()
 
         # Exercise cmd_run's serialized remote launch through a fake SSH client.
         hosts = self.config.read_text(encoding="utf-8").replace(

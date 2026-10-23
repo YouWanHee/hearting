@@ -686,7 +686,7 @@ def _release_live_references(run_root, cache):
 
 
 def _release_tree_safe(root):
-    """Reject broken, absolute, or escaping symlinks before publishing a tree."""
+    """Reject absolute or escaping symlinks before publishing a tree."""
     root = Path(root).resolve(strict=True)
     try:
         for current, dirs, files in os.walk(root, followlinks=False):
@@ -699,7 +699,7 @@ def _release_tree_safe(root):
                 target = os.readlink(item)
                 if os.path.isabs(target):
                     return False
-                resolved = (item.parent / target).resolve(strict=True)
+                resolved = (item.parent / target).resolve(strict=False)
                 resolved.relative_to(root)
     except (OSError, RuntimeError, ValueError):
         return False
@@ -840,6 +840,8 @@ def _select_payload_agent_home(provenance, host, run_root, *, dry_run=False):
         key = _release_key(identity)
         if not key:
             return "", "publish-failed", "managed launcher release failed immutable identity validation"
+        if not _release_tree_safe(source):
+            return "", "publish-failed", "managed release identity could not be verified"
         entry = Path(run_root) / RELEASE_CACHE_NAME / key
         if dry_run:
             cache = entry.parent
