@@ -141,6 +141,25 @@ class HumanWaitStateTests(unittest.TestCase):
             self.assertIn(missing_sid, {item["owner"]["session_id"]
                                         for item in still_pending["items"]})
 
+    def test_producer_keeps_claude_sidecar_pending_after_transcript_write_without_sessions(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from tools.fleet import interaction
+        now = 2_000_000
+        sid = "fedcba98-7654-4321-8765-abcdefabcdef"
+        state_dir = Path(self.tmp.name) / "interactions"
+        claude_home = Path(self.tmp.name) / "claude-home"
+        transcript = claude_home / "projects" / "project" / (sid + ".jsonl")
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{"type":"attachment"}\n', encoding="utf-8")
+        os.utime(transcript, (now - 10, now - 10))
+        with mock.patch.dict(os.environ, {"FLEET_INTERACTION_STATE_DIR": str(state_dir),
+                                          "CLAUDE_CONFIG_DIR": str(claude_home)}):
+            self.assertTrue(interaction.set_wait(sid, "claude", "decision",
+                                                 "claude-asktool", now=now - 100))
+            # Transcript metadata can be appended while the user is still deciding.
+            pending = observation.read_answer_waits(jobs_paths=(), now=now)
+            self.assertIn(sid, {item["owner"]["session_id"] for item in pending["items"]})
+
     def test_fake_herdr_gets_quiet_registration_and_only_six_hour_sound(self):
         import time
         bin_dir = Path(self.tmp.name) / "bin"

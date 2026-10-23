@@ -372,15 +372,11 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                 return float(fallback)
 
     def sidecar_activity_since(harness, session_id):
-        """Newest exact transcript/rollout mtime already available on disk."""
-        if harness == "codex":
-            home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
-            candidates = home.glob("sessions/**/rollout-*-%s.jsonl" % session_id)
-        elif harness == "claude":
-            home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
-            candidates = home.glob("projects/*/%s.jsonl" % session_id)
-        else:
+        """Newest exact Codex rollout mtime; Claude transcripts are not answer signals."""
+        if harness != "codex":
             return None
+        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+        candidates = home.glob("sessions/**/rollout-*-%s.jsonl" % session_id)
         newest = None
         try:
             for candidate in candidates:
