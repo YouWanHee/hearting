@@ -371,26 +371,6 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
             except (TypeError, ValueError, OverflowError):
                 return float(fallback)
 
-    def sidecar_activity_since(harness, session_id):
-        """Newest exact Codex rollout mtime; Claude transcripts are not answer signals."""
-        if harness != "codex":
-            return None
-        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
-        candidates = home.glob("sessions/**/rollout-*-%s.jsonl" % session_id)
-        newest = None
-        try:
-            for candidate in candidates:
-                try:
-                    if candidate.is_symlink() or not candidate.is_file():
-                        continue
-                    mtime = candidate.stat().st_mtime
-                except OSError:
-                    continue
-                newest = mtime if newest is None else max(newest, mtime)
-        except OSError:
-            return None
-        return newest
-
     # S1 stores only exact identity and timing. Native question text is private
     # to the runtime and is never recovered from a prompt or sidecar.
     try:
@@ -418,11 +398,6 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                 if sidecar and sidecar.get("source") != "codex-appserver":
                     activity_since = (getattr(sess, "_interaction_activity", None)
                                       if sess is not None else None)
-                    transcript_activity = sidecar_activity_since(harness, sid)
-                    if transcript_activity is not None:
-                        activity_since = max(
-                            (value for value in (activity_since, transcript_activity)
-                             if isinstance(value, (int, float))), default=None)
                 record = interaction.pending_wait(
                     sid, harness,
                     session_start=getattr(sess, "started_at", None) if sess is not None else None,
