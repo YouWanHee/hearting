@@ -99,9 +99,7 @@ def _model_pair(model):
         key = render._model_key(name)
     except Exception:
         text = name.split(" (", 1)[0]
-        lowered = text.lower()
-        family = next((f for f in ("opus", "sonnet", "haiku", "fable", "gpt") if f in lowered), "other")
-        key = "fam_" + family
+        key = "fam_other"
     return [text, key]
 
 
