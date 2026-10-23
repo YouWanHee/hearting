@@ -373,6 +373,29 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         )
         PD.create(**self.kwargs)
 
+    def test_positive_batch_hold_refuses_before_claim_or_retry_sidecar_write(self):
+        delivery_id = self.kwargs["delivery_id"]
+        record_path = PD.record_path(self.root, "sess-claim", delivery_id)
+        sidecar = PD.courier_retry_path(record_path)
+        jobs = self.root / "jobs.log"
+        jobs.write_text("")
+        record = PD.read(self.root, "sess-claim", delivery_id)
+        info = jobs.stat()
+        batch = {"delivery_ids": (delivery_id, "delivery-sibling"), "held": True,
+                 "attempt_ids": ("att-child", "att-sibling"), "registry_path": str(jobs),
+                 "registry_signature": (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns),
+                 "seed_identity": (record["delivery_id"], record["receipt_digest"],
+                                   tuple(record["attempt_ids"]), record["recipient_digest"])}
+        with unittest.mock.patch("dispatch_notice_state.resolve_delivery_batch", return_value=batch):
+            with self.assertRaises(PD.PendingDeliveryError) as caught:
+                PD.claim(self.root, "sess-claim", delivery_id, claim_owner="held",
+                         lease_seconds=30, jobs=jobs)
+        self.assertEqual((caught.exception.reason, caught.exception.detail),
+                         ("pending-delivery-claim-refused", "batch-hold"))
+        self.assertEqual(PD.read(self.root, "sess-claim", delivery_id)["attempts"], 0)
+        self.assertEqual(PD.read(self.root, "sess-claim", delivery_id)["state"], "pending")
+        self.assertFalse(sidecar.exists())
+
     def _retry_state(self):
         path = PD.record_path(self.root, "sess-claim", self.kwargs["delivery_id"])
         metadata = json.loads(PD.courier_retry_path(path).read_text(encoding="utf-8"))

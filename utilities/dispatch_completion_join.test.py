@@ -4061,14 +4061,15 @@ class NextLegReceiptTest(unittest.TestCase):
                                  "required_action": "advance-completed"}]}
         text = JOIN.completion_followup_text(
             receipt, jobs=str(jobs), surface="/fixture/preflight.sh")
+        from dispatch_session_sweep import COMPLETION_DELIVERY_HEADER
+        fixed_text = COMPLETION_DELIVERY_HEADER + "\n" + text
         required = ("Original request/format apply", "Review result",
                     "approved follow-through", "First close:",
                     "checks run/reused/skipped/unrun", "commit/PR/deployment/serving",
                     "No harvest/restart/manual finalize", "Receipt/ACK isn't execution",
                     "handled exact repeats need no ACK", "new failures/conflicts",
                     "unfinished work, questions")
-        self.assertTrue(all(part in text for part in required))
-        from dispatch_session_sweep import COMPLETION_DELIVERY_HEADER
+        self.assertTrue(all(part in fixed_text for part in required))
         self.assertLessEqual(len(COMPLETION_DELIVERY_HEADER) + len(text), 583)
         receipt_only = "Receipt received. The queue was consumed and ACKed."
         self.assertFalse(all(part in receipt_only for part in required))

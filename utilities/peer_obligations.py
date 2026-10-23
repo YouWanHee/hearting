@@ -810,6 +810,20 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False,
         return
     if message.get("state") not in {"pending", "queued", "unverified", "received"}:
         return
+    many = message.get("dispatch_notices")
+    if many is not None:
+        if (not isinstance(many, list) or not 1 < len(many) <= 24
+                or message.get("dispatch_notice") is not None
+                or any(not isinstance(item, dict) for item in many)
+                or len({item.get("delivery_id") for item in many}) != len(many)):
+            return
+        for binding in many:
+            yield from _registered_delivery_bindings(
+                {**message, "dispatch_notice": binding}, roots,
+                received_only=received_only,
+                require_current_recipient=require_current_recipient,
+                read_context=read_context)
+        return
     binding = message.get("dispatch_notice") or {}
     expected_binding = {"duty_id", "jobs", "attempt_id", "carrier", "recipient_sid",
                         "storage_recipient", "delivery_id", "claim_owner"}
@@ -903,11 +917,12 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False,
 
 
 def registered_delivery_settled(message, *, roots=None, read_context=None):
-    """An exact historical recipient receipt settles the immutable result record."""
-    return any(record["state"] in {"acked", "rejected", "expired"}
-               for _store, _duty, _row, record, _root, _storage, _delivery_id
-               in _registered_delivery_bindings(message, roots,
-                   require_current_recipient=False, read_context=read_context))
+    """Settle only when every exact binding in a retained delivery is terminal."""
+    bindings = list(_registered_delivery_bindings(
+        message, roots, require_current_recipient=False, read_context=read_context))
+    return bool(bindings) and all(record["state"] in {"acked", "rejected", "expired"}
+                                  for _store, _duty, _row, record, _root, _storage, _delivery_id
+                                  in bindings)
 
 
 def received_registered_ack(jobs, record, recipient_sid) -> bool:

@@ -834,11 +834,10 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
     if completed_work and all(child["attempt_id"] in completed_work for child in receipt["children"]):
         notes = [f"The approved route plan names a next leg (index {child['next_leg']['index']}): "
                  f"{child['next_leg']['compose_command']}" for child in receipt["children"] if child.get("next_leg")]
-        return ("Original request/format apply. Review result; do approved follow-through now or via registered "
-                "continuation. First close: changes/why, observed before/after, checks run/reused/skipped/unrun, "
-                "commit/PR/deployment/serving, limits; invent none. No harvest/restart/manual finalize. "
-                "Receipt/ACK isn't execution; handled exact repeats need no ACK. Keep new failures/conflicts, "
-                "unfinished work, questions."
+        return ("Original request/format apply. Review result; do approved follow-through or existing "
+                "continuation. First close: changes/why, before/after, checks run/reused/skipped/unrun, "
+                "commit/PR/deployment/serving, limits. No harvest/restart/manual finalize. "
+                "Receipt/ACK isn't execution; handled exact repeats need no ACK."
                 + ("".join("\n" + note for note in notes)
                    + ("\nIf this next leg is already approved, execute it in this turn or its existing registered continuation. "
                       "Nothing starts it from receipt alone; obtain approval only for work outside the existing scope." if notes else "")))

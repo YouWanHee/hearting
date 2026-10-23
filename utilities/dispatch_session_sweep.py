@@ -338,6 +338,7 @@ def sweep_deliver(
                "codex" if recipient_kind.startswith("codex") else
                "opencode" if recipient_kind.startswith("opencode") else "")
     legacy_bindings_by_evidence: dict[int, tuple[dict, dict]] = {}
+    visited_batch_ids: set[str] = set()
 
     def settle_observed(record):
         evidence = native_evidence
@@ -376,6 +377,8 @@ def sweep_deliver(
     # that the seat handover bound to it. Those stay stored (and acked) under the registered
     # parent; only the receiving session differs.
     for current in addressed:
+        if current.get("delivery_id") in visited_batch_ids:
+            continue
         if claimed and time.monotonic_ns() - start_ns > DELIVER_BUDGET_SECONDS * 1_000_000_000:
             break
         storage_key = current[STORAGE_KEY]
@@ -399,48 +402,75 @@ def sweep_deliver(
         if jobs is None and not receipt.get("job_registry") and not standalone_notice:
             continue
         try:
-            record = pending_delivery.claim(
-                root,
-                storage_key,
-                delivery_id,
-                claim_owner=claim_owner,
-                lease_seconds=DELIVER_LEASE_SECONDS,
-                require_generation_proof=False,
-                jobs=jobs,
-                retry_context=_retry_context(recipient_kind, session_id, storage_key, current),
+            from dispatch_notice_state import resolve_delivery_batch
+            batch = resolve_delivery_batch(jobs, current, recipient_key=storage_key) if jobs is not None else None
+            batch_ids = tuple(batch.get("delivery_ids", ())) if batch else ()
+            if (batch and len(batch_ids) > 1
+                    and time.monotonic_ns() - start_ns > DELIVER_BUDGET_SECONDS * 1_000_000_000):
+                continue
+            group_claims = pending_delivery.claim_ready_batch(
+                root, storage_key, delivery_id, claim_owner=claim_owner,
+                lease_seconds=DELIVER_LEASE_SECONDS, require_generation_proof=False,
+                jobs=jobs, retry_context=_retry_context(recipient_kind, session_id, storage_key, current),
             )
         except pending_delivery.PendingDeliveryError:
             continue
-        # The stored identity, taken before keep_claim may project the
-        # carrier's in-memory receipt view.
-        expected_identity = pending_delivery.received_ack_identity(
-            record, storage_key, delivery_id)
+        group_ids = {member.get("delivery_id") for member in group_claims}
+        visited_batch_ids.update(group_ids)
+        # Check elapsed at the group boundary. A group that crossed the
+        # six-second carrier budget while claiming is released as a whole.
+        if (len(group_claims) > 1 and time.monotonic_ns() - start_ns
+                > DELIVER_BUDGET_SECONDS * 1_000_000_000):
+            for member in group_claims:
+                try:
+                    pending_delivery.release_claim(root, storage_key, member["delivery_id"],
+                                                   claim_owner=claim_owner)
+                except pending_delivery.PendingDeliveryError:
+                    pass
+            continue
+        group_output = []
+        group_ok = True
         from dispatch_notice_state import keep_claim
-        try:
-            if not keep_claim(root, storage_key, delivery_id, record, claim_owner, jobs=jobs):
-                continue
-        except OSError:
+        for record in group_claims:
+            member_id = record["delivery_id"]
+            expected_identity = pending_delivery.received_ack_identity(
+                record, storage_key, member_id)
+            try:
+                if not keep_claim(root, storage_key, member_id, record, claim_owner, jobs=jobs):
+                    group_ok = False
+                    break
+            except OSError:
+                group_ok = False
+                break
+            fresh = pending_delivery.read(root, storage_key, member_id)
+            if (fresh is None or pending_delivery.received_ack_identity(
+                    fresh, storage_key, member_id) != expected_identity
+                    or fresh.get("claim_owner") != claim_owner
+                    or settle_observed({**fresh, STORAGE_KEY: storage_key})["received"]):
+                group_ok = False
+                break
+            final = pending_delivery.read(root, storage_key, member_id)
+            if (final is None or pending_delivery.received_ack_identity(
+                    final, storage_key, member_id) != expected_identity
+                    or final.get("claim_owner") != claim_owner):
+                group_ok = False
+                break
+            from dispatch_supervision import CONTINUED_KEY, continue_for_parent
+            continued = continue_for_parent(record, session_id=session_id,
+                                            recipient_kind=recipient_kind)
+            group_output.append({**record, STORAGE_KEY: storage_key, IDENTITY_KEY: expected_identity,
+                                 **({CONTINUED_KEY: continued} if continued else {})})
+        if not group_ok:
+            if len(group_claims) == 1:
+                continue  # Preserve the established singleton recovery lease.
+            for member in group_claims:
+                try:
+                    pending_delivery.release_claim(root, storage_key, member["delivery_id"],
+                                                   claim_owner=claim_owner)
+                except pending_delivery.PendingDeliveryError:
+                    pass
             continue
-        # Native reads are outside the record lock. Recheck both immutable
-        # identity and claim ownership after that read, immediately before this
-        # carrier returns context for output.
-        fresh = pending_delivery.read(root, storage_key, delivery_id)
-        if (fresh is None or pending_delivery.received_ack_identity(
-                fresh, storage_key, delivery_id) != expected_identity
-                or fresh.get("claim_owner") != claim_owner):
-            continue
-        if settle_observed({**fresh, STORAGE_KEY: storage_key})["received"]:
-            continue
-        final = pending_delivery.read(root, storage_key, delivery_id)
-        if (final is None or pending_delivery.received_ack_identity(
-                final, storage_key, delivery_id) != expected_identity
-                or final.get("claim_owner") != claim_owner):
-            continue
-        # An answer another session sent: this session is the parent, so its carrier continues the route.
-        from dispatch_supervision import CONTINUED_KEY, continue_for_parent
-        continued = continue_for_parent(record, session_id=session_id, recipient_kind=recipient_kind)
-        claimed.append({**record, STORAGE_KEY: storage_key, IDENTITY_KEY: expected_identity,
-                        **({CONTINUED_KEY: continued} if continued else {})})
+        claimed.extend(group_output)
     elapsed_ns = time.monotonic_ns() - start_ns
     _append_self_instrumentation(root, elapsed_ns, entry_count, len(claimed))
     return claimed, entry_count
@@ -464,8 +494,9 @@ GATE_DELIVERY_HEADER = (
     "Do not start Monitor, dispatch-wait, or a polling loop."
 )
 COMPLETION_DELIVERY_HEADER = (
-    "Hearting runtime delivery. Follow required_action; continue approved work. "
-    "ACK isn't execution. Keep failures, conflicts, unfinished work, questions; "
+    "Hearting runtime delivery. Follow required_action; inspect-recovery is diagnostic. "
+    "Follow route's next-action receipt; runtime-v1 owners close/finalize. "
+    "Tracked-Workflow Continuation. Keep new failures/conflicts, unfinished work, questions; "
     "no Monitor/dispatch-wait/polling."
 )
 
