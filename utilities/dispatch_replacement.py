@@ -1547,7 +1547,6 @@ def _reuse_snapshot(jobs, route, lines):
         ready = DC.completion_attempt_readiness(route, node, marker, Path(jobs), registry_lines=lines)
         if ready.state != 'ready':
             raise DC.DispatchContractError('replacement-completion-unsettled', str(node['id']))
-        observations[str(node['id'])] = (node, path, marker, currency)
         restored_from = None
         revision = marker.get('revision') if isinstance(marker.get('revision'), dict) else {}
         if (marker.get('stage_authority') == 'revision'
@@ -1556,6 +1555,9 @@ def _reuse_snapshot(jobs, route, lines):
                 restored_from = _digest(_read(directory / f"{node['id']}.{revision['of_sequence']}.json"))
             except (OSError, ValueError, KeyError, TypeError):
                 raise DC.DispatchContractError('replacement-restored-predecessor-unreadable', str(node['id']))
+        # Keep the predecessor digest with its own observation; the reuse
+        # rows below are built in a second pass over every node.
+        observations[str(node['id'])] = (node, path, marker, currency, restored_from)
         if currency.state == 'superseded' or merge_unobservable:
             invalidated[str(node['id'])] = {
                 'node': node['id'], 'marker_digest': _digest(marker),
@@ -1570,7 +1572,7 @@ def _reuse_snapshot(jobs, route, lines):
     changed = True
     while changed:
         changed = False
-        for node_id, (node, _path, marker, currency) in observations.items():
+        for node_id, (node, _path, marker, currency, _restored_from) in observations.items():
             if node_id in invalidated:
                 continue
             invalid_parents = sorted(set(str(parent) for parent in node.get('depends_on') or ())
@@ -1588,7 +1590,7 @@ def _reuse_snapshot(jobs, route, lines):
         observation = observations.get(node_id)
         if observation is None or node_id in invalidated:
             continue
-        _node, path, marker, _currency = observation
+        _node, path, marker, _currency, restored_from = observation
         # A gates-off evidence edit is recorded only when this completion is
         # actually part of the successor's reusable evidence.
         DC.note_evidence_change(route, node, path, marker)

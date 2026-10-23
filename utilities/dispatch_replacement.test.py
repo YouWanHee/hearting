@@ -3483,6 +3483,28 @@ class ReplacementReuseCurrencyTest(unittest.TestCase):
         changed_attempt["completed"][0]["attempt_id"] = "att-retried"
         self.assertFalse(R._reuse_preserved(old, changed_attempt))
 
+    def test_restored_from_stays_with_its_own_node_in_a_mixed_route(self):
+        # plan is restored, impl-review is ordinary (restored first), and
+        # independent-verify is restored after the ordinary test/report rows.
+        for node_id in ("plan", "independent-verify"):
+            tombstone = dict(self.markers[node_id], state="superseded-by-upstream-revision",
+                             superseded_by={"node": "upstream", "sequence": 2})
+            (self.completion / f"{node_id}.1.json").write_text(json.dumps(tombstone), encoding="utf-8")
+            restored = dict(self.markers[node_id], sequence=2, stage_authority="revision",
+                            revision={"basis": "upstream-revision-consumed", "of_sequence": 1})
+            (self.completion / f"{node_id}.json").write_text(json.dumps(restored), encoding="utf-8")
+        states = {node["id"]: ("current", "completion-marker-verified")
+                  for node in self.route["nodes"]}
+        snapshot = self.snapshot(states)
+        rows = {row["node"]: row for row in snapshot["completed"]}
+        self.assertEqual(set(rows), {node["id"] for node in self.route["nodes"]})
+        for node_id in ("plan", "independent-verify"):
+            tombstone = json.loads((self.completion / f"{node_id}.1.json").read_text(encoding="utf-8"))
+            self.assertEqual(rows[node_id]["restored_from"], R._digest(tombstone))
+        self.assertNotEqual(rows["plan"]["restored_from"], rows["independent-verify"]["restored_from"])
+        for node_id in ("impl-review", "test", "report"):
+            self.assertNotIn("restored_from", rows[node_id])
+
     def test_merge_index_snapshot_is_pending_only_while_merge_is_observed(self):
         git = ["git", "-C", str(self.root)]
         subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
