@@ -7485,6 +7485,68 @@ class FixtureRegistryGuardTest(unittest.TestCase):
 
 class ComposeRouteTest(TestRoute):
  """SD-135: `compose` seals a preset-free shape/subgraph through the same sealer."""
+ def test_non_git_decision_is_single_and_conservative_classifier_is_purpose_based(self):
+  cwd="/tmp/non-git-project"
+  diagnosis={"state":"non-git","cwd":cwd,"detail":"fatal: not a git repository"}
+  direct=R._decide_non_git_compose(diagnosis,None,False,0,False,None)
+  self.assertEqual(direct["kind"],"direct")
+  for request_shape,route_plan,depth,attempt in (("framed",False,0,False),(None,True,0,False),
+                                                 (None,False,1,False),("direct",False,0,True)):
+   result=R._decide_non_git_compose(diagnosis,request_shape,route_plan,depth,attempt,"autopilot-code")
+   self.assertEqual(result["kind"],"refuse")
+   self.assertTrue(result["cause"].startswith("git 저장소 아님: "+cwd))
+   self.assertIn("depth-0",result["next"])
+  self.assertEqual(R._decide_non_git_compose({"state":"git"},None,False,0,False,None)["kind"],"git")
+  self.assertEqual(R._decide_non_git_compose({"state":"error","detail":"permission denied"},None,False,0,False,None)["kind"],"error")
+  cases={
+   "기술 동향 조사 후 핵심 내용을 정리한다.":("autopilot-research","technology"),
+   "시장 조사 결과를 정리한다.":("autopilot-research","market"),
+   "고정 metric으로 두 모델 결과를 비교한다.":("autopilot-lab","eval"),
+   "Implement a reusable evaluation driver.":("autopilot-code","dev"),
+   "Fix only typos in the existing report.":("autopilot-refine","default"),
+   "Write an independent paper.":("autopilot-draft","paper"),
+   "Inspect existing code structure.":("analyze-project","code"),
+   "Analyze the existing codebase structure.":("analyze-project","code"),
+   "Analyze existing documentation structure.":("analyze-project","doc"),
+   "Inspect existing paper structure.":("analyze-project","paper"),
+   "Package existing results as a ZIP.":("autopilot-ship","package"),
+  }
+  for task,expected in cases.items():
+   with self.subTest(task=task): self.assertEqual(R._classify_non_git_task(task),expected)
+  for task in ("계속 진행", "분석해줘", "Do not research this; fix code instead.",
+               'The task says "market research" but do not do that.',
+               "Research the topic and implement a reusable tool."):
+   with self.subTest(task=task): self.assertIsNone(R._classify_non_git_task(task))
+  failed = self.nested(parent="codex", child="codex", status="unsupported", failure="worktree-not-found")
+  with self.assertRaisesRegex(ValueError, "dispatch-evidence-exact-worktree-reprobe-required.*worktree-not-found"):
+   R._fallback_chain({"tuples":[failed],"native_subagent":[]}, expected_worktree=R.ROOT, require_scope=True)
+
+ def test_non_git_classified_research_modes_compile_and_seal_as_direct(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   for mode in ("academic","market","technology"):
+    with self.subTest(mode=mode):
+     route=self.compose(capability="autopilot-research",capability_mode=mode,shape="direct",graph=None,
+                        slug="research-"+mode,artifact_root=tmp,capability_source="non-git-task-classification")
+     self.assertEqual((route["capability"],route["effective_intensity"]),("autopilot-research","direct"))
+     self.assertEqual(len(route["nodes"]),1)
+     self.assertEqual(next(row for row in route["selection"]["selection_basis"]
+                           if row["axis"]=="compose-capability")["source"],"non-git-task-classification")
+     R.verify_route(route,R.ROOT)
+
+ def test_non_git_unresolved_capability_marker_and_exact_card_lines(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   route=self.compose(capability="autopilot-code",capability_mode="dev",shape="direct",graph=None,
+                      slug="unresolved",artifact_root=tmp,capability_source="non-git-unresolved",
+                      work_request={"text":"계속 진행","owner_harness":None})
+   basis=next(row for row in route["selection"]["selection_basis"] if row["axis"]=="compose-capability")
+   self.assertEqual(basis["source"],"non-git-unresolved")
+   self.assertIn("source=non-git-unresolved", "\n".join(R.compose_decision_lines(route)))
+   decision={"kind":"direct","capability_unresolved":True}
+   card=R.compose_card(route,non_git_decision=decision)
+   self.assertEqual(card.count("git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작"),1)
+   self.assertEqual(card.count("작업 종류 미정 — `--capability`로 지정"),1)
+   R.verify_route(route,R.ROOT)
+
  def test_automatic_depth_two_evidence_uses_enabled_prospective_owner_pool(self):
   readiness = self.evidence()
   enabled = ("claude", "codex", "opencode")
