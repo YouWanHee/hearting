@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import errno
 import fcntl
+import functools
 import hashlib
 import json
 import math
@@ -1274,10 +1275,19 @@ def resolve_parent_extinction(
     return ParentExtinctionEvidence("unproven", "parent-extinction-unproven:" + process.reason, parent_id)
 
 
-def parse_registry_metadata(pipe: str) -> dict[str, str]:
-    """Parse the stable six-column registry's comma-delimited metadata."""
+@functools.lru_cache(maxsize=8192)
+def _registry_metadata_items(pipe: str) -> tuple[tuple[str, str], ...]:
+    return tuple(dict(part.split("=", 1) for part in pipe.split(",") if "=" in part).items())
 
-    return dict(part.split("=", 1) for part in pipe.split(",") if "=" in part)
+
+def parse_registry_metadata(pipe: str) -> dict[str, str]:
+    """Parse the stable six-column registry's comma-delimited metadata.
+
+    One prompt-hook sweep reads the same rows many times; the parse is cached by
+    the row text and every caller still gets its own dict.
+    """
+
+    return dict(_registry_metadata_items(pipe))
 
 
 # SD-156: attempt registration's source-lineage fields. One name per fact, so
