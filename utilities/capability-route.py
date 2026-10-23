@@ -30,6 +30,7 @@ import resource_resume as RESOURCE_RESUME
 from dispatch_continuation_budget import (COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT,
                                           derive_workload_ordinary)
 from dispatch_contract import (
+    diagnose_repository_start,
     row_is_subsession,
     CANONICAL_PARENT_TRANSPORTS,
     DispatchContractError,
@@ -4438,6 +4439,11 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
         work_request = {**work_request, "owner_harness": owner or work_request.get("owner_harness")}
     selection = compose_route(**kwargs, work_request=work_request, route_plan=binding,
                               parent_harness=owner or "claude", selection_only=True)
+    diagnosis = _compose_git_diagnosis(kwargs["cwd"])
+    if (diagnosis.get("state") == "non-git" and selection.get("shape") != "direct"
+            and _isolates_worktree(selection)):
+        raise ValueError("git 저장소 아님: source-mutating worker route; git init 후 다시 시작하거나, "
+                         "이 세션에서 --shape direct로 진행")
     frame_preparation = frame_route.get("framed_worktree") or {}
     inherit_frame_allocation = _inherits_frame_worktree(frame_route, leg, index, kwargs["cwd"])
     if _isolates_worktree(selection) and not inherit_frame_allocation:
@@ -10041,8 +10047,10 @@ def _complete_node_locked(
                    if owner_closure is not None else {}),
             }
 
-def _git_changed_files(worktree):
+def _git_changed_files(worktree, *, route=None):
     """Return the worktree's git-visible changed file paths (AC 28 audit)."""
+    if route is not None and route.get("source_commit") == "unversioned":
+        raise ValueError("git-change-observation-not-applicable:unversioned-route")
     try:
         result = subprocess.run(
             # `-uall`: the default collapses an untracked directory to one
@@ -10065,6 +10073,41 @@ def _git_changed_files(worktree):
         if path:
             changed.add((Path(worktree) / path).resolve(strict=False))
     return changed
+
+
+def _artifact_output_snapshot(directory):
+    """Digest regular files in one cycle output tree; never follow symlinks."""
+    lexical_root = Path(directory).expanduser()
+    if lexical_root.is_symlink():
+        raise ValueError("artifact-snapshot-root-is-symlink")
+    root = lexical_root.resolve(strict=False)
+    snapshot = {}
+    if not root.is_dir():
+        return snapshot
+    def walk_error(exc):
+        raise ValueError(f"artifact-snapshot-unreadable:{exc}") from exc
+    for base, dirs, files in os.walk(root, topdown=True, followlinks=False, onerror=walk_error):
+        dirs[:] = sorted(name for name in dirs if not (Path(base) / name).is_symlink())
+        for name in sorted(files):
+            path = Path(base) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            resolved = path.resolve(strict=True)
+            if root not in resolved.parents:
+                continue
+            try:
+                snapshot[str(resolved)] = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise ValueError(f"artifact-snapshot-unreadable:{resolved}:{exc}") from exc
+    return snapshot
+
+
+def _artifact_delta(baseline, directory):
+    before = _baseline_content_map(baseline)
+    after = {Path(path).resolve(strict=False): digest
+             for path, digest in _artifact_output_snapshot(directory).items()}
+    return {path for path in (set(before) | set(after))
+            if before.get(path) != after.get(path)}
 
 
 def _content_digest(path):
@@ -10157,12 +10200,12 @@ def _git_committed_files(worktree, ancestor, head):
     try:
         probe = subprocess.run(
             ["git", "-C", str(worktree), "diff", "--name-only", str(ancestor), str(head)],
-            text=True, capture_output=True, check=False,
+            text=True, capture_output=True, check=False, timeout=60,
         )
-    except (OSError, ValueError):
-        return set()
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"git-commit-observation-failed:{exc}") from exc
     if probe.returncode != 0:
-        return set()
+        raise ValueError("git-commit-observation-failed:" + (probe.stderr or f"exit={probe.returncode}"))
     return {
         (Path(worktree) / line.strip()).resolve(strict=False)
         for line in probe.stdout.splitlines()
@@ -10229,9 +10272,12 @@ def record_subdivision_baseline(route, node_id, manifest, *, jobs=None):
             raise ValueError(f"subdivision-baseline-identity-conflict:{node_id}")
         return existing
     from datetime import datetime, timezone
+    unversioned = route.get("source_commit") == "unversioned"
+    artifact_output = (os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR")
+                       or str(route.get("artifact_root") or ""))
     record = {
         **identity,
-        "head_commit": _head_commit(worktree),
+        "head_commit": None if unversioned else _head_commit(worktree),
         # anchor M3 / B5: path -> content digest, not a path list. A path list
         # is a permanent exemption: a file dirty at admission became invisible
         # to the audit for the whole subdivision, and those are exactly the
@@ -10239,10 +10285,11 @@ def record_subdivision_baseline(route, node_id, manifest, *, jobs=None):
         # checklist), so in practice they are always dirty. Digests make the
         # subtraction a real delta -- unchanged since admission stays exempt,
         # changed again does not.
-        "changed_files": {
+        "artifact_output_dir": artifact_output if unversioned else None,
+        "changed_files": (_artifact_output_snapshot(artifact_output) if unversioned else {
             str(item): _content_digest(item)
-            for item in sorted(_git_changed_files(worktree))
-        },
+            for item in sorted(_git_changed_files(worktree, route=route))
+        }),
         "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     try:
@@ -10426,7 +10473,8 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
     # is refused outright, and a lineage-clean descent is a slice commit only
     # when it actually carries a slice's `fixed_files`.
     committed = set()
-    if baseline is not None:
+    unversioned = route.get("source_commit") == "unversioned"
+    if baseline is not None and not unversioned:
         head = _head_commit(worktree)
         baseline_head = baseline.get("head_commit")
         if head != baseline_head:
@@ -10456,7 +10504,13 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
     # A lineage-clean commit moves its files out of `git status` and into
     # history, so the audit has to add them back or accepting the commit would
     # silently blind the very measurement it just passed.
-    changed = _git_changed_files(worktree) | committed
+    if unversioned:
+        output_dir = (baseline or {}).get("artifact_output_dir") or os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR")
+        if not output_dir:
+            _refuse("subdivision-baseline-missing", "unversioned artifact output directory unavailable")
+        changed = _artifact_delta(baseline, output_dir)
+    else:
+        changed = _git_changed_files(worktree, route=route) | committed
     outside = changed - declared_union - preexisting
     if outside:
         _refuse(
@@ -10543,28 +10597,7 @@ def _git(cwd, *args):
 
 def _compose_git_diagnosis(cwd):
     """Keep an explicit start-time distinction between a non-repository and Git failure."""
-    probe_env = os.environ.copy()
-    probe_env["LC_ALL"] = "C"
-    probe_env.pop("LANGUAGE", None)
-    try:
-        result = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
-                                text=True, capture_output=True, timeout=60, env=probe_env)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return {"state": "error", "detail": f"{type(exc).__name__}: {exc}"}
-    if result.returncode == 0:
-        try:
-            bare = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--is-bare-repository"],
-                                  text=True, capture_output=True, timeout=60, env=probe_env)
-        except (OSError, subprocess.SubprocessError) as exc:
-            return {"state": "error", "detail": f"{type(exc).__name__}: {exc}"}
-        if bare.returncode != 0 or bare.stdout.strip() == "true":
-            return {"state": "error", "detail": (bare.stderr or "bare Git repository").strip()}
-        return {"state": "git", "root": result.stdout.strip()}
-    stderr = result.stderr or ""
-    exhausted = "not a git repository (or any" in stderr.lower()
-    if exhausted and not os.path.lexists(Path(cwd) / ".git"):
-        return {"state": "non-git", "detail": stderr}
-    return {"state": "error", "detail": stderr or f"git exited {result.returncode}"}
+    return diagnose_repository_start(cwd)
 
 
 def _decide_non_git_compose(cwd_diagnosis, requested_shape,
@@ -10582,12 +10615,12 @@ def _decide_non_git_compose(cwd_diagnosis, requested_shape,
         detail = cwd_diagnosis.get("detail") or "git diagnosis unavailable"
         return {**common, "kind": "error", "detail": f"{common['cwd']}: {detail}"}
     cause = f"git 저장소 아님: {common['cwd']}"
+    if requested_shape not in (None, "direct"):
+        return {**common, "kind": "worker-candidate", "cause": cause,
+                "next": "git init 후 다시 시작하거나, 이 세션에서 --shape direct로 진행"}
     if dispatch_depth > 0 or registered_attempt:
         return {**common, "kind": "refuse", "cause": cause,
                 "next": "git init 후 다시 시작하거나, depth-0 부모에서 같은 compose를 --shape 없이 또는 --shape direct로 실행"}
-    if requested_shape not in (None, "direct"):
-        return {**common, "kind": "refuse", "cause": cause,
-                "next": "git init 후 다시 시작하거나, depth-0에서 같은 compose를 --shape 없이 또는 --shape direct로 실행"}
     return {**common, "kind": "direct", "cause": cause}
 
 
@@ -12053,6 +12086,11 @@ def main():
         if a.start and not a.explain:
             selection = compose_route(**compose_args, selection_only=True)
             is_framed = selection.get("shape") == "framed"
+            non_git_worker = bool(a.start and not a.explain
+                                  and non_git_decision.get("kind") == "worker-candidate")
+            if non_git_worker and _isolates_worktree(selection):
+                raise ValueError(f"{non_git_decision['cause']}; source-mutating worker route; "
+                                 f"{non_git_decision['next']}")
             if _isolates_worktree(selection) or is_framed:
                 approved_leg_cwd = bool((route_plan_binding or {}).get("leg", {}).get("cwd"))
                 prep_key = _compose_preparation_key(compose_args, route_plan_binding, a.prompt_file)
@@ -12063,7 +12101,10 @@ def main():
                 }
                 if is_framed:
                     prepare_kwargs["framed_start"] = True
-                worktree = prepare_isolated_worktree(**prepare_kwargs)
+                if non_git_worker:
+                    worktree = {"state": "skipped", "reason": "non-git-artifact-only"}
+                else:
+                    worktree = prepare_isolated_worktree(**prepare_kwargs)
                 if not (is_framed and worktree.get("state") == "failed"):
                     print("worktree_prepared=" + worktree["state"] + "".join(
                         f" {key}={worktree[key]}" for key in ("path", "branch", "base", "reason")

@@ -941,5 +941,27 @@ class PinnedFourReceiptSurfacesTest(PinnedPlanFixture):
             self.assertNotIn("compose_argv(", text, name)
 
 
+class NonGitRoutePlanScopeTest(unittest.TestCase):
+    def test_mutating_first_leg_is_refused_before_worktree_preparation(self):
+        with tempfile.TemporaryDirectory(prefix="route-plan-non-git-") as temp:
+            cwd = Path(temp).resolve()
+            leg = {"shape": "solo"}
+            selection = {"nodes": [{"write_scope": ["source/**"]}]}
+            kwargs = {"cwd": str(cwd), "selection_pins": None, "owner": "claude"}
+            with mock.patch.object(RP, "leg_arguments", return_value={}), \
+                 mock.patch.object(RP, "leg_cwd", return_value=str(cwd)), \
+                 mock.patch.object(R, "_leg_compose_kwargs", return_value=kwargs), \
+                 mock.patch.object(R, "compose_route", return_value=selection), \
+                 mock.patch.object(R, "prepare_isolated_worktree") as prepare:
+                with self.assertRaisesRegex(ValueError, "git 저장소 아님: source-mutating worker route"):
+                    R.compile_first_leg(
+                        leg, frame_route={"cwd": str(cwd), "artifact_root": str(cwd / ".agent_reports")},
+                        frame_cycle_id="cyc_fixture", context={"slug": "fixture", "cwd": str(cwd),
+                                                               "owner": "claude"},
+                        binding={}, work_request=None, readiness=lambda _cwd: {},
+                    )
+            prepare.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -140,6 +140,13 @@ echo "state: branch=$br head=$head base=$def dirty=$(git status --porcelain 2>/d
 - **DONE-BRANCH:** after a branch is merged into base it is finished. At a new work cycle, a non-base branch that is zero commits ahead and is not a just-created branch for this task must be replaced with `git fetch origin && git switch -c <slug> origin/$def`. This applies to direct edits too; uncommitted work on a dead branch is already drift.
 - **Periodic recheck:** remember the entry `head`. Before each commit, stop if `head` changed underneath the session or a new `MERGE_HEAD` appeared. Non-git and single-checkout paths pass harmlessly.
 
+In a non-Git folder, a sealed artifact-only worker route stays in its original cwd and
+uses the canonical cycle output as its write area; it does not create a linked `-wt`
+folder or initialize Git. Source-mutating worker scopes are refused before route
+registration or worktree preparation. Existing artifact-scope and parallel-overlap
+checks continue to bound cycle output writes. The route's sealed `source_commit=unversioned`
+is the runtime signal; a Git probe error is not equivalent to a non-Git folder.
+
 #### Git index-lock failure diagnosis
 
 Dispatched worker children run with `GIT_OPTIONAL_LOCKS=0`

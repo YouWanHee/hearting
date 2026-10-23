@@ -7493,9 +7493,13 @@ class ComposeRouteTest(TestRoute):
   for request_shape,depth,attempt in (("framed",0,False),("solo",0,False),
                                       (None,1,False),("direct",0,True)):
    result=R._decide_non_git_compose(diagnosis,request_shape,depth,attempt,"autopilot-code")
-   self.assertEqual(result["kind"],"refuse")
+   expected = "worker-candidate" if request_shape in ("framed", "solo") else "refuse"
+   self.assertEqual(result["kind"],expected)
    self.assertTrue(result["cause"].startswith("git 저장소 아님: "+cwd))
-   self.assertIn("depth-0",result["next"])
+   if expected == "worker-candidate":
+    self.assertIn("--shape direct",result["next"])
+   else:
+    self.assertIn("depth-0",result["next"])
   self.assertEqual(R._decide_non_git_compose({"state":"git"},None,0,False,None)["kind"],"git")
   self.assertEqual(R._decide_non_git_compose({"state":"error","detail":"permission denied"},None,0,False,None)["kind"],"error")
   cases={
@@ -10608,6 +10612,22 @@ class TerminalGateRegistrySnapshotTest(unittest.TestCase):
    self.assertTrue(all(tuple(lines)==snapshot.lines for lines in seen["marker_lines"]))
    self.assertEqual(len(seen["owner_view"].records),2,
                     "owner absence checks must receive the full view, not its selected owner row")
+
+
+class NonGitArtifactDeltaTest(unittest.TestCase):
+ def test_artifact_snapshot_delta_tracks_create_modify_delete_and_skips_symlinks(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td);output=root/"cycle"/"artifacts";output.mkdir(parents=True)
+   keep=output/"keep.md";keep.write_text("same\n")
+   changed=output/"changed.md";changed.write_text("before\n")
+   deleted=output/"deleted.md";deleted.write_text("gone\n")
+   outside=root/"outside.md";outside.write_text("outside\n")
+   (output/"linked.md").symlink_to(outside)
+   baseline={"changed_files":R._artifact_output_snapshot(output)}
+   changed.write_text("after\n");deleted.unlink()
+   created=output/"created.md";created.write_text("new\n")
+   delta=R._artifact_delta(baseline,output)
+   self.assertEqual(delta,{changed,deleted,created})
 
 
 if __name__=="__main__": unittest.main()
