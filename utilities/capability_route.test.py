@@ -7675,6 +7675,13 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(route["workflow_contract"]["terminal_nodes"],["owner-close"])
   R.verify_route(route,R.ROOT)
 
+ def test_report_scope_links_a_follower_through_a_dropped_stage(self):
+  # rt-7bb0eb4782ff1274: execute waited only on the dropped plan-check, so it ran beside plan.
+  route=self.compose(graph="plan,execute,test,report",execution_scope="report")
+  deps={node["id"]:node.get("depends_on") for node in route["nodes"]}
+  self.assertEqual(deps["execute"],["plan"])
+  R.verify_route(route,R.ROOT)
+
  def test_auto_owner_close_notice_is_once_before_start_and_explain(self):
   import work_start
   with tempfile.TemporaryDirectory() as tmp,mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):

@@ -3017,6 +3017,22 @@ def _complete_compose_group_consumers(registry, base, graph, find_input, **kwarg
     return recipe
 
 
+def _kept_dependencies(order, declared, kept):
+    """`declared` with each stage left out of the graph replaced by the kept stages it waited on,
+    transitively, so dropping a stage never makes its follower concurrent with its producer."""
+    found, seen, pending = [], set(), list(declared)
+    while pending:
+        dep = pending.pop(0)
+        if dep in seen:
+            continue
+        seen.add(dep)
+        if dep in kept:
+            found.append(dep)
+        else:
+            pending.extend(order.get(dep, {}).get("depends_on") or [])
+    return found
+
+
 def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, *, preserve_base_dependencies=False,
                             extra_stages=None, group_intensity=None, complete_group_consumers=False):
     """Cut the caller's stage subgraph out of the capability's own recipe.
@@ -3187,7 +3203,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
                 node["depends_on"] = [borrowed_ids[dep] for dep in declared_dependencies if dep in borrowed_ids]
             else:
                 declared_dependencies = order.get(node_id, {}).get("depends_on") or []
-                node["depends_on"] = [dep for dep in declared_dependencies if dep in ids]
+                node["depends_on"] = _kept_dependencies(order, declared_dependencies, set(ids))
         else:
             node["depends_on"] = [previous["id"]] if previous else []
         if not preserve_base_dependencies and previous and gate_group(previous["id"]):
