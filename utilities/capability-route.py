@@ -3413,6 +3413,13 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
         if set(row.get("after") or []) <= kept_ids
         and {ref.get("node") for ref in row.get("source_outputs") or []} <= kept_ids
     ]
+    # A kept group anchor or an appended owner close can follow the node an extension
+    # names, so the extension runs after what now ends the route.
+    terminals = sorted({node["id"] for node in nodes}
+                       - {dep for node in nodes for dep in node.get("depends_on") or []})
+    for row in extensions:
+        if not set(row.get("after") or []) <= set(terminals):
+            row["after"] = terminals
     recipe = {
         "capability": base_recipe["capability"],
         "modes": list(base_recipe["modes"]),

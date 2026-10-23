@@ -7799,6 +7799,16 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(route["nodes"][-1]["write_scope"],["owner-close.md"])
   R.verify_route(route,R.ROOT)
 
+ def test_strong_research_extension_runs_after_the_appended_owner_close(self):
+  # SR_CorrNet_SD: claim-verify was no longer terminal once owner-close followed its group.
+  for intensity in ("strong","thorough"):
+   with self.subTest(intensity=intensity):
+    route=self.compose(capability="autopilot-research",capability_mode="market",intensity=intensity,
+                       graph="retrieval,synthesis,report,claim-verify")
+    self.assertEqual(route["nodes"][-1]["id"],"owner-close")
+    self.assertEqual([row["after"] for row in route["conditional_extensions"]],[["owner-close"]])
+    R.verify_route(route,R.ROOT)
+
  def test_auto_owner_close_report_scope_keeps_dependency_projection(self):
   route=self.compose(capability="autopilot-lab",capability_mode="eval",intensity="strong",
                      graph="metrics:qa/ml-debug,diagnose,report,independent-verify",execution_scope="report")
