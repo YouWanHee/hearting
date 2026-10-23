@@ -30,6 +30,10 @@ class HumanWaitStateTests(unittest.TestCase):
         self.assertIsNone(state.marked_question("문장 [답변 필요] 중간 표지"))
         self.assertEqual(state.marked_question("[답변 필요] 진행할까요?\n부연"), "진행할까요?")
         self.assertEqual(state.marked_question("[결정 필요]\x1b[31m배포 범위\x1b[0m"), "배포 범위")
+        self.assertEqual(state.marked_question("긴 작업 보고\n변경 사항과 결과\n[답변 필요] 마지막 선택"), "마지막 선택")
+        self.assertIsNone(state.marked_question("예시:\n```text\n[답변 필요] 코드 예시\n```"))
+        self.assertEqual(state.marked_question("~~~md\n[결정 필요] 코드 예시\n~~~\n[결정 필요] 실제 선택"),
+                         "실제 선택")
         self.assertTrue(state.open_signal("claude", "sid-1", "seat-1",
                                           "[답변 필요] 진행할까요?", sequence=3, now=100))
         path = next(Path(self.tmp.name).rglob("*.json"))

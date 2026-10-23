@@ -41,11 +41,22 @@ def _clean(value: str) -> str:
 
 
 def marked_question(text: str) -> str | None:
-    """Return the short first marked line, never infer from punctuation or tone."""
+    """Return a short marked line outside fenced code, never infer from tone."""
     if not isinstance(text, str):
         return None
+    fence = None
     lines = text.splitlines()
     for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith(("```", "~~~")):
+            marker = stripped[0]
+            if fence is None:
+                fence = marker
+            elif fence == marker:
+                fence = None
+            continue
+        if fence is not None:
+            continue
         match = _MARKER.match(line)
         if match:
             return _clean(match.group(1)) or _clean(line.strip())

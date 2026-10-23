@@ -78,6 +78,36 @@ def as_snapshot(value):
     return snapshot
 
 
+def fleet_answer_wait_view(result):
+    """Keep answer-wait identity and timing in Fleet, without private text."""
+    if not isinstance(result, dict):
+        return None
+    items = []
+    for item in result.get("items", ()) or ():
+        if not isinstance(item, dict):
+            continue
+        owner = item.get("owner") if isinstance(item.get("owner"), dict) else {}
+        items.append({key: item[key] for key in (
+            "id", "source", "kind", "route_id", "attempt_id", "gate_id", "since",
+            "attribution", "stale") if key in item})
+        if owner:
+            items[-1]["owner"] = {key: owner[key] for key in ("harness", "session_id")
+                                   if key in owner}
+    health = []
+    for item in result.get("health", ()) or ():
+        if isinstance(item, dict):
+            health.append({key: item[key] for key in ("source", "state") if key in item})
+    return {
+        "items": items,
+        "by_session": dict(result.get("by_session", {}) or {}),
+        "unattributed": list(result.get("unattributed", ()) or ()),
+        "total": int(result.get("total", 0) or 0),
+        "health": health,
+        "observed_at": result.get("observed_at"),
+        "complete": bool(result.get("complete", False)),
+    }
+
+
 # Measured normal tick = 10-12s (attach_projections 5.64s + dispatch.collect
 # 4.33s). At the default 2s interval, interval*6 == 12s would be
 # indistinguishable from a normal tick, so a floor must dominate. 90s is

@@ -28,6 +28,34 @@ def _jobs(snapshot):
     return list(_get(snapshot, "jobs", ()) or ())
 
 
+def _unattributed_wait_line(item, observed_at):
+    source = _get(item, "source")
+    label = {"S1": "질문 창 대기", "S2": "작업 경로 확인 대기",
+             "S3": "owner 답 대기", "S4": "턴 끝 질문"}.get(source, "답 대기")
+    owner = _get(item, "owner", {}) or {}
+    harness = {"claude": "Claude", "codex": "Codex", "opencode": "OpenCode"}.get(
+        _get(owner, "harness"))
+    parts = [label]
+    if harness:
+        parts.append(harness)
+    route_id, attempt_id = _get(item, "route_id"), _get(item, "attempt_id")
+    if route_id:
+        parts.append("경로 " + str(route_id)[-8:])
+    if attempt_id:
+        parts.append("시도 " + str(attempt_id)[-8:])
+    since = _get(item, "since")
+    if isinstance(since, (int, float)) and isinstance(observed_at, (int, float)):
+        elapsed = max(0, int(float(observed_at) - float(since)))
+        if elapsed >= 3600:
+            age = f"{elapsed // 3600}시간 경과"
+        elif elapsed >= 60:
+            age = f"{elapsed // 60}분 경과"
+        else:
+            age = "1분 미만 경과"
+        parts.append(age)
+    return "  · " + " · ".join(parts)
+
+
 # -- status band -----------------------------------------------------------------------------
 
 _JOB_WORDS = (("working", "⠇도는 중"), ("idle", "쉼"), ("done", "끝남"), ("unknown", "?확인 불가"),
@@ -284,7 +312,7 @@ def system_lines(snapshot):
                 lines.append(f"귀속 못 한 항목 {len(unattributed)}")
                 for item in (_get(answer_waits, "items", ()) or ()):
                     if _get(item, "id") in unattributed:
-                        lines.append("  · " + str(_get(item, "question") or "질문 내용 확인 불가")[:100])
+                        lines.append(_unattributed_wait_line(item, _get(answer_waits, "observed_at")))
             stale = [item for item in (_get(answer_waits, "items", ()) or ())
                      if _get(item, "stale", False)]
             if stale:

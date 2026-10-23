@@ -490,6 +490,7 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
             job_key, "human-gates", "%s: %s" % (type(exc).__name__, str(exc)[:160]))
 
     answer_waits = None
+    fleet_answer_waits = None
     try:
         utilities = str(Path(__file__).resolve().parents[3] / "utilities")
         if utilities not in sys.path:
@@ -501,6 +502,8 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
             sessions=sessions, now=_time.time())
         import human_wait_state
         human_wait_state.publish_cache(answer_waits)
+        from ..refresh import fleet_answer_wait_view
+        fleet_answer_waits = fleet_answer_wait_view(answer_waits)
         for session in sessions:
             key = (getattr(session, "harness", None), getattr(session, "session_id", None))
             ids = set(answer_waits.get("by_session", {}).get(key, ()))
@@ -842,7 +845,7 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
         resource_diagnostics=copy.deepcopy(resource_diagnostics),
         observations=observations, tag_metadata=copy.deepcopy(tag_metadata),
         display_snapshot=display_snapshot,
-        answer_waits=answer_waits,
+        answer_waits=fleet_answer_waits,
     )
     if not sessions and not jobs and node_evidence:
         from ..projection import terminal_route_entities
