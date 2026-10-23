@@ -118,7 +118,21 @@ def _directory(jobs):
     return Path(jobs).resolve().parent / 'automatic-replacements'
 
 
+_ROWS_MEMO = [None, None]
+
+
 def _rows(lines):
+    """Registry rows by attempt id. Callers re-read the same registry many times in one
+    process, so the last parse is reused for identical content; each call gets copies."""
+    lines = tuple(lines)
+    key, cached = _ROWS_MEMO
+    if cached is None or key != lines:
+        cached = _parse_rows(lines)
+        _ROWS_MEMO[:] = [lines, cached]
+    return {aid: (list(fields), dict(meta)) for aid, (fields, meta) in cached.items()}
+
+
+def _parse_rows(lines):
     result = {}
     for line in lines:
         fields = line.split('\t')

@@ -2010,13 +2010,17 @@ def _fallback_chain(
         expected_worktree=expected_worktree, require_scope=require_scope,
     )
     tuples=evidence["tuples"]
-    if any(
-        row.get("status") == "unsupported"
+    reprobes = sorted((row for row in tuples
+        if row.get("status") == "unsupported"
         and row.get("failure_scope") == "exact-worktree"
-        and row.get("retry_on_isolated_worktree") == 1
-        for row in tuples
-    ):
-        raise ValueError("dispatch-evidence-exact-worktree-reprobe-required")
+        and row.get("retry_on_isolated_worktree") == 1),
+        key=lambda row: (str(row.get("child_harness", "")), str(row.get("checked_worktree", ""))))
+    if reprobes:
+        detail = "; ".join(
+            f"{row.get('child_harness')}:{row.get('reason') or row.get('failure_class') or 'unknown'}"
+            + (f" worktree={row.get('checked_worktree')}" if row.get("checked_worktree") else "")
+            for row in reprobes)
+        raise ValueError("dispatch-evidence-exact-worktree-reprobe-required: " + detail)
     same=[row for row in tuples if row["child_harness"]==row["parent_harness"]]
     cross=[row for row in tuples if row["child_harness"]!=row["parent_harness"]]
     if contract_version==DISPATCH_CONTRACT_VERSION:
@@ -3017,6 +3021,22 @@ def _complete_compose_group_consumers(registry, base, graph, find_input, **kwarg
     return recipe
 
 
+def _kept_dependencies(order, declared, kept):
+    """`declared` with each stage left out of the graph replaced by the kept stages it waited on,
+    transitively, so dropping a stage never makes its follower concurrent with its producer."""
+    found, seen, pending = [], set(), list(declared)
+    while pending:
+        dep = pending.pop(0)
+        if dep in seen:
+            continue
+        seen.add(dep)
+        if dep in kept:
+            found.append(dep)
+        else:
+            pending.extend(order.get(dep, {}).get("depends_on") or [])
+    return found
+
+
 def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, *, preserve_base_dependencies=False,
                             extra_stages=None, group_intensity=None, complete_group_consumers=False):
     """Cut the caller's stage subgraph out of the capability's own recipe.
@@ -3187,7 +3207,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
                 node["depends_on"] = [borrowed_ids[dep] for dep in declared_dependencies if dep in borrowed_ids]
             else:
                 declared_dependencies = order.get(node_id, {}).get("depends_on") or []
-                node["depends_on"] = [dep for dep in declared_dependencies if dep in ids]
+                node["depends_on"] = _kept_dependencies(order, declared_dependencies, set(ids))
         else:
             node["depends_on"] = [previous["id"]] if previous else []
         if not preserve_base_dependencies and previous and gate_group(previous["id"]):
@@ -3392,6 +3412,13 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
         if set(row.get("after") or []) <= kept_ids
         and {ref.get("node") for ref in row.get("source_outputs") or []} <= kept_ids
     ]
+    # A kept group anchor or an appended owner close can follow the node an extension
+    # names, so the extension runs after what now ends the route.
+    terminals = sorted({node["id"] for node in nodes}
+                       - {dep for node in nodes for dep in node.get("depends_on") or []})
+    for row in extensions:
+        if not set(row.get("after") or []) <= set(terminals):
+            row["after"] = terminals
     recipe = {
         "capability": base_recipe["capability"],
         "modes": list(base_recipe["modes"]),
@@ -3984,7 +4011,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                   transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None,
                   campaign_key=None, parent_cycle_id=None, profile=None, work_request=None, unassigned=False,
                   selection_pins=None, route_plan=None, frameless=False, execution_scope=None,
-                  extra_stages=None, selection_only=False):
+                  extra_stages=None, selection_only=False, capability_source=None):
     """Resolve every default, then compile through the ordinary sealer.
 
     `route_plan` (a binding read by `route_plan.read_route_plan`) seals `{decision, digest, index}`
@@ -4207,8 +4234,8 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         {"axis": "compose-intensity", "signal": given_intensity or SHAPE_INTENSITY[shape],
          "source": "explicit" if given_intensity is not None else "shape-default"},
         {"axis": "compose-capability", "signal": given_capability or route["capability"],
-         "source": "frame-shape" if shape == "framed" else
-                   "explicit" if given_capability is not None else "compose-default"},
+         "source": ("frame-shape" if shape == "framed" else capability_source or
+                   ("explicit" if given_capability is not None else "compose-default"))},
     ])
     if shape == "framed":
         route["selection"]["selection_basis"].append({
@@ -4853,7 +4880,7 @@ def compose_omission_lines(route):
     return lines
 
 
-def compose_decision_lines(route):
+def compose_decision_lines(route, non_git_decision=None):
     """Read only the sealed selection/nodes; same display for every harness."""
     import route_plan as RP
 
@@ -4873,6 +4900,10 @@ def compose_decision_lines(route):
     if capability.get("source") == "compose-default":
         lines.append(f"  capability={route['capability']} (source=compose-default, --capability 지정 안 됨; "
                      "고정 기본값, 과제 문장 분류 없음; 결과 분석·평가·비교는 autopilot-lab/eval 검토)")
+    elif capability.get("source") == "non-git-unresolved":
+        lines.append(f"  capability={route['capability']} (source=non-git-unresolved; 작업 종류 미분류)")
+    elif capability.get("source") == "non-git-task-classification":
+        lines.append(f"  capability={route['capability']} (source=non-git-task-classification)")
     elif capability.get("source") == "frame-shape":
         lines.append("  capability=frame 결정 대기 (source=frame-shape)")
     elif not capability:
@@ -4923,7 +4954,7 @@ def compose_decision_lines(route):
 
 
 def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, route_plan_unreadable=False,
-                 campaign_selection=None, include_decisions=True):
+                 campaign_selection=None, include_decisions=True, non_git_decision=None):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     ids = [node["id"] for node in route["nodes"]]
@@ -4939,7 +4970,11 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
     )
     observed = compose_observations(route)
     if include_decisions:
-        card += "\n" + "\n".join(compose_decision_lines(route))
+        card += "\n" + "\n".join(compose_decision_lines(route, non_git_decision))
+    if non_git_decision and non_git_decision.get("kind") == "direct":
+        card += "\n  git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작"
+        if non_git_decision.get("capability_unresolved"):
+            card += "\n  작업 종류 미정 — `--capability`로 지정"
     card += f"\n  확인 방식 {observed['confirmation']['method']} · 출처 {observed['confirmation']['origin']}"
     for answer in observed["pre_execution_answers"]:
         card += f"\n  {answer['question']}. {answer['name']}: {answer['answer']}"
@@ -6764,7 +6799,9 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
              "route_file":str(Path(route_file).resolve()),"cwd":route["cwd"],
              "capability":route["capability"],"effective_intensity":route["effective_intensity"],
              "closed_at":datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
-             "head_commit":commit or _head_commit(route["cwd"]),"summary":summary,
+             "head_commit":(None if inline_finish_id is not None and
+                            not _COMMIT_SHA.fullmatch(str(route.get("source_commit") or ""))
+                            else commit or _head_commit(route["cwd"])),"summary":summary,
              "registry_current":route.get("_registry_current",True),
              "route_location":classify_route_location(route_file,route["artifact_root"]),
              "terminal_gate_proven":terminal_gate_proven(gates),"terminal_gates":gates}
@@ -10534,6 +10571,86 @@ def _git(cwd, *args):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def _compose_git_diagnosis(cwd):
+    """Keep an explicit start-time distinction between a non-repository and Git failure."""
+    probe_env = os.environ.copy()
+    probe_env["LC_ALL"] = "C"
+    probe_env.pop("LANGUAGE", None)
+    try:
+        result = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+                                text=True, capture_output=True, timeout=60, env=probe_env)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"state": "error", "detail": f"{type(exc).__name__}: {exc}"}
+    if result.returncode == 0:
+        try:
+            bare = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--is-bare-repository"],
+                                  text=True, capture_output=True, timeout=60, env=probe_env)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"state": "error", "detail": f"{type(exc).__name__}: {exc}"}
+        if bare.returncode != 0 or bare.stdout.strip() == "true":
+            return {"state": "error", "detail": (bare.stderr or "bare Git repository").strip()}
+        return {"state": "git", "root": result.stdout.strip()}
+    stderr = result.stderr or ""
+    exhausted = "not a git repository (or any" in stderr.lower()
+    if exhausted and not os.path.lexists(Path(cwd) / ".git"):
+        return {"state": "non-git", "detail": stderr}
+    return {"state": "error", "detail": stderr or f"git exited {result.returncode}"}
+
+
+def _decide_non_git_compose(cwd_diagnosis, requested_shape,
+                            dispatch_depth, registered_attempt, capability_hint):
+    """The single compose-start decision for Git, non-Git direct, and non-Git refusal.
+
+    `requested_shape` is the shape the start will run: a readable route-plan leg's own
+    shape, else `--shape`. Only a direct (or omitted) shape runs without a worker."""
+    common = {"cwd": str(cwd_diagnosis.get("cwd") or ""),
+              "capability_hint": capability_hint}
+    state = cwd_diagnosis.get("state")
+    if state == "git":
+        return {**common, "kind": "git"}
+    if state != "non-git":
+        detail = cwd_diagnosis.get("detail") or "git diagnosis unavailable"
+        return {**common, "kind": "error", "detail": f"{common['cwd']}: {detail}"}
+    cause = f"git 저장소 아님: {common['cwd']}"
+    if dispatch_depth > 0 or registered_attempt:
+        return {**common, "kind": "refuse", "cause": cause,
+                "next": "git init 후 다시 시작하거나, depth-0 부모에서 같은 compose를 --shape 없이 또는 --shape direct로 실행"}
+    if requested_shape not in (None, "direct"):
+        return {**common, "kind": "refuse", "cause": cause,
+                "next": "git init 후 다시 시작하거나, depth-0에서 같은 compose를 --shape 없이 또는 --shape direct로 실행"}
+    return {**common, "kind": "direct", "cause": cause}
+
+
+def _classify_non_git_task(text):
+    """Conservative pure task-purpose classifier; called only for non-Git starts."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if re.search(r"(?:\b(?:not|don't|do not|without|instead of)\b|아니|않|말고|제외)", text, re.I):
+        return None
+    if any(mark in text for mark in ('"', "'", "“", "”", "‘", "’", "`")):
+        return None
+    if re.search(r"\b(?:research)\b|연구|조사", text, re.I):
+        if not re.search(r"문헌 검토|논문 조사|literature review|paper research|academic research|시장 조사|시장 분석|market research|market survey|기술 동향|기술 조사|technology research|technical research|technology survey", text, re.I):
+            return None
+    patterns = {
+        ("autopilot-research", "academic"): r"문헌 검토|논문 조사|literature review|paper research|academic research",
+        ("autopilot-research", "market"): r"시장 조사|시장 분석|market research|market survey",
+        ("autopilot-research", "technology"): r"기술 동향|기술 조사|technology research|technical research|technology survey",
+        ("autopilot-lab", "eval"): r"고정 (?:metric|metrics|결과)|모델 비교|결과 비교|재평가|compare (?:the )?(?:model|results)|fixed (?:metric|results)|reevaluate|re-evaluate|experiment conclusions",
+        ("autopilot-code", "dev"): r"재사용 (?:프로그램|도구|driver)|구현(?:해|한다|하기|$)|함수 버그 수정|implement a reusable|fix (?:the )?(?:function|path) bug",
+        ("autopilot-refine", "default"): r"오탈자|문장만 수정|fix only typos?|typos? only|fix only the wording|correct only",
+        ("autopilot-draft", "presentation"): r"독립 (?:새 )?발표|새 발표문|new independent presentation|write an independent presentation",
+        ("autopilot-draft", "paper"): r"독립 (?:새 )?논문|새 논문 작성|new independent paper|write an independent paper",
+        ("analyze-project", "code"): r"기존 코드.*(?:구조|분석)|inspect existing (?:project )?code|analyze (?:the )?existing codebase",
+        ("analyze-project", "doc"): r"기존 문서.*(?:구조|분석)|inspect existing documents|analyze existing documentation",
+        ("analyze-project", "paper"): r"기존 논문.*(?:구조|분석)|inspect existing papers?|analyze existing paper structure",
+        ("autopilot-ship", "package"): r"주어진 결과.*zip|결과.*패키징|package existing results|make (?:a )?zip from (?:the )?existing",
+    }
+    matches = [(capability, mode) for (capability, mode), pattern in patterns.items()
+               if re.search(pattern, text, re.I)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _git_common_dir(cwd):
     """Absolute common git dir; git < 2.31 lacks --path-format, so absolutize a relative answer."""
     value = _git(cwd, "rev-parse", "--git-common-dir")
@@ -11886,6 +12003,57 @@ def main():
             if a.cwd is None:
                 context=route_plan_binding["record"]["decision"]["first_leg_compose"]["context"]
                 cwd=RP.leg_cwd(route_plan_binding["leg"],cwd,base_cwd=context["cwd"])
+        non_git_decision = None
+        capability_source = None
+        capability_unresolved = False
+        if a.start and not a.explain:
+            diagnosis = {**_compose_git_diagnosis(cwd), "cwd": str(Path(cwd).resolve())}
+            try:
+                dispatch_depth = int(os.environ.get("AGENT_DISPATCH_DEPTH") or 0)
+            except (TypeError, ValueError):
+                dispatch_depth = -1
+            if dispatch_depth < 0:
+                diagnosis = {"state": "error", "cwd": str(Path(cwd).resolve()),
+                             "detail": "invalid AGENT_DISPATCH_DEPTH"}
+            requested_shape = (route_plan_binding["leg"].get("shape")
+                               if route_plan_binding is not None else a.shape)
+            non_git_decision = _decide_non_git_compose(
+                diagnosis, requested_shape, dispatch_depth,
+                bool(os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
+                     or os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER", "").lower() in {"1", "true"}),
+                a.capability)
+            if non_git_decision["kind"] == "error":
+                raise ValueError("compose-start-git-diagnosis: " + str(non_git_decision.get("detail")))
+            if non_git_decision["kind"] == "refuse":
+                raise ValueError(f"{non_git_decision['cause']}; {non_git_decision['next']}")
+            if non_git_decision["kind"] == "direct":
+                shape = "direct"
+                capability = a.capability
+                capability_mode = a.capability_mode
+                original_mode_hint = a.capability_mode
+                if a.capability is not None:
+                    capability_source = "explicit"
+                else:
+                    classified = _classify_non_git_task(a.prompt_file.read_text())
+                    if classified is None:
+                        capability = COMPOSE_DEFAULT_CAPABILITY
+                        capability_mode = None
+                        capability_source = "non-git-unresolved"
+                        capability_unresolved = True
+                    else:
+                        capability, inferred_mode = classified
+                        capability_mode = a.capability_mode or inferred_mode
+                        capability_source = "non-git-task-classification"
+                a.capability = capability if a.capability is None else a.capability
+                a.capability_mode = capability_mode
+                a.intensity = "direct"
+                a.graph, a.signal = None, []
+                a.profile_demands = a.explicit_profiles = a.profile = None
+                a.dispatch_evidence = a.registered_headless_evidence = None
+                a.children = None
+                pins = {}
+                a._non_git_mode_hint = (original_mode_hint if capability_unresolved else None)
+                non_git_decision["capability_unresolved"] = capability_unresolved
         pins,pin_warnings=_filter_top_pins(pins)
         owner_pin=(pins.get("owner") or {}).get("harness")
         compose_args=dict(
@@ -11907,7 +12075,10 @@ def main():
             work_request={"text":a.prompt_file.read_text(),"owner_harness":owner_pin} if a.prompt_file else None,
             selection_pins=pins or None,route_plan=route_plan_binding,
             execution_scope=a.execution_scope,
+            capability_source=capability_source,
         )
+        if capability_unresolved and a._non_git_mode_hint:
+            compose_args["work_request"]["routing_hints"] = {"capability_mode": a._non_git_mode_hint}
         worktree=None
         if a.start and not a.explain:
             selection = compose_route(**compose_args, selection_only=True)
@@ -11977,7 +12148,7 @@ def main():
             from work_start import start_work
             jobs=Path(a.jobs or _compose_default_jobs())
             access_change=_record_access_change(route,jobs)
-            print("\n".join(compose_decision_lines(route)), file=sys.stderr, flush=True)
+            print("\n".join(compose_decision_lines(route, non_git_decision)), file=sys.stderr, flush=True)
             started=start_work(route,path,jobs)
             if access_change is not None:
                 started={**started,"access_change":access_change}
@@ -11989,7 +12160,8 @@ def main():
         _route_autoclose(artifact_root,"compose",route)
         print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin,
                            route_plan_unreadable=route_plan_unreadable,
-                           campaign_selection=_campaign_for_card, include_decisions=not a.start),file=sys.stderr)
+                           campaign_selection=_campaign_for_card, include_decisions=not a.start,
+                           non_git_decision=non_git_decision),file=sys.stderr)
         return 0
     if a.command=="correct":
         from dispatch_owner_input import submit, inspect, InputError
