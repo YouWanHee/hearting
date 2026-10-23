@@ -50,6 +50,12 @@ class CoreWriteGuardTest(unittest.TestCase):
         self.assertEqual(G.violation(str(self.primary / "utilities/a.py"), str(self.primary)), "")
         self.assertEqual(G.violation("relative.py", str(self.worktree)), "")
 
+    def test_exact_primary_runtime_directory_is_writable(self):
+        self.assertEqual(G.violation(str(self.primary / ".agent_runtime" / "job" / "run.py"),
+                                     str(self.worktree)), "")
+        reason = G.violation(str(self.primary / ".agent_runtime-cache" / "run.py"), str(self.worktree))
+        self.assertIn("shared checkout", reason)
+
     def test_hook_modes(self):
         payload = {"tool_name": "Edit", "cwd": str(self.worktree),
                    "tool_input": {"file_path": str(self.primary / "core/CORE.md")}}

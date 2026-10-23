@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Collection, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from artifact_identity import is_well_formed, kind_of
 
@@ -1355,7 +1355,7 @@ def _check_no_transition_out_of_terminal(events, label, violations) -> None:
 # ---------------------------------------------------------------------------
 
 
-def validate_events(document: Mapping[str, Any]) -> ValidationReport:
+def validate_events(document: Mapping[str, Any], *, allow_sequence_gaps: bool = False) -> ValidationReport:
     violations: List[Violation] = []
     if not isinstance(document, dict):
         return _ok()
@@ -1381,7 +1381,7 @@ def validate_events(document: Mapping[str, Any]) -> ValidationReport:
                     )
                 )
         distinct_sorted = sorted(set(int_seqs))
-        if distinct_sorted:
+        if distinct_sorted and not allow_sequence_gaps:
             if distinct_sorted[0] != 1:
                 violations.append(
                     Violation(
@@ -1576,6 +1576,7 @@ def validate_update(
     previous: Optional[Mapping[str, Any]] = None,
     published: bool = False,
     changeable_cycle_fields: Sequence[str] = (),
+    retired_artifact_ids: Iterable[str] = (),
 ) -> ValidationReport:
     """§45 D-124: a document the runtime published after the cycle closed.
 
@@ -1598,7 +1599,7 @@ def validate_update(
     for old in preserved:
         earlier |= set(declared_ids(old).keys())
     lineage = validate_lineage(document, resolvable_ids=earlier, first_close=False)
-    events = validate_events(document)
+    events = validate_events(document, allow_sequence_gaps=bool(retired_artifact_ids) or published)
     report = shape.merged(locators).merged(lineage).merged(events)
     if published:
         kept = tuple(v for v in report.violations
@@ -1610,10 +1611,16 @@ def validate_update(
     before_cycle = previous.get("cycle") if isinstance(previous.get("cycle"), dict) else {}
     after_cycle = document.get("cycle") if isinstance(document.get("cycle"), dict) else {}
     provisional_completion = before_cycle.get("state") == "active" and after_cycle.get("state") == "completed"
+    retired_ids = set(retired_artifact_ids)
     for key in ("events", "routes"):
         before = [r for r in previous.get(key, []) or []]
         after = [r for r in document.get(key, []) or []]
-        if after[: len(before)] != before and not (key == "routes" and provisional_completion):
+        retained_before = before
+        if key == "events" and retired_ids:
+            retained_before = [row for row in before if not (
+                isinstance(row, dict) and row.get("event_type") == "artifact.revision.recorded"
+                and row.get("target_id") in retired_ids)]
+        if after[: len(retained_before)] != retained_before and not (key == "routes" and provisional_completion):
             violations.append(Violation(
                 "update-earlier-%s-changed" % key, "$.%s" % key,
                 "a refreshed document keeps every earlier %s exactly" % key))
@@ -1621,7 +1628,7 @@ def validate_update(
             allowed = {"artifact.revision.recorded", "route.terminal.recorded"}
             if provisional_completion:
                 allowed.add("cycle.completed")
-            for row in after[len(before):]:
+            for row in after[len(retained_before):]:
                 if not isinstance(row, dict) or row.get("event_type") not in allowed:
                     violations.append(Violation(
                         "update-event-type-not-allowed", "$.events",

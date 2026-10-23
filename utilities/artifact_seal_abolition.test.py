@@ -224,7 +224,7 @@ class A1PolicyWritesParentsTest(SealAbolitionBase):
         excluded = {
             ".pytest_cache/v/cache/lastfailed": b"{}",
             "plans/cycle/.hidden.md": b"hidden file",
-            "plans/.git/config": b"[core]",
+            "plans/cycle/checkout/.git/config": b"[core]",
             "plans/cycle/__pycache__/mod.cpython-312.pyc": b"\x00pyc",
             "plans/cycle/stray.pyc": b"\x00pyc",
             "plans/cycle/draft.md.swp": b"swap",
@@ -257,9 +257,14 @@ class A1PolicyWritesParentsTest(SealAbolitionBase):
             self.assertNotIn(rel, manifest_text, rel)
         self.assertNotIn("outside-link.md", manifest_text)
         self.assertNotIn("linked-dir", manifest_text)
+        expected_excluded = {"artifacts/.pytest_cache/", "artifacts/plans/cycle/checkout/",
+                             "artifacts/plans/cycle/__pycache__/"}
+        expected_excluded.update("artifacts/" + rel for rel in excluded
+                                 if not rel.startswith((".pytest_cache/", "plans/cycle/checkout/",
+                                                        "plans/cycle/__pycache__/")))
         self.assertEqual(
             sorted(sealed["excluded_hidden"]),
-            sorted("artifacts/" + rel for rel in excluded))
+            sorted(expected_excluded))
         self.assertEqual(
             sorted(sealed["excluded_symlinks"]),
             ["artifacts/plans/cycle/linked-dir", "artifacts/plans/cycle/outside-link.md"])
@@ -288,7 +293,7 @@ class A1PolicyWritesParentsTest(SealAbolitionBase):
         self.assertEqual(sorted(sealed["excluded_symlinks"]),
                          ["artifacts/plans/evidence/scratch/pytest-all/test_xcurrent"])
         self.assertEqual(sorted(sealed["excluded_hidden"]),
-                         ["artifacts/.pytest_cache/v/x", "artifacts/plans/evidence/__pycache__/m.pyc"])
+                         ["artifacts/.pytest_cache/", "artifacts/plans/evidence/__pycache__/"])
 
     def test_a1_enumerate_applies_one_rule_without_flags(self):
         self.activate()
@@ -301,7 +306,7 @@ class A1PolicyWritesParentsTest(SealAbolitionBase):
                                                 excluded_symlinks=links)
         self.assertEqual(violations, [])
         self.assertEqual([rel for rel, _data in rows], ["artifacts/plans/cycle/plan.md"])
-        self.assertEqual(excluded, ["artifacts/plans/cycle/.cache/blob"])
+        self.assertEqual(excluded, ["artifacts/plans/cycle/.cache/"])
         self.assertEqual(links, ["artifacts/plans/cycle/link"])
 
     def test_a1_location_and_runtime_guards_unchanged(self):
@@ -562,7 +567,8 @@ class A2SnapshotsAndRefreshTest(SealAbolitionBase):
         self.assertTrue(out["refreshed"])
         self.assertEqual(out["changes"], {"added": ["artifacts/plans/cycle/new.md"],
                                           "modified": ["artifacts/plans/cycle/notes.md"],
-                                          "removed": ["artifacts/plans/cycle/drop.md"]})
+                                          "removed": ["artifacts/plans/cycle/drop.md"],
+                                          "reclassified": []})
         after = json.loads(manifest_path.read_text(encoding="utf-8"))
         by_path = lambda doc: {r["locator"]["path"]: r for r in doc["artifact_revisions"]}
         old_rows, new_rows = by_path(before), by_path(after)
@@ -1284,7 +1290,7 @@ class B1RefreshTest(B1RefreshBase):
         self.assertEqual(json.dumps(old_a, sort_keys=True), json.dumps(new_a, sort_keys=True))
         self.assertEqual(len(self.snapshot_names(result)), 3)
 
-    def test_marker_preserves_old_rows_until_actual_removal_across_full_and_bounded_refresh(self):
+    def test_marker_reclassifies_old_rows_across_full_and_bounded_refresh(self):
         result = self.closed("b1-self-excluded", {
             "plans/cache/edited.md": b"cache original\n",
             "plans/cache/deleted.md": b"will be removed after marker goes\n",
@@ -1304,11 +1310,11 @@ class B1RefreshTest(B1RefreshBase):
         current = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
         current_rows = {row["locator"]["path"]: row for row in current["artifact_revisions"]}
         for rel in ("artifacts/plans/cache/edited.md", "artifacts/plans/cache/deleted.md"):
-            self.assertEqual(current_rows[rel], before_rows[rel])
+            self.assertNotIn(rel, current_rows)
         self.assertNotEqual(current_rows["artifacts/plans/sibling.md"]["artifact_revision_id"],
                             before_rows["artifacts/plans/sibling.md"]["artifact_revision_id"])
-        self.assertEqual([event["field"] for event in self.history.published],
-                         ["artifacts/plans/sibling.md"])
+        self.assertEqual({event["field"] for event in self.history.published},
+                         {"artifacts/plans/sibling.md", "excluded_payload"})
 
         self.edit(result, "plans/cache/edited.md", b"cache changed again under marker\n")
         self.edit(result, "plans/sibling.md", b"sibling changed again\n")
@@ -1319,23 +1325,19 @@ class B1RefreshTest(B1RefreshBase):
         self.assertEqual(bounded["changes"]["removed"], [])
         after_bounded = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
         rows_bounded = {row["locator"]["path"]: row for row in after_bounded["artifact_revisions"]}
-        self.assertEqual(rows_bounded["artifacts/plans/cache/edited.md"], current_rows[
-            "artifacts/plans/cache/edited.md"])
-        self.assertEqual(rows_bounded["artifacts/plans/cache/deleted.md"], current_rows[
-            "artifacts/plans/cache/deleted.md"])
+        self.assertNotIn("artifacts/plans/cache/edited.md", rows_bounded)
+        self.assertNotIn("artifacts/plans/cache/deleted.md", rows_bounded)
 
         marker.unlink()
         settled = self.refresh(result)
         self.assertEqual(settled["status"], "emitted", settled)
-        self.assertEqual(set(settled["changes"]["modified"]), {"artifacts/plans/cache/edited.md"})
-        self.assertEqual(settled["changes"]["removed"], ["artifacts/plans/cache/deleted.md"])
+        self.assertEqual(set(settled["changes"]["added"]), {"artifacts/plans/cache/edited.md"})
+        self.assertEqual(settled["changes"]["removed"], [])
         final = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
         final_rows = {row["locator"]["path"]: row for row in final["artifact_revisions"]}
         self.assertNotIn("artifacts/plans/cache/deleted.md", final_rows)
-        self.assertNotEqual(final_rows["artifacts/plans/cache/edited.md"]["artifact_revision_id"],
-                            current_rows["artifacts/plans/cache/edited.md"]["artifact_revision_id"])
-        self.assertEqual(final["events"][:len(before["events"])], before["events"])
-        self.assertEqual([event["operation"] for event in self.history.published[-2:]], ["update", "delete"])
+        self.assertIn("artifacts/plans/cache/edited.md", final_rows)
+        self.assertEqual([event["operation"] for event in self.history.published[-1:]], ["add"])
         self.assertTrue(L.verify_artifact_revisions(final, cycle) == ())
 
     def test_b1_marked_directories_before_saved_cursor_do_not_regress_bounded_walk(self):
@@ -1537,6 +1539,41 @@ class B1RefreshTest(B1RefreshBase):
             self.assertEqual(len(P.read_cycle_record(self.root, cycle_id).get("history_pending", [])), 1)
         self.assertEqual(self.refresh(result)["status"], "unchanged")
         self.assertEqual(len(self.history.published), 1)
+
+    def test_b1_runtime_reclassification_crash_retry_keeps_files_snapshot_and_retired_ids(self):
+        result = self.closed("b1-runtime-reclass-crash", {
+            "dev_logs/runtime/checkout/source.py": b"payload remains on disk\n",
+            "plans/summary.md": b"ordinary output\n",
+        })
+        cycle = Path(result["cycle_dir"])
+        runtime_root = cycle / "artifacts/dev_logs/runtime/checkout"
+        (runtime_root / ".git").mkdir(parents=True)
+        payload = runtime_root / "source.py"
+        old = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        old_row = next(row for row in old["artifact_revisions"]
+                       if row["locator"]["path"].endswith("/source.py"))
+        old_snapshot_path = L.manifest_snapshot_path(self.root, result["cycle_id"],
+                                                     old["manifest_revision_id"])
+        old_snapshot = old_snapshot_path.read_bytes()
+        history_before = len(self.history.published)
+        with mock.patch.dict(sys.modules, {"artifact_history": None}):
+            with self.assertRaises(adm.AdmissionRecoveryRequired):
+                self.refresh(result, crash_after_manifest=True)
+            P.recover(self.root)
+        current = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        self.assertNotIn("artifacts/dev_logs/runtime/checkout/source.py",
+                         {row["locator"]["path"] for row in current["artifact_revisions"]})
+        self.assertEqual(payload.read_bytes(), b"payload remains on disk\n")
+        self.assertEqual(old_snapshot_path.read_bytes(), old_snapshot)
+        index = adm.load_index(self.root)
+        self.assertIn(old_row["artifact_id"], index.stable_ids)
+        rebuilt = adm.rebuild_index(self.root)
+        self.assertIn(old_row["artifact_id"], rebuilt.stable_ids)
+        self.assertEqual(adm.verify_index(self.root).ok, True)
+        self.assertEqual(self.refresh(result)["status"], "unchanged")
+        lines = self.history.published[history_before:]
+        self.assertEqual([row["field"] for row in lines], ["excluded_payload"])
+        self.assertEqual(lines[0]["target_path"].rsplit("/", 1)[-1], "checkout")
 
     def test_b1_first_close_records_one_line_or_leaves_it_pending(self):
         self.activate()

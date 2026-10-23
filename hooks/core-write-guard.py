@@ -90,6 +90,23 @@ def violation(target: str, cwd: str) -> str:
         relative = path.relative_to(primary)
         if relative.parts and relative.parts[0] in _ARTIFACT_ROOTS:
             return ""
+        # The project's default runtime sibling is the one narrow additional
+        # primary-checkout write surface. realpath resolution above ensures a
+        # symlink inside it cannot redirect writes into source or a release.
+        runtime = Path(os.path.realpath(primary / ".agent_runtime"))
+        if _within(path, runtime):
+            return ""
+        override = os.environ.get("AGENT_RUNTIME_DIR", "")
+        if override:
+            try:
+                candidate = Path(os.path.realpath(Path(override).expanduser()))
+                if (Path(override).is_absolute() and candidate != primary
+                        and not _within(candidate, primary) and not _within(candidate, Path.home())
+                        and not any(_within(candidate, release) for release in _release_roots())
+                        and _within(path, candidate)):
+                    return ""
+            except (OSError, RuntimeError, ValueError):
+                pass
         return (f"hearting: this session works in the worktree {worktree}; edit "
                 f"{worktree / relative} instead of the shared checkout {primary}.")
     except Exception:

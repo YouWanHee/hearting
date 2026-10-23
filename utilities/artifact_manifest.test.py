@@ -1081,6 +1081,22 @@ class TestUpdateDocument(unittest.TestCase):
         self.assertIn("update-earlier-routes-changed",
                       _codes(m.validate_update(moved, preserved=[before], previous=before)))
 
+    def test_only_explicitly_retired_artifact_recordings_may_be_compacted(self):
+        before, after = self._pair()
+        artifact_id = before["artifact_revisions"][0]["artifact_id"]
+        after["events"] = [event for event in after["events"]
+                           if not (event["event_type"] == "artifact.revision.recorded"
+                                   and event["target_id"] == artifact_id)]
+        self.assertIn("update-earlier-events-changed",
+                      _codes(m.validate_update(after, preserved=[before], previous=before)))
+        self.assertTrue(m.validate_update(after, preserved=[before], previous=before,
+                                          retired_artifact_ids={artifact_id}).ok)
+        tampered = json.loads(json.dumps(before))
+        tampered["events"] = [event for event in tampered["events"] if event["event_type"] != "cycle.completed"]
+        self.assertIn("update-earlier-events-changed",
+                      _codes(m.validate_update(tampered, preserved=[before], previous=before,
+                                               retired_artifact_ids={artifact_id})))
+
     def test_only_revision_or_later_terminal_records_may_follow(self):
         before, after = self._pair()
         stray = json.loads(json.dumps(before["events"][0]))
