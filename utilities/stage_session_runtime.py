@@ -87,7 +87,15 @@ def _artifact_fence(args, worktree: Path) -> tuple[list[str], list[str]] | None:
         return found
 
     brief = Path(args.phase_brief).read_text(encoding="utf-8")
-    tokens = [match.group(0).rstrip(".") for match in _BRIEF_PATH_TOKEN.finditer(brief)]
+    def strip_emphasis(value):
+        for delimiter in ("**", "__", "*", "_"):
+            if (value.startswith(delimiter) and value.endswith(delimiter)
+                    and len(value) > 2 * len(delimiter)):
+                return value[len(delimiter):-len(delimiter)]
+        return value
+
+    tokens = [strip_emphasis(match.group(0).rstrip("."))
+              for match in _BRIEF_PATH_TOKEN.finditer(brief)]
     outputs = exact_outputs(tokens)
     declared_outputs = exact_outputs(args.fixed_file)
     effective = outputs | declared_outputs

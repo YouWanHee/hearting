@@ -151,8 +151,12 @@ class StageSessionStateDirTests(unittest.TestCase):
     def test_artifact_only_fence_uses_brief_outputs_and_keeps_declaration_identity(self):
         brief = ("사건 문장: `reviews/claims/voter3.json`, `reviews/claims/voter3-evidence.md`, "
                  "`reviews/claims/voter3-handoff.md`를 기록한다. `reviews/claim-verdict.json을` "
+                 "강조 출력 **reviews/claims/voter3.json**, "
+                 "_reviews/claims/voter3-evidence.md_, "
+                 "__reviews/claims/voter3-handoff.md__도 적는다. "
                  "확인하고 읽지 말 경로는 `reviews/claims/claim-verify.md·x/voter1-*를` 포함한다. "
                  "연결 경로 a/b.json·reviews/claims/**, glob reviews/claims/voter*.json, "
+                 "강조 경로 _internal/x.md와 reviews/claims/**, **/x.md도 제외한다. "
                  "디렉터리 reviews/claims/, URL https://example.test/out.json, "
                  "범위 밖 reports/other.md, ../escape.json, placeholder reviews/claims/<filename>.md.\n")
         args, route, cycle, output_dir = self._artifact_args(brief_text=brief)
@@ -169,6 +173,12 @@ class StageSessionStateDirTests(unittest.TestCase):
         self.assertEqual(args.fixed_file, sorted(str((self.worktree / name).resolve()) for name in [
             "pyproject.toml", "sr_corrnet_sd/diar.py", "sr_corrnet_sd/paths.py", "uv.lock"]))
         self.assertEqual(args.effective_fixed_files, sorted(expected))
+        for relative in ("reviews/claims/voter3.json",
+                         "reviews/claims/voter3-evidence.md",
+                         "reviews/claims/voter3-handoff.md"):
+            self.assertIn(str(output_dir / relative), args.effective_fixed_files)
+        for excluded in ("_internal/x.md", "reviews/claims/**", "**/x.md"):
+            self.assertNotIn(str(output_dir / excluded), args.effective_fixed_files)
         self.assertEqual(args.fixed_files_sha256, runtime._sha_files(declarations))
         self.assertEqual(runtime.metadata(args).split("fixed_files_sha256=")[1].split(",")[0],
                          runtime._sha_files(declarations))
