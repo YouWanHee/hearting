@@ -71,7 +71,9 @@ def _generation_candidates(view):
         if not attempt:
             continue
         first_order.setdefault(attempt, row.order)
-        owners[attempt] = (row.status, meta, row.fields, row.order)
+        # Keep the indexed row so lineage consumers can parse its full metadata
+        # only after the cheap owner/route/time filters have selected it.
+        owners[attempt] = (row.status, meta, row.fields, row.order, row)
         successors.update(meta[name] for name in
                           ("automatic_retry_of", "replacement_original_attempt_id", "prior_attempt_id")
                           if meta.get(name))
@@ -100,8 +102,7 @@ def _generation_candidates(view):
             old_activity = previous[2]
             activity = (old_activity if not math.isfinite(activity) else activity
                         if not math.isfinite(old_activity) else max(activity, old_activity))
-        routes[route_key] = (row, (meta.get("parent_sid"), meta.get("parent_harness"),
-                                   meta.get("attempt_id")), activity)
+        routes[route_key] = (row, meta, activity)
     result = (owners, first_order, successors, routes)
     _GENERATION_CACHE[generation_key] = result
     _GENERATION_CACHE.move_to_end(generation_key)
@@ -441,7 +442,7 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                     read_context = None
                 latest, first_order, successor_sources, route_candidates = _generation_candidates(view)
                 import route_authority
-                for attempt, (status, meta, fields, row_order) in latest.items():
+                for attempt, (status, meta, fields, row_order, row) in latest.items():
                     if meta.get("worker_type") != "owner" or attempt in successor_sources:
                         continue
                     if route_authority.answerable_owner_end(status, meta) != "BLOCKED":
@@ -458,7 +459,7 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                                 and (other_meta.get("owner_route_id") or other_meta.get("route_id")) == route_id
                                 and (other_meta.get("owner_route_hash") or other_meta.get("route_hash")) == route_digest
                                 and (other_meta.get("owner_route_file") or other_meta.get("route_file")) == route_file
-                                for other_id, (_s, other_meta, _f, other_order) in latest.items())
+                                for other_id, (_s, other_meta, _f, other_order, _row) in latest.items())
                     if later:
                         continue
                     try:
@@ -500,8 +501,10 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                         try:
                             if effective_parent is None:
                                 raise ImportError("lineage reader unavailable")
-                            parent = effective_parent(meta, path, read_context=read_context)
-                            parent_harness = effective_parent_harness(meta, path, read_context=read_context)
+                            lineage_meta = row.completion_metadata()
+                            parent = effective_parent(lineage_meta, path, read_context=read_context)
+                            parent_harness = effective_parent_harness(lineage_meta, path,
+                                                                      read_context=read_context)
                         except Exception:
                             parent, parent_harness = meta.get("parent_sid"), meta.get("parent_harness")
                         add({"id": "S3:" + str(attempt), "source": "S3",
@@ -522,7 +525,7 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                 if project_root not in sys.path:
                     sys.path.insert(0, project_root)
                 from tools.fleet import route as route_module
-                for (route_id, route_digest, route_file), (row, parent_meta, route_activity) in route_candidates.items():
+                for (route_id, route_digest, route_file), (row, _candidate_meta, route_activity) in route_candidates.items():
                     if not math.isfinite(route_activity):
                         health.append({"source": "S2", "route_id": route_id,
                                        "state": "unknown", "reason": "invalid-timestamp"})
@@ -530,14 +533,16 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                     if instant - route_activity > 8 * 86400:
                         continue
                     try:
-                        fields = row.fields
-                        meta = {key: value for key, value in zip(
-                            ("parent_sid", "parent_harness", "attempt_id"), parent_meta) if value}
+                        # The route row is already a narrow candidate; full lineage
+                        # metadata is needed only when it actually has a pending wait.
+                        meta = None
                         route_record, outcome = _route_outcome(route_module, route_file,
                                                                route_id, route_digest)
                         if route_record is None:
                             continue
                         for wait in pending_human_waits(route_record, jobs=path, outcome=outcome):
+                            if meta is None:
+                                meta = row.completion_metadata()
                             parent_sid = meta.get("parent_sid")
                             parent_harness = meta.get("parent_harness")
                             if effective_parent is not None:
