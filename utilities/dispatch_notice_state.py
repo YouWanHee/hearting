@@ -17,6 +17,30 @@ from route_identity import route_hash
 _CAPABILITY_ROUTE_CACHE = None
 
 
+def delivery_batch_key(*, registry_id: str, parent_sid: str, attempt_id: str,
+                       route_id: str = "", route_hash_value: str = "",
+                       route_node: str = "", parent_cycle_id: str = "",
+                       sealed_batch_id: str = "", sealed_attempt_ids=()):
+    """Return a key only for an exact, already-validated batch relationship.
+
+    The caller supplies route identity only after ``bound_route`` succeeds and
+    sealed membership only from the existing sealed declaration. Never infer
+    membership from launch order, slug, a shared cycle value, or a batch label.
+    """
+    if not all(isinstance(value, str) and value for value in
+               (registry_id, parent_sid, attempt_id)):
+        return None
+    if route_node in {"frame", "frame-alternative"} and route_id and route_hash_value:
+        return ("frame-pair", registry_id, parent_sid, route_id, route_hash_value)
+    if parent_cycle_id:
+        return ("parent-cycle", registry_id, parent_sid, parent_cycle_id)
+    members = tuple(sorted(set(sealed_attempt_ids))) if isinstance(
+        sealed_attempt_ids, (list, tuple, set, frozenset)) else ()
+    if (sealed_batch_id and len(members) > 1 and attempt_id in members):
+        return ("sealed-parallel", registry_id, parent_sid, sealed_batch_id, members)
+    return None
+
+
 def _capability_route_reader():
     """Load the hyphenated route module once when it is not importable by name."""
     global _CAPABILITY_ROUTE_CACHE

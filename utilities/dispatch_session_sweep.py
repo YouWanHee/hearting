@@ -464,21 +464,9 @@ GATE_DELIVERY_HEADER = (
     "Do not start Monitor, dispatch-wait, or a polling loop."
 )
 COMPLETION_DELIVERY_HEADER = (
-    "Hearting runtime delivery (SD-111 durable pending records for this session). "
-    "Follow each receipt's required_action. advance-completed confirms that attempt's "
-    "completion: read its exact result and perform already approved parent review/follow-through "
-    "this turn or its existing registered continuation. Receipt, queue consumption and ACK are not execution. "
-    "On the first user-facing close of material work, explain what changed and why, observed before/after, "
-    "checks actually run (including reused, skipped, and unrun checks), applicable commit/PR/deployment/serving, "
-    "and limits or remaining work; do not invent deployment or operating results. Follow the owning "
-    "route's next-action receipt for any remaining stages. Runtime-v1 owners have "
-    "runtime-owned close/finalize; a closed route needs no restart. "
-    "inspect-recovery is a runtime diagnostic, not a request for a user decision. "
-    "For other unresolved actions use the exact checked recovery surface. "
-    "An automatic repeat of the same exact result or cleanup-only notice after follow-through was handled "
-    "does not repeat the action or request a new user ACK; preserve new failures, conflicts, unfinished work, "
-    "and direct user questions. "
-    "Do not start Monitor, dispatch-wait, or a polling loop."
+    "Hearting runtime delivery. Follow required_action; continue approved work. "
+    "ACK isn't execution. Keep failures, conflicts, unfinished work, questions; "
+    "no Monitor/dispatch-wait/polling."
 )
 
 

@@ -431,8 +431,13 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         project.mkdir(parents=True)
         transcript = project / "sess-owner.jsonl"
         transcript.write_text(json.dumps({
-            "type": "user", "sessionId": "sess-owner", "summary": "Stop hook feedback",
-            "message": {"content": marker},
+            "type": "user", "sessionId": "sess-owner",
+            "origin": {"kind": "task-notification", "producer": "session-task"},
+            "promptSource": "system", "turnOrigin": "task_notification",
+            "message": {"content": (
+                "<task-notification><task-id>fixture</task-id>"
+                "<summary>Stop hook feedback</summary>" + marker +
+                "</task-notification>")},
         }) + "\n", encoding="utf-8")
         payload = {"hook_event_name": "UserPromptSubmit", "cwd": str(ROOT),
                    "transcript_path": str(transcript)}
@@ -445,6 +450,14 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(output.getvalue(), "")
         exact = PD.read(self.root, "sess-owner", did)
         self.assertEqual((exact["state"], exact["attempts"]), ("acked", 1))
+        replay = io.StringIO()
+        with mock.patch.object(HOOK, "resolve_agent_home", return_value=ROOT), \
+             mock.patch.object(HOOK, "dispatch_state_roots", return_value=(self.root,)), \
+             mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(runtime_home)}), \
+             contextlib.redirect_stdout(replay):
+            self.assertEqual(HOOK._process_session(payload, "sess-owner"), 0)
+        self.assertEqual(replay.getvalue(), "")
+        self.assertEqual(PD.read(self.root, "sess-owner", did)["attempts"], 1)
 
     def test_projected_parent_close_completion_is_delivered_with_its_stored_binding(self):
         import dispatch_recipient_receipt as recipient_receipt
@@ -848,7 +861,7 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(payload["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
         self.assertIn("att-0000000000000000000000000000bbbb", context)
         self.assertNotIn("Harvest each attempt", context)
-        self.assertIn("Follow each receipt's required_action", context)
+        self.assertIn("Follow required_action", context)
         state = PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)["state"]
         self.assertEqual(state, "acked")
 
@@ -1325,7 +1338,7 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
         owed = self.cli("deliver")
         self.assertEqual([item["delivery_id"] for item in owed["records"]], ["delivery-" + "a" * 32])
         self.assertIn("att-0000000000000000000000000000bbbb", owed["text"])
-        self.assertIn("Follow each receipt's required_action", owed["text"])
+        self.assertIn("Follow required_action", owed["text"])
         self.assertEqual(self.state(), "claimed")
         self.assertEqual(self.cli("deliver")["records"], [])      # a live claim is not handed out twice
         self.assertEqual(self.cli("release", json.dumps(owed))["count"], 1)

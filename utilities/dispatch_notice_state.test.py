@@ -36,6 +36,38 @@ class NoticeTest(unittest.TestCase):
                          parent_sid="parent", parent_completion_delivery="claude-parent-runtime")
         self.write_row()
 
+    def test_delivery_batch_membership_decision_table(self):
+        base = dict(registry_id="/jobs/one.log", parent_sid="parent-a",
+                    attempt_id="att-a", route_id="route-a",
+                    route_hash_value="hash-a")
+        # Positive: the two declared frame legs of one exact route.
+        frame_a = notice.delivery_batch_key(**base, route_node="frame")
+        frame_b = notice.delivery_batch_key(**{**base, "attempt_id": "att-b"},
+                                             route_node="frame-alternative")
+        self.assertEqual(frame_a, frame_b)
+        # Positive: exact parent session + parent cycle; capabilities may differ.
+        cycle_a = notice.delivery_batch_key(**base, parent_cycle_id="cycle-a")
+        cycle_b = notice.delivery_batch_key(**{**base, "attempt_id": "att-b"},
+                                             parent_cycle_id="cycle-a")
+        self.assertEqual(cycle_a, cycle_b)
+        # Positive: one existing sealed declaration listing both attempts.
+        sealed_a = notice.delivery_batch_key(
+            **base, sealed_batch_id="sealed-a", sealed_attempt_ids=["att-a", "att-b"])
+        sealed_b = notice.delivery_batch_key(
+            **{**base, "attempt_id": "att-b"}, sealed_batch_id="sealed-a",
+            sealed_attempt_ids=["att-a", "att-b"])
+        self.assertEqual(sealed_a, sealed_b)
+        # Negative: consecutive route-free launches and a shared cycle across parents.
+        self.assertIsNone(notice.delivery_batch_key(
+            registry_id="/jobs/one.log", parent_sid="parent-a", attempt_id="att-a"))
+        self.assertNotEqual(
+            notice.delivery_batch_key(**base, parent_cycle_id="cycle-a"),
+            notice.delivery_batch_key(**{**base, "parent_sid": "parent-b", "attempt_id": "att-b"},
+                                       parent_cycle_id="cycle-a"))
+        # A shared sealed string without the exact sealed membership is not authority.
+        self.assertIsNone(notice.delivery_batch_key(
+            **base, sealed_batch_id="same-string", sealed_attempt_ids=["att-other"]))
+
     def test_hyphenated_capability_route_fallback_is_loaded_once(self):
         original_import = builtins.__import__
         calls = []

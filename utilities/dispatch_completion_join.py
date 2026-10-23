@@ -834,17 +834,11 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
     if completed_work and all(child["attempt_id"] in completed_work for child in receipt["children"]):
         notes = [f"The approved route plan names a next leg (index {child['next_leg']['index']}): "
                  f"{child['next_leg']['compose_command']}" for child in receipt["children"] if child.get("next_leg")]
-        return ("The requested work is complete, including its declared stages and runtime workflow/route/cycle settlement. "
-                "Continue and complete the original user task itself, preserving every explicit content and output-format "
-                "requirement from that request; this receipt supplements the task and does not replace it with a receipt-only response. "
-                "Read the exact result and perform the already approved parent review/follow-through in this turn, "
-                "or run its existing registered continuation. On the first user-facing close, explain what changed and why, "
-                "the observed before/after, checks actually run (including reused, skipped, and unrun checks), applicable "
-                "commit/PR/deployment/serving state, and limits or remaining work. Do not invent deployment or operating "
-                "results. Receipt, queue consumption and ACK are not execution. No harvest, route restart, or manual "
-                "finalization is required. An automatic repeat of this exact result or a cleanup-only notice after the "
-                "follow-through is handled does not call for the same action or a new user ACK; preserve a new failure, "
-                "conflict, unfinished work, or direct user question."
+        return ("Original request/format apply. Review result; do approved follow-through now or via registered "
+                "continuation. First close: changes/why, observed before/after, checks run/reused/skipped/unrun, "
+                "commit/PR/deployment/serving, limits; invent none. No harvest/restart/manual finalize. "
+                "Receipt/ACK isn't execution; handled exact repeats need no ACK. Keep new failures/conflicts, "
+                "unfinished work, questions."
                 + ("".join("\n" + note for note in notes)
                    + ("\nIf this next leg is already approved, execute it in this turn or its existing registered continuation. "
                       "Nothing starts it from receipt alone; obtain approval only for work outside the existing scope." if notes else "")))
