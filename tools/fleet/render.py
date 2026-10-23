@@ -6652,7 +6652,7 @@ _EXPLORER_EARLIER = False    # the output pane was scrolled past its first row: 
 
 
 def set_explorer_mode(enabled=True):
-    """Select the composed B surface for the default live/once entry points."""
+    """Select the cell-based Fleet explorer for live and once entry points."""
     global _EXPLORER_ENABLED
     _EXPLORER_ENABLED = bool(enabled)
 
@@ -6727,44 +6727,22 @@ def _explorer_targets(nav_rows):
 
 
 def _explorer_state_for(state, cols):
-    from .explorer.state import ExplorerState, initial_state, restore
-    if isinstance(state, ExplorerState):
-        return state
-    return restore(state) if state is not None else initial_state(cols)
+    from .explorer.state import NavState
+    return NavState.from_value(state)
 
 
 def _explorer_compose(snapshot, cols, rows, state=None, focus_result=None, last_good=None, now=None,
                       providers=None):
-    """Thin adapter: snapshot + the accepted FocusResult + the viewer state -> explorer providers ->
-    ``frame.compose``. The frame is the whole screen; the legacy line builder is never called."""
-    from .explorer import frame as explorer_frame, nav
-    from .explorer.state import settle
+    """Project collected facts through the immutable view model into the cell renderer."""
+    from .explorer import frame as explorer_frame, live
     global _SELECTABLE, _EXPLORER_NAV_ROWS, _EXPLORER_STATE, _EXPLORER_ALL_ROWS
     state = _explorer_state_for(state, cols)
     view = _explorer_view(snapshot)
-    resolver = getattr(view, "project_of", None)
-    resolver = resolver if callable(resolver) else None
-    nav_width = explorer_frame._layout(cols, rows, state.nav_visible, state.active_region)["nav"].w
-
-    def all_rows(current, result):
-        return nav.build_nav(view, result, current, width=nav_width, project_resolver=resolver)
-
-    rows_now = all_rows(state, focus_result)
-    state = settle(state, rows_now)
-    accepted = None
-    if focus_result is not None and f"{focus_result.key.harness}:{focus_result.key.sid}" == state.focus:
-        accepted = focus_result
-        if accepted.health.state in ("success", "partial"):
-            rows_now = all_rows(state, accepted)
-            state = settle(state, rows_now, accepted.tabs)
+    model = live.build_view_model(view, accepted_detail=focus_result, now=now)
     _EXPLORER_STATE = state
-    frame = explorer_frame.compose(
-        view, accepted, state, cols, rows, providers=providers,
-        last_good=last_good if last_good is not None else _EXPLORER_FRAME,
-        now=time.time() if now is None else now)
-    _EXPLORER_NAV_ROWS = tuple(frame.nav_rows)
-    _EXPLORER_ALL_ROWS = tuple(rows_now)
-    _SELECTABLE = _explorer_targets(rows_now)
+    frame = explorer_frame.draw(model, state, cols, rows, beat=int(_BLINK_ON))
+    _EXPLORER_NAV_ROWS = _EXPLORER_ALL_ROWS = ()
+    _SELECTABLE = []
     return frame
 
 
@@ -6783,6 +6761,7 @@ def _explorer_key_name(ch, searching=False):
     if searching:
         return "text:" + chr(ch) if isinstance(ch, int) and 32 <= ch < 127 else None
     plain = {ord("/"): "/", ord("e"): "e", ord("E"): "e", ord("F"): "F", ord("f"): "F",
+             ord("u"): "u",
              ord("k"): "up", ord("j"): "down"}
     return plain.get(ch)
 
@@ -6813,22 +6792,16 @@ def _explorer_row_y(frame, entry):
 
 
 def _explorer_hit_geometry(frame, snapshot, size):
-    """Publish the click map of exactly this paint: target rows of the navigation only."""
+    """Publish the click map of exactly this painted cell frame."""
     global _CLICK_ROWS, _CLICK_SPANS, _PROMPT_HITS, _HIT_VALID, _HIT_SIZE, _HIT_SNAPSHOT_ID
-    nav_rect = frame.region("nav")
     _CLICK_ROWS, _CLICK_SPANS = {}, {}
-    for entry in _SELECTABLE:
-        y = _explorer_row_y(frame, entry)
-        if y is not None:
-            _CLICK_ROWS[y] = entry
-            _CLICK_SPANS[y] = [(nav_rect.x, nav_rect.x + nav_rect.w)]
+    for hit in frame.hits:
+        if hit.y >= 0:
+            _CLICK_ROWS.setdefault(hit.y, []).append(hit)
     _PROMPT_HITS = []
-    keys = frame.region("keys")
-    if _PROMPT is not None and keys is not None and keys.h:
-        _PROMPT_HITS = _prompt_hit_boxes(_prompt_segs(_PROMPT, size[1]), keys.y, size[1])
     _HIT_SIZE = size
     _HIT_SNAPSHOT_ID = id(snapshot) if snapshot is not None else None
-    _HIT_VALID = tuple(frame.geometry) == (size[1], size[0])
+    _HIT_VALID = (frame.rows, frame.cols) == tuple(size)
 
 
 def _explorer_click_current(size, snapshot):
@@ -6855,104 +6828,34 @@ def _explorer_reveal(state, rows):
 
 def _draw_explorer(stdscr, snapshot):
     global _EXPLORER_FRAME, _EXPLORER_STATE, _EXPLORER_SIZE, _CURSOR_ID
-    from dataclasses import replace
-    from .explorer.state import reduce_key
     h, w = stdscr.getmaxyx()
     if h <= 0 or w <= 0:
         return
     state = _explorer_state_for(_EXPLORER_STATE, w)
-    if _EXPLORER_SIZE is not None and _EXPLORER_SIZE != (h, w):
-        state = reduce_key(state, {"key": "resize", "cols": w})
     _EXPLORER_SIZE = (h, w)
-    if _SELECT_MODE:
-        # The kill cursor is a navigation row: move the selection onto it so the viewport follows.
-        cursor = next((e for e in _SELECTABLE if _entry_id(e) == _CURSOR_ID), None)
-        if cursor is not None and cursor.get("nav_id") and cursor["nav_id"] != state.selection:
-            state = _explorer_reveal(replace(state, selection=cursor["nav_id"]), _EXPLORER_ALL_ROWS)
-    keys = _explorer_keys_provider(w)
-    frame = _explorer_compose(snapshot, w, h, state, _EXPLORER_RESULT,
-                              providers={"keys": keys} if keys else None)
+    frame = _explorer_compose(snapshot, w, h, state)
     _EXPLORER_FRAME = frame
     stdscr.erase()
-    for y, line in enumerate(frame.lines[:h]):
-        try:
-            stdscr.addstr(y, 0, line)
-        except Exception:
-            pass
-    if _SELECT_MODE:
-        cursor = next((e for e in _SELECTABLE if _entry_id(e) == _CURSOR_ID), None)
-        y = _explorer_row_y(frame, cursor) if cursor is not None else None
-        nav_rect = frame.region("nav")
-        if y is not None:
+    if frame.cells:
+        for y, row in enumerate(frame.cells[:h]):
+            for x, cell in enumerate(row[:w]):
+                glyph, colour_key, tint = cell
+                if glyph == "":
+                    continue
+                try:
+                    stdscr.addstr(y, x, glyph, _key_attr(colour_key, tint))
+                except Exception:
+                    pass
+    else:
+        for y, line in enumerate(frame.lines[:h]):
             try:
-                stdscr.chgat(y, nav_rect.x, nav_rect.w, curses.A_REVERSE)
+                stdscr.addstr(y, 0, line)
             except Exception:
                 pass
     _explorer_hit_geometry(frame, snapshot, (h, w))
     refresh = getattr(stdscr, "refresh", None)
     if callable(refresh):
         refresh()
-
-
-def _explorer_output_reader():
-    """The raw-output reader of the live view: the shared viewer, with the registry home as its fallback."""
-    from .explorer.output import OutputReader
-    try:
-        from .collectors import dispatch
-        return OutputReader(fallback_home=dispatch._registry_home())
-    except Exception:
-        return OutputReader()
-
-
-def _explorer_expanded(state):
-    """The focused main session when its row is open (a closed session or a folded project has no lineage read)."""
-    ref = str(getattr(state, "focus", "") or "")
-    if not ref:
-        return ()
-    row_id = f"session:{ref}"
-    for row in _EXPLORER_NAV_ROWS:
-        if row.identity == row_id:
-            return (ref,) if row.open else ()
-    return ()
-
-
-class _SelectionFeed:
-    """Viewer state -> SelectionPump. A changed selection (session, tab or stage) selects and forces a
-    read; every tick polls. No result for the current scope yet draws the previous result of the same
-    session; the curses thread never waits for the pump."""
-
-    def __init__(self, pump):
-        self.pump = pump
-        self.key = None
-        self.last = None
-
-    def update(self, state, generation, now_mono, expanded=None):
-        from .explorer.state import focus_key
-        from .explorer.types import FocusResult, Health
-        key = focus_key(state)
-        if key is None:
-            self.key, self.expanded, changed, self.last = None, (), self.last is not None, None
-            return None, changed
-        expanded = _explorer_expanded(state) if expanded is None else tuple(expanded)
-        if key != self.key or expanded != getattr(self, "expanded", ()):
-            self.key, self.expanded = key, expanded
-            self.pump.select(key, generation, expanded)
-            self.pump.request(force=True)
-        else:
-            self.pump.request_due(now=now_mono)
-        result = self.pump.poll()
-        if result is None and self.last is not None and self.last.key.sid == key.sid:
-            result = self.last
-        if result is None:
-            status = self.pump.status(now_mono)
-            if status.state in ("loading", "failed"):
-                result = FocusResult(key, 0, generation, health=status)
-        changed = result != self.last
-        self.last = result
-        return result, changed
-
-    def stop(self):
-        self.pump.stop()
 
 
 def set_process_view(v):
@@ -9296,25 +9199,11 @@ def _snapshot_line(segs, colored=False, colors=256):
 
 
 def _explorer_once_frame(snapshot, cols, rows, state=None, reader=None):
-    """The default ``--once`` screen: the same providers and compose as the live view. There is no pump
-    here and no curses thread, so the selected scope is read once, synchronously, before composing."""
-    from .explorer.focus import FocusReader
-    from .explorer.state import focus_key
-    from .explorer.types import FocusRequest
+    """The once screen uses the same snapshot-to-cells projection as the live view."""
     global _EXPLORER_RESULT
     state = _explorer_state_for(state if state is not None else _EXPLORER_STATE, cols)
-    frame = _explorer_compose(snapshot, cols, rows, state, None)
-    key = focus_key(_EXPLORER_STATE)
-    result = None
-    if key is not None:
-        reader = reader or FocusReader(live_jobs=lambda: list(getattr(snapshot, "jobs", ()) or ()),
-                                       snapshot=lambda: snapshot)
-        try:
-            result = reader(FocusRequest(key, 1, 0))
-        except Exception:
-            result = None
-    _EXPLORER_RESULT = result
-    return _explorer_compose(snapshot, cols, rows, _EXPLORER_STATE, result)
+    _EXPLORER_RESULT = None
+    return _explorer_compose(snapshot, cols, rows, state)
 
 
 def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
@@ -9359,7 +9248,7 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
         size = shutil.get_terminal_size((100, 45))
         snapshot.governor, snapshot.memory = governor_snapshot, mem_snapshot
         frame = _explorer_once_frame(snapshot, size.columns, size.lines)
-        sys.stdout.write("\n".join(frame.lines).rstrip() + "\n")
+        sys.stdout.write("\n".join(frame.text_rows()).rstrip() + "\n")
         return 0
     gitinfo.enrich_entities(list(sessions) + list(jobs), schedule_ahead=False)
     try:
@@ -10531,7 +10420,7 @@ def viewer_state(live_order):
     layout = dict(_RELOAD_LAYOUT) if isinstance(_RELOAD_LAYOUT, dict) else {}
     frame = _RELOAD_FRAME
     if _EXPLORER_ENABLED:
-        layout = {"schema_version": 2}
+        layout = {"schema_version": 3}
         frame = None
     return {"offset": _OFFSET, "process_view": _PROCESS_VIEW, "show_all": _SHOW_ALL,
             "explorer_state": serialize(_EXPLORER_STATE),
@@ -10552,8 +10441,11 @@ def restore_viewer_state(value):
     global _RELOAD_FRAME_AT, _RELOAD_FRAME_COMPUTE_AT
     global _LAYOUT, _REPO_FOLD, _SELECTABLE, _FOLDABLE, _REPO_FOLDABLE
     global _EXPLORER_STATE
-    from .explorer.state import restore
-    _EXPLORER_STATE = restore(value.get("explorer_state", value))
+    if _EXPLORER_ENABLED:
+        _EXPLORER_STATE = _explorer_state_for(value.get("explorer_state", value), 140)
+    else:
+        from .explorer.state import restore
+        _EXPLORER_STATE = restore(value.get("explorer_state", value))
 
     def tuples(item):
         return tuple(tuples(part) for part in item) if isinstance(item, list) else item
@@ -10573,8 +10465,8 @@ def restore_viewer_state(value):
     layout_meta = value.get("frame_layout")
     _RELOAD_LAYOUT = dict(layout_meta) if isinstance(layout_meta, dict) else None
     if _EXPLORER_ENABLED:
-        _RELOAD_FRAME = None                    # an old frame is never replayed on the B surface
-        _RELOAD_LAYOUT = {"schema_version": 2}
+        _RELOAD_FRAME = None                    # only view state is persisted for the explorer
+        _RELOAD_LAYOUT = {"schema_version": 3}
     _SELECTABLE = []
     _FOLDABLE = []
     _REPO_FOLDABLE = []
@@ -10837,31 +10729,22 @@ def _explorer_text_key(ch):
 
 
 def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
-    """One input event on the B surface. s/x and the mouse reach only the navigation's session and
-    worker rows (``_SELECTABLE``); p, w, a, c and Space change nothing here."""
+    """Apply one decoded event to the explorer's view-local reducer."""
     global _EXPLORER_STATE
-    from .explorer.state import reduce_key
+    from .explorer.state import reduce
     state = _explorer_state_for(_EXPLORER_STATE, (size or (0, 100))[1])
     if ch == curses.KEY_MOUSE:
         mx, my, bstate = mouse_event if mouse_event is not None else _getmouse_event()
         if mx is not None and size is not None and _explorer_click_current(size, snapshot):
-            _handle_mouse_event(mx, my, bstate)
-        return
-    if state.searching:
-        key = _explorer_text_key(ch) or _explorer_key_name(ch, searching=False)
-        if key in ("up", "down", "enter", "escape", "backspace") or (key or "").startswith("text:"):
-            _EXPLORER_STATE = reduce_key(state, key, frame=_EXPLORER_FRAME)
-        return
-    if _SELECT_MODE and _handle_select_key(ch):
-        return
-    if ch in (ord("s"), ord("S"), ord("x"), ord("X")):
-        if not _SELECT_MODE and not _enter_select(_live_targets()):
-            _set_action("no selectable rows")
+            hit = next((item for item in getattr(_EXPLORER_FRAME, "hits", ())
+                        if item.y == my and item.x0 <= mx < item.x1), None)
+            if hit is not None:
+                _EXPLORER_STATE, _effects = reduce(state, {"type": "click", "action": hit.action},
+                                                    _EXPLORER_FRAME)
         return
     key = _explorer_key_name(ch)
     if key:
-        _EXPLORER_STATE = reduce_key(state, key, frame=_EXPLORER_FRAME)
-        _explorer_note_earlier(state, key)
+        _EXPLORER_STATE, _effects = reduce(state, key, _EXPLORER_FRAME)
 
 
 def _explorer_note_earlier(before, key):
@@ -10961,11 +10844,6 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         compute_host_pump.start()
     latest_view = [snapshot]
     selection_feed = None
-    if _EXPLORER_ENABLED:
-        from .explorer.focus import FocusReader, SelectionPump
-        selection_feed = _SelectionFeed(SelectionPump(
-            FocusReader(live_jobs=lambda: list(getattr(latest_view[0], "jobs", ()) or ()),
-                        snapshot=lambda: latest_view[0], output_reader=_explorer_output_reader()), interval))
     sessions, jobs = snapshot.sessions, snapshot.jobs
     resources = snapshot.resources
     usage_snapshots = snapshot.usage_snapshots

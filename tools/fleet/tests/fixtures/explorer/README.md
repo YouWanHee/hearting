@@ -1,0 +1,5 @@
+These fixtures use width-preserving synthetic text in place of freeform source content. cells-140.json and cells-168.json store each cell row as exact [glyph, colour_key, tint, count] runs; the oracle expands them and compares every cell and ordered hit array for every state. source.json points to view_model.json, which contains the same source values; test helpers derive the source wrapper from it.
+
+PEERS is checked structurally because the approved reference hand-places repository frames and link lanes. The check asserts visible link lanes, every graph node and edge kind, non-empty full-state hits, fewer hits after selecting f5, the selected link count, and its selection tint. It covers PEERS-pick-f5 at both 140 and 168 columns.
+
+Repository-only test runs compare the committed goldens. Running freeze_explorer.py --check with the external approved reference directory re-verifies provenance using the input hashes in manifest.json. The reference renderer and PNGs are intentionally external; no private absolute path is stored here. default-once.json is captured separately from the archived base CLI.

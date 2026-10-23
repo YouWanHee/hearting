@@ -17,10 +17,7 @@ import re
 import threading
 import time
 
-from .ledger import build_request_ledger, harness_abbr
-from .output import MAX_STAGE_SOURCES, OutputReader, SourcePlan, read_generation, utility
-from .overview import build_overview
-from .requests import build_tabs, latest_results, request_header
+from .output import OutputReader, read_generation, utility
 from .types import AttemptRow, FocusRequest, FocusResult, Health
 from ..refresh import RefreshPump
 
@@ -30,6 +27,12 @@ _MAX_RECORD_BYTES = 256 * 1024
 _MAX_OBLIGATION_FILES = 256
 _MAX_CYCLE_FILES = 2048
 _DONE_DUTY_STATES = frozenset(("complete", "cancelled"))
+
+
+def harness_abbr(value):
+    value = str(value or "").lower()
+    return {"claude": "CL", "codex": "CX", "opencode": "OC"}.get(
+        value, "?" if not value else value[:2].upper())
 
 
 def _get(value, key, default=None):
@@ -311,46 +314,6 @@ def read_obligations(state_roots, session_id, now, cache):
     return tuple(items)
 
 
-def _plan_of(row, label, role):
-    meta = {key: row.meta.get(key) for key in ("artifact_root", "launch_home") if row.meta.get(key)}
-    return SourcePlan(row.attempt_id, label, row.harness, harness_abbr(row.harness), role,
-                      row.meta.get("log_file") or "", tuple(sorted(meta.items())))
-
-
-def output_plans(key, tab, rows):
-    """(title, plans, stamped) for the selected request: the chosen attempt, the chosen stage's latest
-    attempt, or the supervisor plus the latest attempt of each stage (mixed by native time)."""
-    by_id = {row.attempt_id: row for row in rows}
-    mine = [by_id[a] for a in tab.attempt_ids if a in by_id]
-    stages = [row for row in mine if row.worker_type not in ("owner", "frame") and row.route_node]
-    if key.attempt_id and key.attempt_id in by_id:
-        row = by_id[key.attempt_id]
-        label = "owner" if row.worker_type == "owner" else (row.route_node or row.worker_type or "시도")
-        return f"{label} · {harness_abbr(row.harness)} · 원래 출력", [_plan_of(row, label, "stage")], False
-    if key.stage_id:
-        picked = [row for row in stages if row.route_node == key.stage_id]
-        if not picked:
-            return f"{key.stage_id} · 원래 출력", [], False
-        row = max(picked, key=lambda r: r.line)
-        return f"{key.stage_id} · {harness_abbr(row.harness)} · 원래 출력", [_plan_of(row, key.stage_id, "stage")], False
-    owners = [row for row in mine if row.worker_type == "owner"]
-    latest = {}
-    for row in stages:
-        if row.route_node not in latest or row.line > latest[row.route_node].line:
-            latest[row.route_node] = row
-    chosen = sorted(sorted(latest.values(), key=lambda r: r.line)[-MAX_STAGE_SOURCES:], key=lambda r: r.line)
-    plans, parts = [], []
-    if owners:
-        owner = max(owners, key=lambda r: r.line)
-        plans.append(_plan_of(owner, "owner", "owner"))
-        parts.append(f"감독 {harness_abbr(owner.harness)}")
-    if chosen:
-        plans.extend(_plan_of(row, row.route_node, "stage") for row in chosen)
-        abbrs = list(dict.fromkeys(harness_abbr(row.harness) for row in chosen))
-        parts.append("단계 " + "+".join(abbrs))
-    return f"{tab.label} · " + " + ".join(parts or ["원래 출력"]), plans, len(plans) > 1
-
-
 LINEAGE_LIMIT = 12
 
 
@@ -418,16 +381,7 @@ def _as_mapping(value):
 def collect_focus(request, *, jobs_path=None, artifact_root=None, route_loader=None, now=None,
                   live_jobs=None, snapshot=None, state_roots=None, cache=None, output_reader=None,
                   earlier=False):
-    """Read everything the selected main session's request tabs, ledger and overview need.
-
-    ``live_jobs`` (mapping or list of the current snapshot's jobs, or a callable returning
-    them) supplies liveness and process evidence for rows that are still live; every other
-    row is ``unknown`` and decided without process proof. ``snapshot`` is the already
-    published immutable snapshot, used only to build the overview text. ``output_reader`` (an
-    ``OutputReader``) reads the raw output of the selected request, or of its selected stage; without
-    one nothing is opened, and a request tab that is not selected never reaches it. ``earlier`` asks
-    that reader to read further back first.
-    """
+    """Read only the focused session's bounded source facts and optional earlier transcript."""
     from .. import route as route_module
     route_loader = route_loader or route_module.load
     cache = cache or SourceCache()
@@ -445,42 +399,10 @@ def collect_focus(request, *, jobs_path=None, artifact_root=None, route_loader=N
         artifact_root = derive_artifact_root(rows)
     errors = []
 
-    wanted = key.request_id
     owner_routes = _load_routes(rows, artifact_root, route_loader)
     cycles = _load_cycles(rows, owner_routes, artifact_root, cache)
-    tabs = build_tabs(rows, owner_routes, cycles)
-    header = request_header(tabs, rows)
-    tab = next((t for t in tabs if t.identity == wanted), None) if wanted else None
-
-    request_ledger, ledger_rows, open_results = None, (), ()
-    try:
-        records = dict(owner_routes)
-        if tab is not None:
-            ids = set(tab.attempt_ids)
-            selected_rows = [row for row in rows if row.attempt_id in ids]
-            records.update(_load_routes([], artifact_root, route_loader, selected_rows, records))
-            gates = {}
-            current = tab.owner_route_ids[-1] if tab.owner_route_ids else tab.route_id
-            record = records.get(current)
-            if isinstance(record, dict) and current:
-                for node in record.get("nodes", ()):
-                    node_id = node.get("id") if isinstance(node, dict) else None
-                    if node_id:
-                        gates[(current, node_id)] = _gate(record, current, node_id,
-                                                          state_roots, route_module)
-            request_ledger = build_request_ledger(tab, tabs, rows, records, gates)
-            ledger_rows = request_ledger.rows
-        results = []
-        for row in latest_results(tabs, rows):
-            if row.outcome in ("failed", "review-blocked"):
-                record = owner_routes.get(row.route_id)
-                gate = (_gate(record, row.route_id, row.route_node, state_roots, route_module)
-                        if isinstance(record, dict) else None)
-                results.append((row.route_id, row.route_node, row.outcome, gate))
-        open_results = tuple(results)
-    except Exception as exc:                     # a ledger fault must not hide the tabs
-        errors.append(f"ledger: {type(exc).__name__}")
-        request_ledger, ledger_rows = None, ()
+    records = dict(owner_routes)
+    gates = {}
 
     sources = []
     output, lineage = {}, {}
@@ -499,18 +421,15 @@ def collect_focus(request, *, jobs_path=None, artifact_root=None, route_loader=N
     if key.generation and lineage.get("lineage"):
         generation = next((item for item in lineage["lineage"]
                            if f"{item['harness']}:{item['sid']}" == key.generation), None)
-    if output_reader is not None and (generation is not None or tab is not None):
+    if output_reader is not None and generation is not None:
         title = ""
         try:
-            if generation is not None:
-                view = read_generation(output_reader, generation)
-            else:
-                title, plans, stamped = output_plans(key, tab, rows)
-                view = output_reader.read(key, title, plans, stamped=stamped, earlier=earlier)
-            output = {"output": view.rows, "output_title": view.title, "output_notes": view.notes,
+            view = read_generation(output_reader, generation)
+            output = {"output": view.rows, "output_events": view.events,
+                      "output_title": view.title, "output_notes": view.notes,
                       "output_health": view.health, "output_more": view.more}
             sources.append(("output", view.health))
-        except Exception as exc:                 # an output fault must not hide the tabs or the ledger
+        except Exception as exc:
             errors.append(f"output: {type(exc).__name__}")
             sources.append(("output", Health("failed", None, type(exc).__name__)))
             output = {"output_title": title, "output_health": Health("failed", None, type(exc).__name__)}
@@ -523,15 +442,30 @@ def collect_focus(request, *, jobs_path=None, artifact_root=None, route_loader=N
         sources.append(("obligations", Health("failed", None, type(exc).__name__)))
     events = read_events(entries, nav_tag(session))
 
+    pane = None
+    if session is not None:
+        for field_name in ("herdr_pane", "pane", "pane_id"):
+            pane = _get(session, field_name)
+            if pane is not None:
+                break
+    source_records = {
+        "registry_entries": tuple(entries),
+        "attempts": tuple(rows),
+        "routes": tuple(sorted(records.items())),
+        "cycles": tuple(sorted(cycles.items())),
+        "gates": tuple((route_id, node_id, value)
+                       for (route_id, node_id), value in sorted(gates.items())),
+        "lineage": lineage.get("lineage"),
+        "pane": pane,
+        "obligations": obligations,
+        "output_events": tuple(output.get("output_events", ())),
+        "warnings": tuple(errors),
+    }
     result = FocusResult(
         key=key, epoch=request.epoch, snapshot_generation=request.snapshot_generation,
-        tabs=tabs, ledger=ledger_rows, header=header, request_ledger=request_ledger,
-        obligations=obligations, open_results=open_results, events=events, sources=tuple(sources),
+        obligations=obligations, events=events, sources=tuple(sources),
         health=Health("partial" if errors else "success", wall, "; ".join(errors) or None),
-        **output, **lineage)
-    if snapshot is not None:
-        lines = build_overview(snapshot, result, sid=key.sid)
-        result = FocusResult(**{**result.__dict__, "overview": lines})
+        **output, **lineage, source_records=source_records)
     return result
 
 
@@ -579,8 +513,9 @@ class SelectionReader:
         if isinstance(result, FocusResult):
             return result
         return FocusResult(request.key, request.epoch, request.snapshot_generation,
-                           tabs=tuple(result.get("tabs", ())), ledger=tuple(result.get("ledger", ())),
-                           output=tuple(result.get("output", ())), overview=tuple(result.get("overview", ())),
+                           output=tuple(result.get("output", ())),
+                           events=tuple(result.get("events", ())),
+                           source_records=result.get("source_records", {}),
                            health=Health("success", time.time()))
 
 

@@ -49,12 +49,13 @@ def _proc_start(pid):
         return None
 
 
-def _child_main(evidence_dir):
+def _child_main(evidence_dir, explorer=False):
     from fleet import control, gitinfo, render
     from fleet.model import Session
     from fleet.refresh import LiveSnapshot
 
     evidence_dir = Path(evidence_dir)
+    render.set_explorer_mode(explorer)
     event_path = evidence_dir / "events.jsonl"
     state_path = evidence_dir / "state.json"
     event_path.write_text("", encoding="utf-8")
@@ -131,10 +132,15 @@ def _child_main(evidence_dir):
                       "folded": bool(value["folded"]),
                       "spans": [[int(a), int(b)] for a, b in render._REPO_FOLD_SPANS.get(row, [])]}
                      for row, value in render._REPO_FOLD_ROWS.items()]
-        click_rows = [{"row": int(row), "pid": int(value.get("pid") or 0),
-                       "proc_start": value.get("proc_start"),
-                       "spans": [[int(a), int(b)] for a, b in render._CLICK_SPANS.get(row, [])]}
-                      for row, value in render._CLICK_ROWS.items()]
+        if explorer:
+            click_rows = [{"row": int(row),
+                           "actions": [list(hit.action) for hit in hits]}
+                          for row, hits in render._CLICK_ROWS.items()]
+        else:
+            click_rows = [{"row": int(row), "pid": int(value.get("pid") or 0),
+                           "proc_start": value.get("proc_start"),
+                           "spans": [[int(a), int(b)] for a, b in render._CLICK_SPANS.get(row, [])]}
+                          for row, value in render._CLICK_ROWS.items()]
         h, w = stdscr.getmaxyx()
         state = {"utc": _utc(), "monotonic": time.monotonic(),
                  "frame": frame_count[0], "size": [h, w],
@@ -149,6 +155,21 @@ def _child_main(evidence_dir):
                  "select_mode": bool(render._SELECT_MODE),
                  "prompt_stage": (render._PROMPT or {}).get("stage"),
                  "mouse_config": dict(cfg)}
+        if explorer:
+            frame = render._EXPLORER_FRAME
+            explorer_state = render._EXPLORER_STATE
+            state["explorer"] = {
+                "title": getattr(frame, "title", ""),
+                "regions": ({"screen": [0, 0, int(w), int(h)]} if frame is not None else {}),
+                "hit_count": len(getattr(frame, "hits", ()) or ()),
+                "state": ({"view": explorer_state.view,
+                           "scope": explorer_state.scope,
+                           "opened": explorer_state.opened,
+                           "usage_open": explorer_state.usage_open,
+                           "folds": [list(item) for item in explorer_state.folds],
+                           "scroll": [list(item) for item in explorer_state.scroll]}
+                          if explorer_state is not None else None),
+            }
         _write_json(state_path, state)
         return result
 
@@ -163,12 +184,16 @@ def _child_main(evidence_dir):
     render._getmouse_event = capture_getmouse
     original_input_read = render._CursesInput.read
 
-    def capture_input_read(input_reader, stdscr):
-        result = original_input_read(input_reader, stdscr)
+    def capture_input_read(input_reader, stdscr, *args, **kwargs):
+        result = original_input_read(input_reader, stdscr, *args, **kwargs)
         _ch, mouse_event = result
         if mouse_event is not None:
             x, y, bstate = mouse_event
             event("decoded-mouse-read", x=x, y=y, bstate=bstate)
+        elif _ch != curses.ERR:
+            key = render._explorer_key_name(
+                _ch, searching=bool(getattr(render._EXPLORER_STATE, "searching", False)))
+            event("decoded-key-read", code=int(_ch), key=key)
         return result
 
     render._CursesInput.read = capture_input_read
@@ -203,10 +228,14 @@ def _child_main(evidence_dir):
 
 
 class PtyRun:
-    def __init__(self, evidence_dir):
+    def __init__(self, evidence_dir, *, cols=120, rows=40, live_capture=False):
         self.evidence_dir = Path(evidence_dir).resolve()
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
-        self.mode = "default" if "FLEET_MOUSE" not in os.environ else "opt-out"
+        self.cols, self.rows = max(40, int(cols)), max(12, int(rows))
+        self.live_capture = bool(live_capture)
+        self.mode = ("live-capture" if self.live_capture else
+                     "default" if "FLEET_MOUSE" not in os.environ else "opt-out")
+        self.explorer = False
         self.transcript = bytearray()
         self.inputs = []
         self.assertions = []
@@ -344,12 +373,19 @@ class PtyRun:
         # state snapshot so startup polling cannot mistake it for this child.
         (self.evidence_dir / "state.json").unlink(missing_ok=True)
         master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        fcntl.ioctl(slave, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", self.rows, self.cols, 0, 0))
         child_env = dict(os.environ)
         child_env["TERM"] = os.environ.get("TERM") or "xterm-256color"
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
-        command = [sys.executable, str(Path(__file__).resolve()), "--_fixture-child",
-                   "--evidence-dir", str(self.evidence_dir)]
+        if self.live_capture:
+            command = [sys.executable, str(TOOLS_DIR / "fleet" / "fleet.py"), "--explorer"]
+            child_env["FLEET_PTY_LIVE_CAPTURE"] = "1"
+        else:
+            command = [sys.executable, str(Path(__file__).resolve()), "--_fixture-child",
+                       "--evidence-dir", str(self.evidence_dir)]
+            if self.explorer:
+                command.append("--explorer")
         self.child = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave,
                                       cwd=str(REPO_ROOT), env=child_env, close_fds=True,
                                       start_new_session=True)
@@ -654,8 +690,11 @@ class PtyRun:
                   "TERM": os.environ.get("TERM"),
                   "FLEET_MOUSE": os.environ.get("FLEET_MOUSE", "<unset>"),
                   "child": getattr(self, "child_identity", None),
-                  "returncode": status, "initial_size": [40, 120],
-                  "resize_sizes": [[18, 80]] if any(x.get("label") == "resize" for x in self.inputs) else [],
+                  "returncode": status, "initial_size": [self.rows, self.cols],
+                  "resize_sizes": [[row, col] for row, col in
+                                   ((x.get("rows"), x.get("cols")) for x in self.inputs)
+                                   if row is not None and col is not None],
+                  "source": "host" if self.live_capture else "synthetic-fixture",
                   "inputs": self.inputs, "assertions": self.assertions,
                   "passed": all(x["passed"] for x in self.assertions),
                   "terminal_limitations": [
@@ -671,7 +710,11 @@ class PtyRun:
     def execute(self):
         self.start()
         try:
-            if self.mode == "default":
+            if self.live_capture:
+                self.run_live_capture()
+            elif self.explorer:
+                self.run_explorer()
+            elif self.mode == "default":
                 self.run_default()
             else:
                 self.run_opt_out()
@@ -682,15 +725,82 @@ class PtyRun:
             result = self.finish()
         return result
 
+    def run_live_capture(self):
+        """Capture the real read-only Fleet explorer for evidence; the child is ours to stop."""
+        self.drain(3.0)
+        alive = self.child.poll() is None
+        raw = bytes(self.transcript)
+        self.check("host explorer produced a colored terminal frame",
+                   alive and b"\x1b[" in raw and len(raw) > 256,
+                   {"alive": alive, "bytes": len(raw), "cols": self.cols, "rows": self.rows})
+        (self.evidence_dir / "capture.ansi").write_bytes(raw)
+        self.send(b"q", "quit-owned-live-capture")
+        self.drain(0.25)
+
+    def run_explorer(self):
+        state = self.wait_for("initial explorer frame",
+                              lambda s: s.get("hit_valid") and s.get("explorer", {}).get("hit_count"))
+        initial = state["explorer"]["state"]
+        self.check("explorer frame has screen bounds and view state",
+                   bool(state["explorer"].get("regions")) and bool(initial.get("view")),
+                   state.get("explorer"))
+
+        # Split one CSI arrow across PTY writes around the decoder's ESC deadline.
+        before_view = initial.get("view")
+        self.send(b"\x1b", "split-arrow-prefix")
+        self.drain(0.008)
+        self.send(b"[B", "split-arrow-tail")
+        down = self.wait_for("split CSI arrow is decoded as one down key",
+                             lambda _s: any(row.get("kind") == "decoded-key-read"
+                                            and row.get("key") == "down"
+                                            for row in self.read_events()))
+        decoded = [row for row in self.read_events() if row.get("kind") == "decoded-key-read"]
+        self.check("split escape bytes decode to one arrow event",
+                   sum(row.get("key") == "down" for row in decoded) == 1,
+                   {"view_before": before_view,
+                    "view_after": down["explorer"]["state"].get("view"),
+                    "decoded": decoded[-3:]})
+
+        # Multiple complete inputs in one write remain ordered and each reaches the live loop.
+        start_index = len(self.read_events())
+        self.send(b"\tu", "batched-tab-usage")
+        batched = self.wait_for("both batched keys reach the input loop",
+                                lambda _s: len([row for row in self.read_events()[start_index:]
+                                                if row.get("kind") == "decoded-key-read"
+                                                and row.get("key") in ("tab", "u")]) >= 2)
+        keys = [row.get("key") for row in self.read_events()[start_index:]
+                if row.get("kind") == "decoded-key-read"]
+        self.check("batched tab and usage keys preserve order", keys[:2] == ["tab", "u"], keys)
+        self.check("batched tab and usage keys both change explorer state",
+                   batched["explorer"]["state"]["view"] != initial["view"] and
+                   batched["explorer"]["state"]["usage_open"] != initial["usage_open"],
+                   batched["explorer"]["state"])
+
+        before_f = batched["explorer"]["state"]
+        self.send(b"u", "toggle-explorer-usage")
+        changed = self.wait_for("usage key reaches reducer",
+                                lambda s: s.get("explorer", {}).get("state", {}).get("usage_open")
+                                != before_f.get("usage_open"))
+        self.check("usage toggles in live explorer",
+                   changed["explorer"]["state"]["usage_open"] != before_f["usage_open"],
+                   changed["explorer"]["state"])
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence-dir", required=True)
     parser.add_argument("--_fixture-child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--explorer", action="store_true", help="exercise the explorer in the PTY")
+    parser.add_argument("--live-capture", action="store_true",
+                        help="capture the host-backed explorer in the PTY")
+    parser.add_argument("--cols", type=int, default=120)
+    parser.add_argument("--rows", type=int, default=40)
     args = parser.parse_args()
     if args._fixture_child:
-        return _child_main(args.evidence_dir)
-    run = PtyRun(args.evidence_dir)
+        return _child_main(args.evidence_dir, explorer=args.explorer)
+    run = PtyRun(args.evidence_dir, cols=args.cols, rows=args.rows,
+                 live_capture=args.live_capture)
+    run.explorer = args.explorer
     result = run.execute()
     print(json.dumps({"mode": result["mode"], "passed": result["passed"],
                       "returncode": result["returncode"],
