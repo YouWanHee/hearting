@@ -825,6 +825,68 @@ class BatchObligationTest(unittest.TestCase):
         self.assertTrue(any(item[:3] == (str(self.jobs), "owner-settlement", "att-owner")
                             for item in signatures))
 
+    def test_post_registration_snapshot_disappearance_reaches_settlement(self):
+        self.jobs.write_text(self._runtime_owner_row() + "\n", encoding="utf-8")
+        registry_cache.clear_cache()
+        dependency = self.base / "disappearing-evidence.json"
+        dependency.write_text("sealed", encoding="utf-8")
+        context = obligations.OwnerSettlementReadContext()
+        current_generations = context._current_generations
+        snapshots = 0
+
+        def disappear_after_initial_snapshot(paths, cache=None):
+            nonlocal snapshots
+            snapshots += 1
+            if snapshots == 1:
+                observed = current_generations(paths, cache)
+                dependency.unlink()
+                return observed
+            return current_generations(paths)
+
+        with mock.patch.object(obligations, "_owner_settlement_dependency_paths",
+                               return_value=(dependency,)), \
+             mock.patch.object(context, "_current_generations",
+                               side_effect=disappear_after_initial_snapshot), \
+             mock.patch.object(context, "_register_dependency_watch") as register, \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending",
+                        side_effect=(False, True)) as pending, \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
+             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False):
+            signatures = obligations._resume_owner_settlements(self.jobs, context=context)
+
+        self.assertEqual(snapshots, 2)
+        register.assert_called_once()
+        self.assertEqual(pending.call_count, 2)
+        settle.assert_called_once_with(self.jobs, "att-owner")
+        self.assertNotIn((str(self.jobs.resolve()), "att-owner"), context._settled)
+        self.assertTrue(any(item[:3] == (str(self.jobs), "owner-settlement", "att-owner")
+                            for item in signatures))
+
+    def test_initial_registration_snapshot_error_reaches_settlement(self):
+        self.jobs.write_text(self._runtime_owner_row() + "\n", encoding="utf-8")
+        registry_cache.clear_cache()
+        dependency = self.base / "unreadable-evidence.json"
+        dependency.write_text("sealed", encoding="utf-8")
+        context = obligations.OwnerSettlementReadContext()
+
+        with mock.patch.object(obligations, "_owner_settlement_dependency_paths",
+                               return_value=(dependency,)), \
+             mock.patch.object(context, "_current_generations",
+                               side_effect=PermissionError("injected stat failure")), \
+             mock.patch.object(context, "_register_dependency_watch") as register, \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending",
+                        side_effect=(False, True)) as pending, \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
+             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False):
+            signatures = obligations._resume_owner_settlements(self.jobs, context=context)
+
+        register.assert_not_called()
+        self.assertEqual(pending.call_count, 2)
+        settle.assert_called_once_with(self.jobs, "att-owner")
+        self.assertNotIn((str(self.jobs.resolve()), "att-owner"), context._settled)
+        self.assertTrue(any(item[:3] == (str(self.jobs), "owner-settlement", "att-owner")
+                            for item in signatures))
+
     def test_owner_settlement_accepts_valid_literal_replacement_character(self):
         row = self._runtime_owner_row().replace(
             "completed-supervisor", "completed-supervisor\ufffd")

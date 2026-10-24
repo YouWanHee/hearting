@@ -1298,10 +1298,10 @@ def _pending_owner_settlements(jobs: Path, *, context=None):
                         if dependencies:
                             remembered = context.remember_settled_owner(
                                 jobs, fields[1], raw, meta, related_rows, dependencies)
-                            if remembered is False:
-                                # The proof's dependencies changed while its
-                                # watcher was being installed; settle this row
-                                # through the normal path instead of caching it.
+                            if remembered is not True:
+                                # An invalidated or unavailable snapshot cannot
+                                # prove settlement; keep the row on its normal
+                                # settlement path instead of caching it.
                                 context.forget_active_owner(jobs, attempt_id)
                             else:
                                 context.forget_active_owner(jobs, attempt_id)
