@@ -180,6 +180,70 @@ class ComputeRunLauncherIdentityTest(unittest.TestCase):
             self.assertEqual(recorded["provenance"]["notify"],
                              {"harness": "claude", "id": "route-parent"})
 
+    def test_resource_parent_launch_keeps_payload_provenance_and_share_contract(self):
+        import gpu_leases
+
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_root = root / "runs"
+            route_file = root / "route.json"
+            route_file.write_text("{}\n", encoding="utf-8")
+            registry = root / "resource-runs.json"
+            registry.write_text("{}\n", encoding="utf-8")
+            route_id, route_hash = "rt-resource-parent", "sha256:resource-parent"
+            route = {"route_id": route_id, "route_hash": route_hash,
+                     "route_file": str(route_file)}
+            parent_contract = {"route_id": route_id, "route_file": str(route_file),
+                               "route_hash": route_hash, "run_id": "parent-run",
+                               "node": "full-run"}
+            parent = {"run_id": "parent-run", "registry": str(registry),
+                      "route_id": route_id, "route_file": str(route_file),
+                      "route_hash": route_hash, "contract": parent_contract}
+            payload_home = str(root / "payload-home")
+            provenance = {"AGENT_HOME": str(root / "agent-home"),
+                          "AGENT_DISPATCH_ATTEMPT_ID": "att-parent"}
+            args = SimpleNamespace(host="here", command=["python", "-c", "pass"],
+                name="resource-child", cwd=None, env=None, gpus=None, share=True,
+                dry_run=False, json=True)
+            receipt = {"gpus": [], "gpu_lease": None,
+                       "tmux_transport": {"kind": "nohup-v1"}}
+            remote = mock.Mock(return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(receipt) + "\n", stderr=""))
+            with mock.patch.object(module, "load_config", return_value={
+                    "run_root": run_root, "hosts": {}}), \
+                 mock.patch.object(module, "_refuse_namespace_self"), \
+                 mock.patch.object(module, "_select", return_value=[
+                     ("here", {"ssh_host": "local"})]), \
+                 mock.patch.object(module, "_run_gpu_observation", return_value={
+                     "reachable": True, "gpus": []}), \
+                 mock.patch.object(module, "_launcher_provenance", return_value=provenance), \
+                 mock.patch.object(module, "_launcher_session_owner", return_value=None), \
+                 mock.patch.object(module, "_launcher_route", return_value=route), \
+                 mock.patch.object(module, "_resource_parent", return_value=parent), \
+                 mock.patch.object(module, "_select_payload_agent_home", return_value=(
+                     payload_home, "published", "fixture")), \
+                 mock.patch.object(module, "remote", remote), \
+                 mock.patch.object(module, "_spawn_completion_watch", return_value=False), \
+                 mock.patch.object(gpu_leases, "launcher_session_environment",
+                                   return_value={}), \
+                 mock.patch.object(gpu_leases, "serialized_compute_source",
+                                   return_value="# synthetic compute source\n"), \
+                 mock.patch.object(gpu_leases, "serialized_payload_source",
+                                   return_value="# synthetic payload source\n"), \
+                 mock.patch("sys.stdout", new=io.StringIO()):
+                self.assertEqual(module.cmd_run(args), 0)
+
+            (run_dir,) = list(run_root.iterdir())
+            meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["provenance"]["resource"], parent)
+            self.assertEqual(meta["provenance"]["payload_agent_home"], payload_home)
+            self.assertEqual(meta["provenance"]["agent_home_status"], "published")
+            self.assertTrue(meta["execution_contract"]["share"])
+            self.assertEqual(meta["execution_contract"]["resource_parent"], parent_contract)
+            launch_script = shlex.split(remote.call_args.args[1])[2]
+            self.assertIn("'HEARTING_RESOURCE_RUN_ID': 'parent-run'", launch_script)
+
 
 class SSHNamespacePrefixTest(unittest.TestCase):
     HOST = {"ssh_host": "example.invalid", "ssh_port": 1689, "ssh_user": "operator"}

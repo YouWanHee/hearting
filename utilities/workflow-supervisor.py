@@ -1523,19 +1523,19 @@ def admit_owner_successor_start(route, successor, jobs, owner_attempt_id, owner_
                     and (stage_evidence.get("owner_successor_start") is True
                          or stage_evidence.get("owner_terminal_settlement") is True)
                 )
-                captured_predecessor = preobserved.get(predecessor)
-                reconciled = (
-                    reconcile_legacy_supervised_resource_success(
-                        route, ledger, armed, observed_evidence=captured_predecessor[1])
-                    if captured_predecessor is not None else
-                    reconcile_legacy_supervised_resource_success(route, ledger, armed)
-                )
-                if not owner_settled and reconciled:
-                    # The old marker is now history. The ordinary read-only
-                    # marker gate below will refuse this start and the owner can
-                    # continue the approved resource sequence on the same route.
-                    continue
                 if not owner_settled:
+                    captured_predecessor = preobserved.get(predecessor)
+                    if captured_predecessor is not None:
+                        reconciled = reconcile_legacy_supervised_resource_success(
+                            route, ledger, armed, observed_evidence=captured_predecessor[1])
+                    else:
+                        reconciled = reconcile_legacy_supervised_resource_success(
+                            route, ledger, armed)
+                    if reconciled:
+                        # The old marker is now history. The ordinary read-only
+                        # marker gate below will refuse this start and the owner can
+                        # continue the approved resource sequence on the same route.
+                        continue
                     continue
             elif stage.get("state") != "RUNNING":
                 continue
@@ -1644,21 +1644,53 @@ def _claim_owner_successors(route, ledger, armed, node_id, evidence):
     return claims
 
 
+def _poll_compute_evidence(armed, compute_observations):
+    """Use only an exact pre-lock compute snapshot; local rows keep their old path."""
+    import dispatch_resource_wait as OWNER_RESOURCE
+
+    changed = {"terminal": False, "reason": "compute-resource-binding-changed"}
+    captured = compute_observations.get(armed.get("node"))
+    if not armed.get("resource_registry"):
+        return changed if captured is not None else None
+    try:
+        data = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
+        row = (data.get("runs") or {}).get(armed["predecessor_id"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return changed if captured is not None else {
+            "terminal": False, "reason": "resource-run-absent"}
+
+    execution = row.get("execution") if isinstance(row, dict) else None
+    is_compute = isinstance(execution, dict) and execution.get("kind") == "compute-hosts"
+    if captured is None:
+        return changed if is_compute else None
+
+    if (not isinstance(captured, dict) or captured.get("armed") != armed
+            or not is_compute or not isinstance(row, dict)):
+        return changed
+    evidence = captured.get("evidence")
+    if not isinstance(evidence, dict):
+        return changed
+    resource_sha256 = RESOURCE_RESUME.row_digest(row)
+    resource_binding = OWNER_RESOURCE.resource_body_digest(row)
+    identity = RR.compute_execution_identity(row)
+    evidence_sha256 = evidence.get("resource_sha256")
+    if (not identity or evidence.get("identity") != identity
+            or captured.get("resource_sha256") != resource_sha256
+            or captured.get("resource_binding") != resource_binding
+            or armed.get("resource_binding") != resource_binding
+            or (evidence_sha256 is not None and evidence_sha256 != resource_sha256)
+            or (evidence.get("terminal") is True and evidence_sha256 != resource_sha256)):
+        return changed
+    return evidence
+
+
 def _poll_once_locked(route, ledger, *, compute_observations=None):
     compute_observations = compute_observations or {}
+
     def evidence_for(armed):
-        captured = compute_observations.get(armed.get("node"))
-        if captured and captured[0] == armed:
-            return captured[1]
-        try:
-            row = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))[
-                "runs"][armed["predecessor_id"]]
-        except (OSError, ValueError, KeyError, TypeError):
-            return resource_evidence(armed)
-        execution = row.get("execution") if isinstance(row, dict) else None
-        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
-            return {"terminal": False, "reason": "compute-resource-binding-changed"}
-        return resource_evidence(armed)
+        evidence = _poll_compute_evidence(armed, compute_observations)
+        return resource_evidence(armed) if evidence is None else evidence
+
     import route_parent_close
     closing = route_parent_close.ledger_intent(route, ledger)
     if closing:
@@ -1681,10 +1713,10 @@ def _poll_once_locked(route, ledger, *, compute_observations=None):
     results = []
     for node_id, armed in sorted(read_armed(ledger).items()):
         state = ledger.state()["nodes"].get(node_id, {}).get("state")
-        captured = compute_observations.get(node_id)
-        observed_evidence = (captured[1] if captured and captured[0] == armed else
-                             {"terminal": False, "reason": "compute-resource-binding-changed"}
-                             if captured else None)
+        observed_evidence = (
+            _poll_compute_evidence(armed, compute_observations)
+            if armed.get("predecessor_kind") == "resource" else None
+        )
         if (state == "STAGE_SUCCEEDED" and armed.get("predecessor_kind") == "resource"):
             reconciled = (
                 reconcile_legacy_supervised_resource_success(
@@ -1718,6 +1750,8 @@ def _poll_once_locked(route, ledger, *, compute_observations=None):
 
 
 def poll_once(route, ledger):
+    import dispatch_resource_wait as OWNER_RESOURCE
+
     compute_observations = {}
     for node, armed in read_armed(ledger).items():
         if armed.get("predecessor_kind") != "resource":
@@ -1729,7 +1763,12 @@ def poll_once(route, ledger):
             continue
         execution = row.get("execution") if isinstance(row, dict) else None
         if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
-            compute_observations[node] = (armed, resource_evidence(armed))
+            compute_observations[node] = {
+                "armed": armed,
+                "resource_sha256": RESOURCE_RESUME.row_digest(row),
+                "resource_binding": OWNER_RESOURCE.resource_body_digest(row),
+                "evidence": resource_evidence(armed),
+            }
     with ledger.lock():
         results = _poll_once_locked(route, ledger, compute_observations=compute_observations)
         import route_parent_close

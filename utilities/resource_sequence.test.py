@@ -146,7 +146,11 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                 with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
                      mock.patch('subprocess.check_output', return_value=str(self.base)), \
                      mock.patch.object(SUP.RR, 'compute_execution_observation',
-                                       side_effect=observe_outside_writer_locks):
+                                       side_effect=observe_outside_writer_locks), \
+                     mock.patch.object(
+                         SUP, 'reconcile_legacy_supervised_resource_success',
+                         wraps=SUP.reconcile_legacy_supervised_resource_success,
+                     ) as reconcile:
                     self.assertIsNone(RA.completion_gate(
                         args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
                     ))
@@ -154,6 +158,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                         args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
                     ))
                 self.assertEqual(len(observer_calls), 2)
+                self.assertEqual(reconcile.call_count, 0)
                 self.assertTrue(marker.is_file())
                 self.assertEqual(json.loads(marker.read_bytes())['resource_execution_identity'],
                                  compute_identity)
