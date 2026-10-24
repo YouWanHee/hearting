@@ -10,5 +10,8 @@ class RevisionBatchCLI(RevisionBatchFixture):
     def test_r2_unknown_deferred_and_verdictless_bound_are_atomic(self):
         self._case_test_r2_unknown_deferred_and_verdictless_bound_are_atomic()
 
+    def test_terminal_no_start_reuses_group_start_for_the_exact_gap(self):
+        self._case_test_terminal_no_start_reuses_group_start_for_the_exact_gap()
+
 if __name__ == "__main__":
     unittest.main()
