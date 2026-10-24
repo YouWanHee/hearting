@@ -746,6 +746,222 @@ class ComputeRunQuiescenceTest(unittest.TestCase):
         self.assertEqual(result["reason"], "compute-run-evidence-changed")
 
 
+class ComputeOutputReceiptTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.artifacts = self.root / "artifacts"
+        self.artifacts.mkdir()
+        self.run_root = self.root / "compute-runs"
+        self.run_id = "fixture-output-run"
+        self.run_dir = self.run_root / self.run_id
+        self.run_dir.mkdir(parents=True)
+        self.module = load_module()
+        self.config = {"run_root": self.run_root,
+                       "hosts": {"fixture": {"ssh_host": "fixture.invalid"}}}
+        self.module.remote = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, '{"state":"empty","reason":"fixture-empty-group"}\n', "")
+        self.identity = {"pid": 12, "starttime": "44", "process_group": 12,
+                         "pid_namespace": "pid:[77]", "boot_id": "boot-fixture"}
+
+    def write_execution(self, declared, files):
+        for relative, raw in files.items():
+            target = self.artifacts / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+        parent_contract = {"run_id": "fixture-resource", "route_id": "rt-output-fixture",
+                           "route_hash": "sha256:output-fixture",
+                           "artifact_base": str(self.artifacts),
+                           "declared_outputs": list(declared)}
+        provenance = {"run_id": "fixture-resource", "route_id": parent_contract["route_id"],
+                      "route_hash": parent_contract["route_hash"],
+                      "contract": parent_contract}
+        contract = {"resource_parent": parent_contract,
+                    "route": {"route_id": parent_contract["route_id"],
+                              "route_hash": parent_contract["route_hash"]}}
+        canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":")).encode("utf-8")
+        meta = {"run_id": self.run_id, "host": "fixture",
+                "provenance": {"resource": provenance},
+                "execution_contract": contract,
+                "contract_sha256": self.module.hashlib.sha256(canonical).hexdigest()}
+        (self.run_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        (self.run_dir / "exit_code").write_text("0\n", encoding="ascii")
+        (self.run_dir / "launch-receipt.json").write_text(json.dumps({
+            "schema_version": 1, "run_id": self.run_id, "host": "fixture-host",
+            "identity": self.identity, "state": "finished", "exit_code": 0,
+            "started_at": 1.0, "ended_at": 2.0,
+        }), encoding="utf-8")
+        receipt = self.module._record_compute_outputs(self.run_dir, meta)
+        return receipt, meta
+
+    def observe(self):
+        return self.module.execution_record(self.config, self.run_id)
+
+    def test_standard_full_run_glob_receipt_reaches_fresh_quiescent_observation(self):
+        declared = ["run.json", "logs/**", "experiment-artifact"]
+        receipt, _meta = self.write_execution(declared, {
+            "run.json": b'{"run":"full"}\n',
+            "logs/train.log": b"train complete\n",
+            "logs/nested/metrics.json": b'{"loss":0.1}\n',
+        })
+        self.assertEqual([row["path"] for row in receipt["outputs"]],
+                         ["logs/nested/metrics.json", "logs/train.log", "run.json"])
+        self.assertTrue(all(row["state"] == "present" for row in receipt["outputs"]))
+        result = self.observe()
+        self.assertEqual(result["state"], "quiescent", result)
+        self.assertEqual([row["path"] for row in result["execution"]["outputs"]],
+                         ["logs/nested/metrics.json", "logs/train.log", "run.json"])
+
+    def test_standard_eval_run_glob_receipt_reaches_fresh_quiescent_observation(self):
+        declared = ["run.json", "raw-results/**"]
+        receipt, _meta = self.write_execution(declared, {
+            "run.json": b'{"run":"eval"}\n',
+            "raw-results/fold-1/scores.json": b'{"accuracy":0.9}\n',
+        })
+        self.assertEqual([row["path"] for row in receipt["outputs"]],
+                         ["raw-results/fold-1/scores.json", "run.json"])
+        self.assertEqual(self.observe()["state"], "quiescent")
+
+    def test_overlapping_recursive_patterns_are_sorted_and_deduplicated(self):
+        declared = ["run.json", "logs/**", "logs/nested/**", "experiment-artifact"]
+        receipt, _meta = self.write_execution(declared, {
+            "run.json": b"run\n", "logs/z.log": b"z\n",
+            "logs/nested/a.log": b"a\n",
+        })
+        paths = [row["path"] for row in receipt["outputs"]]
+        self.assertEqual(paths, ["logs/nested/a.log", "logs/z.log", "run.json"])
+        self.assertEqual(len(paths), len(set(paths)))
+        self.assertNotIn("experiment-artifact", paths)
+        self.assertEqual(self.observe()["state"], "quiescent")
+
+    def test_zero_match_is_recorded_as_missing_and_refused(self):
+        receipt, _meta = self.write_execution(["run.json", "logs/**", "experiment-artifact"], {
+            "run.json": b"run\n",
+        })
+        missing = [row for row in receipt["outputs"] if row.get("state") == "missing"]
+        self.assertEqual(missing, [{"path": "logs/**", "state": "missing", "reason": "no-matches"}])
+        result = self.observe()
+        self.assertEqual(result["state"], "not-quiescent")
+        self.assertEqual(result["reason"], "compute-run-output-missing")
+        self.assertEqual(result["differences"][0]["field"], "outputs.logs/**")
+
+    def test_literal_run_json_receipt_shape_stays_compatible(self):
+        receipt, _meta = self.write_execution(["run.json"], {"run.json": b"literal\n"})
+        self.assertEqual(set(receipt), {"schema_version", "run_id", "outputs", "observed_at"})
+        self.assertEqual(set(receipt["outputs"][0]), {"path", "sha256", "size", "state"})
+        self.assertEqual(receipt["outputs"][0]["path"], "run.json")
+        self.assertEqual(self.observe()["state"], "quiescent")
+
+    def test_added_removed_and_mutated_glob_members_break_the_receipt_snapshot(self):
+        self.write_execution(["run.json", "logs/**"], {
+            "run.json": b"run\n", "logs/one.log": b"one\n", "logs/two.log": b"two\n",
+        })
+        self.assertEqual(self.observe()["state"], "quiescent")
+        (self.artifacts / "logs/added.log").write_bytes(b"added\n")
+        result = self.observe()
+        self.assertEqual(result["reason"], "compute-run-output-membership-changed")
+        self.assertEqual(result["differences"][0]["field"], "outputs.paths")
+        (self.artifacts / "logs/added.log").unlink()
+        (self.artifacts / "logs/one.log").unlink()
+        self.assertEqual(self.observe()["reason"], "compute-run-output-membership-changed")
+        (self.artifacts / "logs/one.log").write_bytes(b"one changed\n")
+        self.assertEqual(self.observe()["reason"], "compute-run-output-changed")
+
+    def test_snapshot_recheck_reports_output_receipt_and_file_bytes_expected_actual(self):
+        self.write_execution(["run.json", "logs/**"], {
+            "run.json": b"run\n", "logs/train.log": b"complete\n",
+        })
+        execution = self.observe()["execution"]
+        output_path = self.artifacts / "logs/train.log"
+        original_output = output_path.read_bytes()
+        output_path.write_bytes(b"changed\n")
+        differences = self.module.run_snapshot_differences(
+            self.config, self.run_id, execution)
+        file_difference = next(item for item in differences
+                               if item["field"] == "outputs.logs/train.log")
+        original_row = next(row for row in execution["outputs"]
+                            if row["path"] == "logs/train.log")
+        self.assertEqual(file_difference["expected"], {
+            "sha256": original_row["sha256"], "size": original_row["size"]})
+        self.assertNotEqual(file_difference["expected"], file_difference["actual"])
+        output_path.write_bytes(original_output)
+
+        receipt_path = self.run_dir / "outputs.json"
+        receipt = json.loads(receipt_path.read_bytes())
+        receipt["observed_at"] = receipt.get("observed_at", 0) + 1
+        receipt_path.write_text(json.dumps(receipt, ensure_ascii=False,
+                                           sort_keys=True) + "\n", encoding="utf-8")
+        differences = self.module.run_snapshot_differences(
+            self.config, self.run_id, execution)
+        receipt_difference = next(item for item in differences
+                                  if item["field"] == "compute_run.outputs_sha256")
+        self.assertEqual(receipt_difference["expected"], execution["outputs_sha256"])
+        self.assertNotEqual(receipt_difference["expected"], receipt_difference["actual"])
+
+    def test_snapshot_recheck_reports_sealed_pattern_set_expected_actual(self):
+        declared = ["run.json", "logs/**", "experiment-artifact"]
+        _receipt, _meta = self.write_execution(declared, {
+            "run.json": b"run\n", "logs/train.log": b"complete\n",
+        })
+        execution = self.observe()["execution"]
+        meta_path = self.run_dir / "meta.json"
+        meta = json.loads(meta_path.read_bytes())
+        parent = meta["provenance"]["resource"]["contract"]
+        parent["declared_outputs"] = ["run.json"]
+        meta["execution_contract"]["resource_parent"] = parent
+        meta["contract_sha256"] = self.module.hashlib.sha256(json.dumps(
+            meta["execution_contract"], ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        differences = self.module.run_snapshot_differences(
+            self.config, self.run_id, execution)
+        pattern_difference = next(item for item in differences
+                                  if item["field"] == "declared_outputs")
+        self.assertEqual(pattern_difference["expected"], declared)
+        self.assertEqual(pattern_difference["actual"], ["run.json"])
+
+    def test_symlink_leaf_ancestor_and_base_escape_never_hash_external_bytes(self):
+        external = self.root / "external.bin"
+        external.write_bytes(b"outside-secret-bytes\n")
+        external_hash = self.module.hashlib.sha256(external.read_bytes()).hexdigest()
+        for name, prepare in (
+                ("leaf", lambda: (self.artifacts / "logs").mkdir(exist_ok=True)),
+                ("ancestor", lambda: None)):
+            with self.subTest(kind=name):
+                for path in self.artifacts.iterdir():
+                    if path.is_dir() and not path.is_symlink():
+                        import shutil
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+                prepare()
+                target = self.artifacts / "logs" if name == "ancestor" else self.artifacts / "logs/external.bin"
+                if name == "ancestor":
+                    target.symlink_to(self.root, target_is_directory=True)
+                else:
+                    target.symlink_to(external)
+                receipt, _meta = self.write_execution(["run.json", "logs/**"], {
+                    "run.json": b"run\n",
+                })
+                self.assertNotIn(external_hash, json.dumps(receipt))
+                self.assertNotEqual(self.observe()["state"], "quiescent")
+        for unsafe in ("../external.bin", str(external)):
+            with self.subTest(pattern=unsafe):
+                for path in self.artifacts.iterdir():
+                    if path.is_dir() and not path.is_symlink():
+                        import shutil
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+                receipt, _meta = self.write_execution(["run.json", unsafe], {
+                    "run.json": b"run\n",
+                })
+                self.assertNotIn(external_hash, json.dumps(receipt))
+                self.assertNotEqual(self.observe()["state"], "quiescent")
+
+
 class ComputeHostsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

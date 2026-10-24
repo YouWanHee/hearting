@@ -18,14 +18,15 @@ This holds the static half in one user-owned file and measures the rest:
 
 A run is detached on purpose: the session that starts it may end long before
 the work does, and any later session -- on any host sharing the run root -- can
-follow it by id. Only the standard library is used, matching the rest of the
-harness utilities.
+follow it by id. The runtime adds no third-party dependency; route-owned output
+receipts reuse the harness's shared artifact matcher.
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import datetime
 import fcntl
 import hashlib
@@ -1158,6 +1159,364 @@ def _resource_parent(values=None, route=None):
             "contract": parent_contract}
 
 
+class ComputeOutputError(ValueError):
+    """An output declaration or file cannot safely produce a compute receipt."""
+
+    def __init__(self, reason, *, field="declared_outputs", expected=None, actual=None):
+        super().__init__(reason)
+        self.reason = reason
+        self.difference = {"field": field, "expected": expected, "actual": actual}
+
+
+def _output_pattern_parts(outputs):
+    """Validate path declarations and return their non-semantic matcher forms."""
+    from artifact_context import (
+        ArtifactContextError, _safe_relative, _scope_parts, is_semantic_output,
+    )
+
+    if not isinstance(outputs, list):
+        raise ComputeOutputError("compute-run-output-contract-invalid",
+                                 expected="relative output path declarations", actual=outputs)
+    patterns = []
+    for value in outputs:
+        if not isinstance(value, str) or not value:
+            raise ComputeOutputError("compute-run-output-contract-invalid",
+                                     expected="non-empty relative output path", actual=value)
+        if is_semantic_output(value):
+            continue
+        try:
+            relative = _safe_relative(value)
+        except ArtifactContextError as error:
+            raise ComputeOutputError("compute-run-output-path-invalid",
+                                     expected="safe relative output path", actual=value) from error
+        if relative != value:
+            raise ComputeOutputError("compute-run-output-path-invalid",
+                                     expected=relative, actual=value)
+        item = (value, _scope_parts(value))
+        if item not in patterns:
+            patterns.append(item)
+    return patterns
+
+
+def _output_pattern_matches(parts, pattern):
+    from artifact_context import _path_pattern_matches
+    return _path_pattern_matches(parts, pattern)
+
+
+def _output_pattern_covers_or_ancestors(parts, pattern):
+    """Whether a symlink path matches a pattern or is an ancestor of its match."""
+    from artifact_context import _component_matches, _path_pattern_matches
+    if _path_pattern_matches(parts, pattern):
+        return True
+    return (len(parts) < len(pattern)
+            and all(_component_matches(actual, expected)
+                    for actual, expected in zip(parts, pattern)))
+
+
+def _output_directory_relevant(parts, patterns):
+    """Prune directory walks outside every declared path or recursive glob."""
+    from artifact_context import _component_matches, _path_pattern_matches
+    for _value, pattern in patterns:
+        if (len(parts) <= len(pattern)
+                and all(_component_matches(actual, expected)
+                        for actual, expected in zip(parts, pattern))):
+            return True
+        if pattern and pattern[-1] == "**" and _path_pattern_matches(parts, pattern):
+            return True
+    return False
+
+
+def _open_compute_directory(path):
+    """Open every absolute path component without following symlinks."""
+    absolute = Path(os.path.abspath(str(path)))
+    directory = getattr(os, "O_DIRECTORY", None)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if directory is None or nofollow is None:
+        raise OSError("no-follow directory opens are unavailable")
+    flags = os.O_RDONLY | directory | nofollow
+    descriptor = os.open(absolute.anchor or "/", flags)
+    try:
+        for part in absolute.parts[1:]:
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("compute output base is not a directory")
+        return descriptor
+    except OSError:
+        os.close(descriptor)
+        raise
+
+
+def _output_inventory(base, patterns):
+    """Walk regular files without following symlink directories."""
+    base = Path(base)
+    try:
+        lexical = Path(os.path.abspath(str(base)))
+        info = base.lstat()
+        resolved = base.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ComputeOutputError("compute-run-output-base-unavailable",
+                                 expected="existing artifact base directory",
+                                 actual=type(error).__name__) from error
+    if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or resolved != lexical):
+        raise ComputeOutputError("compute-run-output-base-unsafe",
+                                 expected=str(lexical), actual=str(resolved))
+
+    files = []
+    unsafe = []
+    flags_dir = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        root_descriptor = _open_compute_directory(base)
+    except OSError as error:
+        raise ComputeOutputError("compute-run-output-base-unsafe",
+                                 expected=str(lexical), actual=type(error).__name__) from error
+
+    def visit(directory_descriptor, prefix=()):
+        try:
+            with os.scandir(directory_descriptor) as scan:
+                entries = sorted(scan, key=lambda entry: entry.name)
+        except OSError as error:
+            raise ComputeOutputError("compute-run-output-tree-unavailable",
+                                     expected="readable artifact directory",
+                                     actual=type(error).__name__) from error
+        for entry in entries:
+            parts = (*prefix, entry.name)
+            relative = "/".join(parts)
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise ComputeOutputError("compute-run-output-tree-changed",
+                                         field="outputs." + relative,
+                                         expected="stable directory entry",
+                                         actual=type(error).__name__) from error
+            if stat.S_ISLNK(info.st_mode):
+                unsafe.append((relative, "symlink"))
+            elif stat.S_ISDIR(info.st_mode):
+                if not _output_directory_relevant(parts, patterns):
+                    continue
+                try:
+                    child = os.open(entry.name, flags_dir, dir_fd=directory_descriptor)
+                    opened = os.fstat(child)
+                    if (not stat.S_ISDIR(opened.st_mode)
+                            or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)):
+                        os.close(child)
+                        raise ComputeOutputError("compute-run-output-tree-changed",
+                                                 field="outputs." + relative,
+                                                 expected={"device": info.st_dev, "inode": info.st_ino},
+                                                 actual={"device": opened.st_dev,
+                                                         "inode": opened.st_ino})
+                    try:
+                        visit(child, parts)
+                    finally:
+                        os.close(child)
+                except ComputeOutputError:
+                    raise
+                except OSError as error:
+                    raise ComputeOutputError("compute-run-output-tree-changed",
+                                             field="outputs." + relative,
+                                             expected="non-symlink directory",
+                                             actual=type(error).__name__) from error
+            elif stat.S_ISREG(info.st_mode):
+                files.append(relative)
+            else:
+                unsafe.append((relative, "non-regular"))
+
+    try:
+        visit(root_descriptor)
+    finally:
+        os.close(root_descriptor)
+    return files, unsafe
+
+
+def _expand_compute_outputs(base, declared_outputs):
+    """Expand sealed patterns to a stable concrete file set beneath ``base``."""
+    patterns = _output_pattern_parts(declared_outputs)
+    files, unsafe = _output_inventory(base, patterns)
+    matched_by_pattern = {value: [] for value, _parts in patterns}
+    matched = set()
+    for relative in files:
+        parts = tuple(Path(relative).parts)
+        for value, pattern in patterns:
+            if _output_pattern_matches(parts, pattern):
+                matched.add(relative)
+                matched_by_pattern[value].append(relative)
+    for relative, kind in unsafe:
+        parts = tuple(Path(relative).parts)
+        for value, pattern in patterns:
+            if _output_pattern_covers_or_ancestors(parts, pattern):
+                raise ComputeOutputError("compute-run-output-unsafe",
+                                         field="outputs." + value,
+                                         expected="regular files without symlink ancestors",
+                                         actual={"path": relative, "kind": kind})
+
+    missing_patterns = sorted(value for value, matches in matched_by_pattern.items() if not matches)
+    concrete = sorted(matched)
+    literal_only = all(not _has_output_pattern(value) for value, _parts in patterns)
+    if literal_only:
+        # Keep the established literal receipt row order and single-file bytes.
+        receipt_paths = [value for value in declared_outputs
+                         if isinstance(value, str) and not _is_semantic_output(value)]
+    else:
+        receipt_paths = sorted(set(concrete) | set(missing_patterns))
+    return {"files": concrete, "missing_patterns": missing_patterns,
+            "receipt_paths": receipt_paths}
+
+
+def _is_semantic_output(value):
+    from artifact_context import is_semantic_output
+    return is_semantic_output(value)
+
+
+def _has_output_pattern(value):
+    from artifact_context import _has_pattern
+    return _has_pattern(value)
+
+
+def _hash_compute_output(base, relative):
+    """Hash one regular output through no-follow directory descriptors."""
+    from artifact_context import ArtifactContextError, _safe_relative
+
+    try:
+        safe = _safe_relative(relative)
+    except ArtifactContextError as error:
+        raise ComputeOutputError("compute-run-output-path-invalid",
+                                 field="outputs." + str(relative),
+                                 expected="safe relative output path", actual=relative) from error
+    parts = Path(safe).parts
+    if not parts:
+        raise ComputeOutputError("compute-run-output-path-invalid", actual=relative)
+    base = Path(base)
+    directory = getattr(os, "O_DIRECTORY", None)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if directory is None or nofollow is None:
+        raise ComputeOutputError("compute-run-output-unsafe",
+                                 field="outputs." + safe,
+                                 expected="platform no-follow file opens",
+                                 actual="unsupported runtime")
+    flags_dir = os.O_RDONLY | directory | nofollow
+    flags_file = os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0)
+    opened = []
+    try:
+        current = _open_compute_directory(base)
+        opened.append(current)
+        for part in parts[:-1]:
+            current = os.open(part, flags_dir, dir_fd=current)
+            opened.append(current)
+        descriptor = os.open(parts[-1], flags_file, dir_fd=current)
+        opened.append(descriptor)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ComputeOutputError("compute-run-output-unsafe",
+                                     field="outputs." + safe,
+                                     expected="single-link regular file",
+                                     actual={"mode": before.st_mode, "links": before.st_nlink})
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(descriptor)
+        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size,
+                    after.st_mtime_ns, after.st_ctime_ns)):
+            raise ComputeOutputError("compute-run-output-changed",
+                                     field="outputs." + safe,
+                                     expected={"size": before.st_size,
+                                               "mtime_ns": before.st_mtime_ns,
+                                               "ctime_ns": before.st_ctime_ns},
+                                     actual={"size": after.st_size,
+                                             "mtime_ns": after.st_mtime_ns,
+                                             "ctime_ns": after.st_ctime_ns})
+        if size != after.st_size:
+            raise ComputeOutputError("compute-run-output-changed",
+                                     field="outputs." + safe,
+                                     expected=after.st_size, actual=size)
+        return digest.hexdigest(), size
+    except ComputeOutputError:
+        raise
+    except OSError as error:
+        raise ComputeOutputError("compute-run-output-unsafe-or-unavailable",
+                                 field="outputs." + safe,
+                                 expected="readable regular file beneath artifact base",
+                                 actual=type(error).__name__) from error
+    finally:
+        for descriptor in reversed(opened):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
+def validate_compute_outputs(base, declared_outputs, rows):
+    """Validate receipt coverage, membership, and exact output bytes."""
+    try:
+        expanded = _expand_compute_outputs(base, declared_outputs)
+    except ComputeOutputError as error:
+        return {"ok": False, "reason": error.reason,
+                "differences": [error.difference], "retryable": False,
+                "next_action": "restore safe route-declared output files before retrying"}
+    actual_paths = [item.get("path") for item in rows if isinstance(item, dict)] \
+        if isinstance(rows, list) else None
+    if actual_paths != expanded["receipt_paths"]:
+        return {"ok": False, "reason": "compute-run-output-membership-changed",
+                "differences": [{"field": "outputs.paths",
+                                 "expected": expanded["receipt_paths"],
+                                 "actual": actual_paths}],
+                "retryable": False,
+                "next_action": "preserve the original compute receipt and verify the output set"}
+    if expanded["missing_patterns"]:
+        return {"ok": False, "reason": "compute-run-output-missing",
+                "differences": [{"field": "outputs." + pattern,
+                                 "expected": "one or more regular files",
+                                 "actual": "no matching files"}
+                                for pattern in expanded["missing_patterns"]],
+                "retryable": False,
+                "next_action": "verify the candidate run produced every declared output pattern"}
+    if any(not isinstance(item, dict) or item.get("state") != "present"
+           or not isinstance(item.get("sha256"), str)
+           or type(item.get("size")) is not int for item in rows):
+        return {"ok": False, "reason": "compute-run-output-receipt-invalid",
+                "differences": [{"field": "outputs.receipt",
+                                 "expected": "present path/hash/size rows",
+                                 "actual": rows}],
+                "retryable": False,
+                "next_action": "preserve the receipt and verify the compute output evidence"}
+    by_path = {item["path"]: item for item in rows}
+    try:
+        for relative in expanded["files"]:
+            actual_sha, actual_size = _hash_compute_output(base, relative)
+            row = by_path.get(relative) or {}
+            if actual_sha != row.get("sha256") or actual_size != row.get("size"):
+                return {"ok": False, "reason": "compute-run-output-changed",
+                        "differences": [{"field": "outputs." + relative,
+                                         "expected": {"sha256": row.get("sha256"),
+                                                      "size": row.get("size")},
+                                         "actual": {"sha256": actual_sha, "size": actual_size}}],
+                        "retryable": False,
+                        "next_action": "restore the original completed compute output before replaying"}
+    except ComputeOutputError as error:
+        return {"ok": False, "reason": error.reason,
+                "differences": [error.difference], "retryable": False,
+                "next_action": "restore safe route-declared output files before retrying"}
+    try:
+        current = _expand_compute_outputs(base, declared_outputs)
+    except ComputeOutputError as error:
+        return {"ok": False, "reason": error.reason,
+                "differences": [error.difference], "retryable": False,
+                "next_action": "restore safe route-declared output files before retrying"}
+    if current["receipt_paths"] != expanded["receipt_paths"]:
+        return {"ok": False, "reason": "compute-run-output-membership-changed",
+                "differences": [{"field": "outputs.paths",
+                                 "expected": expanded["receipt_paths"],
+                                 "actual": current["receipt_paths"]}],
+                "retryable": False,
+                "next_action": "preserve the original compute receipt and verify the output set"}
+    return {"ok": True, "files": expanded["files"]}
+
+
 def _record_compute_outputs(run_dir, meta):
     """Snapshot exact route-owned output bytes after the compute exit is observed."""
     parent = (((meta.get("provenance") or {}).get("resource") or {}).get("contract") or {})
@@ -1167,26 +1526,17 @@ def _record_compute_outputs(run_dir, meta):
     if not isinstance(base_text, str) or not isinstance(outputs, list) or not outputs:
         rows.append({"state": "unavailable", "reason": "sealed-output-contract-missing"})
     else:
-        base = Path(base_text)
-        for relative in outputs:
-            try:
-                path = base / relative
-                resolved = path.resolve(strict=True)
-                if not resolved.is_relative_to(base.resolve(strict=True)):
-                    raise ValueError("output outside sealed artifact base")
-                cursor = base
-                for part in Path(relative).parts:
-                    cursor = cursor / part
-                    if cursor.is_symlink():
-                        raise ValueError("output symlink")
-                info = resolved.stat()
-                if not stat.S_ISREG(info.st_mode):
-                    raise ValueError("output is not a regular file")
-                raw = resolved.read_bytes()
-                rows.append({"path": relative, "sha256": hashlib.sha256(raw).hexdigest(),
-                             "size": len(raw), "state": "present"})
-            except (OSError, TypeError, ValueError) as exc:
-                rows.append({"path": relative, "state": "missing", "reason": type(exc).__name__})
+        try:
+            expanded = _expand_compute_outputs(base_text, outputs)
+            for relative in expanded["receipt_paths"]:
+                if relative in expanded["missing_patterns"]:
+                    rows.append({"path": relative, "state": "missing", "reason": "no-matches"})
+                    continue
+                output_hash, output_size = _hash_compute_output(base_text, relative)
+                rows.append({"path": relative, "sha256": output_hash,
+                             "size": output_size, "state": "present"})
+        except ComputeOutputError as error:
+            rows = [{"state": "unavailable", "reason": error.reason}]
     document = {"schema_version": 1, "run_id": meta.get("run_id"), "outputs": rows,
                 "observed_at": time.time()}
     target = Path(run_dir) / "outputs.json"
@@ -2883,27 +3233,23 @@ def observe_run_quiescence(config, run_id, expected=None, *, remote_call=None):
     expected_outputs = parent_contract.get("declared_outputs")
     output_rows = output_receipt.get("outputs") if isinstance(output_receipt, dict) else None
     if (not isinstance(output_receipt, dict) or output_receipt.get("schema_version") != 1
-            or output_receipt.get("run_id") != run_id
-            or not isinstance(expected_outputs, list)
-            or [item.get("path") for item in output_rows or [] if isinstance(item, dict)] != expected_outputs
-            or any(not isinstance(item, dict) or item.get("state") != "present"
-                   or not isinstance(item.get("sha256"), str) for item in output_rows or [])):
-        return {"state": "not-quiescent", "reason": "compute-run-output-missing-or-unsealed", **hashes}
-    try:
-        artifact_base = Path(parent_contract["artifact_base"]).resolve(strict=True)
-        for item in output_rows:
-            path = artifact_base / item["path"]
-            resolved = path.resolve(strict=True)
-            if (not resolved.is_relative_to(artifact_base)
-                    or any((artifact_base.joinpath(*Path(item["path"]).parts[:index])).is_symlink()
-                           for index in range(1, len(Path(item["path"]).parts) + 1))):
-                return {"state": "not-quiescent", "reason": "compute-run-output-unsafe", **hashes}
-            output_raw = resolved.read_bytes()
-            if (hashlib.sha256(output_raw).hexdigest() != item["sha256"]
-                    or len(output_raw) != item.get("size")):
-                return {"state": "not-quiescent", "reason": "compute-run-output-changed", **hashes}
-    except (OSError, KeyError, TypeError, ValueError):
-        return {"state": "not-quiescent", "reason": "compute-run-output-unavailable", **hashes}
+            or output_receipt.get("run_id") != run_id):
+        return {"state": "not-quiescent", "reason": "compute-run-output-receipt-invalid",
+                "differences": [{"field": "outputs.receipt", "expected": {
+                    "schema_version": 1, "run_id": run_id}, "actual": {
+                    "schema_version": output_receipt.get("schema_version")
+                    if isinstance(output_receipt, dict) else None,
+                    "run_id": output_receipt.get("run_id")
+                    if isinstance(output_receipt, dict) else None}}],
+                "retryable": False,
+                "next_action": "preserve and verify the original compute output receipt", **hashes}
+    output_check = validate_compute_outputs(
+        parent_contract.get("artifact_base"), expected_outputs, output_rows)
+    if not output_check.get("ok"):
+        return {"state": "not-quiescent", "reason": output_check.get("reason"),
+                "differences": output_check.get("differences"),
+                "retryable": output_check.get("retryable", False),
+                "next_action": output_check.get("next_action"), **hashes}
     host = next((record for name, record in config["hosts"].items()
                  if name == meta.get("host")), None)
     if not isinstance(host, dict):
@@ -3005,45 +3351,89 @@ def execution_record(config, run_id):
     if observation.get("state") != "quiescent":
         return {"state": observation.get("state", "unknown"),
                 "reason": observation.get("reason", "compute-run-not-quiescent"),
+                "differences": observation.get("differences"),
+                "next_action": observation.get("next_action"),
+                "retryable": observation.get("retryable", False),
                 "execution": execution}
     return {"state": "quiescent", "execution": execution,
             "observation": observation, "run_dir": str(run_dir)}
 
 
-def run_snapshot_current(config, run_id, execution):
-    """Cheap local byte recheck for the short registry/ledger publication lock."""
+def run_snapshot_differences(config, run_id, execution):
+    """Explain a local receipt/output drift at the short publication boundary."""
     run_dir = Path(config["run_root"]) / run_id
     names = {"meta_sha256": "meta.json", "exit_sha256": "exit_code",
              "receipt_sha256": "launch-receipt.json", "outputs_sha256": "outputs.json"}
+    differences = []
+    raw_files = {}
     try:
         for field, name in names.items():
             path = run_dir / name
-            info = path.lstat()
-            if not stat.S_ISREG(info.st_mode) or path.is_symlink():
-                return False
-            if hashlib.sha256(path.read_bytes()).hexdigest() != execution.get(field):
-                return False
+            try:
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+                    actual = "unsafe-or-non-regular"
+                else:
+                    raw = path.read_bytes()
+                    raw_files[name] = raw
+                    actual = hashlib.sha256(raw).hexdigest()
+            except OSError as error:
+                actual = type(error).__name__
+            if actual != execution.get(field):
+                differences.append({"field": "compute_run." + field,
+                                    "expected": execution.get(field), "actual": actual})
+        try:
+            current_meta = json.loads(raw_files["meta.json"])
+            expected_contract = execution.get("contract") or {}
+            actual_contract = current_meta.get("execution_contract")
+            if actual_contract != expected_contract:
+                expected_parent = (expected_contract.get("resource_parent") or {})
+                actual_parent = ((actual_contract or {}).get("resource_parent") or {})
+                if expected_parent.get("declared_outputs") != actual_parent.get("declared_outputs"):
+                    differences.append({"field": "declared_outputs",
+                                        "expected": expected_parent.get("declared_outputs"),
+                                        "actual": actual_parent.get("declared_outputs")})
+                else:
+                    differences.append({"field": "execution.contract",
+                                        "expected": expected_contract, "actual": actual_contract})
+        except (AttributeError, KeyError, TypeError, ValueError):
+            if "meta.json" in raw_files:
+                differences.append({"field": "execution.contract",
+                                    "expected": execution.get("contract"),
+                                    "actual": "unreadable-or-malformed"})
+        try:
+            receipt_rows = json.loads(raw_files["outputs.json"]).get("outputs")
+            if receipt_rows != execution.get("outputs"):
+                differences.append({"field": "execution.outputs",
+                                    "expected": execution.get("outputs"),
+                                    "actual": receipt_rows})
+        except (AttributeError, KeyError, TypeError, ValueError):
+            if "outputs.json" in raw_files:
+                differences.append({"field": "execution.outputs",
+                                    "expected": execution.get("outputs"),
+                                    "actual": "unreadable-or-malformed"})
         outputs = execution.get("outputs")
         contract = execution.get("contract") or {}
         parent = contract.get("resource_parent") or {}
-        base = Path(parent["artifact_base"]).resolve(strict=True)
-        if (not isinstance(outputs, list)
-                or [item.get("path") for item in outputs if isinstance(item, dict)]
-                   != parent.get("declared_outputs")):
-            return False
-        for item in outputs:
-            path = base / item["path"]
-            resolved = path.resolve(strict=True)
-            parts = Path(item["path"]).parts
-            has_link = any(base.joinpath(*parts[:index]).is_symlink()
-                           for index in range(1, len(parts) + 1))
-            if (item.get("state") != "present" or not resolved.is_relative_to(base)
-                    or has_link
-                    or hashlib.sha256(resolved.read_bytes()).hexdigest() != item.get("sha256")):
-                return False
-        return _read_stop_reason(run_dir) is None
-    except (OSError, KeyError, TypeError, ValueError):
-        return False
+        output_check = validate_compute_outputs(
+            parent["artifact_base"], parent.get("declared_outputs"), outputs)
+        if not output_check.get("ok"):
+            differences.extend(output_check.get("differences") or [{
+                "field": "outputs", "expected": "current sealed output set",
+                "actual": output_check.get("reason")}])
+        stop_reason = _read_stop_reason(run_dir)
+        if stop_reason is not None:
+            differences.append({"field": "compute_run.stop_reason", "expected": None,
+                                "actual": stop_reason})
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        differences.append({"field": "compute_run.snapshot", "expected": "current sealed snapshot",
+                            "actual": type(error).__name__})
+    return differences
+
+
+def run_snapshot_current(config, run_id, execution):
+    """Cheap local byte recheck for the short registry/ledger publication lock."""
+    return not run_snapshot_differences(config, run_id, execution)
 
 
 def _stop_reason_path(run_dir):

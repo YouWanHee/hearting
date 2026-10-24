@@ -200,6 +200,35 @@ class ComputeRunAdoptionTest(unittest.TestCase):
             resource_continuation_cancelled=lambda *_args: route_closed,
         )
         fake_compute = SimpleNamespace(load_config=lambda: {"run_root": self.root, "hosts": {}})
+        def validate_fake_outputs(base, declared, rows):
+            expected_paths = list(declared)
+            actual_paths = ([row.get("path") for row in rows if isinstance(row, dict)]
+                            if isinstance(rows, list) else None)
+            if actual_paths != expected_paths:
+                return {"ok": False, "reason": "compute-run-output-membership-changed",
+                        "differences": [{"field": "outputs.paths", "expected": expected_paths,
+                                         "actual": actual_paths}], "retryable": False,
+                        "next_action": "verify the selected compute output set"}
+            for row in rows:
+                target = Path(base) / row["path"]
+                try:
+                    raw = target.read_bytes()
+                except OSError:
+                    return {"ok": False, "reason": "compute-run-output-missing",
+                            "differences": [{"field": "outputs." + row["path"],
+                                             "expected": "present", "actual": "missing"}],
+                            "retryable": False,
+                            "next_action": "verify the selected compute output files"}
+                actual = {"sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}
+                expected = {"sha256": row.get("sha256"), "size": row.get("size")}
+                if actual != expected:
+                    return {"ok": False, "reason": "compute-run-output-changed",
+                            "differences": [{"field": "outputs." + row["path"],
+                                             "expected": expected, "actual": actual}],
+                            "retryable": False,
+                            "next_action": "restore the original compute output before replaying"}
+            return {"ok": True}
+        fake_compute.validate_compute_outputs = validate_fake_outputs
         def fake_execution_record(*_args):
             execution = {**self.execution, "contract": {**self.contract, "cwd": cwd}}
             if missing_outputs_hash:

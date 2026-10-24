@@ -53,6 +53,14 @@ def fail_compute(reason, *, differences=(), next_action="start the resource thro
     raise error
 
 
+def compute_output_refusal(reason):
+    """Keep absent evidence distinct from changed or unsafe output snapshots."""
+    if reason in {"compute-run-output-missing", "compute-run-output-base-unavailable",
+                  "compute-run-output-tree-unavailable"}:
+        return "resource-compute-output-missing"
+    return "resource-compute-output-mismatch"
+
+
 def gpu_payload_environment(environment, lease):
     """Use the lease's exact session for GPU payloads; leave CPU paths untouched."""
     if not lease:
@@ -528,21 +536,51 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
                      next_action="restore access to the configured compute-run evidence")
     if candidate.get("state") != "quiescent":
         reason = candidate.get("reason") or "compute-run-observation-unavailable"
-        if candidate.get("state") == "not-quiescent":
+        if reason.startswith("compute-run-output-"):
+            token = compute_output_refusal(reason)
+        elif "output" in reason:
+            token = "resource-compute-output-missing"
+        elif candidate.get("state") == "not-quiescent":
             token = "resource-compute-not-quiescent"
         elif "exit" in reason or "stopped" in reason:
             token = "resource-compute-exit-not-zero" if "exit" in reason else "resource-compute-stopped"
-        elif "output" in reason:
-            token = "resource-compute-output-missing"
         else:
             token = "resource-compute-observation-unavailable"
-        fail_compute(token, differences=[{"field": "compute-run.observation", "expected": "quiescent",
-                                          "actual": reason}],
-                     next_action="wait for a fresh supported compute-host observation",
-                     retryable=reason in {"compute-run-process-group-populated",
-                                          "compute-run-observation-unavailable",
-                                          "compute-run-host-generation-changed"})
+        fail_compute(token, differences=(candidate.get("differences") or [
+                         {"field": "compute-run.observation", "expected": "quiescent",
+                          "actual": reason}]),
+                     next_action=(candidate.get("next_action")
+                                  or "wait for a fresh supported compute-host observation"),
+                     retryable=candidate.get("retryable", reason in {
+                         "compute-run-process-group-populated",
+                         "compute-run-observation-unavailable",
+                         "compute-run-host-generation-changed"}))
     execution = candidate["execution"]
+
+    def require_current_compute_snapshot():
+        differences_reader = getattr(COMPUTE, "run_snapshot_differences", None)
+        if callable(differences_reader):
+            differences = differences_reader(config, compute_run_id, execution)
+        elif COMPUTE.run_snapshot_current(config, compute_run_id, execution):
+            differences = []
+        else:
+            differences = [{"field": "compute_run.snapshot_current",
+                            "expected": True, "actual": False}]
+        if not differences:
+            return
+        output_fields = {"declared_outputs", "execution.outputs", "compute_run.outputs_sha256"}
+        output_differences = [item for item in differences
+                              if item.get("field") in output_fields
+                              or str(item.get("field", "")).startswith("outputs.")]
+        if output_differences:
+            fail_compute("resource-compute-output-mismatch", differences=output_differences,
+                         next_action=("preserve the original compute receipt and output bytes; "
+                                      "use a fresh completed run if they changed"),
+                         retryable=False)
+        fail_compute("resource-compute-evidence-changed", differences=differences,
+                     next_action="restore the original completed compute-run evidence before replaying",
+                     retryable=False)
+
     provenance = execution.get("provenance") or {}
     if (provenance.get("route_id") != route.get("route_id")
             or provenance.get("route_hash") != route.get("route_hash")
@@ -809,40 +847,20 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
     node_id, armed, node, original = eligible[0]
 
     # A run's declared science outputs must already exist at their route-owned
-    # paths. Adoption never fabricates or copies a science result.
+    # paths. The compute-hosts matcher expands concrete glob members while
+    # retaining abstract handoff outputs as non-path declarations.
     artifact_base = Path(armed.get("artifact_base") or "")
     declared = list(node.get("outputs") or [])
     output_rows = execution.get("outputs")
-    if (not isinstance(output_rows, list)
-            or [item.get("path") for item in output_rows if isinstance(item, dict)] != declared
-            or any(not isinstance(item, dict) or item.get("state") != "present"
-                   or not isinstance(item.get("sha256"), str) for item in output_rows)):
-        fail_compute("resource-compute-output-missing")
-    output_by_path = {item["path"]: item for item in output_rows}
-    missing = []
-    output_differences = []
-    for relative in declared:
-        target = artifact_base / relative
-        try:
-            if (target.is_symlink() or not target.is_file()
-                    or not target.resolve(strict=True).is_relative_to(artifact_base.resolve(strict=True))):
-                missing.append(str(relative))
-            elif hashlib.sha256(target.read_bytes()).hexdigest() != output_by_path[relative]["sha256"]:
-                output_differences.append({"field": "outputs." + str(relative),
-                                           "expected": output_by_path[relative]["sha256"],
-                                           "actual": hashlib.sha256(target.read_bytes()).hexdigest()})
-        except OSError:
-            missing.append(str(relative))
-        except (ValueError, RuntimeError):
-            missing.append(str(relative))
-    if output_differences:
-        fail_compute("resource-compute-output-mismatch", differences=output_differences,
-                     next_action="verify the output bytes from the selected compute run")
-    if missing:
-        fail_compute("resource-compute-output-missing",
-                     differences=[{"field": "outputs." + item, "expected": "present",
-                                   "actual": "missing or unsafe"} for item in missing],
-                     next_action="verify the candidate run's declared output files")
+    output_check = COMPUTE.validate_compute_outputs(artifact_base, declared, output_rows)
+    if not output_check.get("ok"):
+        reason = output_check.get("reason") or "compute-run-output-missing"
+        token = compute_output_refusal(reason)
+        fail_compute(token, differences=output_check.get("differences") or [{
+                         "field": "outputs", "expected": "sealed declared outputs", "actual": reason}],
+                     next_action=output_check.get("next_action")
+                     or "verify the candidate run's declared output files",
+                     retryable=output_check.get("retryable", False))
 
     try:
         owner_wait = OWNER_RESOURCE.start_binding(route, route_file, args, os.environ)
@@ -912,11 +930,7 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
                          next_action=("preserve the published row and verify its original evidence; "
                                       "use a fresh compute run through the existing route if outputs changed"),
                          retryable=False)
-        if not COMPUTE.run_snapshot_current(config, compute_run_id, execution):
-            fail_compute("resource-compute-evidence-changed", differences=[
-                {"field": "compute_run.snapshot_current", "expected": True, "actual": False}],
-                next_action="restore the original completed compute-run evidence before replaying",
-                retryable=False)
+        require_current_compute_snapshot()
         if adopted.get("parent_attempt_id") != owner_wait["parent_attempt_id"]:
             fail_compute("resource-compute-binding-conflict", differences=[
                 {"field": "parent_attempt_id", "expected": owner_wait["parent_attempt_id"],
@@ -1037,9 +1051,7 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
                 fail_compute("resource-compute-route-closed", differences=[
                     {"field": "route.state", "expected": "open", "actual": "closed or cancelled"}],
                     next_action="continue only after the route owner opens a new authorized route")
-            if not COMPUTE.run_snapshot_current(config, compute_run_id, execution):
-                fail_compute("resource-compute-evidence-changed",
-                             next_action="reobserve the completed compute run before retrying")
+            require_current_compute_snapshot()
             def publish(document):
                 current = document["runs"].get(original["run_id"])
                 if current != original or adopted_id in document["runs"]:

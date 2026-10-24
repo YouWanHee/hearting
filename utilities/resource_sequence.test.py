@@ -176,6 +176,12 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         route, path, jobs, registry, output, ledger = self.fixture()
         owner_attempt, _owner_input = self.live_owner(route, jobs, registry, harness='codex')
         (output / 'run.json').write_bytes(b'{"state":"compute-result"}\n')
+        (output / 'logs').mkdir()
+        (output / 'logs/nested').mkdir()
+        (output / 'logs/train.log').write_text('train completed\n')
+        (output / 'logs/nested/metrics.json').write_text('{"loss":0.1}\n')
+        declared_outputs = list(WS.route_node(route, 'full-run').get('outputs') or [])
+        self.assertEqual(declared_outputs, ['run.json', 'logs/**', 'experiment-artifact'])
         attestation = self.base / 'smoke-attestation.json'
         attestation.write_text('{"fixture":true}\n')
         attestation_hash = __import__('hashlib').sha256(attestation.read_bytes()).hexdigest()
@@ -201,16 +207,6 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         compute_dir.mkdir(parents=True)
         (compute_dir / 'log').write_text('remote compute completed\n')
         (compute_dir / 'exit_code').write_text('0\n')
-        declared_outputs = list(WS.route_node(route, 'full-run').get('outputs') or [])
-        output_rows = []
-        for relative in declared_outputs:
-            target = output / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists():
-                target.write_bytes(b'fixture-output\n')
-            output_rows.append({'path': relative,
-                'sha256': __import__('hashlib').sha256(target.read_bytes()).hexdigest(),
-                'state': 'present', 'size': target.stat().st_size})
         sealed = {key: old.get(key) for key in ('command', 'cwd', 'config_ref', 'config_sha256',
                  'source_commit', 'source_dirty', 'source_git_state', 'config_layout', 'launch_request')}
         parent = {'route_id': route['route_id'], 'route_file': str(path.resolve()),
@@ -228,17 +224,33 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             'share': False, 'resource_parent': parent,
             'route': {'route_id': route['route_id'], 'route_file': str(path.resolve()),
                       'route_hash': route['route_hash']}}
-        execution = {'kind': 'compute-hosts', 'run_id': 'compute-fixture',
-            'run_root': str(compute_root), 'host': 'gpu-a', 'meta_sha256': 'm' * 64,
-            'exit_sha256': 'e' * 64, 'receipt_sha256': 'r' * 64,
-            'outputs_sha256': 'o' * 64, 'contract_sha256': 'k' * 64,
-            'contract': execution_contract, 'receipt_state': 'finished', 'identity': {'pid': 4},
-            'outputs': output_rows,
-            'provenance': provenance, 'started_at': 1.0, 'ended_at': 2.0}
-        compute = SimpleNamespace(load_config=lambda: {'run_root': compute_root, 'hosts': {}},
-            execution_record=lambda *_args: {'state': 'quiescent', 'execution': execution,
-                                             'run_dir': str(compute_dir)},
-            run_snapshot_current=lambda *_args: True)
+        compute_meta = {'run_id': 'compute-fixture', 'host': 'gpu-a',
+            'provenance': {'resource': provenance}, 'execution_contract': execution_contract,
+            'contract_sha256': __import__('hashlib').sha256(json.dumps(
+                execution_contract, ensure_ascii=False, sort_keys=True,
+                separators=(',', ':')).encode('utf-8')).hexdigest()}
+        (compute_dir / 'meta.json').write_text(json.dumps(compute_meta), encoding='utf-8')
+        (compute_dir / 'launch-receipt.json').write_text(json.dumps({
+            'schema_version': 1, 'run_id': 'compute-fixture', 'host': 'fixture-host',
+            'identity': {'pid': 4, 'starttime': '4', 'process_group': 4,
+                         'pid_namespace': 'pid:[77]', 'boot_id': 'boot-fixture'},
+            'state': 'finished', 'exit_code': 0, 'started_at': 1.0, 'ended_at': 2.0}),
+            encoding='utf-8')
+        compute_spec_real = importlib.util.spec_from_file_location(
+            'compute_hosts_sequence_e2e', HERE / 'compute-hosts.py')
+        compute = importlib.util.module_from_spec(compute_spec_real)
+        compute_spec_real.loader.exec_module(compute)
+        compute.remote = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, '{"state":"empty","reason":"fixture-empty-group"}\n', '')
+        compute._record_compute_outputs(compute_dir, compute_meta)
+        compute_config_file = self.base / 'compute-hosts.yaml'
+        compute_config_file.write_text(
+            'schema_version: 1\n'
+            f'run_root: {compute_root}\n'
+            'hosts:\n  gpu-a:\n    ssh_host: fixture.invalid\n', encoding='utf-8')
+        candidate = compute.execution_record(compute.load_config(compute_config_file), 'compute-fixture')
+        self.assertEqual(candidate['state'], 'quiescent', candidate)
+        execution = candidate['execution']
         spec_loader = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda _module: None))
         real_spec = importlib.util.spec_from_file_location
         real_module = importlib.util.module_from_spec
@@ -276,12 +288,41 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
              mock.patch.object(artifact_producer, 'prepare_route_artifact_env', return_value={
                  'AGENT_ARTIFACT_OUTPUT_DIR': str(output)}), \
              mock.patch.dict(os.environ, {'AGENT_DISPATCH_JOBS': str(jobs),
-                 'AGENT_DISPATCH_COMPLETION_MODE': 'supervised'}, clear=False), \
-             contextlib.redirect_stdout(io.StringIO()):
+                 'AGENT_DISPATCH_COMPLETION_MODE': 'supervised',
+                 'COMPUTE_HOSTS_CONFIG': str(compute_config_file)}, clear=False), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as before_arm:
                 runner.adopt_compute_run(registry, args, route, path, 'compute-fixture')
             self.assertEqual(before_arm.exception.code, 65)
             self.assertEqual(set(json.loads(registry.read_text())['runs']), {'fixture-run', 'fixture-run__a1'})
+
+            output_receipt_path = compute_dir / 'outputs.json'
+            original_output_receipt = output_receipt_path.read_bytes()
+            changed_receipt = json.loads(original_output_receipt)
+            changed_receipt['outputs'].append({'path': 'logs/injected.log', 'sha256': '0' * 64,
+                                               'size': 1, 'state': 'present'})
+            output_receipt_path.write_text(json.dumps(changed_receipt, ensure_ascii=False,
+                                                       sort_keys=True) + '\n', encoding='utf-8')
+            marker = jobs.parent / 'completion' / route['route_id'] / 'full-run.json'
+            def protected_snapshot():
+                paths = [registry, Path(old['sentinel']), jobs, ledger.journal_path, marker]
+                files = {str(item): item.read_bytes() if item.is_file() else None for item in paths}
+                claims = {item.name: item.read_bytes() for item in ledger.claims_dir.glob('*.claim')}
+                return files, claims
+            before_refusal = protected_snapshot()
+            with self.assertRaises(SystemExit) as changed_receipt_refusal:
+                runner.adopt_compute_run(registry, args, route, path, 'compute-fixture')
+            self.assertEqual(changed_receipt_refusal.exception.code, 65)
+            refusal = json.loads(changed_receipt_refusal.exception.resource_message)
+            self.assertEqual(refusal['reason'], 'resource-compute-output-mismatch')
+            self.assertTrue(refusal['differences'][0].get('expected') is not None)
+            self.assertTrue(refusal['differences'][0].get('actual') is not None)
+            self.assertTrue(refusal['next_action'])
+            self.assertFalse(refusal['retryable'])
+            self.assertEqual(protected_snapshot(), before_refusal)
+            self.assertEqual(set(json.loads(registry.read_text())['runs']), {'fixture-run', 'fixture-run__a1'})
+            output_receipt_path.write_bytes(original_output_receipt)
+
             replay_before_arm = runner.adopt_compute_run(registry, args, route, path, 'compute-fixture')
             self.assertTrue(replay_before_arm['replayed'])
             self.assertEqual(spawned.call_count, 0)
@@ -294,6 +335,11 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                 dispatch_depth=2, parent_slug='fixture-owner', parent_attempt_id=owner_attempt,
                 parent_harness='codex', parent_transport='headless', parent_sandbox='workspace-write',
                 subsession_id=None)
+            armed_outputs = SUP.read_armed(ledger)['full-run']
+            import resource_run_evidence as RUN_EVIDENCE
+            self.assertEqual(RUN_EVIDENCE.outputs(armed_outputs), ['run.json'])
+            self.assertEqual(SUP.artifact_evidence(armed_outputs), {
+                'checked': True, 'missing': [], 'reason': 'artifacts-present'})
             with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
                  mock.patch('subprocess.check_output', return_value=str(self.base)), \
                  mock.patch.object(DC, 'canonical_repository_identity', return_value='fixture-repository'), \
