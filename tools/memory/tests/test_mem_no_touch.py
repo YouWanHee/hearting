@@ -90,6 +90,7 @@ class NoTouchCliTest(unittest.TestCase):
                        (self.rid,))
         writer.commit()
         before = self.snapshot(self.paths)
+        clones_before = set(Path("/tmp").glob("hearting-migration-ro-*"))
         show = self.run_mem("show", self.rid, "--no-touch")
         self.assertEqual(show.returncode, 0, show.stderr)
         self.assertIn("wal-only-newest", show.stdout)
@@ -97,6 +98,7 @@ class NoTouchCliTest(unittest.TestCase):
         self.assertEqual(recall.returncode, 0, recall.stderr)
         self.assertIn("wal-only-newest", recall.stdout)
         self.assertEqual(self.snapshot(self.paths), before)
+        self.assertEqual(set(Path("/tmp").glob("hearting-migration-ro-*")), clones_before)
 
     def test_concurrent_wal_appends_return_one_complete_read_snapshot(self):
         ready = threading.Event()
