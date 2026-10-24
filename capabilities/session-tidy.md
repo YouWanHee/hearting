@@ -68,6 +68,19 @@ target transport they keep their checked pane path and manual fallback.
 Claude's messaging inbox carries text, not new-conversation commands; an inbox
 message containing `/clear` is never evidence that the conversation cleared.
 
+Confirmed tidy succession and same-seat handover edges form one lineage for
+both previous-conversation display and pending-result delivery. A resume that
+moves panes remains connected by its recorded session id; a fork or incomplete
+lineage does not grant a successor. Open records stored under a predecessor's
+session key may be delivered to the unique confirmed same-harness chain end,
+while storage, delivery id, claim, and acknowledgement stay under the original
+key. An explicit registered-job binding to another recipient takes precedence.
+Only tidy-created succession and handover rows are lineage edges; manual
+`/clear`, chronological neighbors, pane aliases, and card text do not create
+edges. Unclear liveness or lineage remains unresolved. Existing activation,
+prompt, and runner sweeps discover open records that have no retained duty.
+New notices retain a duty when written so an idle recipient can be woken.
+
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 ## Portable Procedure

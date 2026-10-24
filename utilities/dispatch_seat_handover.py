@@ -68,6 +68,11 @@ MAX_BINDINGS = 12
 KEEP_ROWS = 40
 
 
+class LineageAttempts(frozenset):
+    """Legacy set-compatible attempt scope with separate route-free notice access."""
+    lineage_notice = True
+
+
 def _st():
     import session_tidy
     return session_tidy
@@ -889,7 +894,7 @@ def _binds(bindings: Iterable[dict], jobs, meta: dict) -> bool:
 
 
 def _lineage_seats(extra=(), *, read_context=None) -> dict:
-    """Every seat with a handover snapshot, plus ``extra``; each ledger is read once per read context."""
+    """Every seat ledger, including succession-only seats with no binding snapshot."""
     seats = {}
     for snapshot in _all_snapshots(read_context):
         data = snapshot.get("seat")
@@ -898,7 +903,74 @@ def _lineage_seats(extra=(), *, read_context=None) -> dict:
     for seat in extra:
         if seat is not None:
             seats.setdefault(seat.key, seat)
-    return {key: handover_rows(seat, read_context=read_context) for key, seat in seats.items()}
+    if read_context is not None:
+        def load_all():
+            result = {}
+            directory = _st().state_root() / "sessions"
+            try:
+                paths = sorted(p for p in directory.glob("*.jsonl") if p.is_file() and not p.is_symlink())
+            except OSError:
+                paths = []
+            for key, seat in seats.items():
+                cached = getattr(read_context, "_handover_ledgers", {}).get((seat.kind, key))
+                rows = list(cached) if cached is not None else _st()._read_ledger_lines(seat)
+                result[key] = [row for row in rows
+                               if row.get("event") in {"handover", "succession"}]
+            for path in paths:
+                key = path.stem
+                if key not in result:
+                    seat = _st().Seat("pane", key)
+                    cached = getattr(read_context, "_handover_ledgers", {}).get((seat.kind, key))
+                    rows = list(cached) if cached is not None else _st()._read_ledger_lines(seat)
+                    result[key] = [row for row in rows
+                                   if row.get("event") in {"handover", "succession"}]
+            return result
+        raw = read_context.lineage_ledgers(load_all)
+        for key, rows in raw.items():
+            seats.setdefault(key, _st().Seat("pane", key))
+        return {key: list(raw.get(key, ())) for key in seats}
+    for key in list(seats):
+        seats[key] = seats[key]
+    directory = _st().state_root() / "sessions"
+    try:
+        paths = sorted(p for p in directory.glob("*.jsonl") if p.is_file() and not p.is_symlink())
+    except OSError:
+        paths = []
+    for path in paths:
+        seats.setdefault(path.stem, _st().Seat("pane", path.stem))
+    return {key: [row for row in _st()._read_ledger_lines(seat)
+                  if row.get("event") in {"handover", "succession"}]
+            for key, seat in seats.items()}
+
+
+def _lineage_successor(rows_by_seat: dict, sid: str, harness: str) -> str:
+    """Follow only unique same-harness tidy edges; ambiguity grants no successor."""
+    current, seen = sid, {sid}
+    while True:
+        targets = set()
+        for rows in rows_by_seat.values():
+            for row in rows:
+                if row.get("event") not in {"handover", "succession"}:
+                    continue
+                if row.get("event") == "succession" and row.get("source") != "tidy-clear":
+                    continue
+                if row.get("event") == "handover" and row.get("source") not in {
+                        "clear", "reservation", "first-message"}:
+                    continue
+                origin = row.get("from")
+                if isinstance(origin, dict):
+                    if origin.get("harness") != harness:
+                        continue
+                    origin = origin.get("sid")
+                if (origin == current and row.get("harness") == harness
+                        and isinstance(row.get("sid"), str) and row["sid"] not in seen):
+                    targets.add(row["sid"])
+        if len(targets) != 1:
+            return current if not targets else sid
+        current = next(iter(targets))
+        if current in seen:
+            return sid
+        seen.add(current)
 
 
 def _row_binds_key(row: dict, key: tuple) -> bool:
@@ -921,7 +993,7 @@ def _lineage_holder(rows_by_seat: dict, key: tuple, registered: str, harness: st
                 if latest is None or order > latest[0]:
                     latest = (order, seat_key, row)
     if latest is None:
-        return registered, harness
+        return _lineage_successor(rows_by_seat, registered, harness), harness
     order, seat_key, row = latest
     current, harness = str(row["sid"]), str(row.get("harness") or harness)
     seen = {registered, current}
@@ -932,7 +1004,7 @@ def _lineage_holder(rows_by_seat: dict, key: tuple, registered: str, harness: st
         if later.get("from") == current and sid and sid not in seen and later.get("source") != "retire":
             current, harness = sid, str(later.get("harness") or harness)
             seen.add(sid)
-    return current, harness
+    return _lineage_successor(rows_by_seat, current, harness), harness
 
 
 def _effective(meta: dict, jobs=None, *, read_context=None, extra_seats=()) -> tuple[str, str]:
@@ -1014,6 +1086,48 @@ def storage_recipients(session: str, env=None, harness: Optional[str] = None) ->
         if seat is None:
             return out
         rows_by_seat = _lineage_seats((seat,))
+        current_harness = harness or _st().session_from_env(None, env or os.environ)[0]
+        lineage_storage = set()
+        if current_harness:
+            # Route-free notices are attached to the original SID. Follow the
+            # same unique graph as authority; never use pane chronology/aliases.
+            predecessors = {}
+            for source, rows in rows_by_seat.items():
+                for row in rows:
+                    origin = row.get("from")
+                    if isinstance(origin, dict):
+                        if origin.get("harness") != current_harness:
+                            continue
+                        origin = origin.get("sid")
+                    if (origin and row.get("harness") == current_harness
+                            and row.get("event") in {"handover", "succession"}
+                            and (row.get("event") != "succession" or row.get("source") == "tidy-clear")
+                            and (row.get("event") != "handover" or row.get("source") in {
+                                "clear", "reservation", "first-message"})):
+                        predecessors.setdefault(str(row["sid"]), set()).add(str(origin))
+            chain = []
+            cursor = session
+            seen = {session}
+            while True:
+                parents = predecessors.get(cursor, set())
+                if not parents:
+                    break
+                if len(parents) != 1:
+                    chain = []
+                    break
+                parent = next(iter(parents))
+                if parent in seen:
+                    chain = []
+                    break
+                # A predecessor that itself forks cannot grant an inherited key.
+                children = [child for child, origins in predecessors.items() if parent in origins]
+                if len(children) != 1:
+                    chain = []
+                    break
+                chain.append(parent)
+                seen.add(parent)
+                cursor = parent
+            lineage_storage = set(chain)
         owed: dict = {}
         for row in _chain_to(rows_by_seat.get(seat.key) or [], session):     # A -> B -> ... -> session
             bindings = [b for b in row.get("bindings") or () if isinstance(b, dict) and b.get("attempt")]
@@ -1026,7 +1140,9 @@ def storage_recipients(session: str, env=None, harness: Optional[str] = None) ->
                     owed.setdefault(str(binding["parent"]), set()).add(binding["attempt"])
         for key, attempts in owed.items():
             if key != session:
-                out.append((key, frozenset(attempts)))
+                out.append((key, LineageAttempts(attempts)))
+        for predecessor in lineage_storage - owed.keys() - {session}:
+            out.append((predecessor, LineageAttempts()))
     except Exception:  # noqa: BLE001
         return [(session, None)]
     return out
@@ -1050,6 +1166,24 @@ def record_for_session(record: dict, allowed: Optional[frozenset]) -> bool:
     of it is one the handover bound (or the key is the session's own)."""
     if allowed is None:
         return True
+    if isinstance(allowed, dict):
+        if (allowed.get("lineage_notice") and
+                (record.get("receipt") or {}).get("kind") == "notice" and
+                not record.get("attempt_ids")):
+            return True
+        allowed = allowed.get("attempts")
+    if (getattr(allowed, "lineage_notice", False)
+            and (record.get("receipt") or {}).get("kind") == "notice"
+            ):
+        ids = record.get("attempt_ids")
+        if isinstance(ids, list) and ids and all(
+                isinstance(item, str) and item.startswith("notice-") for item in ids):
+            try:
+                import session_notice
+                session_notice.validate_pending_record(record)
+                return True
+            except (ImportError, ValueError, TypeError, KeyError):
+                return False
     ids = record.get("attempt_ids")
     return isinstance(ids, list) and bool(ids) and all(i in allowed for i in ids)
 

@@ -765,17 +765,24 @@ def _project_seat_lineage(rows: list[dict], cards: dict, locations: dict,
     grouped = {}
     starts = {}
     edges = {}
+    outgoing = {}
     for row in rows:
         name, session = str(row.get("harness") or ""), str(row.get("sid") or "")
         if not name or not session:
             continue
         key = (name, session)
         if row.get("event") in {"handover", "succession"}:
+            if (row.get("event") == "succession" and row.get("source") != "tidy-clear"):
+                continue
+            if (row.get("event") == "handover" and row.get("source") not in {
+                    "clear", "reservation", "first-message"}):
+                continue
             source = row.get("from")
             if isinstance(source, dict):
                 source = source.get("sid") if source.get("harness") == name else None
             if isinstance(source, str) and source and source != session:
                 edges.setdefault(key, set()).add(source)
+                outgoing.setdefault((name, source), set()).add(session)
             continue
         item = grouped.setdefault(key, {"sid": session, "harness": name,
                                         "started_at": None, "source": "unknown",
@@ -813,7 +820,8 @@ def _project_seat_lineage(rows: list[dict], cards: dict, locations: dict,
         key = (item["harness"], item["sid"])
         predecessors = edges.get(key, set())
         item["predecessor"] = None
-        if len(predecessors) == 1:
+        if (len(predecessors) == 1
+                and len(outgoing.get((item["harness"], next(iter(predecessors))), ())) == 1):
             item["relation"] = "confirmed"
             item["predecessor"] = {"harness": item["harness"], "sid": next(iter(predecessors))}
         elif len(predecessors) > 1:

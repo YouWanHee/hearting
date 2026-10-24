@@ -1177,7 +1177,7 @@ courier for the exact current `effective_parent` session. Native and recovery
 delivery share the notice claim; forms and busy turns use the courier's
 existing retained-message path. Codex and OpenCode keep their existing
 retained completion controllers.
-Confirmed session handover changes the recipient, while the signed notice stays
+Confirmed session handover follows the unique tidy lineage, while the signed notice stays
 under the registered parent's storage key. If an older outer observer cannot
 process this retained duty, its exact PID and existing lock identify a safe
 observer replacement: accepted records remain intact and the replacement takes

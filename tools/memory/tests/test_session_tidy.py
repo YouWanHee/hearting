@@ -3798,8 +3798,8 @@ class SeatHandoverTest(TidyCase):
         replacement = self.row("att-2")                                   # same route, hash and node, still parent A
         self.assertEqual(self.effective(replacement), "sid-B")
         other_node = self.row("att-3", node="other")
-        self.assertEqual(self.effective(other_node), "sid-A")             # a different node was never bound
-        self.assertEqual(self.effective(self.row("att-4", digest="sha256:bb")), "sid-A")
+        self.assertEqual(self.effective(other_node), "sid-B")             # eligible unbound work follows the confirmed seat lineage
+        self.assertEqual(self.effective(self.row("att-4", digest="sha256:bb")), "sid-B")
 
     def test_opencode_hands_over_at_the_first_message_of_the_new_session(self):
         meta = self.row("att-1", parent="ses_A", harness="opencode")
@@ -3821,6 +3821,26 @@ class SeatHandoverTest(TidyCase):
             self.assertFalse(self.handover.record_for_session({"attempt_ids": ["att-1", "att-9"]}, allowed))
             self.assertFalse(self.handover.record_for_session({"attempt_ids": []}, allowed))
             self.assertEqual(self.handover.storage_recipients("sid-A"), [("sid-A", None)])
+
+    def test_succession_only_ledger_discovers_route_free_notice_storage(self):
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            path = st._ledger_path(seat)
+            st.ensure_dir(path.parent)
+            path.write_text(json.dumps({"ts": 10, "harness": "claude", "sid": "sid-B",
+                "event": "succession", "from": "sid-A", "source": "tidy-clear"}) + "\n",
+                encoding="utf-8")
+            recipients = self.handover.storage_recipients("sid-B", harness="claude")
+            self.assertEqual(recipients[0], ("sid-B", None))
+            self.assertIn("sid-A", [key for key, _scope in recipients])
+            scope = next(scope for key, scope in recipients if key == "sid-A")
+            import session_notice
+            receipt = session_notice.validate({"schema_version": 1, "kind": "notice",
+                "subject": "done", "text": "ok", "required_action": "read-notice", "key": "run-1"})
+            record = {"receipt": receipt, "receipt_digest": session_notice.receipt_digest(receipt),
+                      "attempt_ids": ["notice-123"]}
+            self.assertTrue(self.handover.record_for_session(record, scope))
+            self.assertFalse(self.handover.record_for_session({"attempt_ids": ["unbound"]}, scope))
 
     def test_folding_the_ledger_keeps_the_handover_rows_and_leaves_sessions_alone(self):
         meta = self.row("att-1")
