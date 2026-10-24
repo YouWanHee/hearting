@@ -1930,7 +1930,7 @@ read-only probe and does not load the inventory. Fleet uses that observation
 when the inventory is missing or still a template; remote hosts and detached
 runs still require inventory configuration. This observation grants no run
 root or execution access. Usage error reasons are separate from last-good quota
-data and do not make an expired quota fresh.
+data; quota freshness remains tied to its successful observation.
 
 A live direct SSH launch may cross the process boundary without forwarding its
 Claude Code, Codex, or OpenCode session variable. In that case the probe may
