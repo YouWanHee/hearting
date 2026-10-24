@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import math
 import multiprocessing
 import os
 import re
@@ -470,10 +471,21 @@ class CompletionConsumerCorrectionTest(_TmpRootMixin, unittest.TestCase):
                             self.assertEqual(arm["deadline"], original_deadline)
                             self.assertEqual([row[1] for row in deadline_remaining],
                                              ["active", "active"])
+                            clock_ulp = max(
+                                math.ulp(abs(arm["deadline"]["monotonic_deadline"])),
+                                math.ulp(abs(clock.monotonic())),
+                            )
                             self.assertTrue(all(
-                                abs(row[2] - expected) < 1e-9
+                                abs(row[2] - expected) <= 2 * clock_ulp
                                 for row, expected in zip(deadline_remaining, (0.45, 0.4))),
-                                f"the two events must leave 450ms then 400ms: {deadline_remaining}")
+                                f"the two events must leave 450ms then 400ms within two absolute-clock ULPs "
+                                f"(ULP={clock_ulp}): {deadline_remaining}")
+                            logical_remaining = [row[2] for row in deadline_remaining]
+                            self.assertLessEqual(
+                                abs((logical_remaining[0] - logical_remaining[1]) - 0.05),
+                                2 * clock_ulp,
+                                f"the two runner events must remain 50ms apart within two absolute-clock "
+                                f"ULPs (ULP={clock_ulp}): {deadline_remaining}")
                             self.assertTrue(all(
                                 0 <= row[0] <= 500 for row in deadline_remaining),
                                 f"remaining-time observations must stay within the original budget: "
