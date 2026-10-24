@@ -11499,7 +11499,9 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
             self.store.root, self.watch_id, self.identity, self.token)
         self.assertEqual(response["state"], "ready")
         self.assertTrue(self._runner_pass(wake))
-        self.assertEqual(wake.call_count, 1, "steady ready response woke the watcher again")
+        self.assertEqual(
+            wake.call_count, 2,
+            "an unchanged current response still needs notification while its request is pending")
         self.assertEqual(self.jobs_path.read_bytes(), jobs_before)
 
         result = self._publish_receipt()
@@ -11529,7 +11531,7 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(len([row for row in self._all_records()
                              if row.get("kind") == "notice"
                              and (row.get("delivery") or {}).get("receipt") == self.watch_id]), 1)
-        self.assertEqual(wake.call_count, 1)
+        self.assertEqual(wake.call_count, 2)
 
     def test_missing_initial_projection_ensures_the_existing_runner(self):
         observation = dict(self.observation)
@@ -12019,7 +12021,8 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                     mock.patch.object(peer_steward, "_retire_pane_info", return_value={
                         "shell_pid": os.getpid(), "foreground_processes": []}), \
                     mock.patch.object(peer_steward, "_pane_readiness", side_effect=readiness) as heavy_read, \
-                    mock.patch.object(peer_steward, "_wake_watch_observer", return_value=True) as wake:
+                    mock.patch.object(peer_steward, "_wake_current_watch_observer",
+                                      return_value=True) as wake:
                 self.assertTrue(peer_steward._publish_watch_readiness(
                     store, snapshot, read_context=read_context, incarnation=incarnation))
             transport.observe.assert_called_once()
