@@ -3078,7 +3078,10 @@ def route_state_next_action(reason: str, detail: str, route_file: str | None,
         return (
             f"capability-route.py revise {route_arg} --node {target} "
             f"--evidence {evidence_arg} "
-            "--basis review-findings|user-direction|owner-correction"
+            "--basis <review-findings|user-direction|owner-correction> "
+            "[--answers <downstream review/test verdict attempt ids>] "
+            "[--direction <gate-release-id|memo-path>] [--reason <text>] "
+            "--author-attempt-id <attempt that made the change>"
         )
     if reason == "completion-marker-missing":
         return (
@@ -8647,14 +8650,7 @@ def record_evidence_change(
                     and previous.get("marker_sequence") == marker.get("sequence")
                     and previous.get("change_kind", "edited") == change_kind):
                 return
-            changed_at = None
-            evidence_path = Path(str(evidence.get("path") or ""))
-            try:
-                changed_at = datetime.fromtimestamp(
-                    evidence_path.stat().st_mtime, tz=timezone.utc,
-                ).isoformat().replace("+00:00", "Z")
-            except (OSError, ValueError):
-                pass
+            changed_at = _evidence_mtime_text(Path(str(evidence.get("path") or "")))
             command = [Path(sys.argv[0]).name] if sys.argv and sys.argv[0] else []
             command += [arg for arg in sys.argv[1:] if not arg.startswith("-")][:1]
             record = {
@@ -8710,6 +8706,21 @@ def note_evidence_change(
     elif (currency.state == "current" and currency.evidence_digest
           and currency.evidence_digest != evidence.get("sha256")):
         record_evidence_change(route, node, marker_path, marker, currency.evidence_digest)
+    elif (currency.state == "current" and currency.evidence_digest
+          and currency.evidence_digest == evidence.get("sha256")):
+        history = evidence_change_history(marker_path, str(node.get("id")))
+        if (history and history[-1].get("marker_sequence") == marker.get("sequence")
+                and history[-1].get("sha256") != evidence.get("sha256")):
+            record_evidence_change(route, node, marker_path, marker, str(evidence.get("sha256")),
+                                   change_kind="reverted")
+
+
+def _evidence_mtime_text(path: Path) -> str | None:
+    """Return evidence mtime in the exact UTC format used by evidence history."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    except (OSError, ValueError):
+        return None
 
 
 def evidence_change_history(marker_path: Path, node_id: str) -> list[dict[str, object]]:
@@ -11729,30 +11740,92 @@ class RefusedChainClose:
     unclosed_delivery: tuple[str, ...]
 
 
+_NO_START_PROCESS_IDENTITY_KEYS = (
+    "pid",
+    "pid_start",
+    "pid_scope",
+    "pid_host",
+    "pid_host_start",
+    "pid_host_ns",
+    "pid_host_proof",
+    "pid_ns",
+    "pid_observer_ns",
+    "pgid",
+    "pgid_host",
+    "launch_cgroup_b64",
+    "launch_cgroup_ns",
+    "group_reap_proof",
+    "group_reap_pgid",
+    "attempt_descendant_proof",
+    "attempt_descendant_observer_ns",
+    "attempt_descendant_residue",
+    "attempt_descendant_residue_count",
+    "attempt_descendant_residue_basis",
+    "attempt_descendant_residue_at",
+    "reap_watch",
+    "reap_watch_pid",
+    "post_exit_receipt_substitute",
+)
+
+
+def _has_persisted_process_identity(metadata: Mapping[str, str]) -> bool:
+    """Any child identity or descendant/reap evidence contradicts no-start."""
+    return any(metadata.get(key) for key in _NO_START_PROCESS_IDENTITY_KEYS)
+
+
 def attempt_row_never_started(fields: list[str]) -> bool:
     """Prove that a row has never crossed the durable launch fence."""
 
     if len(fields) != 6:
         return False
     metadata = parse_registry_metadata(fields[5])
-    # A claimed row, a row carrying a PID, and a reaped-before-publish row all
-    # remain supervisor-reconciliation evidence. Only an untouched open row or
-    # an explicitly adapter-closed never-launched row with no claim/identity
-    # can be proven never started here.
+    # A claimed row, any persisted child identity, and a reaped-before-publish
+    # row remain supervisor-reconciliation evidence. Parent lineage and
+    # registration metadata are deliberately not execution identity.
     return (
         metadata.get("launch_started") != "1"
         and metadata.get("launch_claimed") == "0"
-        and not metadata.get("pid")
+        and not _has_persisted_process_identity(metadata)
         and metadata.get("launch_outcome", "") in {"", "never-launched"}
     )
+
+
+def attempt_row_terminal_never_started(fields: list[str]) -> bool:
+    """True only for a terminal row carrying strict never-started fence proof."""
+    if len(fields) != 6 or fields[1] not in {"done", "cancelled", "killed"}:
+        return False
+    return terminal_attempt_never_started(fields[1], parse_registry_metadata(fields[5]))
+
+
+def terminal_attempt_never_started(status: str, metadata: Mapping[str, str]) -> bool:
+    """Metadata form of the same terminal no-start proof for semantic censuses."""
+    if status not in {"done", "cancelled", "killed"}:
+        return False
+    if metadata.get("launch_outcome") != "never-launched":
+        return False
+    if (metadata.get("launch_started") == "1" or metadata.get("launch_claimed") != "0"
+            or _has_persisted_process_identity(metadata)):
+        return False
+    # Reviewing a terminal conflict records its inspection, not which outcome
+    # was correct. Retained contradictory results still preclude strict proof.
+    if (metadata.get("terminal_conflict") == "1"
+            or any(metadata.get(key) for key in (
+                "terminal_conflicts_b64", "conflicting_terminal_note", "conflicting_failure_class"))):
+        return False
+    # A committed work result contradicts a never-launched disposition.
+    if (metadata.get("note") in SUCCESS_NOTES
+            or metadata.get("note") in {"completed-review-blocking", "dead-worker-fail"}
+            or metadata.get("failure_class") in {"pass", "success", "fail", "blocked"}):
+        return False
+    return True
 
 
 def attempt_row_withdrawn_before_launch(fields: list[str]) -> bool:
     """Identify a never-started registration withdrawn under the jobs lock.
 
-    An unclaimed open row may still be launched. Only a terminal row explicitly
-    closed as cancelled has lost that launch authority and can leave the round
-    census without hiding a real pre-launch failure.
+    An unclaimed open row may still be launched. This helper names only the
+    cancellation-specific subset; `attempt_row_terminal_never_started` is the
+    broader strict predicate used by round census and retry.
     """
 
     if len(fields) != 6 or not attempt_row_never_started(fields):

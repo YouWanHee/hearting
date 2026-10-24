@@ -43,7 +43,9 @@ class ForegroundInterruptedCloseTest(unittest.TestCase):
             fakebin = root / "bin"
             fakebin.mkdir()
             fake = fakebin / harness
-            fake.write_text("#!/bin/sh\nexec sleep 60\n", encoding="utf-8")
+            version = ('[ "$1" = --version ] && { echo 1.19.0; exit 0; }\n'
+                       if harness == "opencode" else "")
+            fake.write_text("#!/bin/sh\n" + version + "exec sleep 60\n", encoding="utf-8")
             fake.chmod(0o755)
             parent = subprocess.Popen(["sleep", "60"])
             self.addCleanup(lambda: (parent.kill(), parent.wait()))

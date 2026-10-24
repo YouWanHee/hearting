@@ -530,7 +530,13 @@ def prepare_launch_context(*, model: str, context_window: str | int,
     env = dict(os.environ if environ is None else environ)
     native_command = _installed_command(command, environ=env)
     env["OPENCODE_CONFIG_CONTENT"] = config_content
-    runtime_version = _installed_version(native_command, cwd=cwd, env=env)
+    if "OPENCODE_RUNTIME_VERSION" in env:
+        parsed_version = opencode_runtime.parse_version(env["OPENCODE_RUNTIME_VERSION"])
+        if parsed_version is None:
+            raise OpenCodeContextError("opencode-runtime-version-unavailable")
+        runtime_version = ".".join(str(part) for part in parsed_version)
+    else:
+        runtime_version = _installed_version(native_command, cwd=cwd, env=env)
     version_parts = opencode_runtime.parse_version(runtime_version)
     is_v2 = bool(version_parts and opencode_runtime.is_v2(version=version_parts))
     if is_v2:
