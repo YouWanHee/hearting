@@ -2145,6 +2145,27 @@ class DispatchContractTest(unittest.TestCase):
   self.assertTrue(D.terminal_attempt_never_started(
    "done",D.parse_registry_metadata(fields[5])))
 
+ def test_terminal_no_start_keeps_pending_and_reviewed_conflicting_results(self):
+  import base64
+  base={"launch_claimed":"0","launch_outcome":"never-launched",
+        "note":"dead-capacity","failure_class":"capacity"}
+  history={"late-result":{"note":"completed-marker","failure_class":"pass"}}
+  for reviewed in (False,True):
+   if reviewed: history["late-result"]["review_sha256"]="f"*64
+   encoded=base64.b64encode(json.dumps(history).encode()).decode()
+   metadata={**base,"terminal_conflict":"1","terminal_conflicts_b64":encoded}
+   self.assertEqual(D.terminal_conflict_pending(metadata),not reviewed)
+   self.assertFalse(D.terminal_attempt_never_started("done",metadata))
+   self.assertFalse(D.attempt_row_terminal_never_started(
+    attempt_row(metadata,status="done").split("\t")))
+  for extra in ({"terminal_conflict":"1"},{"terminal_conflicts_b64":encoded},
+                {"terminal_conflicts_b64":"unreadable-history"},
+                {"conflicting_terminal_note":"completed-review-blocking"},
+                {"conflicting_failure_class":"fail"}):
+   with self.subTest(extra=extra):
+    self.assertFalse(D.terminal_attempt_never_started("done",{**base,**extra}))
+  self.assertTrue(D.terminal_attempt_never_started("done",base))
+
  def test_claimed_spawn_rechecks_parent_and_publishes_identity_under_lock(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"

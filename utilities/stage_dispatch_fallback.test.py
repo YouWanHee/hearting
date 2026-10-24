@@ -141,6 +141,24 @@ class FallbackTest(unittest.TestCase):
       self.jobs,route,node,candidate),"unknown")
      self.assertIn("\topen\t",self.jobs.read_text(encoding="utf-8"))
 
+ def test_terminal_conflict_never_selects_a_no_start_successor(self):
+  import base64
+  with self.dispatch_env():
+   _path,route,node=self.standard_route()
+   attempt="att-conflicting-no-start"
+   for reviewed in (False,True):
+    history={"late-result":{"note":"completed-marker","failure_class":"pass"}}
+    if reviewed: history["late-result"]["review_sha256"]="f"*64
+    encoded=base64.b64encode(json.dumps(history).encode()).decode()
+    metadata=(f"attempt_id={attempt},route_id={route['route_id']},route_node={node['id']},"
+              "launch_claimed=0,launch_outcome=never-launched,note=dead-capacity,"
+              f"failure_class=capacity,terminal_conflict=1,terminal_conflicts_b64={encoded}")
+    self.jobs.write_text(f"now\tdone\t{self.repo}\t{self.repo}\tstage\t{metadata}\n")
+    before=self.jobs.read_bytes()
+    self.assertEqual(F.retry_proven_unstarted_identity(
+     self.jobs,route["route_id"],node["id"],attempt),attempt)
+    self.assertEqual(self.jobs.read_bytes(),before)
+
  def test_watchdog_fallback_and_fail_closed_preserve_current_attempt(self):
   real_load=F.load_node
   def load_single_node(*args):

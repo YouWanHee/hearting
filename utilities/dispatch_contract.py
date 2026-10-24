@@ -11806,6 +11806,12 @@ def terminal_attempt_never_started(status: str, metadata: Mapping[str, str]) -> 
     if (metadata.get("launch_started") == "1" or metadata.get("launch_claimed") != "0"
             or _has_persisted_process_identity(metadata)):
         return False
+    # Reviewing a terminal conflict records its inspection, not which outcome
+    # was correct. Retained contradictory results still preclude strict proof.
+    if (metadata.get("terminal_conflict") == "1"
+            or any(metadata.get(key) for key in (
+                "terminal_conflicts_b64", "conflicting_terminal_note", "conflicting_failure_class"))):
+        return False
     # A committed work result contradicts a never-launched disposition.
     if (metadata.get("note") in SUCCESS_NOTES
             or metadata.get("note") in {"completed-review-blocking", "dead-worker-fail"}

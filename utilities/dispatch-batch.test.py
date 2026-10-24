@@ -880,6 +880,39 @@ class DispatchBatchTest(unittest.TestCase):
             "launch_outcome=never-launched,note=dead-opencode-context-limit-unavailable\n"),
             encoding="utf-8")
 
+    def test_conflicted_no_start_is_not_discovered_as_a_replacement_gap(self):
+        import base64
+        from dispatch_replacement_batch import seal_launch_input
+        legs = self.legs()
+        manifest, _continuation, partial = self.partial_continuation(legs)
+        _checked, digest, _leg_digests = BATCH.verify_manifest(manifest)
+        args = SimpleNamespace(continuation=None, route=self.route_path, parallel_group="plan",
+            slug_prefix="fixture", parent="owner", prompt_text=BATCH.DEFAULT_PROMPT,
+            qa=None, log_dir=None, allow_degraded_independence=False)
+        seal_launch_input(self.jobs, args, self.route, manifest, digest)
+        peer, gap = legs
+        self.write_existing(peer, status="done", note="completed-marker", all_legs=legs)
+        self._write_unstarted(gap, legs)
+        original = self.jobs.read_text()
+        for reviewed in (False, True):
+            history = {"late-result": {"note": "completed-marker", "failure_class": "pass"}}
+            if reviewed:
+                history["late-result"]["review_sha256"] = "f" * 64
+            encoded = base64.b64encode(json.dumps(history).encode()).decode()
+            lines = []
+            for line in original.splitlines():
+                if f"attempt_id={gap['attempt_id']}" in line:
+                    line += f",terminal_conflict=1,terminal_conflicts_b64={encoded}"
+                lines.append(line)
+            self.jobs.write_text("\n".join(lines) + "\n")
+            before = self.jobs.read_bytes()
+            with mock.patch.object(BATCH.ROUTE_MODULE, "partial_group_continuation",
+                                   return_value=partial) as create:
+                self.assertEqual(BATCH.discover_unstarted_partial_group(
+                    self.jobs, self.route, self.route["nodes"], "plan"), (None, None))
+            create.assert_not_called()
+            self.assertEqual(self.jobs.read_bytes(), before)
+
     def _unstarted_successor_fixture(self, successors=1):
         """Peer PASS + gap G0 never started + `successors` sealed successors that never started."""
         for node in self.route["nodes"]:
