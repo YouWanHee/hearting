@@ -9,17 +9,29 @@ from typing import Union
 import time
 
 import importlib
+import sys
 
-try:
-    from tools.fleet.explorer.nav import card_title
-    from tools.fleet import projection, render
-    from tools.fleet.collectors import dispatch, resolve_parent_edges
-    from tools.fleet.refresh import LiveSnapshot
-except ModuleNotFoundError:
-    from fleet.explorer.nav import card_title
-    from fleet import projection, render
-    from fleet.collectors import dispatch, resolve_parent_edges
-    from fleet.refresh import LiveSnapshot
+
+def _package_name():
+    hinted = __name__.split(".tests.", 1)[0]
+    if hinted in ("fleet", "tools.fleet"):
+        return hinted
+    loaded = [name for name in ("fleet", "tools.fleet")
+              if f"{name}.refresh" in sys.modules]
+    if len(loaded) == 1:
+        return loaded[0]
+    return "fleet"
+
+
+_PACKAGE = _package_name()
+_nav = importlib.import_module(f"{_PACKAGE}.explorer.nav")
+_collectors = importlib.import_module(f"{_PACKAGE}.collectors")
+card_title = _nav.card_title
+projection = importlib.import_module(f"{_PACKAGE}.projection")
+render = importlib.import_module(f"{_PACKAGE}.render")
+dispatch = importlib.import_module(f"{_PACKAGE}.collectors.dispatch")
+resolve_parent_edges = _collectors.resolve_parent_edges
+LiveSnapshot = importlib.import_module(f"{_PACKAGE}.refresh").LiveSnapshot
 
 # Every class below comes from the package this fixture's LiveSnapshot comes from, so a row built
 # here is an instance of the classes the production adapter uses whatever sys.path put it there.

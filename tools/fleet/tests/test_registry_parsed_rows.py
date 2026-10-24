@@ -58,6 +58,51 @@ class ParsedRegistryRowsTest(unittest.TestCase):
                 appended = dispatch.parsed_registry_rows(path)
             self.assertEqual([row[0] for row in appended], [2, 5])
 
+    def test_multiple_appends_reuse_each_prefix_without_dropping_or_repeating_rows(self):
+        dispatch._parse_pipe_meta_cached.cache_clear()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            path.write_text("\nmalformed\ndate\topen\t/repo\t/work\tslug0\tcapability=cap0\n")
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                rows = dispatch.parsed_registry_rows(path)
+            self.assertEqual([row[0] for row in rows], [2])
+            misses = dispatch._parse_pipe_meta_cached.cache_info().misses
+
+            expected_orders = [2]
+            for index in range(1, 4):
+                with path.open("a") as stream:
+                    stream.write(f"date\topen\t/repo\t/work\tslug{index}\tcapability=cap{index}\n")
+                with dispatch._dispatch_registry_cache.registry_read_scope():
+                    rows = dispatch.parsed_registry_rows(path)
+                expected_orders.append(index + 2)
+                self.assertEqual([row[0] for row in rows], expected_orders)
+                self.assertEqual(
+                    [row[1][4] for row in rows], [f"slug{i}" for i in range(index + 1)])
+                self.assertEqual(
+                    dispatch._parse_pipe_meta_cached.cache_info().misses, misses + index)
+
+    def test_cache_is_isolated_by_path_and_file_generation(self):
+        dispatch._parse_pipe_meta_cached.cache_clear()
+        with tempfile.TemporaryDirectory() as directory:
+            first_path = Path(directory) / "first.log"
+            second_path = Path(directory) / "second.log"
+            first_path.write_text("date\topen\t/repo\t/work\tfirst\tcapability=first\n")
+            second_path.write_text("date\topen\t/repo\t/work\tsecond\tcapability=second\n")
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                first = dispatch.parsed_registry_rows(first_path)
+                second = dispatch.parsed_registry_rows(second_path)
+            self.assertEqual(first[0][1][4], "first")
+            self.assertEqual(second[0][1][4], "second")
+
+            first_path.write_text(
+                "date\topen\t/repo\t/work\treplaced\tcapability=replaced\n"
+                "date\topen\t/repo\t/work\tnew\tcapability=new\n")
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                replaced = dispatch.parsed_registry_rows(first_path)
+                unchanged_second = dispatch.parsed_registry_rows(second_path)
+            self.assertEqual([row[1][4] for row in replaced], ["replaced", "new"])
+            self.assertIs(second, unchanged_second)
+
     def test_missing_registry_is_empty(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(dispatch.parsed_registry_rows(Path(directory) / "missing"), ())

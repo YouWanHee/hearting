@@ -7,6 +7,7 @@ from tools.fleet.explorer.view_model import load_fixture
 from tools.fleet.tests.parity_compare import diff_frames, diff_view_models, validate_ledger
 from tools.fleet.tests.parity_states import enumerate_states
 from tools.fleet.tests.reference_injection import inject_model_catalog
+from tools.fleet.tests import snapshot_fixture
 from tools.fleet.tests.snapshot_fixture import replay_snapshot, replay_source_bundle
 
 
@@ -25,7 +26,7 @@ class ReplayContract(unittest.TestCase):
         logs = {"sid-a:0": {"h": "claude", "sid": "sid-a", "lines": ["log row"]}}
         raw = {"lines": ["raw row"]}
         snapshot, detail = replay_source_bundle(state, history, logs, raw, now=10)
-        from tools.fleet.model import ResourceJob, Session
+        ResourceJob, Session = snapshot_fixture._symbols("model", "ResourceJob", "Session")
         self.assertIsInstance(snapshot.sessions[0], Session)
         self.assertIsInstance(snapshot.resources[0], ResourceJob)
         self.assertEqual(snapshot.compute_hosts, {"hosts": []})
@@ -44,7 +45,8 @@ class ReplayContract(unittest.TestCase):
         self.assertIsNone(detail.focus)
 
     def test_snapshot_replay_rebuilds_nested_projection_dataclasses(self):
-        from tools.fleet.model import ActiveNodeProjection, ProgressProjection, Session, WorkProjection
+        ActiveNodeProjection, ProgressProjection, Session, WorkProjection = snapshot_fixture._symbols(
+            "model", "ActiveNodeProjection", "ProgressProjection", "Session", "WorkProjection")
         snapshot, _detail = replay_snapshot({"sessions": [{"harness": "claude", "pid": 7,
             "work_projection": {"source": "route", "active_nodes": [{"id": "execute"}],
                                 "progress": {"done": 2, "total": 4}, "unknown": "discarded"}}]})
@@ -100,7 +102,7 @@ class ReplayClassIdentity(unittest.TestCase):
             other = importlib.import_module("fleet.model")
         finally:
             sys.path.remove(str(root))
-        from tools.fleet.model import Session
+        (Session,) = snapshot_fixture._symbols("model", "Session")
         self.assertIsNot(other.Session, Session)
         snapshot, _detail = replay_snapshot({"sessions": [{"harness": "claude", "pid": 1}]})
         self.assertIsInstance(snapshot.sessions[0], Session)

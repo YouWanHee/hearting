@@ -241,7 +241,7 @@ def _parse_registry_lines(path, lines, generation, *, first_line=0,
     key = (os.path.abspath(os.fspath(path)), generation)
     _PARSED_REGISTRY_ROWS[key] = result
     _PARSED_REGISTRY_LINE_COUNTS[key] = (
-        first_line + len(lines) - 1 if complete_line_count is None
+        first_line + len(lines) if complete_line_count is None
         else complete_line_count
     )
     _PARSED_REGISTRY_SEGMENTS[key] = tuple(segments) if segments is not None else None
