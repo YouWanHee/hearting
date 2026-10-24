@@ -624,7 +624,7 @@ def dispatch_prompt(
         f"- owner_harness: {args.owner_harness or '-'}\n"
         f"- worktree: {args.worktree}\n"
         f"- artifact_root: {args.artifact_root}\n"
-        f"{artifact_context_prompt(os.environ)}"
+        f"{artifact_context_prompt({**os.environ, 'AGENT_RUNTIME_DIR': getattr(args, 'runtime_dir', '')})}"
         f"- route_state: {'consume the immutable record already validated by the wrapper' if args.route_file else 'validated dispatch metadata'}\n"
         f"- {profile_note}\n\n"
         "Claude realization:\n"
@@ -1177,6 +1177,8 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             "--turn-transport", "resume-process",
             "--add-dir", str(args.artifact_root),
         ]
+        if getattr(args, "runtime_dir", ""):
+            command += ["--add-dir", str(args.runtime_dir)]
         if getattr(args, "report_bundle_root", None) is not None:
             command += ["--add-dir", str(args.report_bundle_root)]
         if getattr(args, "execution_access_grant", None) is not None:
@@ -1215,6 +1217,8 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         "--output-format", "stream-json", "--verbose",
         "--no-session-persistence",
     ]
+    if getattr(args, "runtime_dir", ""):
+        cmd += ["--add-dir", str(args.runtime_dir)]
     cmd += claude_worker_arguments(getattr(args, "worker_runtime_env", None))
     if getattr(args, "report_bundle_root", None) is not None:
         cmd += ["--add-dir", str(args.report_bundle_root)]
@@ -1413,14 +1417,15 @@ def main(argv: list[str]) -> int:
     worktree = Path(args.worktree)
     if not worktree.is_dir():
         return fail("worktree-not-found", 66, worktree=args.worktree)
-    if subprocess.run(
-        ["git", "-C", args.worktree, "rev-parse", "--is-inside-work-tree"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ).returncode != 0:
-        return fail("not-a-git-worktree", 65, worktree=args.worktree)
+    try:
+        from dispatch_contract import launch_repository_identity
+        args.repository_identity, args.repository_kind = launch_repository_identity(
+            args.worktree, args.route_file or os.environ.get("AGENT_OWNER_ROUTE_FILE"))
+    except DispatchContractError as exc:
+        return fail(exc.reason, 65, detail=exc.detail, worktree=args.worktree, child_spawned="0")
     try:
         args.artifact_root = resolve_artifact_root(args.worktree)
+        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(args.artifact_root)
         args.report_bundle_root = resolve_report_bundle_root(args.route_file, args.route_node)
     except ValueError as e:
         return fail("writable-root-resolution-failed", 64, detail=str(e), worktree=args.worktree)
@@ -1602,10 +1607,7 @@ def main(argv: list[str]) -> int:
     args.parent_binding = None
     if args.dispatch_depth == 2 and action in ("register", "start"):
         try:
-            repo = subprocess.check_output(
-                ["git", "-C", args.worktree, "rev-parse", "--show-toplevel"],
-                text=True,
-            ).strip()
+            repo = args.repository_identity
             args.parent_binding = resolve_live_parent_attempt(
                 jobs,
                 parent_slug=args.parent_slug or "",
@@ -1855,6 +1857,7 @@ def main(argv: list[str]) -> int:
             # `campaigns/<camp>/cycles/<cyc>/artifacts/` and never issue a
             # second lineage.
             **artifact_cycle_environment(os.environ),
+            "AGENT_RUNTIME_DIR": getattr(args, "runtime_dir", ""),
             "REPORT_BUNDLE_ROOT": str(args.report_bundle_root or ""),
             "AGENT_ROUTE_FILE": (
                 args.route_file

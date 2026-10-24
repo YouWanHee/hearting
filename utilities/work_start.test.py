@@ -71,6 +71,24 @@ class WorkStartTest(unittest.TestCase):
         self.process = mock.patch.object(close, "owner_continuation_processes", side_effect=owner_observation)
         self.process.start(); self.addCleanup(self.process.stop)
 
+    def test_start_work_surfaces_consumed_tombstone_restore_and_keeps_advancing(self):
+        outcome = {"restored": [{"node": "plan-check"}], "errors": ["pending-restore-invalid:leaf"]}
+        module = SimpleNamespace(restore_consumed_tombstones=mock.Mock(return_value=outcome))
+        advanced = []
+        def advance(route, path, jobs, result, **kwargs):
+            advanced.append(True)
+            return {**result, "state": "ready"}
+        with mock.patch("route_parent_close.intent", return_value=None), \
+                mock.patch.object(W, "_route_module", return_value=module), \
+                mock.patch.object(W, "_advance", side_effect=advance), \
+                mock.patch.object(W, "_advance_plan", side_effect=lambda _route, _jobs, result, **kw: result), \
+                mock.patch.object(W, "_arm_capacity_resume", side_effect=lambda result, *_args: result), \
+                mock.patch("start_receipt.save", side_effect=lambda result, _jobs: result):
+            result = W.start_work(self.route, self.path, self.jobs)
+        self.assertEqual(result["restored"], ["plan-check"])
+        self.assertEqual(result["restore_errors"], ["pending-restore-invalid:leaf"])
+        self.assertTrue(advanced)
+
     def test_legacy_continuation_normal_start_reads_original_request_without_rewriting(self):
         source = json.loads(json.dumps(self.route))
         source_path = self.path.with_name("source.json")
@@ -83,7 +101,8 @@ class WorkStartTest(unittest.TestCase):
         before = self.path.read_bytes()
         self.ready = self.released = True
         module = SimpleNamespace(resolve_route_argument=lambda *a: source_path,
-                                 verify_route=lambda value: value)
+                                 verify_route=lambda value: value,
+                                 restore_consumed_tombstones=lambda *a, **kw: {"restored": [], "errors": []})
         with mock.patch.object(W, "_route_module", return_value=module):
             first = self.start()
             second = self.start()
@@ -692,7 +711,7 @@ class WorkStartTest(unittest.TestCase):
                     stamp_harness[0] = True
                 result = W.start_work(self.route, self.path, self.jobs, run=select)
                 self.assertEqual(result["state"], "preparing", result)
-                self.assertEqual(launched, ["codex", "codex"] if headroom < 50 else ["claude", "claude"])
+                self.assertEqual(launched, ["codex", "claude"] if headroom < 50 else ["claude", "codex"])
                 first_launch = pending["launches"][0] if headroom == 30 else result["launches"][0]
                 self.assertIn("selection_source=configured-balanced", first_launch["receipt"])
                 self.assertIn("selection_source=configured-balanced", result["launches"][-1]["receipt"])
@@ -1409,19 +1428,18 @@ class WorkStartTest(unittest.TestCase):
     def adapters(self):
         return [c[c.index("--adapter") + 1] if "--adapter" in c else None for c in self.calls]
 
-    def test_a_pinned_tool_is_passed_to_both_frame_legs_and_then_the_owner(self):
+    def test_an_owner_pin_stays_with_the_owner_and_does_not_pin_frame_legs(self):
         pins = {"contract_version": 1,
                 "owner": {"harness": "opencode", "model": None, "effort": None}}
         self.route["selection_pins"] = pins
         for row in self.route["dispatch_evidence"]["tuples"]:
             row.update(parent_harness="opencode", launch_authority="conductor")
         self.start()
-        # Both legs run on the one tool the caller named (SD-160 allows a shared
-        # harness); with no pin they stay on automatic selection (no --adapter).
-        self.assertEqual(self.adapters(), ["opencode", "opencode"])
+        # Owner selection is retained, while both frame legs stay automatic.
+        self.assertEqual(self.adapters(), [None, None])
         self.ready = True; self.released = True
         self.start()
-        self.assertEqual(self.adapters(), ["opencode", "opencode", "opencode"])
+        self.assertEqual(self.adapters(), [None, None, "opencode"])
 
     def test_a_frame_pin_wins_over_the_owner_pin_for_the_frame_legs_only(self):
         self.route["selection_pins"] = {"contract_version": 1,
@@ -3368,6 +3386,7 @@ class NeverStartedReplacementNormalStartTest(unittest.TestCase):
         self.assertEqual(len(self.launches), before)
         self.assertIn("revise --route rt-fixture --node eval-spec "
                       f"--evidence {shlex.quote(evidence)}", result["next_step"])
+        self.assertIn("--reason", result["next_step"])
         self.assertNotIn("launch settles", result["next_step"])
         self.assertNotIn("next_action", result)
         attention = result["replacement_attention"][0]

@@ -133,7 +133,8 @@ def read_attempts(jobs_path, parent_sid, live_jobs=None, *, entries=None):
             route_node=meta.get("route_node") or None, note=meta.get("note") or "",
             timestamp=fields[0], parent_sid=meta.get("parent_sid") or "",
             liveness=(_get(job, "liveness") if job is not None else None) or "unknown",
-            decision=decision, meta=meta))
+            decision=decision, meta=meta,
+            registered_only=dispatch.row_is_registered_only(fields[1], meta)))
     return sorted(rows, key=lambda row: row.line)
 
 

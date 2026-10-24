@@ -42,7 +42,8 @@ from collections.abc import Mapping
 from .display import label as _user_label, project as _user_project, gpu_owner as _gpu_owner_label
 
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
-                    current_background_shell_jobs, session_parent_visible)
+                    current_background_shell_jobs, session_parent_visible,
+                    current_attempt_rank)
 from . import gitinfo, titles
 from .work_titles import readable as _readable_name, resource_name as _resource_name, resource_title_key, subject_command
 from .collectors import compute_hosts as _compute_hosts
@@ -7820,13 +7821,7 @@ def _current_attempt_jobs(jobs):
         key = (getattr(job, "route_id", None), getattr(job, "route_node", None))
         if not all(key) or not getattr(job, "attempt_id", None):
             continue
-        rank = (
-            -(getattr(job, "registry_priority", None)
-              if getattr(job, "registry_priority", None) is not None else 0),
-            getattr(job, "registry_order", None) if getattr(job, "registry_order", None) is not None else -1,
-            -(getattr(job, "elapsed_min", None) if getattr(job, "elapsed_min", None) is not None else 10**9),
-            index,
-        )
+        rank = current_attempt_rank(job) + (index,)
         if key not in latest_attempt or rank > latest_attempt[key][0]:
             latest_attempt[key] = (rank, job)
     return [

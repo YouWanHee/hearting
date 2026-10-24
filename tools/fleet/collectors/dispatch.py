@@ -56,6 +56,7 @@ try:
 except Exception:  # a monitor must never fail to import over a bookkeeping helper
     _note_worker_home_view = None
 from dispatch_completion_join import read_supervisor_phase_state, read_join_observation  # noqa: E402
+from dispatch_subsession_advance import row_is_registered_only  # noqa: E402
 from dispatch_attempt_policy import decide_attempt, terminal_conflict_pending  # noqa: E402
 import dispatch_registry_cache as _dispatch_registry_cache  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
@@ -3504,6 +3505,7 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
         if dead_terminal_owner:
             job.note = meta.get("note") or "dead-runtime-exit"
         job._registry_metadata = dict(meta)
+        job._registered_only = row_is_registered_only(status, meta)
         job._context_execution_started_at = _iso_to_epoch(ts)
         job.attention_reason = _attempt_attention(meta)
         job._registry_repo = repo

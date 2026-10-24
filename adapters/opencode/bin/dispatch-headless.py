@@ -674,6 +674,7 @@ def scoped_external_directory_config(
     selected_agent: str | None = None,
     task_publish_scope: dict[str, str] | None = None,
     merge_observation_only: bool = False,
+    recordish: bool = False,
 ) -> str:
     v2 = opencode_runtime.is_v2()
     raw = os.environ.get("OPENCODE_CONFIG_CONTENT", "").strip()
@@ -701,6 +702,28 @@ def scoped_external_directory_config(
         rules = opencode_runtime.opencode_permission_rules_for_action(
             subject, tool, default=default)
         return None if rules is None else dict(rules)
+
+    def install_recordish_edit_rules(subject, inherited):
+        if not recordish or not worktree:
+            return
+        cwd = str(Path(worktree).resolve(strict=False))
+        artifact = str(Path(artifact_root).resolve(strict=False))
+        for tool in ("edit", "write", "patch"):
+            current = effective_tool(subject, tool, "allow")
+            rules = {"*": current} if isinstance(current, str) else dict(current or {})
+            for pattern, action in ((cwd, "deny"), (f"{cwd}/**", "deny"),
+                                    (os.path.relpath(cwd, worktree), "deny"),
+                                    (f"{os.path.relpath(cwd, worktree)}/**", "deny"),
+                                    (artifact, "allow"), (f"{artifact}/**", "allow"),
+                                    (os.path.relpath(artifact, worktree), "allow"),
+                                    (f"{os.path.relpath(artifact, worktree)}/**", "allow")):
+                # A pre-existing exact deny remains authoritative for its path.
+                if action == "allow" and rules.get(pattern) == "deny":
+                    continue
+                rules.pop(pattern, None)
+                rules[pattern] = action
+            subject.pop(tool, None)
+            subject[tool] = rules
 
     def install_merge_observation_rules(subject, inherited):
         def has_deny(rules):
@@ -852,9 +875,10 @@ def scoped_external_directory_config(
         permission, publish_commands, resolve=effective_tool))
     if merge_observation_only:
         install_merge_observation_rules(permission, original_permission)
+    install_recordish_edit_rules(permission, original_permission)
     config["permission"] = permission
     if (contract_roots or read_deny_roots or publish_global_allowed
-            or merge_observation_only) and selected_agent:
+            or merge_observation_only or recordish) and selected_agent:
         # Native agent permissions merge after global permissions. Overlay only
         # the selected agent, without giving its other tools a new default.
         agents = config.get("agent", {})
@@ -873,6 +897,7 @@ def scoped_external_directory_config(
         else:
             raise ValueError("OpenCode agent permission must be a string or object")
         original_local = dict(local)
+        install_recordish_edit_rules(local, original_local)
         # Triples accumulate into one overlay per tool in listed order, so a
         # later triple wins on overlap (native last-match) without wiping an
         # earlier triple's unrelated patterns.
@@ -1036,7 +1061,7 @@ def prompt(args: argparse.Namespace) -> tuple[str, str]:
         f"- owner_harness: {args.owner_harness or '-'}\n"
         f"- worktree: {args.worktree}\n"
         f"- artifact_root: {args.artifact_root}\n"
-        f"{artifact_context_prompt(os.environ)}"
+        f"{artifact_context_prompt({**os.environ, 'AGENT_RUNTIME_DIR': getattr(args, 'runtime_dir', '')})}"
         f"- route_state: {'consume the immutable record already validated by the wrapper' if args.route_file else 'validated dispatch metadata'}\n\n"
         "OpenCode realization:\n"
         "- The wrapper already validated capability mode, optional worker mode, QA, artifact-root access, and any route record. Use worker-route only for a safety recheck.\n"
@@ -1340,17 +1365,24 @@ def main(argv: list[str]) -> int:
     worktree = Path(args.worktree)
     if not worktree.is_dir():
         return fail("worktree-not-found", 66, worktree=args.worktree)
-    if subprocess.run(["git", "-C", args.worktree, "rev-parse", "--is-inside-work-tree"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
-        return fail("not-a-git-worktree", 65, worktree=args.worktree)
+    try:
+        from dispatch_contract import launch_repository_identity
+        args.repository_identity, args.repository_kind = launch_repository_identity(
+            args.worktree, args.route_file or os.environ.get("AGENT_OWNER_ROUTE_FILE"))
+    except DispatchContractError as exc:
+        return fail(exc.reason, 65, detail=exc.detail, worktree=args.worktree, child_spawned="0")
     try:
         args.artifact_root = resolve_artifact_root(args.worktree)
+        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(args.artifact_root)
         args.report_bundle_root = resolve_report_bundle_root(args.route_file, args.route_node)
         args.opencode_config_content = scoped_external_directory_config(
             args.artifact_root,
             str(args.report_bundle_root) if args.report_bundle_root is not None else None,
+            execution_access_roots=((Path(args.runtime_dir),) if args.runtime_dir else ()),
             agent_home=args.agent_home,
             worktree=args.worktree,
             selected_agent=args.agent,
+            recordish=args.repository_kind == "non-git",
         )
     except ValueError as e:
         return fail("artifact-root-access-config-failed", 64, detail=str(e), worktree=args.worktree)
@@ -1517,10 +1549,7 @@ def main(argv: list[str]) -> int:
     args.parent_binding = None
     if args.dispatch_depth == 2 and action in ("register", "start"):
         try:
-            repo = subprocess.check_output(
-                ["git", "-C", args.worktree, "rev-parse", "--show-toplevel"],
-                text=True,
-            ).strip()
+            repo = args.repository_identity
             args.parent_binding = resolve_live_parent_attempt(
                 jobs,
                 parent_slug=args.parent_slug or "",
@@ -1570,7 +1599,8 @@ def main(argv: list[str]) -> int:
         args.opencode_config_content = scoped_external_directory_config(
             args.artifact_root,
             str(args.report_bundle_root) if args.report_bundle_root is not None else None,
-            grant.additional_writable_roots if grant is not None else (),
+            (*((Path(args.runtime_dir),) if args.runtime_dir else ()),
+             *(grant.additional_writable_roots if grant is not None else ())),
             grant.read_roots if grant is not None else (),
             agent_home=args.agent_home,
             contract_read_roots=args.contract_read_roots,
@@ -1578,6 +1608,7 @@ def main(argv: list[str]) -> int:
             selected_agent=args.agent,
             task_publish_scope=args.task_publish_scope,
             merge_observation_only=args.merge_observation_only,
+            recordish=args.repository_kind == "non-git",
         )
     except ExecutionAccessError as exc:
         return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")
@@ -1762,6 +1793,7 @@ def main(argv: list[str]) -> int:
             # `campaigns/<camp>/cycles/<cyc>/artifacts/` and never issue a
             # second lineage.
             **artifact_cycle_environment(os.environ),
+            "AGENT_RUNTIME_DIR": getattr(args, "runtime_dir", ""),
             "REPORT_BUNDLE_ROOT": str(args.report_bundle_root or ""),
             "AGENT_ROUTE_FILE": (
                 args.route_file

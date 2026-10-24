@@ -47,10 +47,17 @@ class AttemptRow:
     liveness: str = "unknown"
     decision: Optional[Mapping[str, Any]] = field(default=None, compare=False)
     meta: Mapping[str, str] = field(default_factory=dict, compare=False)
+    registered_only: bool = False   # the runtime's row_is_registered_only: not launched yet
 
     @property
     def outcome(self) -> Optional[str]:
         return (self.decision or {}).get("outcome") if self.decision else None
+
+    @property
+    def rank(self):
+        """Current-attempt order within one route node: a started attempt outranks one that
+        is only registered (a pre-registered chain successor), then the later registry line."""
+        return (not self.registered_only, self.line)
 
 
 @dataclass(frozen=True)

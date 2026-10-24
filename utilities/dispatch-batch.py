@@ -96,8 +96,8 @@ NODE_SPEC.loader.exec_module(DISPATCH_NODE)
 # actually sealed a supported, this-parent candidate for it — this list widens what
 # may be chosen, never what is authorized. OpenCode was absent without a recorded
 # reason while `dispatch-defaults.DISPATCHABLE_HARNESSES` already authorized it as a
-# relief target, and with only two entries the `>= 2 distinct harnesses` rule below
-# had exactly one legal combination, leaving cross-family placement no slack at all.
+# relief target. Width-two groups now prefer distinct harnesses after existing gates
+# and policy rankings; broader support gives that preference more eligible options.
 SUPPORTED_BATCH_HARNESSES = ("codex", "claude", "opencode")
 SAFE_SLUG = re.compile(r"[^A-Za-z0-9._-]+")
 RESERVATION_TOKEN = re.compile(r"[0-9a-f]{32}")
@@ -858,10 +858,20 @@ def assign_harnesses(
                     "peer-gate:no-quality-peer-family-hard-eligible",
                     degradation_reason="sole-gate-non-peer-harness",
                 )
-    # SD-160: independent attempts and different perspectives are sufficient.
-    # Keep every hard-eligible quality-gated combination for capacity ranking.
+    # Prefer distinct harnesses for automatically placed width-two groups after
+    # usage, quality, and capacity policy; explicit pins keep exact behavior.
     independence = "persona"
     degradation_cause = ""
+    distinct_reason = None
+    if len(nodes) == 2:
+        if worker_pin and pinned_legs:
+            distinct_reason = "explicit-worker-pin"
+        else:
+            distinct = [rows for rows in combinations if rows[0][0] != rows[1][0]]
+            if not distinct:
+                distinct_reason = "single-usable-family" if len(usable) == 1 else "no-distinct-eligible-pair"
+                if len(usable) == 1:
+                    degradation_cause = "single-usable-family"
 
     allocation = route.get("dispatch_allocation")
     counts = {harness: 0 for harness in SUPPORTED_BATCH_HARNESSES}
@@ -1002,10 +1012,14 @@ def assign_harnesses(
                      for row in rows]
             within_band_gate = (sum(gated),
                 -sum(float(capacity.get(row[0]) or 0) for row in rows) if all(gated) else 0.0)
+        diversity_order = (0 if len(rows) == 2 and rows[0][0] != rows[1][0]
+                           and not (worker_pin and pinned_legs) else
+                           1 if len(rows) == 2 and not (worker_pin and pinned_legs) else 0)
         return (
             *gate_order,  # B-1: the balanced usage gate precedes quality band
             sum(band_rank(node, row[0]) for node, row in zip(nodes, rows)),
             *within_band_gate,
+            diversity_order,
             affinity_misses,
             depth_affinity_miss,
             *allocation_order,
@@ -1018,6 +1032,11 @@ def assign_harnesses(
         "usable_families": usable,
         "quality_peer_families": sorted(quality_peer) if quality_peer is not None else None,
         "sole_gate": sole_gate,
+        "harness_diversity": ({"reason": distinct_reason} if distinct_reason else
+                              {"reason": "automatic-distinct"} if len(nodes) == 2 and not (worker_pin and pinned_legs) else None),
+        "independence_axes": (["persona"] if distinct_reason else
+                              ["persona", "harness"] if len(nodes) == 2 and not (worker_pin and pinned_legs)
+                              else ["persona"]),
         "family_exclusions": {
             adapter: sorted(reasons)
             for adapter, reasons in sorted(exclusions.items())
@@ -1042,6 +1061,16 @@ def assign_harnesses(
         diagnostics["degradation_detail"] = detail[:512]
 
     chosen = min(combinations, key=score)
+    if len(nodes) == 2:
+        if worker_pin and pinned_legs:
+            diagnostics["harness_diversity"] = {"reason": "explicit-worker-pin"}
+            diagnostics["independence_axes"] = ["persona"]
+        elif chosen[0][0] != chosen[1][0]:
+            diagnostics["harness_diversity"] = {"reason": "automatic-distinct"}
+            diagnostics["independence_axes"] = ["persona", "harness"]
+        else:
+            diagnostics["harness_diversity"] = {"reason": distinct_reason or "existing-policy-ranking"}
+            diagnostics["independence_axes"] = ["persona"]
     return [
         (node, adapter, hop, ordinal)
         for node, (adapter, hop, ordinal) in zip(nodes, chosen)
@@ -2503,10 +2532,8 @@ def main(argv: list[str] | None = None) -> int:
         if not self_slug or not parent_attempt:
             raise BatchError("parent-identity-mismatch", f"parent={args.parent} self={self_slug or '-'}")
         adopt_self_parent(args, self_slug)
-        repo = subprocess.check_output(
-            ["git", "-C", str(route["cwd"]), "rev-parse", "--show-toplevel"],
-            text=True,
-        ).strip()
+        from dispatch_contract import work_root_identity
+        repo = work_root_identity(route["cwd"], route=route)
         resolve_live_parent_attempt(
             jobs,
             parent_slug=args.parent,
