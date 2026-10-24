@@ -135,14 +135,14 @@ def sandbox(argv: list[str], world: Path, env: dict[str, str], cwd: Path | None 
         args += ["--ro-bind", str(source), destination]
     for key, value in env.items():
         args += ["--setenv", key, value.replace(str(world), "/journey")]
-    args += ["--chdir", str(Path("/journey") / cwd.relative_to(world)) if cwd else "/journey/home", "--"]
+    args += ["--chdir", str(Path("/journey") / cwd.relative_to(world)) if cwd else "/journey/home"]
     if probes:
         args += ["--setenv", "JOURNEY_PROBE_HOME", real_home,
                  "--setenv", "JOURNEY_PROBE_NAS", "/home/nas",
                  "--setenv", "JOURNEY_PROBE_NAME", world.name]
         probe = "import os,pathlib,json,shutil; h=pathlib.Path(os.environ['JOURNEY_PROBE_HOME']); n=pathlib.Path(os.environ['JOURNEY_PROBE_NAS']); r={'real_home_empty':not list(h.iterdir()),'nas_empty':not list(n.iterdir())}; h.joinpath(os.environ['JOURNEY_PROBE_NAME']).write_text('x'); n.joinpath(os.environ['JOURNEY_PROBE_NAME']).write_text('x'); r['herdr_absent_from_path']=shutil.which('herdr') is None; print(json.dumps(r))"
-        return args + ["python3", "-c", probe]
-    return args + argv
+        return args + ["--", "python3", "-c", probe]
+    return args + ["--"] + argv
 
 
 def auth_file(root: Path, harness: str) -> Path:
@@ -497,7 +497,15 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                     commands = [hook.get("command", "") for entries in cfg.get("hooks", {}).values()
                                 for entry in entries for hook in entry.get("hooks", []) if isinstance(hook, dict)]
                     paths = [p for command in commands for p in re.findall(r"\$HOME/([^\"\s]+)", command)]
-                    missing = [p for p in paths if not (home / p).is_file()]
+                    def exists_in_world(relative):
+                        candidate = home / relative
+                        if candidate.is_file(): return True
+                        if candidate.is_symlink():
+                            target_path = os.readlink(candidate)
+                            if target_path.startswith("/journey/"):
+                                return (world / target_path[len("/journey/"):]).is_file()
+                        return False
+                    missing = [p for p in paths if not exists_in_world(p)]
                     if missing: record["failures"].append({"reason": "claude-hook-command-missing", "count": len(missing)})
                 except (ValueError, OSError): record["failures"].append({"reason": "claude-settings-invalid"})
         # Demo test is explicitly observed before and after; baseline failure is expected.
