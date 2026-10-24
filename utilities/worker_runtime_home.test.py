@@ -915,14 +915,13 @@ class WorkerHomes(unittest.TestCase):
             'plugins': ['user-plugin'],
             'mcp': {'servers': {'user-server': {'type': 'local', 'command': ['tool']}}},
         }))
-        env = {**self.env, 'HOME': str(self.base), 'XDG_DATA_HOME': str(data_home),
-               'XDG_CONFIG_HOME': str(self.base / 'config'),
+        env = {**self.env, 'HOME': str(self.base), 'OPENCODE_RUNTIME_VERSION': '2.0.32',
+               'XDG_DATA_HOME': str(data_home), 'XDG_CONFIG_HOME': str(self.base / 'config'),
                'XDG_STATE_HOME': str(self.base / 'state'),
                'XDG_CACHE_HOME': str(self.base / 'cache'),
                'OPENCODE_CONFIG_DIR': str(config_source)}
-        with patch.dict(os.environ, {'OPENCODE_RUNTIME_VERSION': '2.0.32'}):
-            result = prepare_worker_home(ROOT, 'opencode', 'stage', 'v2-worker', env=env,
-                                         destination=self.base / 'v2-worker-home')
+        result = prepare_worker_home(ROOT, 'opencode', 'stage', 'v2-worker', env=env,
+                                     destination=self.base / 'v2-worker-home')
         self.assertNotIn('XDG_DATA_HOME', result)
         self.assertNotIn('OPENCODE_CONFIG_DIR', result)
         home = Path(result['HEARTING_WORKER_HOME'])
