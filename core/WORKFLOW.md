@@ -207,7 +207,12 @@ purpose is shown as unresolved while retaining the existing storage fallback. Th
 performs that capability's work and can close it through the normal inline `finish` path.
 The start card says `git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작`.
 An explicit worker shape, including a route-plan leg whose own shape is not direct, remains a
-worker request and is refused in a non-Git folder with the reason and next action. A later compose in a Git repository follows the
+worker request. In a non-Git folder, a compiled artifact-only worker route may run in the
+bound folder; a route whose compiled write scope mutates source is refused with the reason
+and the next action (`git init` and restart, or continue this session with `--shape direct`).
+The classification comes from the compiled write scope, not a capability-name list. An
+omitted shape keeps the existing direct-start behavior and is not silently changed to framed.
+A later compose in a Git repository follows the
 existing Git behavior.
 Likewise, code review within an implementation/debug cycle belongs to
 `autopilot-code --mode audit`; independent inspection of completed work belongs
