@@ -68,6 +68,9 @@ _SECTION_HEAD = re.compile(r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:\*\*)?[ \t]*8[ \t]*[
 # Section 8 under a title in any language: a heading or a numbered line that starts with 8.
 _SECTION_NUMBER = re.compile(r"^[ \t]{0,3}(?:#{1,6}[ \t]*(?:\*\*)?[ \t]*8(?![0-9])|(?:\*\*)?[ \t]*8[ \t]*[.):])[^\n]*", re.M)
 _NEXT_SECTION = re.compile(r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:\*\*)?[ \t]*(?:9|1[0-9])[ \t]*[.):]", re.M)
+# The same two as markdown headings only: a numbered list line `8.` or `9.` is not a section.
+_HEADING_NUMBER = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]*(?:\*\*)?[ \t]*8(?![0-9])[^\n]*", re.M)
+_NEXT_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]*(?:\*\*)?[ \t]*(?:9|1[0-9])[ \t]*[.):]", re.M)
 _FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*([A-Za-z0-9_-]*)[ \t]*$")
 
 
@@ -239,13 +242,20 @@ def none_text(reason) -> str:
 
 def _section8(text: str):
     """Section 8 of a brief, found by its title or, under a title in another language, by its
-    number; None when the brief has no section 8 heading at all."""
-    head = _SECTION_HEAD.search(text) or _SECTION_NUMBER.search(text)
-    if head is None:
+    number; None when the brief has no section 8 heading at all. A numbered list line `8.` in an
+    earlier section, or `9.` inside section 8, also matches a number, so each reading is tried in
+    order (title, heading number, any numbered line; each ended at the next 9+ line, then at the
+    next 9+ heading) and the first that holds a proposal block wins, else the first reading."""
+    readings = []
+    for pattern in (_SECTION_HEAD, _HEADING_NUMBER, _SECTION_NUMBER):
+        for head in pattern.finditer(text):
+            rest = text[head.end():]
+            for ending in (_NEXT_SECTION, _NEXT_HEADING):
+                tail = ending.search(rest)
+                readings.append(rest[:tail.start()] if tail else rest)
+    if not readings:
         return None
-    rest = text[head.end():]
-    tail = _NEXT_SECTION.search(rest)
-    section = rest[:tail.start()] if tail else rest
+    section = next((reading for reading in readings if _proposal_blocks(reading)), readings[0])
     if len(section.encode("utf-8")) > MAX_SECTION_BYTES:
         raise ProposalError("section-too-large")
     return section
