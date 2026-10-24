@@ -17,6 +17,12 @@ import workflow_state as WS
 import worker_bootstrap as WB
 
 ROOT = Path(__file__).resolve().parents[1]
+LIVE_TODO_COUNTS = {"first.txt": 1, "second.txt": 2, "third.txt": 0}
+LIVE_TODO_FIXTURES = {
+    "first.txt": "TODO: first item\nReviewed\n",
+    "second.txt": "TODO: second item\nTODO: third item\n",
+    "third.txt": "No marker found\n",
+}
 
 
 def _clean_test_env():
@@ -89,7 +95,7 @@ def _live_solo_findings(workdir, final_text, events):
     except OSError as exc:
         coverage = ""
         findings.append(f"O3 coverage.md is missing: {exc}")
-    counts = {"first.txt": 1, "second.txt": 2, "third.txt": 0}
+    counts = LIVE_TODO_COUNTS
     for filename, count in counts.items():
         after_o1 = [cmd + "\n" + out for i, cmd, out, code, status in tools
                     if i > o1_index and successful((i, cmd, out, code, status))]
@@ -624,9 +630,13 @@ class LiveSoloResultComparatorFixtureTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "rows.csv").write_text("category,value\nA,2\n", encoding="utf-8")
-            for name, body in (("first.txt", "TODO: first\n"),
-                               ("second.txt", "TODO: second\nTODO: third\n"),
-                               ("third.txt", "No marker\n")):
+            self.assertEqual(
+                {name: len(re.findall(r"\bTODO\b", body))
+                 for name, body in LIVE_TODO_FIXTURES.items()},
+                LIVE_TODO_COUNTS,
+            )
+            self.assertNotIn("TODO", LIVE_TODO_FIXTURES["third.txt"])
+            for name, body in LIVE_TODO_FIXTURES.items():
                 (root / name).write_text(body, encoding="utf-8")
             totals = {"count": 6, "total": 27, "groups": {"A": 9, "B": 6, "C": 12}}
             (root / "totals.json").write_text(json.dumps(totals), encoding="utf-8")
@@ -653,6 +663,17 @@ class LiveSoloResultComparatorFixtureTest(unittest.TestCase):
             final = "O1 complete: 3. O2 complete: count 6, total 27, A=9 B=6 C=12. O3 complete: 3. All complete."
             self.assertEqual(_live_solo_findings(root, final, events), [])
             self.assertEqual(_live_solo_judgment(0, [], events), "PASS")
+
+            failed_command_events = [
+                {**event, "item": dict(event["item"])}
+                if isinstance(event.get("item"), dict) else event
+                for event in events
+            ]
+            failed_command_events[0]["item"].update(exit_code=1, status="failed")
+            findings = _live_solo_findings(root, final, failed_command_events)
+            self.assertTrue(any("O1 command/result event" in item for item in findings), findings)
+            self.assertEqual(_live_solo_judgment(0, findings, failed_command_events), "FAIL")
+
             (root / "totals.json").unlink()
             findings = _live_solo_findings(root, final, events)
             self.assertTrue(any("O2 totals.json is missing" in item for item in findings), findings)
@@ -683,22 +704,22 @@ class LiveSoloContinuationTest(unittest.TestCase):
             root = Path(tmp).resolve()
             (root / "rows.csv").write_text(
                 "category,value\nA,2\nB,5\nA,7\nC,4\nB,1\nC,8\n", encoding="utf-8")
-            (root / "first.txt").write_text("TODO: first item\nReviewed\n", encoding="utf-8")
-            (root / "second.txt").write_text("TODO: second item\nTODO: third item\n", encoding="utf-8")
-            (root / "third.txt").write_text("No TODO items\n", encoding="utf-8")
+            for name, body in LIVE_TODO_FIXTURES.items():
+                (root / name).write_text(body, encoding="utf-8")
+            self.assertNotIn("TODO", LIVE_TODO_FIXTURES["third.txt"])
             request = (
                 "Finite solo work request. Approved endpoint: report. No implementation, "
                 "deployment, or merge work. Complete these three distinct duties and then "
                 "report the status of O1, O2, and O3. This request has no done_when field.\n\n"
                 "O1 (first, a small quick-like check): run exactly "
-                "python3 -c 'print(sum([1,2]))' and record the observed result 3.\n\n"
+                "python3 -c 'print(sum([1,2]))' and record its observed output.\n\n"
                 f"O2 (remaining calculation): read all six rows in {root / 'rows.csv'}, "
-                "compute count 6, total 27, and group totals A=9, B=6, C=12; write "
+                "compute the row count, sum of values, and per-category totals; write "
                 f"{root / 'totals.json'} as JSON with fields count, total, and groups.\n\n"
                 "O3 (remaining exhaustive inspection and report): inspect each of these "
                 f"three text files using commands that name the file: {root / 'first.txt'}, "
-                f"{root / 'second.txt'}, and {root / 'third.txt'}. Record all three per-file "
-                f"TODO counts (1, 2, 0), total 3, and command/evidence references in "
+                f"{root / 'second.txt'}, and {root / 'third.txt'}. Record the TODO count "
+                "found in each file, their summed total, and command/evidence references in "
                 f"{root / 'coverage.md'}. Use a table with file, TODO count, and evidence columns."
             )
             assignment = WB.assignment_prompt(SimpleNamespace(worker_type="owner"), request, {})
