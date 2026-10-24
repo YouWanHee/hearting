@@ -424,7 +424,9 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
                            "--artifact-root", str(self.artifact_root), "--unassigned", "--jobs", str(self.jobs)])
         self.assertEqual(len(self.route_files()), 1)
         self.assertEqual(len(self.start_calls), 1)
-        self.assertEqual(len(self.owner_attempt_rows()), 1)
+        # Only the framed route's own frame legs launched; the refused routes wrote none.
+        frame_legs = [node for node in frame_route["nodes"] if node["id"] != "route-decision"]
+        self.assertEqual(len(self.owner_attempt_rows()), len(frame_legs))
         self.assertFalse(project.with_name(project.name + "-wt").exists())
 
     def test_non_git_direct_cleans_dispatch_hints_and_preserves_explicit_capability(self):
