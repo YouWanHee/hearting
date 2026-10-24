@@ -854,7 +854,7 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
             + "\nThe commands use the shared, runtime-neutral registry harvest compatibility surface; "
               "it does not select or change the owner or child harness. "
               "Continue the authorized work within its existing human gates. "
-              "This receipt creates no new approval step.")
+              "Receipt/ACK isn't execution. This receipt creates no new approval step.")
 
 
 def _project_legacy_receipt(receipt, jobs: Path, parent_attempt_id: str):

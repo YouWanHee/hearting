@@ -120,7 +120,9 @@ class NoticeTest(unittest.TestCase):
     def test_missing_materialization_holds_only_for_wall_clock_grace(self):
         records, ids = self._success_batch_fixture(materialize_sibling=False)
         lines = self.jobs.read_text().splitlines()
-        now = time.monotonic_ns()
+        # Offset keeps now - age positive on a freshly booted host (monotonic
+        # clock below 900 s), where a non-positive stamp is treated as missing.
+        now = time.monotonic_ns() + 2000 * 1_000_000_000
         fields = lines[1].split("\t")
         for age, expected in ((899, True), (901, False)):
             metadata = fields[5].split(",")
