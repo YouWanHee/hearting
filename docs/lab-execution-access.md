@@ -95,8 +95,9 @@ extra stage, parallel leg도 포함된다. 카탈로그 선언이 compute 판단
 
 새 route의 한 선택은 prospective readiness, sealed `codex_execution_sandbox`,
 실제 exec/App Server 실행, GPU lease admission에 함께 쓰인다. 이미 봉인된 route는
-seal의 GPU 범위와 sandbox를 유지한다. seal이 없는 역사 route는 checked Codex
-parent tuple의 sandbox를 유지하고 compute 접근을 소급해서 넓히지 않는다. 같은
+seal의 GPU 범위와 sandbox를 유지한다. seal이 없는 역사 route는 기존 owner sandbox
+선택을 유지하며, checked Codex parent tuple만으로 sandbox를 바꾸거나 compute 접근과
+GPU lease를 소급해서 만들지 않는다. 같은
 cycle의 lab 또는 code suffix owner는 완료 prefix의 seal을 이어받으며 그 아래
 비-compute child는 기본값을 유지한다. Caller의 기존 `--sandbox`,
 `CODEX_DISPATCH_SANDBOX`, `CODEX_DISPATCH_SANDBOX_FORCE` precedence는 보존하고

@@ -174,27 +174,28 @@ class GpuSandboxTest(unittest.TestCase):
         self.assertFalse(G.select(old)["gpu_scope"])
         historical = {"capability": "autopilot-code", "nodes": nodes,
             "dispatch_evidence": {"tuples": [{"parent_harness": "codex",
-                "parent_sandbox": "workspace-write"}]}}
-        self.assertEqual(G.select(historical)["source"], "historical-dispatch-evidence")
+                "parent_sandbox": "workspace-write"}, {"parent_harness": "codex",
+                "parent_sandbox": "danger-full-access"}]}}
+        self.assertEqual(G.select(historical)["source"], "default")
         self.assertEqual(G.select(historical)["sandbox"], "workspace-write")
+        self.assertFalse(G.select(historical)["gpu_scope"])
         self.assertEqual(G.gpu_resource_nodes(historical), [])
 
-    def test_historical_workspace_tuple_is_applied_and_checked_without_resealing(self):
-        choice = {**G.select_fresh(self.route), "sandbox": "workspace-write"}
-        evidence = self.evidence(choice)
-        self.route["dispatch_evidence"] = evidence
-        self.route.pop("codex_execution_sandbox", None)
+    def test_preseal_eval_route_keeps_owner_sandbox_and_does_not_add_gpu_or_lease(self):
+        self.route["nodes"] = [{"id": "eval-run", "part": "autopilot-lab:eval-run",
+                                "kind": "resource-runner"}]
+        self.route["dispatch_evidence"] = {"tuples": [
+            {"parent_harness": "codex", "parent_sandbox": "danger-full-access"},
+            {"parent_harness": "codex", "parent_sandbox": "workspace-write"}]}
         args = self.args()
+        original_sandbox = args.sandbox
         original = self.route_file.read_bytes()
         C.apply_gpu_execution_sandbox(args)
-        self.assertEqual("workspace-write", args.sandbox)
+        self.assertEqual(original_sandbox, args.sandbox)
         self.assertFalse(args.gpu_execution_scope)
-        node = {"dispatch_depth": 2, "fallback_hops": R._fallback_chain(
-            evidence, expected_worktree=self.worktree, require_scope=True)}
-        D.resolve_checked_tuple(self.route, node, "codex", {"parent_harness": "codex",
-            "parent_transport": "headless", "parent_sandbox": "workspace-write"})
+        self.assertIsNone(args.gpu_execution_selection)
+        self.assertEqual([], G.gpu_resource_nodes(self.route))
         self.assertEqual(original, self.route_file.read_bytes())
-        self.assertNotIn("codex_execution_sandbox", self.route)
 
     def test_existing_override_precedence_is_shared(self):
         choice = G.select(self.route, requested="read-only", environ={
@@ -259,6 +260,7 @@ class GpuSandboxTest(unittest.TestCase):
         with self.assertRaisesRegex(D.DispatchNodeError, "dispatch-evidence-parent-runtime-mismatch"):
             D.resolve_checked_tuple(self.route, node, "codex", {"parent_harness": "codex",
                 "parent_transport": "headless", "parent_sandbox": "danger-full-access"})
+        self.route["codex_execution_sandbox"] = G.select_fresh(self.route)
         args = self.args(sandbox="danger-full-access",
                          replacement_input_argv=["--sandbox", "danger-full-access"])
         with self.assertRaises(C.DispatchContractError) as raised:
@@ -482,7 +484,7 @@ class GpuSandboxTest(unittest.TestCase):
             rows = A.advisories(self.route, owner_harness="codex",
                 sandbox="danger-full-access" if applied else None, gpu_selection=G.select(self.route))
             row = next(r for r in rows if r["code"] == G.RECEIPT_CODE)
-            self.assertIn("OS enforcement 없음", row["message"])
+            self.assertIn("OS enforcement가 없습니다", row["message"])
             self.assertEqual(row["file_enforcement"], "none")
             self.assertEqual(A.receipt_advisories(A.RECEIPT_KEY + json.dumps(row)), [row])
 

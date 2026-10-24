@@ -61,13 +61,13 @@ def _choice(route, *, node, owner, requested, environ, historical):
         mode = sealed.get("sandbox", "workspace-write") if scoped else "workspace-write"
         source = sealed.get("source", "sealed-selection") if scoped else "default"
     elif historical and codex_rows:
-        modes = {row.get("parent_sandbox") for row in codex_rows}
-        if len(modes) != 1 or next(iter(modes)) not in MODES:
-            raise ValueError("dispatch-evidence-parent-runtime-mismatch")
+        # Before the explicit sandbox seal existed, checked tuples did not
+        # select an owner sandbox. Keep those routes on the ordinary path;
+        # tuple/runtime agreement remains the dispatch contract's concern.
         targets = []
         scoped = False
-        mode = next(iter(modes)) if owner else "workspace-write"
-        source = "historical-dispatch-evidence" if owner else "default"
+        mode = "workspace-write"
+        source = "default"
     else:
         targets = fresh_gpu_resource_nodes(route)
         scoped = (bool(targets) and (owner or node in targets))
@@ -109,12 +109,12 @@ def advisory(route, *, owner_harness=None, selection=None, applied=False):
     if owner not in {"auto", "codex"}:
         return []
     mode = choice["sandbox"]
-    message = (f"Codex compute GPU: {mode} ({choice['source']}); target owner and compute resource nodes "
+    message = (f"Codex compute GPU: {mode} ({choice['source']}); 대상 owner와 compute resource node: "
                + ", ".join(choice["gpu_resource_nodes"]) + ". ")
     if mode == "danger-full-access":
-        message += "filesystem/network OS enforcement 없음; approved roots and child≤parent are logical boundaries. "
+        message += "filesystem/network OS enforcement가 없습니다. 승인된 root와 child≤parent는 논리적 경계입니다. "
     else:
-        message += "NVIDIA devices may not be visible in the selected Codex sandbox. "
-    message += "Outer or managed runtime constraints remain; selection does not guarantee GPU availability."
+        message += "선택된 Codex sandbox에서 NVIDIA 장치가 보이지 않을 수 있습니다. "
+    message += "외부 또는 관리형 runtime 제약은 계속 적용되며, 선택이 GPU 사용 가능성을 보장하지는 않습니다."
     return [{"code": RECEIPT_CODE, "phase": "applied" if applied else "prospective",
              "owner_harness": owner, **choice, "message": message}]

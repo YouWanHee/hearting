@@ -808,10 +808,7 @@ def apply_gpu_execution_sandbox(args: argparse.Namespace) -> None:
     selection = GPU_SANDBOX.select(
         route, owner=owner, node=getattr(args, "route_node", None),
         requested=args.sandbox if cli_explicit else None)
-    historical_owner_tuple = (owner and not route.get("codex_execution_sandbox")
-        and any(row.get("parent_harness") == "codex"
-                for row in (route.get("dispatch_evidence") or {}).get("tuples", [])))
-    if not selection["gpu_scope"] and not historical_owner_tuple:
+    if not selection["gpu_scope"]:
         return
     if owner:
         for row in (route.get("dispatch_evidence") or {}).get("tuples", []):

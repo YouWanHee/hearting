@@ -35,9 +35,9 @@ import dispatch_stage_advance as ADVANCE  # noqa: E402
 
 GOLDEN = HERE / "fixtures" / "sd165-route-golden.json"
 GPU_EVAL_ADVISORY = (
-    "  Codex compute GPU: danger-full-access (gpu-compute-resource); target owner and compute resource nodes eval-run. "
-    "filesystem/network OS enforcement 없음; approved roots and child≤parent are logical boundaries. "
-    "Outer or managed runtime constraints remain; selection does not guarantee GPU availability."
+    "  Codex compute GPU: danger-full-access (gpu-compute-resource); 대상 owner와 compute resource node: eval-run. "
+    "filesystem/network OS enforcement가 없습니다. 승인된 root와 child≤parent는 논리적 경계입니다. "
+    "외부 또는 관리형 runtime 제약은 계속 적용되며, 선택이 GPU 사용 가능성을 보장하지는 않습니다."
 )
 GOLDEN_KEYS = (
     "parallel_groups", "completion_gates", "human_gates", "human_gate_bindings",
@@ -313,9 +313,9 @@ class HistoricalGpuExceptionTest(unittest.TestCase):
         self.assertEqual(card, self.OLD_CARD + "\n" + GPU_EVAL_ADVISORY)
         for old, new in (("danger-full-access", "workspace-write"),
                 ("gpu-compute-resource", "caller-cli"), ("gpu-compute-resource", "forced-env"),
-                ("nodes eval-run", "nodes full-run"),
-                ("OS enforcement 없음", "OS enforcement enforced"),
-                ("logical boundaries", "OS boundaries")):
+                ("compute resource node: eval-run", "compute resource node: full-run"),
+                ("OS enforcement가 없습니다", "OS enforcement가 적용됩니다"),
+                ("논리적 경계", "OS 경계")):
             changed = card.replace(old, new)
             self.assertNotEqual(changed, card, (old, new))
             with self.subTest(old=old, new=new), self.assertRaises(AssertionError):
