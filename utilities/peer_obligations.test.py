@@ -201,8 +201,32 @@ class ObligationStoreTest(unittest.TestCase):
 
         tomb = pending.tombstone_path(pending.record_path(jobs.parent, storage, delivery_id))
         tomb.parent.mkdir(parents=True, exist_ok=True)
-        tomb.write_text(json.dumps({"delivery_id": delivery_id, "attempt_ids": [attempt],
-                                    "terminal_state": "expired"}), encoding="utf-8")
+        tomb.write_text(json.dumps({
+            "schema": pending.PRUNE_TOMBSTONE_SCHEMA,
+            "delivery_id": delivery_id,
+            "recipient_digest": "wrong-recipient",
+            "attempt_ids": [attempt],
+            "parent_attempt_id": "att-parent",
+            "terminal_state": "expired",
+        }), encoding="utf-8")
+        with mock.patch("dispatch_completion_join.current_attempt_row", return_value=row), \
+             mock.patch("dispatch_seat_handover.effective_parent", return_value="sid-parent"), \
+             mock.patch("dispatch_pending_delivery.read", return_value=None), \
+             mock.patch.object(obligations, "ensure_normal_runner") as ensure, \
+             mock.patch.object(obligations.ObligationStore, "create", autospec=True) as create:
+            self.assertTrue(obligations.retain_registered_completion(
+                jobs, attempt, "sid-parent", carrier))
+        create.assert_called_once()
+        ensure.assert_called_once()
+
+        tomb.write_text(json.dumps({
+            "schema": pending.PRUNE_TOMBSTONE_SCHEMA,
+            "delivery_id": delivery_id,
+            "recipient_digest": pending.recipient_digest(storage),
+            "attempt_ids": [attempt],
+            "parent_attempt_id": "att-parent",
+            "terminal_state": "expired",
+        }), encoding="utf-8")
         with mock.patch("dispatch_completion_join.current_attempt_row", return_value=row), \
              mock.patch("dispatch_seat_handover.effective_parent", return_value="sid-parent"), \
              mock.patch("dispatch_pending_delivery.read", return_value=None), \

@@ -7182,11 +7182,39 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
         delivery_id = row.metadata.get("delivery_id", "")
         record = pending.read(jobs.parent, storage_recipient, delivery_id)
         if record is None:
-            store.update(duty["id"], state="unknown",
-                         observation={**observation,
-                                      "reason": "completion-delivery-record-unavailable",
-                                      "delivery_id": delivery_id})
-            return
+            terminal_state = peer_obligations._registered_terminal_state(
+                jobs.parent, storage_recipient, delivery_id, row.attempt_id,
+                row.metadata, intent["carrier"])
+            if terminal_state is not None:
+                store.update(duty["id"], state="complete", delivery=terminal_state,
+                             cleanup="complete")
+                return
+            # Terminal-close materialization is idempotent. Use it only for a
+            # missing exact record; _reconcile_obligations backs off an unknown
+            # duty if this bounded recovery attempt still cannot restore source.
+            from dispatch_completion_join import materialize_after_terminal_close
+            materialize_after_terminal_close(jobs, row.attempt_id)
+            record = pending.read(jobs.parent, storage_recipient, delivery_id)
+            expected_digest = row.metadata.get("delivery_receipt_digest")
+            expected_revision = row.metadata.get("delivery_row_revision")
+            try:
+                if record is not None:
+                    pending.received_ack_identity(record, storage_recipient, delivery_id)
+            except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+                record = None
+            if (record is None
+                    or record.get("recipient_kind") != intent["carrier"]
+                    or row.attempt_id not in (record.get("attempt_ids") or [])
+                    or not expected_digest
+                    or record.get("receipt_digest") != expected_digest
+                    or not expected_revision
+                    or (record.get("row_revisions") or {}).get(row.attempt_id)
+                        != expected_revision):
+                store.update(duty["id"], state="unknown",
+                             observation={**observation,
+                                          "reason": "completion-delivery-record-unavailable",
+                                          "delivery_id": delivery_id})
+                return
         if record and record.get("state") in {"acked", "rejected", "expired"}:
             if record.get("state") == "acked" and _resume_native_receiving_turn(
                     duty, store, row, record, recipient_sid, storage_recipient):

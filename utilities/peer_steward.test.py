@@ -10592,6 +10592,77 @@ class NativeReceivingTurnRecoveryTest(_TmpRootMixin, unittest.TestCase):
         duty = store.update(duty_id, observation={"native_receiving_turn": binding})
         return store, duty, aid, sid
 
+    def test_present_registered_record_does_not_rematerialize(self):
+        import dispatch_completion_join as join
+        store, duty, _aid, sid = self._duty()
+        with mock.patch.object(join, "materialize_after_terminal_close") as materialize, \
+             mock.patch("dispatch_seat_handover.effective_parent", return_value=sid), \
+             mock.patch.object(peer_steward, "_resume_native_receiving_turn", return_value=False):
+            peer_steward._resume_registered_obligation(duty, store)
+        materialize.assert_not_called()
+        self.assertEqual(store.get(duty["id"])["state"], "complete")
+
+    def test_missing_registered_record_recovers_after_transient_materialization_failure(self):
+        import dispatch_completion_join as join
+        import dispatch_pending_delivery as pending
+        store, duty, aid, sid = self._duty()
+        exact = pending.read(self.tmp_root, sid, "delivery-native-crash")
+        path = pending.record_path(self.tmp_root, sid, "delivery-native-crash")
+        path.unlink()
+        attempts = 0
+
+        def recover_once(jobs, attempt_id):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 2:
+                restored = pending.create(
+                    self.tmp_root,
+                    recipient_kind=exact["recipient_kind"], recipient_key=sid,
+                    delivery_id=exact["delivery_id"],
+                    session_generation=exact["session_generation"],
+                    session_generation_supported=exact["session_generation_supported"],
+                    attempt_ids=exact["attempt_ids"],
+                    parent_attempt_id=exact["parent_attempt_id"],
+                    route_id=exact["route_id"], route_node=exact["route_node"],
+                    receipt=exact["receipt"], receipt_digest=exact["receipt_digest"],
+                    row_revisions=exact["row_revisions"], lineage=exact.get("lineage", []))
+                pending.claim(self.tmp_root, sid, restored["delivery_id"],
+                              claim_owner="fixture", lease_seconds=30)
+                pending.ack(self.tmp_root, sid, restored["delivery_id"],
+                            acked_by="codex-native-prompt:" + sid)
+
+        with mock.patch.object(join, "materialize_after_terminal_close",
+                               side_effect=recover_once) as materialize, \
+             mock.patch("dispatch_seat_handover.effective_parent", return_value=sid), \
+             mock.patch.object(peer_steward, "_resume_native_receiving_turn", return_value=False):
+            peer_steward._resume_registered_obligation(store.get(duty["id"]), store)
+            self.assertEqual(store.get(duty["id"])["state"], "unknown")
+            peer_steward._resume_registered_obligation(store.get(duty["id"]), store)
+
+        self.assertEqual(materialize.call_count, 2)
+        self.assertEqual(pending.read(self.tmp_root, sid, "delivery-native-crash")["state"], "acked")
+        current = store.get(duty["id"])
+        self.assertEqual((current["state"], current["delivery"]), ("complete", "acked"))
+
+    def test_matching_terminal_tombstone_is_never_rematerialized(self):
+        import dispatch_completion_join as join
+        import dispatch_pending_delivery as pending
+        store, duty, _aid, sid = self._duty()
+        path = pending.record_path(self.tmp_root, sid, "delivery-native-crash")
+        exact = pending.read(self.tmp_root, sid, "delivery-native-crash")
+        pending._write_prune_tombstone(path, exact)
+        path.unlink()
+
+        with mock.patch.object(join, "materialize_after_terminal_close") as materialize, \
+             mock.patch("dispatch_seat_handover.effective_parent", return_value=sid):
+            peer_steward._resume_registered_obligation(duty, store)
+            peer_steward._resume_registered_obligation(store.get(duty["id"]), store)
+
+        materialize.assert_not_called()
+        self.assertIsNone(pending.read(self.tmp_root, sid, "delivery-native-crash"))
+        current = store.get(duty["id"])
+        self.assertEqual((current["state"], current["delivery"]), ("complete", "acked"))
+
     def _run_empty_native_recovery(self, request_context, native_items=()):
         import codex_queue_delivery
         import codex_queue_dispatch

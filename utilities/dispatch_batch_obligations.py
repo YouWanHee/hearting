@@ -741,15 +741,15 @@ class OwnerSettlementReadContext:
         queue = self._dependency_queues.get(root)
         if not queue:
             return any(item_root == root for item_root, _attempt in self._invalidated_owners)
-        checked = 0
+        examined = 0
         invalidated = False
-        while queue and checked < _SETTLED_DEPENDENCY_CHECKS_PER_PASS:
+        while queue and examined < _SETTLED_DEPENDENCY_CHECKS_PER_PASS:
             key = queue.popleft()
             self._dependency_queued.discard(key)
+            examined += 1
             entry = self._settled.get(key)
             if entry is None:
                 continue
-            checked += 1
             if not self._dependencies_current(entry):
                 self._metrics["dependency_invalidations"] += 1
                 self._invalidated_owners.add(key)
@@ -830,20 +830,24 @@ class OwnerSettlementReadContext:
         key = str(jobs.resolve(strict=False))
         prior = self._seen.get(key)
         stamp = _registry_stamp(jobs)
-        if prior is None or stamp is None or stamp != prior[0]:
-            return True
-        if any(root == key for root, _attempt in self._active_owners):
-            return True
-        for metadata in prior[1]:
-            try:
-                if not lease_is_held(jobs, metadata):
-                    return True
-            except Exception:
-                return True
-        # Registry changes select only their related owner rows. Check a
-        # bounded rotating dependency batch on unchanged passes so settled
-        # history does not add work behind unrelated appends.
-        return self._validate_settled_dependency_batch(jobs)
+        scan = prior is None or stamp is None or stamp != prior[0]
+        active_owner = any(root == key for root, _attempt in self._active_owners)
+        if active_owner:
+            scan = True
+        # A full candidate scan below rechecks each candidate's lease itself;
+        # only the unchanged fast path needs this cached lease probe.
+        if prior is not None and not scan:
+            for metadata in prior[1]:
+                try:
+                    if not lease_is_held(jobs, metadata):
+                        scan = True
+                except Exception:
+                    scan = True
+        # Advance the bounded rotating batch on every pass. Registry changes
+        # and active owners also need full candidate selection, but neither can
+        # defer dependency invalidation indefinitely.
+        dependency_changed = self._validate_settled_dependency_batch(jobs)
+        return scan or dependency_changed
 
     def cached_signatures(self, jobs: Path):
         prior = self._seen.get(str(jobs.resolve(strict=False)))

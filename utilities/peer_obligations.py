@@ -733,13 +733,16 @@ def _write_atomic(path: Path, value: dict, *, dir_fd: int | None = None) -> None
                 os.unlink(temporary_name, dir_fd=dir_fd)
 
 
-def _registered_terminal_source(root, storage, delivery_id, attempt_id, metadata,
-                                carrier):
-    """Prove an exact terminal delivery before dedup creates a replacement duty."""
+def _registered_terminal_state(root, storage, delivery_id, attempt_id, metadata,
+                               carrier):
+    """Return the state of an exactly bound terminal delivery source, if present."""
     import dispatch_pending_delivery as pending
     root, storage = Path(root), str(storage or "")
     if not storage or not isinstance(delivery_id, str) or not delivery_id:
-        return False
+        return None
+    expected_kind = metadata.get("delivery_recipient_kind")
+    if expected_kind and expected_kind != carrier:
+        return None
     try:
         exact = pending.read(root, storage, delivery_id)
         if exact is not None:
@@ -747,24 +750,37 @@ def _registered_terminal_source(root, storage, delivery_id, attempt_id, metadata
                     or exact.get("recipient_kind") != carrier
                     or attempt_id not in (exact.get("attempt_ids") or [])
                     or exact.get("state") not in {"acked", "rejected", "expired"}):
-                return False
+                return None
             expected_digest = metadata.get("delivery_receipt_digest")
             expected_revision = metadata.get("delivery_row_revision")
             if expected_digest and exact.get("receipt_digest") != expected_digest:
-                return False
+                return None
             if (expected_revision and (exact.get("row_revisions") or {}).get(attempt_id)
                     != expected_revision):
-                return False
+                return None
             pending.received_ack_identity(exact, storage, delivery_id)
-            return True
+            return exact["state"]
         tombstone = pending.tombstone_path(
             pending.record_path(root, storage, delivery_id))
         value = json.loads(tombstone.read_text(encoding="utf-8"))
-        return bool(value.get("delivery_id") == delivery_id
-                    and attempt_id in (value.get("attempt_ids") or [])
-                    and value.get("terminal_state") in {"acked", "rejected", "expired"})
+        expected_parent = metadata.get("parent_attempt_id")
+        if (value.get("schema") != pending.PRUNE_TOMBSTONE_SCHEMA
+                or value.get("delivery_id") != delivery_id
+                or value.get("recipient_digest") != pending.recipient_digest(storage)
+                or attempt_id not in (value.get("attempt_ids") or [])
+                or (expected_parent and value.get("parent_attempt_id") != expected_parent)
+                or value.get("terminal_state") not in {"acked", "rejected", "expired"}):
+            return None
+        return value["terminal_state"]
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
-        return False
+        return None
+
+
+def _registered_terminal_source(root, storage, delivery_id, attempt_id, metadata,
+                                carrier):
+    """Prove an exact terminal delivery before dedup creates a replacement duty."""
+    return _registered_terminal_state(
+        root, storage, delivery_id, attempt_id, metadata, carrier) is not None
 
 
 def retain_registered_completion(jobs, attempt_id, session_id, carrier, *, holder=None,

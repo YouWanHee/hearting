@@ -631,6 +631,57 @@ class BatchObligationTest(unittest.TestCase):
         self.assertTrue(any(signature[2] == "att-owner" for signature in resumed))
         self.assertEqual(pending.call_count, 3)
 
+    def test_dependency_sweep_progresses_during_appends_and_an_active_owner(self):
+        settled_count = obligations._SETTLED_DEPENDENCY_CHECKS_PER_PASS + 1
+        target = f"att-settled-{settled_count - 1:03d}"
+        rows = [self._runtime_owner_row(f"att-settled-{index:03d}")
+                for index in range(settled_count)]
+        rows.append(self._runtime_owner_row("att-active", status="open"))
+        self.jobs.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        dependencies = {}
+        for index in range(settled_count):
+            path = self.base / f"terminal-evidence-{index:03d}.json"
+            path.write_text("sealed", encoding="utf-8")
+            dependencies[f"att-settled-{index:03d}"] = path
+        context = obligations.OwnerSettlementReadContext()
+        historical = []
+        target_checks = 0
+
+        def owner_pending(_jobs, _status, metadata):
+            nonlocal target_checks
+            attempt_id = metadata["attempt_id"]
+            historical.append(attempt_id)
+            if attempt_id == target:
+                target_checks += 1
+                return target_checks > 1
+            return False
+
+        with mock.patch.object(obligations, "_owner_settlement_dependency_paths",
+                               side_effect=lambda _jobs, _status, metadata:
+                                   (dependencies[metadata["attempt_id"]],)), \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending",
+                        side_effect=owner_pending), \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
+             mock.patch("dispatch_contract.supervisor_lease_is_held",
+                        side_effect=lambda _jobs, metadata:
+                            metadata.get("attempt_id") == "att-active"):
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            dependencies[target].write_text("changed", encoding="utf-8")
+
+            passes = (settled_count + obligations._SETTLED_DEPENDENCY_CHECKS_PER_PASS - 1) // \
+                     obligations._SETTLED_DEPENDENCY_CHECKS_PER_PASS
+            for index in range(passes):
+                with self.jobs.open("a", encoding="utf-8") as stream:
+                    stream.write(f"t\tdone\t/repo\t/wt\tchild\t"
+                                 f"attempt_id=att-unrelated-{index}\n")
+                obligations._resume_owner_settlements(self.jobs, context=context)
+
+        self.assertEqual(passes, 2)
+        self.assertEqual(historical.count(target), 3,
+                         "the changed owner is rechecked and sent to settlement")
+        self.assertEqual(context.metrics()["dependency_invalidations"], 1)
+        settle.assert_called_once_with(self.jobs, target)
+
     def test_owner_settlement_accepts_valid_literal_replacement_character(self):
         row = self._runtime_owner_row().replace(
             "completed-supervisor", "completed-supervisor\ufffd")
