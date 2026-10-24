@@ -141,6 +141,24 @@ class OpenCodeRunCodecTest(unittest.TestCase):
                                  for thread in threading.enumerate()))
             self.assertEqual(list(root.iterdir()), [])
 
+    def test_launch_version_probe_rejects_valid_output_from_a_stopped_lease(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            script.write_text(
+                "#!/usr/bin/env python3\nimport os,signal,time\n"
+                "print('opencode 2.0.32',flush=True)\n"
+                "os.kill(os.getppid(),signal.SIGTERM)\n"
+                "time.sleep(30)\n")
+            script.chmod(0o700)
+            with self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                        "opencode-runtime-version-unavailable"):
+                runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertFalse(any(thread.name == "opencode-version-probe-output" and thread.is_alive()
+                                 for thread in threading.enumerate()))
+
     def test_v1_flags_and_v2_provider_variant_are_separate(self):
         v1 = runtime.run_argv(binary="opencode", cwd="/work", agent="build",
                               model="opencode-go/model", variant="high", pure=True,

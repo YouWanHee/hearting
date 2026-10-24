@@ -106,6 +106,8 @@ MEMORY_EXCEEDED_EXIT = 125
 SUBREAPER_UNAVAILABLE_EXIT = 126
 SCOPE_CLEANUP_FAILED_EXIT = 127
 _CLEANUP_ACTIVE = False
+_LAUNCHING = False
+_DEFERRED_STOP: int | None = None
 
 
 def memory_budget_bytes() -> int:
@@ -233,7 +235,11 @@ def wait_within_budget(process: subprocess.Popen[bytes], timeout: float, scope: 
 
 
 def _stop(signum, _frame):
+    global _DEFERRED_STOP
     if _CLEANUP_ACTIVE:
+        return
+    if _LAUNCHING:
+        _DEFERRED_STOP = signum
         return
     raise SystemExit(128 + signum)
 
@@ -250,7 +256,7 @@ def terminate_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    global _CLEANUP_ACTIVE
+    global _CLEANUP_ACTIVE, _LAUNCHING, _DEFERRED_STOP
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, required=True)
     parser.add_argument("--require-subreaper", action="store_true")
@@ -269,40 +275,46 @@ def main(argv: list[str] | None = None) -> int:
     for signum in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, _stop)
     scope = secrets.token_hex(8)
-    process = subprocess.Popen(command, start_new_session=True,
-                               env={**os.environ, SCOPE_ENV: scope})
-    # An adopted descendant that exits is collected at once, so a check that
-    # waits for a fixture to die never sees it lingering as this lease's zombie.
-    signal.signal(signal.SIGCHLD, lambda _signum, _frame: reap_zombies(keep=process.pid))
-    lease = lease_context(command, args.timeout)
+    process: subprocess.Popen | None = None
     lease_path: Path | None = None
-    if lease is not None:
-        lease_path, value = lease
-        identity = process_launch_identity(process.pid)
-        if identity.get("pid_start") and identity.get("pgid") == str(process.pid):
-            value.update(
-                {
-                    "pid": process.pid,
-                    "pid_start": identity["pid_start"],
-                    "pgid": process.pid,
-                }
-            )
-            atomic_json(lease_path, value)
-        else:
-            lease_path = None
     status = 1
+    _CLEANUP_ACTIVE = False
+    _DEFERRED_STOP = None
+    _LAUNCHING = True
     try:
+        # A stop delivered between Popen's return and the assignment must not
+        # lose the child identity. Defer only that window; all setup after it
+        # is already inside this lifetime's cleanup boundary.
+        process = subprocess.Popen(command, start_new_session=True,
+                                   env={**os.environ, SCOPE_ENV: scope})
+        _LAUNCHING = False
+        if _DEFERRED_STOP is not None:
+            raise SystemExit(128 + _DEFERRED_STOP)
+        # Adopted descendants are reaped without taking the command's status.
+        signal.signal(signal.SIGCHLD, lambda _signum, _frame: reap_zombies(keep=process.pid))
+        lease = lease_context(command, args.timeout)
+        if lease is not None:
+            lease_path, value = lease
+            identity = process_launch_identity(process.pid)
+            if identity.get("pid_start") and identity.get("pgid") == str(process.pid):
+                value.update({"pid": process.pid, "pid_start": identity["pid_start"],
+                              "pgid": process.pid})
+                atomic_json(lease_path, value)
+            else:
+                lease_path = None
         status = wait_within_budget(process, args.timeout, scope)
         if status is None:
             terminate_group(process)
             status = 124
     except MemoryError as exc:
         print(exc, file=sys.stderr)
-        terminate_group(process)
+        if process is not None:
+            terminate_group(process)
         status = MEMORY_EXCEEDED_EXIT
     finally:
         _CLEANUP_ACTIVE = True
-        if process.poll() is None:
+        _LAUNCHING = False
+        if process is not None and process.poll() is None:
             terminate_group(process)
         ended = end_scope(scope)
         remaining = sorted(scope_pids(process_table(), scope))

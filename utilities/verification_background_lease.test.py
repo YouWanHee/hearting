@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -88,6 +89,65 @@ class LeaseScopeTest(unittest.TestCase):
         done = self.run_lease([sys.executable, "-c", "print('ok')"])
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "ok"))
         self.assertNotIn("verification-scope-ended", done.stderr)
+
+    def test_term_and_hup_during_spawn_and_lease_publication_end_the_scope(self):
+        for timing in ("spawn", "publication"):
+            for signum in (signal.SIGTERM, signal.SIGHUP):
+                with self.subTest(timing=timing, signum=signum), tempfile.TemporaryDirectory() as td:
+                    base = Path(td)
+                    identity = base / "child.identity"
+                    detached = base / "detached.pid"
+                    lease_file = base / "lease.json"
+                    command = [sys.executable, "-c",
+                        "import subprocess,pathlib,time\n"
+                        f"child=subprocess.Popen(['setsid','env','-i','sleep',{self.marker!r}])\n"
+                        f"pathlib.Path({str(detached)!r}).write_text(str(child.pid))\n"
+                        "time.sleep(60)\n"]
+                    driver = f'''import importlib.util,os,pathlib,signal,sys,time
+sys.path.insert(0,{str(HERE)!r})
+spec=importlib.util.spec_from_file_location("signal_window_lease",{str(LEASE)!r})
+lease=importlib.util.module_from_spec(spec);spec.loader.exec_module(lease)
+real_spawn=lease.subprocess.Popen
+def spawn(*args,**kwargs):
+    child=real_spawn(*args,**kwargs)
+    start=lease.process_launch_identity(child.pid).get("pid_start","")
+    pathlib.Path({str(identity)!r}).write_text(str(child.pid)+":"+start)
+    if {timing!r}=="spawn": os.kill(os.getpid(),{int(signum)})
+    return child
+lease.subprocess.Popen=spawn
+if {timing!r}=="publication":
+    real_write=lease.atomic_json
+    lease.lease_context=lambda *args:(pathlib.Path({str(lease_file)!r}),{{}})
+    def write(path,value):
+        real_write(path,value)
+        deadline=time.monotonic()+5
+        while not pathlib.Path({str(detached)!r}).exists():
+            if time.monotonic()>=deadline: raise RuntimeError("fixture child did not start")
+            time.sleep(.01)
+        os.kill(os.getpid(),{int(signum)})
+    lease.atomic_json=write
+raise SystemExit(lease.main(["--timeout","20","--",*{command!r}]))
+'''
+                    try:
+                        done = subprocess.run([sys.executable, "-c", driver],
+                            capture_output=True, text=True, timeout=30)
+                        self.assertEqual(done.returncode, 128 + signum, done.stderr)
+                        pid, _start = identity.read_text().split(":")
+                        self.assertFalse(Path(f"/proc/{pid}").exists())
+                        if detached.exists():
+                            self.assertFalse(Path(f"/proc/{detached.read_text()}").exists())
+                        self.assertFalse(lease_file.exists())
+                        self.assertEqual(marked(self.marker), [])
+                    finally:
+                        if identity.exists():
+                            pid, start = identity.read_text().split(":")
+                            current = L.process_launch_identity(int(pid))
+                            if start and current.get("pid_start") == start:
+                                try:
+                                    os.killpg(int(pid), signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                        self.kill_marked()
 
     def test_required_subreaper_failure_does_not_start_the_command(self):
         with mock.patch.object(L, "become_subreaper", return_value=False), \
