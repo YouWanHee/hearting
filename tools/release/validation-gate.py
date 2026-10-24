@@ -85,7 +85,8 @@ def admit(event: dict, context: Mapping[str, str], *, api=None) -> dict[str, str
     ref = context.get("GITHUB_REF", "")
     version_tag = ref.startswith("refs/tags/v")
     _require((kind == "push" and version_tag)
-             or (kind == "workflow_dispatch" and ref == "refs/heads/main"),
+             or (kind == "workflow_dispatch"
+                 and (ref == "refs/heads/main" or version_tag)),
              "release requires a version tag or manual main invocation")
     head = _sha(context.get("GITHUB_SHA"))
     if kind == "push":

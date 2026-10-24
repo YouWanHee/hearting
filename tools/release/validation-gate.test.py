@@ -92,6 +92,19 @@ class ReleaseGateTest(unittest.TestCase):
                 self.assertEqual(GATE.admit(event, context, api=lambda _: {}),
                                  {"head": HEAD, "validation_required": "true"})
 
+    def test_tag_ref_dispatch_requires_full_checks_without_api_reuse(self):
+        for ref in ("refs/tags/v1.2.3", "refs/tags/v1.2.0-rc.1"):
+            with self.subTest(ref=ref):
+                context = dict(self.context, GITHUB_REF=ref)
+                calls = []
+                event = {"repository": REPO}
+                result = GATE.admit(
+                    event, context,
+                    api=lambda endpoint: calls.append(endpoint) or self.checks_run(),
+                )
+                self.assertEqual(result, {"head": HEAD, "validation_required": "true"})
+                self.assertEqual(calls, [])
+
     def test_annotated_tag_object_does_not_replace_runner_commit(self):
         context = dict(self.context, GITHUB_EVENT_NAME="push", GITHUB_REF="refs/tags/v1.2.3")
         event = {"repository": REPO, "ref": "refs/tags/v1.2.3", "after": HEAD, "deleted": False}
@@ -102,7 +115,6 @@ class ReleaseGateTest(unittest.TestCase):
                 ("push", "refs/heads/main", TIP, False),
                 ("pull_request", "refs/heads/main", TIP, False),
                 ("workflow_dispatch", "refs/heads/feature", TIP, False),
-                ("workflow_dispatch", "refs/tags/v1.2.3", TIP, False),
                 ("push", "refs/tags/v1.2.3", TIP, True)):
             with self.subTest(kind=kind, ref=ref, after=after, deleted=deleted):
                 context = dict(self.context, GITHUB_EVENT_NAME=kind, GITHUB_REF=ref)

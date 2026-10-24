@@ -4,7 +4,8 @@ Hearting releases are immutable delivery points, not snapshots of every
 documentation change. Merging to `main` and completing Checks do not publish a
 release. An input-free `workflow_dispatch` request on `main` prepares one
 release for that exact commit; until a request is made, the current latest
-release remains available.
+release remains available. A manual run on an existing `v*` tag ref remains
+available for retrying or resuming that tag's workflow.
 
 ## Version decision
 
@@ -45,7 +46,8 @@ gh workflow run release.yml --repo dmlguq456/hearting --ref main
 ```
 
 The admission job looks for up to 20 exact-SHA `main` push runs of the existing
-Checks workflow. A result is reused only when its workflow name and path,
+Checks workflow only for a manual request on `main`. A result is reused only
+when its workflow name and path,
 event, branch, completion and success state, full `head_sha`,
 `head_commit.id`, and repository and head repository names and IDs all match.
 The existing main Checks policy may skip expensive suites for documentation
@@ -56,9 +58,10 @@ or execute candidate code.
 If no trusted result exists, or the Actions API is missing, malformed, or
 unavailable, the request runs the existing reusable Checks workflow on the
 same requested SHA. Invalid repository, event, ref, or SHA identity is denied
-before lookup. Tag pushes always run the full reusable Checks workflow. The
-admission job has only `contents: read` and `actions: read`; write access stays
-in the serialized release job.
+before lookup. Tag pushes and manual runs on `v*` tag refs always run the full
+reusable Checks workflow; tag runs never reuse main Checks. The admission job
+has only `contents: read` and `actions: read`; write access stays in the
+serialized release job.
 
 The planner refreshes tags, finds the published stable baseline, computes all
 release relevant changes since that tag, then reserves an annotated version
@@ -72,7 +75,12 @@ the planner to refresh and recalculate.
 
 The workflow builds the four release assets from the admitted source SHA,
 publishes with `--verify-tag` and generated notes, then invokes the existing
-post publish smoke test with that exact version. Consumers keep the existing
+post publish smoke test with that exact version. A version-tag run validates
+and uses the version already selected by the ref; it does not reinterpret or
+recalculate a human-chosen version. Existing prerelease tag pushes, such as
+`v1.2.0-rc.1`, continue to publish as prereleases through this same tag path;
+this preserves existing SemVer behavior and adds no separate rc workflow or
+release path. Consumers keep the existing
 `latest` and exact `--version` installation behavior, checksums, and pinned
 runtime roots.
 
@@ -80,6 +88,8 @@ For the first public release, complete the existing public readiness work
 before a maintainer pushes `v4.0.0` at the prepared exact `main` commit. The
 tag path validates the chosen commit and version. It works even if that same
 commit has already been published under v3 or contains only documentation.
+A manual run on that existing version-tag ref follows the same tag validation
+and full Checks path, for retry or resume.
 
 After an input free request, observe that workflow run and its summary, verify
 the exact published release metadata, then update and verify the local install
