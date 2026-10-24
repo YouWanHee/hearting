@@ -28,6 +28,7 @@ CACHE_MODULE_RELATIVE = Path("utilities") / "dispatch_registry_cache.py"
 WINDOWS = ("cold_start", "warm_unchanged_12s", "unrelated_event_12s")
 ROLES = ("carrier", "readiness-helper", "peer-watch", "shared-runner")
 RETAINED_FIXTURE_BYTES = 28 * 1024 * 1024
+SIX_WATCH_LIFECYCLE_CASE = "real-runner-five-stewards-plus-independent-target"
 
 
 def _read_json(path):
@@ -805,18 +806,36 @@ def _selected_registry_view_regression(lifecycle):
         for name in selected)
 
 
-def _lifecycle_errors(lifecycle):
-    errors = []
+def _select_six_watch_lifecycle_fixture(lifecycle):
+    """Select the named six-watch case from a multi-case lifecycle run."""
+    if not isinstance(lifecycle, dict):
+        return None, ["lifecycle evidence is missing"]
+    fixtures = lifecycle.get("fixtures")
+    if not isinstance(fixtures, list):
+        return None, ["six-watch lifecycle fixture list is missing or malformed"]
+    matches = [fixture for fixture in fixtures
+               if isinstance(fixture, dict)
+               and fixture.get("case") == SIX_WATCH_LIFECYCLE_CASE]
+    if not matches:
+        return None, ["six-watch lifecycle fixture is missing"]
+    if len(matches) != 1:
+        return None, ["six-watch lifecycle fixture identity is duplicated or ambiguous"]
+    return matches[0], []
+
+
+def _lifecycle_errors(lifecycle, fixture_selection=None):
     if not isinstance(lifecycle, dict):
         return ["lifecycle evidence is missing"]
+    if fixture_selection is None:
+        fixture_selection = _select_six_watch_lifecycle_fixture(lifecycle)
+    fixture, selection_errors = fixture_selection
+    errors = list(selection_errors)
     if lifecycle.get("tests_run", 0) <= 0 or lifecycle.get("suite_exit_code") != 0:
         errors.append("lifecycle suite did not complete successfully")
     if lifecycle.get("failures") or lifecycle.get("errors"):
         errors.append("lifecycle suite reported failures or errors")
-    fixtures = lifecycle.get("fixtures")
-    if not isinstance(fixtures, list) or len(fixtures) != 1 or not isinstance(fixtures[0], dict):
-        return errors + ["six-watch lifecycle fixture is missing or ambiguous"]
-    fixture = fixtures[0]
+    if fixture is None:
+        return errors
     if fixture.get("watch_count") != 6 or fixture.get("same_target_count") != 5:
         errors.append("lifecycle fixture did not exercise five shared watches and one control")
     if fixture.get("distinct_stewards") != 6:
@@ -932,12 +951,17 @@ def _candidate_runner_check(measurement):
     return valid and bool(peaks), peaks
 
 
-def _make_handoff(report, evidence_dir, measurement, lifecycle, cleanup):
+def _make_handoff(report, evidence_dir, measurement, lifecycle, cleanup,
+                  lifecycle_selection=None):
     d1 = report["d1_source_provenance"]
     d1_latency = report.get("d1_attempt_readiness", {})
     d2 = report["d2_shared_observation"]
     d2_cost = report.get("d2_obligation_pass_cost", {})
-    fixture = (lifecycle.get("fixtures") or [{}])[0]
+    if lifecycle_selection is None:
+        lifecycle_selection = _select_six_watch_lifecycle_fixture(lifecycle)
+    selected_lifecycle_fixture, _selection_errors = lifecycle_selection
+    fixture = (selected_lifecycle_fixture
+               if isinstance(selected_lifecycle_fixture, dict) else {})
     metric_rows = report["metric_windows"]
 
     def source_line(side):
@@ -1042,7 +1066,11 @@ def _assemble_report(evidence_dir, baseline_root, measurement_command, lifecycle
         d2_measurement = {}
     provenance_errors = _source_provenance_errors(
         measurement_evidence, baseline_root, ROOT)
-    lifecycle_errors = _lifecycle_errors(lifecycle_evidence)
+    lifecycle_selection = _select_six_watch_lifecycle_fixture(lifecycle_evidence)
+    lifecycle_fixture, _selection_errors = lifecycle_selection
+    if not isinstance(lifecycle_fixture, dict):
+        lifecycle_fixture = {}
+    lifecycle_errors = _lifecycle_errors(lifecycle_evidence, lifecycle_selection)
     lifecycle_errors.extend(_lifecycle_cleanup_errors(lifecycle_cleanup))
     retained_errors = []
     provenance = measurement_evidence.get("source_provenance", {})
@@ -1118,7 +1146,6 @@ def _assemble_report(evidence_dir, baseline_root, measurement_command, lifecycle
     provenance_complete = not provenance_errors
     status = "PASS" if (subcommands_pass and provenance_complete and not matrix_errors
                          and shared_observation_complete and cleanup_complete) else "FAIL"
-    lifecycle_fixture = (lifecycle_evidence.get("fixtures") or [{}])[0]
     report = {
         "schema_version": 2,
         "status": status,
@@ -1191,7 +1218,9 @@ def _assemble_report(evidence_dir, baseline_root, measurement_command, lifecycle
     _write_json(acceptance_path, report)
     handoff_path = Path(evidence_dir) / "final-source-evidence.md"
     handoff_path.write_text(_make_handoff(report, evidence_dir, measurement_evidence,
-                                          lifecycle_evidence, cleanup), encoding="utf-8")
+                                          lifecycle_evidence, cleanup,
+                                          lifecycle_selection=lifecycle_selection),
+                          encoding="utf-8")
     return report, acceptance_path, handoff_path
 
 
