@@ -43,6 +43,8 @@ class JourneyTests(unittest.TestCase):
         self.assertEqual(fj.AUTH_NAMES["codex"], ["auth.json"])
         self.assertEqual(fj.AUTH_NAMES["opencode"], ["auth.json"])
         self.assertEqual(fj.auth_file(Path("/tmp/auth"), "opencode"), Path("/tmp/auth/opencode/auth.json"))
+        self.assertEqual(fj.auth_file(Path("/tmp/auth"), "opencode", "v2"),
+                         Path("/tmp/auth/opencode/credentials-v2.json"))
 
     def test_confirmation_card_gets_one_answer_then_completion(self):
         card = "[실행 확인]\n작업: fix\n이유: typo\n경로: direct\n범위: greet\n완료: test\n\n→ 진행 / 수정: <틀린 부분> / 중단"
@@ -131,6 +133,236 @@ class JourneyTests(unittest.TestCase):
             con.execute("insert into session values ('s', 100, 20, 5)"); con.commit(); con.close()
             result = fj.telemetry(Path(tmp), "opencode")
         self.assertEqual((result["status"], result["total"], result["sessions"]), ("measured", 125, 1))
+
+    def test_opencode_telemetry_prefers_session_v2_and_sums_five_buckets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "home/.local/share/opencode/opencode.db"; db.parent.mkdir(parents=True)
+            con = fj.sqlite3.connect(db)
+            con.execute("create table session (id text, tokens_input integer, tokens_output integer, tokens_reasoning integer)")
+            con.execute("insert into session values ('old', 900, 900, 900)")
+            con.execute("create table session_v2 (id text, tokens_input integer, tokens_output integer, tokens_reasoning integer, tokens_cache_read integer, tokens_cache_write integer)")
+            con.executemany("insert into session_v2 values (?, ?, ?, ?, ?, ?)", [
+                ("s1", 100, 20, 5, 7, 3), ("s2", 10, 2, 1, 4, 2)])
+            con.commit(); con.close()
+            result = fj.telemetry(Path(tmp), "opencode")
+        self.assertEqual((result["status"], result["total"], result["sessions"]), ("measured", 154, 2))
+        self.assertEqual((result["input"], result["output"], result["reasoning"],
+                          result["cache_read"], result["cache_write"]), (110, 22, 6, 11, 5))
+        self.assertEqual(result["total_formula"], "input+output+reasoning+cache_read+cache_write (session_v2 table)")
+
+    def test_opencode_telemetry_rejects_incomplete_session_v2_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "home/.local/share/opencode/opencode.db"; db.parent.mkdir(parents=True)
+            con = fj.sqlite3.connect(db)
+            con.execute("create table session (id text, tokens_input integer, tokens_output integer, tokens_reasoning integer)")
+            con.execute("create table session_v2 (id text, tokens_input integer)")
+            con.commit(); con.close()
+            result = fj.telemetry(Path(tmp), "opencode")
+        self.assertEqual((result["status"], result["total"], result["reason"]),
+                         ("unknown", None, "unsupported-opencode-schema"))
+
+    def test_v2_completeness_requires_transferable_native_credentials(self):
+        key = {"id": "k", "integrationID": "provider", "label": "Key", "active": True,
+               "value": {"type": "key", "key": "fixture-only"}, "future": {"keep": True}}
+        oauth = {"id": "o", "integrationID": "provider", "label": "OAuth", "active": False,
+                 "value": {"type": "oauth", "methodID": "method", "access": "a", "refresh": "r", "expires": 0}}
+        external = {"id": "e", "integrationID": "provider", "label": "External", "active": True,
+                    "value": {"type": "external", "methodID": "method"}}
+        def encoded(rows): return json.dumps(rows, allow_nan=True).encode()
+        for rows in ([key], [oauth], [key, external]):
+            self.assertTrue(fj.credential_complete("opencode", encoded(rows), "v2"))
+        rejected = ([], [external], [{**key, "value": {"type": "key", "key": ""}}],
+                    [{**oauth, "value": {**oauth["value"], "access": ""}}],
+                    [{**oauth, "value": {**oauth["value"], "expires": True}}],
+                    [{**key, "id": ""}], [key, key], [{**key, "value": {"type": "unknown", "key": "x"}}])
+        for rows in rejected:
+            with self.subTest(rows=rows):
+                self.assertFalse(fj.credential_complete("opencode", encoded(rows), "v2"))
+        self.assertFalse(fj.credential_complete("opencode", b"[{", "v2"))
+        self.assertFalse(fj.credential_complete("opencode", encoded([{
+            **oauth, "value": {**oauth["value"], "expires": float("nan")}}]), "v2"))
+
+    def test_version_classifier_never_calls_runtime_probe_for_unknown(self):
+        self.assertIsNone(fj.opencode_generation("", 0))
+        self.assertIsNone(fj.opencode_generation("OpenCode", 0))
+        self.assertIsNone(fj.opencode_generation("opencode v2.0.32", 1))
+        self.assertEqual(fj.opencode_generation("opencode v2.0.32", 0), "v2")
+        self.assertEqual(fj.opencode_generation("opencode 1.2.3", 0), "v1")
+
+    def test_v2_transport_adds_standalone_and_unknown_refuses_argv(self):
+        cwd = Path("/tmp/world/repo")
+        self.assertEqual(fj.turn_argv("opencode", "opencode", cwd, None, "task", "v1"),
+                         ["opencode", "run", "--format", "json", "task"])
+        self.assertEqual(fj.turn_argv("opencode", "opencode", cwd, "s", "next", "v2"),
+                         ["opencode", "run", "--standalone", "--format", "json", "--session", "s", "next"])
+        with self.assertRaisesRegex(ValueError, "opencode-version-unknown"):
+            fj.turn_argv("opencode", "opencode", cwd, None, "task")
+        result = fj.transport_result("opencode", 0, "--session --format", "v2")
+        self.assertFalse(result["supported"])
+        self.assertIn("--standalone", result["missing_flags"])
+
+    def test_private_capture_is_bounded_and_keeps_stderr_secret_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "emit.py"
+            script.write_text("import sys; sys.stderr.write('fixture-secret'); sys.stdout.write('x'*20000)")
+            result = fj.private_auth_command([os.sys.executable, str(script)], env=dict(os.environ))
+            self.assertTrue(result["ok"])
+            self.assertEqual(len(result["stdout"]), 20000)
+            self.assertNotIn("stderr", result)
+            oversized = fj.private_auth_command([os.sys.executable, "-c", "import sys; sys.stdout.write('x'*1000)"],
+                                                env=dict(os.environ), stdout_limit=999)
+            self.assertEqual((oversized["ok"], oversized["reason"], oversized["stdout"]),
+                             (False, "oversized", b""))
+            stderr_oversized = fj.private_auth_command(
+                [os.sys.executable, "-c", "import sys; sys.stderr.write('x'*1000)"],
+                env=dict(os.environ), stderr_limit=999)
+            self.assertEqual((stderr_oversized["ok"], stderr_oversized["reason"]), (False, "oversized"))
+            timed_out = fj.private_auth_command([os.sys.executable, "-c", "import time; time.sleep(30)"],
+                                                env=dict(os.environ), timeout=0.1)
+            self.assertEqual((timed_out["ok"], timed_out["reason"]), (False, "timeout"))
+
+    def test_fake_v2_cli_import_export_round_trip_uses_no_auth_json(self):
+        payload = [{"id": "fixture", "integrationID": "provider", "label": "fake key", "active": True,
+                    "value": {"type": "key", "key": "fixture-only-not-a-real-key"}}]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); world = root / "world"
+            for name in ("tmp", "data/opencode"):
+                (world / name).mkdir(parents=True, exist_ok=True)
+            store = root / "credentials-v2.json"; store.write_text(json.dumps(payload))
+            fake = root / "fake_opencode.py"
+            fake.write_text("""#!/usr/bin/env python3
+import json, os, pathlib, sys
+cmd = sys.argv[1:]
+state = pathlib.Path(os.environ['XDG_DATA_HOME']) / 'opencode' / 'state.json'
+if cmd[:2] == ['auth', 'import']:
+    if pathlib.Path(cmd[-1]).stat().st_mode & 0o777 != 0o600: raise SystemExit(8)
+    state.write_bytes(pathlib.Path(cmd[-1]).read_bytes())
+elif cmd[:2] == ['auth', 'export']:
+    sys.stdout.buffer.write(state.read_bytes())
+else:
+    raise SystemExit(9)
+""")
+            fake.chmod(0o700)
+            env = {"XDG_DATA_HOME": str(world / "data"), "HOME": str(world / "home"), "PATH": os.environ["PATH"]}
+            old_sandbox = fj.sandbox
+            fj.sandbox = lambda argv, *a, **k: argv
+            try:
+                ok, reason = fj.import_v2_credentials(store, world, str(fake), env, [])
+            finally:
+                fj.sandbox = old_sandbox
+            self.assertTrue(ok, reason)
+            self.assertEqual(json.loads((world / "data/opencode/state.json").read_bytes()), payload)
+            self.assertFalse((world / "data/opencode/auth.json").exists())
+            self.assertEqual(list((world / "tmp").iterdir()), [])
+
+    def test_fake_v1_v2_login_cli_keeps_native_v1_and_exports_v2(self):
+        for generation, version in (("v1", "opencode 1.2.3"), ("v2", "opencode v2.0.32")):
+            with self.subTest(generation=generation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); fake = root / "opencode"; trace = root / "calls.jsonl"
+                fake.write_text("""#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+trace = pathlib.Path(os.environ['FAKE_TRACE'])
+with trace.open('a') as f: f.write(json.dumps(args)+'\\n')
+data = pathlib.Path(os.environ['XDG_DATA_HOME']) / 'opencode'
+data.mkdir(parents=True, exist_ok=True)
+if args == ['--version']:
+    print(os.environ['FAKE_VERSION'])
+elif args[:2] == ['auth', 'login']:
+    if ('--standalone' in args) != (os.environ['FAKE_VERSION'].startswith('opencode v2')): raise SystemExit(3)
+    filename = 'state-v2.json' if '--standalone' in args else 'auth.json'
+    data.joinpath(filename).write_text(json.dumps([{'id':'fixture','integrationID':'provider','label':'key','active':True,'value':{'type':'key','key':'fixture-only'}}] if filename.startswith('state') else {'api':{'type':'api','key':'fixture-only'}}))
+elif args[:2] == ['auth', 'export']:
+    if '--standalone' not in args: raise SystemExit(4)
+    sys.stdout.write(data.joinpath('state-v2.json').read_text())
+else: raise SystemExit(5)
+""")
+                fake.chmod(0o700)
+                original = {"argv": os.sys.argv, "which": fj.shutil.which,
+                            "sandbox": fj.sandbox, "clean_env": fj.clean_env}
+                fj.shutil.which = lambda name: str(fake) if name == "opencode" else original["which"](name)
+                fj.sandbox = lambda argv, *a, **k: [str(fake), *argv[1:]]
+                def configured_env(*args, **kwargs):
+                    env = original["clean_env"](*args, **kwargs)
+                    env.update({"FAKE_TRACE": str(trace), "FAKE_VERSION": version})
+                    return env
+                fj.clean_env = configured_env
+                os.sys.argv = ["first-journey.py", "login", "--harness", "opencode",
+                               "--auth-root", str(root / "auth")]
+                try:
+                    self.assertEqual(fj.main(), 0)
+                finally:
+                    os.sys.argv = original["argv"]
+                    fj.shutil.which = original["which"]
+                    fj.sandbox = original["sandbox"]
+                    fj.clean_env = original["clean_env"]
+                calls = [json.loads(line) for line in trace.read_text().splitlines()]
+                self.assertEqual(calls.count(["--version"]), 1)
+                login_call = next(args for args in calls if args[:2] == ["auth", "login"])
+                self.assertEqual("--standalone" in login_call, generation == "v2")
+                if generation == "v2":
+                    self.assertEqual(calls.count(["auth", "export", "--standalone"]), 1)
+                    path = root / "auth/opencode/credentials-v2.json"
+                    self.assertFalse((root / "auth/opencode/auth.json").exists())
+                else:
+                    self.assertNotIn(["auth", "export", "--standalone"], calls)
+                    path = root / "auth/opencode/auth.json"
+                self.assertTrue(path.is_file())
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_v2_final_export_rotation_replaces_store_atomically(self):
+        def payload(key):
+            return json.dumps([{"id": "fixture", "integrationID": "provider", "label": "fake key",
+                                "active": True, "value": {"type": "key", "key": key}}]).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "opencode/credentials-v2.json"
+            original = payload("before")
+            rotated = payload("after")
+            store.parent.mkdir(mode=0o700); store.write_bytes(original)
+            prior = fj._ACTIVE_AUTH; private = fj.private_auth_command
+            fj._ACTIVE_AUTH = {"harness": "opencode", "generation": "v2", "store": store,
+                               "target": None, "original": original, "env": {},
+                               "export_argv": ["fake-opencode", "auth", "export", "--standalone"]}
+            fj.private_auth_command = lambda *a, **k: {"ok": True, "reason": None, "exit": 0,
+                                                        "seconds": 0, "stdout": rotated}
+            try:
+                self.assertTrue(fj.persist_active_auth())
+            finally:
+                fj.private_auth_command = private; fj._ACTIVE_AUTH = prior
+            self.assertEqual(store.read_bytes(), rotated)
+            self.assertEqual(store.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(store.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_incomplete_v2_final_export_warns_and_preserves_store(self):
+        original = json.dumps([{"id": "fixture", "integrationID": "provider", "label": "key", "active": True,
+                                "value": {"type": "key", "key": "fixture"}}]).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "credentials-v2.json"; store.write_bytes(original)
+            prior = fj._ACTIVE_AUTH; private = fj.private_auth_command
+            fj._ACTIVE_AUTH = {"harness": "opencode", "generation": "v2", "store": store,
+                               "target": None, "original": original, "env": {},
+                               "export_argv": ["fake-opencode", "auth", "export", "--standalone"]}
+            fj.private_auth_command = lambda *a, **k: {"ok": True, "reason": None, "exit": 0,
+                                                        "seconds": 0, "stdout": b"[]"}
+            try:
+                self.assertFalse(fj.persist_active_auth())
+                self.assertEqual(fj._ACTIVE_AUTH["last_error"], "auth-export-incomplete")
+            finally:
+                fj.private_auth_command = private; fj._ACTIVE_AUTH = prior
+            self.assertEqual(store.read_bytes(), original)
+
+    def test_unknown_opencode_generation_never_runs_task(self):
+        calls = []
+        old = fj.run
+        fj.run = lambda *a, **k: calls.append(a) or {"exit": 0, "seconds": 0, "output": ""}
+        try:
+            result = fj.headless_turn("opencode", "opencode", "task", Path("/tmp/repo"),
+                                      Path("/tmp/world"), {}, 30, [], opencode_generation=None)
+        finally:
+            fj.run = old
+        self.assertEqual(result["status"], "opencode-version-unknown")
+        self.assertEqual(calls, [])
 
     def test_claude_usage_deduplicates_message_id(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,7 +493,8 @@ class JourneyTests(unittest.TestCase):
             target = Path(tmp) / "world-auth.json"; target.write_text('{"token":"')
             previous = fj._ACTIVE_AUTH
             try:
-                fj._ACTIVE_AUTH = ("claude", store, target, store.read_bytes())
+                fj._ACTIVE_AUTH = {"harness": "claude", "generation": "native", "store": store,
+                                   "target": target, "original": store.read_bytes()}
                 fj.persist_active_auth()
             finally:
                 fj._ACTIVE_AUTH = previous
@@ -310,7 +543,8 @@ class JourneyTests(unittest.TestCase):
                     target.write_bytes(candidate)
                     previous = fj._ACTIVE_AUTH
                     try:
-                        fj._ACTIVE_AUTH = (harness, store, target, original)
+                        fj._ACTIVE_AUTH = {"harness": harness, "generation": "v1" if harness == "opencode" else "native",
+                                           "store": store, "target": target, "original": original}
                         self.assertFalse(fj.credential_complete(harness, candidate))
                         fj.persist_active_auth()
                     finally:
@@ -326,7 +560,8 @@ class JourneyTests(unittest.TestCase):
                 target.write_bytes(candidate)
                 previous = fj._ACTIVE_AUTH
                 try:
-                    fj._ACTIVE_AUTH = (harness, store, target, original)
+                    fj._ACTIVE_AUTH = {"harness": harness, "generation": "v1" if harness == "opencode" else "native",
+                                       "store": store, "target": target, "original": original}
                     self.assertTrue(fj.credential_complete(harness, candidate))
                     fj.persist_active_auth()
                 finally:
@@ -341,9 +576,10 @@ class JourneyTests(unittest.TestCase):
             fj.run = lambda argv, **kwargs: calls.append(argv) or {
                 "exit": 0, "seconds": 0, "output": "Usage: opencode run [prompt]"}
             fj.sandbox = lambda argv, *a, **k: argv
-            transport = fj.probe_transport("opencode", "opencode", Path("/tmp/world"), {}, [], 5)
+            transport = fj.probe_transport("opencode", "opencode", Path("/tmp/world"), {}, [], 5, "v1")
             outcome = fj.headless_turn("opencode", "opencode", "Fix the task", Path("/tmp/repo"),
-                                       Path("/tmp/world"), {}, 5, [], transport_supported=transport["supported"])
+                                       Path("/tmp/world"), {}, 5, [], transport_supported=transport["supported"],
+                                       opencode_generation="v1")
         finally:
             fj.run = previous; fj.sandbox = previous_sandbox
         self.assertFalse(transport["supported"])

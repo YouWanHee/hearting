@@ -17,10 +17,23 @@ python3 tools/release/first-journey.py run --source published --model-free --out
 ```
 
 Login is performed in an isolated environment and retains only the selected
-harness native credential file under `/tmp/hearting-measure-auth-UID`. Run copies
-that file into the fresh world and back under an exclusive lock. A hard kill
-during credential rotation can require login again. Never point `--auth-root`
+harness credential under `/tmp/hearting-measure-auth-UID`. OpenCode V1 keeps
+using `opencode/auth.json`. OpenCode V2 stores the bounded
+`auth export --standalone` payload in `opencode/credentials-v2.json`; each
+fresh run imports it with `auth import --standalone`, then exports it again
+under the same exclusive lock after the task. V2 commands include
+`--standalone`. The runner determines the generation once from the sandboxed
+`--version`; if that probe fails, it reports `opencode-version-unknown` and
+does not guess V1 or start an authenticated task. Never point `--auth-root`
 at a real profile.
+
+The temporary V2 import file is created mode 0600 inside the isolated world and
+removed immediately after import. Credential export is captured separately
+from stderr with 64 KiB per-stream limits and a 10-second timeout; secret
+payloads are not written to journey logs. A hard kill during credential
+rotation can require login again. A retained failure world contains its
+imported credential in its private database, so remove that world when it is no
+longer needed.
 
 `--model-free` skips authentication and model calls. On Linux, `bwrap` is
 required; if it is unavailable, the run reports `isolation-unavailable` and
@@ -38,7 +51,11 @@ available; Claude account percentages and reset epochs when available; and
 failures. Account attribution is uncertain and may include other work. Raw
 transcripts and credentials stay in the local experiment world; only JSON and
 Markdown summaries are exported. Task output is never exported.
-Worlds are removed on success and retained on failure by default; use
+OpenCode V2 usage is read from `session_v2` when that table exists, summing
+input, output, reasoning, cache-read, and cache-write token buckets. When it
+does not exist, the runner reads the V1 `session` table. The reported total is
+the sum of those exposed buckets, not a cost or account quota. Worlds are
+removed on success and retained on failure by default; use
 `--keep-world never|always` to change this.
 
 The demo starts with `Helo` and a test expecting `Hello`. The runner records the

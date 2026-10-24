@@ -19,22 +19,67 @@ import signal
 import sqlite3
 import re
 import importlib.util
+import math
+import selectors
 from pathlib import Path
 
 VERSION = "1"
 PROFILES = {"claude-only": ["claude"], "all": ["claude", "codex", "opencode"]}
 TASK_HARNESSES = {"claude-only": ["claude"], "all": ["codex", "opencode"]}
 AUTH_NAMES = {"claude": [".credentials.json"], "codex": ["auth.json"], "opencode": ["auth.json"]}
+OPENCODE_V2_AUTH_NAME = "credentials-v2.json"
+AUTH_CAPTURE_LIMIT = 64 * 1024
+AUTH_CAPTURE_TIMEOUT = 10
+UTILITIES = Path(__file__).resolve().parents[2] / "utilities"
+if str(UTILITIES) not in sys.path:
+    sys.path.insert(0, str(UTILITIES))
+from opencode_runtime import is_v2 as opencode_is_v2, parse_version as parse_opencode_version
 DEFAULT_PROMPT = "Fix the typo in greet's output, run the existing focused test, and show the diff."
-_ACTIVE_AUTH: tuple[str, Path, Path, bytes] | None = None
+_ACTIVE_AUTH: dict | None = None
 
 
-def credential_complete(harness: str, data: bytes) -> bool:
+def credential_complete(harness: str, data: bytes, generation: str | None = None) -> bool:
     """Check only the credential structure needed to identify a complete login."""
     try:
         value = json.loads(data)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
+    if harness == "opencode" and generation == "v2":
+        if not isinstance(value, list) or not value:
+            return False
+        ids: set[str] = set()
+        transferable = False
+        for entry in value:
+            if (not isinstance(entry, dict)
+                    or not isinstance(entry.get("id"), str) or not entry["id"]
+                    or entry["id"] in ids
+                    or not isinstance(entry.get("integrationID"), str) or not entry["integrationID"]
+                    or not isinstance(entry.get("label"), str)
+                    or type(entry.get("active")) is not bool
+                    or not isinstance(entry.get("value"), dict)):
+                return False
+            ids.add(entry["id"])
+            credential = entry["value"]
+            kind = credential.get("type")
+            if kind == "key":
+                if not isinstance(credential.get("key"), str) or not credential["key"]:
+                    return False
+                transferable = True
+            elif kind == "oauth":
+                expiry = credential.get("expires")
+                if (not isinstance(credential.get("methodID"), str) or not credential["methodID"]
+                        or not isinstance(credential.get("access"), str) or not credential["access"]
+                        or not isinstance(credential.get("refresh"), str) or not credential["refresh"]
+                        or type(expiry) not in (int, float)
+                        or (isinstance(expiry, float) and not math.isfinite(expiry)) or expiry < 0):
+                    return False
+                transferable = True
+            elif kind == "external":
+                if not isinstance(credential.get("methodID"), str) or not credential["methodID"]:
+                    return False
+            else:
+                return False
+        return transferable
     if not isinstance(value, dict):
         return False
     if harness == "claude":
@@ -79,16 +124,126 @@ def credential_complete(harness: str, data: bytes) -> bool:
     return False
 
 
-def persist_active_auth() -> None:
-    if not _ACTIVE_AUTH: return
-    harness, store, target, original = _ACTIVE_AUTH
+def atomic_auth_write(store: Path, data: bytes) -> None:
+    """Replace a credential store through a fresh mode-0600 sibling file."""
+    store.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if store.parent.is_symlink():
+        raise OSError("credential directory is a symlink")
+    os.chmod(store.parent, 0o700)
+    if store.is_symlink():
+        raise OSError("credential store is a symlink")
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{store.name}.", suffix=".tmp", dir=store.parent)
+    temporary = Path(temporary_name)
     try:
-        if target.is_file() and not target.is_symlink():
-            latest = target.read_bytes()
-            if credential_complete(harness, latest) and latest != original:
-                temporary = store.with_name(store.name + ".tmp")
-                temporary.write_bytes(latest); os.chmod(temporary, 0o600); os.replace(temporary, store)
-    except OSError: pass
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, store)
+        os.chmod(store, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def private_auth_command(argv: list[str], *, env: dict[str, str], timeout: int = AUTH_CAPTURE_TIMEOUT,
+                         stdout_limit: int = AUTH_CAPTURE_LIMIT, stderr_limit: int = AUTH_CAPTURE_LIMIT) -> dict:
+    """Capture secret-bearing auth output with concurrent fixed-size limits."""
+    started = time.monotonic()
+    process = None
+    streams: dict = {}
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    reason = None
+    try:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=env, start_new_session=True)
+        limits = {process.stdout: ("stdout", stdout_limit), process.stderr: ("stderr", stderr_limit)}
+        with selectors.DefaultSelector() as selector:
+            for stream, (name, _limit) in limits.items():
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+            deadline = started + timeout
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    reason = "timeout"
+                    break
+                for key, _ in selector.select(min(remaining, 0.1)):
+                    chunk = os.read(key.fileobj.fileno(), 8192)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    name = key.data
+                    if len(captured[name]) + len(chunk) > limits[key.fileobj][1]:
+                        reason = "oversized"
+                        break
+                    captured[name].extend(chunk)
+                if reason:
+                    break
+        if reason:
+            _stop_private_process_group(process)
+        else:
+            code = process.wait(timeout=max(0.0, started + timeout - time.monotonic()))
+            if code != 0:
+                reason = "failed"
+        return {"ok": reason is None, "reason": reason, "exit": process.returncode,
+                "seconds": round(time.monotonic() - started, 3),
+                "stdout": bytes(captured["stdout"]) if reason is None else b""}
+    except subprocess.TimeoutExpired:
+        if process:
+            _stop_private_process_group(process)
+        return {"ok": False, "reason": "timeout", "exit": 124,
+                "seconds": round(time.monotonic() - started, 3), "stdout": b""}
+    except OSError:
+        if process:
+            _stop_private_process_group(process)
+        return {"ok": False, "reason": "failed", "exit": 127,
+                "seconds": round(time.monotonic() - started, 3), "stdout": b""}
+    except BaseException:
+        if process:
+            _stop_private_process_group(process)
+        raise
+    finally:
+        if process:
+            for stream in (process.stdout, process.stderr):
+                if stream:
+                    stream.close()
+
+
+def _auth_read_latest(ledger: dict) -> bytes | None:
+    if ledger["generation"] == "v2":
+        result = private_auth_command(ledger["export_argv"], env=ledger["env"])
+        if not result["ok"]:
+            ledger["last_error"] = f"auth-export-{result['reason']}"
+            return None
+        return result["stdout"]
+    target = ledger["target"]
+    if target.is_file() and not target.is_symlink():
+        return target.read_bytes()
+    return None
+
+
+def persist_active_auth() -> bool:
+    ledger = _ACTIVE_AUTH
+    if not ledger:
+        return True
+    try:
+        latest = _auth_read_latest(ledger)
+        if latest is None:
+            return False
+        if not credential_complete(ledger["harness"], latest, ledger["generation"]):
+            ledger["last_error"] = "auth-export-incomplete"
+            return False
+        if latest != ledger["original"]:
+            atomic_auth_write(ledger["store"], latest)
+        ledger["persisted"] = True
+        return True
+    except (OSError, ValueError):
+        ledger["last_error"] = "auth-persist-failed"
+        return False
 
 
 def auth_signal(signum, _frame):
@@ -105,6 +260,20 @@ def _stop_process_group(process: subprocess.Popen) -> None:
     except ProcessLookupError: pass
     process.wait()
     process.communicate()
+
+
+def _stop_private_process_group(process: subprocess.Popen) -> None:
+    """Reap a secret-output child without draining unbounded pipes into memory."""
+    try: os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError: pass
+    try: process.wait(timeout=0.25)
+    except subprocess.TimeoutExpired: pass
+    try: os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError: pass
+    process.wait()
+    for stream in (process.stdout, process.stderr):
+        if stream:
+            stream.close()
 
 
 def safe_root(value: str, label: str, forbidden: list[Path]) -> Path:
@@ -217,8 +386,67 @@ def sandbox(argv: list[str], world: Path, env: dict[str, str], cwd: Path | None 
     return args + ["--"] + argv
 
 
-def auth_file(root: Path, harness: str) -> Path:
-    return root / harness / AUTH_NAMES[harness][0]
+def auth_file(root: Path, harness: str, generation: str | None = None) -> Path:
+    name = OPENCODE_V2_AUTH_NAME if harness == "opencode" and generation == "v2" else AUTH_NAMES[harness][0]
+    return root / harness / name
+
+
+def opencode_generation(output: str, exit_code: int) -> str | None:
+    """Classify only a successfully parsed sandbox version; never probe the host."""
+    if exit_code != 0:
+        return None
+    version = parse_opencode_version(output)
+    if version is None:
+        return None
+    return "v2" if opencode_is_v2(version=version) else "v1"
+
+
+def _credential_identity(data: bytes) -> list[dict] | None:
+    try:
+        value = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, list):
+        return None
+    return [{key: entry.get(key) for key in ("id", "integrationID", "active", "value")}
+            for entry in value if isinstance(entry, dict)]
+
+
+def import_v2_credentials(store: Path, world: Path, executable: str, env: dict[str, str],
+                          mounts: list[tuple[Path, str]]) -> tuple[bool, str | None]:
+    """Import into one fresh world, unlink the transfer file, and verify by export."""
+    try:
+        original = store.read_bytes()
+    except OSError:
+        return False, "auth-import-missing"
+    if not credential_complete("opencode", original, "v2"):
+        return False, "auth-import-incomplete"
+    temp_dir = world / "tmp"
+    temp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix="journey-auth-", suffix=".json", dir=temp_dir)
+    path = Path(name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(original)
+        imported = private_auth_command(sandbox([executable, "auth", "import", "--standalone", str(path)],
+                                                world, env, cli=mounts), env=env)
+    except OSError:
+        return False, "auth-import-failed"
+    finally:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    if not imported["ok"]:
+        return False, f"auth-import-{imported['reason']}"
+    exported = private_auth_command(sandbox([executable, "auth", "export", "--standalone"],
+                                            world, env, cli=mounts), env=env)
+    if not exported["ok"] or not credential_complete("opencode", exported["stdout"], "v2"):
+        return False, "auth-import-verification-failed"
+    if _credential_identity(exported["stdout"]) != _credential_identity(original):
+        return False, "auth-import-verification-mismatch"
+    return True, None
 
 
 def published_installer(world: Path, tag: str, timeout: int) -> tuple[Path, str, str]:
@@ -302,24 +530,33 @@ def telemetry(world: Path, harness: str) -> dict:
         databases = [db for db in home.rglob("opencode.db") if db.is_file()]
         if not databases:
             return {"status": "unknown", "total": None, "sessions": 0, "reason": "opencode-db-missing"}
-        totals = {"input": 0, "output": 0, "reasoning": 0}; sessions = 0
+        totals = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0}; sessions = 0
+        used_v2 = False
         try:
             for db in databases:
                 con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
                 try:
-                    columns = {row[1] for row in con.execute("pragma table_info(session)")}
-                    if not {"tokens_input", "tokens_output", "tokens_reasoning"} <= columns:
+                    tables = {row[0] for row in con.execute("select name from sqlite_master where type='table'")}
+                    table = "session_v2" if "session_v2" in tables else "session"
+                    used_v2 = used_v2 or table == "session_v2"
+                    columns = {row[1] for row in con.execute(f"pragma table_info({table})")}
+                    required = {"tokens_input", "tokens_output", "tokens_reasoning"}
+                    if table == "session_v2":
+                        required |= {"tokens_cache_read", "tokens_cache_write"}
+                    if not required <= columns:
                         raise ValueError("schema")
-                    for row in con.execute("select tokens_input, tokens_output, tokens_reasoning from session"):
+                    selected = ("tokens_input", "tokens_output", "tokens_reasoning", "tokens_cache_read", "tokens_cache_write") if table == "session_v2" else ("tokens_input", "tokens_output", "tokens_reasoning")
+                    for row in con.execute(f"select {', '.join(selected)} from {table}"):
                         sessions += 1
-                        for key, value in zip(totals, row): totals[key] += _number(value) or 0
+                        for key, value in zip(selected, row):
+                            totals[key.removeprefix("tokens_")] += _number(value) or 0
                 finally:
                     con.close()
         except (sqlite3.Error, ValueError):
             return {"status": "unknown", "total": None, "sessions": 0, "reason": "unsupported-opencode-schema"}
         return {"status": "measured" if sessions else "unknown", **totals,
                 "total": sum(totals.values()) if sessions else None,
-                "total_formula": "input+output+reasoning (session table)", "sessions": sessions,
+                "total_formula": "input+output+reasoning+cache_read+cache_write (session_v2 table)" if used_v2 else "input+output+reasoning (session table)", "sessions": sessions,
                 "reason": None if sessions else "no-opencode-sessions"}
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fleet"))
     from token_budget import parse_codex_token_count
@@ -448,12 +685,16 @@ def route_evidence(world: Path) -> int:
                for _ in routes.glob("*.json"))
 
 
-def turn_argv(harness: str, command: str, cwd: Path, sid: str | None, message: str) -> list[str]:
+def turn_argv(harness: str, command: str, cwd: Path, sid: str | None, message: str,
+              opencode_generation: str | None = None) -> list[str]:
     if harness == "claude":
         return [command, "-p", "--output-format", "stream-json", "--verbose", *(["--resume", sid] if sid else []), message]
     if harness == "codex":
         return [command, "exec", "resume", "--json", sid, message] if sid else [command, "exec", "--json", "--cd", str(cwd), message]
-    return [command, "run", "--format", "json", *(["--session", sid] if sid else []), message]
+    if opencode_generation not in {"v1", "v2"}:
+        raise ValueError("opencode-version-unknown")
+    return [command, "run", *( ["--standalone"] if opencode_generation == "v2" else []), "--format", "json",
+            *(["--session", sid] if sid else []), message]
 
 
 TRANSPORT_HELP = {
@@ -463,26 +704,41 @@ TRANSPORT_HELP = {
 }
 
 
-def transport_result(harness: str, exit_code: int, output: str) -> dict:
-    required = TRANSPORT_HELP[harness][1]
+def transport_result(harness: str, exit_code: int, output: str,
+                     opencode_generation: str | None = None) -> dict:
+    if harness == "opencode":
+        if opencode_generation not in {"v1", "v2"}:
+            return {"supported": False, "exit": exit_code, "required_flags": [],
+                    "missing_flags": [], "reason": "opencode-version-unknown"}
+        required = (*TRANSPORT_HELP[harness][1], *( ("--standalone",) if opencode_generation == "v2" else () ))
+    else:
+        required = TRANSPORT_HELP[harness][1]
     missing = [flag for flag in required if flag not in output]
     return {"supported": exit_code == 0 and not missing,
             "exit": exit_code, "required_flags": list(required), "missing_flags": missing}
 
 
 def probe_transport(harness: str, executable: str, world: Path, env: dict[str, str],
-                    mounts: list[tuple[Path, str]], timeout: int) -> dict:
+                    mounts: list[tuple[Path, str]], timeout: int,
+                    opencode_generation: str | None = None) -> dict:
+    if harness == "opencode" and opencode_generation not in {"v1", "v2"}:
+        return transport_result(harness, 1, "", opencode_generation)
     args, _required = TRANSPORT_HELP[harness]
+    if harness == "opencode" and opencode_generation == "v2":
+        args = ["run", "--help", "--standalone"]
     result = run(sandbox([executable, *args], world, env, cli=mounts), env=env, timeout=timeout)
-    return transport_result(harness, result["exit"], result["output"])
+    return transport_result(harness, result["exit"], result["output"], opencode_generation)
 
 
 def headless_turn(harness: str, command: str, prompt: str, cwd: Path, world: Path,
                   env: dict[str, str], timeout: int, mounts: list[tuple[Path, str]], judge=None,
-                  transport_supported: bool = True) -> dict:
+                  transport_supported: bool = True, opencode_generation: str | None = None) -> dict:
     """Drive one task session: answer only the confirmation card, stop on anything else."""
     if not transport_supported:
         return {"status": "unsupported-headless-transport", "turns": [], "canned_answers": 0,
+                "session_id": None, "turn_index": 0, "output": ""}
+    if harness == "opencode" and opencode_generation not in {"v1", "v2"}:
+        return {"status": "opencode-version-unknown", "turns": [], "canned_answers": 0,
                 "session_id": None, "turn_index": 0, "output": ""}
     deadline = time.monotonic() + timeout
     turns: list[dict] = []; texts: list[str] = []; answers = 0; sid = None; message = prompt
@@ -491,7 +747,7 @@ def headless_turn(harness: str, command: str, prompt: str, cwd: Path, world: Pat
         remaining = int(deadline - time.monotonic())
         if remaining < 5:
             status = "task-timeout"; break
-        step = run(sandbox(turn_argv(harness, command, cwd, sid, message), world, env, cwd, mounts),
+        step = run(sandbox(turn_argv(harness, command, cwd, sid, message, opencode_generation), world, env, cwd, mounts),
                    env=env, timeout=remaining, cwd=cwd)
         text, found, denials = event_text(step["output"], harness)
         sid = sid or found
@@ -628,19 +884,23 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
             for name in ("claude", "codex", "opencode", "herdr"):
                 probe = run(sandbox(["sh", "-c", f"command -v {name}"], world, env, cli=cli_mounts), env=env, timeout=args.step_timeout)
                 if probe["exit"] == 0: visible.append(name)
-            versions = {}; transport_supported = {}
+            versions = {}; transport_supported = {}; generations = {}
             for name in PROFILES[profile]:
                 if name in binaries:
                     version = run(sandbox([binaries[name][1], "--version"], world, env, cli=cli_mounts), env=env, timeout=args.step_timeout)
-                    versions[name] = version["output"][-120:].strip().replace(str(world), "<world>") if version["exit"] == 0 else "unknown"
+                    if name == "opencode":
+                        generations[name] = opencode_generation(version["output"], version["exit"])
+                        versions[name] = version["output"][-120:].strip().replace(str(world), "<world>") if generations[name] else "unknown"
+                    else:
+                        versions[name] = version["output"][-120:].strip().replace(str(world), "<world>") if version["exit"] == 0 else "unknown"
                     if name in TASK_HARNESSES[profile]:
                         transport_supported[name] = probe_transport(name, binaries[name][1], world, env,
-                                                                     cli_mounts, args.step_timeout)
+                                                                     cli_mounts, args.step_timeout, generations.get(name))
             expected_visible = ["claude"] if profile == "claude-only" else ["claude", "codex", "opencode"]
             record["environment"] = {"visible_cli_names": visible, "cli_versions": versions,
                                       "transport_flags": {"claude": "-p --output-format stream-json --verbose [--resume <id>]",
                                                           "codex": "exec --json --cd <repo> | exec resume --json <id>",
-                                                          "opencode": "run --format json [--session <id>]"},
+                                                          "opencode": "run [--standalone] --format json [--session <id>]"},
                                       "env_hygiene": ["DISABLE_AUTOUPDATER=1", "no permission flags"],
                                       "transport_supported": transport_supported,
                                       "allowlist_names": sorted(env)}
@@ -722,35 +982,57 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                          "session_tokens": {"status":"unknown","input":None,"output":None,"total":None,"reason":"model-free"}}
             elif any(step["name"] == "install" and step["exit"] != 0 for step in record["steps"]):
                 model = {"status": "install-failed", "turns": 0, "canned_answers": 0, "session_tokens": {"status":"unknown","input":None,"output":None,"reason":"installation-failed"}}
+            elif harness == "opencode" and generations.get(harness) not in {"v1", "v2"}:
+                model = {"status": "opencode-version-unknown", "turns": 0, "canned_answers": 0,
+                         "session_tokens": "unknown"}
             elif not transport_supported.get(harness, {}).get("supported", False):
                 model = {"status": "unsupported-headless-transport", "turns": 0, "canned_answers": 0,
                          "session_tokens": "unknown", "transport": transport_supported.get(harness)}
-            elif not auth_file(Path(args.auth_root), harness).is_file():
+            elif (not auth_file(Path(args.auth_root), harness, generations.get(harness)).is_file()
+                  or auth_file(Path(args.auth_root), harness, generations.get(harness)).is_symlink()
+                  or auth_file(Path(args.auth_root), harness, generations.get(harness)).parent.is_symlink()):
                 model = {"status": "measurement-login-missing", "turns": 0, "canned_answers": 0, "session_tokens": "unknown"}
             elif not cli_map[harness]:
                 model = {"status": "cli-missing", "turns": 0, "session_tokens": "unknown"}
             else:
                 model = {"status": "pending", "turns": 1, "canned_answers": 0, "session_tokens": "unknown"}
-                store = auth_file(Path(args.auth_root), harness)
+                generation = generations.get(harness, "native")
+                store = auth_file(Path(args.auth_root), harness, generation)
                 try:
                     root = safe_root(args.auth_root, "auth-root", [Path.home(), Path("/home/nas")])
                     if root.stat().st_uid != os.getuid():
                         raise ValueError("auth-root must be owned by the current user")
                     with (root / ".lock").open("a") as lock:
+                        os.chmod(root, 0o700)
+                        os.chmod(root / ".lock", 0o600)
                         fcntl.flock(lock, fcntl.LOCK_EX)
+                        if store.is_symlink() or store.parent.is_symlink():
+                            raise ValueError("credential store path is a symlink")
                         before = store.read_bytes()
                         if harness == "claude":
                             target = home / ".claude/.credentials.json"
                         elif harness == "codex":
                             target = home / ".codex/auth.json"
+                        elif generation == "v2":
+                            target = None
                         else:
                             target = home / ".local/share/opencode/auth.json"
-                        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                        target.write_bytes(before); os.chmod(target, 0o600)
-                        _ACTIVE_AUTH = (harness, store, target, before)
+                        if generation != "v2":
+                            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                            with os.fdopen(fd, "wb") as stream:
+                                stream.write(before)
                         if harness == "claude": env["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
                         elif harness == "codex": env["CODEX_HOME"] = str(home / ".codex")
                         else: env["XDG_DATA_HOME"] = str(home / ".local/share")
+                        export_argv = sandbox([cli_map[harness][1], "auth", "export", "--standalone"], world, env, cli=cli_mounts) if generation == "v2" else None
+                        if generation == "v2":
+                            imported, import_error = import_v2_credentials(store, world, cli_map[harness][1], env, cli_mounts)
+                            if not imported:
+                                model["status"] = import_error
+                                record["harnesses"].append({"name": harness, "model": model})
+                                record["failures"].append({"harness": harness, "reason": import_error})
+                                continue
                         usage_started = time.monotonic()
                         account_before = claude_account_snapshot(home / ".claude") if harness == "claude" else None
                         if harness == "claude": record["steps"].append({"name":"usage-before:claude","exit":0 if account_before else 1,"seconds":round(time.monotonic()-usage_started,3),"status":"measured" if account_before else "unknown"})
@@ -759,8 +1041,28 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                         judge = lambda: judge_repo(repo_dir, baseline_test, lambda argv: sandbox(argv, world, baseline_env, repo_dir),
                                                    baseline_env)["focused_test_passed"]
                         # Invoke the CLI by name so an installed launcher in ~/.local/bin is used, as for a user.
-                        outcome = headless_turn(harness, harness, args.prompt, repo_dir, world,
-                                                env, args.task_timeout, cli_mounts, judge)
+                        _ACTIVE_AUTH = {"harness": harness, "generation": generation, "store": store,
+                                        "target": target, "original": before, "env": env,
+                                        "export_argv": export_argv, "persisted": False}
+                        try:
+                            outcome = headless_turn(harness, harness, args.prompt, repo_dir, world,
+                                                    env, args.task_timeout, cli_mounts, judge,
+                                                    opencode_generation=generation if harness == "opencode" else None)
+                        finally:
+                            pending_error = sys.exc_info()[1]
+                            cleanup_error = None
+                            try:
+                                if not persist_active_auth():
+                                    model["auth_persist_warning"] = _ACTIVE_AUTH.get("last_error", "auth-persist-failed") if _ACTIVE_AUTH else "auth-persist-failed"
+                                    record["failures"].append({"harness": harness, "reason": "auth-persist-failed"})
+                            except BaseException as exc:
+                                cleanup_error = exc
+                                model["auth_persist_warning"] = "auth-persist-interrupted"
+                                record["failures"].append({"harness": harness, "reason": "auth-persist-failed"})
+                            finally:
+                                _ACTIVE_AUTH = None
+                            if cleanup_error is not None and pending_error is None:
+                                raise cleanup_error
                         record["steps"].append({"name": f"task:{harness}", "exit": outcome["turns"][-1]["exit"] if outcome["turns"] else 1,
                                                 "seconds": round(time.monotonic() - started, 3), "turns": len(outcome["turns"])})
                         for turn in outcome["turns"]:
@@ -768,7 +1070,6 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                         usage_started = time.monotonic()
                         account_after = claude_account_snapshot(home / ".claude") if harness == "claude" else None
                         if harness == "claude": record["steps"].append({"name":"usage-after:claude","exit":0 if account_after else 1,"seconds":round(time.monotonic()-usage_started,3),"status":"measured" if account_after else "unknown"})
-                        persist_active_auth(); _ACTIVE_AUTH = None
                         (world / "logs" / f"{harness}.assistant-text.txt").write_text(outcome["output"], encoding="utf-8")
                         model.update({"status": outcome["status"], "turns": len(outcome["turns"]),
                                       "canned_answers": outcome["canned_answers"], "turn_index": outcome["turn_index"],
@@ -812,7 +1113,7 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
     except Exception as exc:
         record["failures"].append({"reason": "journey-error", "detail": (type(exc).__name__ + ": " + str(exc)[:300]).replace(str(world), "<world>")})
     finally:
-        persist_active_auth()
+        # The credential lifetime is owned by the same lock scope as the task.
         _ACTIVE_AUTH = None
         record["elapsed_seconds"] = round(time.monotonic() - began, 3)
         record["duration_s"] = record["elapsed_seconds"]
@@ -918,20 +1219,39 @@ def main() -> int:
                 resolved = Path(cli).resolve()
                 if harness == "codex": mounts=[(resolved.parent.parent,"/opt/journey-cli/codex")]; executable="/opt/journey-cli/codex/bin/codex"
                 else: mounts=[(resolved,"/opt/journey-cli/"+harness)]; executable="/opt/journey-cli/"+harness
+                generation = None
+                if harness == "opencode":
+                    probe = run(sandbox([executable, "--version"], world, env, cli=mounts), env=env,
+                                timeout=AUTH_CAPTURE_TIMEOUT)
+                    generation = opencode_generation(probe["output"], probe["exit"])
+                    if generation is None:
+                        print("opencode-version-unknown", file=sys.stderr)
+                        return 1
                 command = {"claude": [executable, "auth", "login"], "codex": [executable, "login"],
-                           "opencode": [executable, "auth", "login"]}[harness]
+                           "opencode": [executable, "auth", "login", *( ["--standalone"] if generation == "v2" else [] )]}[harness]
                 result = subprocess.run(sandbox(command, world, env, cli=mounts), env=env)
                 if result.returncode == 0:
+                    if harness == "opencode" and generation == "v2":
+                        exported = private_auth_command(sandbox([executable, "auth", "export", "--standalone"],
+                                                                 world, env, cli=mounts), env=env)
+                        credential = exported["stdout"]
+                        if not exported["ok"]:
+                            print(f"auth-export-{exported['reason']}", file=sys.stderr)
+                            return 1
+                        if not credential_complete(harness, credential, generation):
+                            print("login-credential-incomplete", file=sys.stderr)
+                            return 1
+                        atomic_auth_write(auth_file(root, harness, generation), credential)
+                        return result.returncode
                     candidates = {"claude": config / ".credentials.json", "codex": config / "auth.json",
                                   "opencode": world / "data/opencode/auth.json"}
                     source = candidates[harness]
                     if not source.is_file() or source.is_symlink(): return 1
                     credential = source.read_bytes()
-                    if not credential_complete(harness, credential):
+                    if not credential_complete(harness, credential, generation):
                         print("login-credential-incomplete", file=sys.stderr); return 1
-                    target = auth_file(root, harness); target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    temporary = target.with_name(target.name + ".tmp")
-                    temporary.write_bytes(credential); os.chmod(temporary, 0o600); os.replace(temporary, target)
+                    target = auth_file(root, harness, generation)
+                    atomic_auth_write(target, credential)
                 return result.returncode
             finally:
                 shutil.rmtree(world, ignore_errors=True)
