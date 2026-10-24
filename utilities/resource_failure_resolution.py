@@ -196,78 +196,112 @@ def _retry_registry(armed):
 
 def _route_context(route, armed, failed_row):
     """Resolve the exact route record and retain a best-effort resume handle."""
-    candidates = [armed.get("route_file"), failed_row.get("route")]
-    try:
-        import artifact_lifecycle
-        candidates.append(str(artifact_lifecycle.canonical_route_path(
-            Path(route["artifact_root"]), route["route_id"])))
-    except (ImportError, KeyError, TypeError, ValueError, OSError):
-        pass
-
-    seen = set()
     fallback = None
-    for candidate in candidates:
-        if not isinstance(candidate, str) or not candidate:
+    for source, key in ((armed, "route_file"), (failed_row, "route")):
+        candidate = source.get(key)
+        if candidate is None or candidate == "":
             continue
+        if not isinstance(candidate, str):
+            return fallback, route, False
         path = Path(candidate)
         if fallback is None:
             fallback = path
         try:
-            identity = str(path.resolve())
-        except OSError:
-            identity = str(path)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        try:
             observed = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
-            continue
-        if (isinstance(observed, dict)
-                and observed.get("route_id") == route.get("route_id")
-                and observed.get("route_hash") == route.get("route_hash")):
-            return path, observed, True
-    return fallback, route, False
+            return path, route, False
+        if (not isinstance(observed, dict)
+                or observed.get("route_id") != route.get("route_id")
+                or observed.get("route_hash") != route.get("route_hash")):
+            return path, route, False
+        return path, observed, True
+
+    try:
+        import artifact_lifecycle
+        canonical = artifact_lifecycle.canonical_route_path(
+            Path(route["artifact_root"]), route["route_id"])
+    except (ImportError, KeyError, TypeError, ValueError, OSError):
+        return fallback, route, False
+    if fallback is None:
+        fallback = canonical
+    try:
+        observed = json.loads(canonical.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return canonical, route, False
+    if (isinstance(observed, dict)
+            and observed.get("route_id") == route.get("route_id")
+            and observed.get("route_hash") == route.get("route_hash")):
+        return canonical, observed, True
+    return canonical, route, False
 
 
 def _owner_continuation(route, route_path, failed_row, jobs):
     """Use the receipt's effective owner and shared continuation judgment."""
     parent = failed_row.get("parent_attempt_id")
-    if not isinstance(parent, str) or not parent:
+    if not isinstance(parent, str) or not parent or route_path is None:
         return None
     try:
         import dispatch_replacement as DR
         import route_authority
+        import owner_route_binding as ORB
+        import route_lineage
+        from dispatch_contract import parse_registry_metadata
+        from dispatch_registry_cache import registry_snapshot
 
-        effective, _lineage = DR.effective_attempts(jobs, {parent})
+        jobs_path = Path(jobs).expanduser()
+        snapshot = registry_snapshot(jobs_path)
+        if not snapshot.complete:
+            return None
+        rows = []
+        for line in snapshot.lines:
+            fields = line.split("\t")
+            if len(fields) != 6:
+                return None
+            rows.append((fields, parse_registry_metadata(fields[5])))
+        effective, _lineage = DR.effective_attempts(jobs_path, {parent})
         if len(effective) != 1:
             return None
         owner_id = next(iter(effective))
-        rows = DR._rows(Path(jobs).read_text(encoding="utf-8").splitlines())
-        entry = rows.get(owner_id)
-        if not entry:
+        if not snapshot.matches_jobs(jobs_path):
             return None
-        fields, metadata = entry
-        route_id = metadata.get("owner_route_id") or metadata.get("route_id")
-        route_hash = metadata.get("owner_route_hash") or metadata.get("route_hash")
+        owner_rows = [(fields, metadata) for fields, metadata in rows
+                      if metadata.get("attempt_id") == owner_id]
+        if len(owner_rows) != 1:
+            return None
+        fields, metadata = owner_rows[0]
         if (metadata.get("worker_type") != "owner"
                 or metadata.get("attempt_id") != owner_id
-                or route_id != route.get("route_id")
-                or route_hash != route.get("route_hash")
+                or metadata.get("dispatch_depth") != "1"
                 or len(fields) < 2):
             return None
-        bound_path = metadata.get("owner_route_file") or metadata.get("route_file")
-        if bound_path and route_path:
-            try:
-                if Path(bound_path).resolve() != Path(route_path).resolve():
-                    return None
-            except OSError:
-                return None
-        answered = bool(DR._retained_corrections(jobs, owner_id))
+
+        binding, binding_status = ORB.resolve_owner_route_lifecycle(
+            jobs_path, owner_attempt_id=owner_id, registry_rows=rows)
+        if (binding is None or binding_status not in {
+                "owner-route-launch-binding", "owner-route-post-launch-attachment",
+                "owner-route-advance-current"}):
+            return None
+        active_raw = json.loads(Path(binding.route_file).read_text(encoding="utf-8"))
+        active_verified = ORB.ROUTE.verify_route(active_raw)
+        if (active_verified.get("route_id"), active_verified.get("route_hash")) != (
+                binding.route_id, binding.route_hash):
+            return None
+        # The lifecycle resolver verified this exact binding and every adopted
+        # generation; recheck the reread bytes and their route ancestry before
+        # using them for guidance.
+        ancestry = route_lineage.verified_route_lineage(active_raw, observe=True)
+        if not any((item.get("route_id"), item.get("route_hash")) ==
+                   (route.get("route_id"), route.get("route_hash")) for item in ancestry):
+            return None
+        if not snapshot.matches_jobs(jobs_path):
+            return None
+        answered = bool(DR._retained_corrections(jobs_path, owner_id))
         decision = route_authority.decide_continuation(
-            route, action="owner", jobs=jobs, owner_attempt_id=owner_id,
+            active_raw, action="owner", jobs=jobs_path,
             status=fields[1], metadata=metadata, facts={"answered": answered})
-        return decision, owner_id, metadata
+        if not snapshot.matches_jobs(jobs_path):
+            return None
+        return decision, owner_id, metadata, active_raw, Path(binding.route_file)
     except Exception:
         # Guidance generation must preserve the typed resource failure even when
         # registry, lineage, retained-answer, or process evidence is unavailable.
@@ -304,21 +338,39 @@ def retry_step(route, armed, jobs, reason):
     retry = f"{base}__a{ordinal}"
     route_path, observed_route, route_valid = _route_context(route, armed, failed_row)
 
+    resume_route_path = route_path
+
     def resume(continuation="resume"):
         try:
             from parent_next_directive import resume_command
-            command = resume_command(route_path, jobs, agent_home=Path(__file__).resolve().parents[1])
+            command = resume_command(resume_route_path, jobs, agent_home=Path(__file__).resolve().parents[1])
         except Exception:
             command = ""
         return {"command": command, "run_id": retry, "revalidate_nodes": nodes[1:],
                 "meaning": "route 상태를 닫힘 또는 답변 가능한 owner로 확인하지 못했습니다. 기존 resume_command를 따릅니다.",
                 "continuation": continuation}
 
-    outcome = None
+    owner = None
+    guidance_route = observed_route
+    guidance_path = route_path
     if route_valid and route_path is not None:
+        owner = _owner_continuation(observed_route, route_path, failed_row, jobs)
+        if owner is not None:
+            _decision, _owner_id, _metadata, active_route, active_path = owner
+            if any(node.get("id") == armed["node"]
+                   for node in active_route.get("nodes", [])):
+                guidance_route, guidance_path = active_route, active_path
+                resume_route_path = active_path
+                nodes = [armed["node"], *[node["id"] for node in
+                                           descendants(active_route, armed["node"])]]
+            else:
+                owner = None
+
+    outcome = None
+    if route_valid and guidance_path is not None:
         try:
             import dispatch_notice_state
-            outcome = dispatch_notice_state.closed_outcome(route_path, observed_route)
+            outcome = dispatch_notice_state.closed_outcome(guidance_path, guidance_route)
         except Exception:
             return resume("resume-unobservable")
     if outcome and not outcome.get("finish_pending"):
@@ -326,10 +378,9 @@ def retry_step(route, armed, jobs, reason):
     elif not route_valid or route_path is None:
         return resume("resume-unobservable")
     else:
-        owner = _owner_continuation(observed_route, route_path, failed_row, jobs)
         if owner is None:
             return resume()
-        decision, owner_id, metadata = owner
+        decision, owner_id, metadata, _active_route, _active_path = owner
         if decision.state in {"answer", "running"}:
             try:
                 from parent_next_directive import correction_command
@@ -337,7 +388,7 @@ def retry_step(route, armed, jobs, reason):
                     agent_home=Path(__file__).resolve().parents[1]) + " --message-file /dev/stdin")
             except Exception:
                 return resume("resume-unobservable")
-            message = _retry_message(observed_route, run_id, retry, nodes, reason)
+            message = _retry_message(guidance_route, run_id, retry, nodes, reason)
             return {"command": shlex.join(["printf", "%s", message]) + " | " + command,
                     "run_id": retry, "revalidate_nodes": nodes[1:],
                     "meaning": ("BLOCKED owner이면 먼저 owner_report를 확인하고, 답으로 맞는 경우 이 재시도 안내를 전달합니다. "
@@ -356,22 +407,23 @@ def retry_step(route, armed, jobs, reason):
         else:
             return resume()
 
-    task = (f"Continue the approved task from {route['route_id']}. Resource {run_id} remains failed: {reason}. "
+    compose_route = guidance_route if owner is not None else route
+    task = (f"Continue the approved task from {compose_route['route_id']}. Resource {run_id} remains failed: {reason}. "
             f"Retain its registry, sentinel, outputs and all historical PASS/FAIL records unchanged. "
             f"Reuse its checked configuration and smoke inputs, run a distinct resource attempt {retry} "
             "in this new cycle's output directory, and revalidate every selected downstream stage against "
             "the new output bytes. Historical PASS markers do not complete this leg. Original task:\n"
-            + str((route.get("work_request") or {}).get("text") or route.get("slug", "")))
+            + str((compose_route.get("work_request") or {}).get("text") or compose_route.get("slug", "")))
     argv = ["hearting", "run", "capability-route", "compose", "--start", "--shape", "staged",
-            "--capability", route["capability"], "--capability-mode", route["capability_mode"],
-            "--intensity", route["effective_intensity"], "--graph", ",".join(nodes),
+            "--capability", compose_route["capability"], "--capability-mode", compose_route["capability_mode"],
+            "--intensity", compose_route["effective_intensity"], "--graph", ",".join(nodes),
             # A pipe can be read only once. Supplying the existing slug option
             # keeps compose's slug inference from consuming the task first.
-            "--slug", f"{route['route_id']}-{armed['node']}-retry-a{ordinal}",
-            "--cwd", route["cwd"], "--artifact-root", route["artifact_root"],
+            "--slug", f"{compose_route['route_id']}-{armed['node']}-retry-a{ordinal}",
+            "--cwd", compose_route["cwd"], "--artifact-root", compose_route["artifact_root"],
             "--jobs", str(jobs), "--prompt-file", "/dev/stdin"]
-    if route.get("campaign_key"):
-        argv += ["--campaign-key", route["campaign_key"]]
+    if compose_route.get("campaign_key"):
+        argv += ["--campaign-key", compose_route["campaign_key"]]
     else:
         argv += ["--unassigned"]
     return {"command": shlex.join(["printf", "%s", task]) + " | " + shlex.join(argv),
