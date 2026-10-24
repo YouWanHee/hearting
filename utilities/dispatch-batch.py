@@ -2503,10 +2503,8 @@ def main(argv: list[str] | None = None) -> int:
         if not self_slug or not parent_attempt:
             raise BatchError("parent-identity-mismatch", f"parent={args.parent} self={self_slug or '-'}")
         adopt_self_parent(args, self_slug)
-        repo = subprocess.check_output(
-            ["git", "-C", str(route["cwd"]), "rev-parse", "--show-toplevel"],
-            text=True,
-        ).strip()
+        from dispatch_contract import work_root_identity
+        repo = work_root_identity(route["cwd"], route=route)
         resolve_live_parent_attempt(
             jobs,
             parent_slug=args.parent,

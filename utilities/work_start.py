@@ -2038,6 +2038,15 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     "recovery_command": resume,
                     "next_step": "The owner did not start: the artifact admission lock stayed busy. Nothing ran; "
                         "run resume_command again later (after about a minute) and it starts the owner again."}
+        if result["launches"]:
+            launch = result["launches"][-1]
+            receipt_text = launch.get("receipt") or ""
+            if ("reason=non-git-route-invalid" in receipt_text
+                    and "detail=source-mutating route" in receipt_text):
+                return {**result, "state": "needs-attention", "reason": "owner-launch-not-admitted",
+                        "required_action": "inspect-preparation",
+                        "next_step": (f"git 저장소 아님: {route.get('cwd', '')}: source-mutating worker route; "
+                                      "git init 후 다시 시작하거나, 이 세션에서 --shape direct로 진행")}
         return {**result, "state": "needs-attention", "reason": "owner-launch-not-admitted"}
     status, metadata = rows[aid]
     if launched_now and _never_started(status, metadata):

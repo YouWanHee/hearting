@@ -3325,6 +3325,35 @@ class StageRecoveryProgressTest(unittest.TestCase):
                 self.assertIn('scoped uncommitted paths unavailable', unavailable)
 
 
+class NonGitStageProgressTest(unittest.TestCase):
+    def test_unversioned_progress_skips_git_and_lists_cycle_outputs(self):
+        import artifact_context
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cwd = root / "documents"
+            cwd.mkdir()
+            output = root / "cycle" / "artifacts"
+            output.mkdir(parents=True)
+            result = output / "research.md"
+            result.write_text("observed output\n", encoding="utf-8")
+            route = {"route_id": "rt-non-git-progress", "route_hash": "fixture",
+                     "source_commit": "unversioned", "cwd": str(cwd),
+                     "artifact_root": str(root), "nodes": [{"id": "execute",
+                     "outputs": ["research.md"], "write_scope": ["artifacts/**"]}]}
+            route_path = root / "route.json"
+            route_path.write_text(json.dumps(route), encoding="utf-8")
+            meta = {"worker_type": "stage", "route_node": "execute",
+                    "route_file": str(route_path), "note": "dead-timeout"}
+            with mock.patch.object(D._route_module(), "verify_route"), \
+                 mock.patch.object(artifact_context, "resolve_context",
+                                   return_value=SimpleNamespace(output_dir=output)), \
+                 mock.patch.object(R, "_git_readonly", side_effect=AssertionError("Git must not be probed")):
+                block = R._stage_progress_block(
+                    root / "jobs.log", "att-stage", ["2000-01-01T00:00:00Z", "done", "", "", "", ""], meta, [])
+            self.assertIn("git 아닌 폴더 — 커밋·미커밋 관찰 해당 없음", block)
+            self.assertIn("research.md", block)
+
+
 class ReplacementReuseCurrencyTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

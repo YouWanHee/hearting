@@ -118,7 +118,21 @@ def _directory(jobs):
     return Path(jobs).resolve().parent / 'automatic-replacements'
 
 
+_ROWS_MEMO = [None, None]
+
+
 def _rows(lines):
+    """Registry rows by attempt id. Callers re-read the same registry many times in one
+    process, so the last parse is reused for identical content; each call gets copies."""
+    lines = tuple(lines)
+    key, cached = _ROWS_MEMO
+    if cached is None or key != lines:
+        cached = _parse_rows(lines)
+        _ROWS_MEMO[:] = [lines, cached]
+    return {aid: (list(fields), dict(meta)) for aid, (fields, meta) in cached.items()}
+
+
+def _parse_rows(lines):
     result = {}
     for line in lines:
         fields = line.split('\t')
@@ -578,8 +592,11 @@ def _stage_progress_block(jobs, aid, fields, meta, lines):
                  if item.get('id') == meta.get('route_node')), None)
     worktree = (route or {}).get('cwd')
     scopes = (node or {}).get('write_scope') or []
+    unversioned = bool(route and route.get('source_commit') == 'unversioned')
     head = None
-    if worktree:
+    if unversioned:
+        observations.append('- git 아닌 폴더 — 커밋·미커밋 관찰 해당 없음')
+    elif worktree:
         result = _git_readonly(worktree, 'rev-parse', 'HEAD')
         if result is not None and result.returncode == 0:
             head = result.stdout.decode('ascii', 'replace').strip()
@@ -590,7 +607,9 @@ def _stage_progress_block(jobs, aid, fields, meta, lines):
         observations.append('- worktree unavailable from the sealed route')
 
     launch_head = meta.get('launch_head')
-    if not launch_head:
+    if unversioned:
+        observations.append('- commit range: 해당 없음 (unversioned route)')
+    elif not launch_head:
         observations.append('- launch_head unavailable; commit range not observed')
     elif not worktree or not head:
         observations.append(f'- launch_head recorded ({launch_head}); commit range unavailable')
@@ -616,7 +635,7 @@ def _stage_progress_block(jobs, aid, fields, meta, lines):
             if len(commits) > 20:
                 observations.append(f'  - truncated; {len(commits) - 20} more commit(s)')
 
-    if worktree:
+    if worktree and not unversioned:
         result = _git_readonly(worktree, 'status', '--porcelain=v1', '-z',
                                '--untracked-files=all')
         if result is None or result.returncode != 0:
@@ -644,6 +663,8 @@ def _stage_progress_block(jobs, aid, fields, meta, lines):
                 observations.append(f'  - {status} {path}')
             if len(paths) > 40:
                 observations.append(f'  - truncated; {len(paths) - 40} more path(s)')
+    elif unversioned:
+        observations.append('- scoped uncommitted paths: 해당 없음 (unversioned route)')
 
     try:
         import artifact_context

@@ -12,6 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SID = "11111111-2222-3333-4444-555555555555"
 
 
+def inside_codex_sandbox():
+    try:
+        return b"codex-linux-sandbox" in Path("/proc/1/cmdline").read_bytes()
+    except OSError:
+        return False
+
+
 def git(cwd, *args):
     subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True,
                    env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
@@ -194,6 +201,11 @@ class CodexWiringTest(WiringFixture):
 
 @unittest.skipUnless(shutil.which("node"), "node not installed")
 class OpenCodeWiringTest(WiringFixture):
+    def setUp(self):
+        if inside_codex_sandbox():
+            self.skipTest("OpenCode Node subprocess stdin cannot be observed inside a Codex OS sandbox")
+        super().setUp()
+
     def call(self, tool, args, sid="ses_1"):
         script = f"""
 process.env.AGENT_HOME = {json.dumps(str(ROOT))}

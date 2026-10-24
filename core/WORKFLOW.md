@@ -198,9 +198,22 @@ defaults to the named **Existing-result analysis** composition in
 `metrics → diagnose → report`, adding `independent-verify` at strong or higher
 with its declared group and automatic owner close. Include `eval-run` only when
 the request needs new raw results, using its existing inputs and write scope.
-The parent chooses the capability: omitting `--capability` in ordinary compose
+In a Git folder, the parent chooses the capability: omitting `--capability` in ordinary compose
 uses the fixed `autopilot-code` default, not a classifier of the task text; framed work
-leaves that choice to its frame.
+leaves that choice to its frame. A depth-0 `compose --start` in a non-Git folder with no
+shape or `--shape direct` runs inline in the current session. Its task purpose selects the
+capability when clear; an explicit `--capability` and mode take precedence, and an unclear
+purpose is shown as unresolved while retaining the existing storage fallback. The session
+performs that capability's work and can close it through the normal inline `finish` path.
+The start card says `git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작`.
+An explicit worker shape, including a route-plan leg whose own shape is not direct, remains a
+worker request. In a non-Git folder, a compiled artifact-only worker route may run in the
+bound folder; a route whose compiled write scope mutates source is refused with the reason
+and the next action (`git init` and restart, or continue this session with `--shape direct`).
+The classification comes from the compiled write scope, not a capability-name list. An
+omitted shape keeps the existing direct-start behavior and is not silently changed to framed.
+A later compose in a Git repository follows the
+existing Git behavior.
 Likewise, code review within an implementation/debug cycle belongs to
 `autopilot-code --mode audit`; independent inspection of completed work belongs
 to `audit`. Both may inspect code; purpose, not file type, decides the owner.
@@ -224,6 +237,11 @@ a mode retains its existing deployment/release behavior (`default`).
 | "Fix the reusable archive builder" | `autopilot-code` | Program implementation, not packaging an existing result |
 | "Write an independent presentation for the recipient" | `autopilot-draft` | New document goal, not file collection |
 | "Deploy the application to production" | `autopilot-ship` | Obtain deploy approval at route start; retain post-deploy verification |
+
+For the non-Git direct start only, task classification is conservative: clear research,
+fixed-result evaluation, reusable code, document correction or drafting, project analysis,
+and packaging use their corresponding existing capabilities. Generic analysis, conflicting
+purposes, negation, and quoted examples stay unresolved; they add no required question or flag.
 
 
 ### 0.2.1. Shape Before Preset (SD-135)
