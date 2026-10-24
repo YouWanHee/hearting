@@ -77,7 +77,7 @@ def build_ledger_rows(tab, attempts, route_records=None, gates=None):
     out = []
     for node in _node_ids(route_records.get(route_id), rows):
         history = [row for row in rows if row.route_node == node]
-        current = history[-1] if history else None
+        current = max(history, key=lambda row: row.rank) if history else None
         out.append(LedgerRow(
             route_node=node,
             harness=harness_abbr(current.harness) if current else "",

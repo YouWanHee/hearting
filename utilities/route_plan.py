@@ -28,10 +28,17 @@ SCHEMA = "route_decision_v1"
 CAPABILITY = "route-frame"
 SHAPE = "framed"
 NODE_IDS = ("frame", "frame-alternative", "route-decision")
-# A framed route runs one frame leg by default, and both legs for uncertain or hard-to-reverse
-# work (user decision 2026-10-07). A recipe's own frame pair is always both legs.
+# A new framed route runs both legs by default. Explicit direct/quick may narrow to one
+# deep leg when the request has no protected path, multi-adapter paths, or spec/ship hint.
+# A recipe's own frame pair is always both legs.
 ONE_LEG_NODE_IDS = ("frame", "route-decision")
 FRAME_PAIR = ("frame", "frame-alternative")
+_FRAME_PATH = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:\./|/|`)?(?:core|capabilities|roles|spec)/[^\s`'\"<>),;]+"
+    r"|(?<![A-Za-z0-9_.-])(?:\./|~/|/|`)?(?:[A-Za-z0-9_.-]+/)*prd\.md(?![A-Za-z0-9_.-])",
+    re.I,
+)
+_ADAPTER_PATH = re.compile(r"(?<![A-Za-z0-9_.-])adapters/(claude|codex|opencode)(?=/|\b)")
 TERMINAL_NODE = "route-decision"
 RECORD_RELATIVE = "shards/frame/route-decision.json"
 MAX_RECORD_BYTES = 262144
@@ -87,6 +94,28 @@ def valid_frame_legs(route, legs) -> bool:
     """Whether `legs` is a frame set this route may have: the pair, or `frame` alone on a framed route."""
     legs = set(legs)
     return legs == set(FRAME_PAIR) or (legs == {"frame"} and is_framed_route(route))
+
+
+def frame_leg_decision(given_intensity, request_text="", routing_hints=None):
+    """Return the sealed frame width, its source, and a stable human-readable reason."""
+    if given_intensity is None:
+        return 2, "default", "기본"
+    if given_intensity not in {"direct", "quick", "standard", "strong", "thorough", "adversarial"}:
+        raise ValueError("invalid intensity")
+    if given_intensity not in {"direct", "quick"}:
+        return 2, "explicit", f"--intensity {given_intensity} 표시"
+    text = str(request_text or "")
+    match = _FRAME_PATH.search(text)
+    if match:
+        reason = re.sub(r"[`\n\r]+", "", match.group(0))[:72]
+        return 2, "automatic", f"자동 지킴: --intensity {given_intensity}이지만 과제에 {reason}"
+    adapters = list(dict.fromkeys(_ADAPTER_PATH.findall(text)))
+    if len(adapters) >= 2:
+        return 2, "automatic", f"자동 지킴: --intensity {given_intensity}이지만 과제에 어댑터 둘 이상"
+    hints = routing_hints or {}
+    if hints.get("capability") in {"autopilot-spec", "autopilot-ship"}:
+        return 2, "automatic", f"자동 지킴: --intensity {given_intensity}이지만 과제에 {hints['capability']} 작업"
+    return 1, "explicit", f"간단 표시 --intensity {given_intensity}"
 
 
 def _canonical(value) -> bytes:
