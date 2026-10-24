@@ -360,7 +360,8 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
         context = wrapper.opencode_context
         attempt = "att-opencode-owner-cap-refresh"
         opencode = self.fakebin / "opencode"
-        opencode.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        opencode.write_text(
+            '#!/bin/sh\n[ "$1" = --version ] && echo 2.0.32\nexit 0\n', encoding="utf-8")
         opencode.chmod(0o755)
 
         env = self.route_binding_env(self.base_env(self.jobs["opencode"]))

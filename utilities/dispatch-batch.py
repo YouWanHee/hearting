@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_contract import (  # noqa: E402
     DispatchContractError,
     GOVERNOR_RESERVATION_ENV,
+    attempt_row_terminal_never_started,
     attempt_process_quiescence,
     completion_attempt_readiness,
     completion_marker_gate,
@@ -518,6 +519,97 @@ def unfinished_batch_input(jobs, route, nodes, group, parent_attempt, prompt, ad
     return candidates[0] if candidates else None
 
 
+def discover_unstarted_partial_group(jobs: Path, route: dict, nodes: list[dict], group: str):
+    """Find one sealed group with exactly one terminal strict no-start gap."""
+    directory = jobs.resolve().parent / "automatic-replacements" / "batch-inputs"
+    if not directory.is_dir():
+        return None, None
+    by_id = {}
+    for line in jobs.read_text(encoding="utf-8", errors="replace").splitlines():
+        fields = line.split("\t")
+        if len(fields) == 6:
+            metadata = parse_registry_metadata(fields[5])
+            by_id.setdefault(metadata.get("attempt_id"), []).append((fields, metadata))
+    matches = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            manifest, digest, leg_digests = verify_manifest(payload["manifest"])
+        except (OSError, ValueError, KeyError, TypeError, ReplicaBatchContractError):
+            continue
+        if (manifest.get("route_id") != route.get("route_id")
+                or (manifest.get("parallel_group") or manifest.get("replica_group")) != group
+                or {str(row.get("route_node")) for row in manifest.get("members", [])}
+                    != {str(node.get("id")) for node in nodes}):
+            continue
+        no_starts = []
+        valid = True
+        peer_unsettled = False
+        for member in manifest["members"]:
+            rows = by_id.get(str(member.get("attempt_id")), [])
+            if len(rows) != 1:
+                valid = False
+                break
+            fields, metadata = rows[0]
+            expected = (metadata.get("route_id") == route.get("route_id")
+                and metadata.get("route_node") == member.get("route_node")
+                and metadata.get("batch_group") == group
+                and metadata.get("batch_manifest_sha256") == digest
+                and metadata.get("batch_leg_sha256") == leg_digests.get(str(member.get("attempt_id"))))
+            if not expected:
+                valid = False
+                break
+            if attempt_row_terminal_never_started(fields):
+                no_starts.append((member, fields))
+            elif fields[1] not in {"done", "cancelled", "killed"} or metadata.get("note") != "completed-marker":
+                # A live or explicitly unsettled sibling must not make this
+                # look like a fresh group. Preserve the single-gap continuation
+                # and let the caller retry this exact command after settlement.
+                if (member.get("route_node") != manifest.get("gap_leg_id")
+                        and (fields[1] in {"open", "running", "draining"}
+                             or metadata.get("terminal_conflict") == "1"
+                             or metadata.get("note", "").startswith("terminal-observation-"))):
+                    peer_unsettled = True
+                else:
+                    valid = False
+                    break
+        if not valid or len(no_starts) != 1:
+            continue
+        if peer_unsettled:
+            error = BatchError("partial-continuation-peer-unsettled",
+                               f"group={group}:peer terminal state is not settled")
+            error.next_action = "same-command"
+            error.retry_when = "peer terminal PASS marker and quiescence are current"
+            raise error
+        member, _fields = no_starts[0]
+        try:
+            partial = ROUTE_MODULE.partial_group_continuation(
+                route, source_group_id=group, source_batch_manifest=manifest,
+                failed_source_attempt_id=str(member["attempt_id"]),
+                gap_leg_id=str(member["route_node"]))
+        except ValueError as exc:
+            detail = str(exc)
+            if ("continuation-source-node-unverified" in detail
+                    or "continuation-source-verdict-not-pass" in detail):
+                error = BatchError("partial-continuation-peer-unsettled", detail[:512])
+                error.next_action = "same-command"
+                error.retry_when = "peer terminal PASS marker and quiescence are current"
+                raise error
+            continue
+        except (KeyError, TypeError):
+            continue
+        continuation_id = "cont-" + hashlib.sha256(
+            json.dumps(partial, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:32]
+        partial["continuation_id"] = continuation_id
+        continuation = {"continuation_contract_version": 1,
+            "source_route_id": route["route_id"], "source_route_hash": route["route_hash"],
+            "continuation_id": continuation_id, "partial_group_continuation": partial}
+        matches.append((continuation, partial))
+    if len(matches) > 1:
+        raise BatchError("partial-continuation-source-ambiguous", group)
+    return matches[0] if matches else (None, None)
+
+
 def prior_batch_assignments(payload: dict, route: dict, nodes: list[dict], parent_identity: dict):
     members = {m["route_node"]: m for m in payload["manifest"]["members"]}
     assignments = []
@@ -739,9 +831,16 @@ def assign_harnesses(
     parent_identity: dict[str, str] | None = None,
     jobs: Path | None = None,
     recheck: bool = False,
+    fixed: dict[str, tuple[str, str, int]] | None = None,
+    excluded: dict[str, set[str]] | None = None,
 ) -> tuple[list[tuple[dict[str, object], str, str, int]], str, dict[str, object]]:
     """Pick a harness per node. Side-effect free unless `recheck` (a launch that will start),
     which may send the usage gate's Claude probe; never writes the ledger.
+
+    `fixed` keeps a node on its already-realized tuple (a reused successful
+    peer: no capacity probe, but it still takes part in the group's quality
+    and diversity rules). `excluded` removes harnesses a node's previous
+    attempts could not start on. Both default to the ordinary placement.
 
     A caller that realizes a new child launch may persist this function's
     returned diagnostics (`degradation_cause`/`degradation_detail`). Raised
@@ -764,6 +863,10 @@ def assign_harnesses(
         # group-level diagnostics/degradation evidence below, which
         # legitimately wants group-wide reasons.
         node_exclusions: dict[str, set[str]] = {}
+        if fixed and str(node.get("id")) in fixed:
+            options.append([tuple(fixed[str(node.get("id"))])])
+            continue
+        unstarted = (excluded or {}).get(str(node.get("id")), set())
         from dispatch_capacity_evidence import active_limits
         quota_limits = (active_limits(jobs, profile=node.get("model_profile"), recheck=recheck)
                         if jobs is not None else {})
@@ -780,6 +883,10 @@ def assign_harnesses(
                 # not merely ranked last.
                 exclusions.setdefault(adapter, set()).add("outside-profile-policy")
                 node_exclusions.setdefault(adapter, set()).add("outside-profile-policy")
+                continue
+            if adapter in unstarted:
+                exclusions.setdefault(adapter, set()).add("launch-never-started")
+                node_exclusions.setdefault(adapter, set()).add("launch-never-started")
                 continue
             if adapter in quota_limits:
                 reason = f"quota-until-{quota_limits[adapter]['reset_epoch']}"
@@ -1179,6 +1286,116 @@ def _recovery_replacement_attempt(metadata: dict[str, str]) -> str:
     return ""
 
 
+def _partial_seal_path(jobs: Path, partial: dict, step: int) -> Path:
+    identity = str(partial["replacement_leg_identity"]).split(":", 1)[1]
+    suffix = "" if step == 1 else f".step-{step}"
+    return jobs.parent / "recovery" / "partial-group" / f"{identity}{suffix}.json"
+
+
+def partial_successor_attempt_id(partial: dict, predecessor_attempt_id: str, step: int) -> str:
+    """Deterministic successor of a strict no-start successor (step >= 2)."""
+    return "att-" + record_digest({
+        "replacement_leg_identity": str(partial["replacement_leg_identity"]),
+        "predecessor_attempt_id": predecessor_attempt_id,
+        "step": step,
+    }).split(":", 1)[1][:48]
+
+
+def partial_gap_lineage(jobs: Path, partial: dict, *, lines: list[str] | None = None) -> dict:
+    """Follow one gap's sealed successors past attempts that never started.
+
+    Step 1 is the existing partial replacement. Only a successor whose terminal
+    row carries the strict never-started proof moves the chain on, and each
+    such attempt's harness is excluded from the next placement. A successor
+    that launched, is still registered, or has no row yet ends the walk.
+    """
+    if lines is None:
+        try:
+            lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            raise BatchError("batch-registry-unreadable", str(exc)) from exc
+    rows: dict[str, list[tuple[list[str], dict[str, str]]]] = {}
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) == 6:
+            metadata = parse_registry_metadata(fields[5])
+            rows.setdefault(str(metadata.get("attempt_id", "")), []).append((fields, metadata))
+
+    def unstarted_harness(attempt_id: str) -> str:
+        found = rows.get(attempt_id, [])
+        if len(found) != 1 or not attempt_row_terminal_never_started(found[0][0]):
+            return ""
+        metadata = found[0][1]
+        return str(metadata.get("batch_harness") or metadata.get("harness") or "")
+
+    excluded = []
+    source = unstarted_harness(str(partial["failed_source_attempt_id"]))
+    if source:
+        excluded.append(source)
+    step, seal, unstarted = 1, None, []
+    while True:
+        path = _partial_seal_path(jobs, partial, step)
+        try:
+            seal = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            seal = None
+        except (OSError, ValueError) as exc:
+            raise BatchError("partial-continuation-seal-invalid", str(path)) from exc
+        if seal is None:
+            return {"step": step, "seal": None, "predecessor_attempt_id": (
+                    "" if step == 1 else predecessor), "excluded": sorted(set(excluded)),
+                    "unstarted_successors": unstarted}
+        attempt = str(seal.get("replacement_attempt_id", ""))
+        harness = unstarted_harness(attempt)
+        if not harness:
+            return {"step": step, "seal": seal, "predecessor_attempt_id": str(
+                    seal.get("predecessor_attempt_id", "")), "excluded": sorted(set(excluded)),
+                    "unstarted_successors": unstarted}
+        excluded.append(harness)
+        unstarted.append(attempt)
+        predecessor = attempt
+        step += 1
+
+
+def _seal_partial_successor(jobs, partial, lines, lineage, gap_assignment, *, apply, base):
+    """Seal one later successor under the registry lock (see partial_gap_lineage)."""
+    current = partial_gap_lineage(jobs, partial, lines=lines)
+    if current["step"] != lineage["step"]:
+        error = BatchError("partial-continuation-lineage-advanced",
+                           f"step={lineage['step']}:current={current['step']}")
+        error.next_action = "same-command"
+        raise error
+    if gap_assignment is None:
+        raise BatchError("partial-continuation-lineage-placement-missing")
+    adapter, hop, ordinal = gap_assignment
+    if current["seal"] is not None:
+        seal = current["seal"]
+        if (seal.get("replacement_harness"), seal.get("replacement_fallback_hop"),
+                seal.get("replacement_fallback_ordinal")) != (adapter, hop, int(ordinal)):
+            error = BatchError("partial-continuation-lineage-advanced", "sealed placement differs")
+            error.next_action = "same-command"
+            raise error
+        return seal
+    if adapter in current["excluded"]:
+        raise BatchError("partial-continuation-lineage-placement-invalid", adapter)
+    step = int(current["step"])
+    predecessor = str(current["predecessor_attempt_id"])
+    seal = {
+        **base,
+        "replacement_attempt_id": partial_successor_attempt_id(partial, predecessor, step),
+        "retry_claim_reused": False,
+        "step": step,
+        "predecessor_attempt_id": predecessor,
+        "replacement_harness": adapter,
+        "replacement_fallback_hop": hop,
+        "replacement_fallback_ordinal": int(ordinal),
+        "excluded_harnesses": list(current["excluded"]),
+    }
+    if apply:
+        _write_once_json(_partial_seal_path(jobs, partial, step), seal)
+    return seal
+
+
 def prepare_partial_replacement(
     jobs: Path,
     route: dict[str, object],
@@ -1188,8 +1405,15 @@ def prepare_partial_replacement(
     source_leg_digests: dict[str, str],
     *,
     apply: bool,
+    lineage: dict | None = None,
+    gap_assignment: tuple[str, str, int] | None = None,
 ) -> dict[str, object]:
-    """CAS the exact gap replacement identity before governor reservation."""
+    """CAS the exact gap replacement identity before governor reservation.
+
+    With a `lineage` past step 1 (the previous successor never started), the
+    successor and its placement are sealed write-once per step, so a repeated
+    or concurrent start reuses the same attempt and never re-rolls the harness.
+    """
 
     original_attempt = str(partial["failed_source_attempt_id"])
     gap = str(partial["gap_leg_id"])
@@ -1225,7 +1449,8 @@ def prepare_partial_replacement(
             if (
                 mismatches
                 or (fields[1] not in {"done", "cancelled", "killed"}
-                    if partial.get("automatic_replacement_evidence") else fields[1] != "done")
+                    if partial.get("automatic_replacement_evidence")
+                    else fields[1] != "done")
                 or metadata.get("note") == "completed-marker"
             ):
                 raise BatchError(
@@ -1266,6 +1491,23 @@ def prepare_partial_replacement(
                 )
             if replacement_attempt == original_attempt:
                 raise BatchError("partial-continuation-replacement-attempt-reused")
+            if lineage is not None and int(lineage.get("step", 1)) > 1:
+                return _seal_partial_successor(
+                    jobs, partial, lines, lineage, gap_assignment, apply=apply,
+                    base={
+                        "schema_version": 1,
+                        "continuation_id": str(partial.get("continuation_id") or ""),
+                        "source_route_id": str(route["route_id"]),
+                        "source_route_hash": str(route["route_hash"]),
+                        "source_group_id": str(partial["source_group_id"]),
+                        "source_batch_manifest_digest": source_manifest_digest,
+                        "failed_source_attempt_id": original_attempt,
+                        "gap_leg_id": gap,
+                        "reused_peer_set_proof_digest": str(
+                            partial["reused_peer_set_proof_digest"]
+                        ),
+                        "replacement_leg_identity": str(partial["replacement_leg_identity"]),
+                    })
             seal = {
                 "schema_version": 1,
                 "continuation_id": str(partial.get("continuation_id") or ""),
@@ -2315,6 +2557,7 @@ def main(argv: list[str] | None = None) -> int:
     route: dict[str, object] = {}
     continuation_record: dict[str, object] | None = None
     partial: dict[str, object] | None = None
+    partial_lineage: dict | None = None
     try:
         route_path = args.route.resolve()
         route = load_route(route_path, args.action)
@@ -2414,6 +2657,9 @@ def main(argv: list[str] | None = None) -> int:
             2,
             args.action,
         ).path
+        if partial is None and args.action == "start":
+            continuation_record, partial = discover_unstarted_partial_group(
+                jobs, route, nodes, args.parallel_group)
         if args.log_dir is not None:
             args.log_dir = validate_dispatch_log_dir(jobs, args.log_dir)
         args.review_inputs = {}
@@ -2433,6 +2679,10 @@ def main(argv: list[str] | None = None) -> int:
         for capped_node in nodes:
             capped_node_id = str(capped_node["id"])
             if not DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(capped_node):
+                continue
+            if partial is not None and capped_node_id != str(partial["gap_leg_id"]):
+                # The sealed PASS peers are historical inputs to the partial
+                # replacement; they do not need a fresh round admission.
                 continue
             if partial is not None and partial.get("automatic_replacement_evidence"):
                 # The claim has already validated the dead exact source. Reused
@@ -2522,6 +2772,41 @@ def main(argv: list[str] | None = None) -> int:
                            "family_exclusions": {}, "capacity": {},
                            "degradation_cause": "", "sole_gate": "not-applicable",
                            "allocation_source": "sealed-source-manifest"}
+            if not partial.get("automatic_replacement_evidence"):
+                partial_lineage = partial_gap_lineage(jobs, partial)
+                if partial_lineage["step"] > 1:
+                    # The previous successor never started. Keep the peers on
+                    # their realized tuples and place only the gap again,
+                    # without the harnesses it could not start on.
+                    gap_id = str(partial["gap_leg_id"])
+                    sealed = partial_lineage["seal"]
+                    if sealed is not None:
+                        gap_node = next(node for node in nodes if str(node["id"]) == gap_id)
+                        selected = DISPATCH_NODE.resolve_checked_tuple(
+                            route, gap_node, str(sealed["replacement_harness"]),
+                            parent_identity=parent_identity)
+                        placed = {gap_id: (str(sealed["replacement_harness"]),
+                                           selected.fallback_hop, selected.ordinal)}
+                    else:
+                        chosen, independence, diagnostics = assign_harnesses(
+                            route, nodes, allow_degraded=args.allow_degraded_independence,
+                            parent_identity=parent_identity, jobs=jobs,
+                            recheck=args.action == "start",
+                            fixed={str(node["id"]): (adapter, hop, ordinal)
+                                   for node, adapter, hop, ordinal in assignments
+                                   if str(node["id"]) != gap_id},
+                            excluded={gap_id: set(partial_lineage["excluded"])})
+                        placed = {gap_id: next((adapter, hop, ordinal)
+                                  for node, adapter, hop, ordinal in chosen
+                                  if str(node["id"]) == gap_id)}
+                    assignments = [
+                        (node, *placed[str(node["id"])]) if str(node["id"]) in placed
+                        else (node, adapter, hop, ordinal)
+                        for node, adapter, hop, ordinal in assignments
+                    ]
+                    diagnostics = {**diagnostics, "allocation_source": "partial-gap-reassignment",
+                                   "gap_excluded_harnesses": partial_lineage["excluded"],
+                                   "gap_successor_step": partial_lineage["step"]}
         else:
             assignments, independence, diagnostics = assign_harnesses(
                 route, nodes, allow_degraded=args.allow_degraded_independence,
@@ -2748,6 +3033,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         try:
             revalidate_partial_peers(route, nodes, partial)
+            gap_assignment = next(
+                (str(leg["adapter"]), str(leg["hop"]), int(leg["ordinal"]))
+                for leg in legs if leg["node"] == partial["gap_leg_id"])
             replacement_seal = prepare_partial_replacement(
                 jobs,
                 route,
@@ -2756,6 +3044,8 @@ def main(argv: list[str] | None = None) -> int:
                 source_manifest_digest,
                 source_leg_digests,
                 apply=args.action == "start",
+                lineage=partial_lineage,
+                gap_assignment=gap_assignment,
             )
         except BatchError as exc:
             return fail(exc.reason, 65, detail=exc.detail, admitted=0, spawned=0)
@@ -2875,7 +3165,8 @@ def main(argv: list[str] | None = None) -> int:
                 leg_digest=leg_digests[str(leg["attempt_id"])],
                 agent_home=agent_home,
                 replaced_attempt_id=str(partial["failed_source_attempt_id"]) if partial else "",
-                prior_attempt_ids=historical_batch_attempts,
+                prior_attempt_ids=historical_batch_attempts | frozenset(
+                    (partial_lineage or {}).get("unstarted_successors", ())),
             )
             if existing is None:
                 pending_legs.append(leg)
