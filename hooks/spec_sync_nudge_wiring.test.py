@@ -169,6 +169,66 @@ hooks.dispose?.({ silent: true });
                 result = run([NODE, "--input-type=module", "-e", script], cwd=ROOT, env=env, timeout=45)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_opencode_v2_returns_context_in_the_native_tool_result(self):
+        if not NODE:
+            self.skipTest("node is unavailable")
+        with tempfile.TemporaryDirectory(prefix="spec-sync-v2-") as raw:
+            base = Path(raw)
+            _, linked = make_linked_fixture(base)
+            script = r'''import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { pathToFileURL } from "node:url";
+childProcess.spawnSync = () => ({ status: 0, stdout: "", stderr: "" });
+syncBuiltinESMExports();
+const plugin = (await import(pathToFileURL(process.env.PLUGIN_PATH))).default;
+const hooks = new Map();
+const ctx = {
+  location: { directory: process.env.FIXTURE_CWD },
+  session: {
+    get: async ({ sessionID }) => ({ id: sessionID,
+      title: sessionID === "worker" ? "hearting-worker-att-fixture" : "Main work" }),
+    hook: async (name, fn) => hooks.set("session." + name, fn),
+  },
+  tool: { hook: async (name, fn) => hooks.set("tool." + name, fn) },
+  shell: { hook: async () => {} },
+  permission: { hook: async () => {} },
+  event: { subscribe: async function* ({ signal }) {
+    await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
+  } },
+};
+const cleanup = await plugin.setup(ctx);
+try {
+  for (const sessionID of ["main", "worker"]) {
+    for (const [tool, input] of [
+      ["edit", { filePath: "source.py", oldString: "epoch = 30", newString: "epoch = 50" }],
+      ["apply_patch", { patchText: process.env.PATCH_TEXT }],
+    ]) {
+      const original = { content: [{ type: "text", text: "TOOL-OUTPUT" },
+        { type: "image", data: "preserve-image", mimeType: "image/png" }],
+        metadata: { unchanged: true }, title: "original title" };
+      const event = { sessionID, tool, input, status: "completed", result: original };
+      await hooks.get("tool.execute.after")(event);
+      assert.deepEqual(event.result.content.slice(0, 2), original.content);
+      assert.deepEqual(event.result.metadata, original.metadata);
+      assert.equal(event.result.title, original.title);
+      const context = event.result.content.slice(2).map(part => part.text || "").join("\n");
+      assert.ok(context.includes("CANONICAL_ONLY"), `${sessionID}/${tool}: ${JSON.stringify(event)}`);
+      assert.ok(!context.includes("SHADOW_ONLY"));
+      assert.equal(context.split("Spec synchronization nudge").length - 1, 1);
+      const failure = { sessionID, tool, input, status: "error", error: { message: "edit failed" } };
+      const before = JSON.stringify(failure);
+      await hooks.get("tool.execute.after")(failure);
+      assert.equal(JSON.stringify(failure), before, "failed tool result must remain unchanged");
+    }
+  }
+} finally { await cleanup(); }
+'''
+            env = clean_env(base / "home", PLUGIN_PATH=ROOT / "adapters/opencode/plugins/hearting-guards.js",
+                            FIXTURE_CWD=linked, PATCH_TEXT=PATCH)
+            result = run([NODE, "--input-type=module", "-e", script], cwd=ROOT, env=env, timeout=45)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_noise_filter_caps_fail_open_and_reader_priority(self):
         with tempfile.TemporaryDirectory(prefix="spec-sync-noise-") as raw:
             base = Path(raw)

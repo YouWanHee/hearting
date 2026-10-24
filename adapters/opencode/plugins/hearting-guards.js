@@ -983,12 +983,19 @@ async function setupOpenCodeV2(ctx) {
     const output = { output: Array.isArray(content)
       ? content.map((part) => part?.text || "").filter(Boolean).join("\n") : "",
       metadata: event.status === "error" ? { exit: 1 } : {} }
+    const originalText = output.output
     if (v2WorkerSessions.has(event.sessionID)) {
       await appendSpecSyncNudge(ctx, { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output, root)
-      return
+    } else {
+      await hooks["tool.execute.after"]?.(
+        { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output)
     }
-    await hooks["tool.execute.after"]?.(
-      { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output)
+    if (event.status === "completed" && Array.isArray(content) &&
+        output.output.startsWith(originalText) && output.output.length > originalText.length) {
+      // V2 consumes the native result, not the legacy adapter's temporary string.
+      const text = output.output.slice(originalText.length).replace(/^\n/, "")
+      event.result = { ...event.result, content: [...content, { type: "text", text }] }
+    }
   }))
   await ctx.shell.hook("create.before", async (event) => {
     const env = event.env || {}

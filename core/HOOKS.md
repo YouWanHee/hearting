@@ -28,6 +28,10 @@ preflight doctor path, without blurring the conformance/drill distinction above.
 
 ## Status Classes
 
+Post-edit context must reach the runtime's native result, including OpenCode V2
+`event.result.content`. Preserve the completed result's original content and
+metadata when appending context; failed tool events remain unchanged.
+
 | Status | Meaning |
 |---|---|
 | `portable-check` | Core decision logic is runtime-neutral and has a CLI entry point. It may also accept Claude hook JSON for compatibility. |
