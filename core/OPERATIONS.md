@@ -2517,10 +2517,13 @@ identified settlement dependency remain unchanged. This is a scheduling
 optimization: it does not satisfy delivery, inspection, claim, mutation, or
 completion authority. Missing, unreadable, unstable, or untracked dependencies
 require a fresh observation and remain unknown until that observation succeeds.
-Runner recovery stops when its state-root identity or runner-lock inode is
-replaced; it cannot recreate a removed root. Terminal obligation history is
-retained only for its bounded, source-verified retention window, while pending
-work and exact late receipts remain recoverable.
+The first explicit lifecycle producer may initialize one state-root directory
+beneath an existing parent and then carries that root identity through its
+recovery-lock and runner request. Observers reuse that identity: recovery stops
+when the state-root or runner-lock inode is replaced and does not recreate a
+removed root. Terminal obligation history is retained only for its bounded,
+source-verified retention window, while pending work and exact late receipts
+remain recoverable.
 
 Identity on the ledger (F-100c): every steward record carries `to.session_id` resolved
 through `herdr agent get` (Claude UUID, Codex thread id; herdr reports no id for

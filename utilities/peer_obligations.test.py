@@ -137,6 +137,40 @@ class ObligationStoreTest(unittest.TestCase):
             store.create("after-removal", "message", {}, {})
         self.assertFalse(state_root.exists())
 
+    def test_lifecycle_initializer_creates_one_root_beneath_an_existing_parent(self):
+        parent = self.root / "existing-parent"
+        parent.mkdir()
+        state_root = parent / "state"
+        store = obligations.ObligationStore(state_root, allow_state_root_creation=True)
+
+        self.assertTrue(store._initialize_state_root_for_producer(create_parents=False))
+        self.assertTrue(state_root.is_dir())
+        self.assertEqual(state_root.stat().st_mode & 0o777, 0o700)
+        self.assertTrue(store._state_root_identity_is_current())
+        self.assertTrue(store.ensure_directory())
+
+    def test_lifecycle_initializer_refuses_missing_parent_and_replaced_root(self):
+        missing_root = self.root / "missing-parent" / "state"
+        missing = obligations.ObligationStore(
+            missing_root, allow_state_root_creation=True)
+        self.assertFalse(missing._initialize_state_root_for_producer(create_parents=False))
+        self.assertFalse(missing_root.parent.exists())
+
+        state_root = self.root / "observed-state"
+        state_root.mkdir()
+        observed = obligations.ObligationStore(
+            state_root, allow_state_root_creation=True)
+        moved = state_root.with_name("observed-state-held")
+        state_root.rename(moved)
+        state_root.mkdir(mode=0o700)
+
+        self.assertFalse(observed._initialize_state_root_for_producer(create_parents=False))
+        self.assertFalse(observed.ensure_directory())
+        with self.assertRaises(obligations.ObligationError):
+            observed.create("replacement-must-stay-empty", "message", {}, {})
+        self.assertEqual(list(state_root.iterdir()), [])
+        self.assertEqual(list(moved.iterdir()), [])
+
     def test_terminal_retention_is_due_bounded_and_preserves_live_work(self):
         now = time.time()
         old_ids = []

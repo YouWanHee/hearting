@@ -1107,27 +1107,88 @@ class ObligationStore:
                                    "active_index_scans": 0, "active_index_entries": 0,
                                    "active_full_scans": 0}
         self._active_list_context = None
+        self._ensure_recovery_directory_fd = None
 
-    def _initialize_state_root_for_producer(self) -> bool:
+    def _state_root_identity_is_current(self) -> bool:
+        expected = self._state_root_identity
+        if expected is None:
+            return False
+        try:
+            info = os.stat(self.state_root, follow_symlinks=False)
+        except OSError:
+            return False
+        return (stat.S_ISDIR(info.st_mode)
+                and (info.st_dev, info.st_ino) == expected)
+
+    def _initialize_state_root_for_producer(self, *, create_parents=True) -> bool:
         """Initialize a genuinely absent root only on an explicit create path."""
         if self._state_root_identity is not None:
-            try:
-                info = os.stat(self.state_root, follow_symlinks=False)
-                return (stat.S_ISDIR(info.st_mode)
-                        and (info.st_dev, info.st_ino) == self._state_root_identity)
-            except OSError:
-                return False
+            return self._state_root_identity_is_current()
         if not self._allow_state_root_creation:
             return False
         try:
-            self.state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            info = os.stat(self.state_root, follow_symlinks=False)
-            if not stat.S_ISDIR(info.st_mode):
-                return False
-            self._state_root_identity = (info.st_dev, info.st_ino)
-            return True
+            if create_parents:
+                self.state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+                info = os.stat(self.state_root, follow_symlinks=False)
+                if not stat.S_ISDIR(info.st_mode):
+                    return False
+                self._state_root_identity = (info.st_dev, info.st_ino)
+                return True
+
+            # Lifecycle recovery may create the one state-root directory it
+            # owns, but only beneath a parent that is already present. Anchor
+            # both mkdir and the identity read to that parent descriptor.
+            parent_fd = os.open(self.state_root.parent, _DIRECTORY_FLAGS)
+            try:
+                try:
+                    os.mkdir(self.state_root.name, 0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                root_fd = os.open(self.state_root.name, _DIRECTORY_FLAGS,
+                                  dir_fd=parent_fd)
+                try:
+                    root = os.fstat(root_fd)
+                    entry = os.stat(self.state_root.name, dir_fd=parent_fd,
+                                    follow_symlinks=False)
+                    if (not stat.S_ISDIR(root.st_mode)
+                            or not stat.S_ISDIR(entry.st_mode)
+                            or (root.st_dev, root.st_ino) != (entry.st_dev, entry.st_ino)):
+                        return False
+                    self._state_root_identity = (root.st_dev, root.st_ino)
+                    return True
+                finally:
+                    os.close(root_fd)
+            finally:
+                os.close(parent_fd)
         except OSError:
             return False
+
+    def _directory_binding_is_current(self, directory_fd) -> bool:
+        """Check that an opened obligations directory is still the named one."""
+        current_fd = self._obligations_fd(create=False)
+        if current_fd is None:
+            return False
+        try:
+            expected = os.fstat(directory_fd)
+            current = os.fstat(current_fd)
+            return (stat.S_ISDIR(expected.st_mode) and stat.S_ISDIR(current.st_mode)
+                    and (expected.st_dev, expected.st_ino) == (current.st_dev, current.st_ino))
+        except OSError:
+            return False
+        finally:
+            os.close(current_fd)
+
+    def _file_binding_is_current(self, directory_fd, file_fd, name) -> bool:
+        """Check an opened lock against its name under the current store root."""
+        if not self._directory_binding_is_current(directory_fd):
+            return False
+        try:
+            held = os.fstat(file_fd)
+            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError:
+            return False
+        return (stat.S_ISREG(held.st_mode) and stat.S_ISREG(entry.st_mode)
+                and (held.st_dev, held.st_ino) == (entry.st_dev, entry.st_ino))
 
     def begin_read_pass(self) -> None:
         """Share one discovery snapshot among lists made during a runner pass."""
@@ -2478,7 +2539,7 @@ def _handoff_legacy_runner(store: ObligationStore, lock_path: Path, *,
     # Any newly accepted active duty may require code newer than the runner
     # already holding this lease. Consult only active markers so this handoff
     # never scans settled history on the producer callback.
-    active_duties = store.list(fast_active_only=True)
+    active_duties = store.list(kinds={"registered-batch"}, fast_active_only=True)
     if not active_duties and not reconciliation_required:
         return False
     if not service_current:
@@ -2516,8 +2577,27 @@ def _handoff_legacy_runner(store: ObligationStore, lock_path: Path, *,
 
 
 def _ensure_runner(root, *, service_current=None, use_remembered=False,
-                   remember_binding=False, reconciliation_required=False):
-    store = ObligationStore(root, allow_state_root_creation=False)
+                   remember_binding=False, reconciliation_required=False,
+                   store=None, recovery_lock_fd=None):
+    store = (store if store is not None else
+             ObligationStore(root, allow_state_root_creation=False))
+    if (root is not None
+            and Path(root).expanduser().resolve(strict=False) != store.state_root):
+        return False
+    if not store._state_root_identity_is_current():
+        return False
+    recovery_directory_fd = getattr(store, "_ensure_recovery_directory_fd", None)
+
+    def recovery_lock_is_current():
+        if recovery_lock_fd is None:
+            return True
+        return (recovery_directory_fd is not None
+                and store._file_binding_is_current(
+                    recovery_directory_fd, recovery_lock_fd,
+                    "ensure-obligations.lock"))
+
+    if not recovery_lock_is_current():
+        return False
     # Producer callbacks already know which duty they just accepted. Consult
     # only active markers here so a cold migration over terminal history never
     # delays the callback that starts the shared runner.
@@ -2528,20 +2608,35 @@ def _ensure_runner(root, *, service_current=None, use_remembered=False,
             return False
     if not store.ensure_directory():
         return False
-    if lock_path.is_symlink():
-        raise ObligationError("peer-obligation-runner-lock-symlink")
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    directory_fd = store._obligations_fd(create=False)
+    if directory_fd is None:
+        return False
+    fd = None
     try:
+        try:
+            current_lock = os.stat(RUNNER_LOCK_NAME, dir_fd=directory_fd,
+                                   follow_symlinks=False)
+        except FileNotFoundError:
+            current_lock = None
+        if current_lock is not None and stat.S_ISLNK(current_lock.st_mode):
+            raise ObligationError("peer-obligation-runner-lock-symlink")
+        fd = os.open(RUNNER_LOCK_NAME,
+                     os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                     0o600, dir_fd=directory_fd)
+        if not store._file_binding_is_current(directory_fd, fd, RUNNER_LOCK_NAME):
+            return False
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            if not store._file_binding_is_current(directory_fd, fd, RUNNER_LOCK_NAME):
+                return False
             handoff = _handoff_legacy_runner(
                 store, lock_path, reconciliation_required=reconciliation_required,
                 service_current=service_current)
             if handoff == "current":
-                return True
+                return recovery_lock_is_current()
             if handoff != "replaced":
-                return not reconciliation_required
+                return not reconciliation_required and recovery_lock_is_current()
             deadline = time.monotonic() + 2
             while True:
                 try:
@@ -2551,6 +2646,8 @@ def _ensure_runner(root, *, service_current=None, use_remembered=False,
                     if time.monotonic() >= deadline:
                         return False
                     time.sleep(0.02)
+            if not store._file_binding_is_current(directory_fd, fd, RUNNER_LOCK_NAME):
+                return False
         code_root = _code_root()
         binding = validate_service_binding(service_current, root=code_root)
         if use_remembered:
@@ -2567,13 +2664,17 @@ def _ensure_runner(root, *, service_current=None, use_remembered=False,
         active_root = active_service_root(binding, root=code_root) if binding else None
         runner_root = active_root or code_root
         runner = runner_root / "utilities" / "peer-steward.py"
-        state_root = Path(root).resolve() if root else peer_state_root()
+        state_root = Path(root).resolve() if root else store.state_root
         child_env = (_service_exec_environment(code_root, runner_root) if binding else None)
         argv = [sys.executable, str(runner), "__obligation-runner", "--lock-fd", str(fd),
                 "--state-root", str(state_root)]
         if binding:
             argv.extend(("--service-current", binding))
         _RUNNERS[:] = [process for process in _RUNNERS if process.poll() is None]
+        if not store._file_binding_is_current(directory_fd, fd, RUNNER_LOCK_NAME):
+            return False
+        if not recovery_lock_is_current():
+            return False
         process = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -2584,7 +2685,9 @@ def _ensure_runner(root, *, service_current=None, use_remembered=False,
     except (OSError, subprocess.SubprocessError):
         return False
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
+        os.close(directory_fd)
 
 
 def ensure_runner(root: str | Path | None = None, *,
@@ -2596,7 +2699,8 @@ def ensure_runner(root: str | Path | None = None, *,
 
 
 def ensure_normal_runner(root: str | Path | None = None, *, lifecycle_root=None,
-                         reconciliation_required=False) -> bool:
+                         reconciliation_required=False, _store=None,
+                         _recovery_lock_fd=None) -> bool:
     """Ensure a producer runner using only verified lifecycle provenance.
 
     Lifecycle callbacks may establish the binding while holding the existing
@@ -2607,9 +2711,11 @@ def ensure_normal_runner(root: str | Path | None = None, *, lifecycle_root=None,
         binding = managed_service_binding(lifecycle_root)
         return _ensure_runner(root, service_current=binding,
                               remember_binding=binding is not None,
-                              reconciliation_required=reconciliation_required)
+                              reconciliation_required=reconciliation_required,
+                              store=_store, recovery_lock_fd=_recovery_lock_fd)
     return _ensure_runner(root, use_remembered=True,
-                          reconciliation_required=reconciliation_required)
+                          reconciliation_required=reconciliation_required,
+                          store=_store, recovery_lock_fd=_recovery_lock_fd)
 
 
 def request_dispatch_reconciliation(state_root: str | Path) -> bool:

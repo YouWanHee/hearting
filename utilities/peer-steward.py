@@ -30,6 +30,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -80,7 +81,6 @@ _PATHS_SPEC.loader.exec_module(INSTALL_PATHS)
 # from a hook inherits.
 _HERDR_SESSION = os.environ.get("AGENT_HERDR_SESSION") or None
 _RETIRE_FOLLOWUP_COMPLETE = set()
-_RETIRE_FOLLOWUP_RETRIES = {}
 
 
 def _herdr_argv(*args):
@@ -1483,16 +1483,20 @@ def _retire_predecessor(duty):
 def _retire_handover(duty, *, wait=None):
     """Consume only the accepted retirement's original succession, on any observer."""
     intent = duty.get("intent") or {}
-    requester = intent.get("requester") or {}
+    requester = intent.get("requester")
     try:
+        if not isinstance(requester, dict) or not requester:
+            requester = None
+            own_sid, own_harness = _current_session_identity()
+        else:
+            own_sid, own_harness = requester.get("session_id"), requester.get("harness")
         resolved = _retire_predecessor(duty)
     except Exception:  # noqa: BLE001 - the retire itself already succeeded
         return "error"
     if resolved is None:
         return None
     identity, evidence = resolved
-    return _seat_handover(identity, requester.get("session_id"),
-                          requester.get("harness"), requester=requester,
+    return _seat_handover(identity, own_sid, own_harness, requester=requester,
                           accepted_at=duty.get("accepted_at"),
                           recheck=(lambda: _retire_predecessor(duty) == resolved) if evidence else None,
                           wait=wait)
@@ -2028,46 +2032,6 @@ def _retire_subject_state(duty):
     return "unknown"
 
 
-def _retire_followup_fingerprint(duty, identity):
-    """Observe the cheap source generations that can wake a held retire retry."""
-    foreground = _retire_booked_foreground(duty) or {}
-    pid = foreground.get("pid")
-    process = _retire_process_record(pid) if isinstance(pid, int) else None
-    process_fingerprint = (process.get("start"), process.get("group"),
-                           tuple(process.get("argv") or ())) if isinstance(process, dict) else None
-    process_start = _proc_start_ticks(pid) if isinstance(pid, int) else None
-    pane = identity.get("pane")
-    successor_stamp = None
-    if isinstance(pane, str) and pane:
-        try:
-            info = _seat_successor_path(pane).lstat()
-            successor_stamp = (info.st_dev, info.st_ino, info.st_size,
-                               info.st_mtime_ns, info.st_ctime_ns)
-        except OSError:
-            pass
-    route_stamp = None
-    native = None
-    if identity.get("harness") == "opencode":
-        try:
-            import dispatch_seat_handover as handover
-            jobs = Path(handover._default_jobs())
-            route_stamp = dispatch_batch_obligations._registry_stamp(jobs)
-        except (OSError, ValueError, RuntimeError):
-            pass
-        if _handoff_lifetime_valid(foreground):
-            try:
-                record = _retained_tui_selection(foreground)
-                if record is not None:
-                    value = record.get("value") or {}
-                    source = record.get("source") or {}
-                    native = (value.get("sessionID"), value.get("writtenAt"),
-                              tuple(source.get("generation") or ()))
-            except Exception:
-                pass
-    return (_retire_subject_state(duty), process_fingerprint, process_start,
-            successor_stamp, route_stamp, native)
-
-
 def _retire_zombie_matches(pid, expected_start):
     """A same-birth zombie has exited, but /proc still exists until its parent reaps it."""
     if (type(pid) is not int or pid <= 1 or not isinstance(expected_start, str)
@@ -2106,25 +2070,44 @@ def _complete_gone_retire(store, duty):
     return False
 
 
-def _mark_completed_retire_followup(store, duty, identity, reason, handover, *,
-                                    defer_if_missing=False):
+def _retire_followup_successor_pane(duty):
+    intent = duty.get("intent") or {}
+    requester = intent.get("requester")
+    if isinstance(requester, dict) and requester:
+        return requester.get("pane")
+    return _caller_pane()
+
+
+def _retire_followup_ready(duty, identity, reason, handover, *,
+                           defer_if_missing=False):
     unresolved = (handover == "error" or (isinstance(handover, str)
                   and handover.startswith("skipped:")))
-    if handover is None:
-        pane = (identity or {}).get("pane")
-        if not pane:
-            pane = ((duty.get("intent") or {}).get("requester") or {}).get("pane")
+    if handover is None and defer_if_missing:
+        unresolved = True
+    pane = _retire_followup_successor_pane(duty)
+    if pane:
         try:
-            if defer_if_missing or (pane and _seat_successor_path(pane).exists()):
-                unresolved = True
+            _seat_successor_path(pane).lstat()
+        except FileNotFoundError:
+            pass
         except OSError:
             unresolved = True
+        else:
+            unresolved = True
     try:
-        _request_watch_terminal(identity, reason)
+        if _request_watch_terminal(identity, reason) is None:
+            unresolved = True
     except Exception:
         unresolved = True
+    return not unresolved
+
+
+def _mark_completed_retire_followup(store, duty, identity, reason, handover, *,
+                                    defer_if_missing=False):
+    complete = _retire_followup_ready(
+        duty, identity, reason, handover, defer_if_missing=defer_if_missing)
     observation = dict(duty.get("observation") or {})
-    observation.update(terminal_followup="pending" if unresolved else "complete",
+    observation.update(terminal_followup="complete" if complete else "pending",
                        terminal_followup_result=str(handover or "none"))
     try:
         return store.update(duty["id"], observation=observation)
@@ -2256,48 +2239,27 @@ def _resume_retire_obligation(duty, store, *, read_context=None,
         if observation.get("terminal_followup") == "complete":
             _RETIRE_FOLLOWUP_COMPLETE.add(followup_key)
             return
-        source_fingerprint = _retire_followup_fingerprint(duty, ident)
-        prior = _RETIRE_FOLLOWUP_RETRIES.get(followup_key)
-        if prior is not None and prior[2] != source_fingerprint:
-            _RETIRE_FOLLOWUP_RETRIES.pop(followup_key, None)
-            prior = None
-        if prior is not None and time.monotonic() < prior[0]:
-            return
-        attempts = prior[1] if prior is not None else 0
         try:
-            # A busy successor belongs to its existing owner. Keep unresolved
-            # handover evidence retryable, with an item-local bounded backoff.
             handover = _retire_handover(duty, wait=0)
-            if handover == "error" or (isinstance(handover, str)
-                                        and handover.startswith("skipped:")):
-                raise RuntimeError("retire-handover-unresolved")
-            if handover is None:
-                pane = ident.get("pane") or ((intent.get("requester") or {}).get("pane"))
-                if pane:
-                    try:
-                        _seat_successor_path(pane).lstat()
-                    except FileNotFoundError:
-                        pass
-                    except OSError as exc:
-                        raise RuntimeError("retire-successor-unavailable") from exc
-                    else:
-                        raise RuntimeError("retire-successor-unresolved")
-            _request_watch_terminal(ident, "completed-retire")
-            _RETIRE_FOLLOWUP_COMPLETE.add(followup_key)
-            _RETIRE_FOLLOWUP_RETRIES.pop(followup_key, None)
+            if not _retire_followup_ready(
+                    duty, ident, "completed-retire", handover):
+                return
             if persist_followup:
                 current = store.get(duty["id"]) or duty
                 current_observation = dict(current.get("observation") or {})
-                current_observation.update(terminal_followup="complete",
-                                          terminal_followup_result=str(handover or "none"))
-                store.update(duty["id"], observation=current_observation)
+                if current_observation.get("terminal_followup") != "complete":
+                    current_observation.update(
+                        terminal_followup="complete",
+                        terminal_followup_result=str(handover or "none"))
+                    store.update(duty["id"], observation=current_observation)
+            _RETIRE_FOLLOWUP_COMPLETE.add(followup_key)
             if len(_RETIRE_FOLLOWUP_COMPLETE) > 4096:
                 _RETIRE_FOLLOWUP_COMPLETE.clear()
         except Exception:
-            attempts += 1
-            delay = min(60, 2 ** min(attempts - 1, 6))
-            _RETIRE_FOLLOWUP_RETRIES[followup_key] = (
-                time.monotonic() + delay, attempts, source_fingerprint)
+            # The active duty is revisited on the next runner pass. Keeping
+            # that lineage is the retry; a fingerprint scan of other inputs
+            # would add a second owner for the same decision.
+            return
         return
     if duty.get("state") == "cancelled":
         return
@@ -3093,12 +3055,12 @@ def _settle_ended_seatless_recipient(watch_id, arm, root=None, *, census=None,
 def _request_watch_terminal(identity, reason):
     """Ask matching observers to settle on their next bounded wake."""
     if not isinstance(identity, dict):
-        return 0
+        return None
     server = identity.get("server") or "default"
     pane, harness, sid = identity.get("pane"), identity.get("harness"), identity.get("session_id")
     if not all(isinstance(value, str) and value and value != "-"
                for value in (pane, harness, sid)):
-        return 0
+        return None
     root = _watch_root()
     count = 0
     for watch_id, arm in _watch_entries(root):
@@ -7952,8 +7914,10 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
     retry_state = {} if retry_state is None else retry_state
     for duty in duties:
         duty_id = duty.get("id", "")
+        kind = (duty.get("intent") or {}).get("kind")
         fingerprint = _obligation_retry_fingerprint(duty)
-        retryable = duty.get("state") == "unknown" and fingerprint is not None
+        retryable = (duty.get("state") == "unknown" and fingerprint is not None
+                     and kind != "registered-batch")
         if retryable:
             prior = retry_state.get(duty_id)
             if (prior is not None and prior[0] == fingerprint
@@ -7962,7 +7926,6 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
         else:
             retry_state.pop(duty_id, None)
         try:
-            kind = duty.get("intent", {}).get("kind")
             if kind == "message" or duty.get("id", "").startswith(("message-", "delay-")):
                 _resume_message_obligation(duty, store, read_context=read_context)
             elif kind == "retire":
@@ -8200,32 +8163,65 @@ def cmd_obligation_runner(args):
             time.sleep(delay)
 
 
-def _acquire_ensure_obligations_lock(store):
+def _acquire_ensure_obligations_lock(store, *, retain_directory=False):
     """Try the shared recovery lock without waiting or unlinking its inode."""
     if not store.ensure_directory():
         return None
-    path = store.root / "ensure-obligations.lock"
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    directory_fd = store._obligations_fd(create=False)
+    if directory_fd is None:
+        return None
+    fd = None
+    acquired = False
     try:
+        try:
+            entry = os.stat("ensure-obligations.lock", dir_fd=directory_fd,
+                            follow_symlinks=False)
+        except FileNotFoundError:
+            entry = None
+        if entry is not None and stat.S_ISLNK(entry.st_mode):
+            return None
+        fd = os.open("ensure-obligations.lock",
+                     os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                     0o600, dir_fd=directory_fd)
+        if not store._file_binding_is_current(
+                directory_fd, fd, "ensure-obligations.lock"):
+            return None
         # This descriptor belongs only to this short call. A detached observer
         # or runner must never keep the shared exclusion alive after we exit.
         os.set_inheritable(fd, False)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            os.close(fd)
             return None
+        if not store._file_binding_is_current(
+                directory_fd, fd, "ensure-obligations.lock"):
+            return None
+        acquired = True
+        if retain_directory:
+            store._ensure_recovery_directory_fd = directory_fd
+            directory_fd = None
         return fd
     except Exception:
-        os.close(fd)
         raise
+    finally:
+        if fd is not None and not acquired:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def cmd_ensure_obligations(_args):
     """Request the shared runner and return without repeating its global work."""
-    store = peer_obligations.ObligationStore(allow_state_root_creation=False)
+    store = peer_obligations.ObligationStore(allow_state_root_creation=True)
+    if not store._initialize_state_root_for_producer(create_parents=False):
+        return 0
+    # The explicit lifecycle producer has completed the sole root-creation
+    # step. Its Store is now observation-only through the runner request.
+    store._allow_state_root_creation = False
     try:
-        lock_fd = _acquire_ensure_obligations_lock(store)
+        lock_fd = _acquire_ensure_obligations_lock(store, retain_directory=True)
     except Exception:
         return 0
     if lock_fd is None:
@@ -8234,7 +8230,8 @@ def cmd_ensure_obligations(_args):
         try:
             lifecycle_root = getattr(_args, "lifecycle_root", None)
             peer_obligations.ensure_normal_runner(
-                lifecycle_root=lifecycle_root, reconciliation_required=True)
+                lifecycle_root=lifecycle_root, reconciliation_required=True,
+                _store=store, _recovery_lock_fd=lock_fd)
         except Exception:
             pass
         return 0
@@ -8244,6 +8241,10 @@ def cmd_ensure_obligations(_args):
         except OSError:
             pass
         os.close(lock_fd)
+        directory_fd = store._ensure_recovery_directory_fd
+        store._ensure_recovery_directory_fd = None
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def receiver_idle(recipient, pane, *, peer=True):
