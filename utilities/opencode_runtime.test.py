@@ -50,6 +50,31 @@ class OpenCodeRunCodecTest(unittest.TestCase):
                                             "opencode-runtime-version-unavailable"):
                     runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
 
+    def test_launch_version_probe_reads_only_a_bounded_head(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            script.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                "sys.stdout.write('opencode 2.0.32\\n' + 'x' * (512 * 1024))\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            with unittest.mock.patch.object(runtime, "VERSION_PROBE_OUTPUT_LIMIT", 32):
+                self.assertEqual(runtime.probe_launch_version(
+                    binary=str(script), cwd=temp, state_root=root), (2, 0, 32))
+            script.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                "sys.stdout.write('x' * 64 + '\\nopencode 2.0.32\\n')\n",
+                encoding="utf-8",
+            )
+            with unittest.mock.patch.object(runtime, "VERSION_PROBE_OUTPUT_LIMIT", 32), \
+                    self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                           "opencode-runtime-version-unavailable"):
+                runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+            self.assertEqual(list(root.iterdir()), [])
+
     def test_v1_flags_and_v2_provider_variant_are_separate(self):
         v1 = runtime.run_argv(binary="opencode", cwd="/work", agent="build",
                               model="opencode-go/model", variant="high", pure=True,

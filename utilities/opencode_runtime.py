@@ -126,6 +126,9 @@ def runtime_version(binary: str = "opencode") -> tuple[int, int, int] | None:
 runtime_version.cache_clear = _runtime_version_probe.cache_clear
 
 
+VERSION_PROBE_OUTPUT_LIMIT = 64 * 1024
+
+
 def probe_launch_version(*, binary: str = "opencode", cwd: str,
                          state_root: str | Path,
                          environ: Mapping[str, str] | None = None,
@@ -160,12 +163,18 @@ def probe_launch_version(*, binary: str = "opencode", cwd: str,
             for name in ("OPENCODE_DB", "OPENCODE_AUTH", "OPENCODE_DATA_DIR",
                          "OPENCODE_CONFIG_CONTENT", "OPENCODE_RUNTIME_VERSION"):
                 env.pop(name, None)
-            result = subprocess.run(
-                [executable, "--version"], cwd=cwd, env=env, text=True,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=timeout, check=False,
-            )
-            version = parse_version((result.stdout or "") + "\n" + (result.stderr or ""))
+            # Bounded read: a broken or substituted binary may print until
+            # the timeout; only the head can carry a version line.
+            output = private / "version.out"
+            with output.open("wb") as sink:
+                result = subprocess.run(
+                    [executable, "--version"], cwd=cwd, env=env,
+                    stdout=sink, stderr=subprocess.STDOUT,
+                    timeout=timeout, check=False,
+                )
+            with output.open("rb") as handle:
+                head = handle.read(VERSION_PROBE_OUTPUT_LIMIT)
+            version = parse_version(head.decode("utf-8", errors="replace"))
             if result.returncode != 0 or version is None:
                 raise OpenCodeRuntimeError("opencode-runtime-version-unavailable")
             return version
