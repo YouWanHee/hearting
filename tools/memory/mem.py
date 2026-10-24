@@ -5626,7 +5626,10 @@ def _rekey_project(old, current, evidence, *, return_result=False, automatic=Fal
                         "evidence": evidence, "batch_index": batch_index,
                         "batch_count": len(batches),
                         "backup_sha256": backup["sha256"]}
-            _capture_v2_operation(con, "rekey", post_ids=batch, prior_states=prior,
+            # Snapshot only this batch's lineage. Passing every moved record
+            # repeatedly decodes earlier batches without affecting this operation.
+            _capture_v2_operation(con, "rekey", post_ids=batch,
+                                  prior_states={rid: prior[rid] for rid in batch},
                                   project_namespace=current, source_namespace=old,
                                   reason=_repository_rekey_reason(metadata))
             operation_ids.append(con.execute(
