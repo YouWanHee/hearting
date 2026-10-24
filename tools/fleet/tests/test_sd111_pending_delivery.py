@@ -233,10 +233,112 @@ class PendingDeliveryCountsTest(unittest.TestCase):
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         return counts
 
+    def _count_with_complete_graph(self, graph_sids, recipient_sid="dead-C"):
+        graph = SimpleNamespace(ledger_keys={
+            ("claude", sid): () for sid in graph_sids
+        })
+        observation = {
+            "complete": True,
+            "herdr_complete": True,
+            "process_complete": True,
+            "native_sid_complete": True,
+            "live": set(),
+        }
+        with mock.patch("dispatch_seat_handover.lineage_graph", return_value=graph), \
+                mock.patch("dispatch_seat_handover.record_recipient",
+                           return_value=recipient_sid):
+            return dispatch._pending_delivery_counts(
+                [str(self.jobs_path)], session_observation=observation)
+
+    def _new_pending_file(self, storage_sid, delivery_suffix="a"):
+        record = pending_delivery.create(**_record(
+            root=self.state_root,
+            recipient_key=storage_sid,
+            delivery_id="delivery-" + delivery_suffix * 32,
+        ))
+        return record, pending_delivery.record_path(
+            self.state_root, storage_sid, record["delivery_id"]
+        )
+
     def test_dead_storage_and_confirmed_dead_chain_end_count_once(self):
         counts = self._count_with_graph("dead-A", "dead-C", duplicate_paths=True)
         self.assertEqual(counts["no_recipient"], 1)
         self.assertEqual(counts["pending"], 1)
+
+    def test_directory_digest_mismatch_keeps_no_recipient_unknown(self):
+        record, path = self._new_pending_file("dead-A")
+        row = json.loads(path.read_text(encoding="utf-8"))
+        row["recipient_digest"] = pending_delivery.recipient_digest("dead-C")
+        path.write_text(json.dumps(row), encoding="utf-8")
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+
+        counts = self._count_with_complete_graph(("dead-A", "dead-C"))
+
+        self.assertEqual(counts["pending"], 1)
+        self.assertIsNone(counts["no_recipient"])
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_filename_delivery_id_mismatch_keeps_no_recipient_unknown(self):
+        _record_value, path = self._new_pending_file("dead-A")
+        row = json.loads(path.read_text(encoding="utf-8"))
+        row["delivery_id"] = "delivery-" + "b" * 32
+        path.write_text(json.dumps(row), encoding="utf-8")
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+
+        counts = self._count_with_complete_graph(("dead-A",))
+
+        self.assertEqual(counts["pending"], 1)
+        self.assertIsNone(counts["no_recipient"])
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_misplaced_duplicate_is_checked_before_identity_deduplication(self):
+        record, path = self._new_pending_file("dead-A")
+        wrong_directory = self.state_root / "pending-delivery" / pending_delivery.recipient_digest(
+            "other-A"
+        )
+        wrong_directory.mkdir(parents=True)
+        misplaced = wrong_directory / path.name
+        misplaced.write_bytes(path.read_bytes())
+        before = {
+            item: (item.read_bytes(), item.stat().st_mtime_ns)
+            for item in (path, misplaced)
+        }
+
+        counts = self._count_with_complete_graph(("dead-A",))
+
+        self.assertEqual(counts["pending"], 2)
+        self.assertIsNone(counts["no_recipient"])
+        self.assertEqual({
+            item: (item.read_bytes(), item.stat().st_mtime_ns)
+            for item in (path, misplaced)
+        }, before)
+        self.assertEqual(record["delivery_id"], path.stem)
+
+    def test_unhashable_identity_fields_remain_unknown_without_raising(self):
+        files = []
+        malformed_rows = (
+            ("malformed-A", "c", {"delivery_id": ["delivery-" + "d" * 32]}),
+            ("malformed-B", "e", {"recipient_digest": {"invalid": "digest"}}),
+        )
+        for storage_sid, suffix, changes in malformed_rows:
+            _record_value, path = self._new_pending_file(storage_sid, suffix)
+            row = json.loads(path.read_text(encoding="utf-8"))
+            row.update(changes)
+            path.write_text(json.dumps(row), encoding="utf-8")
+            files.append(path)
+        before = {
+            path: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in files
+        }
+
+        counts = self._count_with_complete_graph(("malformed-A", "malformed-B"))
+
+        self.assertEqual(counts["pending"], 2)
+        self.assertIsNone(counts["no_recipient"])
+        self.assertEqual({
+            path: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in files
+        }, before)
 
     def test_live_successor_and_live_untidied_storage_are_excluded(self):
         successor = self._count_with_graph("dead-A", "live-C", live={("claude", "live-C")})

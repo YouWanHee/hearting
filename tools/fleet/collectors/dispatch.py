@@ -3770,10 +3770,11 @@ def _annotate_orphan_conductors(jobs, now, jobs_path=None):
 
 def _pending_delivery_counts(paths, *, session_observation=None):
     """SD-111 P6: read-only pending/expired visibility. Never transitions
-    any state -- glob + json.loads only, mirroring the enumeration pattern
-    `dispatch_completion_join.reconcile_pending_delivery()` already uses
-    (`pending_root.glob("*/*.json")`). Fleet's F-27 control module is the
-    only fleet surface with write authority; this collector has none.
+    any state -- it mirrors the `dispatch_completion_join.reconcile_pending_delivery()`
+    enumeration pattern (`pending_root.glob("*/*.json")`) and validates
+    observed path identity before using a row for no-recipient accounting.
+    Fleet's F-27 control module is the only fleet surface with write authority;
+    this collector has none.
 
     `pending` is the sum of two terms (plan §1.6-1, §9 R-9 -- both are
     mandatory): rows that stamped `delivery_intent` but have no
@@ -3853,6 +3854,21 @@ def _pending_delivery_counts(paths, *, session_observation=None):
     seen_roots = set()
     seen_no_recipient = set()
     no_recipient_unknown = False
+    try:
+        from dispatch_pending_delivery import record_path as pending_record_path
+        from dispatch_pending_delivery import recipient_digest as pending_recipient_digest
+    except Exception:
+        pending_record_path = None
+        pending_recipient_digest = None
+
+    def _matches_recipient_digest(sid, expected_digest):
+        if pending_recipient_digest is None or not isinstance(sid, str) or not sid:
+            return False
+        try:
+            return pending_recipient_digest(sid) == expected_digest
+        except (UnicodeError, RuntimeError, TypeError, ValueError):
+            return False
+
     for path in paths:
         try:
             root = dispatch_state_root(path)
@@ -3892,43 +3908,74 @@ def _pending_delivery_counts(paths, *, session_observation=None):
                 continue
             delivery_id = record.get("delivery_id")
             recipient_digest = record.get("recipient_digest")
-            if delivery_id and recipient_digest:
+            if (isinstance(delivery_id, str) and delivery_id
+                    and isinstance(recipient_digest, str) and recipient_digest):
                 all_records.add((delivery_id, recipient_digest))
             state = record.get("state")
-            if state in {"pending", "claimed", "sent-ambiguous"}:
+            if isinstance(state, str) and state in {"pending", "claimed", "sent-ambiguous"}:
                 pending += 1
                 if no_recipient is not None and graph is not None:
+                    # Validate each observed row before deduplication; a
+                    # misplaced duplicate must not disappear behind a valid
+                    # row with the same immutable delivery identity.
+                    if (not isinstance(delivery_id, str)
+                            or not delivery_id.startswith("delivery-")
+                            or not isinstance(recipient_digest, str)
+                            or record_file.parent.name != recipient_digest
+                            or record_file.name != f"{delivery_id}.json"):
+                        no_recipient_unknown = True
+                        continue
+                    kind = record.get("recipient_kind")
+                    if not isinstance(kind, str):
+                        no_recipient_unknown = True
+                        continue
+                    harness = kind.split("-", 1)[0].lower()
+                    if harness not in {"claude", "codex", "opencode"}:
+                        no_recipient_unknown = True
+                        continue
+                    storage_candidates = {
+                        sid for candidate_harness, sid in graph.ledger_keys
+                        if candidate_harness == harness
+                        and _matches_recipient_digest(sid, recipient_digest)
+                    }
+                    storage_candidates.update(
+                        sid for candidate_harness, sid in live_sessions
+                        if candidate_harness == harness
+                        and _matches_recipient_digest(sid, recipient_digest)
+                    )
+                    if len(storage_candidates) != 1:
+                        no_recipient_unknown = True
+                        continue
+                    storage_sid = next(iter(storage_candidates))
+                    if pending_record_path is None or pending_recipient_digest is None:
+                        no_recipient_unknown = True
+                        continue
+                    try:
+                        storage_digest = pending_recipient_digest(storage_sid)
+                        expected_path = pending_record_path(root, storage_sid, delivery_id)
+                    except (UnicodeError, RuntimeError, TypeError, ValueError):
+                        no_recipient_unknown = True
+                        continue
+                    if (storage_digest != recipient_digest
+                            or record_file.parent.name != storage_digest
+                            or record_file.name != f"{delivery_id}.json"
+                            or record_file != expected_path):
+                        no_recipient_unknown = True
+                        continue
+
                     identity = (delivery_id, recipient_digest)
-                    if identity not in seen_no_recipient:
-                        seen_no_recipient.add(identity)
-                        kind = record.get("recipient_kind") or ""
-                        harness = kind.split("-", 1)[0].lower()
-                        if harness not in {"claude", "codex", "opencode"}:
-                            no_recipient_unknown = True
-                            continue
-                        storage_candidates = {
-                            sid for candidate_harness, sid in graph.ledger_keys
-                            if candidate_harness == harness
-                            and hashlib.sha256(sid.encode("utf-8")).hexdigest() == recipient_digest
-                        }
-                        storage_candidates.update(
-                            sid for candidate_harness, sid in live_sessions
-                            if candidate_harness == harness
-                            and hashlib.sha256(sid.encode("utf-8")).hexdigest() == recipient_digest
-                        )
-                        if len(storage_candidates) != 1:
-                            no_recipient_unknown = True
-                            continue
-                        storage_sid = next(iter(storage_candidates))
-                        try:
-                            from dispatch_seat_handover import record_recipient
-                            recipient_sid = record_recipient(record, storage_sid, harness=harness)
-                        except Exception:
-                            recipient_sid = None
-                        if recipient_sid is None:
-                            no_recipient_unknown = True
-                        elif (harness, recipient_sid) not in live_sessions:
-                            no_recipient += 1
+                    if identity in seen_no_recipient:
+                        continue
+                    seen_no_recipient.add(identity)
+                    try:
+                        from dispatch_seat_handover import record_recipient
+                        recipient_sid = record_recipient(record, storage_sid, harness=harness)
+                    except Exception:
+                        recipient_sid = None
+                    if recipient_sid is None:
+                        no_recipient_unknown = True
+                    elif (harness, recipient_sid) not in live_sessions:
+                        no_recipient += 1
             elif state == "expired":
                 expired += 1
 
