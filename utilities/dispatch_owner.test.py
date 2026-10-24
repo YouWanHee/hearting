@@ -169,6 +169,7 @@ class FrameAlternativeSelectionTest(unittest.TestCase):
             binding = SimpleNamespace(route_file=str(route_file), route_id=route["route_id"],
                 route_hash=route["route_hash"], route_node="frame-alternative",
                 registry_digest="sha256:test", write_scope=str(base), completion_gate="test")
+            out = io.StringIO()
             with mock.patch.object(OWNER, "_parse", return_value=(None, values, ["--start"], str(route_file), [])), \
                  mock.patch.object(OWNER, "_authoritative_jobs", return_value=str(jobs)), \
                  mock.patch.object(OWNER, "_sealed_owner_context", return_value={
@@ -183,12 +184,16 @@ class FrameAlternativeSelectionTest(unittest.TestCase):
                  mock.patch.object(OWNER.os, "access", return_value=True), \
                  mock.patch.object(OWNER, "select_launch_lifecycle", return_value="detached"), \
                  mock.patch.object(OWNER, "run_owner_wrapper", return_value=0) as launch, \
-                 contextlib.redirect_stdout(io.StringIO()):
+                 contextlib.redirect_stdout(out):
                 self.assertEqual(OWNER.main([]), 0)
             argv = launch.call_args.args[0]
             self.assertEqual(values["--model-profile"], "top")
             self.assertIn("--pair-model-profile", argv)
             self.assertEqual(argv[argv.index("--pair-model-profile") + 1], "deep")
+            owner_output = out.getvalue()
+            self.assertIn("model_diversity_proposal=proposed", owner_output)
+            self.assertIn("model_diversity_proposal_profile=deep", owner_output)
+            self.assertNotRegex(owner_output, r"(?m)^model_diversity=")
 
     def test_unusable_configured_alternate_records_reason_only_after_successful_start(self):
         import artifact_producer

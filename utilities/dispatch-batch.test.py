@@ -138,6 +138,30 @@ class PairModelProposalTest(unittest.TestCase):
         receipt = self._receipt(("opus", "sonnet"))
         self.assertIn("model", receipt["realized_independence_axes"])
 
+    def test_proposal_diagnostics_are_separate_from_realized_row_fields(self):
+        args = SimpleNamespace(parallel_group="plan")
+        legs = [{"attempt_id": "att-a"}, {"attempt_id": "att-b"}]
+        results = [
+            {"attempt_id": "att-a", "launch_state": "started", "model_profile": "deep",
+             "model": "opus", "model_source": "profile", "model_diversity": "distinct",
+             "model_diversity_from": "deep"},
+            {"attempt_id": "att-b", "launch_state": "started", "model_profile": "balanced",
+             "model": "sonnet", "model_source": "profile+diversity", "model_diversity": "rotated",
+             "model_diversity_from": "balanced-deep/opus"},
+        ]
+        diagnostics = {"model_diversity_proposal": {"reason": "proposed", "profile": "balanced"}}
+        receipt, _ = BATCH.batch_receipt(
+            args=args, lifecycle="detached", independence="persona", required_axes=["model"],
+            realized_axes=[], degradation_reason="", legs=legs, results=results, admitted=2,
+            selection_diagnostics=diagnostics)
+        self.assertIn("model_diversity_proposal", receipt["selection_diagnostics"])
+        self.assertNotIn("model_diversity", receipt["selection_diagnostics"])
+        realized = receipt["selection_diagnostics"]["model_diversity_realized"]
+        rotated = next(row for row in realized.values() if row["model"] == "sonnet")
+        self.assertEqual(rotated["model_diversity"], "rotated")
+        self.assertEqual(rotated["model_profile"], "balanced")
+        self.assertEqual(rotated["model_source"], "profile+diversity")
+
     def test_effort_or_variant_does_not_create_model_axis(self):
         receipt = self._receipt(("opus", "opus"))
         self.assertNotIn("model", receipt["realized_independence_axes"])

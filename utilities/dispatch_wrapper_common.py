@@ -1058,11 +1058,24 @@ def prepare_pair_model_rotation(args: argparse.Namespace, *, harness: str) -> di
                 raise ValueError("pair-reservation-not-unclaimed")
             route_authority.require_batch_reservation(payload, expected)
             manifest, _, _ = verify_manifest(payload.get("batch_manifest"))
-            sibling_id = next(str(member["route_node"]) for member in manifest["members"]
-                              if member.get("route_node") != node_id)
+            manifest_members = manifest.get("members")
+            if not isinstance(manifest_members, list) or len(manifest_members) != 2:
+                raise ValueError("pair-manifest-cardinality-mismatch")
+            own_members = [member for member in manifest_members
+                           if member.get("route_node") == node_id]
+            if len(own_members) != 1:
+                raise ValueError("pair-manifest-current-member-mismatch")
+            sibling_members = [member for member in manifest_members
+                               if member.get("route_node") != node_id]
+            if len(sibling_members) != 1:
+                raise ValueError("pair-manifest-sibling-member-mismatch")
+            sibling_member = sibling_members[0]
+            if sibling_member.get("harness") != harness:
+                raise ValueError("pair-sibling-harness-mismatch")
+            sibling_id = str(sibling_member.get("route_node", ""))
             sibling = next(node for node in members if node.get("id") == sibling_id)
             if sibling.get("model_profile") != next(
-                member.get("model_profile") for member in manifest["members"]
+                member.get("model_profile") for member in manifest_members
                 if member.get("route_node") == sibling_id):
                 raise ValueError("pair-sealed-profile-mismatch")
         else:

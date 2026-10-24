@@ -2684,7 +2684,7 @@ def main(argv: list[str] | None = None) -> int:
     if prior_input is None and partial is None:
         pair_profiles, pair_diagnostic = _pair_model_proposals(
             assignments, route=route, source_root=ROOT, jobs=jobs)
-    diagnostics["model_diversity"] = pair_diagnostic
+    diagnostics["model_diversity_proposal"] = pair_diagnostic
     required_axes = list(nodes[0].get("parallel_independence_axes", ["perspective"]))
     effective_axes = effective_independence_axes(required_axes)
     realized_axes = []

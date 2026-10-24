@@ -1101,9 +1101,9 @@ def main(argv):
                                   quality_band=quality_band,
                                   relief_promoted=relief_promoted, top_excluded=top_excluded)), flush=True)
         if pair_model_reason != "not-applicable":
-            print(f"model_diversity={pair_model_reason}", flush=True)
-            print(f"model_diversity_profile={pair_model_profile or values.get('--model-profile', '-')}", flush=True)
-            print(f"model_diversity_from={values.get('--model-profile', '-')}/{first.get('model', '-')}", flush=True)
+            print(f"model_diversity_proposal={pair_model_reason}", flush=True)
+            print(f"model_diversity_proposal_profile={pair_model_profile or values.get('--model-profile', '-')}", flush=True)
+            print(f"model_diversity_proposal_from={values.get('--model-profile', '-')}/{first.get('model', '-')}", flush=True)
         if frame_degradation:
             print(f"reason={reason}", flush=True)
         if explicit_policy and source == "explicit":

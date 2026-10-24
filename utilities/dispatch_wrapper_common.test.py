@@ -83,8 +83,8 @@ class WrapperCommonTest(unittest.TestCase):
 
     def test_pair_hint_is_rederived_from_batch_reservation_and_shared_models(self):
         manifest = {"members": [
-            {"route_node": "plan-a", "model_profile": "deep"},
-            {"route_node": "plan-b", "model_profile": "balanced-deep"},
+            {"route_node": "plan-a", "model_profile": "deep", "harness": "claude"},
+            {"route_node": "plan-b", "model_profile": "balanced-deep", "harness": "claude"},
         ]}
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.dict(os.environ, {"AGENT_MODEL_GOVERNOR_RESERVATION_TOKEN": "token-fixture"}), \
@@ -110,10 +110,32 @@ class WrapperCommonTest(unittest.TestCase):
         self.assertEqual(receipt["model_diversity"], "rotated")
         self.assertEqual(receipt["model_source"], "profile+diversity")
 
+    def test_cross_harness_manifest_keeps_the_sealed_profile_despite_pair_hint(self):
+        manifest = {"members": [
+            {"route_node": "plan-a", "model_profile": "deep", "harness": "codex"},
+            {"route_node": "plan-b", "model_profile": "balanced-deep", "harness": "claude"},
+        ]}
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(os.environ, {"AGENT_MODEL_GOVERNOR_RESERVATION_TOKEN": "token-fixture"}), \
+             mock.patch("dispatch_contract.replica_batch_expectation", return_value={}), \
+             mock.patch("dispatch_contract.resolve_model_governor_root", return_value=Path(td) / "governor"), \
+             mock.patch("dispatch_contract._governor_json", return_value={
+                 "state": "unclaimed", "batch_manifest": manifest}), \
+             mock.patch("route_authority.require_batch_reservation"), \
+             mock.patch("replica_batch_contract.verify_manifest", return_value=(manifest, "digest", {})):
+            args = self._pair_args(td)
+            context = C.prepare_pair_model_rotation(args, harness="claude")
+            wrapper = load("claude")
+            settings = wrapper.resolve_model_settings(args)
+        self.assertEqual(context["status"], "unverified-kept-sealed")
+        self.assertEqual(context["profile"], "balanced-deep")
+        self.assertEqual(settings["profile"], "balanced-deep")
+        self.assertEqual(args.model_profile, "balanced-deep")
+
     def test_unmatched_pair_hint_keeps_the_sealed_profile(self):
         manifest = {"members": [
-            {"route_node": "plan-a", "model_profile": "deep"},
-            {"route_node": "plan-b", "model_profile": "balanced-deep"},
+            {"route_node": "plan-a", "model_profile": "deep", "harness": "claude"},
+            {"route_node": "plan-b", "model_profile": "balanced-deep", "harness": "claude"},
         ]}
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.dict(os.environ, {"AGENT_MODEL_GOVERNOR_RESERVATION_TOKEN": "token-fixture"}), \
@@ -176,8 +198,8 @@ class WrapperCommonTest(unittest.TestCase):
         for profile in ("balanced-deep", "balanced", "light"):
             config["CFG_MODEL_PROFILE_" + profile.upper().replace("-", "_")] = "deep:medium"
         manifest = {"members": [
-            {"route_node": "plan-a", "model_profile": "deep"},
-            {"route_node": "plan-b", "model_profile": "balanced-deep"},
+            {"route_node": "plan-a", "model_profile": "deep", "harness": "claude"},
+            {"route_node": "plan-b", "model_profile": "balanced-deep", "harness": "claude"},
         ]}
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.dict(os.environ, {"AGENT_MODEL_GOVERNOR_RESERVATION_TOKEN": "token-fixture"}), \
