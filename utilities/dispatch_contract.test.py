@@ -110,7 +110,13 @@ class FrameLaunchGateTest(unittest.TestCase):
    records=[json.loads(line) for line in (base/"degradations"/"rt-launch-ledger.jsonl").read_text().splitlines()]
    self.assertEqual(len(records),1)
    self.assertEqual(records[0]["writer"],"dispatch_contract.py")
+   self.assertEqual(records[0]["reason"],"frame-single-available-harness")
    self.assertEqual(records[0]["prior_attempt_ids"],["att-capacity"])
+   D.record_frame_launch_degradation(route,jobs,[],"att-first","codex",
+       reason="frame-other-harness-unusable",detail='{"codex":"limited"}')
+   records=[json.loads(line) for line in (base/"degradations"/"rt-launch-ledger.jsonl").read_text().splitlines()]
+   self.assertEqual(records[-1]["reason"],"frame-other-harness-unusable")
+   self.assertEqual(records[-1]["detail"],"[detail omitted]")
    with mock.patch("dispatch_degradation.record_degradation",return_value=None):
     self.assertIsNone(D.record_frame_launch_degradation(route,jobs,["att-capacity"],"att-first","codex"))
 

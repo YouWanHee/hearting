@@ -174,7 +174,7 @@ def build_tabs(attempts=(), routes=(), cycles=()):
 
 
 def latest_results(tabs, attempts):
-    """Latest row per (route_id, route_node) among open requests (highest registry line)."""
+    """Current row per (route_id, route_node) among open requests (``AttemptRow.rank``)."""
     by_id = {row.attempt_id: row for row in attempts}
     latest = {}
     for tab in tabs:
@@ -185,7 +185,7 @@ def latest_results(tabs, attempts):
             if row is None or not row.route_id or not row.route_node:
                 continue
             key = (row.route_id, row.route_node)
-            if key not in latest or row.line > latest[key].line:
+            if key not in latest or row.rank > latest[key].rank:
                 latest[key] = row
     return tuple(sorted(latest.values(), key=lambda r: r.line))
 
