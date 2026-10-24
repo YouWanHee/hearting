@@ -96,12 +96,12 @@ PY
 python3 "$ROOT/tools/generate.py" >/dev/null
 grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/manifest.json"
 grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/tools/skill-conformance/invocation-policy.tsv"
-grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/skills/autopilot-code/SKILL.md"
-grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/claude/skills/autopilot-code/SKILL.md"
-grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/autopilot-code/SKILL.md"
-grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/codex/skills/autopilot-code/SKILL.md"
-grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/codex/plugins/hearting-codex/skills/autopilot-code/SKILL.md"
-grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/opencode/skills/autopilot-code/SKILL.md"
+grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/capabilities/autopilot-code/references/procedure.md"
+grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/claude/capabilities/autopilot-code/references/procedure.md"
+grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/claude/plugin-marketplace/plugins/hearting-claude/capabilities/autopilot-code/references/procedure.md"
+grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/codex/capabilities/autopilot-code/references/procedure.md"
+grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/codex/plugins/hearting-codex/capabilities/autopilot-code/references/procedure.md"
+grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/opencode/capabilities/autopilot-code/references/procedure.md"
 
 cp "$TMP/harness-manifest.json" "$MANIFEST"
 chmod 0755 "$PLUGIN_HOOKS_JSON"
@@ -327,12 +327,12 @@ depth, tests, safety, and validation on fallback|fallback preservation guarantee
 before committing|expose-change-before-committing clause
 BOOTSTRAP_PARITY_EOF
 done
-if grep -Fq '## Projected Portable Details' "$ROOT/adapters/codex/skills/autopilot-code/SKILL.md"; then
+if grep -Fq '## Projected Portable Details' "$ROOT/adapters/codex/capabilities/autopilot-code/references/procedure.md"; then
   echo "not ok - entry-router Codex Skill preloads projected details" >&2
   exit 1
 fi
 grep -Fq '## Projected Portable Details' "$ROOT/adapters/codex/skills/code-plan/SKILL.md"
-if grep -Fq '## Portable Contract' "$ROOT/adapters/opencode/skills/autopilot-code/SKILL.md"; then
+if grep -Fq '## Portable Contract' "$ROOT/adapters/opencode/capabilities/autopilot-code/references/procedure.md"; then
   echo "not ok - entry-router OpenCode Skill preloads portable details" >&2
   exit 1
 fi
@@ -354,9 +354,8 @@ for projected in \
 done
 grep -Fq 'agent-chosen memory recall' "$ROOT/capabilities/analyze-project.md"
 for owner in \
-  "$ROOT/skills/analyze-project/references/owner-execution.md" \
-  "$ROOT/adapters/claude/skills/analyze-project/references/owner-execution.md" \
-  "$ROOT/adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/analyze-project/references/owner-execution.md"; do
+  "$ROOT/capabilities/analyze-project/references/owner-execution.md" \
+  "$ROOT/adapters/claude/plugin-marketplace/plugins/hearting-claude/capabilities/analyze-project/references/owner-execution.md"; do
   grep -Fq 'agent-chosen memory recall' "$owner" || {
     echo "not ok - post-approval owner contract missing from $owner" >&2
     exit 1
@@ -389,7 +388,7 @@ printf '%s\n' "$opencode_mode" | grep -Fq 'report_tool_contract_check=adapters/o
 test -x "$ROOT/tools/figure-semantic-verify.py"
 test -f "$ROOT/tools/figure-semantic-manifest.schema.json"
 test -L "$ROOT/adapters/claude/tools/figure-semantic-verify.py"
-grep -Fq '### Step 4c: Report figure semantic gate' "$ROOT/skills/autopilot-draft/references/pipeline-steps.md"
+grep -Fq '### Step 4c: Report figure semantic gate' "$ROOT/capabilities/autopilot-draft/references/pipeline-steps.md"
 grep -Fq 'PNG existence, dimensions, count, and links alone are not a pass' "$ROOT/skills/code-test/SKILL.md"
 cmp -s "$ROOT/adapters/codex/skills/analyze-project/SKILL.md" \
   "$ROOT/adapters/codex/plugins/hearting-codex/skills/analyze-project/SKILL.md"

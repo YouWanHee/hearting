@@ -59,9 +59,9 @@ need adapters/opencode/AGENTS.md 'otherwise omit .--shape. and let the frame dec
 
 # 5. Claude skill realization
 need skills/autopilot-lab/SKILL.md 'core/WORKFLOW.md §0.2'         'lab SKILL semantic routing 참조'
-need skills/autopilot-lab/references/eval-procedure.md 'pre-execution gate' 'lab eval-procedure gate 참조'
-need adapters/claude/skills/autopilot-lab/references/eval-procedure.md 'WAV, MP3, or OGG' 'Claude lab audio parity projection 존재'
-need adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/autopilot-lab/references/eval-procedure.md 'WAV, MP3, or OGG' 'Claude plugin lab audio parity projection 존재'
+need capabilities/autopilot-lab/references/eval-procedure.md 'pre-execution gate' 'lab eval-procedure gate 참조'
+need adapters/claude/capabilities/autopilot-lab/references/eval-procedure.md 'WAV, MP3, or OGG' 'Claude lab audio parity projection 존재'
+need adapters/claude/plugin-marketplace/plugins/hearting-claude/capabilities/autopilot-lab/references/eval-procedure.md 'WAV, MP3, or OGG' 'Claude plugin lab audio parity projection 존재'
 
 # 6. 행동 드릴 fixture 존재 (Cases A–E)
 for c in r_route_lab_eval_primary r_route_refine_doc_only r_route_spec_policy_lab_exec \

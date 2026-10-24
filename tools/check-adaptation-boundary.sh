@@ -573,8 +573,8 @@ check_install_layout_codex_projection() {
     fail_msg "INSTALL_LAYOUT.md must validate Codex runtime projection outputs with the shared non-Claude deny regex"
   fi
   if ! grep -Fq 'codex_setting/bin/preflight.sh capability-info autopilot-code >/tmp/codex-capability.txt' INSTALL_LAYOUT.md \
-    || ! grep -Fq "rg '^native_skill_path=adapters/codex/skills/autopilot-code/SKILL.md$' /tmp/codex-capability.txt" INSTALL_LAYOUT.md \
-    || ! grep -Fq "rg '^native_plugin_skill_path=adapters/codex/plugins/hearting-codex/skills/autopilot-code/SKILL.md$' /tmp/codex-capability.txt" INSTALL_LAYOUT.md \
+    || ! grep -Fq "rg '^native_skill_path=adapters/codex/capabilities/autopilot-code/references/procedure.md$' /tmp/codex-capability.txt" INSTALL_LAYOUT.md \
+    || ! grep -Fq "rg '^native_plugin_skill_path=adapters/codex/plugins/hearting-codex/capabilities/autopilot-code/references/procedure.md$' /tmp/codex-capability.txt" INSTALL_LAYOUT.md \
     || ! grep -Fq "rg '^compat_reference=not-projected$' /tmp/codex-capability.txt" INSTALL_LAYOUT.md; then
     fail_msg "INSTALL_LAYOUT.md must validate Codex capability-info native projections without root Skill compat references"
   fi
@@ -684,7 +684,7 @@ check_install_layout_opencode_projection() {
     fail_msg "INSTALL_LAYOUT.md must validate OpenCode runtime projection outputs with the shared non-Claude deny regex"
   fi
   if ! grep -Fq 'opencode_setting/bin/preflight.sh capability-info autopilot-code >/tmp/opencode-capability.txt' INSTALL_LAYOUT.md \
-    || ! grep -Fq "rg '^native_skill_path=adapters/opencode/skills/autopilot-code/SKILL.md$' /tmp/opencode-capability.txt" INSTALL_LAYOUT.md \
+    || ! grep -Fq "rg '^native_skill_path=adapters/opencode/capabilities/autopilot-code/references/procedure.md$' /tmp/opencode-capability.txt" INSTALL_LAYOUT.md \
     || ! grep -Fq "rg '^native_command_path=adapters/opencode/commands/autopilot-code.md$' /tmp/opencode-capability.txt" INSTALL_LAYOUT.md \
     || ! grep -Fq "rg '^compat_reference=not-projected$' /tmp/opencode-capability.txt" INSTALL_LAYOUT.md; then
     fail_msg "INSTALL_LAYOUT.md must validate OpenCode capability-info native projections without root Skill compat references"
@@ -1628,16 +1628,16 @@ check_codex_native_plugin_projection() {
   if [ ! -f "$marketplace" ]; then
     fail_msg "Codex native plugin marketplace is missing"
   fi
-  if [ ! -f "$plugin_root/skills/autopilot-code/SKILL.md" ]; then
+  if [ ! -f "$plugin_root/capabilities/autopilot-code/references/procedure.md" ]; then
     fail_msg "Codex native plugin must include generated capability skills"
   fi
   if ! grep -Fq 'five-field confirmation card' "$plugin_root/skills/autopilot-lab/SKILL.md" \
     || grep -Fq '## Projected Portable Details' "$plugin_root/skills/autopilot-lab/SKILL.md"; then
     fail_msg "Codex native plugin entry Skill must preserve the compact confirmation boundary"
   fi
-  if ! grep -Fq 'five-field confirmation card' "$plugin_root/skills/autopilot-code/SKILL.md" \
-    || ! grep -Fq 'dispatch-depth-1 owner reads it' "$plugin_root/skills/autopilot-code/SKILL.md" \
-    || grep -Fq '## Projected Portable Details' "$plugin_root/skills/autopilot-code/SKILL.md"; then
+  if ! grep -Fq 'five-field confirmation card' "$plugin_root/capabilities/autopilot-code/references/procedure.md" \
+    || ! grep -Fq 'dispatch-depth-1 owner reads it' "$plugin_root/capabilities/autopilot-code/references/procedure.md" \
+    || grep -Fq '## Projected Portable Details' "$plugin_root/capabilities/autopilot-code/references/procedure.md"; then
     fail_msg "Codex native plugin autopilot-code entry projection must stay compact"
   fi
   for skill in "$plugin_root"/skills/*/SKILL.md; do
@@ -3760,7 +3760,7 @@ check_language_neutrality_contract() {
     fail_msg "roles/response-policy.md must define the terminal-safe enumeration contract"
   fi
   if rg -n '[\x{2460}-\x{2473}\x{24EA}\x{24F5}-\x{24FE}\x{2776}-\x{2793}\x{3251}-\x{325F}\x{32B1}-\x{32BF}]' \
-    roles/response-policy.md skills/autopilot-spec/references/prd-authoring.md >/dev/null 2>&1; then
+    roles/response-policy.md capabilities/autopilot-spec/references/prd-authoring.md >/dev/null 2>&1; then
     fail_msg "terminal-facing response policy and choice templates must not contain enclosed numeral glyphs"
   fi
   # 재홈 2026-07-22: the retired editorial-team router's audience-language contract now
