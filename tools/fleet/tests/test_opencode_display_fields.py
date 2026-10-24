@@ -347,10 +347,11 @@ class CurrentSessionBindingTest(unittest.TestCase):
                               (summary_map.get(sid), 10.0 if sid in summary_map else None)),
         )
 
-    def _run_v1(self, sess, claim):
+    def _run_v1(self, sess, claim, registry=None):
         with mock.patch.object(opencode, "session_of_process", return_value=claim), \
                 mock.patch.object(opencode, "_proc_start_ticks", return_value="123"), \
                 mock.patch.object(opencode, "_db", return_value=str(self.db)), \
+                mock.patch.object(opencode.session_registry, "read", return_value=registry), \
                 mock.patch.object(opencode, "_enrich_v2", return_value=False) as v2_mock, \
                 mock.patch("fleet.context_policy.read_policy", return_value=None), \
                 self._title_patches()[0], self._title_patches()[1], self._title_patches()[2]:
@@ -425,6 +426,7 @@ class CurrentSessionBindingTest(unittest.TestCase):
         with mock.patch.object(opencode, "session_of_process", return_value=claim), \
                 mock.patch.object(opencode, "_proc_start_ticks", return_value="123"), \
                 mock.patch.object(opencode, "_db", return_value=str(self.db)), \
+                mock.patch.object(opencode.session_registry, "read", return_value=None), \
                 mock.patch.object(opencode, "_opencode_v2_runtime", return_value=runtime), \
                 mock.patch.object(opencode, "_attach_v2_shell_tasks"), \
                 mock.patch("fleet.context_policy.read_policy", return_value=None), \
@@ -447,6 +449,137 @@ class CurrentSessionBindingTest(unittest.TestCase):
         self.assertEqual((sess.title, sess.summary), ("Title B", "Summary B"))
         self.assertEqual(sess.active_context_tokens, 123)
         self.assertEqual(sess._refresh_source["session_id"], "ses_b")
+
+    def test_v2_real_reader_keeps_selected_directory_when_launch_cwd_differs(self):
+        from fleet import session_cwd
+
+        db = self.root / "opencode-v2.db"
+        with sqlite3.connect(db) as con:
+            con.execute("CREATE TABLE credential (id TEXT, integration_id TEXT, value TEXT)")
+            con.execute(
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, "
+                "slug TEXT, title TEXT, agent TEXT, model TEXT, time_created INT, "
+                "time_updated INT, cost REAL, tokens_input INT, tokens_output INT, "
+                "tokens_reasoning INT)")
+            con.execute(
+                "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, "
+                "seq INT, time_created INT, time_updated INT, data TEXT)")
+            con.execute("INSERT INTO session_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "ses_a", "/other/project", None, "slug-a", "native-a", "build",
+                json.dumps({"id": "model-a", "providerID": "provider"}),
+                1000, 9000, 9.0, 90, 0, 0))
+            con.execute("INSERT INTO session_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "ses_b", "/selected/project", None, "slug-b", "native-b", "build",
+                json.dumps({"id": "model-b", "providerID": "provider"}),
+                1000, 2000, 0.2, 7, 3, 1))
+            con.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)", (
+                "msg-b", "ses_b", "assistant", 1, 1500, 2000,
+                json.dumps({"content": [{"type": "text", "text": "selected B"}],
+                            "tokens": {"total": 123},
+                            "time": {"created": 1500, "completed": 2000}})))
+        before = db.read_bytes()
+        runtime = opencode._opencode_v2_runtime()
+        session = self._session(prior="ses_a")
+        session.cwd = "/launch/project"
+        shell_key = opencode._v2_shell_key(str(db), "ses_b", None)
+        self.addCleanup(opencode._V2_SHELL_TASKS.pop, shell_key, None)
+        with mock.patch.object(runtime, "read_session_observation",
+                               wraps=runtime.read_session_observation) as reader, \
+                mock.patch.object(opencode, "session_of_process",
+                                  return_value=("ses_b", "opencode-tui-selection")), \
+                mock.patch.object(opencode, "_proc_start_ticks", return_value="123"), \
+                mock.patch.object(opencode, "_db", return_value=str(db)), \
+                mock.patch.object(opencode.session_registry, "read", return_value=None), \
+                mock.patch("fleet.context_policy.read_policy", return_value=None), \
+                self._title_patches()[0], self._title_patches()[1], self._title_patches()[2]:
+            opencode.enrich(session)
+
+        reader.assert_called_once()
+        self.assertEqual(reader.call_args.args[0], "ses_b")
+        self.assertEqual(session.session_id, "ses_b")
+        self.assertEqual((session.title, session.summary), ("Title B", "Summary B"))
+        self.assertEqual(session.model, "model-b")
+        self.assertEqual(session.active_context_tokens, 123)
+        self.assertEqual(session._refresh_source["session_id"], "ses_b")
+        self.assertEqual(session._session_cwd, ("ses_b", "/selected/project"))
+        self.assertEqual(session.cwd, "/launch/project")
+        session_cwd.project([session])
+        self.assertEqual(session.cwd, "/selected/project")
+        self.assertEqual(db.read_bytes(), before)
+
+    def test_registry_requires_live_pid_start_and_current_session_before_apply(self):
+        self._add("ses_a", updated=999999, context=99)
+        self._add("ses_b", updated=1000, context=22)
+        stale_records = (
+            {"pid": 4243, "procStart": "123", "sessionId": "ses_b",
+             "name": "wrong-pid", "status": "busy", "cwd": "/wrong-pid",
+             "kind": "wrong-pid", "startedAt": 1000000, "updatedAt": 1000500},
+            {"pid": 4242, "procStart": "122", "sessionId": "ses_b",
+             "name": "old-start", "status": "busy", "cwd": "/old-start",
+             "kind": "old-start", "startedAt": 1000000, "updatedAt": 1000500},
+            {"pid": 4242, "procStart": "123", "sessionId": "ses_a",
+             "name": "wrong-session", "status": "busy", "cwd": "/wrong-session",
+             "kind": "wrong-session", "startedAt": 1000000, "updatedAt": 1000500},
+        )
+        for record in stale_records:
+            with self.subTest(record=record):
+                sess = self._session(prior="ses_a")
+                sess.process_role = "conversation"
+                sess.elapsed_min = 17
+                with mock.patch.object(opencode.session_registry, "apply_to_session",
+                                       wraps=opencode.session_registry.apply_to_session) as apply:
+                    self._run_v1(sess, ("ses_b", "opencode-tui-selection"), record)
+                apply.assert_not_called()
+                self.assertEqual(sess.session_id, "ses_b")
+                self.assertEqual(sess.cwd, "/repo")
+                self.assertEqual((sess.process_role, sess.elapsed_min), ("conversation", 17))
+                for field in ("status", "kind", "started_at", "updated_at",
+                              "registry_proc_start", "registry_name", "runtime_name"):
+                    self.assertIsNone(getattr(sess, field), field)
+                self.assertNotIn(record["name"], (sess.slug, sess.title, sess.runtime_name))
+
+    def test_matching_registry_record_applies_only_to_its_current_sid(self):
+        self._add("ses_b", updated=1000, context=22)
+        record = {"pid": 4242, "procStart": "123", "sessionId": "ses_b",
+                  "name": "current-name", "nameSource": "user", "status": "busy",
+                  "cwd": "/registry-cwd", "kind": "interactive",
+                  "startedAt": 1000000, "updatedAt": 1000500}
+        sess, _v2 = self._run_v1(
+            self._session(prior="ses_a"), ("ses_b", "opencode-tui-selection"), record)
+        self.assertEqual(sess.session_id, "ses_b")
+        self.assertEqual((sess.registry_name, sess.runtime_name),
+                         ("current-name", "current-name"))
+        self.assertEqual((sess.status, sess.kind), ("busy", "interactive"))
+        self.assertEqual((sess.registry_proc_start, sess.started_at, sess.updated_at),
+                         ("123", 1000.0, 1000.5))
+        self.assertEqual(sess.cwd, "/repo")
+
+    def test_registry_fields_clear_when_same_session_transitions_to_unknown(self):
+        self._add("ses_a", updated=999999, context=99)
+        self._add("ses_b", updated=1000, context=22)
+        record = {"pid": 4242, "procStart": "123", "sessionId": "ses_b",
+                  "name": "prior-name", "nameSource": "user", "status": "busy",
+                  "cwd": "/registry-cwd", "kind": "interactive",
+                  "startedAt": 1000000, "updatedAt": 1000500}
+        sess = self._session()
+        sess.process_role = "conversation"
+        self._run_v1(sess, ("ses_b", "opencode-tui-selection"), record)
+        self.assertEqual(sess.registry_name, "prior-name")
+
+        self._run_v1(sess, ("ses_a", "opencode-tui-selection"), record)
+        self.assertEqual(sess.session_id, "ses_a")
+        self.assertIsNone(sess.registry_name)
+        self.assertIsNone(sess.status)
+        self.assertIsNone(sess.kind)
+
+        self._run_v1(sess, (None, ""), record)
+        self.assertIsNone(sess.session_id)
+        self.assertEqual(sess.session_identity_evidence["verdict"], "unobserved")
+        self.assertEqual(sess.cwd, "/repo")
+        self.assertEqual(sess.process_role, "conversation")
+        for field in ("status", "kind", "started_at", "updated_at",
+                      "registry_proc_start", "registry_name", "runtime_name", "slug"):
+            self.assertIsNone(getattr(sess, field), field)
 
     def test_v2_does_not_enumerate_a_unique_candidate_without_current_selection(self):
         self._add("ses_a", updated=999999, context=41)

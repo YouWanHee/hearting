@@ -470,6 +470,11 @@ def _clear_session_enrichment(sess):
         ("_refresh_source", None), ("subagents", None), ("is_child", False),
         ("mtime", None), ("shell_jobs", []), ("shell_job_observation", None),
         ("_opencode_provider_id", None),
+        # These fields are populated only from the session registry for OpenCode.
+        # Clear them on every pass so an old or rejected record cannot survive a
+        # selection change on the same Session object.
+        ("status", None), ("kind", None), ("started_at", None), ("updated_at", None),
+        ("registry_proc_start", None), ("registry_name", None), ("runtime_name", None),
     ):
         setattr(sess, name, value)
     if not getattr(sess, "session_id", None):
@@ -479,6 +484,49 @@ def _clear_session_enrichment(sess):
         sess._opencode_bind_kind = "process"
         from fleet.session_handle import resolve_tag
         sess.session_tag = resolve_tag("opencode", sess.session_id)
+
+
+def _current_registry_record(sess, sid):
+    """Return registry data only when it names this exact live PID/start/SID."""
+    pid = getattr(sess, "pid", None)
+    expected_start = getattr(sess, "proc_start", None)
+    if not sid or pid is None or isinstance(pid, bool) or expected_start is None:
+        return None
+    try:
+        expected_pid = int(pid)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    before = _proc_start_ticks(pid)
+    if before is None or str(before) != str(expected_start):
+        return None
+    try:
+        record = session_registry.read("opencode", pid)
+    except Exception:
+        return None
+    after = _proc_start_ticks(pid)
+    if after is None or str(after) != str(expected_start) or str(after) != str(before):
+        return None
+    if not isinstance(record, dict):
+        return None
+    record_pid = record.get("pid")
+    if (isinstance(record_pid, bool)
+            or not isinstance(record_pid, (int, str))
+            or (isinstance(record_pid, str)
+                and (not record_pid.isascii() or not record_pid.isdigit()))):
+        return None
+    try:
+        if int(record_pid) != expected_pid:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    record_start = record.get("procStart")
+    if record_start is None or isinstance(record_start, bool) or str(record_start) != str(expected_start):
+        return None
+    # Registry display fields are session-bound. A PID/start match alone cannot
+    # attach a prior conversation's name or status to the current TUI selection.
+    if record.get("sessionId") != sid:
+        return None
+    return record
 
 
 def _opencode_v2_runtime():
@@ -527,11 +575,6 @@ def _enrich_v2(sess, tick, db):
                            tree=getattr(sess, "_proc_tree", None),
                            kids=getattr(sess, "_proc_kids", None))
     native = observed.get("session") or {}
-    if native.get("directory") and sess.cwd and os.path.realpath(native["directory"]) != os.path.realpath(sess.cwd):
-        # The process/session binding is exact, but a mismatched directory is
-        # not allowed to reattribute session activity to this pane.
-        _attempt_sidecar_fallback(sess)
-        return True
     sess._opencode_bind_kind = "process"
     sess._refresh_source = {"kind": "opencode-db-v2", "harness": "opencode",
                             "db_path": db, "session_id": sid,
@@ -983,14 +1026,11 @@ def enrich(sess, tick=None):
     # "not-implemented"`), so this always reads None today — the call is here so the
     # harness-parity contract (D) and a future writer both have one call site, matching
     # claude/codex's tier-1 read at the top of their own `enrich`.
-    try:
-        rec = session_registry.read("opencode", sess.pid)
-        if rec:
-            session_registry.apply_to_session(sess, rec, "opencode")
-    except Exception:
-        pass
     sid = _resolve_current_identity(sess)
     _clear_session_enrichment(sess)
+    rec = _current_registry_record(sess, sid)
+    if rec:
+        session_registry.apply_to_session(sess, rec, "opencode")
     if not sid:
         _attempt_sidecar_fallback(sess)
         return
