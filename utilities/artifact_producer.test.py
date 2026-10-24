@@ -1691,6 +1691,7 @@ class SelfExclusionPayloadTest(ProducerTestBase):
             self.assertTrue(artifact_payload.self_excluded_directory(checkout, payload_root=root))
             env = root / "conda-env"
             (env / "conda-meta").mkdir(parents=True)
+            self.assertFalse((env / "conda-meta" / "history").exists())
             self.assertTrue(artifact_payload.self_excluded_directory(env, payload_root=root))
             packages = root / "node_modules"
             packages.mkdir()
