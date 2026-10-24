@@ -2517,7 +2517,7 @@ identified settlement dependency remain unchanged. This is a scheduling
 optimization: it does not satisfy delivery, inspection, claim, mutation, or
 completion authority. Missing, unreadable, unstable, or untracked dependencies
 require a fresh observation and remain unknown until that observation succeeds.
-Runner recovery must stop when its state-root identity or runner-lock inode is
+Runner recovery stops when its state-root identity or runner-lock inode is
 replaced; it cannot recreate a removed root. Terminal obligation history is
 retained only for its bounded, source-verified retention window, while pending
 work and exact late receipts remain recoverable.
