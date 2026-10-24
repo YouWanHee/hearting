@@ -216,20 +216,37 @@ def _live_solo_findings(workdir, final_text, events):
     if not re.search(r"\b(command|evidence)\b|```|`(?:grep|python3|cat|sed|rg)\b", coverage, re.I):
         findings.append("O3 command/evidence reference is missing from coverage.md")
 
-    final = str(final_text or "")
-    for marker in ("O1", "O2", "O3"):
-        if marker not in final:
-            findings.append(f"Final status omits {marker}")
-        elif not re.search(rf"\b{marker}\b[^\n]*\b(complete|completed|done|met|passed)\b",
-                           final, re.I):
-            findings.append(f"Final status does not report {marker} complete")
-    expected_values = {LIVE_O1_RESULT, LIVE_CSV_TOTALS["count"], LIVE_CSV_TOTALS["total"],
-                       *LIVE_CSV_TOTALS["groups"].values(), expected_todo_total}
-    for marker in map(str, expected_values):
-        if not re.search(rf"(?<!\d){re.escape(marker)}(?!\d)", final):
-            findings.append(f"Final status omits expected value {marker}")
-    if not re.search(r"\b(complete|completed|done|finished)\b", final, re.I):
-        findings.append("Final status does not report O1–O3 complete")
+    # A finite machine-readable report avoids interpreting words such as "not complete".
+    final = str(final_text or "").strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*\n(.*)\n```", final, re.S | re.I)
+    if fenced:
+        final = fenced.group(1)
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate report key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        report = json.loads(final, object_pairs_hook=unique_object)
+    except ValueError:
+        report = None
+    expected_report = {
+        "O1": {"status": "complete", "result": LIVE_O1_RESULT},
+        "O2": {"status": "complete", **LIVE_CSV_TOTALS},
+        "O3": {"status": "complete", "counts": LIVE_TODO_COUNTS,
+               "total": expected_todo_total},
+    }
+    if not isinstance(report, dict) or set(report) != set(expected_report):
+        findings.append("Final report must contain exactly O1, O2, and O3 JSON results")
+    else:
+        for marker, expected in expected_report.items():
+            # JSON serialization also distinguishes counts from booleans.
+            if json.dumps(report[marker], sort_keys=True) != json.dumps(expected, sort_keys=True):
+                findings.append(f"Final {marker} status/results contradict fixture-backed completion")
     return findings
 
 
@@ -773,13 +790,36 @@ class LiveSoloResultComparatorFixtureTest(unittest.TestCase):
                 *[command_event(f"python3 count-todos {name}", f"{name}: {count}\n")
                   for name, count in LIVE_TODO_COUNTS.items()],
             ]
-            groups_text = ", ".join(f"{name}={value}"
-                                     for name, value in LIVE_CSV_TOTALS["groups"].items())
-            final = (f"O1 complete: {LIVE_O1_RESULT}. O2 complete: count {LIVE_CSV_TOTALS['count']}, "
-                     f"total {LIVE_CSV_TOTALS['total']}, {groups_text}. "
-                     f"O3 complete: {sum(LIVE_TODO_COUNTS.values())}. All complete.")
+            report = {
+                "O1": {"status": "complete", "result": 3},
+                "O2": {"status": "complete", "count": 6, "total": 27,
+                       "groups": {"A": 9, "B": 6, "C": 12}},
+                "O3": {"status": "complete", "counts": {"first.txt": 1,
+                       "second.txt": 2, "third.txt": 0}, "total": 3},
+            }
+            final = json.dumps(report)
             self.assertEqual(_live_solo_findings(root, final, events), [])
             self.assertEqual(_live_solo_judgment(0, [], events), "PASS")
+            self.assertEqual(_live_solo_findings(root, f"```json\n{final}\n```", events), [])
+
+            for status in ("not complete", "incomplete", "blocked"):
+                contradictory = json.loads(final)
+                contradictory["O1"]["status"] = status
+                findings = _live_solo_findings(root, json.dumps(contradictory), events)
+                self.assertTrue(any("Final O1" in item for item in findings), findings)
+                self.assertEqual(_live_solo_judgment(0, findings, events), "FAIL")
+            for marker, field, value in (("O1", "result", 27), ("O2", "total", 3),
+                                          ("O3", "counts", {"first.txt": True,
+                                                           "second.txt": 2, "third.txt": 0})):
+                incorrect = json.loads(final)
+                incorrect[marker][field] = value
+                findings = _live_solo_findings(root, json.dumps(incorrect), events)
+                self.assertTrue(any(f"Final {marker}" in item for item in findings), findings)
+            for invalid in ("O1 is not complete; O2 complete; O3 complete; 3 6 27 9 12",
+                            '{"O1":{"status":"incomplete"},' + final[1:]):
+                findings = _live_solo_findings(root, invalid, events)
+                self.assertTrue(any("Final report" in item for item in findings), findings)
+                self.assertEqual(_live_solo_judgment(0, findings, events), "FAIL")
 
             def assert_rejected(candidate_events, expected_finding, label):
                 findings = _live_solo_findings(root, final, candidate_events)
@@ -878,7 +918,13 @@ class LiveSoloContinuationTest(unittest.TestCase):
                 "count command whose output includes a line in the form '<filename>: <count>', "
                 "including for zero-count files; use a count method that exits successfully for zero. "
                 "Record each observed count, their summed total, and command/evidence references in "
-                f"{root / 'coverage.md'}. Use a table with file, TODO count, and evidence columns."
+                f"{root / 'coverage.md'}. Use a table with file, TODO count, and evidence columns, "
+                "including a Total row.\n\n"
+                "Return only one final JSON object with exactly O1, O2, and O3 entries. "
+                "O1 has status and result; O2 has status, count, total, and groups; "
+                "O3 has status, counts (mapping each filename to its observed count), and total. "
+                "Use integer results and status 'complete' only for fulfilled duties; otherwise "
+                "report the actual status. Do not include other prose in the final response."
             )
             assignment = WB.assignment_prompt(SimpleNamespace(worker_type="owner"), request, {})
             prompt = ("Quick procedure: use an inline micro-plan, focused verification, "
@@ -930,7 +976,7 @@ class LiveSoloContinuationTest(unittest.TestCase):
                     final_parts.append(str(item.get("text") or ""))
                 if event.get("type") == "turn.completed":
                     final_parts.append(str(event.get("last_agent_message") or ""))
-            final_text = "\n".join(part for part in final_parts if part).strip()
+            final_text = next((part.strip() for part in reversed(final_parts) if part.strip()), "")
             findings = _live_solo_findings(root, final_text, events)
             judgment = _live_solo_judgment(returncode, findings, events, error)
             evidence = {
