@@ -141,7 +141,8 @@ def read_attempts(jobs_path, parent_sid, live_jobs=None, *, entries=None):
             route_node=meta.get("route_node") or None, note=meta.get("note") or "",
             timestamp=fields[0], parent_sid=meta.get("parent_sid") or "",
             liveness=(_get(job, "liveness") if job is not None else None) or "unknown",
-            decision=decision, meta=meta))
+            decision=decision, meta=meta,
+            registered_only=dispatch.row_is_registered_only(fields[1], meta)))
     return sorted(rows, key=lambda row: row.line)
 
 
@@ -318,8 +319,8 @@ def _plan_of(row, label, role):
 
 
 def output_plans(key, tab, rows):
-    """(title, plans, stamped) for the selected request: the chosen attempt, the chosen stage's latest
-    attempt, or the supervisor plus the latest attempt of each stage (mixed by native time)."""
+    """(title, plans, stamped) for the selected request: the chosen attempt, the chosen stage's current
+    attempt, or the supervisor plus the current attempt of each stage (mixed by native time)."""
     by_id = {row.attempt_id: row for row in rows}
     mine = [by_id[a] for a in tab.attempt_ids if a in by_id]
     stages = [row for row in mine if row.worker_type not in ("owner", "frame") and row.route_node]
@@ -331,12 +332,12 @@ def output_plans(key, tab, rows):
         picked = [row for row in stages if row.route_node == key.stage_id]
         if not picked:
             return f"{key.stage_id} · 원래 출력", [], False
-        row = max(picked, key=lambda r: r.line)
+        row = max(picked, key=lambda r: r.rank)
         return f"{key.stage_id} · {harness_abbr(row.harness)} · 원래 출력", [_plan_of(row, key.stage_id, "stage")], False
     owners = [row for row in mine if row.worker_type == "owner"]
     latest = {}
     for row in stages:
-        if row.route_node not in latest or row.line > latest[row.route_node].line:
+        if row.route_node not in latest or row.rank > latest[row.route_node].rank:
             latest[row.route_node] = row
     chosen = sorted(sorted(latest.values(), key=lambda r: r.line)[-MAX_STAGE_SOURCES:], key=lambda r: r.line)
     plans, parts = [], []
