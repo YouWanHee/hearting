@@ -1,0 +1,1 @@
+../../../../../tools/fleet/tests/test_preregistered_chain_current.py

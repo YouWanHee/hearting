@@ -2998,6 +2998,117 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
         self.assertTrue(refresh.call_args.kwargs.get("authority_lock_held"))
         self.assertEqual(len(self._wait_calls()), 0)
 
+    def test_pending_receipt_recheck_waits_for_the_same_watch_refresh(self):
+        watch_id = "pending-receipt-refresh-watch"
+        arm = {
+            "schema_version": 1, "watch_id": watch_id, "target": "peer-a",
+            "server": "named", "armed_ts": "then", "timeout": 30_000,
+            "observer_protocol": 2,
+            "agent": {"harness": "claude", "session_id": "sid-a",
+                      "name": "peer-a", "pane": "w1:p1"},
+            "steward": {"harness": "claude", "session_id": "steward-a",
+                        "project": "fixture"},
+        }
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        self.watch_root.mkdir(parents=True, exist_ok=True)
+        peer_steward._write_json_atomic(paths.arm, arm)
+        native_result = {"state": "result", "agent_state": "idle",
+                         "agent": arm["agent"], "reason": "idle"}
+        identity = {"server": "named", "pane": "w1:p1", "native_state": "idle"}
+        start = str(peer_steward.process_start_ticks(os.getpid()) or "")
+        token = "same-watch-delayed-refresh-token"
+        original_observation = {
+            "state": "pending", "native_wait": native_result,
+            "readiness_transition": {
+                "token": token, "identity": identity,
+                "consumer": {"pid": os.getpid(), "pid_start": start},
+                "requested_at": time.time(),
+            },
+        }
+        peer_steward._write_json_atomic(paths.observation, original_observation)
+        store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        lock_fd = peer_steward._open_lock(paths.lock)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        args = SimpleNamespace(
+            lock_fd=lock_fd, server="named", expected_harness="claude",
+            expected_session_id="sid-a", expected_pane="w1:p1", watch_id=watch_id,
+            target="peer-a", until=["idle"], timeout=30_000, ref=["cycle-ref"],
+            steward_harness="claude", steward_session_id="steward-a",
+            steward_project="fixture", armed_ts="then", rearmed_from=None,
+            rearm_count=0, service_current=None,
+        )
+        results = [
+            SimpleNamespace(state="ready", reason="first-runner-ready"),
+            SimpleNamespace(state="pending", reason="shared-readiness-revalidating"),
+            SimpleNamespace(state="ready", reason="fresh-runner-ready"),
+            SimpleNamespace(state="ready", reason="fresh-runner-ready"),
+        ]
+        lock_checks = []
+        observation_writes = []
+        write_observation = peer_steward._write_watch_observation
+
+        def delayed_refresh(*_args, **kwargs):
+            lock_checks.append(bool(kwargs.get("authority_lock_held")))
+            result = results.pop(0)
+            if result.state == "pending":
+                # Model the existing runner's response wake arriving while the
+                # observer owns its watch lock and is between authority checks.
+                wake_fd = peer_steward._WATCH_WAKE_FD
+                if wake_fd is None:
+                    raise AssertionError("watch observer wake pipe is unavailable")
+                os.write(wake_fd, b"ready")
+            return result
+
+        def capture_observation(write_paths, value, **kwargs):
+            observation_writes.append(dict(value))
+            return write_observation(write_paths, value, **kwargs)
+
+        try:
+            with mock.patch.object(peer_steward, "_watch_root", return_value=self.watch_root), \
+                    mock.patch.object(peer_steward.peer_obligations, "ObligationStore",
+                                      return_value=store), \
+                    mock.patch.object(peer_steward, "_watch_timeout_remaining_ms",
+                                      return_value=(30_000, "active")), \
+                    mock.patch.object(peer_steward, "_terminal_watch_request", return_value=None), \
+                    mock.patch.object(peer_steward, "_watch_native_result_identity",
+                                      return_value=("match", "sid-a", "")), \
+                    mock.patch.object(peer_steward, "_watch_readiness_identity",
+                                      return_value=identity), \
+                    mock.patch.object(peer_steward, "_write_watch_observation",
+                                      side_effect=capture_observation), \
+                    mock.patch.object(peer_steward.herdr_observation,
+                                      "socket_path_for_endpoint", return_value=None), \
+                    mock.patch.object(peer_steward.shared_readiness, "wake_runner",
+                                      return_value=True), \
+                    mock.patch.object(peer_steward.peer_obligations,
+                                      "ensure_normal_runner"), \
+                    mock.patch.object(peer_steward, "_watch_transition_readiness",
+                                      side_effect=delayed_refresh) as refresh, \
+                    mock.patch.object(peer_steward, "_prepare_watch_notice") as prepare_notice, \
+                    mock.patch.object(peer_steward, "_record") as record, \
+                    mock.patch.object(peer_steward.subprocess, "Popen",
+                                      side_effect=AssertionError("native wait replayed")), \
+                    mock.patch.object(peer_steward.os, "_exit", side_effect=SystemExit):
+                with self.assertRaises(SystemExit):
+                    peer_steward.cmd_watch_run(args)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+        self.assertTrue(paths.receipt.exists(),
+                        "a pending receipt-edge authority check must leave the observer waiting")
+        receipt = json.loads(paths.receipt.read_text(encoding="utf-8"))
+        self.assertEqual((receipt["watch_id"], receipt["state"]), (watch_id, "idle"))
+        pending_writes = [value for value in observation_writes
+                          if value.get("reason") == "shared-readiness-revalidating"]
+        self.assertTrue(pending_writes, "receipt-edge pending state must be durably observed")
+        self.assertEqual(pending_writes[0]["native_wait"], native_result)
+        self.assertEqual(pending_writes[0]["readiness_transition"]["token"], token)
+        self.assertEqual(lock_checks, [False, True, False, True])
+        self.assertEqual((refresh.call_count, prepare_notice.call_count, record.call_count),
+                         (4, 1, 1))
+        self.assertEqual(len(self._wait_calls()), 0)
+
     def test_conflicting_native_session_stays_unknown_without_replaying_wait(self):
         env = self._env("held")
         identity_path = self.tmp_root / "conflicting-native-identity.json"
@@ -3621,8 +3732,13 @@ class WatchMessageTransportSettlementTest(_WatchMixin, unittest.TestCase):
         import session_tidy
 
         env = self._env("idle")
+        # The shared obligation runner these commands start can reach a duty before
+        # its ACK; a census without the recipient would cancel it as
+        # recipient-session-absent, so list the recipient's session.
         env.update({"HERDR_PANE_ID": "fixture:watch-transport-seat",
-                    "AGENT_DISPATCH_CALLER_HARNESS": "claude"})
+                    "AGENT_DISPATCH_CALLER_HARNESS": "claude",
+                    "FAKE_HERDR_PANES": json.dumps(
+                        [{"pane_id": "w1:p9", "agent_session": {"value": "steward-1"}}])})
         proc = self._run("watch", target, env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         fields = self._fields(proc.stdout.splitlines()[0])
@@ -11383,7 +11499,9 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
             self.store.root, self.watch_id, self.identity, self.token)
         self.assertEqual(response["state"], "ready")
         self.assertTrue(self._runner_pass(wake))
-        self.assertEqual(wake.call_count, 1, "steady ready response woke the watcher again")
+        self.assertEqual(
+            wake.call_count, 2,
+            "an unchanged current response still needs notification while its request is pending")
         self.assertEqual(self.jobs_path.read_bytes(), jobs_before)
 
         result = self._publish_receipt()
@@ -11413,7 +11531,7 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(len([row for row in self._all_records()
                              if row.get("kind") == "notice"
                              and (row.get("delivery") or {}).get("receipt") == self.watch_id]), 1)
-        self.assertEqual(wake.call_count, 1)
+        self.assertEqual(wake.call_count, 2)
 
     def test_missing_initial_projection_ensures_the_existing_runner(self):
         observation = dict(self.observation)
@@ -11584,7 +11702,7 @@ class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):
                     {"pane": self.pane, "harness": "claude",
                      "session_id": "target-session"},
                     self.server, self.watch_id, self.paths, self.receipt)
-            self.assertFalse(result)
+            self.assertEqual(result, peer_steward._WATCH_RECEIPT_PENDING)
             self.assertFalse(self.paths.receipt.exists(),
                              "new work must block the receipt boundary")
 
@@ -11903,7 +12021,8 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                     mock.patch.object(peer_steward, "_retire_pane_info", return_value={
                         "shell_pid": os.getpid(), "foreground_processes": []}), \
                     mock.patch.object(peer_steward, "_pane_readiness", side_effect=readiness) as heavy_read, \
-                    mock.patch.object(peer_steward, "_wake_watch_observer", return_value=True) as wake:
+                    mock.patch.object(peer_steward, "_wake_current_watch_observer",
+                                      return_value=True) as wake:
                 self.assertTrue(peer_steward._publish_watch_readiness(
                     store, snapshot, read_context=read_context, incarnation=incarnation))
             transport.observe.assert_called_once()
@@ -12561,7 +12680,8 @@ class SharedReadinessRunnerTest(unittest.TestCase):
                                 "shell_pid": os.getpid(), "foreground_processes": []}), \
                             mock.patch.object(peer_steward.peer_obligations,
                                 "execution_attempts_for_processes", return_value=(owner,)):
-                        self.assertFalse(peer_steward._watch_publish_ready_receipt(
+                        self.assertEqual(peer_steward._WATCH_RECEIPT_PENDING,
+                                         peer_steward._watch_publish_ready_receipt(
                             "agent-a", "idle", arm,
                             {"pane": agent["pane"], "harness": "claude",
                              "session_id": "sid-a"}, server, watch_id, paths, receipt))
