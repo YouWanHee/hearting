@@ -1409,6 +1409,85 @@ class CodexCompactBridgeTest(TidyCase):
         self.assertEqual(int(queue.get("card_generation", 0) or 0), accepted["acceptance"]["source_generation"])
         self.assertEqual(accepted["acceptance"]["card_generation"], card["generation"])
 
+    def test_a_marked_reply_card_is_taken_at_turn_end_with_the_same_queue_clear_and_continue(self):
+        import dispatch_seat_handover as handover
+
+        path = self.rollout()
+        requests, clears, continues = [], [], []
+
+        def request(pathname, nonce, target):
+            requests.append((target, nonce))
+            claim, reason = clear.claim_idle_card_request(pathname, nonce)
+            self.assertIsNotNone(claim, reason)
+            prompt = clear.idle_card_request_text(claim)
+            self.assertIn("자동 압축 뒤 카드 작성 요청", prompt)
+            self.assertNotIn("이어서해", prompt)
+            self.assertEqual(st.run_hook("codex", "prompt", self.SID, cwd=str(self.cwd),
+                                         env=self.env, prompt_text=prompt), "")
+            self.assertTrue(clear.finish_idle_card_request(claim, accepted=True))
+            begin, end = st.reply_card_markers(claim["nonce"])
+            self.assertIn(begin, prompt)
+            self.assertIn(end, prompt)
+            # The session answers with the card only; the turn-end observer takes it.
+            self.assertEqual(st.accept_reply_card("codex", self.SID, str(self.cwd), "그냥 답"), "reply-card=none")
+            reply = f"{begin}\n진행 중: 실제 main 카드\n다음 할 일: 다음 입력을 기다림\n{end}"
+            self.assertEqual(st.accept_reply_card("codex", self.SID, str(self.cwd), reply[:-3]),
+                             "reply-card=none reason=unmarked")                       # cut off
+            line = st.accept_reply_card("codex", self.SID, str(self.cwd), reply)
+            self.assertTrue(line.startswith("reply-card=accepted enqueue="), line)
+            self.assertTrue(line.endswith("clear=scheduled"), line)
+            self.assertEqual(st.accept_reply_card("codex", self.SID, str(self.cwd), reply),
+                             "reply-card=skipped reason=already-accepted")            # Stop seen twice
+            return {"accepted": "true"}
+
+        def clear_once(*_args):
+            clears.append(1)
+            return {"cleared": "true", "new_session": "codex-successor"}
+
+        def continue_once(*_args):
+            continues.append(1)
+            return {"continued": "true"}
+
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}), \
+                mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
+                mock.patch.object(clear, "_start_helper", return_value=4321), \
+                mock.patch.object(clear, "_helper_is_live", return_value=True), \
+                mock.patch.object(clear, "_run_idle_card_request", side_effect=request), \
+                mock.patch.object(clear, "_prepare_handover_snapshot", wraps=clear._prepare_handover_snapshot), \
+                mock.patch.object(handover, "collect_snapshot_bindings", return_value=[]), \
+                mock.patch.object(handover, "publish_snapshot_locked", return_value=0), \
+                mock.patch.object(runner, "start_detached", return_value=9876), \
+                mock.patch.object(clear, "validate_continue", side_effect=lambda p, n: (clear.read_reservation(self.seat.key), "")):
+            result = st.run_hook("codex", "compact", self.SID, phase="after", compact_summary="",
+                                 compact_context={"trigger": "auto", "turn_id": "turn-compact-1",
+                                                  "event_id": "compact-event-1"},
+                                 transcript=str(path), cwd=str(self.cwd), env=self.env)
+            self.assertEqual(result, "booking=scheduled")
+            booking = clear.read_reservation(self.seat.key)
+            self.assertTrue(booking["compact"]["card_request_required"])
+            self.assertEqual(booking["memory_state"], "queued")
+            self.assertEqual(runner.read_item(booking["queue_id"])["operation_id"], booking["operation_id"])
+            with path.open("ab") as handle:
+                handle.write((json.dumps({"type": "event_msg", "payload": {
+                    "type": "task_complete", "turn_id": "turn-compact-1"}}) + "\n").encode())
+            result = clear.run_helper(self.seat.key, booking["nonce"], wait=lambda *_: "idle",
+                                      steward=clear_once, continuer=continue_once, sleep=lambda _delay: None)
+
+        self.assertEqual(result, "continued")
+        self.assertEqual(requests, [(PANE, booking["nonce"])])
+        self.assertEqual((len(clears), len(continues)), (1, 1))
+        accepted = clear.read_reservation(self.seat.key)
+        self.assertEqual((accepted["origin"], accepted["status"], accepted["followup_kind"]),
+                         ("compact", "cleared", "continue"))
+        self.assertEqual(accepted["snapshot_state"], "ready")
+        self.assertEqual(accepted["continued"]["state"], "sent")
+        card = st.read_latest_card(self.seat)
+        self.assertEqual(card["body"], "진행 중: 실제 main 카드\n다음 할 일: 다음 입력을 기다림")
+        queue = runner.read_item(accepted["queue_id"])
+        self.assertEqual(queue["operation_id"], accepted["operation_id"])
+        self.assertEqual(int(queue.get("card_generation", 0) or 0), accepted["acceptance"]["source_generation"])
+        self.assertEqual(accepted["acceptance"]["card_generation"], card["generation"])
+
     def test_auto_compact_persists_same_operation_queue_before_card_request_and_after_cancel(self):
         path = self.rollout()
         starts = []
@@ -2645,6 +2724,126 @@ class ClearBookingTest(TidyCase):
         self.hook("claude", "prompt", "sid-A")
         with self.iso.patched_environ():
             self.assertEqual(clear.validate_request(path), (None, "new-input"))
+
+
+class TidyOneCallTest(TidyCase):
+    """``tidy`` = ``card`` then, only for a written card, ``enqueue`` (+ ``handoff``) in one call."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake_herdr = self.iso.root / "fake-herdr"
+        self.fake_herdr.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.fake_herdr.chmod(0o755)
+        self.started = []
+
+    reservation = ClearBookingTest.reservation
+
+    def tidy(self, text, *, sid="sid-A", harness="claude", no_clear=False, no_continue=False,
+             handoff=None, extra=None):
+        env = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+               "HEARTING_TIDY_HERDR": str(self.fake_herdr)}
+        env.update(extra or {})
+        args = SimpleNamespace(harness=harness, session_id=sid, cwd=str(self.cwd), file=None, text=text,
+                               no_clear=no_clear, no_continue=no_continue, handoff=handoff)
+        out = io.StringIO()
+        with self.iso.patched_environ(env), contextlib.redirect_stdout(out), \
+                mock.patch.object(clear, "_start_helper",
+                                  side_effect=lambda key, nonce: self.started.append(nonce) or 4242), \
+                mock.patch.object(runner, "start_detached", return_value=None):
+            code = st.cmd_tidy(args)
+            seat = st.resolve_seat(harness, str(self.cwd))
+        return code, out.getvalue().splitlines(), seat
+
+    def queued(self):
+        folder = self.state / "queue"
+        return [json.loads(p.read_text(encoding="utf-8")) for p in folder.glob("*.json")] if folder.exists() else []
+
+    def test_one_call_writes_the_card_queues_the_tidy_and_books_the_clear(self):
+        self.hook("claude", "prompt", "sid-A")
+        code, lines, seat = self.tidy("진행 중: 한 번에\n다음 할 일: 기다림")
+        self.assertEqual(code, 0)
+        self.assertTrue(lines[0].startswith("card="), lines)
+        self.assertRegex(lines[1], r"^enqueue=\S+ seat=\S+ status=queued clear=scheduled$")
+        self.assertEqual(lines[-1], "say=곧 이 창이 자동으로 비워지고, 새 세션이 카드를 받아 이어서 진행합니다.")
+        with self.iso.patched_environ():
+            self.assertEqual(st.read_latest_card(seat)["body"], "진행 중: 한 번에\n다음 할 일: 기다림")
+        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(self.reservation(seat)["status"], "reserved")
+        self.assertEqual(len(self.started), 1)
+
+    def test_no_card_means_no_queue_and_no_clear(self):
+        self.hook("claude", "prompt", "sid-A")
+        code, lines, seat = self.tidy("   ")
+        self.assertEqual((code, lines), (1, ["card=none reason=empty-body", "enqueue=none reason=no-card"]))
+        self.assertEqual(self.queued(), [])
+        self.assertIsNone(self.reservation(seat))
+        self.assertEqual(self.started, [])
+        with mock.patch.object(st, "write_card", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                self.tidy("카드")
+        self.assertEqual(self.queued(), [])
+        self.assertIsNone(self.reservation(seat))
+
+    def test_a_worker_gets_nothing(self):
+        code, lines, seat = self.tidy("워커 카드", extra={"AGENT_SESSION_ROLE": "worker"})
+        self.assertEqual((code, lines), (0, ["card=none reason=worker"]))
+        self.assertFalse((self.state / "cards").exists())
+        self.assertEqual(self.queued(), [])
+
+    def test_modes_keep_their_enqueue_meaning(self):
+        self.hook("claude", "prompt", "sid-A")
+        _code, lines, seat = self.tidy("카드", no_clear=True)
+        self.assertTrue(lines[1].endswith("clear=off"), lines)
+        self.assertEqual(lines[-1], "say=이 창은 그대로 둡니다. 이제 /clear 하거나 닫아도 됩니다.")
+        self.assertIsNone(self.reservation(seat))
+        _code, lines, seat = self.tidy("카드 2", no_continue=True)
+        self.assertTrue(lines[1].endswith("clear=scheduled continue=off"), lines)
+        self.assertEqual(lines[-1], "say=곧 이 창이 자동으로 비워집니다.")
+
+    def test_handoff_runs_after_the_queue_and_keeps_its_own_line_and_exit_code(self):
+        self.hook("claude", "prompt", "sid-A")
+        calls = []
+
+        def handoff(seat, target):
+            calls.append((len(self.queued()), self.reservation(seat)["status"], target))
+            return "prompted=failed target=peer-x", 1
+
+        with mock.patch.object(runner, "handoff", side_effect=handoff):
+            code, lines, seat = self.tidy("카드", handoff="peer-x")
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, [(1, "reserved", "peer-x")])
+        self.assertEqual(lines[2], "prompted=failed target=peer-x")
+        self.assertEqual(lines[-1], "say=곧 이 창이 자동으로 비워집니다.")
+        self.assertEqual(self.reservation(seat)["status"], "reserved")     # a failed handoff keeps the clear
+
+    def test_an_older_card_and_prompt_do_not_block_the_new_one_call_card(self):
+        self.hook("claude", "prompt", "sid-A")
+        self.card("sid-A", "이전 카드")
+        self.hook("claude", "prompt", "sid-A")
+        _code, lines, seat = self.tidy("새 카드")
+        self.assertTrue(lines[1].endswith("clear=scheduled"), lines)   # the new card follows the newest prompt
+
+    def test_report_line_for_each_outcome(self):
+        line = st.tidy_report_line
+        self.assertEqual(line("clear=scheduled", origin="idle"), "곧 이 창이 자동으로 비워집니다.")
+        self.assertEqual(line("clear=manual hint=/new", harness="opencode"), "이제 /new 하거나 닫아도 됩니다.")
+        self.assertEqual(line("clear=skipped reason=new-input", harness="opencode"), "이제 /new 하거나 닫아도 됩니다.")
+        self.assertEqual(line("clear=skipped reason=new-input", harness="codex"), "이제 /clear 하거나 닫아도 됩니다.")
+        self.assertIn("다음 입력", line("clear=pending reason=x"))
+
+    def test_the_automatic_requests_ask_for_one_marked_reply(self):
+        for origin in ("idle", "compact"):
+            text = clear.idle_card_request_text({"nonce": "n1", "origin": origin})
+            begin, end = st.reply_card_markers("n1")
+            self.assertIn(begin, text)
+            self.assertIn(end, text)
+            self.assertNotIn("\n", text)
+            self.assertNotIn("enqueue", text)
+            self.assertTrue(text.endswith("요청 식별자: n1"))
+        self.assertEqual(st.reply_card_body(f"{begin}\n 진행 중: x \n{end}\n", "n1"), "진행 중: x")
+        for broken in (f"{begin}\n진행 중: x", f"앞말\n{begin}\n진행 중: x\n{end}", f"{begin}\n\n{end}",
+                       f"{begin}\n진행 중: x\n{end} 뒷말"):
+            self.assertIsNone(st.reply_card_body(broken, "n1"), broken)
 
 
 class OpenCodeTransactionReadTest(TidyCase):

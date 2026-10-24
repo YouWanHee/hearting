@@ -264,16 +264,25 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
         except UnicodeError as exc: raise InlineFinishError("finish-summary-invalid") from exc
         if not summary_text: raise InlineFinishError("finish-summary-invalid")
     source = str(route.get("source_commit") or "")
-    commit = str(args.commit or api._head_commit(route["cwd"]) or "").lower()
-    if not api._COMMIT_SHA.fullmatch(source) or not api._COMMIT_SHA.fullmatch(commit):
-        raise InlineFinishError("finish-commit-invalid")
-    ancestor = subprocess.run(["git", "-C", route["cwd"], "merge-base", "--is-ancestor", source, commit], capture_output=True)
-    head = subprocess.run(["git", "-C", route["cwd"], "rev-parse", "HEAD"], capture_output=True, text=True)
-    if ancestor.returncode or head.returncode or not _on_a_branch(route["cwd"], commit):
-        raise InlineFinishError("finish-commit-not-source-descendant")
+    source_is_sha = bool(api._COMMIT_SHA.fullmatch(source))
+    if source_is_sha:
+        commit = str(args.commit or api._head_commit(route["cwd"]) or "").lower()
+        if not api._COMMIT_SHA.fullmatch(commit):
+            raise InlineFinishError("finish-commit-invalid")
+        ancestor = subprocess.run(["git", "-C", route["cwd"], "merge-base", "--is-ancestor", source, commit], capture_output=True)
+        head = subprocess.run(["git", "-C", route["cwd"], "rev-parse", "HEAD"], capture_output=True, text=True)
+        if ancestor.returncode or head.returncode or not _on_a_branch(route["cwd"], commit):
+            raise InlineFinishError("finish-commit-not-source-descendant")
+    else:
+        # The route's sealed source kind is authoritative, even if this folder
+        # later acquires Git metadata or the caller supplies --commit.
+        commit = None
     # Tracked edits inside this direct node's declared scope are not admissible.
     scope = (node.get("write_scope") or [])
-    _unscoped_tracked_dirt(route["cwd"], scope)
+    if source_is_sha:
+        _unscoped_tracked_dirt(route["cwd"], scope)
+    else:
+        unscoped_tracked_dirt = []
     identity = artifact_lifecycle.read_root_identity(root)
     if not identity: raise InlineFinishError("finish-artifact-root-identity-missing")
     try:
@@ -328,7 +337,8 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
                 facts={"registered_route": registered_route(route, jobs, bool(inherited_jobs))})
             if not choice.allowed:
                 raise InlineFinishError(choice.reason)
-            unscoped_tracked_dirt = _unscoped_tracked_dirt(route["cwd"], scope)
+            unscoped_tracked_dirt = (_unscoped_tracked_dirt(route["cwd"], scope)
+                                     if source_is_sha else [])
             latest = artifact_producer.read_cycle_record(root, record["cycle_id"])
             if (not latest or latest.get("state") not in {"open", "sealed"}
                     or not dispatch_terminal_commit.cycle_identity_matches(
@@ -339,7 +349,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
                     or current_route.get("route_hash") != intent["route_hash"]
                     or api.route_hash(current_route) != intent["route_hash"]):
                 raise InlineFinishError("finish-route-drift")
-            if not _on_a_branch(route["cwd"], intent["commit"]):
+            if source_is_sha and not _on_a_branch(route["cwd"], intent["commit"]):
                 raise InlineFinishError("finish-commit-drift")
             choice = decide_continuation(route, action="finish-cycle",
                 facts={"review_live": artifact_producer._live_review_lease(root, record["cycle_id"]) is not None})
@@ -563,7 +573,8 @@ def _finish_deleted_cycle(root: Path, route: dict, route_file: Path, record: dic
         summary = Path(args.summary_file).read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
         summary = ""
-    commit = str(args.commit or api._head_commit(route["cwd"]) or "").lower() or None
+    commit = (str(args.commit or api._head_commit(route["cwd"]) or "").lower() or None
+              if api._COMMIT_SHA.fullmatch(str(route.get("source_commit") or "")) else None)
     api.close_route(route, route_file, commit, summary or f"{route.get('capability')} {route.get('slug') or route['route_id']}",
                     allow_unproven=True,
                     autoclose={"reason": "cycle-deleted", "trigger": "finish", "closed_by": "finish",
