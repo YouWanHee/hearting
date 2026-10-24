@@ -7513,7 +7513,9 @@ class ComposeRouteTest(TestRoute):
 
  def test_graphless_research_start_passes_the_exact_sealed_graph_to_owner(self):
   import types, work_start
-  with tempfile.TemporaryDirectory() as tmp:
+  # The compiler and emitter must observe the same runtime root with gates on.
+  with tempfile.TemporaryDirectory() as tmp, \
+       mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT)}):
    route=self.compose(capability="autopilot-research",capability_mode="market",
                       intensity="strong",graph=None,artifact_root=tmp,
                       work_request={"text":"Verify graph preservation","owner_harness":"codex"})
