@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import codecs
 import contextlib
 import contextvars
+import functools
 import hashlib
 import os
 from pathlib import Path
@@ -63,6 +64,7 @@ def _utf8_status(data: bytes) -> tuple[bool, bool]:
     return False, consumed < len(data)
 
 
+@functools.lru_cache(maxsize=8192)
 def _completion_metadata(raw: str) -> tuple[tuple[str, str], ...]:
     values = {}
     for part in raw.split(","):
@@ -72,6 +74,7 @@ def _completion_metadata(raw: str) -> tuple[tuple[str, str], ...]:
     return tuple(values.items())
 
 
+@functools.lru_cache(maxsize=8192)
 def _handover_metadata(raw: str) -> tuple[tuple[str, str], ...]:
     values = {}
     for part in raw.split(","):

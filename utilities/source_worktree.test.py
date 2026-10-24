@@ -52,6 +52,7 @@ class SourceWorktreeFixture(unittest.TestCase):
         fixture_env.update({
             "HOME": str(fixture_home), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CEILING_DIRECTORIES": str(base),
             "AGENT_HOME": str(ROOT), "AGENT_DISPATCH_JOBS": str(base / "jobs.log"),
             "AGENT_ARTIFACT_CHECKPOINT": "off",
         })
@@ -354,6 +355,116 @@ class FramedStartPolicyTest(SourceWorktreeFixture):
 
 
 class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
+    def test_non_git_start_without_shape_or_with_direct_starts_inline_without_git_or_worker(self):
+        project = Path(self.tmp.name) / "non-git-project"
+        project.mkdir()
+        prompt = Path(self.tmp.name) / "non-git-task.md"
+        prompt.write_text("기술 동향 조사 결과를 정리한다.\n", encoding="utf-8")
+        for shape_args in ([], ["--shape", "direct"]):
+            with self.subTest(shape=shape_args or "omitted"):
+                argv = ["capability-route.py", "compose", "--start", "--slug", "non-git-start",
+                        *shape_args, "--prompt-file", str(prompt), "--cwd", str(project),
+                        "--artifact-root", str(self.artifact_root), "--unassigned", "--jobs", str(self.jobs)]
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(self.main(argv), 0)
+                route, _path = self.start_calls[-1]
+                self.assertEqual((route["capability"], route["effective_intensity"], route["source_commit"]),
+                                 ("autopilot-research", "direct", "unversioned"))
+                self.assertEqual([node["id"] for node in route["nodes"]], ["inline"])
+                self.assertIn("git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작",
+                              err.getvalue())
+                self.assertEqual(err.getvalue().count("git 아닌 폴더 — 이 세션이 직접 진행"), 1)
+                self.assertFalse((project / ".git").exists())
+                self.assertFalse((self.artifact_root / ".runtime" / "worktree-preparation").exists())
+                self.assertEqual(self.owner_attempt_rows(), [])
+        self.assertEqual(len(self.route_files()), 1)
+
+    def test_non_git_mutating_worker_and_registered_direct_refuse_before_route_write(self):
+        project = Path(self.tmp.name) / "non-git-refusal"
+        project.mkdir()
+        prompt = Path(self.tmp.name) / "non-git-refusal.md"
+        prompt.write_text("Implement a reusable driver.\n", encoding="utf-8")
+        self.evidence.write_text(json.dumps({"tuples": [{
+            "parent_harness": "claude", "parent_transport": "headless",
+            "parent_sandbox": "adapter-default", "child_harness": "codex",
+            "launch_authority": "conductor", "status": "supported",
+            "probe_source": "fixture", "probe_time": "2026-10-15T00:00:00Z",
+            "failure_class": "", "checked_worktree": str(project.resolve()),
+            "failure_scope": "none", "codex_command": "ok", "retry_on_isolated_worktree": 0,
+        }], "native_subagent": []}), encoding="utf-8")
+        for extra in (["--shape", "solo"], ["--shape", "staged"]):
+            with self.subTest(extra=extra):
+                argv = ["capability-route.py", "compose", "--start", "--slug", "refused",
+                        *extra, "--prompt-file", str(prompt), "--cwd", str(project),
+                        "--dispatch-evidence", str(self.evidence),
+                        "--artifact-root", str(self.artifact_root), "--unassigned", "--jobs", str(self.jobs)]
+                with self.assertRaisesRegex(ValueError, "git 저장소 아님: .*source-mutating worker route"):
+                    self.main(argv)
+        framed_argv = ["capability-route.py", "compose", "--start", "--slug", "framed-recordish",
+                       "--shape", "framed", "--prompt-file", str(prompt), "--cwd", str(project),
+                       "--dispatch-evidence", str(self.evidence), "--artifact-root", str(self.artifact_root),
+                       "--unassigned", "--jobs", str(self.jobs)]
+        self.assertEqual(self.main(framed_argv), 0)
+        frame_route = self.start_calls[-1][0]
+        self.assertEqual((frame_route["source_commit"], frame_route["selection"]["shape"],
+                          frame_route["cwd"]), ("unversioned", "framed", str(project.resolve())))
+        from dispatch_contract import launch_repository_identity
+        self.assertEqual(launch_repository_identity(
+            project, self.start_calls[-1][1]), (str(project.resolve()), "non-git"))
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_DEPTH": "1"}):
+            with self.assertRaisesRegex(ValueError, "git 저장소 아님: .*depth-0 부모"):
+                self.main(["capability-route.py", "compose", "--start", "--slug", "depth-refused",
+                           "--shape", "direct", "--prompt-file", str(prompt), "--cwd", str(project),
+                           "--artifact-root", str(self.artifact_root), "--unassigned", "--jobs", str(self.jobs)])
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
+            with self.assertRaisesRegex(ValueError, "git 저장소 아님: .*depth-0 부모"):
+                self.main(["capability-route.py", "compose", "--start", "--slug", "registered-refused",
+                           "--shape", "direct", "--prompt-file", str(prompt), "--cwd", str(project),
+                           "--artifact-root", str(self.artifact_root), "--unassigned", "--jobs", str(self.jobs)])
+        self.assertEqual(len(self.route_files()), 1)
+        self.assertEqual(len(self.start_calls), 1)
+        self.assertEqual(len(self.owner_attempt_rows()), 1)
+        self.assertFalse(project.with_name(project.name + "-wt").exists())
+
+    def test_non_git_direct_cleans_dispatch_hints_and_preserves_explicit_capability(self):
+        project = Path(self.tmp.name) / "non-git-selection"
+        project.mkdir()
+        prompt = Path(self.tmp.name) / "non-git-selection.md"
+        prompt.write_text("Compare model code outputs as a technology research task.\n", encoding="utf-8")
+        demands = Path(self.tmp.name) / "demands.json"
+        demands.write_text("{}\n", encoding="utf-8")
+        profiles = Path(self.tmp.name) / "profiles.json"
+        profiles.write_text("{}\n", encoding="utf-8")
+        argv = ["capability-route.py", "compose", "--start", "--slug", "non-git-selection",
+                "--prompt-file", str(prompt), "--cwd", str(project), "--artifact-root", str(self.artifact_root),
+                "--unassigned", "--jobs", str(self.jobs), "--graph", "execute", "--intensity", "standard",
+                "--signal", "shared-contract", "--profile", "light", "--pin", "worker=codex",
+                "--profile-demands", str(demands), "--explicit-profiles", str(profiles),
+                "--dispatch-evidence", str(self.evidence), "--capability", "autopilot-research",
+                "--capability-mode", "technology"]
+        self.assertEqual(self.main(argv), 0)
+        route, _path = self.start_calls[-1]
+        self.assertEqual((route["capability"], route["effective_intensity"]), ("autopilot-research", "direct"))
+        self.assertEqual(route["selection"]["promotion_signals"], [])
+        self.assertIsNone(route.get("dispatch_evidence"))
+        self.assertIn(route.get("profile_demands"), (None, {}))
+        self.assertIn(route.get("explicit_profiles"), (None, {}))
+        self.assertEqual([node["id"] for node in route["nodes"]], ["inline"])
+        self.assertEqual(self.probe_cwds, [])
+        self.assertEqual(self.owner_attempt_rows(), [])
+        prompt.write_text("계속 진행\n", encoding="utf-8")
+        mode_only = ["capability-route.py", "compose", "--start", "--slug", "non-git-mode-only",
+                     "--prompt-file", str(prompt), "--cwd", str(project), "--artifact-root", str(self.artifact_root),
+                     "--unassigned", "--jobs", str(self.jobs), "--capability-mode", "eval"]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.main(mode_only), 0)
+        mode_route, _path = self.start_calls[-1]
+        self.assertEqual((mode_route["capability"], mode_route["capability_mode"]), ("autopilot-code", "dev"))
+        self.assertEqual(mode_route["work_request"]["routing_hints"], {"capability_mode": "eval"})
+        self.assertIn("작업 종류 미정 — `--capability`로 지정", err.getvalue())
+
     def test_read_only_changed_file_status_disables_optional_index_refresh(self):
         result = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with mock.patch.object(R.subprocess, "run", return_value=result) as run:
