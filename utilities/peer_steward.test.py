@@ -5684,6 +5684,43 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
             self.assertEqual(operation.call_count, 3)
         batch_probe.assert_not_called()
 
+    def test_runner_closes_settlement_watcher_when_its_context_retires(self):
+        store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
+        contexts = []
+        context_type = peer_steward.dispatch_batch_obligations.OwnerSettlementReadContext
+
+        def make_context():
+            context = context_type()
+            if not context._ensure_dependency_watcher():
+                self.skipTest("inotify is unavailable")
+            contexts.append((context, context._dependency_watch_fd))
+            return context
+
+        with lock_path.open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with mock.patch.object(
+                    peer_steward.dispatch_batch_obligations,
+                    "OwnerSettlementReadContext", side_effect=make_context), \
+                 mock.patch.object(peer_steward, "_runner_readiness_loop"), \
+                 mock.patch.object(peer_steward, "_external_obligation_snapshot",
+                                   return_value={"jobs_stamps": {}}), \
+                 mock.patch.object(peer_steward, "_external_obligation_signature",
+                                   return_value=((), ())), \
+                 mock.patch.object(peer_steward, "_external_obligation_snapshot_unchanged",
+                                   return_value=True), \
+                 mock.patch.object(peer_steward, "_reconcile_external_obligations"), \
+                 mock.patch.object(peer_steward, "_publish_watch_readiness"):
+                self.assertEqual(peer_steward.cmd_obligation_runner(SimpleNamespace(
+                    state_root=self.tmp_root, lock_fd=lock.fileno())), 0)
+
+        self.assertEqual(len(contexts), 1)
+        context, watcher_fd = contexts[0]
+        self.assertEqual(context._dependency_watch_fd, -1)
+        self.assertTrue(context._dependency_watcher_fallback)
+        with self.assertRaises(OSError):
+            os.fstat(watcher_fd)
+
     def test_runner_idle_backoff_ignores_repeated_observation_writes_and_resets_on_change(self):
         store, duty = self.pending_message()
         ticks = []

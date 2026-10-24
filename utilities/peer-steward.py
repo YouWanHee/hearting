@@ -8051,6 +8051,7 @@ def cmd_obligation_runner(args):
             # Its state root was removed or replaced (e.g. a finished test's
             # temporary home): no producer can reach this runner any more.
             stop_readiness_worker()
+            settlement_context.close()
             if wake_fd is not None:
                 os.close(wake_fd)
             return 0
@@ -8066,10 +8067,12 @@ def cmd_obligation_runner(args):
             # A service replacement may exec this process. Join the readiness
             # worker first so no old-code thread survives the process image.
             stop_readiness_worker()
+            settlement_context.close()
             peer_obligations.exec_service_runner(
                 args.lock_fd, store.root.parents[1], service_current,
                 herdr_session=_HERDR_SESSION,
             )
+            settlement_context = dispatch_batch_obligations.OwnerSettlementReadContext()
             start_readiness_worker()
         external_snapshot = _external_obligation_snapshot()
         _reconcile_external_obligations(
@@ -8111,12 +8114,14 @@ def cmd_obligation_runner(args):
                                for key, stamp in external_snapshot.get("jobs_stamps", {}).items())
             if (not _runner_duties(store, latest_duties) and not any(latest_external)
                     and not jobs_changed):
+                settlement_context.close()
                 if wake_fd is not None:
                     os.close(wake_fd)
                 return 0
             try:
                 fcntl.flock(args.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
+                settlement_context.close()
                 if wake_fd is not None:
                     os.close(wake_fd)
                 return 0

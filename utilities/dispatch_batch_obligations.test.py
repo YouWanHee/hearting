@@ -689,6 +689,142 @@ class BatchObligationTest(unittest.TestCase):
         self.assertEqual(context.metrics()["dependency_invalidations"], 1)
         settle.assert_called_once_with(self.jobs, target)
 
+    def _watch_context(self):
+        context = obligations.OwnerSettlementReadContext()
+        if not context._ensure_dependency_watcher():
+            context.close()
+            self.skipTest("inotify is unavailable")
+        self.addCleanup(context.close)
+        return context
+
+    def _remember_dependency(self, context, attempt, dependency):
+        return context.remember_settled_owner(
+            self.jobs, "done", f"row-{attempt}", {"attempt_id": attempt}, (),
+            (dependency,))
+
+    def test_dependency_watch_churn_releases_directory_and_filesystem_entries(self):
+        context = self._watch_context()
+        watcher_fd = context._dependency_watch_fd
+
+        for index in range(32):
+            directory = self.base / f"watch-churn-{index}"
+            directory.mkdir()
+            dependency = directory / "terminal.json"
+            dependency.write_text("sealed", encoding="utf-8")
+            attempt = f"att-churn-{index}"
+            self.assertTrue(self._remember_dependency(context, attempt, dependency))
+            self.assertEqual(len(context._dependency_watch_dirs), 1)
+            self.assertTrue(context._dependency_watch_fs_support)
+
+            context.forget_owner(self.jobs, attempt)
+            self.assertFalse(context._dependency_watch_dirs)
+            self.assertFalse(context._dependency_watch_paths)
+            self.assertFalse(context._dependency_watch_keys)
+            self.assertFalse(context._dependency_watch_fs_support)
+            self.assertEqual(os.fstat(watcher_fd).st_mode != 0, True)
+
+        context.close()
+        self.assertEqual(context._dependency_watch_fd, -1)
+        with self.assertRaises(OSError):
+            os.fstat(watcher_fd)
+
+    def test_dependency_watch_shares_directory_and_alias_ownership_until_last_owner(self):
+        context = self._watch_context()
+        shared = self.base / "watch-shared"
+        shared.mkdir()
+        alias = self.base / "watch-shared-alias"
+        alias.symlink_to(shared, target_is_directory=True)
+        first_path = shared / "first.json"
+        second_path = alias / "second.json"
+        first_path.write_text("one", encoding="utf-8")
+        second_path.write_text("two", encoding="utf-8")
+
+        self.assertTrue(self._remember_dependency(context, "att-shared-first", first_path))
+        self.assertTrue(self._remember_dependency(context, "att-shared-same", first_path))
+        self.assertTrue(self._remember_dependency(context, "att-shared-alias", second_path))
+        first_key = (str(self.jobs.resolve()), "att-shared-first")
+        same_key = (str(self.jobs.resolve()), "att-shared-same")
+        alias_key = (str(self.jobs.resolve()), "att-shared-alias")
+        first_pairs = context._dependency_watch_keys[first_key]
+        alias_pairs = context._dependency_watch_keys[alias_key]
+        shared_wd = first_pairs[0][0]
+        self.assertEqual({pair[0] for pair in alias_pairs}, {shared_wd})
+        self.assertEqual(context._dependency_watch_paths[(shared_wd, "first.json")],
+                         {first_key, same_key})
+        self.assertEqual(set(context._dependency_watch_dirs.values()), {shared_wd})
+        self.assertEqual(set(context._dependency_watch_dirs), {str(shared), str(alias)})
+
+        watcher_fd = context._dependency_watch_fd
+        remove = context._dependency_watch_remove
+        with mock.patch.object(context, "_dependency_watch_remove", wraps=remove) as rm_watch:
+            context.forget_owner(self.jobs, "att-shared-first")
+            self.assertEqual(context._dependency_watch_paths[(shared_wd, "first.json")],
+                             {same_key})
+            context.forget_owner(self.jobs, "att-shared-same")
+            self.assertIn((shared_wd, "second.json"), context._dependency_watch_paths)
+            rm_watch.assert_not_called()
+
+            context.forget_owner(self.jobs, "att-shared-alias")
+            rm_watch.assert_called_once_with(watcher_fd, shared_wd)
+
+        self.assertFalse(context._dependency_watch_dirs)
+        self.assertFalse(context._dependency_watch_paths)
+        self.assertFalse(context._dependency_watch_fs_support)
+
+    def test_dependency_watcher_closes_on_retirement_and_stat_fallback(self):
+        closing = self._watch_context()
+        closing_fd = closing._dependency_watch_fd
+        closing.close()
+        self.assertEqual(closing._dependency_watch_fd, -1)
+        with self.assertRaises(OSError):
+            os.fstat(closing_fd)
+
+        fallback = self._watch_context()
+        fallback_fd = fallback._dependency_watch_fd
+        dependency = self.base / "fallback-evidence.json"
+        dependency.write_text("sealed", encoding="utf-8")
+        key = (str(self.jobs.resolve()), "att-fallback")
+        with mock.patch.object(fallback, "_dependency_watch_supported", return_value=False):
+            fallback._register_dependency_watch(key, (dependency,))
+
+        self.assertTrue(fallback._dependency_watcher_fallback)
+        self.assertEqual(fallback._dependency_watch_fd, -1)
+        self.assertFalse(fallback._dependency_watch_dirs)
+        self.assertFalse(fallback._dependency_watch_fs_support)
+        with self.assertRaises(OSError):
+            os.fstat(fallback_fd)
+
+    def test_snapshot_install_race_invalidates_proof_and_reaches_settlement(self):
+        self.jobs.write_text(self._runtime_owner_row() + "\n", encoding="utf-8")
+        registry_cache.clear_cache()
+        dependency = self.base / "race-evidence.json"
+        dependency.write_text("before", encoding="utf-8")
+        context = self._watch_context()
+        register = context._register_dependency_watch
+
+        def replace_between_snapshot_and_install(key, paths):
+            replacement = dependency.with_suffix(".replacement")
+            replacement.write_text("after-atomic-replace", encoding="utf-8")
+            os.replace(replacement, dependency)
+            register(key, paths)
+
+        with mock.patch.object(obligations, "_owner_settlement_dependency_paths",
+                               return_value=(dependency,)), \
+             mock.patch.object(context, "_register_dependency_watch",
+                               side_effect=replace_between_snapshot_and_install), \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending",
+                        side_effect=(False, True)) as pending, \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close") as settle, \
+             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False):
+            signatures = obligations._resume_owner_settlements(self.jobs, context=context)
+
+        self.assertEqual(pending.call_count, 2)
+        settle.assert_called_once_with(self.jobs, "att-owner")
+        self.assertEqual(context.metrics()["dependency_invalidations"], 1)
+        self.assertNotIn((str(self.jobs.resolve()), "att-owner"), context._settled)
+        self.assertTrue(any(item[:3] == (str(self.jobs), "owner-settlement", "att-owner")
+                            for item in signatures))
+
     def test_owner_settlement_accepts_valid_literal_replacement_character(self):
         row = self._runtime_owner_row().replace(
             "completed-supervisor", "completed-supervisor\ufffd")
