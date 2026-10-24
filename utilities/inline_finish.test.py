@@ -1250,6 +1250,19 @@ class SpecInlinePublicationTest(unittest.TestCase):
         outcome = json.loads(CAP.outcome_path(fixture.route_file).read_text())
         self.assertTrue(outcome["terminal_gate_proven"])
 
+    def test_code_inline_finish_without_spec_transaction_has_no_publication_attempt(self):
+        fixture = PublicInlineFinishTest()
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        with unittest.mock.patch.object(artifact_producer, "list_references",
+                                       side_effect=AssertionError("unseeded code must not enumerate references")), \
+                unittest.mock.patch.object(artifact_producer, "admit_shared",
+                                          side_effect=AssertionError("unseeded code must not attempt publication")):
+            done = fixture.finish()
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertNotIn("shared_publication", json.loads(done.stdout))
+        self.assertEqual(artifact_producer.status(fixture.root)["shared_spec_publications"], [])
+
 
 class NextLegFinishTest(PublicInlineFinishTest):
     """A direct route that is leg 0 of an approved route plan reports `next_leg` on finish and replay."""

@@ -1648,6 +1648,28 @@ class WorkStartTest(unittest.TestCase):
                 self.assertEqual(outcome_path.read_bytes(), original)
         self.assertEqual(self.calls, [])
 
+    def test_closed_code_without_spec_transaction_stays_completed_without_publication_lookup(self):
+        import artifact_producer
+        self.route["capability"] = "autopilot-code"
+        artifact_root = Path(self.tmp.name) / "code-artifacts"
+        artifact_root.mkdir()
+        self.route["artifact_root"] = str(artifact_root.resolve())
+        self.path.write_text(json.dumps(self.route))
+        outcome_path = self.path.with_suffix(".outcome.json")
+        outcome_path.write_text(json.dumps({"route_id": self.route["route_id"],
+            "route_hash": self.route["route_hash"], "terminal_gate_proven": True}))
+        with mock.patch.object(artifact_producer, "prepare_route_artifact_env",
+                               side_effect=AssertionError("reopen")), \
+                mock.patch.object(artifact_producer, "route_cycle_for", return_value=None), \
+                mock.patch.object(artifact_producer, "list_references",
+                                  side_effect=AssertionError("unseeded code must not enumerate references")), \
+                mock.patch.object(artifact_producer, "admit_shared",
+                                  side_effect=AssertionError("unseeded code must not attempt publication")):
+            receipt = self.start()
+        self.assertEqual(receipt["state"], "completed", receipt)
+        self.assertNotIn("shared_publication", receipt)
+        self.assertEqual(self.calls, [])
+
     def test_closed_runtime_owner_retries_only_post_seal_publication_and_keeps_the_returned_revision(self):
         import artifact_producer
         import dispatch_terminal_commit as terminal

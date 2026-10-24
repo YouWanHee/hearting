@@ -2189,6 +2189,129 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
             self.assertEqual(artifact_producer.list_references(fixture.root, "spec"), [])
 
 
+class CodeRouteSpecPublicationIntegrationTest(unittest.TestCase):
+    def _fixture(self):
+        fixture = PRODUCER_FIXTURE.TerminalTransactionIntegrationTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        return fixture
+
+    def _git_worktree(self, fixture):
+        worktree = Path(fixture._tmp.name) / "code-source"
+        worktree.mkdir()
+        subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+        subprocess.run(["git", "-C", str(worktree), "config", "user.email", "fixture@example.com"], check=True)
+        subprocess.run(["git", "-C", str(worktree), "config", "user.name", "Fixture"], check=True)
+        (worktree / "README.md").write_text("fixture source\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(worktree), "commit", "-qm", "fixture source"], check=True)
+        return worktree
+
+    def _owner_metadata(self, fixture, jobs, owner, report):
+        from dispatch_completion_join import exact_attempt_row
+        owner_log = jobs.parent / "code-owner.jsonl"
+        text = f"artifact: {report}\nverdict: PASS\nblocker: none"
+        owner_log.write_text(json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": text}}) + "\n" +
+                             json.dumps({"type": "turn.completed"}) + "\n", encoding="utf-8")
+        jobs.write_text(jobs.read_text().replace(
+            "worker_type=owner", f"attempt_schema_version=2,worker_type=owner,log_file={owner_log},workflow_completion=runtime-v1"))
+        fixture._closed_owner(jobs, owner)
+        return exact_attempt_row(jobs, owner).metadata
+
+    def test_standard_code_transaction_cli_publishes_component_prd_during_terminal_settlement(self):
+        fixture = self._fixture()
+        fixture.activate()
+
+        # Establish a real shared base through the existing spec publication path.
+        base_route, base_file, base_cycle = fixture.begin("direct", "autopilot-spec", "update")
+        base_prd = fixture.write_output(base_cycle, rel="spec/c/prd.md", data=b"# Component\nBefore\n")
+        fixture.close(base_route, base_file)
+        artifact_producer.finalize(fixture.root, cycle_id=base_cycle["cycle_id"])
+        base_publication = artifact_producer.completed_spec_publication(
+            fixture.root, cycle_id=base_cycle["cycle_id"], settle=True)
+        self.assertEqual(base_publication["status"], "admitted", base_publication)
+
+        # The source worktree and route are isolated from the invoking owner.
+        worktree = self._git_worktree(fixture)
+
+        route, route_file, jobs, owner, cycle, report, _request = fixture._prepare_fixture(
+            "claude", "autopilot-code", worktree=worktree)
+        persisted = json.loads(route_file.read_text(encoding="utf-8"))
+        execute = next(node for node in persisted["nodes"] if node["id"] == "execute")
+        self.assertEqual(Path(persisted["cwd"]).resolve(), worktree.resolve())
+        self.assertEqual(Path(persisted["artifact_root"]).resolve(), fixture.root.resolve())
+        self.assertTrue(persisted["spec_touch"])
+        self.assertIn("spec/**", execute["write_scope"])
+
+        edit = (
+            "import os; from pathlib import Path; "
+            "p=Path(os.environ['AGENT_SPEC_ROOT'])/'prd.md'; "
+            "p.write_bytes(p.read_bytes()+b'After\\n')"
+        )
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(("AGENT_ARTIFACT_", "AGENT_ROUTE_", "AGENT_REVIEW_",
+                                      "AGENT_DISPATCH_", "AGENT_OWNER_"))}
+        env.update({"AGENT_ARTIFACT_ROOT": str(fixture.root),
+                    "AGENT_ROUTE_FILE": str(route_file),
+                    "AGENT_ROUTE_ID": route["route_id"],
+                    "AGENT_ROUTE_NODE": "execute"})
+        transaction = Path(__file__).resolve().parents[1] / "utilities/spec-transaction.py"
+        command = [sys.executable, str(transaction), "run",
+                   "--artifact-root", str(fixture.root),
+                   "--worktree", str(worktree),
+                   "--route", str(route_file),
+                   "--node", "execute",
+                   "--spec-root", "c",
+                   "--", sys.executable, "-c", edit]
+        result = subprocess.run(command, cwd=worktree, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        cycle_dir = Path(cycle["cycle_dir"])
+        cycle_prd = cycle_dir / "artifacts/spec/c/prd.md"
+        source_bytes = cycle_prd.read_bytes()
+        self.assertEqual(source_bytes, b"# Component\nBefore\nAfter\n")
+        self.assertEqual((cycle_dir / "artifacts/spec/c/_internal/versions/v1/prd.md").read_bytes(),
+                         base_prd.read_bytes())
+
+        metadata = self._owner_metadata(fixture, jobs, owner, report)
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs),
+                                          "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            settled = T.settle_owner_completion(jobs, "done", metadata)
+        self.assertEqual(settled.result, "completed", settled)
+        self.assertEqual(settled.shared_publication["status"], "admitted", settled)
+        self.assertEqual(artifact_producer.read_cycle_record(fixture.root, cycle["cycle_id"])["state"], "sealed")
+
+        revision_id = settled.shared_publication["shared_reference_revision_id"]
+        reference_id = settled.shared_publication["shared_reference_id"]
+        shared_tree, revision = artifact_producer._verified_shared_spec(fixture.root, reference_id, revision_id)
+        self.assertEqual(shared_tree["c/prd.md"], source_bytes)
+        self.assertEqual(shared_tree["c/_internal/versions/v1/prd.md"], base_prd.read_bytes())
+        self.assertEqual(revision["spec_merge"]["base_revision_id"],
+                         base_publication["shared_reference_revision_id"])
+        reference = artifact_producer._read_json(
+            artifact_producer._reference_path(fixture.root, "spec", reference_id))
+        self.assertEqual(reference["revisions"], [base_publication["shared_reference_revision_id"], revision_id])
+
+    def test_standard_code_terminal_without_spec_transaction_remains_completed_noop(self):
+        fixture = self._fixture()
+        worktree = self._git_worktree(fixture)
+        route, _route_file, jobs, owner, _cycle, report, _request = fixture._prepare_fixture(
+            "claude", "autopilot-code", worktree=worktree)
+        metadata = self._owner_metadata(fixture, jobs, owner, report)
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs),
+                                          "AGENT_ARTIFACT_ROOT": str(fixture.root)}), \
+                mock.patch.object(artifact_producer, "list_references",
+                                  side_effect=AssertionError("unseeded code must not enumerate references")), \
+                mock.patch.object(artifact_producer, "admit_shared",
+                                  side_effect=AssertionError("unseeded code must not attempt publication")):
+            settled = T.settle_owner_completion(jobs, "done", metadata)
+        self.assertEqual(settled.result, "completed", settled)
+        self.assertIsNone(settled.shared_publication)
+        self.assertEqual(T.owner_completion_state(jobs, "done", metadata).state, "complete")
+        self.assertEqual(route["capability"], "autopilot-code")
+
+
 class OwnerFinishPrimaryRegressionTest(_TerminalCommitFixture):
     def test_request_carries_optional_owner_handoff_primary(self):
         request = self.request()

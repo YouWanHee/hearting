@@ -648,7 +648,7 @@ class PlanSlicesBriefAndAdapterTest(unittest.TestCase):
         route = {"route_id": "rt-b", "route_hash": "sha256:" + "4" * 64, "cwd": str(root / "wt"),
                  "effective_intensity": "standard",
                  "nodes": [{"id": "execute", "dispatch_depth": 2, "completion_gate": "code-execute",
-                            "kind": "pipeline-stage", "write_scope": ["source/**"],
+                            "kind": "pipeline-stage", "write_scope": ["source/**", "evidence/**"],
                             "subdivision": {"min_intensity": "standard", "max_slices": 4,
                                             "disjointness": "exact-fixed-files"}}]}
         (root / "route.json").write_text(json.dumps(route))
@@ -674,8 +674,38 @@ class PlanSlicesBriefAndAdapterTest(unittest.TestCase):
                 self.assertIn("Never run git add, commit, checkout, restore, stash, reset or rollback", text)
                 self.assertIn("GIT_OPTIONAL_LOCKS=0", text)
                 self.assertIn("checklist.md", text)
+                self.assertIn("required narrow_verify:", text)
+                self.assertIn("report: evidence/", text)
+                self.assertIn("separate from worktree fixed_files", text)
+                self.assertNotIn("chain:", text)
             self.assertNotIn("only the b part", texts[0])
             self.assertIn("only the b part", texts[1])
+
+    def test_slice_ids_are_lowercased_and_report_paths_stay_out_of_fixed_files(self):
+        slices = [
+            {"id": "Fix-A", "files": ["utilities/a.py"], "verify": "python3 -m unittest a"},
+            {"id": "Fix-B", "files": ["utilities/b.py"], "verify": "python3 -m unittest b"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            _receipt, manifest, _plan, _wt = self._plan(td, slices)
+            self.assertEqual([s["slug"] for s in manifest["sessions"]], ["execute-fix-a", "execute-fix-b"])
+            expected_reports = ["evidence/fix-a/report.md", "evidence/fix-b/report.md"]
+            for session, report_path in zip(manifest["sessions"], expected_reports):
+                self.assertNotIn("report_path", session)
+                self.assertEqual(len(session["fixed_files"]), 1)
+                self.assertTrue(Path(session["fixed_files"][0]).as_posix().endswith(
+                    "utilities/a.py" if session["slug"].endswith("fix-a") else "utilities/b.py"
+                ))
+                self.assertNotIn(report_path, session["fixed_files"])
+                brief = Path(session["phase_brief"]).read_text()
+                self.assertIn(f"report: {report_path}", brief)
+                self.assertIn("also run any additional checks named in this brief", brief)
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaisesRegex(SUBDIV.StageSessionError, "plan-slice-id-invalid:fix-a"):
+                self._plan(td, [
+                    {"id": "Fix-A", "files": ["utilities/a.py"], "verify": "true"},
+                    {"id": "fix-a", "files": ["utilities/b.py"], "verify": "true"},
+                ])
 
     def test_slice_adapter_follows_route_allocation_without_pin(self):
         def adapters(loader, env, slices=None):

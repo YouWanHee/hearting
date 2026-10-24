@@ -35,6 +35,7 @@ from stage_session_contract import (  # noqa: E402
     StageSessionError,
     _git_path,
     load_manifest,
+    report_path_from_brief,
     same_repository_worktree,
 )
 from dispatch_subsession_advance import chain_manifest_pointer_path  # noqa: E402
@@ -308,7 +309,8 @@ def dispatch_command(
         "--prompt-text", (
             f"Execute sub-session {session['subsession_id']} from phase brief "
             f"{session['phase_brief']} within the fixed files. "
-            f"Then verify only with: {session['narrow_verify']}"
+            f"Run the required narrow verify: {session['narrow_verify']}. "
+            "Also run any additional checks required by the phase brief."
         ),
         "--subsession-id", session["subsession_id"],
         "--subsession-index", str(session["index"]),
@@ -486,8 +488,13 @@ _FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 SLICE_RULES = (
     "Edit only the fixed_files above. Never run git add, commit, checkout, restore, stash, "
     "reset or rollback; read git state with `GIT_OPTIONAL_LOCKS=0 git ...`. checklist.md and "
-    "the dev log belong to the owner. If a file outside the list is needed, stop and hand "
-    "off. Finish by reporting the changed files and the verify result; your final `artifact:` line is your state ledger's absolute path, never a source file."
+    "the dev log belong to the owner. Complete all processable items in the brief and write your "
+    "report to the artifact path supplied separately from the worktree fixed_files. Always run "
+    "narrow_verify as a required check and also run "
+    "additional checks named in the phase brief. If a needed source file is outside the list, "
+    "finish independent in-scope work, then report the exact path, change, and unfinished item; "
+    "do not widen the fence. Finish by reporting changed files and verification results; your "
+    "final `artifact:` line is your state ledger's absolute path, never a source file."
 )
 
 
@@ -672,7 +679,7 @@ def plan_slices(
     for index, item in enumerate(slices, 1):
         if not isinstance(item, dict):
             raise StageSessionError(f"plan-slice-invalid:{index}")
-        slice_id = str(item.get("id") or f"s{index}")
+        slice_id = str(item.get("id") or f"s{index}").lower()
         if not _SLICE_ID.fullmatch(slice_id) or slice_id in seen:
             raise StageSessionError(f"plan-slice-id-invalid:{slice_id}")
         seen.add(slice_id)
@@ -697,20 +704,34 @@ def plan_slices(
         fixed = fixed_of(item)
         if not isinstance(fixed, list) or not fixed:
             raise StageSessionError(f"fixed-files-missing:{slice_id}")
+        import artifact_context
+        report_path = f"evidence/{slice_id}/report.md"
+        artifact_scopes = [
+            scope for scope in (node.get("write_scope") or [])
+            if isinstance(scope, str) and artifact_context.classify_scope(scope) == "artifact"
+        ]
+        if not artifact_context.scope_matches(report_path, artifact_scopes):
+            report_path = None
         brief_path = output_path.parent / f"{chain_id}-{slice_id}.brief.md"
-        briefs.append((brief_path, (
+        session_id = f"ss-{chain_id[4:]}-{slice_id}"
+        brief_text_for_session = (
             f"# {node_id} slice {index}/{len(slices)} — {slice_id}\n\n"
-            f"chain: {chain_id}\n"
             + (f"plan: {plan_path}\n" if plan_path else "")
             + f"worktree: {worktree}\n"
             f"fixed_files (exhaustive; touch nothing else, commit nothing):\n"
             + "".join(f"- {f}\n" for f in fixed)
-            + f"narrow_verify: {narrow_verify.strip()}\n\n"
+            + (f"report: {report_path} (relative to the cycle output directory; separate from worktree fixed_files)\n"
+               if report_path else "")
+            + f"required narrow_verify: {narrow_verify.strip()} (also run any additional checks named in this brief)\n\n"
             f"rules: {SLICE_RULES}\n"
             + (f"\n{brief_text.strip()}\n" if brief_text and brief_text.strip() else "")
-        )))
+        )
+        report_path_from_brief(
+            brief_text_for_session, session_id=session_id, route_node=node_id, node=node,
+        )
+        briefs.append((brief_path, brief_text_for_session))
         sessions.append({
-            "subsession_id": f"ss-{chain_id[4:]}-{slice_id}",
+            "subsession_id": session_id,
             "attempt_id": f"att-{chain_id[4:]}-{slice_id}",
             "adapter": adapter,
             "slug": f"{node_id}-{slice_id}",

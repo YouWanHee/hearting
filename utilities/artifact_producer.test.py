@@ -2698,6 +2698,47 @@ class CompletedSpecPublicationTest(ProducerTestBase):
     def _publish(self, cycle, *, settle=True):
         return P.completed_spec_publication(self.root, cycle_id=cycle["cycle_id"], settle=settle)
 
+    def test_unseeded_code_cycle_skips_publication_lookup_and_finalize_output(self):
+        import contextlib
+        import io
+        self.activate()
+        route, path, cycle = self.begin("direct", "autopilot-code", "dev")
+        self.write_output(cycle, rel="plans/fixture/final_report.md", data=b"PASS\n")
+        self.close(route, path)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+        with mock.patch.object(P, "list_references", side_effect=AssertionError("no seed: no reference lookup")), \
+                mock.patch.object(P, "admit_shared", side_effect=AssertionError("no transaction: no admission")):
+            self.assertEqual(self._publish(cycle)["status"], "not-applicable")
+            self.assertEqual(P.status(self.root)["shared_spec_publications"], [])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(P.main(["finalize", "--artifact-root", str(self.root),
+                                         "--cycle", cycle["cycle_id"]]), P.OK)
+            self.assertNotIn("shared_publication", json.loads(output.getvalue()))
+
+    def test_code_seed_and_restored_version_history_without_authoring_delta_are_noop(self):
+        self.activate()
+        _, _base_path, base = self._completed({
+            "c/prd.md": b"# Component base\n",
+            "c/_internal/versions/v1/prd.md": b"# Historical preimage\n",
+        })
+        published = self._publish(base)
+        self.assertEqual(published["status"], "admitted", published)
+        route, path, cycle = self.begin("direct", "autopilot-code", "dev")
+        spec_base = Path(cycle["cycle_dir"]) / "artifacts/spec"
+        tx_spec = importlib.util.spec_from_file_location(
+            "spec_transaction_seed_only", Path(__file__).with_name("spec-transaction.py"))
+        transaction = importlib.util.module_from_spec(tx_spec)
+        tx_spec.loader.exec_module(transaction)
+        transaction.seed_cycle_spec(spec_base, self.root, spec_base / "c")
+        self.close(route, path)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+        with mock.patch.object(P, "admit_shared", side_effect=AssertionError("seed alone is not a publication")):
+            publication = self._publish(cycle)
+            self.assertEqual(publication["status"], "not-applicable", publication)
+        self.assertFalse(any(row["cycle_id"] == cycle["cycle_id"]
+                             for row in P.status(self.root)["shared_spec_publications"]))
+
     def test_completed_missing_lineage_is_detected_and_normal_completion_admits_once(self):
         self.activate()
         _, path, cycle = self._completed({"REPORT.md": b"PASS evidence\n", "prd.md": b"# User PRD\n"})
@@ -4808,16 +4849,20 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
                     fixture.doCleanups()
 
     def _prepare_fixture(self, harness="claude", capability="autopilot-code", *,
-                         owner="att-transaction-owner", child="att-transaction-report"):
+                         owner="att-transaction-owner", child="att-transaction-report", worktree=None):
         import dispatch_terminal_commit as terminal
         self.activate()
-        route=R.compile_route(capability,"update" if capability=="autopilot-spec" else "dev","standard",cwd=R.ROOT,artifact_root=self.root,
+        cwd=Path(worktree).resolve() if worktree is not None else R.ROOT
+        dispatch={"tuples":[nested(harness,"codex")]}
+        for row in dispatch["tuples"]:
+            row["checked_worktree"]=str(cwd)
+        route=R.compile_route(capability,"update" if capability=="autopilot-spec" else "dev","standard",cwd=cwd,artifact_root=self.root,
             predicates=[],transport="headless",tracking="tracked",tracked_gate_evidence=gate_evidence(),
-            slug="terminal-transaction-fixture",dispatch_evidence={"tuples":[nested(harness,"codex")]})
+            slug="terminal-transaction-fixture",dispatch_evidence=dispatch)
         if capability=="autopilot-spec":
             route=R.compose_route(capability=capability,capability_mode="update",shape="staged",
-                graph="review,prd-transaction",slug="terminal-transaction-fixture",cwd=R.ROOT,
-                artifact_root=self.root,intensity="standard",dispatch_evidence={"tuples":[nested(harness,"codex")]},
+                graph="review,prd-transaction",slug="terminal-transaction-fixture",cwd=cwd,
+                artifact_root=self.root,intensity="standard",dispatch_evidence=dispatch,
                 unassigned=True)
         route_file=Path(L.admit_runtime_route(self.root,route).route_file)
         jobs=Path(self._tmp.name)/"jobs.log"
@@ -4825,7 +4870,7 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
             registered_worker="1",harness=harness,owner_route_file=str(route_file),
             owner_route_id=route["route_id"],owner_route_hash=route["route_hash"])
         def row(status,slug,metadata):
-            return f"2026-09-08T00:00:00Z\t{status}\t{R.ROOT}\t{R.ROOT}\t{slug}\t"+",".join(f"{k}={v}" for k,v in metadata.items())+"\n"
+            return f"2026-09-08T00:00:00Z\t{status}\t{route['cwd']}\t{route['cwd']}\t{slug}\t"+",".join(f"{k}={v}" for k,v in metadata.items())+"\n"
         jobs.write_text(row("open","owner",owner_meta))
         with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs)}):
             result=P.begin(self.root,route_file=route_file,capability=capability,intensity="standard",

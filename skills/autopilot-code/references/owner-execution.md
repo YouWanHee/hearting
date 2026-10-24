@@ -5,7 +5,7 @@ Code-work entrypoint. Detect spec context and close the `plan → execute → te
 ## Quick Contract
 
 - Standalone default output: `<artifact-root>/plans/<date>_<slug>/`. Routed work uses the selected graph's declared outputs. `direct` creates no durable plan; `quick` uses a micro-plan; plan/checklist belong only to selected planning work.
-- When a spec exists, emit a one-line `spec-significance` judgment before editing code. Route spec-significant changes through an `autopilot-spec` update first.
+- When a spec exists, emit a one-line `spec-significance` judgment before editing code. For spec-significant work, the plan or code owner updates the affected component PRD before implementation through the same route: run `spec-transaction --node execute` inside `code-execute` for standard+, use the one-shot transaction for quick, and apply it inline for direct. Only an explicit user deferral skips the update.
 - Recheck git and worktree state at entry and immediately before durable write-back or commit. Follow `<agent-home>/core/OPERATIONS.md §5.9` for active operations, conflict-resolution authority, detached HEAD, and unexpected HEAD changes.
 - Do not parallelize QA at every stage. Scale `plan-check` and final `code-test` from the rigor derived from intensity (CONVENTIONS §1.1).
 - Follow an explicit artifact or audience language for user-facing reports. Otherwise, use the conversation language.

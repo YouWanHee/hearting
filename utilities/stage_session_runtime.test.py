@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import artifact_producer  # noqa: E402
 import stage_session_runtime as runtime  # noqa: E402
 from dispatch_contract import DispatchContractError  # noqa: E402
+from stage_session_contract import StageSessionError  # noqa: E402
 
 
 def _args(worktree: Path, brief: Path, fixed: Path, **overrides) -> argparse.Namespace:
@@ -25,6 +26,7 @@ def _args(worktree: Path, brief: Path, fixed: Path, **overrides) -> argparse.Nam
         stage_authority=0, fixed_file=[str(fixed)], narrow_verify="python3 -c pass",
         expected_round_trips=1, state_dir=None, dispatch_depth=2, route_id="rt-0123456789abcdef",
         route_node="execute", attempt_id="att-" + "1" * 32, worktree=str(worktree),
+        route_file="", artifact_root="",
         execution_surface="registered-headless", registered_worker="1", fallback_hop="same-harness-headless",
         capability_owner="owner",
     )
@@ -63,11 +65,112 @@ class StageSessionStateDirTests(unittest.TestCase):
         args=_args(self.worktree,self.brief,self.fixed)
         runtime.bind(args,artifact_root=self.root,action="dry-run")
         fragment=runtime.prompt_fragment(args)
-        self.assertIn("dispatch_subsession_handoff.py",fragment)
         self.assertIn("Before compaction",fragment)
         self.assertIn("Native helper support",fragment)
         self.assertIn(f"final handoff: `artifact: {args.state_ledger}`",fragment)
+        self.assertNotIn("- read the predecessor chain handoff", fragment)
+        self.assertIn("runtime writes any successor's chain-scoped handoff from the ledger", fragment)
+        self.assertNotIn("flush the chain-scoped handoff", fragment)
         self.assertEqual(runtime.prompt_fragment(argparse.Namespace(subsession_id=None)),"")
+
+    def _route_file(self, write_scope=("source/**", "evidence/**")):
+        path = self.root / "route.json"
+        path.write_text(json.dumps({
+            "route_id": "rt-0123456789abcdef", "artifact_root": str(self.root),
+            "nodes": [{"id": "execute", "write_scope": list(write_scope)}],
+        }), encoding="utf-8")
+        return path
+
+    def test_predecessor_handoff_is_rendered_only_for_serial_successors(self):
+        route_file = self._route_file(write_scope=("source/**",))
+        expected = self.root / ".runtime" / "stage-sessions" / "rt-0123456789abcdef" / "ssc-0001.handoff.md"
+        cases = [
+            ("parallel", 2, 3, "planned", False),
+            ("serial", 1, 1, "planned", False),
+            ("serial", 1, 3, "planned", False),
+            ("serial", 1, 1, "gap-retry", False),
+            ("serial", 2, 3, "planned", True),
+            ("serial", 3, 3, "planned", True),
+        ]
+        for mode, index, count, purpose, has_handoff in cases:
+            with self.subTest(mode=mode, index=index, purpose=purpose):
+                args = _args(
+                    self.worktree, self.brief, self.fixed,
+                    route_file=str(route_file), artifact_root=str(self.root),
+                    subsession_mode=mode, subsession_index=index,
+                    subsession_count=count, subsession_purpose=purpose,
+                )
+                runtime.bind(args, artifact_root=self.root, action="dry-run")
+                fragment = runtime.prompt_fragment(args)
+                self.assertEqual(str(expected) in fragment, has_handoff)
+                self.assertEqual("- read the predecessor chain handoff" in fragment, has_handoff)
+                self.assertNotIn("flush the chain-scoped handoff", fragment)
+
+    def test_report_path_is_a_separate_scoped_artifact_output(self):
+        route_file = self._route_file()
+        cycle = self.root / "cycle" / "artifacts"
+        scope = mock.Mock(output_dir=str(cycle), write_scope=("source/**", "evidence/**"))
+        self.brief.write_text("report: evidence/slice-a/report.md (relative to cycle output)\n")
+        args = _args(self.worktree, self.brief, self.fixed, route_file=str(route_file))
+        with mock.patch("worker_bootstrap._linked_slice_source_worktree", return_value=self.worktree), \
+                mock.patch("worker_bootstrap._child_scope_environment", return_value={}), \
+                mock.patch("worker_bootstrap.resolve_node_scope", return_value=scope), \
+                mock.patch.object(artifact_producer, "check_write", return_value={"verdict": "allow"}):
+            runtime.bind(args, artifact_root=self.root, action="start")
+        self.assertEqual(args.report_file, str(cycle / "evidence" / "slice-a" / "report.md"))
+        self.assertEqual(args.fixed_file, [str(self.fixed)])
+        self.assertNotIn(args.report_file, args.fixed_file)
+        self.assertIn(args.report_file, args.effective_fixed_files)
+        self.assertIn(str(self.fixed), args.effective_fixed_files)
+        self.assertEqual(args.fixed_files_sha256, runtime._sha_files([str(self.fixed)]))
+        ledger = Path(args.state_ledger).read_text(encoding="utf-8")
+        meta = json.loads(ledger.splitlines()[0].removeprefix("<!-- worker-state-ledger:v1 ").removesuffix(" -->"))
+        self.assertEqual(set(meta["fixed_files"]), {str(self.fixed), args.report_file})
+        fragment = runtime.prompt_fragment(args)
+        self.assertIn(f"artifact report: {args.report_file}", fragment)
+        self.assertIn(f"fixed files", fragment)
+
+    def test_nodes_without_evidence_scope_do_not_require_report_or_cycle(self):
+        route_file = self._route_file(write_scope=("source/**",))
+        self.brief.write_text("report: evidence/slice-a/report.md\n")
+        args = _args(self.worktree, self.brief, self.fixed, route_file=str(route_file))
+        with mock.patch("worker_bootstrap._linked_slice_source_worktree", return_value=self.worktree), \
+                mock.patch("worker_bootstrap._child_scope_environment", return_value={}), \
+                mock.patch("worker_bootstrap.resolve_node_scope") as resolve:
+            runtime.bind(args, artifact_root=self.root, action="dry-run")
+        self.assertEqual(args.report_file, "")
+        self.assertEqual(args.effective_fixed_files, [str(self.fixed)])
+        resolve.assert_not_called()
+
+    def test_explicit_report_outside_evidence_scope_is_refused(self):
+        route_file = self._route_file(write_scope=("source/**", "evidence/allowed/report.md"))
+        self.brief.write_text("report: evidence/slice-a/report.md\n")
+        args = _args(self.worktree, self.brief, self.fixed, route_file=str(route_file))
+        with self.assertRaisesRegex(StageSessionError, "report-path-outside-write-scope"):
+            runtime.bind(args, artifact_root=self.root, action="dry-run")
+
+    def test_report_path_symlink_is_refused(self):
+        route_file = self._route_file()
+        cycle = self.root / "cycle" / "artifacts"
+        evidence = cycle / "evidence"
+        (evidence / "sibling").mkdir(parents=True)
+        (evidence / "slice-a").symlink_to(evidence / "sibling", target_is_directory=True)
+        self.brief.write_text("report: evidence/slice-a/report.md\n")
+        scope = mock.Mock(output_dir=str(cycle), write_scope=("source/**", "evidence/**"))
+        args = _args(self.worktree, self.brief, self.fixed, route_file=str(route_file))
+        with mock.patch("worker_bootstrap._linked_slice_source_worktree", return_value=self.worktree), \
+                mock.patch("worker_bootstrap._child_scope_environment", return_value={}), \
+                mock.patch("worker_bootstrap.resolve_node_scope", return_value=scope), \
+                mock.patch.object(artifact_producer, "check_write", return_value={"verdict": "allow"}):
+            with self.assertRaises(DispatchContractError) as caught:
+                runtime.bind(args, artifact_root=self.root, action="dry-run")
+        self.assertEqual(caught.exception.reason, "subsession-report-path-symlink")
+
+    def test_report_path_is_not_a_runtime_cli_input(self):
+        parser = argparse.ArgumentParser()
+        runtime.add_arguments(parser)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--report-path", "evidence/slice-a/report.md"])
 
     def test_dry_run_creates_nothing(self):
         args = _args(self.worktree, self.brief, self.fixed)

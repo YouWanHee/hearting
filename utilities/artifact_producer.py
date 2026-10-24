@@ -1827,7 +1827,10 @@ def status(root: Path) -> Dict[str, Any]:
     klass = classify_root(root)
     fallback = legacy_fallback_state(root, classification=klass)
     specs = [r for r in records if r.get("capability") == "autopilot-spec" and r.get("state") == "sealed"]
-    references = list_references(root, "spec") if specs else []
+    code_specs = [r for r in records if r.get("capability") == "autopilot-code"
+                  and r.get("state") == "sealed" and _code_cycle_has_spec_source(root, r)]
+    publication_cycles = [*specs, *code_specs]
+    references = list_references(root, "spec") if publication_cycles else []
     # Read shared revision metadata once per status call, not once per cycle.
     # This is an in-call projection, never a cache or publication authority.
     lineage: Dict[str, Any] = {}
@@ -1842,7 +1845,7 @@ def status(root: Path) -> Dict[str, Any]:
                     lineage.setdefault(source_cycle, {}).setdefault(ref_id, []).append((revision_id, revision))
     publications = [completed_spec_publication(root, cycle_id=r["cycle_id"], references=references,
                                               known_publications=lineage.get(r["cycle_id"], {}))
-                    for r in specs]
+                    for r in publication_cycles]
     return {
         "artifact_root": str(root),
         "cutover": read_cutover(root),
@@ -9098,14 +9101,98 @@ def _finished_spec_publication(root: Path, reference: Mapping[str, Any], cycle_i
     return None, None
 
 
+def _spec_source_manifest_hints(root: Path, record: Mapping[str, Any], source_rel: str) -> Tuple[bool, bool]:
+    """Return whether a cycle manifest ever named this source and its seed receipt."""
+    documents = []
+    current = _read_json(_record_cycle_manifest_path(root, record))
+    if isinstance(current, dict):
+        documents.append(current)
+    try:
+        documents.extend(document for _raw, document in artifact_lifecycle.read_manifest_snapshots(
+            root, record["cycle_id"]) if isinstance(document, dict))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    prefix = source_rel.rstrip("/") + "/"
+    has_source = has_seed = False
+    for document in documents:
+        for row in document.get("artifact_revisions", []):
+            if not isinstance(row, Mapping):
+                continue
+            locator = row.get("locator")
+            path = locator.get("path") if isinstance(locator, Mapping) else None
+            if not isinstance(path, str):
+                continue
+            if path == source_rel or path.startswith(prefix):
+                has_source = True
+            if path == prefix + SPEC_BASE_RECEIPT:
+                has_seed = True
+    return has_source, has_seed
+
+
+def _code_cycle_has_spec_source(root: Path, record: Mapping[str, Any]) -> bool:
+    """Cheap census guard: unseeded code cycles with no spec output are not candidates."""
+    try:
+        directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
+        source_rel = _placed_locator("artifacts/spec", _output_placements(root, record))
+        source_path = directory / source_rel
+        if _path_entry_present(source_path / SPEC_BASE_RECEIPT):
+            return True
+        has_source, _has_seed = _spec_source_manifest_hints(root, record, source_rel)
+        return has_source
+    except (ProducerError, OSError, ValueError, KeyError, TypeError):
+        # Keep a damaged sealed code cycle visible to the normal classifier.
+        return True
+
+
+def _code_spec_tree_changed(root: Path, record: Mapping[str, Any], source_rel: str,
+                            source_path: Path, seed: Mapping[str, Any]) -> bool:
+    """Compare only seeded authoring content to its pinned base, not seed metadata/history."""
+    if seed.get("seed_complete") is not True:
+        raise ProducerError("shared-base-invalid", "incomplete seed")
+    directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
+    source_rows = _sealed_source_files(directory, record, source_rel, source_path)
+    source_tree = _spec_bytes(source_path)
+    if source_rows != [(row["path"], row["sha256"], row["byte_size"])
+                       for row in _spec_inventory(source_tree)]:
+        raise ProducerError("source-manifest-mismatch", source_rel)
+    components = _spec_seed_components(source_tree)
+    if components is None:
+        states = seed.get("component_seeds")
+        if (not isinstance(states, dict)
+                or any(not isinstance(name, str)
+                       or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", name)
+                       or value is not True for name, value in states.items())):
+            raise ProducerError("shared-base-invalid", "incomplete seed")
+    reference_id = seed.get("reference_id")
+    base_id = _spec_admission_base(root, source_path, reference_id, None)
+    base_tree: Mapping[str, bytes] = {}
+    if base_id is not None:
+        if not isinstance(reference_id, str):
+            raise ProducerError("shared-base-invalid", "reference identity")
+        base_tree, _base_record = _verified_shared_spec(root, reference_id, base_id)
+
+    def authoring(tree: Mapping[str, bytes]) -> Dict[str, bytes]:
+        selected = {}
+        for path, data in tree.items():
+            if path == SPEC_BASE_RECEIPT or "/_internal/versions/" in "/" + path:
+                continue
+            if components is not None and path.split("/", 1)[0] not in components:
+                continue
+            selected[path] = data
+        return selected
+
+    return authoring(source_tree) != authoring(base_tree)
+
+
 def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = False,
                                references: Optional[Sequence[Mapping[str, Any]]] = None,
                                known_publications: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Finish publication after the work is complete, without changing its outcome.
 
-    Status reads actual source lineage. Normal completion retries the existing
-    admission transaction, with its seed/base/CAS and immutable-revision recovery.
-    No extra completion gate, mutable completion flag, or model rerun is involved.
+    Spec routes keep their established primary-artifact contract. Code routes
+    become eligible only when a completed cycle contains the real spec seed
+    receipt and its sealed authoring files differ from that receipt's base.
+    Both use the same admission transaction, CAS and immutable-lineage retry.
     """
     root = Path(root).resolve()
     result = {"cycle_id": cycle_id, "status": "not-applicable"}
@@ -9113,28 +9200,40 @@ def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = Fals
         record = read_cycle_record(root, cycle_id)
         if record is None:
             return {**result, "status": "pending", "reason": "cycle-unknown"}
-        if record.get("capability") != "autopilot-spec":
+        capability = record.get("capability")
+        if capability not in {"autopilot-spec", "autopilot-code"}:
             return result
         if record.get("state") != "sealed" or _published_cycle_state(root, record) != "completed":
             return {**result, "reason": "spec-work-not-completed"}
-        result.update(status="pending", reason="shared-publication-required")
         directory = cycle_dir(root, record["campaign_id"], cycle_id, record)
         source_rel = _placed_locator("artifacts/spec", _output_placements(root, record))
         source_path = directory / source_rel
         seed_path = source_path / SPEC_BASE_RECEIPT
-        seed = _read_json(seed_path)
-        if _path_entry_present(seed_path) and seed is None:
-            raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
-        reference_id = seed.get("reference_id") if seed is not None else None
-        if reference_id is not None and not artifact_identity.is_well_formed(reference_id, "shared_reference"):
-            raise ProducerError("shared-base-invalid", "reference identity")
+        seed_present = _path_entry_present(seed_path)
+
+        if capability == "autopilot-code" and not seed_present:
+            has_source, has_seed = _spec_source_manifest_hints(root, record, source_rel)
+            if not has_source:
+                return result
+
+        seed = _read_json(seed_path) if seed_present or source_path.is_dir() else None
+        spec_reference_id = None
+        if capability == "autopilot-spec":
+            if seed_present and seed is None:
+                raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
+            spec_reference_id = seed.get("reference_id") if seed is not None else None
+            if (spec_reference_id is not None
+                    and not artifact_identity.is_well_formed(spec_reference_id, "shared_reference")):
+                raise ProducerError("shared-base-invalid", "reference identity")
         refs = list(references) if references is not None else list_references(root, "spec")
-        if reference_id is not None:
-            refs = [r for r in refs if r.get("shared_reference_id") == reference_id]
-            if len(refs) != 1:
-                raise ProducerError("reference-unknown", reference_id)
+        if capability == "autopilot-spec":
+            if spec_reference_id is not None:
+                refs = [r for r in refs if r.get("shared_reference_id") == spec_reference_id]
+                if len(refs) != 1:
+                    raise ProducerError("reference-unknown", spec_reference_id)
+
         # An already admitted source remains finished even after edits/deletion
-        # or a newer latest. Its original seed base never becomes today's base.
+        # or a newer latest. Check the exact historical manifest lineage first.
         finished = []
         for reference in refs:
             revision_id, revision = _finished_spec_publication(
@@ -9154,9 +9253,40 @@ def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = Fals
             result.pop("reason", None)
             if not settle:
                 return result
-        elif len(refs) > 1:
-            raise ProducerError("shared-reference-ambiguous", "spec completion lacks a unique seed/reference")
+            admission = admit_shared(root, cycle_id=cycle_id, kind="spec", source="spec",
+                                     reference_id=reference_id)
+            return {**result, "status": "admitted", "admission": admission,
+                    "shared_reference_id": admission["shared_reference_id"],
+                    "shared_reference_revision_id": admission["shared_reference_revision_id"],
+                    "content_digest": admission.get("content_digest"), "reason": None}
+
+        if capability == "autopilot-code" and not seed_present:
+            if source_path.is_symlink() or has_seed:
+                raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
+            return result
+        if capability == "autopilot-code":
+            if seed_present and seed is None:
+                raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
+            reference_id = seed.get("reference_id") if seed is not None else None
+            if (reference_id is not None
+                    and not artifact_identity.is_well_formed(reference_id, "shared_reference")):
+                raise ProducerError("shared-base-invalid", "reference identity")
+            if reference_id is not None:
+                refs = [r for r in refs if r.get("shared_reference_id") == reference_id]
+                if len(refs) != 1:
+                    raise ProducerError("reference-unknown", reference_id)
+            elif len(refs) > 1:
+                raise ProducerError("shared-reference-ambiguous", "spec completion lacks a unique seed/reference")
         else:
+            reference_id = spec_reference_id
+            if reference_id is None and len(refs) > 1:
+                raise ProducerError("shared-reference-ambiguous", "spec completion lacks a unique seed/reference")
+
+        if capability == "autopilot-code":
+            if seed is None or not _code_spec_tree_changed(root, record, source_rel, source_path, seed):
+                return result
+        result.update(status="pending", reason="shared-publication-required")
+        if capability == "autopilot-spec" and not refs:
             # Reuse the sealed manifest's canonical route admission, including
             # verified continuations of the cycle's original begin identity.
             document = _read_json(directory / "manifest.json") or {}
@@ -9165,8 +9295,8 @@ def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = Fals
             if primary is None:
                 return {**result, "reason": "official-spec-prd-missing"}
             result["primary_path"] = str(primary)
-            if not settle:
-                return result
+        if not settle:
+            return result
         admission = admit_shared(root, cycle_id=cycle_id, kind="spec", source="spec",
                                  reference_id=reference_id)
         # The existing API validates and commits, or reuses the exact earlier
@@ -9179,6 +9309,29 @@ def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = Fals
             OSError, ValueError, KeyError, TypeError) as exc:
         return {**result, "status": "pending", "reason": getattr(exc, "code", type(exc).__name__),
                 "detail": str(exc)}
+
+
+def completed_route_spec_publication(route: Mapping[str, Any], *, settle: bool = False) -> Dict[str, Any]:
+    """Resolve the route's completed-cycle publication without inventing a code obligation."""
+    result = {"status": "not-applicable"}
+    capability = route.get("capability")
+    if capability not in {"autopilot-spec", "autopilot-code"}:
+        return result
+    root_value = route.get("artifact_root")
+    if not isinstance(root_value, str) or not root_value.strip():
+        return ({**result, "status": "pending", "reason": "spec-artifact-root-unavailable"}
+                if capability == "autopilot-spec" else result)
+    try:
+        root = Path(root_value).resolve()
+        cycle = route_cycle_for(root, route)
+    except (ProducerError, OSError, ValueError, KeyError, TypeError) as exc:
+        return {**result, "status": "pending", "reason": getattr(exc, "code", type(exc).__name__),
+                "detail": str(exc)}
+    if cycle is None:
+        return ({**result, "status": "pending", "reason": "spec-cycle-unavailable"}
+                if capability == "autopilot-spec" else result)
+    publication = completed_spec_publication(root, cycle_id=cycle["cycle_id"], settle=settle)
+    return publication if publication.get("status") != "not-applicable" else result
 
 
 def admit_shared(
@@ -11782,10 +11935,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if result.get("warning"):
                 print(result["warning"], file=sys.stderr)
             record = read_cycle_record(root, args.cycle)
-            if record is not None and record.get("capability") == "autopilot-spec":
+            if record is not None and record.get("capability") in {"autopilot-spec", "autopilot-code"}:
                 # Legacy normal completion/recovery has no owner envelope.
                 # Finalize has released its lock before existing admission runs.
-                result["shared_publication"] = completed_spec_publication(root, cycle_id=args.cycle, settle=True)
+                publication = completed_spec_publication(root, cycle_id=args.cycle, settle=True)
+                if publication.get("status") != "not-applicable":
+                    result["shared_publication"] = publication
         elif args.command == "review-lease":
             if args.operation == "acquire":
                 if not args.attempt:
