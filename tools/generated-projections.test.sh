@@ -96,12 +96,12 @@ PY
 python3 "$ROOT/tools/generate.py" >/dev/null
 grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/manifest.json"
 grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/tools/skill-conformance/invocation-policy.tsv"
-grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/capabilities/autopilot-code/references/procedure.md"
-grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/claude/capabilities/autopilot-code/references/procedure.md"
-grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/claude/plugin-marketplace/plugins/hearting-claude/capabilities/autopilot-code/references/procedure.md"
-grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/codex/capabilities/autopilot-code/references/procedure.md"
-grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/codex/plugins/hearting-codex/capabilities/autopilot-code/references/procedure.md"
-grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/opencode/capabilities/autopilot-code/references/procedure.md"
+grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/skills/autopilot-code/SKILL.md"
+grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/claude/skills/autopilot-code/SKILL.md"
+grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/autopilot-code/SKILL.md"
+grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/codex/skills/autopilot-code/SKILL.md"
+grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/codex/plugins/hearting-codex/skills/autopilot-code/SKILL.md"
+grep -q "GENERATOR_ROUTE_SENTINEL" "$ROOT/adapters/opencode/skills/autopilot-code/SKILL.md"
 
 cp "$TMP/harness-manifest.json" "$MANIFEST"
 chmod 0755 "$PLUGIN_HOOKS_JSON"
@@ -327,12 +327,12 @@ depth, tests, safety, and validation on fallback|fallback preservation guarantee
 before committing|expose-change-before-committing clause
 BOOTSTRAP_PARITY_EOF
 done
-if grep -Fq '## Projected Portable Details' "$ROOT/adapters/codex/capabilities/autopilot-code/references/procedure.md"; then
+if grep -Fq '## Projected Portable Details' "$ROOT/adapters/codex/skills/autopilot-code/SKILL.md"; then
   echo "not ok - entry-router Codex Skill preloads projected details" >&2
   exit 1
 fi
 grep -Fq '## Projected Portable Details' "$ROOT/adapters/codex/skills/code-plan/SKILL.md"
-if grep -Fq '## Portable Contract' "$ROOT/adapters/opencode/capabilities/autopilot-code/references/procedure.md"; then
+if grep -Fq '## Portable Contract' "$ROOT/adapters/opencode/skills/autopilot-code/SKILL.md"; then
   echo "not ok - entry-router OpenCode Skill preloads portable details" >&2
   exit 1
 fi

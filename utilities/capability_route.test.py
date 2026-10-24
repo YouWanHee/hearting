@@ -6550,8 +6550,7 @@ class InlineStageCompletionRecipeTest(unittest.TestCase):
   for relative in (
    "capabilities/autopilot-code/references/dev-pipeline.md",
    "adapters/claude/plugin-marketplace/plugins/hearting-claude/capabilities/autopilot-code/references/dev-pipeline.md",
-   "adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/"
-   "autopilot-code/references/dev-pipeline.md",
+   "adapters/codex/plugins/hearting-codex/capabilities/autopilot-code/references/dev-pipeline.md",
   ):
    text=(Path(R.ROOT)/relative).read_text(encoding="utf-8")
    with self.subTest(relative):

@@ -573,8 +573,8 @@ check_install_layout_codex_projection() {
     fail_msg "INSTALL_LAYOUT.md must validate Codex runtime projection outputs with the shared non-Claude deny regex"
   fi
   if ! grep -Fq 'codex_setting/bin/preflight.sh capability-info autopilot-code >/tmp/codex-capability.txt' INSTALL_LAYOUT.md \
-    || ! grep -Fq "rg '^native_skill_path=adapters/codex/capabilities/autopilot-code/references/procedure.md$' /tmp/codex-capability.txt" INSTALL_LAYOUT.md \
-    || ! grep -Fq "rg '^native_plugin_skill_path=adapters/codex/plugins/hearting-codex/capabilities/autopilot-code/references/procedure.md$' /tmp/codex-capability.txt" INSTALL_LAYOUT.md \
+    || ! grep -Fq "rg '^native_skill_path=adapters/codex/skills/autopilot-code/SKILL.md$' /tmp/codex-capability.txt" INSTALL_LAYOUT.md \
+    || ! grep -Fq "rg '^native_plugin_skill_path=adapters/codex/plugins/hearting-codex/skills/autopilot-code/SKILL.md$' /tmp/codex-capability.txt" INSTALL_LAYOUT.md \
     || ! grep -Fq "rg '^compat_reference=not-projected$' /tmp/codex-capability.txt" INSTALL_LAYOUT.md; then
     fail_msg "INSTALL_LAYOUT.md must validate Codex capability-info native projections without root Skill compat references"
   fi
@@ -684,7 +684,7 @@ check_install_layout_opencode_projection() {
     fail_msg "INSTALL_LAYOUT.md must validate OpenCode runtime projection outputs with the shared non-Claude deny regex"
   fi
   if ! grep -Fq 'opencode_setting/bin/preflight.sh capability-info autopilot-code >/tmp/opencode-capability.txt' INSTALL_LAYOUT.md \
-    || ! grep -Fq "rg '^native_skill_path=adapters/opencode/capabilities/autopilot-code/references/procedure.md$' /tmp/opencode-capability.txt" INSTALL_LAYOUT.md \
+    || ! grep -Fq "rg '^native_skill_path=adapters/opencode/skills/autopilot-code/SKILL.md$' /tmp/opencode-capability.txt" INSTALL_LAYOUT.md \
     || ! grep -Fq "rg '^native_command_path=adapters/opencode/commands/autopilot-code.md$' /tmp/opencode-capability.txt" INSTALL_LAYOUT.md \
     || ! grep -Fq "rg '^compat_reference=not-projected$' /tmp/opencode-capability.txt" INSTALL_LAYOUT.md; then
     fail_msg "INSTALL_LAYOUT.md must validate OpenCode capability-info native projections without root Skill compat references"
@@ -1628,17 +1628,9 @@ check_codex_native_plugin_projection() {
   if [ ! -f "$marketplace" ]; then
     fail_msg "Codex native plugin marketplace is missing"
   fi
-  if [ ! -f "$plugin_root/capabilities/autopilot-code/references/procedure.md" ]; then
-    fail_msg "Codex native plugin must include generated capability skills"
-  fi
   if ! grep -Fq 'five-field confirmation card' "$plugin_root/skills/autopilot-lab/SKILL.md" \
     || grep -Fq '## Projected Portable Details' "$plugin_root/skills/autopilot-lab/SKILL.md"; then
     fail_msg "Codex native plugin entry Skill must preserve the compact confirmation boundary"
-  fi
-  if ! grep -Fq 'five-field confirmation card' "$plugin_root/capabilities/autopilot-code/references/procedure.md" \
-    || ! grep -Fq 'dispatch-depth-1 owner reads it' "$plugin_root/capabilities/autopilot-code/references/procedure.md" \
-    || grep -Fq '## Projected Portable Details' "$plugin_root/capabilities/autopilot-code/references/procedure.md"; then
-    fail_msg "Codex native plugin autopilot-code entry projection must stay compact"
   fi
   for skill in "$plugin_root"/skills/*/SKILL.md; do
     [ -f "$skill" ] || continue
@@ -1670,6 +1662,19 @@ check_codex_native_plugin_projection() {
   if ! grep -Fq 'native_plugin_skill_path=' adapters/codex/bin/capability-map.sh \
     || ! grep -Fq 'codex-native-skill-plugin' adapters/codex/bin/capability-map.sh; then
     fail_msg "adapters/codex/bin/capability-map.sh must report Codex native plugin skill realization"
+  fi
+}
+
+check_codex_native_plugin_entry_skill() {
+  skill="adapters/codex/plugins/hearting-codex/skills/autopilot-code/SKILL.md"
+  if [ ! -f "$skill" ]; then
+    fail_msg "$skill is missing"
+    return
+  fi
+  if ! grep -Fq 'five-field confirmation card' "$skill" \
+    || ! grep -Fq 'dispatch-depth-1 owner reads it' "$skill" \
+    || grep -Fq '## Projected Portable Details' "$skill"; then
+    fail_msg "Codex native plugin autopilot-code entry projection must stay compact"
   fi
 }
 
@@ -3871,6 +3876,7 @@ check_codex_native_agent_projection
 check_codex_model_pin_role_map_consistency
 check_codex_native_mode_projection
 check_codex_native_hook_projection
+check_codex_native_plugin_entry_skill
 check_portable_agent_home_resolution
 check_opencode_tool_projection
 check_opencode_native_skill_projection

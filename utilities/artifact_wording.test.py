@@ -54,8 +54,9 @@ CYCLE_RELATIVE_TARGETS = [
     ("capabilities/code-plan/references/procedure.md",
      "The stage uses its node's declared outputs and write scope."),
     ("capabilities/code-execute/references/procedure.md",
-     "Example: `$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_refactor_engine/plan.md` → "
-     "`$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_refactor_engine/`"),
+     "For a registered stage, write `checklist.md` and step logs only to the runtime-declared "
+     "output locations under `$AGENT_ARTIFACT_OUTPUT_DIR`, "
+     "within the node's declared outputs and write scope."),
     ("capabilities/code-test/references/procedure.md",
      "Write a detailed test log to: the code-test node's declared report output"),
     ("capabilities/code-report/references/procedure.md",
@@ -67,9 +68,9 @@ CYCLE_RELATIVE_TARGETS = [
      "- `--output <dir>`: `$AGENT_ARTIFACT_OUTPUT_DIR/documents/{date}_{name}/`"),
     ("capabilities/draft-refine/references/procedure.md",
      "- Otherwise fuzzy-search with `ls -d $AGENT_ARTIFACT_OUTPUT_DIR/documents/*$ARGUMENTS* 2>/dev/null`."),
-    ("capabilities/draft-refine/references/procedure.md",
-     "- $AGENT_ARTIFACT_OUTPUT_DIR/analysis_project/paper/*.md is the primary source produced "
-     "by `analyze-project --mode paper`"),
+    ("capabilities/draft-refine.md",
+     "the resolver applies the selected node's declared outputs and write scope while preserving "
+     "the existing draft target."),
     ("capabilities/design-init/references/procedure.md",
      "Look for `design_state.yaml` under `$AGENT_ARTIFACT_OUTPUT_DIR/designs/<name>/` or "
      "`$AGENT_ARTIFACT_OUTPUT_DIR/spec/design/`."),
