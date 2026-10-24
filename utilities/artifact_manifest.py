@@ -1269,14 +1269,16 @@ def validate_lineage(
             outcome = cycle.get("outcome_criterion")
             outcome = outcome if isinstance(outcome, dict) else {}
             required_roles = outcome.get("required_artifact_roles") or []
-            roles_present = set()
-            for rev in artifact_revisions:
-                art = next(
-                    (a for a in artifacts if a.get("artifact_id") == rev.get("artifact_id")),
-                    None,
-                )
-                if art is not None:
-                    roles_present.add(art.get("role"))
+            # The first artifacts[] row per id, as a per-revision scan would
+            # find it; one table keeps a cycle with many files linear.
+            role_by_artifact: Dict[Any, Any] = {}
+            for art in artifacts:
+                role_by_artifact.setdefault(art.get("artifact_id"), art.get("role"))
+            roles_present = {
+                role_by_artifact[rev.get("artifact_id")]
+                for rev in artifact_revisions
+                if rev.get("artifact_id") in role_by_artifact
+            }
             for role in required_roles if first_close else ():
                 if role not in roles_present:
                     violations.append(
