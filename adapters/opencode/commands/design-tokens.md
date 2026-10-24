@@ -12,15 +12,14 @@ This is adapter-owned output generated from `capabilities/design-tokens.md`, not
    `tool_contract_check`, and obey `runtime_surface` / `fallback` before
    claiming full support. For `unsupported`, stop or use the reported
    `fallback`.
-3. Before edits, run `adapters/opencode/bin/preflight.sh write <file> [session-id]`.
-4. Before spec-changing work, run
+3. Before spec-changing work, run
    `adapters/opencode/bin/preflight.sh capability design-tokens [cwd] [session-id]`.
-5. If the command receives arguments, map them to the portable argument shape:
+4. If the command receives arguments, map them to the portable argument shape:
    `<design path or app path>`.
 
 Portable contract excerpt:
 
-- Invocation semantics: Design tokens decision — color palette, typography scale, spacing scale, radius, shadow, motion. Writes tokens.css / tailwind.config.ts. Extends existing tokens (never silently overwrites). Versions every change — snapshots prior tokens to _internal/versions/v{N}/ + logs reason to design_summary.md (mirrors spec versioning), so later token edits stay traceable. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
+- Invocation semantics: Design token decisions cover palette, typography, spacing, radius, shadow, and motion. Record proposed values, rationale, and a rendered specimen in the design artifacts; hand off application-file edits to `autopilot-code`, which inspects and updates the real imported token source. Extend existing tokens by default and preserve version history in the design artifacts. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 
 User arguments from OpenCode: `$ARGUMENTS`

@@ -320,6 +320,7 @@ Use `adapters/codex/bin/preflight.sh runtime-projection
 when hook trust must fail runtime checks.
 The lifecycle hooks provide informational context. The design hook is a console-check alert path, not a
 full render/screenshot visual harness.
+The final `PostToolUse` hook group passes Edit/Write/MultiEdit/apply_patch input to the shared `hooks/spec-sync-nudge.sh` and returns one `hookSpecificOutput.additionalContext` JSON object when canonical spec lines remain stale.
 
 Codex CLI 0.142.x exposes `codex debug prompt-input`, but not a hook listing or
 hook firing debug surface. Current tests validate `hooks.json` structure and
@@ -634,11 +635,14 @@ the release the launch resolved, and the owner tree gets that same release as
 its `AGENT_HOME` (not the moving pointer), so a release activated while the
 owner runs changes neither; a projection check failure names
 `reason=codex-runtime-projection-mismatch`. Dispatch-depth-2 workers
-do not inherit the network widening. The outer Codex sandbox also admits only
-the existing harness `.core-grounding` directory and Claude `session-env`
-directory as downstream runtime scratch roots. This keeps adapter write guards
-functional and lets a checked Codex→Claude worker initialize Bash without
-making the rest of either runtime home writable.
+do not inherit the network widening. The outer Codex sandbox admits the
+existing harness `.core-grounding` directory and Claude `session-env` directory
+as downstream runtime scratch roots. For a child-spawning owner it also admits
+OpenCode's exact `opencode` subdirectories under the user's XDG data, state, and
+cache roots, where V2 keeps its native database and service state. No broader
+runtime home is opened. This keeps adapter write guards functional and lets a
+checked Codex→Claude worker initialize Bash without making the rest of either
+runtime home writable.
 Broker v1/v2 records remain readable for migration, and `preflight.sh broker`
 retains only diagnostic `status` and idempotent `stop` during the drain release.
 

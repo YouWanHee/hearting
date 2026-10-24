@@ -1017,6 +1017,32 @@ class ParentCloseTest(unittest.TestCase):
             spawn.assert_not_called()
         self.assertEqual(work_start.start_work(self.route, self.path, self.jobs)["state"], "cancelled")
 
+    def test_unstarted_cancellation_is_uncounted_but_cannot_register_a_new_successor(self):
+        import review_round_cap as CAP
+        fallback = load("parent_close_no_start_fallback", "stage-dispatch-fallback.py")
+        owner = self.process("att-owner")
+        self.row("att-owner", process=owner)
+        original = self.row("att-gap", parent="att-owner", route_node="execute")
+        CLOSE.request(self.route, self.path, jobs=self.jobs)
+        self.assertTrue(DC.close_attempt_row_if(
+            self.jobs, original["attempt_id"], CLOSE.NOTE, DC.attempt_row_never_started,
+            evidence={"failure_class": "cancelled", "parent_close_settled": "1",
+                      "launch_outcome": "never-launched"}))
+        fields, metadata = CLOSE._rows(self.jobs)[original["attempt_id"]]
+        self.assertTrue(DC.attempt_row_terminal_never_started(fields))
+        self.assertEqual(CAP.logical_round_records([(fields, metadata)]), [])
+        successor = fallback.retry_proven_unstarted_identity(
+            self.jobs, self.route["route_id"], "execute", original["attempt_id"])
+        self.assertNotEqual(successor, original["attempt_id"])
+        candidate = {**original, "attempt_id": successor}
+        row = "\t".join(["now", "open", str(self.base), str(self.base), "gap-successor",
+                         ",".join(f"{key}={value}" for key, value in candidate.items())])
+        before = self.jobs.read_bytes()
+        with self.assertRaisesRegex(DC.DispatchContractError, "cancelled-by-parent"):
+            DC.claim_attempt_row(self.jobs, successor, row, launch=True)
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertIsNone(owner.poll())  # Authority wins even before the owner stops.
+
     def test_before_first_dispatch_no_registry_means_no_close_intent(self):
         self.jobs.unlink()
         self.assertIsNone(CLOSE.intent(self.route, self.jobs))
