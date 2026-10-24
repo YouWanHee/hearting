@@ -2732,6 +2732,8 @@ class SeedOnlyCodeCleanupWorkStartTest(GF.fixture.ProducerTestBase):
 
         with mock.patch.object(artifact_producer, "admit_shared",
                                side_effect=AssertionError("seed-only cleanup must not publish shared refs")), \
+                mock.patch.object(artifact_producer, "list_references",
+                                  side_effect=AssertionError("seed-only cleanup must not census shared refs")), \
                 mock.patch.object(artifact_producer, "prepare_route_artifact_env",
                                   side_effect=AssertionError("closed route must not be reopened")):
             result = W.start_work(json.loads(route_path.read_text()), route_path, self.jobs)

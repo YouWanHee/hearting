@@ -1828,18 +1828,32 @@ def status(root: Path) -> Dict[str, Any]:
     fallback = legacy_fallback_state(root, classification=klass)
     specs = [r for r in records if r.get("capability") == "autopilot-spec" and r.get("state") == "sealed"]
     code_specs = []
-    resolved_references = None
+    resolved_references: Optional[Dict[str, Dict[str, Any]]] = None
+    unresolved_code_references = False
     for record in records:
         if record.get("capability") != "autopilot-code" or record.get("state") != "sealed":
             continue
-        decision = _code_cycle_publication_decision(root, record, resolved_references)
-        if decision.get("references") is not None:
-            resolved_references = decision["references"]
+        decision = _code_cycle_publication_decision(
+            root, record, list(resolved_references.values()) if resolved_references is not None else None)
+        rows = decision.get("references")
+        if rows is not None:
+            if resolved_references is None:
+                resolved_references = {}
+            for reference in rows:
+                reference_id = reference.get("shared_reference_id")
+                if isinstance(reference_id, str):
+                    resolved_references[reference_id] = reference
         if decision["obligation"]:
             code_specs.append(record)
+            if rows is None:
+                unresolved_code_references = True
     publication_cycles = [*specs, *code_specs]
-    references = (resolved_references if resolved_references is not None else
-                  list_references(root, "spec") if publication_cycles else [])
+    if not publication_cycles:
+        references = []
+    elif specs or unresolved_code_references or resolved_references is None:
+        references = list_references(root, "spec")
+    else:
+        references = list(resolved_references.values())
     # Read shared revision metadata once per status call, not once per cycle.
     # This is an in-call projection, never a cache or publication authority.
     lineage: Dict[str, Any] = {}
@@ -9122,7 +9136,7 @@ def _spec_source_manifest_hints(root: Path, record: Mapping[str, Any], source_re
     except (OSError, ValueError, KeyError, TypeError):
         pass
     prefix = source_rel.rstrip("/") + "/"
-    has_seed = False
+    has_source = has_seed = False
     for document in documents:
         for row in document.get("artifact_revisions", []):
             if not isinstance(row, Mapping):
@@ -9263,83 +9277,113 @@ def _code_cycle_snapshot_publication_obligation(
     root: Path, record: Mapping[str, Any], source_rel: str,
     hints: Mapping[str, Any], reference_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Resolve a removed code payload through its sealed seed digest and lineage."""
-    references = reference_rows if reference_rows is not None else list_references(root, "spec")
+    """Resolve one seed base from immutable evidence when its payload was removed."""
     document = hints.get("sealed")
     if not isinstance(document, Mapping):
-        return {"obligation": True, "references": references}
-    missing_source = root / ".runtime" / "missing-cycle-payload" / str(record.get("cycle_id")) / source_rel
-    for candidate_reference in references:
-        published_id, published = _finished_spec_publication(
-            root, candidate_reference, str(record.get("cycle_id")), source_rel,
-            record, missing_source, None)
-        if published is not None:
-            return {"obligation": True, "references": references,
-                    "finished": (candidate_reference, published_id, published)}
+        return {"obligation": True}
     source_facts = _code_cycle_snapshot_spec_facts(document, source_rel)
     if source_facts is None:
-        return {"obligation": True, "references": references}
+        return {"obligation": True}
     receipt_fact = source_facts.get(SPEC_BASE_RECEIPT)
     if receipt_fact is None:
         # A seed in an earlier manifest but absent from the exact sealed
         # revision is a missing-seed case, not proof of an unused transaction.
-        return {"obligation": True, "references": references}
+        return {"obligation": True}
     receipt_digest, receipt_size = receipt_fact
     source_components = tuple(sorted({path.split("/", 1)[0] for path in source_facts
                                       if not path.startswith("_internal/")}))
-    candidates: List[Tuple[Optional[Mapping[str, Any]], Optional[str], Optional[str],
-                           Optional[Tuple[str, ...]]]] = []
 
-    def try_candidate(reference: Optional[Mapping[str, Any]], reference_id: Optional[str],
-                      revision_id: Optional[str], content_digest: Optional[str]) -> None:
-        option_rows: List[Optional[Tuple[str, ...]]] = [None]
-        if source_components:
-            option_rows.append(source_components)
-        for components in option_rows:
-            raw = _json_bytes({
-                "schema_version": 1, "reference_id": reference_id,
-                "revision_id": revision_id, "content_digest": content_digest,
-                **({"components": list(components),
-                   "component_seeds": {component: True for component in components}}
-                  if components is not None else {}),
-                "seed_complete": True,
-            })
-            if len(raw) == receipt_size and _digest(raw) == receipt_digest:
-                candidates.append((reference, reference_id, revision_id, components))
+    def matches(reference_id: Optional[str], revision_id: Optional[str],
+                content_digest: Optional[str], components: Optional[Tuple[str, ...]]) -> bool:
+        raw = _json_bytes({
+            "schema_version": 1, "reference_id": reference_id,
+            "revision_id": revision_id, "content_digest": content_digest,
+            **({"components": list(components),
+               "component_seeds": {component: True for component in components}}
+              if components is not None else {}),
+            "seed_complete": True,
+        })
+        return len(raw) == receipt_size and _digest(raw) == receipt_digest
 
-    try_candidate(None, None, None, None)
-    for reference in references:
-        reference_id = reference.get("shared_reference_id")
-        if not isinstance(reference_id, str):
-            continue
-        revision_ids = reference.get("revisions")
-        if not isinstance(revision_ids, list):
-            continue
-        if not revision_ids:
-            try_candidate(reference, reference_id, None, None)
-        for revision_id in revision_ids:
-            if not isinstance(revision_id, str):
-                continue
-            revision_record = _read_json(
-                root / "shared/spec" / reference_id / "revisions" / revision_id / REVISION_RECORD_NAME)
-            if not isinstance(revision_record, Mapping):
-                continue
-            content_digest = revision_record.get("content_digest")
-            if not isinstance(content_digest, str):
-                continue
-            try_candidate(reference, reference_id, revision_id, content_digest)
-
-    if len(candidates) != 1:
-        return {"obligation": True, "references": references}
-    reference, reference_id, revision_id, components = candidates[0]
-    try:
+    component_receipt = source_components or None
+    reference: Optional[Mapping[str, Any]] = None
+    reference_id: Optional[str] = None
+    revision_id: Optional[str] = None
+    components: Optional[Tuple[str, ...]] = None
+    if matches(None, None, None, None):
+        base_tree: Mapping[str, bytes] = {}
+    elif component_receipt is not None and matches(None, None, None, component_receipt):
+        components = component_receipt
         base_tree = {}
-        if revision_id is not None:
-            if not isinstance(reference, Mapping) or revision_id not in reference.get("revisions", []):
-                return {"obligation": True, "references": references}
-            base_tree, _base_record = _verified_shared_spec(root, reference_id, revision_id)
-    except (ProducerError, OSError, ValueError, KeyError, TypeError):
-        return {"obligation": True, "references": references}
+    else:
+        found = None
+
+        def match_reference(candidate: Mapping[str, Any]):
+            candidate_id = candidate.get("shared_reference_id")
+            revision_ids = candidate.get("revisions")
+            if not isinstance(candidate_id, str) or not isinstance(revision_ids, list):
+                return None
+            if not revision_ids and matches(candidate_id, None, None, None):
+                return (candidate, candidate_id, None, None, None)
+            for candidate_revision in revision_ids:
+                if not isinstance(candidate_revision, str):
+                    continue
+                revision_record = _read_json(
+                    root / "shared/spec" / candidate_id / "revisions" / candidate_revision
+                    / REVISION_RECORD_NAME)
+                content = revision_record.get("content_digest") if isinstance(revision_record, Mapping) else None
+                if isinstance(content, str) and matches(candidate_id, candidate_revision, content, None):
+                    return (candidate, candidate_id, candidate_revision, content, None)
+                if (isinstance(content, str) and component_receipt is not None
+                        and matches(candidate_id, candidate_revision, content, component_receipt)):
+                    return (candidate, candidate_id, candidate_revision, content, component_receipt)
+            return None
+
+        seen_ids = set()
+        for candidate in reference_rows or ():
+            candidate_id = candidate.get("shared_reference_id")
+            if isinstance(candidate_id, str):
+                seen_ids.add(candidate_id)
+            found = match_reference(candidate)
+            if found is not None:
+                break
+        if found is None:
+            directory = root / "shared/spec"
+            try:
+                entries = sorted(directory.iterdir(), key=lambda path: path.name)
+            except OSError:
+                entries = []
+            for entry in entries:
+                if entry.name in seen_ids or entry.is_symlink() or not entry.is_dir():
+                    continue
+                candidate = _read_json(entry / "reference.json")
+                if (not isinstance(candidate, Mapping)
+                        or candidate.get("shared_reference_id") != entry.name):
+                    continue
+                found = match_reference(candidate)
+                if found is not None:
+                    break
+        if found is None:
+            return {"obligation": True}
+        reference, reference_id, revision_id, _content_digest, components = found
+        try:
+            if (revision_id is not None
+                    and revision_id not in reference.get("revisions", [])):
+                return {"obligation": True}
+            base_tree, _base_record = _verified_shared_spec(root, reference_id, revision_id) \
+                if revision_id is not None else ({}, {})
+        except (ProducerError, OSError, ValueError, KeyError, TypeError):
+            return {"obligation": True}
+
+    exact_references = [dict(reference)] if isinstance(reference, Mapping) else []
+    if exact_references:
+        missing_source = root / ".runtime" / "missing-cycle-payload" / str(record.get("cycle_id")) / source_rel
+        published_id, published = _finished_spec_publication(
+            root, exact_references[0], str(record.get("cycle_id")), source_rel,
+            record, missing_source, None)
+        if published is not None:
+            return {"obligation": True, "references": exact_references,
+                    "finished": (exact_references[0], published_id, published)}
 
     def authoring_facts(files: Mapping[str, Tuple[str, int]]) -> Optional[Dict[str, Tuple[str, int]]]:
         selected: Dict[str, Tuple[str, int]] = {}
@@ -9355,8 +9399,9 @@ def _code_cycle_snapshot_publication_obligation(
     base_facts = {path: (_digest(data), len(data)) for path, data in base_tree.items()}
     base_authoring = authoring_facts(base_facts)
     if current_authoring is None or base_authoring is None:
-        return {"obligation": True, "references": references}
-    return {"obligation": current_authoring != base_authoring, "references": references}
+        return {"obligation": True, "references": exact_references}
+    return {"obligation": current_authoring != base_authoring,
+            "references": exact_references}
 
 
 def _code_cycle_publication_decision(root: Path, record: Mapping[str, Any],

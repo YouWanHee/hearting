@@ -2844,8 +2844,10 @@ class CompletedSpecPublicationTest(ProducerTestBase):
         }
         campaign_dir.rename(moved_campaign)
 
-        with mock.patch.object(P, "admit_shared",
-                               side_effect=AssertionError("seed-only cleanup must not admit shared refs")):
+        with mock.patch.object(P, "list_references",
+                               side_effect=AssertionError("seed-only cleanup must not census shared refs")), \
+                mock.patch.object(P, "admit_shared",
+                                  side_effect=AssertionError("seed-only cleanup must not admit shared refs")):
             self.assertEqual(self._publish(cycle, settle=False),
                              {"cycle_id": cycle["cycle_id"], "status": "not-applicable"})
             self.assertEqual(P.completed_route_spec_publication(route, settle=False),
