@@ -29,4 +29,3 @@ class InitialReadinessTests(unittest.TestCase):
         _, completed = runtime.prepare({"observations": {"usage": {"state": "unavailable"}}}, None,
                                        vm=vm, generation=1, now=2.0)
         self.assertTrue(completed["ready"])
-

@@ -114,12 +114,13 @@ class RefreshPump:
 
     def __init__(self, producer, interval, clock=time.monotonic,
                  thread_factory=threading.Thread, name="fleet-refresh",
-                 stall_after=None):
+                 stall_after=None, adaptive_cadence=False):
         self._producer = producer
         self._interval = max(0.1, float(interval))
         self._clock = clock
         self._thread_factory = thread_factory
         self._name = str(name)
+        self._adaptive_cadence = bool(adaptive_cadence)
         self._lock = threading.RLock()
         self._thread = None
         self._running = False
@@ -293,15 +294,16 @@ class RefreshPump:
                 self._last_error = error
                 self._failure_streak = min(3, self._failure_streak + 1)
             self._running = False
-            # Schedule from completion, not start. Repeated failures back off
-            # exponentially, bounded at eight intervals; success restores the
-            # normal cadence and never changes explicit force-refresh behavior.
-            cooldown = self._interval * (2 ** self._failure_streak)
-            # Start the next periodic observation only after an idle interval
-            # at least as long as the last collection. This bounds duty cycle
-            # at 50% for a collection slower than the requested interval.
-            adaptive_delay = max(self._interval, self._last_duration)
-            self._next_due = finished_at + max(cooldown, adaptive_delay)
+            if self._adaptive_cadence:
+                # Explorer snapshots leave an idle interval after slow reads
+                # and back off repeated failures, bounded at eight intervals.
+                cooldown = self._interval * (2 ** self._failure_streak)
+                adaptive_delay = max(self._interval, self._last_duration)
+                delay = max(cooldown, adaptive_delay)
+            else:
+                # Preserve the original shared-pump cadence for board callers.
+                delay = self._interval
+            self._next_due = finished_at + delay
             if self._pending and not self._stopped:
                 self._pending = False
                 self._running = True

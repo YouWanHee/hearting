@@ -96,7 +96,7 @@ class RefreshPumpTest(unittest.TestCase):
             release.wait()
             return calls
 
-        pump = RefreshPump(producer, 2.0, clock=lambda: clock[0])
+        pump = RefreshPump(producer, 2.0, clock=lambda: clock[0], adaptive_cadence=True)
         pump.start()
         self.assertTrue(entered.wait(1.0))
         clock[0] = 20.0
@@ -110,7 +110,7 @@ class RefreshPumpTest(unittest.TestCase):
         self._wait(lambda: pump.generation == 2 and not pump.running)
         pump.stop()
 
-    def test_slow_collection_gets_an_idle_period_equal_to_its_duration(self):
+    def test_slow_collection_uses_base_interval_unless_adaptive_cadence_is_enabled(self):
         clock = [0.0]
         entered = threading.Event()
         release = threading.Event()
@@ -122,6 +122,18 @@ class RefreshPumpTest(unittest.TestCase):
             return "done"
 
         pump = RefreshPump(producer, 2.0, clock=lambda: clock[0])
+        self.assertTrue(pump.start())
+        self.assertTrue(entered.wait(1.0))
+        release.set()
+        self._wait(lambda: pump.generation == 1 and not pump.running)
+        self.assertTrue(pump.request_due(now=12.0))
+        self._wait(lambda: pump.generation == 2 and not pump.running)
+        pump.stop()
+
+        clock[0] = 0.0
+        entered.clear()
+        release.clear()
+        pump = RefreshPump(producer, 2.0, clock=lambda: clock[0], adaptive_cadence=True)
         self.assertTrue(pump.start())
         self.assertTrue(entered.wait(1.0))
         release.set()
@@ -167,7 +179,7 @@ class RefreshPumpTest(unittest.TestCase):
                 raise RuntimeError("temporary")
             return "ok"
 
-        pump = RefreshPump(producer, 2.0, clock=lambda: clock[0])
+        pump = RefreshPump(producer, 2.0, clock=lambda: clock[0], adaptive_cadence=True)
         for expected_cooldown in (4.0, 8.0, 16.0, 16.0):
             finished.clear()
             self.assertTrue(pump.request(force=True))

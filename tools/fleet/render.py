@@ -11091,7 +11091,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     # sessions here are unobserved, not a successful census with zero sessions.
     snapshot = LiveSnapshot(hearting=dict(_HEARTING) if isinstance(_HEARTING, dict) else None)
     generation = 0
-    pump = RefreshPump(collect_snapshot, interval)
+    pump = RefreshPump(collect_snapshot, interval, adaptive_cadence=_EXPLORER_ENABLED)
     pump.start()
     follower = getattr(collect_all, "install_follower", None)
     install_pump = RefreshPump(follower.target, interval, name="fleet-install-refresh") if follower else None

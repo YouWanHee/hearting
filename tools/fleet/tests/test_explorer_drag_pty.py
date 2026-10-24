@@ -7,12 +7,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
+from unittest import mock as patching
 
 
 TOOLS = Path(__file__).resolve().parents[2]
 VIEWPORT = TOOLS / "fleet" / "tests" / "pty_repo_viewport.py"
-REFERENCE_DIR = Path("/home/nas/user/Uihyeop/personal/hearting/.agent_reports/campaigns/2026-10-20_openrig-absorb-1020/2026-10-24_fleet2-r14-parity-code/artifacts/evidence/reference/mock-r14")
+REFERENCE_DIR = os.environ.get("FLEET_EXPLORER_REFERENCE_COPY")
 
 
 class ExplorerDragPtyTests(unittest.TestCase):
@@ -39,20 +39,21 @@ class ExplorerDragPtyTests(unittest.TestCase):
         return (json.loads((evidence / "state.json").read_text(encoding="utf-8")), report)
 
     def compare_reference(self, first_state, first_report, root):
-        if not (REFERENCE_DIR / "view.py").is_file():
-            self.skipTest("cycle reference viewer is unavailable")
-        reference_view_path = REFERENCE_DIR / "view.py"
+        if not REFERENCE_DIR or not (Path(REFERENCE_DIR) / "view.py").is_file():
+            self.skipTest("set FLEET_EXPLORER_REFERENCE_COPY to run the cycle reference comparison")
+        reference_dir = Path(REFERENCE_DIR)
+        reference_view_path = reference_dir / "view.py"
         spec = importlib.util.spec_from_file_location("fleet_cycle_reference_view", reference_view_path)
         viewer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(viewer)
-        sys.path.insert(0, str(REFERENCE_DIR))
+        sys.path.insert(0, str(reference_dir))
         try:
-            import mock13
-            defaults = {"repos": [project[0] for project in mock13.PROJECTS],
+            reference_data = importlib.import_module("mock13")
+            defaults = {"repos": [project[0] for project in reference_data.PROJECTS],
                         "sessions": {project[0]: [session["tag"] for session in project[3]]
-                                     for project in mock13.PROJECTS},
+                                     for project in reference_data.PROJECTS},
                         "session_repo": {session["tag"]: project[0]
-                                         for project in mock13.PROJECTS for session in project[3]}}
+                                         for project in reference_data.PROJECTS for session in project[3]}}
             ref_repo_by_tag = defaults["session_repo"]
             fleet_repo_by_tag = first_state["explorer"]["order"]["repo_by_tag"]
             ref_to_fleet = {}
@@ -63,7 +64,7 @@ class ExplorerDragPtyTests(unittest.TestCase):
                     ref_to_fleet[ref_repo] = fleet_repo
                     fleet_to_ref[fleet_repo] = ref_repo
             self.assertEqual(set(fleet_to_ref), set(first_state["explorer"]["order"]["repos"]))
-            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "reference-state")}):
+            with patching.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "reference-state")}):
                 ordering = viewer.load_order(defaults)
                 preview_order = {"repo_order": list(ordering["repo_order"]),
                                  "session_order": {key: list(value) for key, value in
@@ -91,7 +92,7 @@ class ExplorerDragPtyTests(unittest.TestCase):
                       "grabbed": "repo:" + source_ref,
                       "drop_before": "repo:" + target_ref}
                 st = dict(scope=None, tab="OVERVIEW", uopen=0, gitv=0, design=4, gen=-1, ui=ui, note="")
-                with mock.patch.object(viewer.os, "get_terminal_size", return_value=os.terminal_size((120, 40))):
+                with patching.patch.object(viewer.os, "get_terminal_size", return_value=os.terminal_size((120, 40))):
                     result, _cols, _rows = viewer.draw(st, 1)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 frame = json.loads(result.stdout)
@@ -103,7 +104,7 @@ class ExplorerDragPtyTests(unittest.TestCase):
                 fleet_grab = preview["grabbed"]
                 fleet_drop = preview["drop"]
                 self.assertEqual((fleet_grab["row"], fleet_drop["row"]), (ref_grab, ref_drop))
-                rgb = mock13.mock2.TINT[236]
+                rgb = reference_data.mock2.TINT[236]
                 tint_sgr = "48;2;%d;%d;%d" % tuple(rgb)
                 self.assertTrue(all(tint_sgr in cell[0] for cell in reference_cells[ref_grab][:32]),
                                 reference_cells[ref_grab][:32])
@@ -116,7 +117,7 @@ class ExplorerDragPtyTests(unittest.TestCase):
                 self.assertEqual([cell[1] for cell in reference_cells[ref_drop][:4]],
                                  [cell[0] for cell in fleet_drop["cells"][:4]])
         finally:
-            sys.path.remove(str(REFERENCE_DIR))
+            sys.path.remove(str(reference_dir))
 
     def test_drag_reorders_in_pty_and_survives_a_new_process(self):
         with tempfile.TemporaryDirectory() as directory:

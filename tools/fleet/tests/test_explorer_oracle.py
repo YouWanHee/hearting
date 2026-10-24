@@ -9,11 +9,8 @@ from tools.fleet.explorer.state import NavState
 from tools.fleet.explorer.view_model import load_fixture
 
 FIXTURES = Path(__file__).parent / "fixtures" / "explorer"
-APPROVED = Path("/home/nas/user/Uihyeop/personal/hearting/.agent_reports/research/2026-10-21_hearting-openrig-fleet/mock-r14")
-ARTIFACTS = Path(os.environ.get(
-    "AGENT_ARTIFACT_OUTPUT_DIR",
-    "/home/nas/user/Uihyeop/personal/hearting/.agent_reports/campaigns/2026-10-20_openrig-absorb-1020/2026-10-24_fleet2-r14-parity-code/artifacts",
-))
+APPROVED = os.environ.get("FLEET_EXPLORER_REFERENCE_DIR")
+EVIDENCE = os.environ.get("FLEET_EXPLORER_EVIDENCE_DIR")
 
 
 def expand_rows(rows):
@@ -23,8 +20,12 @@ def expand_rows(rows):
 
 class CoreReference(unittest.TestCase):
     def test_freezer_matches_unscrubbed_raw_reference(self):
+        if not APPROVED or not Path(APPROVED).is_dir():
+            self.skipTest("set FLEET_EXPLORER_REFERENCE_DIR to run the raw reference comparison")
+        if not EVIDENCE or not Path(EVIDENCE).is_dir():
+            self.skipTest("set FLEET_EXPLORER_EVIDENCE_DIR to run the evidence comparison")
         from tools.fleet.tests.freeze_explorer import check_raw_reference
-        report = check_raw_reference(APPROVED, ARTIFACTS / "evidence" / "w2-frame" /
+        report = check_raw_reference(Path(APPROVED), Path(EVIDENCE) / "w2-frame" /
                                      "freezer-vs-reference.json")
         self.assertEqual(report["comparisons"], 36)
         self.assertEqual(report["difference_count"], 0, report["differences"])
