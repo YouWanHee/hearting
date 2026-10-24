@@ -2601,33 +2601,15 @@ def _safe_existing_dest(
 
 
 def _preservable_user_changes(
-    state: dict, desired: List[dict], user_changed: dict
+    _state: dict, _desired: List[dict], user_changed: dict
 ) -> dict:
-    """Return only changed paths that refresh would preserve as collisions."""
-    allowed_link_roots = [
-        Path(state[key]) for key in ("source_root", "active_root") if state.get(key)
-    ]
-    desired_by_dest = {item["dest"]: item for item in desired}
-    preserved = {}
-    for value, prior in user_changed.items():
-        entry = desired_by_dest.get(value)
-        try:
-            _safe_existing_dest(
-                Path(value),
-                entry.get("kind", "remove") if entry else "remove",
-                set(),
-                allowed_link_roots,
-                Path(entry["source"]) if entry and entry.get("source") else None,
-            )
-        except ActivationError as exc:
-            if str(exc).startswith((
-                "foreign destination symlink collision:",
-                "destination collision; refusing to overwrite:",
-            )):
-                preserved[value] = prior
-            else:
-                raise
-    return preserved
+    """Keep every in-scope prior-owned drift classified by ``_trusted_owned``.
+
+    Rechecking these paths with ``_safe_existing_dest`` would reinterpret a
+    changed Herdr copy as a fresh same-ID adoption and hide the ownership drift
+    from both status and refresh. Same-ID adoption is only for unowned paths.
+    """
+    return {value: dict(prior) for value, prior in user_changed.items()}
 
 
 def _snapshot_record(dest: Path, backup_root: Path, index: int) -> dict:
@@ -3017,20 +2999,18 @@ def _apply_transaction(
                 continue
             seen.add(key)
             _ensure_owned_destination(runtime, dest, scope)
-            kind = desired_by_dest.get(key, {}).get("kind", "remove")
-            source = desired_by_dest.get(key, {}).get("source")
-            try:
-                _safe_existing_dest(dest, kind, owned, allowed_link_roots,
-                                    Path(source) if source else None)
-            except ActivationError as exc:
-                prior = user_changed.get(key)
-                if prior is None or not str(exc).startswith((
-                    "foreign destination symlink collision:",
-                    "destination collision; refusing to overwrite:",
-                )):
-                    raise
+            prior = user_changed.get(key)
+            if prior is not None:
+                # _trusted_owned already proved this is an in-scope recorded
+                # path whose current state differs from its prior receipt.
+                # Preserve it before the generic same-ID Herdr adoption path
+                # can treat it as a new, unowned destination.
                 preserved.append(dict(prior))
                 continue
+            kind = desired_by_dest.get(key, {}).get("kind", "remove")
+            source = desired_by_dest.get(key, {}).get("source")
+            _safe_existing_dest(dest, kind, owned, allowed_link_roots,
+                                Path(source) if source else None)
             record = _snapshot_record(dest, backup_root, len(snapshots))
             record["postimage"] = (
                 safe_fs.PathState("missing").public()
