@@ -19,6 +19,16 @@ class Health:
 
 
 @dataclass(frozen=True)
+class ModelCatalog:
+    """A bounded, read-only runtime catalog observation for one harness."""
+    harness: str
+    state: str = "unknown"
+    source: Optional[str] = None
+    models: Tuple[str, ...] = ()
+    observed_at: Optional[float] = None
+
+
+@dataclass(frozen=True)
 class AttemptRow:
     """One exact registry attempt and its already-projected source facts."""
     attempt_id: str
@@ -102,3 +112,4 @@ class ExplorerDetail:
     seats: Mapping[str, Any] = field(default_factory=dict, compare=False)
     config: Optional[Mapping[str, Any]] = field(default=None, compare=False)
     panes: Mapping[str, str] = field(default_factory=dict, compare=False)
+    catalogs: Mapping[str, ModelCatalog] = field(default_factory=dict, compare=False)

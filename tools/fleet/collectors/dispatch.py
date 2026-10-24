@@ -16,6 +16,7 @@ live_stage() derives the real pipeline stage from plans/*_<slug>/ artifacts (por
 statusline.sh:131-171) so the label reflects live progress, not the static argv.
 """
 import functools
+from collections import OrderedDict
 import json
 import glob
 import hashlib
@@ -218,6 +219,27 @@ def _parse_pipe_meta_uncached(pipe):
 
 _parse_pipe_meta_cached = functools.lru_cache(maxsize=8192)(_parse_pipe_meta_uncached)
 
+_PARSED_REGISTRY_ROWS = OrderedDict()
+_PARSED_REGISTRY_ROWS_LIMIT = 32
+
+
+def _parse_registry_lines(path, lines, generation):
+    """Parse registry rows once per observed file generation."""
+    rows = []
+    for line_number, line in enumerate(lines, 1):
+        fields = tuple(line.split("\t"))
+        if len(fields) != 6:
+            continue
+        metadata = MappingProxyType(dict(_parse_pipe_meta(fields[5] or "")))
+        rows.append((line_number, fields, metadata))
+    result = tuple(rows)
+    key = (os.path.abspath(os.fspath(path)), generation)
+    _PARSED_REGISTRY_ROWS[key] = result
+    _PARSED_REGISTRY_ROWS.move_to_end(key)
+    while len(_PARSED_REGISTRY_ROWS) > _PARSED_REGISTRY_ROWS_LIMIT:
+        _PARSED_REGISTRY_ROWS.popitem(last=False)
+    return result
+
 
 def parsed_registry_rows(path):
     """Return an immutable parsed snapshot of valid six-field registry rows.
@@ -227,19 +249,32 @@ def parsed_registry_rows(path):
     legacy and key/value forms retain their established meaning.
     """
     lines = _pinned_registry_lines(path)
+    generation = None
     if lines is None:
         try:
-            lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+            source = Path(path)
+            before = source.stat()
+            lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
+            after = source.stat()
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+                    before.st_ctime_ns) == (after.st_dev, after.st_ino, after.st_size,
+                                            after.st_mtime_ns, after.st_ctime_ns):
+                generation = (after.st_dev, after.st_ino, after.st_size,
+                              after.st_mtime_ns, after.st_ctime_ns)
         except OSError:
             return ()
-    rows = []
-    for line_number, line in enumerate(lines, 1):
-        fields = tuple(line.split("\t"))
-        if len(fields) != 6:
-            continue
-        metadata = MappingProxyType(dict(_parse_pipe_meta(fields[5] or "")))
-        rows.append((line_number, fields, metadata))
-    return tuple(rows)
+    else:
+        try:
+            view = _dispatch_registry_cache.current_registry_view(Path(path))
+            generation = tuple(view.signature)
+        except (OSError, ValueError):
+            pass
+    key = (os.path.abspath(os.fspath(path)), generation)
+    cached = _PARSED_REGISTRY_ROWS.get(key) if generation is not None else None
+    if cached is not None:
+        _PARSED_REGISTRY_ROWS.move_to_end(key)
+        return cached
+    return _parse_registry_lines(path, lines, generation)
 
 
 def _parse_pipe(pipe):
@@ -2831,21 +2866,10 @@ def _scan_registry_evidence(paths):
     for path in paths:
         path_result = {}
         path_attempts = {}
-        try:
-            rows = _pinned_registry_lines(path)
-            if rows is None:
-                with open(path, encoding="utf-8", errors="replace") as f:
-                    rows = f.read().splitlines()
-        except OSError:
-            continue
-        for registry_order, line in enumerate(rows):
-            if not line.strip():
-                continue
-            fields = line.split("\t")
-            if len(fields) != 6:
-                continue
+        rows = parsed_registry_rows(path)
+        for registry_order, fields, meta in rows:
             ts, status, _repo, _worktree, slug, pipe = fields
-            meta = _parse_pipe_meta(pipe or "")
+            meta = dict(meta)
             attempt_contract = _attempt_contract(meta)
             route_id = meta.get("route_id")
             route_node = meta.get("route_node")

@@ -2,6 +2,7 @@
 import unittest
 import json
 from pathlib import Path
+from unittest import mock
 
 from tools.fleet.explorer.live import build_view_model
 from tools.fleet.explorer.chrome import count_word
@@ -130,8 +131,42 @@ class RealDataFidelity(unittest.TestCase):
         vm = self.build(Session(harness="claude", pid=1, session_tag="u1", cwd="/x/repo", liveness="idle"),
                         hearting={"version": "v3.42.0-2-gdc406c55a-dirty", "install_method": "unmanaged"},
                         usage_snapshots=usage)
-        self.assertEqual(vm.system["install"]["version"], "v3.42.0")
+        self.assertEqual(vm.system["install"]["version"], "v3.42.0-2-gdc406c55a-dirty")
         self.assertRegex(vm.system["usage_api"]["freshness"], r"^\d\d:\d\d$")
+
+    def test_route_uses_recorded_result_name_and_default_version_helper_keeps_build(self):
+        from tools.fleet.explorer import live
+        snapshot = {"resources": (), "sessions": (), "jobs": (), "route_entities": ()}
+        collected = {"route-x": {"view": {"nodes": [], "slug": "route-slug"},
+                                  "record": {"slug": "route-slug", "result": {
+                                      "name": "recorded task name", "result": "success"}},
+                                  "jobs": [], "sessions": []}}
+        with mock.patch.object(live, "_collect_routes", return_value=collected):
+            routes, _nodes = live._route_records(snapshot, [], {}, lambda _cwd: None, 10)
+        self.assertEqual(routes[0]["title"], "recorded task name")
+        install = live._install_record({"hearting": {"version": "v7.8.9-4-gabc123-dirty"}})
+        self.assertEqual(install["version"], "v7.8.9-4-gabc123-dirty")
+
+    def test_peer_endpoint_matches_a_resumed_session_alias_and_newest_first(self):
+        from tools.fleet.explorer.live import _peer_records
+        sessions = [
+            {"tag": "new", "harness": "claude", "repo": "repo"},
+            {"tag": "sender", "harness": "codex", "repo": "repo"},
+        ]
+        index = {
+            "new": {"sid": "sid-new", "ids": ("sid-new", "sid-old"),
+                    "session": {"peer_last_recv": {"from_session_id": "sid-sender",
+                                                      "from_harness": "codex", "kind": "steer",
+                                                      "age_min": 20}}},
+            "sender": {"sid": "sid-sender", "ids": ("sid-sender",),
+                       "session": {"peer_last_sent": {"to_session_id": "sid-old",
+                                                       "to_harness": "claude", "kind": "handoff",
+                                                       "age_min": 2}}},
+        }
+        _nodes, edges = _peer_records(sessions, index, 100)
+        self.assertEqual(edges["links"][0][1], ["new", "claude"])
+        self.assertEqual(edges["links"][0][2], "handoff")
+        self.assertEqual(edges["links"][1][2], "steer")
 
     def test_decision_records_become_the_answered_list_and_the_feed_line(self):
         memory = {"recent": [{"ts": "2026-10-23T12:00:00+00:00", "action": "decision-record", "type": "decision",

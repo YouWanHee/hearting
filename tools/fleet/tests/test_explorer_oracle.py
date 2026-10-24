@@ -70,32 +70,23 @@ class ListReference(unittest.TestCase):
                     self.assertEqual(cells, expand_rows(expected["cells"]), f"{case} cells at {cols}")
                     self.assertEqual(hits, expected["hits"], f"{case} ordered hits at {cols}")
 
-    def test_peer_graph_and_filtered_links_are_structural(self):
+    def test_peers_and_filtered_links_match_exact_reference(self):
         vm = load_fixture(FIXTURES / "view_model.json")
-        # The approved reference hand-places repo frames and link lanes; assert graph structure rather than unstable cells.
         for cols in (140, 168):
-            full = draw(vm, NavState(view="PEERS", title="PEERS"), cols, 45, beat=1)
-            picked = draw(vm, NavState(view="PEERS", title="PEERS",
-                                       folds=(("pfocus:PEERS", "f5"),)), cols, 45, beat=1)
-            with self.subTest(cols=cols, state="PEERS"):
-                self.assertTrue(any("LINKS" in row for row in full.text_rows()))
-                self.assertTrue(any("[f5]" in row for row in picked.text_rows()))
-                self.assertGreater(len(full.hits), 0)
-                self.assertLess(len(picked.hits), len(full.hits))
-                full_rows = full.text_rows()
-                for _repo, columns in vm.peer_nodes:
-                    for column in columns:
-                        for tag in column:
-                            self.assertTrue(any(f"[{tag}]" in row for row in full_rows), tag)
-                for _frm, _to, kind, _when, _note in vm.peer_edges["links"]:
-                    self.assertTrue(any(str(kind) in row for row in full_rows), kind)
-                selected_count = sum(1 for link in vm.peer_edges["links"]
-                                     if any(isinstance(endpoint, (list, tuple)) and str(endpoint[0]) == "f5"
-                                            for endpoint in link[:2]))
-                self.assertTrue(any(f"[f5] · {selected_count} links" in row for row in picked.text_rows()))
-                focused_row = next(i for i, row in enumerate(picked.text_rows()) if "[f5]" in row)
-                focused_col = picked.text_rows()[focused_row].index("[f5]")
-                self.assertEqual(picked.cells[focused_row][focused_col][2], 236)
+            expected_file = json.loads((FIXTURES / f"cells-{cols}.json").read_text())
+            cases = (
+                ("PEERS", NavState(view="PEERS", title="PEERS")),
+                ("PEERS-pick-f5", NavState(view="PEERS", title="PEERS",
+                                            folds=(("pfocus:PEERS", "f5"),))),
+            )
+            for name, state in cases:
+                with self.subTest(cols=cols, state=name):
+                    expected = expected_file["list_states"][name]
+                    actual = draw(vm, state, cols, 45, beat=1)
+                    cells = [[list(cell) for cell in row] for row in actual.cells]
+                    hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits]
+                    self.assertEqual(cells, expand_rows(expected["cells"]), f"{name} cells at {cols}")
+                    self.assertEqual(hits, expected["hits"], f"{name} ordered hits at {cols}")
 
 
 class QuietReference(unittest.TestCase):

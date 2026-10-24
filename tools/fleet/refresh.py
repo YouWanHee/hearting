@@ -131,6 +131,7 @@ class RefreshPump:
         self._last_error = None
         self._started_at = None
         self._last_success_at = None
+        self._failure_streak = 0
         self._stall_after = (
             float(stall_after) if stall_after is not None
             else _resolve_stall_after(self._interval)
@@ -283,12 +284,16 @@ class RefreshPump:
                 self._generation += 1
                 self._last_error = None
                 self._last_success_at = self._clock()
+                self._failure_streak = 0
             else:
                 self._last_error = error
+                self._failure_streak = min(3, self._failure_streak + 1)
             self._running = False
-            # Schedule from completion, not start. A slow producer therefore
-            # gets a real cooldown instead of immediately chasing elapsed ticks.
-            self._next_due = self._clock() + self._interval
+            # Schedule from completion, not start. Repeated failures back off
+            # exponentially, bounded at eight intervals; success restores the
+            # normal cadence and never changes explicit force-refresh behavior.
+            cooldown = self._interval * (2 ** self._failure_streak)
+            self._next_due = self._clock() + cooldown
             if self._pending and not self._stopped:
                 self._pending = False
                 self._running = True

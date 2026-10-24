@@ -3,6 +3,7 @@
 
     python3 tools/fleet/tests/explorer_capture.py --cols 140 --rows 45 --out DIR \
         [--view ROUTES] [--scope session:a7] [--usage] [--fold ropen:ROUTES=rt-…] [--demo]
+        [--bundle JSON | --view-model JSON]
 
 The default reads this host the way ``fleet --explorer --once`` does (collectors, compute hosts,
 memory). ``--demo`` uses the hermetic demo rows the end-to-end test uses instead. Each run writes
@@ -139,6 +140,8 @@ def main(argv=None):
     parser.add_argument("--usage", action="store_true", help="draw the usage block open")
     parser.add_argument("--fold", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--demo", action="store_true", help="the hermetic demo rows, not this host")
+    parser.add_argument("--bundle", type=Path, help="replay a recorded snapshot/detail JSON bundle")
+    parser.add_argument("--view-model", type=Path, help="draw a scrubbed typed view-model fixture")
     args = parser.parse_args(argv)
 
     out = args.out.resolve()
@@ -146,21 +149,35 @@ def main(argv=None):
         parser.error("--out must be outside the repository (captures are evidence, not source)")
     out.mkdir(parents=True, exist_ok=True)
 
-    package = "tools.fleet" if args.demo else "fleet"
+    if args.bundle and args.view_model:
+        parser.error("--bundle and --view-model are mutually exclusive")
+    package = "tools.fleet" if args.demo or args.bundle or args.view_model else "fleet"
     render = importlib.import_module(package + ".render")
     NavState = importlib.import_module(package + ".explorer.state").NavState
     render.set_explorer_mode(True)
-    snapshot = demo_snapshot(render) if args.demo else host_snapshot(render)
     folds = tuple(sorted(tuple(item.split("=", 1)) for item in args.fold))
     title = args.scope.split(":", 1)[-1] if args.scope != "-" else args.view
     state = NavState(view=args.view, scope=args.scope, title=title, usage_open=args.usage, folds=folds)
-    frame = render._explorer_compose(snapshot, args.cols, args.rows, state, now=time.time())
-    if not args.demo:                       # the reads the live view would do for this screen
-        detail = render.explorer_read_detail(snapshot, state)
-        frame = render._explorer_compose(snapshot, args.cols, args.rows, state, detail, now=time.time())
+    if args.view_model:
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.view_model import load_fixture
+        frame = draw(load_fixture(args.view_model), state, args.cols, args.rows, beat=1)
+    elif args.bundle:
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.live import build_view_model
+        from tools.fleet.tests.snapshot_fixture import replay_snapshot
+        snapshot, detail = replay_snapshot(args.bundle)
+        frame = draw(build_view_model(snapshot, accepted_detail=detail, now=time.time()),
+                     state, args.cols, args.rows, beat=1)
+    else:
+        snapshot = demo_snapshot(render) if args.demo else host_snapshot(render)
+        frame = render._explorer_compose(snapshot, args.cols, args.rows, state, now=time.time())
+        if not args.demo:                       # the reads the live view would do for this screen
+            detail = render.explorer_read_detail(snapshot, state)
+            frame = render._explorer_compose(snapshot, args.cols, args.rows, state, detail, now=time.time())
 
     label = (args.scope.replace(":", "-") if args.scope != "-" else args.view.lower()) + (
-        "-usage" if args.usage else "") + ("-demo" if args.demo else "")
+        "-usage" if args.usage else "") + ("-demo" if args.demo else "") + ("-recorded" if args.bundle else "")
     stem = out / f"explorer-{label}-{args.cols}x{args.rows}"
     stem.with_suffix(".txt").write_text("\n".join(row.rstrip() for row in frame.text_rows()) + "\n",
                                         encoding="utf-8")

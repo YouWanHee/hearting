@@ -493,7 +493,18 @@ def _route_records(snapshot, session_rows, session_index, resolver, now):
         worktree = None
         if cwd and ("-wt" in cwd or "/.worktrees/" in cwd):
             worktree = os.path.basename(cwd.rstrip("/")) or None
-        title = _text(view.get("slug")) or _text(record.get("slug")) or \
+        result = _get(_get(owner, "work_projection"), "result") if owner is not None else None
+        if result is None:
+            result = _get(record, "result")
+        if result is None:
+            for session in slot["sessions"]:
+                chain = _get(session, "route_chain")
+                chain_nodes = _get(chain, "nodes", default=()) if chain is not None else ()
+                match = next((node for node in chain_nodes if _get(node, "route_id") == rid), None)
+                if match is not None and _get(match, "result") is not None:
+                    result = _get(match, "result")
+                    break
+        title = _text(_get(result, "name")) or _text(view.get("slug")) or _text(record.get("slug")) or \
             (_text(_get(owner, "slug")) if owner is not None else None)
         if (owner is None or not jobs) and (session_row or {}).get("title"):
             title = title or session_row["title"]
@@ -649,7 +660,7 @@ def _question_records(session_rows, session_index, now):
 
 
 def _peer_records(session_rows, session_index, now):
-    tag_by_sid = {info["sid"]: tag for tag, info in session_index.items() if info["sid"]}
+    tag_by_sid = {known: tag for tag, info in session_index.items() for known in info["ids"]}
     harness_of = {row["tag"]: row["harness"] for row in session_rows}
     links, linked = [], set()
 
@@ -693,6 +704,17 @@ def _peer_records(session_rows, session_index, now):
             by_repo.setdefault(row["repo"], []).append([row["tag"]])
     for repo, columns in by_repo.items():
         nodes.append([repo, columns])
+    # The collector exposes one newest send and receive per session. Put those
+    # observations in temporal order while retaining stable row order for ties.
+    def newest(link):
+        value = link[3]
+        if isinstance(value, str):
+            match = re.match(r"(\d+)(m|h|d) ago$", value)
+            if match:
+                scale = {"m": 1, "h": 60, "d": 1440}[match.group(2)]
+                return int(match.group(1)) * scale
+        return float("inf")
+    unique.sort(key=newest)
     if not unique:
         return [], None                       # no peer record: the section is omitted
     return nodes, {"links": unique, "cross": [], "side_lanes": []}
@@ -1077,7 +1099,13 @@ def _install_record(snapshot):
     install = _get(snapshot, "hearting")
     if not isinstance(install, Mapping) or not _text(install.get("version")):
         return None
-    version = str(install["version"]).split("-", 1)[0]
+    version = str(install["version"])
+    try:
+        from .. import render
+        segments = render._hearting_version_segments(version)
+        version = "".join(text for text, _key in segments)
+    except Exception:
+        pass
     record = {"version": version if version[:1] == "v" or not version[:1].isdigit() else "v" + version}
     for key in ("managed", "pinned", "distribution"):
         if key in install:

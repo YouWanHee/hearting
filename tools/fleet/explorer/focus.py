@@ -96,22 +96,11 @@ def _registry_paths(jobs_path):
 def session_entries(jobs_path, parent_sid):
     """Every registry line (number, fields, meta) naming ``parent_sid`` as its parent, in file order."""
     dispatch = _dispatch()
-    entries, number = [], 0
+    entries = []
     for path in _registry_paths(jobs_path):
-        try:
-            lines = dispatch._dispatch_registry_cache.registry_view(Path(path)).lines
-        except FileNotFoundError:
-            continue
-        for line in lines:
-            number += 1
-            if not line.strip():
-                continue
-            fields = line.split("\t")
-            if len(fields) != 6:
-                continue
-            meta = dispatch._parse_pipe_meta(fields[5] or "")
+        for line_number, fields, meta in dispatch.parsed_registry_rows(path):
             if meta.get("parent_sid") == parent_sid:
-                entries.append((number, fields, meta))
+                entries.append((line_number, list(fields), dict(meta)))
     return entries
 
 
@@ -837,11 +826,22 @@ def read_model_config():
         choices[adapter] = picked
         hidden = [item for item in str(values.get("CFG_MAIN_SESSION_ONLY_MODELS", "")).split() if item]
         if hidden:
-            main_only[adapter] = hidden[0]
+            main_only[adapter] = hidden
         window = values.get("CFG_MODEL_CONTEXT_WINDOW")
         if str(window).isdigit():
             context[adapter] = int(window)
-    if not profile_map:
+    catalog_sources = {}
+    try:
+        from .model_catalog import read_catalogs
+        catalogs = read_catalogs()
+        for adapter, catalog in catalogs.items():
+            catalog_sources[adapter] = {"state": catalog.state, "source": catalog.source,
+                                        "observed_at": catalog.observed_at}
+            if catalog.models:
+                choices[adapter] = list(catalog.models)
+    except Exception:
+        catalogs = {}
+    if not profile_map and not any(catalog.models for catalog in catalogs.values()):
         return None
     pools, allocation = {}, {}
     try:
@@ -875,7 +875,8 @@ def read_model_config():
     return {"profiles": [p for p in _PROFILES if any(m.get(p) for m in profile_map.values())],
             "profile_map": profile_map, "model_choices": choices, "main_only": main_only,
             "efforts": list(_EFFORTS), "pools": pools, "effort_keys": dict(_EFFORT_KEYS), "shown": shown,
-            "context": context, "context_source": dict(_CONTEXT_SOURCE), "tidy": None,
+            "context": context, "context_source": dict(_CONTEXT_SOURCE), "catalog_sources": catalog_sources,
+            "tidy": None,
             "token_units": dict(_TOKEN_UNITS), "allocation": allocation}
 
 

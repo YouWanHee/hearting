@@ -264,6 +264,26 @@ def sanitize_reference(renderer) -> None:
 
 def _fixture_values(renderer):
     """Project complete, already scrubbed reference records into the stable VM shape."""
+    literal_sources = {
+        "mock13": {name: getattr(renderer, name) for name in
+                   ("ROOT_STATUS", "GPU_PROCS", "PROFILES", "PROFILE_MAP", "MODEL_CHOICES",
+                    "MODEL_SHOWN", "MAIN_ONLY", "CTX", "CTX_HOW", "PEER_CROSS",
+                    "PEER_SIDE_LANES", "PEER_PROJECTS") if hasattr(renderer, name)},
+        "mock5": {name: getattr(renderer.mock5, name) for name in ("OWN", "EXTRA")
+                  if hasattr(renderer.mock5, name)},
+        "mock6": {name: getattr(renderer.mock6, name) for name in
+                  ("OWN", "EXTRA", "LINKS", "PEER_CROSS", "PEER_SIDE_LANES")
+                  if hasattr(renderer.mock6, name)},
+        "mock3": {name: getattr(renderer.mock3, name) for name in
+                  ("MEMORY", "COMPUTE", "FEED", "USAGE") if hasattr(renderer.mock3, name)},
+        "mock4": {name: getattr(renderer.mock4, name) for name in
+                  ("MEMORY", "QUESTIONS", "ANSWERED", "ROOT_STATUS") if hasattr(renderer.mock4, name)},
+        "opencode_palette": {name: renderer.mock2.K[name] for name in ("hb_opencode", "h_opencode")
+                              if name in renderer.mock2.K},
+    }
+    # The public fixture keeps shape and widths for literal-only drawing data, but no model
+    # identifiers, private text, paths, titles, or source bodies.
+    literal_sources = _redact_blob(_jsonable(literal_sources), renderer.width)
     projects = []
     sessions = []
     for name, done, age, rows in renderer.PROJECTS:
@@ -416,11 +436,13 @@ def _fixture_values(renderer):
         },
         "events": [list(item[:-1]) + [_same_width(str(item[-1]), renderer.width)]
                    for item in renderer.mock3.FEED],
+        "source_records": {"reference_literals": literal_sources},
     }
 
 
-def capture(reference: Path, cols: int, view="OVERVIEW", ui=None, scope=None, uopen=False) -> dict:
-    renderer = load_reference(reference)
+def capture(reference: Path, cols: int, view="OVERVIEW", ui=None, scope=None, uopen=False,
+            renderer=None) -> dict:
+    renderer = renderer or load_reference(reference)
     renderer.path = reference
     sanitize_reference(renderer)
     renderer.GITV = 0
@@ -834,17 +856,14 @@ def build(reference: Path, output: Path) -> dict:
                 "and ordered hit array for every state. source.json points to view_model.json, which "
                 "contains the same source values; long redacted strings use the fixture's transparent "
                 "zlib/base85 encoding and test helpers decode them on load.\n\n"
-                "PEERS is checked structurally because the approved reference hand-places repository "
-                "frames and link lanes. The check asserts visible link lanes, every graph node and edge "
-                "kind, non-empty full-state hits, fewer hits after selecting f5, the selected link count, "
-                "and its selection tint. It covers PEERS-pick-f5 at both 140 and 168 columns.\n\n"
+                "PEERS cells and ordered hits are checked exactly against the approved reference at 140 "
+                "and 168 columns, including the filtered f5 state. The independent renderer's hand-placed "
+                "repository frames and link lanes are preserved as the oracle.\n\n"
                 "transitions.json is compact unindented JSON: cases store each viewer-main input chunk "
                 "and a trace of state/frame references; shared frames intern identical frames, while "
                 "the rows pool interns repeated cell rows stored as exact run-length records. Transition "
-                "PEERS frames use the same "
-                "structural node, edge, selection, and hit assertions as the PEERS screen oracle because "
-                "the approved reference hand-places its graph lanes. Other transition frames compare all "
-                "cells and ordered hits exactly.\n\n"
+                "PEERS frames compare cells and ordered hits exactly with the same approved layout. Other "
+                "transition frames compare all cells and ordered hits exactly.\n\n"
                 "Repository-only test runs compare the committed goldens. Running freeze_explorer.py "
                 "--check with the external approved reference directory re-verifies provenance using "
                 "the input hashes in manifest.json. The reference renderer and PNGs are intentionally "

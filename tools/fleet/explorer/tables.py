@@ -209,8 +209,8 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
         y += len(live_routes) * 2 + 2
         y += 1
         grid.put(x, y, "── ", "line")
-        recent_end = grid.put(x + 3, y, "RECENT", "head")
-        recent_end = grid.put(recent_end, y, "  completed results", "dim", limit=right)
+        recent_end = grid.put(x + 3, y, "RECENT", "head", limit=x + 15)
+        recent_end = grid.put(x + 18, y, "completed results", "dim", limit=right)
         grid.put(recent_end, y, " ", "branch_s", limit=right)
         for xx in range(recent_end + 1, right):
             grid.put(xx, y, "─", "line")
@@ -292,8 +292,8 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
         y += 1
     y += 1
     grid.put(x, y, "── ", "line")
-    recent_title_end = grid.put(x + 3, y, "RECENT", "head")
-    recent_title_end = grid.put(recent_title_end, y, "  completed results", "dim", limit=right)
+    recent_title_end = grid.put(x + 3, y, "RECENT", "head", limit=x + 15)
+    recent_title_end = grid.put(x + 18, y, "completed results", "dim", limit=right)
     grid.put(recent_title_end, y, " ", "branch_s")
     for cell_x in range(recent_title_end + 1, right):
         grid.put(cell_x, y, "─", "line")

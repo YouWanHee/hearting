@@ -108,6 +108,21 @@ class SourceCacheContracts(unittest.TestCase):
             self.assertEqual(cache.reads, 2)
 
 
+class ParsedRegistryRows(unittest.TestCase):
+    def test_focus_uses_b0_parsed_rows_and_keeps_physical_line_numbers(self):
+        from unittest import mock
+        from tools.fleet.explorer import focus
+        class Dispatch:
+            @staticmethod
+            def parsed_registry_rows(_path):
+                return ((4, ("ts", "open", "", "", "attempt", "parent_sid=selected"),
+                         {"parent_sid": "selected", "attempt_id": "attempt"}),)
+        with mock.patch.object(focus, "_dispatch", return_value=Dispatch):
+            rows = focus.session_entries("registry", "selected")
+        self.assertEqual(rows, [(4, ["ts", "open", "", "", "attempt", "parent_sid=selected"],
+                                 {"parent_sid": "selected", "attempt_id": "attempt"})])
+
+
 
 
 class FakeTidy:

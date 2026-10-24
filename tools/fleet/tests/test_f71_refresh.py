@@ -134,6 +134,34 @@ class RefreshPumpTest(unittest.TestCase):
         self.assertEqual(pump.poll(1), (2, "new"))
         pump.stop()
 
+    def test_repeated_failures_use_bounded_cooldown_and_success_resets_it(self):
+        clock = [0.0]
+        calls = [0]
+        finished = threading.Event()
+
+        def producer():
+            calls[0] += 1
+            finished.set()
+            if calls[0] <= 4:
+                raise RuntimeError("temporary")
+            return "ok"
+
+        pump = RefreshPump(producer, 2.0, clock=lambda: clock[0])
+        for expected_cooldown in (4.0, 8.0, 16.0, 16.0):
+            finished.clear()
+            self.assertTrue(pump.request(force=True))
+            self.assertTrue(finished.wait(1.0))
+            self._wait(lambda: not pump.running)
+            self.assertFalse(pump.request_due(now=clock[0] + expected_cooldown - 0.1))
+            clock[0] += expected_cooldown
+        finished.clear()
+        self.assertTrue(pump.request_due())
+        self.assertTrue(finished.wait(1.0))
+        self._wait(lambda: pump.generation == 1 and not pump.running)
+        self.assertFalse(pump.request_due(now=clock[0] + 1.9))
+        self.assertTrue(pump.request_due(now=clock[0] + 2.0))
+        pump.stop()
+
     def test_stop_has_bounded_join_for_stuck_daemon_worker(self):
         entered = threading.Event()
         release = threading.Event()

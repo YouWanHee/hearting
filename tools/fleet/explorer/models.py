@@ -225,10 +225,26 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
             else:
                 grid.put(x + pool_col, y, "route-sealed explicit choice only", "dim", limit=right)
         y += 1
-    main_only = _dict(data.get("main_only"))
-    if main_only:
-        names = "  ·  ".join(f"{name} {shown.get(model, model)}" for name, model in main_only.items())
-        grid.put(x + 3, y, "main session only, never dispatched:  " + names, "dim", limit=right)
+    main_only = data.get("main_only")
+    if isinstance(main_only, Mapping):
+        main_items = tuple(sorted(main_only.items(), key=lambda item: str(item[0])))
+    elif isinstance(main_only, (list, tuple)):
+        main_items = tuple((item.get("harness", "·"), item.get("model", "·"))
+                           if isinstance(item, Mapping) else ("·", item) for item in main_only)
+    else:
+        main_items = ()
+    if main_items:
+        label = "main session only, never dispatched:"
+        grid.put(x + 3, y, label, "dim", limit=right)
+        cursor = x + 3 + len(label) + 2
+        for harness_name, model_id in main_items:
+            display = shown.get(model_id, model_id)
+            fragment = f"{harness_name} {display}"
+            if cursor + len(fragment) > right:
+                y += 1
+                cursor = x + 5
+            grid.put(cursor, y, fragment, "dim", limit=right)
+            cursor += len(fragment) + 3
     y += 2
     current = _dict(profile_map.get(harness)).get(profile)
     model_choice = values.get("ui:model")

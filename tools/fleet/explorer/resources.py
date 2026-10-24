@@ -114,7 +114,43 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
     grid.put(x + 1, y, f"{len(hosts)}/{len(hosts)} hosts · GPU {busy}/{total} working · {idle_hosts} host idle", "dim")
     y += 2
     data = vm.system if isinstance(vm.system, Mapping) else {}
+    processes = tuple(data.get("gpu_processes") or ())
+    if processes:
+        summary = data.get("gpu_process_summary") or {}
+        total_processes = summary.get("count", len(processes))
+        unregistered = summary.get("unregistered", 0)
+        grid.put(x, y, "── GPU processes", "head", limit=grid.cols - 1)
+        grid.put(x + 18, y, f"{total_processes} total · {unregistered} unregistered", "dim",
+                 limit=grid.cols - 1)
+        y += 1
+        for process in processes:
+            if not isinstance(process, Mapping):
+                continue
+            sid = process.get("session_id") or process.get("session")
+            cwd = str(process.get("cwd") or "")
+            repo = cwd.rstrip("/").rsplit("/", 1)[-1] if cwd else None
+            command = str(process.get("command") or "·")
+            # Process collectors provide the display command when available. Keep
+            # the script token and omit common interpreter/flag prefixes.
+            tokens = command.split()
+            if len(tokens) > 1 and tokens[0].rsplit("/", 1)[-1] in (
+                    "python", "python3", "node", "bash", "sh"):
+                command = " ".join(tokens[1:])
+            command = command.split(" --", 1)[0].rsplit("/", 1)[-1] or "·"
+            vram = process.get("vram")
+            age = process.get("age") or process.get("time")
+            line = (f"└ [{sid or '·'}] {repo + '/' if repo else '·'}  {command}  "
+                    f"{vram if vram is not None else '·'} VRAM {age or '·'}")
+            grid.put(x + 1, y, line, "soft", limit=grid.cols - 1)
+            y += 1
     extras = tuple(data.get("unregistered_gpu_processes") or ())
+    known_processes = {(str(item.get("host") or ""), str(item.get("gpu") or ""),
+                        str(item.get("command") or ""))
+                       for item in processes if isinstance(item, Mapping)}
+    extras = tuple(entry for entry in extras
+                   if (str((tuple(entry) + (None,) * 5)[0] or ""),
+                       str((tuple(entry) + (None,) * 5)[1] or ""),
+                       str((tuple(entry) + (None,) * 5)[2] or "")) not in known_processes)
     if extras:
         summary = data.get("unregistered_gpu_summary") or {}
         cursor = grid.put(x, y, "── ", "line")
