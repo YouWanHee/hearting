@@ -3,6 +3,7 @@
 import os
 import json
 import importlib.util
+import re
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,94 @@ ADAPTERS = {
         "opencode.prompt.txt",
     ),
 }
+
+
+def _live_solo_findings(workdir, final_text, events):
+    """Compare a live run's files, tool observations, and final status to O1–O3."""
+    findings = []
+    tools = []
+    for index, event in enumerate(events):
+        item = event.get("item") if isinstance(event, dict) else None
+        if not isinstance(item, dict) or item.get("type") != "command_execution":
+            continue
+        command = str(item.get("command") or "")
+        output = str(item.get("aggregated_output") or item.get("output") or "")
+        tools.append((index, command, output, item.get("exit_code"), item.get("status")))
+
+    successful = lambda row: row[3] == 0 or (row[3] is None and row[4] == "completed")
+    o1 = [(i, cmd, out) for i, cmd, out, code, status in tools
+          if successful((i, cmd, out, code, status))
+          and "python3" in cmd and "sum([1,2])" in cmd and "3" in out.split()]
+    if not o1:
+        findings.append("O1 command/result event for sum([1,2]) -> 3 is missing")
+    o1_index = o1[-1][0] if o1 else -1
+
+    csv_path = Path(workdir) / "rows.csv"
+    later_csv = [(i, cmd, out) for i, cmd, out, code, status in tools
+                 if i > o1_index and csv_path.name in cmd
+                 and successful((i, cmd, out, code, status))]
+    if not later_csv:
+        findings.append("O2 CSV inspection event after O1 is missing")
+    totals_path = Path(workdir) / "totals.json"
+    try:
+        totals = json.loads(totals_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        totals = None
+        findings.append(f"O2 totals.json is missing or invalid: {exc}")
+    expected_totals = {"count": 6, "total": 27, "groups": {"A": 9, "B": 6, "C": 12}}
+    if totals is not None and totals != expected_totals:
+        findings.append(f"O2 totals.json differs from {expected_totals!r}: {totals!r}")
+
+    coverage_path = Path(workdir) / "coverage.md"
+    try:
+        coverage = coverage_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        coverage = ""
+        findings.append(f"O3 coverage.md is missing: {exc}")
+    counts = {"first.txt": 1, "second.txt": 2, "third.txt": 0}
+    for filename, count in counts.items():
+        after_o1 = [cmd + "\n" + out for i, cmd, out, code, status in tools
+                    if i > o1_index and successful((i, cmd, out, code, status))]
+        if not any(filename in evidence for evidence in after_o1):
+            findings.append(f"O3 tool evidence for {filename} after O1 is missing")
+        if not any(filename in line and str(count) in line for line in coverage.splitlines()):
+            findings.append(f"O3 per-file result {filename}={count} is missing from coverage.md")
+    if not re.search(r"\btotal\b\s*[:=|]?\s*3\b|\b3\s+total\b", coverage, re.I):
+        findings.append("O3 total TODO count 3 is missing from coverage.md")
+    if not re.search(r"\b(command|evidence)\b|```|`(?:grep|python3|cat|sed|rg)\b", coverage, re.I):
+        findings.append("O3 command/evidence reference is missing from coverage.md")
+
+    final = str(final_text or "")
+    for marker in ("O1", "O2", "O3"):
+        if marker not in final:
+            findings.append(f"Final status omits {marker}")
+        elif not re.search(rf"\b{marker}\b[^\n]*\b(complete|completed|done|met|passed|blocked|incomplete|pending)\b",
+                           final, re.I):
+            findings.append(f"Final status does not state {marker}'s outcome")
+    for marker in ("3", "6", "27", "9", "12"):
+        if not re.search(rf"(?<!\d){marker}(?!\d)", final):
+            findings.append(f"Final status omits expected value {marker}")
+    if not re.search(r"\b(complete|completed|done|finished)\b", final, re.I):
+        findings.append("Final status does not report O1–O3 complete")
+    return findings
+
+
+def _live_solo_judgment(returncode, findings, events, error=None):
+    """Keep runtime refusal distinct from observed incomplete or wrong behavior."""
+    if error:
+        return "BLOCKED"
+    runtime_text = "\n".join(
+        str(item.get("aggregated_output") or item.get("output") or "")
+        for event in events if isinstance(event, dict)
+        for item in [event.get("item")]
+        if isinstance(item, dict) and item.get("type") == "command_execution"
+    ).lower()
+    if any(marker in runtime_text for marker in (
+        "app-server socket directory", "error building bubblewrap command",
+        "not inside a trusted directory", "not logged in", "authentication failed",
+    )):
+        return "BLOCKED"
+    return "PASS" if returncode == 0 and not findings else "FAIL"
 
 
 class WorkerDispatchPromptTest(unittest.TestCase):
@@ -210,6 +299,69 @@ class WorkerDispatchPromptTest(unittest.TestCase):
                 self.assertIn("TASK",prompt)
 
 
+    def test_completion_scope_and_original_request_reach_all_adapter_prompts(self):
+        for harness, (wrapper, model, _suffix) in ADAPTERS.items():
+            spec = importlib.util.spec_from_file_location("completion_" + harness, wrapper)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            for worker_type, intensity, depth, unit in (
+                ("owner", "quick", "1", "_kernel/owner"),
+                ("stage", "standard", "2", "dev/backend"),
+            ):
+                for endpoint in ("complete", "report"):
+                    for with_done_when in (False, True):
+                        with self.subTest(harness=harness, worker_type=worker_type,
+                                          endpoint=endpoint, done_when=with_done_when), \
+                                tempfile.TemporaryDirectory() as tmp:
+                            root = Path(tmp)
+                            node_id = "one-shot" if worker_type == "owner" else "execute"
+                            output_dir = root / "cycle" / "artifacts"
+                            output_dir.mkdir(parents=True)
+                            route = {
+                                "route_id": "rt-prompt-completion",
+                                "cwd": str(root),
+                                "artifact_root": str(root / "reports"),
+                                "nodes": [{
+                                    "id": node_id, "unit": unit, "worker_type": worker_type,
+                                    "outputs": ["dev_logs/result.md"],
+                                    "write_scope": ["source/**", "dev_logs/**"],
+                                }],
+                            }
+                            route_file = root / "route.json"
+                            route_file.write_text(json.dumps(route), encoding="utf-8")
+                            task = ("Original request: O1 calculate and record the first result; "
+                                    "O2 calculate every group total; O3 inspect every named file "
+                                    f"and report all results. Execution scope: {endpoint}.")
+                            axes = ["--worktree", str(root), "--slug", "completion",
+                                    "--capability", "autopilot-code", "--capability-mode", "dev",
+                                    "--intensity", intensity, "--dispatch-depth", depth,
+                                    "--worker-type", worker_type, "--unit", unit,
+                                    "--prompt-text", task, "--jobs", str(root / "jobs.log"), *model]
+                            args = module.parser().parse_args(axes)
+                            args.route_file = str(route_file)
+                            args.route_node = node_id
+                            args.artifact_root = str(root / "reports")
+                            args.agent_home = module.resolve_agent_home()
+                            render = module.prompt if harness == "opencode" else module.dispatch_prompt
+                            plan = ("Plan for this leg (approved in the frame interview):\n"
+                                    "Done when (sealed ids, in this order):\n- fixture: retain optional plan duties\n\n") \
+                                if with_done_when else ""
+                            # Exercise both optional plan shapes at the existing rendering seam.
+                            with mock.patch.object(WB, "plan_leg_prompt", return_value=plan), \
+                                    mock.patch.dict(os.environ, {"AGENT_ARTIFACT_OUTPUT_DIR": str(output_dir)}):
+                                prompt, _ = render(args)
+                            self.assertIn(task, prompt)
+                            self.assertIn("Completion precedence:", prompt)
+                            self.assertIn("approved endpoint and this node's assigned scope", prompt)
+                            self.assertIn("Stop at an approved report endpoint", prompt)
+                            self.assertIn("outputs=[", prompt)
+                            self.assertIn(str(output_dir / "dev_logs" / "result.md"), prompt)
+                            self.assertEqual("Done when (sealed ids" in prompt, with_done_when)
+                            if endpoint == "report":
+                                self.assertIn("Execution scope: report.", prompt)
+                                self.assertIn("bounded stage completes only its assigned portion", prompt)
+
+
 class FrameAssignmentPromptTest(unittest.TestCase):
     def test_real_adapter_prompts_distinguish_goal_report_from_current_frame_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -247,11 +399,13 @@ class FrameAssignmentPromptTest(unittest.TestCase):
                     self.assertNotIn("Read only the exposed autopilot-code",text)
                     self.assertNotIn("skills/autopilot-code/SKILL.md",text)
 
-    def test_legacy_frame_keeps_its_callers_path_and_nonframe_assignment_is_unchanged(self):
+    def test_legacy_frame_keeps_its_path_and_nonframe_assignment_gets_completion_precedence(self):
         frame=WB.assignment_prompt(SimpleNamespace(worker_type="frame"),"Analyze this work; output /tmp/brief.md",{})
         self.assertIn("/tmp/brief.md",frame)
         for kind in ("owner","stage","review","support"):
-            self.assertEqual(WB.assignment_prompt(SimpleNamespace(worker_type=kind),"TASK",{}),"Assignment:\nTASK\n\n")
+            text = WB.assignment_prompt(SimpleNamespace(worker_type=kind),"TASK",{})
+            self.assertTrue(text.startswith("Assignment:\nTASK\n\nCompletion precedence:"))
+            self.assertIn("approved endpoint and this node's assigned scope", text)
 
 
 class ReleasedTaskPromptTest(unittest.TestCase):
@@ -309,6 +463,8 @@ class ReleasedTaskPromptTest(unittest.TestCase):
                 context = WB.released_task_prompt(self.args())
                 self.assertIn("actor_kind: " + (kind or "unknown"), context)
                 self.assertIn("The recorded scope and decisions below govern this work.", context)
+                self.assertIn("role and intensity defaults neither expand nor shrink it", context)
+                self.assertIn("Quick examples and concise reporting are procedure defaults", context)
                 self.assertNotIn("The recorded user scope", context)
                 self.assertEqual(self.ledger.journal_path.read_bytes(), before)
                 self.assertNotIn("actor_kind", legacy)
@@ -459,6 +615,169 @@ class UnitBootstrapPromptTest(unittest.TestCase):
         self.assertEqual(WB.unit_bootstrap_declaration(ROOT, "editorial/polish")["gates"], ("audit-report",))
         for unit in ("qa/test", "dev/backend", "material/figure-gen", "_kernel/owner"):
             self.assertEqual(WB.unit_bootstrap_declaration(ROOT, unit), {}, unit)
+
+
+class LiveSoloResultComparatorFixtureTest(unittest.TestCase):
+    """A local fixture proves the live result comparator rejects a missing duty."""
+
+    def test_fixture_rejects_deleted_expected_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "rows.csv").write_text("category,value\nA,2\n", encoding="utf-8")
+            for name, body in (("first.txt", "TODO: first\n"),
+                               ("second.txt", "TODO: second\nTODO: third\n"),
+                               ("third.txt", "No marker\n")):
+                (root / name).write_text(body, encoding="utf-8")
+            totals = {"count": 6, "total": 27, "groups": {"A": 9, "B": 6, "C": 12}}
+            (root / "totals.json").write_text(json.dumps(totals), encoding="utf-8")
+            (root / "coverage.md").write_text(
+                "| File | TODO count | Evidence |\n"
+                "| first.txt | 1 | `grep -n TODO first.txt` |\n"
+                "| second.txt | 2 | `grep -n TODO second.txt` |\n"
+                "| third.txt | 0 | `grep -n TODO third.txt` |\n"
+                "| Total | 3 | command results above |\n",
+                encoding="utf-8",
+            )
+            events = [
+                {"type": "item.completed", "item": {"type": "command_execution",
+                 "command": "python3 -c 'print(sum([1,2]))'", "aggregated_output": "3\n",
+                 "exit_code": 0, "status": "completed"}},
+                {"type": "item.completed", "item": {"type": "command_execution",
+                 "command": "cat rows.csv", "aggregated_output": "A,2\nB,5\nA,7\nC,4\nB,1\nC,8\n",
+                 "exit_code": 0, "status": "completed"}},
+                *[{"type": "item.completed", "item": {"type": "command_execution",
+                   "command": f"grep -n TODO {name}", "aggregated_output": "TODO result\n",
+                   "exit_code": 0, "status": "completed"}}
+                  for name in ("first.txt", "second.txt", "third.txt")],
+            ]
+            final = "O1 complete: 3. O2 complete: count 6, total 27, A=9 B=6 C=12. O3 complete: 3. All complete."
+            self.assertEqual(_live_solo_findings(root, final, events), [])
+            self.assertEqual(_live_solo_judgment(0, [], events), "PASS")
+            (root / "totals.json").unlink()
+            findings = _live_solo_findings(root, final, events)
+            self.assertTrue(any("O2 totals.json is missing" in item for item in findings), findings)
+            self.assertEqual(_live_solo_judgment(0, findings, events), "FAIL")
+            runtime_events = [{"item": {"type": "command_execution", "status": "failed",
+                "exit_code": 1, "aggregated_output": "error building bubblewrap command: "
+                "app-server socket directory must be a user-owned directory with mode 0700"}}]
+            self.assertEqual(_live_solo_judgment(0, ["O1 was not observed"], runtime_events), "BLOCKED")
+
+
+@unittest.skipUnless(os.environ.get("HEARTING_LIVE_SOLO") == "1",
+                     "set HEARTING_LIVE_SOLO=1 with an eligible model to run the live check")
+class LiveSoloContinuationTest(unittest.TestCase):
+    """One synchronous native Codex run of the finite report-ended solo request."""
+
+    def test_real_model_completes_o1_o2_o3_after_the_first_small_check(self):
+        model = os.environ.get("HEARTING_LIVE_MODEL", "").strip()
+        effort = os.environ.get("HEARTING_LIVE_EFFORT", "").strip()
+        output = os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR", "").strip()
+        if not model or not effort:
+            self.fail("HEARTING_LIVE_MODEL and HEARTING_LIVE_EFFORT are required for the opt-in live run")
+        if not output:
+            self.fail("AGENT_ARTIFACT_OUTPUT_DIR must bind evidence to the current cycle")
+
+        evidence_dir = Path(output).resolve() / "evidence" / "solo-live"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".hearting-solo-live-", dir=ROOT) as tmp:
+            root = Path(tmp).resolve()
+            (root / "rows.csv").write_text(
+                "category,value\nA,2\nB,5\nA,7\nC,4\nB,1\nC,8\n", encoding="utf-8")
+            (root / "first.txt").write_text("TODO: first item\nReviewed\n", encoding="utf-8")
+            (root / "second.txt").write_text("TODO: second item\nTODO: third item\n", encoding="utf-8")
+            (root / "third.txt").write_text("No TODO items\n", encoding="utf-8")
+            request = (
+                "Finite solo work request. Approved endpoint: report. No implementation, "
+                "deployment, or merge work. Complete these three distinct duties and then "
+                "report the status of O1, O2, and O3. This request has no done_when field.\n\n"
+                "O1 (first, a small quick-like check): run exactly "
+                "python3 -c 'print(sum([1,2]))' and record the observed result 3.\n\n"
+                f"O2 (remaining calculation): read all six rows in {root / 'rows.csv'}, "
+                "compute count 6, total 27, and group totals A=9, B=6, C=12; write "
+                f"{root / 'totals.json'} as JSON with fields count, total, and groups.\n\n"
+                "O3 (remaining exhaustive inspection and report): inspect each of these "
+                f"three text files using commands that name the file: {root / 'first.txt'}, "
+                f"{root / 'second.txt'}, and {root / 'third.txt'}. Record all three per-file "
+                f"TODO counts (1, 2, 0), total 3, and command/evidence references in "
+                f"{root / 'coverage.md'}. Use a table with file, TODO count, and evidence columns."
+            )
+            assignment = WB.assignment_prompt(SimpleNamespace(worker_type="owner"), request, {})
+            prompt = ("Quick procedure: use an inline micro-plan, focused verification, "
+                      "and a concise report.\n\n" + assignment)
+            (evidence_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+            command = ["codex", "exec", "--cd", str(root), "--sandbox", "workspace-write",
+                       "--model", model, "-c", f"model_reasoning_effort={effort}",
+                       "-c", "approval_policy=never", "--json", "-"]
+            child_env = os.environ.copy()
+            # A synchronous verification run is not a registered worker or route attempt.
+            for name in (
+                "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_DISPATCH_PARENT_ATTEMPT_ID",
+                "AGENT_DISPATCH_ROUTE_ID", "AGENT_DISPATCH_ROUTE_FILE",
+                "AGENT_OWNER_ATTEMPT_ID", "AGENT_OWNER_ROUTE_ID", "AGENT_OWNER_ROUTE_HASH",
+                "AGENT_ROUTE_ID", "AGENT_ROUTE_FILE",
+            ):
+                child_env.pop(name, None)
+            error = None
+            returncode = None
+            stdout = ""
+            stderr = ""
+            try:
+                result = subprocess.run(
+                    command, input=prompt, text=True, capture_output=True, cwd=root,
+                    env=child_env, timeout=900, check=False,
+                )
+                returncode, stdout, stderr = result.returncode, result.stdout, result.stderr
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                if isinstance(exc, subprocess.TimeoutExpired):
+                    stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+                    stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            (evidence_dir / "stdout.jsonl").write_text(stdout, encoding="utf-8")
+            (evidence_dir / "stderr.txt").write_text(stderr, encoding="utf-8")
+            events = []
+            malformed = []
+            for line_no, line in enumerate(stdout.splitlines(), 1):
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    malformed.append(line_no)
+                    continue
+                if isinstance(value, dict):
+                    events.append(value)
+            final_parts = []
+            for event in events:
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "agent_message":
+                    final_parts.append(str(item.get("text") or ""))
+                if event.get("type") == "turn.completed":
+                    final_parts.append(str(event.get("last_agent_message") or ""))
+            final_text = "\n".join(part for part in final_parts if part).strip()
+            findings = _live_solo_findings(root, final_text, events)
+            judgment = _live_solo_judgment(returncode, findings, events, error)
+            evidence = {
+                "surface": "synchronous codex exec --json",
+                "registered_route_or_attempt": False,
+                "judgment": judgment,
+                "model": model,
+                "effort": effort,
+                "command": command,
+                "returncode": returncode,
+                "error": error,
+                "event_count": len(events),
+                "malformed_json_lines": malformed,
+                "final_text": final_text,
+                "findings": findings,
+                "artifacts": {
+                    "totals.json": (root / "totals.json").is_file(),
+                    "coverage.md": (root / "coverage.md").is_file(),
+                },
+            }
+            (evidence_dir / "result.json").write_text(
+                json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            self.assertIsNone(error, f"native execution failed; evidence: {evidence_dir}")
+            self.assertEqual(returncode, 0, f"codex exec returned {returncode}; evidence: {evidence_dir}")
+            self.assertEqual(judgment, "PASS",
+                             f"live O1–O3 judgment was {judgment}: {findings}; evidence: {evidence_dir}")
 
 
 if __name__ == "__main__":
