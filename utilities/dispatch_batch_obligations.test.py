@@ -221,10 +221,10 @@ class BatchObligationTest(unittest.TestCase):
         first_registry_before = self.jobs.read_bytes()
         read_owner_rows = obligations._pending_owner_settlements
 
-        def fail_first_registry(path):
+        def fail_first_registry(path, *, context=None):
             if Path(path) == self.jobs:
                 raise PermissionError("fixture registry read denied")
-            return read_owner_rows(path)
+            return read_owner_rows(path, context=context)
 
         class Launched:
             pid = 902342
@@ -604,6 +604,32 @@ class BatchObligationTest(unittest.TestCase):
             self.assertEqual(settle.call_count, 2, "an unresolved unowned row stays retryable")
             self.assertEqual(registry_cache.metrics_snapshot()["content_reads"], 2,
                              "retryable settlement reuses unchanged registry content")
+
+    def test_settled_owner_cache_survives_unrelated_append_and_invalidates_dependencies(self):
+        self.jobs.write_text(self._runtime_owner_row() + "\n", encoding="utf-8")
+        dependency = self.base / "terminal-evidence.json"
+        dependency.write_text("sealed", encoding="utf-8")
+        registry_cache.clear_cache()
+        context = obligations.OwnerSettlementReadContext()
+        with mock.patch.object(obligations, "_owner_settlement_dependency_paths",
+                               return_value=(dependency,)), \
+             mock.patch("dispatch_terminal_commit.owner_completion_pending",
+                        side_effect=[False, True, True]) as pending, \
+             mock.patch("dispatch_completion_join.materialize_after_terminal_close"), \
+             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=False):
+            self.assertEqual(obligations._resume_owner_settlements(
+                self.jobs, context=context), ())
+            with self.jobs.open("a", encoding="utf-8") as stream:
+                stream.write("2026-10-19T00:00:00Z\tdone\t/repo\t/wt\tchild\t"
+                             "attempt_id=att-unrelated\n")
+            self.assertEqual(obligations._resume_owner_settlements(
+                self.jobs, context=context), ())
+            pending.assert_called_once()
+
+            dependency.write_text("changed", encoding="utf-8")
+            resumed = obligations._resume_owner_settlements(self.jobs, context=context)
+        self.assertTrue(any(signature[2] == "att-owner" for signature in resumed))
+        self.assertEqual(pending.call_count, 3)
 
     def test_owner_settlement_accepts_valid_literal_replacement_character(self):
         row = self._runtime_owner_row().replace(

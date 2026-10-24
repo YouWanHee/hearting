@@ -641,10 +641,155 @@ def _directory_stamp(path: Path):
 
 
 class OwnerSettlementReadContext:
-    """Reuse unchanged settlement discovery while rechecking observed leases."""
+    """Reuse exact settled-owner observations while rechecking their dependencies."""
 
     def __init__(self):
         self._seen = {}
+        self._settled = {}
+        self._active_owners = {}
+        self._route_owners = {}
+        self._cursors = {}
+        self._invalidated_owners = set()
+        self._pass_file_generations = {}
+        self._metrics = {"historical_checks": 0, "settled_cache_hits": 0,
+                         "dependency_checks": 0, "dependency_invalidations": 0}
+
+    @staticmethod
+    def _fingerprint_rows(rows):
+        return tuple((row.order, row.status, row.raw) for row in rows)
+
+    @staticmethod
+    def _current_generations(paths, cache=None):
+        from runtime_observation import file_generation
+        generations = []
+        for path in paths:
+            key = str(Path(path).absolute())
+            if cache is not None and key in cache:
+                generation = cache[key]
+            else:
+                generation = file_generation(path)
+                if cache is not None:
+                    cache[key] = generation
+            generations.append(generation)
+        return tuple(generations)
+
+    def _dependencies_current(self, entry, cache=None):
+        _row, _related, paths, generations, _aliases = entry
+        try:
+            current = self._current_generations(paths, cache)
+        except OSError:
+            return False
+        self._metrics["dependency_checks"] += len({str(Path(path).absolute())
+                                                    for path in paths})
+        return current == generations
+
+    def begin_dependency_pass(self):
+        self._pass_file_generations.clear()
+
+    def settled_owner_current(self, jobs: Path, status: str, raw: str, metadata: dict,
+                              related_rows) -> bool:
+        key = (str(jobs.resolve(strict=False)), metadata.get("attempt_id", ""))
+        entry = self._settled.get(key)
+        if entry is None:
+            return False
+        if (entry[0] != (status, raw)
+                or entry[1] != self._fingerprint_rows(related_rows)):
+            self.forget_owner(jobs, metadata.get("attempt_id", ""))
+            return False
+        if not self._dependencies_current(entry, self._pass_file_generations):
+            self.forget_owner(jobs, metadata.get("attempt_id", ""))
+            self._metrics["dependency_invalidations"] += 1
+            return False
+        self._metrics["settled_cache_hits"] += 1
+        return True
+
+    def remember_settled_owner(self, jobs: Path, status: str, raw: str,
+                               metadata: dict, related_rows, dependencies) -> bool:
+        key = (str(jobs.resolve(strict=False)), metadata.get("attempt_id", ""))
+        paths = tuple(dependencies)
+        try:
+            generations = self._current_generations(paths, self._pass_file_generations)
+        except OSError:
+            self.forget_owner(jobs, metadata.get("attempt_id", ""))
+            return False
+        aliases = tuple(sorted({metadata.get(field, "") for field in
+            ("route_id", "route_hash", "owner_route_id", "owner_route_hash") if metadata.get(field)}))
+        self.forget_owner(jobs, metadata.get("attempt_id", ""))
+        self._settled[key] = ((status, raw), self._fingerprint_rows(related_rows),
+                              paths, generations, aliases)
+        for alias in aliases:
+            self._route_owners.setdefault((key[0], alias), set()).add(key[1])
+        if len(self._settled) > 4096:
+            oldest = next(iter(self._settled))
+            self.forget_owner(Path(oldest[0]), oldest[1])
+        return True
+
+    def forget_owner(self, jobs: Path, attempt_id: str):
+        key = (str(jobs.resolve(strict=False)), attempt_id)
+        entry = self._settled.pop(key, None)
+        if entry is not None:
+            for alias in entry[4]:
+                owners = self._route_owners.get((key[0], alias))
+                if owners is not None:
+                    owners.discard(attempt_id)
+                    if not owners:
+                        self._route_owners.pop((key[0], alias), None)
+
+    def remember_active_owner(self, jobs: Path, record):
+        key = (str(jobs.resolve(strict=False)), record.completion_metadata().get("attempt_id", ""))
+        self._active_owners[key] = record
+
+    def forget_active_owner(self, jobs: Path, attempt_id: str):
+        self._active_owners.pop((str(jobs.resolve(strict=False)), attempt_id), None)
+
+    def active_owner_ids(self, jobs: Path):
+        key = str(jobs.resolve(strict=False))
+        return tuple(attempt for (root, attempt) in self._active_owners if root == key)
+
+    def affected_settled_owner_ids(self, jobs: Path, records):
+        root = str(jobs.resolve(strict=False))
+        affected = set()
+        for record in records:
+            metadata = record.completion_metadata()
+            parent = metadata.get("parent_attempt_id")
+            if parent and (root, parent) in self._settled:
+                affected.add(parent)
+            for field in ("route_id", "route_hash", "owner_route_id", "owner_route_hash"):
+                alias = metadata.get(field)
+                if alias:
+                    affected.update(self._route_owners.get((root, alias), ()))
+            attempt = metadata.get("attempt_id")
+            if attempt and (root, attempt) in self._settled:
+                affected.add(attempt)
+        return tuple(affected)
+
+    def take_invalidated_owner_ids(self, jobs: Path):
+        root = str(jobs.resolve(strict=False))
+        affected = tuple(attempt for item_root, attempt in self._invalidated_owners
+                         if item_root == root)
+        self._invalidated_owners.difference_update((root, attempt) for attempt in affected)
+        return affected
+
+    def owner_candidate_floor(self, jobs: Path, view):
+        key = str(jobs.resolve(strict=False))
+        prior = self._cursors.get(key)
+        if (prior is not None and view.append_only_generation
+                and view.path_identity == prior[0] and view.resolved_path == prior[1]
+                and tuple(view.signature[:2]) == prior[2]
+                and view.last_complete_order >= prior[3]):
+            return prior[3]
+        return -1
+
+    def remember_owner_cursor(self, jobs: Path, view):
+        key = str(jobs.resolve(strict=False))
+        self._cursors[key] = (view.path_identity, view.resolved_path,
+                              tuple(view.signature[:2]), view.last_complete_order)
+
+    def metrics(self):
+        return dict(self._metrics)
+
+    def record_historical_check(self):
+        self._metrics["historical_checks"] += 1
 
     def needs_scan(self, jobs: Path, lease_is_held) -> bool:
         key = str(jobs.resolve(strict=False))
@@ -652,11 +797,20 @@ class OwnerSettlementReadContext:
         stamp = _registry_stamp(jobs)
         if prior is None or stamp is None or stamp != prior[0]:
             return True
+        if any(root == key for root, _attempt in self._active_owners):
+            return True
         for metadata in prior[1]:
             try:
                 if not lease_is_held(jobs, metadata):
                     return True
             except Exception:
+                return True
+        pass_generations = {}
+        for (jobs_key, attempt), entry in tuple(self._settled.items()):
+            if jobs_key == key and not self._dependencies_current(entry, pass_generations):
+                self._metrics["dependency_invalidations"] += 1
+                self._invalidated_owners.add((jobs_key, attempt))
+                self.forget_owner(jobs, attempt)
                 return True
         return False
 
@@ -674,7 +828,97 @@ class OwnerSettlementReadContext:
         self._seen[key] = (after_stamp, tuple(live_leases), tuple(signatures))
 
 
-def _pending_owner_settlements(jobs: Path):
+def _owner_settlement_dependency_paths(jobs: Path, status: str, metadata: dict):
+    """Return the exact cheap file generations that guard a settled cache entry."""
+    try:
+        import dispatch_contract
+        import dispatch_terminal_commit as terminal
+        request = terminal._historical_request(jobs, status, metadata)
+        if request is None:
+            return None
+        route = json.loads(Path(request.route_file).read_text(encoding="utf-8"))
+        route_id = route["route_id"]
+        attempt_id = metadata["attempt_id"]
+        slot = terminal.terminal_slot(request.artifact_root, route_id, attempt_id)
+        route_module = terminal._route_module()
+        binding_path = terminal.producer_binding_path(
+            request.artifact_root, route_id, attempt_id)
+        paths = [Path(request.route_file), terminal._commit_state_path(request),
+                 route_module.outcome_path(Path(request.route_file)),
+                 dispatch_contract.terminal_claim_path(jobs, route_id, attempt_id),
+                 binding_path, terminal.campaign_goal_path(request),
+                 slot / "owner-envelope.json", slot / "owner-envelope.txt"]
+        for node in route.get("nodes", []):
+            if node.get("terminal") is not True:
+                continue
+            marker_path = route_module.completion_dir(
+                route_id, jobs=request.jobs) / (str(node.get("id")) + ".json")
+            paths.append(marker_path)
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                evidence_path = (marker.get("evidence") or {}).get("path")
+                if isinstance(evidence_path, str) and evidence_path:
+                    evidence = Path(evidence_path)
+                    paths.append(evidence if evidence.is_absolute()
+                                 else request.artifact_root / evidence)
+            except (OSError, ValueError, TypeError):
+                pass
+        try:
+            envelope = json.loads((slot / "owner-envelope.json").read_text(encoding="utf-8"))
+            primary = envelope.get("primary_path")
+            if isinstance(primary, str) and primary:
+                paths.append(Path(primary))
+        except (OSError, ValueError, TypeError):
+            pass
+
+        if binding_path.is_file():
+            binding = json.loads(binding_path.read_text(encoding="utf-8"))
+            cycle_id = (binding.get("binding") or {}).get("cycle_id")
+            if isinstance(cycle_id, str) and cycle_id:
+                import artifact_producer as producer
+                cycle = producer.read_cycle_record(request.artifact_root, cycle_id)
+                if cycle is None:
+                    return None
+                paths.extend((producer.cycle_record_path(request.artifact_root, cycle_id),
+                              producer._record_cycle_manifest_path(request.artifact_root, cycle),
+                              producer.artifact_admission._index_path(request.artifact_root),
+                              request.artifact_root / producer.artifact_admission.ADMISSION_REL
+                                  / "root-identity.json"))
+                if route_id:
+                    canonical_route = producer.route_lineage.canonical_route_path(
+                        request.artifact_root, route_id)
+                    paths.extend((canonical_route,
+                                  producer.artifact_lifecycle.canonical_outcome_path(
+                                      request.artifact_root, route_id)))
+                    producer_route = json.loads(canonical_route.read_text(encoding="utf-8"))
+                    paths.extend(route_module.completion_dir(route_id) /
+                                 (str(node["id"]) + ".json")
+                                 for node in producer_route.get("nodes", [])
+                                 if node.get("terminal") is True)
+                snapshots = producer.artifact_lifecycle.manifest_snapshot_dir(
+                    request.artifact_root, cycle_id)
+                paths.append(snapshots)
+                if snapshots.is_dir():
+                    paths.extend(path for path in snapshots.iterdir()
+                                 if path.suffix == ".json")
+        # Missing optional files depend on their nearest existing parent, so
+        # their later creation invalidates the observation without a tree scan.
+        observed = []
+        seen = set()
+        for dependency in paths:
+            candidate = Path(dependency).expanduser()
+            while not candidate.exists() and candidate != candidate.parent:
+                candidate = candidate.parent
+            key = str(candidate.absolute())
+            if key not in seen:
+                seen.add(key)
+                observed.append(candidate)
+        return tuple(observed) if observed else None
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+
+
+def _pending_owner_settlements(jobs: Path, *, context=None):
     """Return exact owner rows whose existing terminal path still owes work."""
     from dispatch_contract import (
         SUPERVISOR_LEASE_KIND, parse_registry_metadata, supervisor_lease_is_held,
@@ -683,12 +927,36 @@ def _pending_owner_settlements(jobs: Path):
 
     try:
         from dispatch_registry_cache import registry_view
-        view = registry_view(jobs)
+        view = registry_view(jobs, append_only=True)
         view.require_complete_text()
-        candidates = view.settlement_owner_candidates()
+        if context is None:
+            candidates = view.settlement_owner_candidates()
+        else:
+            floor = context.owner_candidate_floor(jobs, view)
+            selected = {record.completion_metadata().get("attempt_id", ""): record
+                        for record in (view.settlement_owner_candidates()
+                                       if floor < 0 else
+                                       view.settlement_owner_candidates_since(floor))
+                        if record.completion_metadata().get("attempt_id")}
+            changed_rows = view.records_since(floor) if floor >= 0 else ()
+            impacted = set(context.affected_settled_owner_ids(jobs, changed_rows))
+            impacted.update(context.take_invalidated_owner_ids(jobs))
+            impacted.update(context.active_owner_ids(jobs))
+            for attempt_id in impacted:
+                current = view.settlement_owner_candidate(attempt_id)
+                if current is None:
+                    context.forget_owner(jobs, attempt_id)
+                    context.forget_active_owner(jobs, attempt_id)
+                else:
+                    previous = selected.get(attempt_id)
+                    if previous is None or current.order > previous.order:
+                        selected[attempt_id] = current
+            candidates = tuple(selected.values())
     except FileNotFoundError:
         return ()
     pending = []
+    if context is not None:
+        context.begin_dependency_pass()
     for candidate in candidates:
         order, raw, fields = candidate.order, candidate.raw, candidate.fields
         if fields[1] not in {"open", "running", "done"}:
@@ -698,21 +966,56 @@ def _pending_owner_settlements(jobs: Path):
                 or meta.get("supervisor_lease") != SUPERVISOR_LEASE_KIND
                 or not meta.get("supervisor_lease_file") or not meta.get("log_file")
                 or not meta.get("attempt_id")):
+            if context is not None and meta.get("attempt_id"):
+                context.forget_active_owner(jobs, meta["attempt_id"])
+                context.forget_owner(jobs, meta["attempt_id"])
             continue
+        attempt_id = meta["attempt_id"]
+        if fields[1] in {"open", "running"} and context is not None:
+            context.remember_active_owner(jobs, candidate)
         if fields[1] == "done":
             if meta.get("workflow_completion") != "runtime-v1":
+                if context is not None:
+                    context.forget_active_owner(jobs, attempt_id)
+                    context.forget_owner(jobs, attempt_id)
+                continue
+            related_rows = view.completion_related(
+                meta.get("attempt_id", ""),
+                meta.get("owner_route_id") or meta.get("route_id", ""),
+                meta.get("owner_route_hash") or meta.get("route_hash", ""))
+            if (context is not None and context.settled_owner_current(
+                    jobs, fields[1], raw, meta, related_rows)):
+                context.forget_active_owner(jobs, attempt_id)
                 continue
             try:
-                if not owner_completion_pending(jobs, fields[1], meta):
+                if context is not None:
+                    context.record_historical_check()
+                pending_state = owner_completion_pending(jobs, fields[1], meta)
+                if not pending_state:
+                    if context is not None:
+                        dependencies = _owner_settlement_dependency_paths(jobs, fields[1], meta)
+                        if dependencies:
+                            context.remember_settled_owner(
+                                jobs, fields[1], raw, meta, related_rows, dependencies)
+                        context.forget_active_owner(jobs, attempt_id)
+                    elif context is not None:
+                        context.remember_active_owner(jobs, candidate)
                     continue
+                if context is not None:
+                    context.forget_owner(jobs, meta["attempt_id"])
+                    context.remember_active_owner(jobs, candidate)
             except Exception:
                 # An unavailable observation remains a retryable obligation.
-                pass
+                if context is not None:
+                    context.forget_owner(jobs, attempt_id)
+                    context.remember_active_owner(jobs, candidate)
         try:
             lease_held = supervisor_lease_is_held(jobs, meta)
         except (OSError, ValueError):
             lease_held = True
         pending.append((order, fields[1], raw, meta, lease_held))
+    if context is not None:
+        context.remember_owner_cursor(jobs, view)
     return tuple(pending)
 
 
@@ -732,7 +1035,7 @@ def _resume_owner_settlements(jobs: Path, *, context=None) -> None:
         return context.cached_signatures(jobs)
     before_stamp = _registry_stamp(jobs)
     try:
-        pending = _pending_owner_settlements(jobs)
+        pending = _pending_owner_settlements(jobs, context=context)
     except (OSError, UnicodeError):
         if context is not None:
             context.remember(jobs, before_stamp, (), retry_required=True)
