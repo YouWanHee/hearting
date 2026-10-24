@@ -808,7 +808,10 @@ def apply_gpu_execution_sandbox(args: argparse.Namespace) -> None:
     selection = GPU_SANDBOX.select(
         route, owner=owner, node=getattr(args, "route_node", None),
         requested=args.sandbox if cli_explicit else None)
-    if not selection["gpu_scope"]:
+    historical_owner_tuple = (owner and not route.get("codex_execution_sandbox")
+        and any(row.get("parent_harness") == "codex"
+                for row in (route.get("dispatch_evidence") or {}).get("tuples", [])))
+    if not selection["gpu_scope"] and not historical_owner_tuple:
         return
     if owner:
         for row in (route.get("dispatch_evidence") or {}).get("tuples", []):
@@ -816,7 +819,7 @@ def apply_gpu_execution_sandbox(args: argparse.Namespace) -> None:
                 raise DispatchContractError("dispatch-evidence-parent-runtime-mismatch",
                                             "selected GPU owner sandbox differs from its checked tuple")
     args.gpu_execution_selection = selection
-    args.gpu_execution_scope = True
+    args.gpu_execution_scope = bool(selection["gpu_scope"])
     args.sandbox = selection["sandbox"]
 
 

@@ -35,9 +35,9 @@ import dispatch_stage_advance as ADVANCE  # noqa: E402
 
 GOLDEN = HERE / "fixtures" / "sd165-route-golden.json"
 GPU_EVAL_ADVISORY = (
-    "  Codex GPU lab: danger-full-access (gpu-lab-resource); 대상 owner 및 GPU 실행·검증 노드 eval-run. "
-    "filesystem/network OS enforcement 없음; 요청 root와 child≤parent는 논리 경계입니다. "
-    "외부 sandbox·관리된 runtime 제약은 유지되며 GPU 조회 성공을 보증하지 않습니다."
+    "  Codex compute GPU: danger-full-access (gpu-compute-resource); target owner and compute resource nodes eval-run. "
+    "filesystem/network OS enforcement 없음; approved roots and child≤parent are logical boundaries. "
+    "Outer or managed runtime constraints remain; selection does not guarantee GPU availability."
 )
 GOLDEN_KEYS = (
     "parallel_groups", "completion_gates", "human_gates", "human_gate_bindings",
@@ -312,10 +312,10 @@ class HistoricalGpuExceptionTest(unittest.TestCase):
         self.assertEqual(_historical_gpu_card(self.route(), card, self), self.OLD_CARD)
         self.assertEqual(card, self.OLD_CARD + "\n" + GPU_EVAL_ADVISORY)
         for old, new in (("danger-full-access", "workspace-write"),
-                ("gpu-lab-resource", "caller-cli"), ("gpu-lab-resource", "forced-env"),
-                ("노드 eval-run", "노드 full-run"),
+                ("gpu-compute-resource", "caller-cli"), ("gpu-compute-resource", "forced-env"),
+                ("nodes eval-run", "nodes full-run"),
                 ("OS enforcement 없음", "OS enforcement enforced"),
-                ("논리 경계입니다", "OS 경계입니다")):
+                ("logical boundaries", "OS boundaries")):
             changed = card.replace(old, new)
             self.assertNotEqual(changed, card, (old, new))
             with self.subTest(old=old, new=new), self.assertRaises(AssertionError):
@@ -327,7 +327,7 @@ class HistoricalGpuExceptionTest(unittest.TestCase):
 
     def test_additional_notice_and_cpu_approval_unit_gate_changes_remain_visible(self):
         card = self.OLD_CARD + "\n" + GPU_EVAL_ADVISORY
-        extra = GPU_EVAL_ADVISORY.replace("gpu-lab-resource", "caller-env")
+        extra = GPU_EVAL_ADVISORY.replace("gpu-compute-resource", "caller-env")
         projected = _historical_gpu_card(self.route(), card + "\n" + extra, self)
         self.assertNotEqual(projected, self.OLD_CARD)
         self.assertIn(extra, projected)
@@ -795,7 +795,8 @@ class ResourceShareTest(CatalogBase):
         artifacts.mkdir()
         env.update(AGENT_HOME=str(R.ROOT), AGENT_DISPATCH_JOBS=str(base / "jobs.log"),
                    AGENT_RESOURCE_RUN_INDEX=str(base / "resource-runs.index.json"),
-                   DISPATCH_DEFAULTS_CONFIG=str(R.ROOT / "profiles" / "dispatch-defaults.yaml"))
+                   DISPATCH_DEFAULTS_CONFIG=str(R.ROOT / "profiles" / "dispatch-defaults.yaml"),
+                   CUDA_VISIBLE_DEVICES="")
         (base / "jobs.log").write_text("", encoding="utf-8")
         for argv in (["git", "init", "-q", str(repo)],
                      ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
