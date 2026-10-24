@@ -247,11 +247,55 @@ class JourneyTests(unittest.TestCase):
             target = Path(tmp) / "world-auth.json"; target.write_text('{"token":"')
             previous = fj._ACTIVE_AUTH
             try:
-                fj._ACTIVE_AUTH = (store, target, store.read_bytes())
+                fj._ACTIVE_AUTH = ("claude", store, target, store.read_bytes())
                 fj.persist_active_auth()
             finally:
                 fj._ACTIVE_AUTH = previous
             self.assertEqual(store.read_text(), '{"token":"original"}')
+
+    def test_incomplete_credentials_never_replace_store_and_complete_fixtures_do(self):
+        rejected = {
+            "claude": (b"{}", b'{"claudeAiOauth":{"accessToken":"fake-access"}}'),
+            "codex": (b"{}", b'{"tokens":{"access_token":"","refresh_token":"fake-refresh"}}'),
+            "opencode": (b"{}",),
+        }
+        complete = {
+            "claude": b'{"claudeAiOauth":{"accessToken":"fake-access","refreshToken":"fake-refresh"}}',
+            "codex": b'{"tokens":{"access_token":"fake-access","refresh_token":"fake-refresh"}}',
+            "opencode": b'{"account":{"type":"fake"}}',
+        }
+        for harness, candidates in rejected.items():
+            for candidate in candidates:
+                with self.subTest(harness=harness, candidate=candidate), tempfile.TemporaryDirectory() as tmp:
+                    store = Path(tmp) / "store.json"
+                    original = b'{"keep":"original-bytes"}'
+                    store.write_bytes(original)
+                    target = Path(tmp) / "world-auth.json"
+                    target.write_bytes(candidate)
+                    previous = fj._ACTIVE_AUTH
+                    try:
+                        fj._ACTIVE_AUTH = (harness, store, target, original)
+                        self.assertFalse(fj.credential_complete(harness, candidate))
+                        fj.persist_active_auth()
+                    finally:
+                        fj._ACTIVE_AUTH = previous
+                    self.assertEqual(store.read_bytes(), original)
+
+        for harness, candidate in complete.items():
+            with self.subTest(harness=harness), tempfile.TemporaryDirectory() as tmp:
+                store = Path(tmp) / "store.json"
+                original = b'{"keep":"original-bytes"}'
+                store.write_bytes(original)
+                target = Path(tmp) / "world-auth.json"
+                target.write_bytes(candidate)
+                previous = fj._ACTIVE_AUTH
+                try:
+                    fj._ACTIVE_AUTH = (harness, store, target, original)
+                    self.assertTrue(fj.credential_complete(harness, candidate))
+                    fj.persist_active_auth()
+                finally:
+                    fj._ACTIVE_AUTH = previous
+                self.assertEqual(store.read_bytes(), candidate)
 
     def test_unsupported_transport_does_not_execute_task_argv(self):
         calls = []

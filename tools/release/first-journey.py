@@ -26,20 +26,45 @@ PROFILES = {"claude-only": ["claude"], "all": ["claude", "codex", "opencode"]}
 TASK_HARNESSES = {"claude-only": ["claude"], "all": ["codex", "opencode"]}
 AUTH_NAMES = {"claude": [".credentials.json"], "codex": ["auth.json"], "opencode": ["auth.json"]}
 DEFAULT_PROMPT = "Fix the typo in greet's output, run the existing focused test, and show the diff."
-_ACTIVE_AUTH: tuple[Path, Path, bytes] | None = None
+_ACTIVE_AUTH: tuple[str, Path, Path, bytes] | None = None
+
+
+def credential_complete(harness: str, data: bytes) -> bool:
+    """Check only the credential structure needed to identify a complete login."""
+    try:
+        value = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(value, dict):
+        return False
+    if harness == "claude":
+        oauth = value.get("claudeAiOauth")
+        return (isinstance(oauth, dict)
+                and isinstance(oauth.get("accessToken"), str) and bool(oauth["accessToken"])
+                and isinstance(oauth.get("refreshToken"), str) and bool(oauth["refreshToken"]))
+    if harness == "codex":
+        if isinstance(value.get("OPENAI_API_KEY"), str) and value["OPENAI_API_KEY"]:
+            return True
+        tokens = value.get("tokens")
+        return (isinstance(tokens, dict)
+                and isinstance(tokens.get("access_token"), str) and bool(tokens["access_token"])
+                and isinstance(tokens.get("refresh_token"), str) and bool(tokens["refresh_token"]))
+    if harness == "opencode":
+        return bool(value) and all(isinstance(item, dict) and isinstance(item.get("type"), str)
+                                   for item in value.values())
+    return False
 
 
 def persist_active_auth() -> None:
     if not _ACTIVE_AUTH: return
-    store, target, original = _ACTIVE_AUTH
+    harness, store, target, original = _ACTIVE_AUTH
     try:
         if target.is_file() and not target.is_symlink():
             latest = target.read_bytes()
-            json.loads(latest)
-            if latest != original:
+            if credential_complete(harness, latest) and latest != original:
                 temporary = store.with_name(store.name + ".tmp")
                 temporary.write_bytes(latest); os.chmod(temporary, 0o600); os.replace(temporary, store)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError): pass
+    except OSError: pass
 
 
 def auth_signal(signum, _frame):
@@ -698,7 +723,7 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                             target = home / ".local/share/opencode/auth.json"
                         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                         target.write_bytes(before); os.chmod(target, 0o600)
-                        _ACTIVE_AUTH = (store, target, before)
+                        _ACTIVE_AUTH = (harness, store, target, before)
                         if harness == "claude": env["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
                         elif harness == "codex": env["CODEX_HOME"] = str(home / ".codex")
                         else: env["XDG_DATA_HOME"] = str(home / ".local/share")
@@ -877,9 +902,12 @@ def main() -> int:
                                   "opencode": world / "data/opencode/auth.json"}
                     source = candidates[harness]
                     if not source.is_file() or source.is_symlink(): return 1
+                    credential = source.read_bytes()
+                    if not credential_complete(harness, credential):
+                        print("login-credential-incomplete", file=sys.stderr); return 1
                     target = auth_file(root, harness); target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                     temporary = target.with_name(target.name + ".tmp")
-                    temporary.write_bytes(source.read_bytes()); os.chmod(temporary, 0o600); os.replace(temporary, target)
+                    temporary.write_bytes(credential); os.chmod(temporary, 0o600); os.replace(temporary, target)
                 return result.returncode
             finally:
                 shutil.rmtree(world, ignore_errors=True)
