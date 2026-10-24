@@ -104,16 +104,14 @@ class OpenCodeDispatchScopeFixtureTest(unittest.TestCase):
         self.assertFalse(artifact_probe.is_relative_to(self.worktree))
 
         with mock.patch.dict(os.environ, self.env, clear=True):
-            nested = DISPATCH.prepare_nested_runtime(
-                self.worktree, "att-native-fixture", state_root=self.state_root,
-            )
+            self.assertFalse(hasattr(DISPATCH, "prepare_nested_runtime"))
             scoped = DISPATCH.scoped_external_directory_config(
                 str(self.artifact_root), agent_home=str(ROOT), worktree=str(self.worktree),
                 selected_agent="build",
             )
             launch_env = {
                 **self.env,
-                **{key: value for key, value in nested.items() if value is not None},
+                "OPENCODE_RUNTIME_VERSION": "1.19.0",
                 "AGENT_SESSION_ROLE": "worker",
                 "AGENT_DISPATCH_CHILD": "1",
                 "AGENT_DISPATCH_DEPTH": "1",

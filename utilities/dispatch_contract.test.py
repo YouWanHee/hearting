@@ -2104,6 +2104,68 @@ class DispatchContractTest(unittest.TestCase):
    with self.subTest(fields=fields):
     self.assertFalse(D.attempt_row_withdrawn_before_launch(fields))
 
+ def test_terminal_never_started_is_shared_and_rejects_conflicting_evidence(self):
+  base={"route_id":"rt-no-start","route_node":"plan-check","attempt_id":"att-no-start",
+        "launch_claimed":"0","launch_outcome":"never-launched"}
+  for status in ("done","cancelled","killed"):
+   fields=attempt_row(base,status=status).split("\t")
+   self.assertTrue(D.attempt_row_terminal_never_started(fields))
+   self.assertTrue(D.terminal_attempt_never_started(status,D.parse_registry_metadata(fields[5])))
+  negatives=(
+   ("open",base), ("running",base), ("done",{k:v for k,v in base.items() if k!="launch_claimed"}),
+   ("done",{**base,"launch_claimed":"1"}), ("done",{**base,"pid":"123"}),
+   ("done",{**base,"launch_started":"1"}), ("done",{**base,"launch_outcome":"started"}),
+   ("done",{**base,"note":"completed-marker"}),
+  )
+  for status,metadata in negatives:
+   with self.subTest(status=status,metadata=metadata):
+    self.assertFalse(D.attempt_row_terminal_never_started(attempt_row(metadata,status=status).split("\t")))
+
+ def test_no_start_rejects_every_persisted_child_identity_but_ignores_parent_lineage(self):
+  base={"route_id":"rt-no-start","route_node":"plan-check","attempt_id":"att-no-start",
+        "launch_claimed":"0","launch_outcome":"never-launched"}
+  identities={"pid":"41","pid_start":"900","pid_scope":"namespace-local",
+              "pid_host":"1041","pid_host_start":"900","pid_ns":"pid:[12]",
+              "pid_observer_ns":"pid:[12]","pgid":"41","pgid_host":"1041"}
+  for key,value in identities.items():
+   metadata={**base,key:value}
+   with self.subTest(identity=key):
+    self.assertFalse(D.attempt_row_never_started(
+     attempt_row(metadata,status="open").split("\t")))
+    fields=attempt_row(metadata,status="done").split("\t")
+    self.assertFalse(D.attempt_row_terminal_never_started(fields))
+    self.assertFalse(D.terminal_attempt_never_started(
+     "done",D.parse_registry_metadata(fields[5])))
+
+  lineage={**base,"parent_attempt_id":"att-parent","parent_pid":"41",
+           "parent_pid_start":"900","dispatch_depth":"2",
+           "worker_type":"stage","registered_worker":"1"}
+  fields=attempt_row(lineage,status="done").split("\t")
+  self.assertTrue(D.attempt_row_terminal_never_started(fields))
+  self.assertTrue(D.terminal_attempt_never_started(
+   "done",D.parse_registry_metadata(fields[5])))
+
+ def test_terminal_no_start_keeps_pending_and_reviewed_conflicting_results(self):
+  import base64
+  base={"launch_claimed":"0","launch_outcome":"never-launched",
+        "note":"dead-capacity","failure_class":"capacity"}
+  history={"late-result":{"note":"completed-marker","failure_class":"pass"}}
+  for reviewed in (False,True):
+   if reviewed: history["late-result"]["review_sha256"]="f"*64
+   encoded=base64.b64encode(json.dumps(history).encode()).decode()
+   metadata={**base,"terminal_conflict":"1","terminal_conflicts_b64":encoded}
+   self.assertEqual(D.terminal_conflict_pending(metadata),not reviewed)
+   self.assertFalse(D.terminal_attempt_never_started("done",metadata))
+   self.assertFalse(D.attempt_row_terminal_never_started(
+    attempt_row(metadata,status="done").split("\t")))
+  for extra in ({"terminal_conflict":"1"},{"terminal_conflicts_b64":encoded},
+                {"terminal_conflicts_b64":"unreadable-history"},
+                {"conflicting_terminal_note":"completed-review-blocking"},
+                {"conflicting_failure_class":"fail"}):
+   with self.subTest(extra=extra):
+    self.assertFalse(D.terminal_attempt_never_started("done",{**base,**extra}))
+  self.assertTrue(D.terminal_attempt_never_started("done",base))
+
  def test_claimed_spawn_rechecks_parent_and_publishes_identity_under_lock(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"
