@@ -2948,6 +2948,10 @@ def recall(query, tier=None, scope=None, cwd=None, sessions=False, limit=20,
 
             has_fts = con.execute(
                 "SELECT name FROM sqlite_master WHERE name='records_fts'").fetchone()
+            has_cjk_tbl = con.execute(
+                "SELECT name FROM sqlite_master WHERE name='records_cjk'").fetchone()
+            cjk_ok = (_CJK_OK if touch else
+                      bool(has_fts and not os.environ.get("MEM_NO_TRIGRAM") and has_cjk_tbl))
 
             def _fts_literal(q):
                 """Treat FTS5 operators in the query as a literal phrase."""
@@ -3003,9 +3007,7 @@ def recall(query, tier=None, scope=None, cwd=None, sessions=False, limit=20,
                     # Bucket 2: CJK bigram shadow — ranked substring matching (W4).
                     # The query is re-expressed as bigram phrases; snippets come
                     # from the original body, never the shadow transform.
-                    if _has_cjk(query) and _CJK_OK:
-                        has_cjk_tbl = con.execute(
-                            "SELECT name FROM sqlite_master WHERE name='records_cjk'").fetchone()
+                    if _has_cjk(query) and cjk_ok:
                         cjk_expr = _cjk_query_expr(query)
                         if has_cjk_tbl and cjk_expr:
                             try:
@@ -3022,7 +3024,7 @@ def recall(query, tier=None, scope=None, cwd=None, sessions=False, limit=20,
                                         tagged.append((2, tr[7], -(tr[6] or 1), tr))
                             except sqlite3.OperationalError:
                                 pass
-                    elif _has_cjk(query) and not _CJK_OK:
+                    elif _has_cjk(query) and not cjk_ok:
                         # Bucket 2: unranked LIKE only when the shadow index is unavailable.
                         where_l, params_l = build_where()
                         where_l = (where_l + " AND r.body LIKE ?") if where_l != "1" else "r.body LIKE ?"

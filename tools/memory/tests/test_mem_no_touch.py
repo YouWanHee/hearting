@@ -265,6 +265,41 @@ assert set(Path("/tmp").glob("hearting-migration-ro-*")) == clones_before
         self.assertIn("no-touch fixture body", result.stdout)
         self.assertEqual(self.snapshot([old_db]), before)
 
+    def test_no_touch_cjk_shadow_ranks_repeated_korean_term_without_writes(self):
+        weak = self.run_mem(
+            "add", "durable", "note",
+            "실험 노트 항목: 스펙트로그램 관련 설정은 별도 문서에 있고 여기는 다른 잡다한 내용이 길게 이어진다",
+            "--scope", "global")
+        strong = self.run_mem(
+            "add", "durable", "note",
+            "스펙트로그램 창 설정 정본: 스펙트로그램 해상도와 스펙트로그램 hop 값 기록",
+            "--scope", "global")
+        self.assertEqual(weak.returncode, 0, weak.stderr)
+        self.assertEqual(strong.returncode, 0, strong.stderr)
+        weak_id = weak.stdout.split()[-1]
+        strong_id = strong.stdout.split()[-1]
+        with sqlite3.connect(self.store / "memory.db") as con:
+            self.assertEqual(
+                con.execute("SELECT name FROM sqlite_master WHERE name='records_cjk'").fetchone()[0],
+                "records_cjk")
+            con.execute("UPDATE records SET last_accessed='2001-01-01' WHERE id IN (?, ?)",
+                        (weak_id, strong_id))
+
+        before = self.snapshot(self.paths + [self.events])
+        result = self.run_mem("recall", "펙트로그", "--no-touch", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)["results"]
+        ids = [row["id"] for row in rows]
+        self.assertIn(weak_id, ids)
+        self.assertIn(strong_id, ids)
+        self.assertLess(ids.index(strong_id), ids.index(weak_id))
+        self.assertEqual(self.snapshot(self.paths + [self.events]), before)
+        with sqlite3.connect(self.store / "memory.db") as con:
+            accesses = dict(con.execute(
+                "SELECT id, last_accessed FROM records WHERE id IN (?, ?)",
+                (weak_id, strong_id)))
+        self.assertEqual(accesses, {weak_id: "2001-01-01", strong_id: "2001-01-01"})
+
     def test_ordinary_main_show_and_recall_keep_access_touch_and_events(self):
         show = self.run_mem("show", self.rid)
         self.assertEqual(show.returncode, 0, show.stderr)

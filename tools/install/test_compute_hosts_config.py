@@ -72,6 +72,7 @@ class ComputeHostsConfigTests(unittest.TestCase):
             self.assertTrue(path.is_symlink())
             self.assertEqual(path.read_text(encoding="utf-8"), "user-owned\n")
 
+            # destructive-ok: reason=replace the first symlink fixture with a dangling symlink; boundary=the exact temporary compute-host config leaf
             path.unlink()
             dangling = Path(td) / "missing-target.yaml"
             path.symlink_to(dangling)
