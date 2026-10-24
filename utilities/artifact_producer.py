@@ -9209,8 +9209,23 @@ def _code_cycle_has_publication_obligation(root: Path, record: Mapping[str, Any]
     source_rel = _placed_locator("artifacts/spec", _output_placements(root, record))
     hints = _code_cycle_snapshot_spec_hints(root, record, source_rel)
     if hints is not None and not hints[1]:
-        # The exact immutable cycle history proves no code spec transaction
-        # was ever seeded. Ordinary payload cleanup cannot add one later.
+        # An extant payload that contradicts the immutable snapshot remains a
+        # corruption case. Only ordinary campaign cleanup can rely on the
+        # snapshot alone to prove there was no transaction.
+        try:
+            manifest_path = _record_cycle_manifest_path(root, record)
+        except ProducerError as exc:
+            if (exc.code == "sealed-cycle-state-unknown"
+                    and f"{record.get('cycle_id')}: campaign-locator=missing" in exc.detail):
+                return False
+            return True
+        source_path = manifest_path.parent / source_rel
+        if (_path_entry_present(source_path / SPEC_BASE_RECEIPT) or source_path.is_symlink()):
+            return True
+        try:
+            _published_cycle_state(root, record)
+        except ProducerError:
+            return True
         return False
     try:
         # This also keeps a present but corrupt manifest on the existing typed

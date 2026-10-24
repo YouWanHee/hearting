@@ -2832,6 +2832,20 @@ class CompletedSpecPublicationTest(ProducerTestBase):
         self.assertEqual((publication["status"], publication["reason"]),
                          ("pending", "shared-base-invalid"), publication)
 
+    def test_unmanifested_corrupt_code_seed_is_not_hidden_by_unseeded_snapshot(self):
+        self.activate()
+        route, path, cycle = self.begin("direct", "autopilot-code", "dev")
+        self.write_output(cycle, rel="plans/fixture/final_report.md", data=b"PASS\n")
+        self.close(route, path)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+
+        receipt = Path(cycle["cycle_dir"]) / "artifacts/spec" / P.SPEC_BASE_RECEIPT
+        receipt.parent.mkdir(parents=True)
+        receipt.write_bytes(b"{corrupt seed")
+        publication = self._publish(cycle)
+        self.assertEqual((publication["status"], publication["reason"]),
+                         ("pending", "shared-base-invalid"), publication)
+
     def test_code_interrupted_publication_reuses_exact_revision(self):
         self.activate()
         _, _, base = self._completed({"c/prd.md": b"# Component base\n"})
