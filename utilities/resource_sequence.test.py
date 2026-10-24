@@ -114,6 +114,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                     'kind': 'compute-hosts', 'run_id': 'compute-fixture',
                     'run_root': str(self.base / 'compute'), 'meta_sha256': 'm' * 64,
                     'exit_sha256': 'e' * 64, 'receipt_sha256': 'r' * 64,
+                    'outputs_sha256': 'o' * 64,
                     'contract_sha256': 'c' * 64,
                     'provenance': {'route_id': route['route_id'], 'route_hash': route['route_hash']},
                 }
@@ -229,7 +230,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                       'route_hash': route['route_hash']}}
         execution = {'kind': 'compute-hosts', 'run_id': 'compute-fixture',
             'run_root': str(compute_root), 'host': 'gpu-a', 'meta_sha256': 'm' * 64,
-            'exit_sha256': 'e' * 64, 'receipt_sha256': 'r' * 64, 'contract_sha256': 'k' * 64,
+            'exit_sha256': 'e' * 64, 'receipt_sha256': 'r' * 64,
+            'outputs_sha256': 'o' * 64, 'contract_sha256': 'k' * 64,
             'contract': execution_contract, 'receipt_state': 'finished', 'identity': {'pid': 4},
             'outputs': output_rows,
             'provenance': provenance, 'started_at': 1.0, 'ended_at': 2.0}

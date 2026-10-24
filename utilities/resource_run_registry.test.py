@@ -14,6 +14,22 @@ import resource_run_registry as registry
 
 
 class ResourceRegistryTest(unittest.TestCase):
+    def test_compute_identity_requires_output_receipt_but_keeps_stable_format(self):
+        execution = {"kind": "compute-hosts", "run_id": "compute-1",
+                     "meta_sha256": "m" * 64, "exit_sha256": "e" * 64,
+                     "receipt_sha256": "r" * 64, "outputs_sha256": "o" * 64,
+                     "contract_sha256": "c" * 64}
+        identity = registry.compute_execution_identity({"execution": execution})
+        self.assertEqual(identity, "compute-hosts:compute-1:" + ":".join(
+            execution[key] for key in
+            ("meta_sha256", "exit_sha256", "receipt_sha256", "contract_sha256")))
+        self.assertEqual(registry.compute_execution_identity({"execution": {
+            **execution, "outputs_sha256": "x" * 64}}), identity)
+        self.assertIsNone(registry.compute_execution_identity({"execution": {
+            key: value for key, value in execution.items() if key != "outputs_sha256"}}))
+        self.assertIsNone(registry.compute_execution_identity({"execution": {
+            "kind": "local-resource", "outputs_sha256": "o" * 64}}))
+
     def test_compute_identity_uses_recorded_receipt_without_remote_or_local_probe(self):
         row = {"execution": {"kind": "compute-hosts", "run_id": "compute-1",
                              "receipt_state": "finished"},

@@ -4193,6 +4193,7 @@ class TestComputePollObservationBoundary(WorkflowFixture):
                 "meta_sha256": "m" * 64,
                 "exit_sha256": "e" * 64,
                 "receipt_sha256": "r" * 64,
+                "outputs_sha256": "o" * 64,
                 "contract_sha256": "c" * 64,
                 "provenance": {
                     "route_id": route["route_id"],

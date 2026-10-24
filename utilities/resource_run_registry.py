@@ -400,13 +400,21 @@ def resource_process_group_quiescent(run: dict) -> bool:
 
 
 def compute_execution_identity(run: dict) -> str | None:
+    """Return the stable compute identity only with a complete output receipt.
+
+    ``outputs_sha256`` is required evidence, but remains outside the persisted
+    identity string so existing adopted rows and completion markers keep their
+    identity. Replay compares this digest separately before reusing that row.
+    """
     execution = run.get("execution") if isinstance(run, dict) else None
     if not isinstance(execution, dict) or execution.get("kind") != "compute-hosts":
         return None
-    required = ("run_id", "meta_sha256", "exit_sha256", "receipt_sha256", "contract_sha256")
+    required = ("run_id", "meta_sha256", "exit_sha256", "receipt_sha256",
+                "outputs_sha256", "contract_sha256")
     if not all(isinstance(execution.get(key), str) and execution[key] for key in required):
         return None
-    return "compute-hosts:" + ":".join(str(execution[key]) for key in required)
+    identity_fields = ("run_id", "meta_sha256", "exit_sha256", "receipt_sha256", "contract_sha256")
+    return "compute-hosts:" + ":".join(str(execution[key]) for key in identity_fields)
 
 
 def compute_execution_observation(run: dict) -> dict:

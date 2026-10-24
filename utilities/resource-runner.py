@@ -557,6 +557,86 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
              "actual": provenance.get("route_file")},
         ], next_action="select a completed run recorded for this exact route")
 
+    identity = compute_execution_identity({"execution": execution})
+    if identity is None:
+        required_evidence = ("run_id", "meta_sha256", "exit_sha256", "receipt_sha256",
+                             "outputs_sha256", "contract_sha256")
+        missing = [{"field": "execution." + key, "expected": "non-empty recorded evidence",
+                    "actual": execution.get(key)}
+                   for key in required_evidence
+                   if not isinstance(execution.get(key), str) or not execution[key]]
+        fail_compute("resource-compute-output-missing" if any(
+            item["field"] == "execution.outputs_sha256" for item in missing
+        ) else "resource-compute-observation-unavailable",
+            differences=missing or [{"field": "execution.kind", "expected": "compute-hosts",
+                                     "actual": execution.get("kind")}],
+            next_action="verify the persisted compute-run evidence before adopting it")
+    if (execution.get("run_id") != compute_run_id
+            or not isinstance(execution.get("run_root"), str) or not execution["run_root"]):
+        fail_compute("resource-compute-observation-unavailable", differences=[
+            {"field": "execution.locator", "expected": {
+                "run_id": compute_run_id, "run_root": "canonical configured run root"},
+             "actual": {"run_id": execution.get("run_id"),
+                        "run_root": execution.get("run_root")}}],
+            next_action="restore the configured compute-run locator before adopting it")
+
+    route_path = str(Path(route_file).resolve(strict=True))
+    node_id = provenance.get("node")
+
+    def replay_evidence_differences(row):
+        stored = row.get("execution") if isinstance(row, dict) else None
+        if not isinstance(stored, dict) or stored.get("kind") != "compute-hosts":
+            return [{"field": "execution", "expected": "stored compute-hosts evidence",
+                     "actual": stored}]
+        found = []
+        # Keep the old identity string stable for existing markers; compare every
+        # immutable receipt and locator field independently before reusing a row.
+        for key in ("outputs_sha256", "run_id", "run_root", "host", "remote_host",
+                    "meta_sha256", "exit_sha256", "receipt_sha256", "contract_sha256",
+                    "contract", "identity", "provenance", "outputs", "receipt_state",
+                    "started_at", "ended_at"):
+            if stored.get(key) != execution.get(key):
+                found.append({"field": "execution." + key,
+                              "expected": stored.get(key), "actual": execution.get(key)})
+        if row.get("execution", {}).get("identity_key") != identity:
+            found.append({"field": "execution.identity_key", "expected": identity,
+                          "actual": row.get("execution", {}).get("identity_key")})
+        for field, expected, actual in (
+                ("route", route_path, row.get("route")),
+                ("node", node_id, row.get("node")),
+                ("jobs", str(jobs), row.get("jobs")),
+                ("compute_run_id", compute_run_id, row.get("compute_run_id"))):
+            if expected != actual:
+                found.append({"field": field, "expected": expected, "actual": actual})
+        return found
+
+    def adopted_locator_rows(rows):
+        return [row for row in rows
+                if isinstance(row, dict)
+                and isinstance(row.get("execution"), dict)
+                and row["execution"].get("kind") == "compute-hosts"
+                and row["execution"].get("run_root") == execution.get("run_root")
+                and row["execution"].get("run_id") == compute_run_id
+                and row.get("route") == route_path and row.get("node") == node_id]
+
+    # Discover an already-adopted run by its canonical execution locator before
+    # identity lookup or retry ordinal selection. A changed receipt must never
+    # become a new __aN row merely because it no longer matches the old identity.
+    registry_snapshot = json.loads(registry.read_text(encoding="utf-8"))
+    locator_rows = adopted_locator_rows((registry_snapshot.get("runs") or {}).values())
+    if len(locator_rows) > 1:
+        fail_compute("resource-compute-binding-conflict", differences=[
+            {"field": "compute_run_locator.matches", "expected": 1,
+             "actual": len(locator_rows)}],
+            next_action="resolve duplicate adopted rows through the existing resource owner")
+    if locator_rows:
+        differences = replay_evidence_differences(locator_rows[0])
+        if differences:
+            fail_compute("resource-compute-evidence-changed", differences=differences,
+                         next_action=("preserve the published row and verify its original evidence; "
+                                      "use a fresh compute run through the existing route if outputs changed"),
+                         retryable=False)
+
     ledger = sup.ledger_for(route, str(jobs))
     armed_rows = sup.read_armed(ledger)
     eligible = []
@@ -698,15 +778,18 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
         # longer the original failed row named by compute provenance. Find the
         # already-published identity by its exact route/node binding so replay
         # can converge before treating that successful row as a new baseline.
-        replay_node_id = provenance.get("node")
+        replay_node_id = node_id
         replay_node = WS.route_node(route, replay_node_id) if isinstance(replay_node_id, str) else None
         replay_armed = armed_rows.get(replay_node_id) if isinstance(replay_node_id, str) else None
         replay_rows = [row for row in (json.loads(registry.read_text(encoding="utf-8")).get("runs") or {}).values()
                        if isinstance(row, dict)
+                       and identity is not None
                        and (row.get("execution") or {}).get("identity_key") == compute_execution_identity(
                            {"execution": execution})
                        and row.get("route") == str(Path(route_file).resolve(strict=True))
                        and row.get("node") == replay_node_id and row.get("jobs") == str(jobs)
+                       and row.get("compute_run_id") == compute_run_id
+                       and (row.get("execution") or {}).get("run_root") == execution.get("run_root")
                        and replay_armed is not None
                        and replay_armed.get("predecessor_id") in {
                            row.get("run_id"), (provenance.get("contract") or {}).get("run_id")}
@@ -774,12 +857,29 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
 
     data = json.loads(registry.read_text(encoding="utf-8"))
     runs = data.get("runs") or {}
+    # Recheck the locator against the latest registry snapshot as well. A
+    # concurrent publisher may have written the same run after the earlier
+    # observation; a different evidence digest must not fall through to __aN.
+    locator_rows = adopted_locator_rows(runs.values())
+    if len(locator_rows) > 1:
+        fail_compute("resource-compute-binding-conflict", differences=[
+            {"field": "compute_run_locator.matches", "expected": 1,
+             "actual": len(locator_rows)}],
+            next_action="resolve duplicate adopted rows through the existing resource owner")
+    if locator_rows:
+        differences = replay_evidence_differences(locator_rows[0])
+        if differences:
+            fail_compute("resource-compute-evidence-changed", differences=differences,
+                         next_action=("preserve the published row and verify its original evidence; "
+                                      "use a fresh compute run through the existing route if outputs changed"),
+                         retryable=False)
     # Stable identity lookup precedes retry ordinal selection, so retry after
     # publication/arm interruption converges on the same row.
-    identity = compute_execution_identity({"execution": execution})
-    existing = [row for row in runs.values() if isinstance(row, dict)
+    existing = [row for row in runs.values() if identity is not None and isinstance(row, dict)
                 and (row.get("execution") or {}).get("identity_key") == identity
-                and row.get("node") == node_id]
+                and row.get("route") == route_path and row.get("node") == node_id
+                and row.get("jobs") == str(jobs) and row.get("compute_run_id") == compute_run_id
+                and (row.get("execution") or {}).get("run_root") == execution.get("run_root")]
     if len(existing) > 1:
         fail_compute("resource-compute-binding-conflict", differences=[
             {"field": "compute_execution_identity.matches", "expected": 1, "actual": len(existing)}],
@@ -806,6 +906,17 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
                          next_action="repeat the same compute-run start to finish the published arm")
     if existing:
         adopted = existing[0]
+        differences = replay_evidence_differences(adopted)
+        if differences:
+            fail_compute("resource-compute-evidence-changed", differences=differences,
+                         next_action=("preserve the published row and verify its original evidence; "
+                                      "use a fresh compute run through the existing route if outputs changed"),
+                         retryable=False)
+        if not COMPUTE.run_snapshot_current(config, compute_run_id, execution):
+            fail_compute("resource-compute-evidence-changed", differences=[
+                {"field": "compute_run.snapshot_current", "expected": True, "actual": False}],
+                next_action="restore the original completed compute-run evidence before replaying",
+                retryable=False)
         if adopted.get("parent_attempt_id") != owner_wait["parent_attempt_id"]:
             fail_compute("resource-compute-binding-conflict", differences=[
                 {"field": "parent_attempt_id", "expected": owner_wait["parent_attempt_id"],
