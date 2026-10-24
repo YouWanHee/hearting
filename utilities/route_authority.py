@@ -630,6 +630,12 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                     raise _contract_error("owner-closure-intensity-unknown", "owner-closure-intensity-unknown:" + route["effective_intensity"])
                 raise
         worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
+        # Strict terminal no-start rows remain in the physical registry and in
+        # dispatch-node's lineage view, but are not launched rounds. Derive the
+        # exclusion from the same launch-fence proof used by retry admission.
+        from dispatch_contract import terminal_attempt_never_started
+        rows = [(status, meta) for status, meta in rows
+                if not terminal_attempt_never_started(status, meta)]
         kinds = [_ROUND.classify_round_row(s, m, worker_type=m.get("worker_type") or worker_type) for s, m in rows]
         source_digest = facts.get("source_subject_digest")
         source_aware = False

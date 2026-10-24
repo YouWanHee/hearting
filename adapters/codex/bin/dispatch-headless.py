@@ -780,14 +780,13 @@ def dispatch_prompt(
         f"- owner_harness: {args.owner_harness or '-'}\n"
         f"- worktree: {args.worktree}\n"
         f"- artifact_root: {args.artifact_root}\n"
-        f"{artifact_context_prompt(os.environ)}"
+        f"{artifact_context_prompt({**os.environ, 'AGENT_RUNTIME_DIR': getattr(args, 'runtime_dir', '')})}"
         f"- route_state: {route_state}\n\n"
         "Codex realization:\n"
         f"{contract_read_prompt(args, 'codex')}"
         "- An owner has no worker mode and must not load any unit persona path.\n"
         f"- Run $AGENT_HOME/adapters/codex/bin/preflight.sh qa-policy {args.qa} {qa_track(args.capability)} and keep its required assurance in the artifact.\n"
         "- The wrapper already validated capability mode, worker unit/mode, QA, artifact root, and any route record. Re-run worker-route only for a safety recheck.\n"
-        "- Before each edit run $AGENT_HOME/adapters/codex/bin/preflight.sh write <file>; preserve required test and tool-contract checks in the artifact.\n"
         "- Codex may still auto-discover project AGENTS.md; do not explicitly load the full harness adapter bootstrap or another runtime's adapter.\n\n"
         f"{heartbeat}"
         f"{no_commit_clause}"
@@ -825,7 +824,7 @@ def apply_gpu_execution_sandbox(args: argparse.Namespace) -> None:
                 raise DispatchContractError("dispatch-evidence-parent-runtime-mismatch",
                                             "selected GPU owner sandbox differs from its checked tuple")
     args.gpu_execution_selection = selection
-    args.gpu_execution_scope = True
+    args.gpu_execution_scope = bool(selection["gpu_scope"])
     args.sandbox = selection["sandbox"]
 
 
@@ -872,6 +871,7 @@ spec_read_marker_required = HARNESS_STATE.spec_read_marker_required
 _spec_grounding_dir = HARNESS_STATE.spec_grounding_dir
 _core_grounding_dir = HARNESS_STATE.core_grounding_dir
 route_bound_worker_writable_dirs = HARNESS_STATE.route_bound_worker_writable_dirs
+nested_opencode_store_writable_dirs = HARNESS_STATE.nested_opencode_store_writable_dirs
 progress_writable_dirs = HARNESS_STATE.progress_writable_dirs
 registry_writable_launch = HARNESS_STATE.registry_writable_launch
 
@@ -899,16 +899,26 @@ def nested_owner_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
     # write access the pre-release fence closes every child as
     # `summary-owner-launch-failed`/`never-launched`.
     summary_dirs = summary_writable_dirs()
+    opencode_store_dirs = nested_opencode_store_writable_dirs(args)
     candidates = (
         canonical_registry_root,
         claude_config / "session-env",
         *summary_dirs,
+        *opencode_store_dirs,
     )
     result = []
     seen = set()
+    opencode_roots = set(opencode_store_dirs)
     for path in candidates:
-        path = path.resolve()
-        if path in summary_dirs or path.is_dir():
+        if path in opencode_roots:
+            # Keep the final app directory lexical and recheck it at the
+            # adapter boundary. Never turn a leaf symlink into a wider mount.
+            path = path.parent.resolve(strict=False) / path.name
+            if path.is_symlink():
+                continue
+        else:
+            path = path.resolve()
+        if path in summary_dirs or path in opencode_store_dirs or path.is_dir():
             if path not in seen:
                 seen.add(path)
                 result.append(path)
@@ -925,6 +935,7 @@ def ensure_owner_writable_dirs(args: argparse.Namespace) -> None:
     to_create.extend(route_bound_worker_writable_dirs(args))
     if nested_owner_writable_dirs(args):
         to_create.extend(summary_writable_dirs())
+        to_create.extend(nested_opencode_store_writable_dirs(args))
     if spec_read_marker_required(args):
         to_create.append(_spec_grounding_dir(args))
     if getattr(args, "route_id", None) or getattr(
@@ -1076,6 +1087,8 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             "--approval", args.approval,
             "--writable-root", str(args.artifact_root),
         ]
+        if getattr(args, "runtime_dir", ""):
+            command += ["--writable-root", str(args.runtime_dir)]
         if getattr(args, "report_bundle_root", None) is not None:
             command += ["--writable-root", str(args.report_bundle_root)]
         if owner_supervised:
@@ -1141,6 +1154,8 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         "--add-dir",
         args.artifact_root,
     ]
+    if getattr(args, "runtime_dir", ""):
+        cmd += ["--add-dir", str(args.runtime_dir)]
     cmd += codex_worker_arguments(getattr(args, "worker_runtime_env", None))
     if getattr(args, "report_bundle_root", None) is not None:
         cmd += ["--add-dir", str(args.report_bundle_root)]
@@ -1568,6 +1583,7 @@ def main(argv: list[str]) -> int:
         )
     try:
         args.artifact_root = resolve_artifact_root(args.worktree)
+        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(args.artifact_root)
         args.report_bundle_root = resolve_report_bundle_root(args.route_file, args.route_node)
     except ValueError as e:
         return fail("writable-root-resolution-failed", 64, detail=str(e), worktree=args.worktree)
@@ -2061,6 +2077,7 @@ def main(argv: list[str]) -> int:
             # `campaigns/<camp>/cycles/<cyc>/artifacts/` and never issue a
             # second lineage.
             **artifact_cycle_environment(os.environ),
+            "AGENT_RUNTIME_DIR": getattr(args, "runtime_dir", ""),
             "REPORT_BUNDLE_ROOT": str(args.report_bundle_root or ""),
             "AGENT_ROUTE_FILE": (
                 args.route_file
