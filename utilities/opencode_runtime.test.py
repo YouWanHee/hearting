@@ -15,6 +15,41 @@ import opencode_runtime as runtime
 
 
 class OpenCodeRunCodecTest(unittest.TestCase):
+    def test_launch_version_probe_uses_private_store_and_rejects_bad_versions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            script.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, pathlib, sys\n"
+                "assert pathlib.Path(os.environ['HOME']).is_relative_to(pathlib.Path(os.environ['TMPDIR']))\n"
+                "assert os.environ['XDG_DATA_HOME'] != '/user/data'\n"
+                "assert 'secret' not in os.environ\n"
+                "print('opencode 2.0.32')\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            version = runtime.probe_launch_version(
+                binary=str(script), cwd=temp, state_root=root,
+                environ={"PATH": os.environ.get("PATH", ""), "HOME": "/user",
+                         "XDG_DATA_HOME": "/user/data", "OPENAI_API_KEY": "secret"},
+            )
+            self.assertEqual(version, (2, 0, 32))
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_launch_version_probe_fails_closed_for_nonzero_or_malformed_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            for body in ("print('not a version')\n", "print('opencode 2.0.32')\nsys.exit(1)\n"):
+                script.write_text("#!/usr/bin/env python3\nimport sys\n" + body, encoding="utf-8")
+                script.chmod(0o700)
+                with self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                            "opencode-runtime-version-unavailable"):
+                    runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+
     def test_v1_flags_and_v2_provider_variant_are_separate(self):
         v1 = runtime.run_argv(binary="opencode", cwd="/work", agent="build",
                               model="opencode-go/model", variant="high", pure=True,

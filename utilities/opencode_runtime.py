@@ -16,10 +16,12 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from types import MappingProxyType
 from urllib.parse import quote
@@ -97,11 +99,7 @@ def parse_version(value: str | None) -> tuple[int, int, int] | None:
 
 
 @lru_cache(maxsize=16)
-def runtime_version(binary: str = "opencode") -> tuple[int, int, int] | None:
-    """Read the executable version once per process; never start a session."""
-    configured = os.environ.get("OPENCODE_RUNTIME_VERSION")
-    if configured:
-        return parse_version(configured)
+def _runtime_version_probe(binary: str) -> tuple[int, int, int] | None:
     # Test/injected command overrides are often scripts with unrelated
     # ``--version`` semantics. Never execute an arbitrary command merely to
     # identify it as OpenCode; callers can pass a known version through the
@@ -115,6 +113,66 @@ def runtime_version(binary: str = "opencode") -> tuple[int, int, int] | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     return parse_version((result.stdout or "") + "\n" + (result.stderr or ""))
+
+
+def runtime_version(binary: str = "opencode") -> tuple[int, int, int] | None:
+    """Return the launch binding before consulting the ambient probe cache."""
+    configured = os.environ.get("OPENCODE_RUNTIME_VERSION")
+    if configured:
+        return parse_version(configured)
+    return _runtime_version_probe(binary)
+
+
+runtime_version.cache_clear = _runtime_version_probe.cache_clear
+
+
+def probe_launch_version(*, binary: str = "opencode", cwd: str,
+                         state_root: str | Path,
+                         environ: Mapping[str, str] | None = None,
+                         timeout: float = 5) -> tuple[int, int, int]:
+    """Identify this launch's binary without reading or writing a user store.
+
+    The probe uses a private HOME and all four XDG roots beneath a temporary
+    directory in canonical dispatch state. Only non-secret process settings
+    needed to locate and execute the binary are inherited.
+    """
+    source = os.environ if environ is None else environ
+    path_value = source.get("PATH", os.defpath)
+    executable = shutil.which(binary, path=path_value)
+    if not executable:
+        raise OpenCodeRuntimeError("opencode-runtime-version-unavailable")
+    root = Path(state_root).resolve(strict=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix="opencode-version-", dir=root) as temp:
+            private = Path(temp)
+            home = private / "home"
+            home.mkdir(mode=0o700)
+            env = {"PATH": path_value, "HOME": str(home)}
+            for name in ("DATA", "CACHE", "STATE", "CONFIG"):
+                directory = private / name.lower()
+                directory.mkdir(mode=0o700)
+                env[f"XDG_{name}_HOME"] = str(directory)
+            env["OPENCODE_CONFIG_DIR"] = str(private / "config" / "opencode")
+            env["TMPDIR"] = str(private)
+            for name in ("LANG", "LC_ALL", "LC_CTYPE", "TERM"):
+                if source.get(name):
+                    env[name] = str(source[name])
+            for name in ("OPENCODE_DB", "OPENCODE_AUTH", "OPENCODE_DATA_DIR",
+                         "OPENCODE_CONFIG_CONTENT", "OPENCODE_RUNTIME_VERSION"):
+                env.pop(name, None)
+            result = subprocess.run(
+                [executable, "--version"], cwd=cwd, env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=timeout, check=False,
+            )
+            version = parse_version((result.stdout or "") + "\n" + (result.stderr or ""))
+            if result.returncode != 0 or version is None:
+                raise OpenCodeRuntimeError("opencode-runtime-version-unavailable")
+            return version
+    except OpenCodeRuntimeError:
+        raise
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+        raise OpenCodeRuntimeError("opencode-runtime-version-unavailable") from exc
 
 
 def is_v2(binary: str = "opencode", version: tuple[int, int, int] | None = None,

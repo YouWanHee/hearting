@@ -11747,12 +11747,36 @@ def attempt_row_never_started(fields: list[str]) -> bool:
     )
 
 
+def attempt_row_terminal_never_started(fields: list[str]) -> bool:
+    """True only for a terminal row carrying strict never-started fence proof."""
+    if len(fields) != 6 or fields[1] not in {"done", "cancelled", "killed"}:
+        return False
+    return terminal_attempt_never_started(fields[1], parse_registry_metadata(fields[5]))
+
+
+def terminal_attempt_never_started(status: str, metadata: Mapping[str, str]) -> bool:
+    """Metadata form of the same terminal no-start proof for semantic censuses."""
+    if status not in {"done", "cancelled", "killed"}:
+        return False
+    if metadata.get("launch_outcome") != "never-launched":
+        return False
+    if (metadata.get("launch_started") == "1" or metadata.get("launch_claimed") != "0"
+            or metadata.get("pid")):
+        return False
+    # A committed work result contradicts a never-launched disposition.
+    if (metadata.get("note") in SUCCESS_NOTES
+            or metadata.get("note") in {"completed-review-blocking", "dead-worker-fail"}
+            or metadata.get("failure_class") in {"pass", "success", "fail", "blocked"}):
+        return False
+    return True
+
+
 def attempt_row_withdrawn_before_launch(fields: list[str]) -> bool:
     """Identify a never-started registration withdrawn under the jobs lock.
 
-    An unclaimed open row may still be launched. Only a terminal row explicitly
-    closed as cancelled has lost that launch authority and can leave the round
-    census without hiding a real pre-launch failure.
+    An unclaimed open row may still be launched. This helper names only the
+    cancellation-specific subset; `attempt_row_terminal_never_started` is the
+    broader strict predicate used by round census and retry.
     """
 
     if len(fields) != 6 or not attempt_row_never_started(fields):

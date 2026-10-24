@@ -58,6 +58,25 @@ def route_bound_worker_writable_dirs(args) -> tuple[Path, ...]:
     return tuple(paths)
 
 
+def nested_opencode_store_writable_dirs(args, environ=None) -> tuple[Path, ...]:
+    """Open only OpenCode's native V2 store to a child-spawning Codex owner."""
+    eligible = getattr(
+        args, "nested_headless_network_eligible",
+        getattr(args, "nested_headless_network", False),
+    )
+    if not eligible or getattr(args, "worker_type", None) != "owner":
+        return ()
+    import os
+    env = os.environ if environ is None else environ
+    home = Path(env.get("HOME") or Path.home())
+    roots = (
+        Path(env.get("XDG_DATA_HOME") or home / ".local/share") / "opencode",
+        Path(env.get("XDG_STATE_HOME") or home / ".local/state") / "opencode",
+        Path(env.get("XDG_CACHE_HOME") or home / ".cache") / "opencode",
+    )
+    return tuple(path.expanduser().resolve(strict=False) for path in roots)
+
+
 def progress_writable_dirs(args) -> tuple[Path, ...]:
     """The two dispatch-state subdirectories an attempt writes progress into.
 

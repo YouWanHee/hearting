@@ -23,6 +23,10 @@ CONTEXT = DISPATCH.opencode_context
 
 class OpenCodeDispatchContextTest(unittest.TestCase):
     def setUp(self):
+        launch_version = mock.patch.object(
+            DISPATCH.opencode_runtime, "probe_launch_version", return_value=(2, 0, 32))
+        launch_version.start()
+        self.addCleanup(launch_version.stop)
         self.temp = tempfile.TemporaryDirectory(prefix="opencode-dispatch-context-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)

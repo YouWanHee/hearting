@@ -377,12 +377,15 @@ An optional `allocation.owner_order` in the selected dispatch defaults orders el
 Schema v4 may also define an optional top-level `worker_account` mapping for
 `claude`, `codex`, and `opencode`. It selects only the worker's authentication
 source: a Claude config directory, a Codex home for `auth.json`, or an OpenCode
-`XDG_DATA_HOME` for `opencode/auth.json`. Relative paths resolve from the
+V1 `XDG_DATA_HOME` for `opencode/auth.json`. Relative paths resolve from the
 launch cwd and `~` resolves from that launch's `HOME`. An omitted harness key
 keeps the existing source. Model affinity and allocation remain independent.
 Worker settings, permissions, hooks, models, and plugins continue to come from
 the parent config source. Credential contents are not copied or edited; Codex
-and OpenCode `auth.json` are linked from the selected source. Claude account
+and OpenCode V1 `auth.json` are linked from the selected source. OpenCode V2
+stores provider credentials and runtime state in its native XDG database and
+does not use `auth.json`; V2 account selection is not provided by
+`worker_account`. Claude account
 metadata and secure-storage path selection follow the selected config
 directory. OpenCode also accepts provider credentials from the inherited
 environment or a project `.env` ([CLI documentation](https://docs.opencode.ai/docs/cli/));
@@ -923,7 +926,7 @@ A legacy hash collision is diagnostic
      continues to encode this conductor with the compatibility owner worker
      type and `_kernel/owner`; standard+ capability ownership is a distinct
      semantic responsibility.
-   - **Partial parallel continuation:** the original immutable launch input, or the complete exact original registry rows for older batches, supplies the source manifest and its assignment hashes. Verify its sealed digest and each member binding before reserving the one failed leg. A current retry brief belongs to that leg's launch; the original group assignment and successful peer identities remain unchanged. The replacement keeps the source member fields except its attempt ID; its current parent and retry brief are recorded by the ordinary launch path. Reused PASS, quiescence, scope and independence checks remain in force on all three harnesses.
+   - **Partial parallel continuation:** the original immutable launch input, or the complete exact original registry rows for older batches, supplies the source manifest and its assignment hashes. Verify its sealed digest and each member binding before reserving the one failed leg. A current retry brief belongs to that leg's launch; the original group assignment and successful peer identities remain unchanged. The replacement keeps the source member fields except its attempt ID; its current parent and retry brief are recorded by the ordinary launch path. Reused PASS, quiescence, scope and independence checks remain in force on all three harnesses. The ordinary group `start` finds this shape itself: when one sealed member ended with the strict no-start proof and every other member holds its current PASS marker, any live owner of the route re-launches only that member, with no continuation file and no round consumed; a still-running peer returns the same-command wait. If that successor also fails to start, the next `start` keeps the peers on their realized tuples and places only the gap again through the ordinary harness assignment without every harness it could not start on; the step seal (`<identity>.step-<n>.json`) fixes that placement and identity, the governor admits the changed gap placement only against it, and exhausted candidates end in `parallel-headless-unavailable`.
    - **Full headless ceremony:** launch an adapter-specific headless main in the worktree. It acts as a complete main for that runtime, including team roles, hooks or preflight, and plan artifacts. The adapter owns noninteractive tool and permission setup and documents its cost realization. The top-level dispatch is a dispatch-depth-1 capability owner that returns only synthesis to main.
    - At `standard+`, the dispatch-depth-1 owner is a thin conductor. It dispatches compiled `code-plan`, `plan-check`, `code-execute`, `impl-review`, `code-test`, and `code-report` nodes through dispatch-depth-2 headless sessions, reads verdict/status metadata rather than stage bodies, and passes context only through files. A route stage is the semantic work and completion-gate unit; a worker session is only an execution-capacity unit. They are not one-to-one. The owner may keep a stage in one session or declare bounded first-class sub-sessions below the same route node when scope size, context pressure, or round-trip cost warrants it. That choice is owner discretion and does not require route recompilation. A declared `parallel_group` replaces member-level starts with one exact `dispatch-batch --parallel-group` transaction. Before any stage, the owner verifies that the artifact root and `spec/` exist.
    - Artifact relocation uses that same authority to protect live work. A no-live history move does not transfer parent authority, and historical redirects never authorize root-local writes.

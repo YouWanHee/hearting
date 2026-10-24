@@ -2104,6 +2104,23 @@ class DispatchContractTest(unittest.TestCase):
    with self.subTest(fields=fields):
     self.assertFalse(D.attempt_row_withdrawn_before_launch(fields))
 
+ def test_terminal_never_started_is_shared_and_rejects_conflicting_evidence(self):
+  base={"route_id":"rt-no-start","route_node":"plan-check","attempt_id":"att-no-start",
+        "launch_claimed":"0","launch_outcome":"never-launched"}
+  for status in ("done","cancelled","killed"):
+   fields=attempt_row(base,status=status).split("\t")
+   self.assertTrue(D.attempt_row_terminal_never_started(fields))
+   self.assertTrue(D.terminal_attempt_never_started(status,D.parse_registry_metadata(fields[5])))
+  negatives=(
+   ("open",base), ("running",base), ("done",{k:v for k,v in base.items() if k!="launch_claimed"}),
+   ("done",{**base,"launch_claimed":"1"}), ("done",{**base,"pid":"123"}),
+   ("done",{**base,"launch_started":"1"}), ("done",{**base,"launch_outcome":"started"}),
+   ("done",{**base,"note":"completed-marker"}),
+  )
+  for status,metadata in negatives:
+   with self.subTest(status=status,metadata=metadata):
+    self.assertFalse(D.attempt_row_terminal_never_started(attempt_row(metadata,status=status).split("\t")))
+
  def test_claimed_spawn_rechecks_parent_and_publishes_identity_under_lock(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"

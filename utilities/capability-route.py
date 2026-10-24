@@ -58,6 +58,7 @@ from dispatch_contract import (
     completion_marker_is_current,
     completion_attempt_readiness,
     attempt_row_withdrawn_before_launch,
+    attempt_row_terminal_never_started,
     completion_conflict_attempt,
     owner_closure_shape,
     _diff_attribution_execute_launch_head,
@@ -9178,7 +9179,8 @@ def review_round_records(lines, route_ids, node_id, *, jobs=None):
     return REVIEW_ROUND_CAP.logical_round_records(rows,jobs=jobs)
 
 def _review_round_rows(lines, route_id, node_id, *, jobs=None):
-    return [(fields[1], meta) for fields, meta in review_round_records(lines, {route_id}, node_id,jobs=jobs)]
+    return [(fields[1], meta) for fields, meta in review_round_records(lines, {route_id}, node_id,jobs=jobs)
+            if not attempt_row_terminal_never_started(fields)]
 
 def _node_revision_records(route, node_id, jobs=None):
     """Every SD-154 `revision` record in one node's own completion-dir

@@ -634,11 +634,14 @@ the release the launch resolved, and the owner tree gets that same release as
 its `AGENT_HOME` (not the moving pointer), so a release activated while the
 owner runs changes neither; a projection check failure names
 `reason=codex-runtime-projection-mismatch`. Dispatch-depth-2 workers
-do not inherit the network widening. The outer Codex sandbox also admits only
-the existing harness `.core-grounding` directory and Claude `session-env`
-directory as downstream runtime scratch roots. This keeps adapter write guards
-functional and lets a checked Codex→Claude worker initialize Bash without
-making the rest of either runtime home writable.
+do not inherit the network widening. The outer Codex sandbox admits the
+existing harness `.core-grounding` directory and Claude `session-env` directory
+as downstream runtime scratch roots. For a child-spawning owner it also admits
+OpenCode's exact `opencode` subdirectories under the user's XDG data, state, and
+cache roots, where V2 keeps its native database and service state. No broader
+runtime home is opened. This keeps adapter write guards functional and lets a
+checked Codex→Claude worker initialize Bash without making the rest of either
+runtime home writable.
 Broker v1/v2 records remain readable for migration, and `preflight.sh broker`
 retains only diagnostic `status` and idempotent `stop` during the drain release.
 
