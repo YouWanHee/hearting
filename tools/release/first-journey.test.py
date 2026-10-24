@@ -203,7 +203,9 @@ if args[:2]==['auth','import']:
  (data/'state.json').write_bytes(p.read_bytes()); (data/'import-path').write_text(str(p)); raise SystemExit(0)
 if args[:2]==['auth','export']:
  p=pathlib.Path((data/'import-path').read_text()); payload=(data/'state.json').read_bytes()
- if cfg.get('incomplete') and cfg.get('task_done'): payload=b'[]'
+ if cfg.get('fractional_expiry') and cfg.get('task_done'):
+  payload=json.dumps([{'id':'fixture-oauth','integrationID':'provider','label':'fake oauth','active':True,'value':{'type':'oauth','methodID':'fixture-method','access':'fixture-access','refresh':'fixture-refresh','expires':1.5}}]).encode()
+ elif cfg.get('incomplete') and cfg.get('task_done'): payload=b'[]'
  log('export',temp_exists=p.exists(),size=len(payload)); sys.stdout.buffer.write(payload); raise SystemExit(0)
 if args[:1]==['run']:
  if '--help' in args: log('run-help'); print('Usage --standalone --format --session'); raise SystemExit(0)
@@ -211,7 +213,7 @@ if args[:1]==['run']:
  (home/'.runtime/routes').mkdir(parents=True,exist_ok=True); (home/'.runtime/routes/f.json').write_text('{}')
  if first and cfg.get('rotate'):
   state=json.loads((data/'state.json').read_text()); state[0]['value']['key']+='-rotated'; state[0]['label']+=' rotated'; (data/'state.json').write_text(json.dumps(state))
- if first and cfg.get('incomplete'): cfg['task_done']=True; (world/'fake-config.json').write_text(json.dumps(cfg))
+ if first and (cfg.get('incomplete') or cfg.get('fractional_expiry')): cfg['task_done']=True; (world/'fake-config.json').write_text(json.dumps(cfg))
  if first and cfg.get('interrupt'):
   (home/'pid').write_text(str(os.getpid())); time.sleep(30)
  if cfg.get('run_sleep'): time.sleep(cfg['run_sleep'])
@@ -319,12 +321,15 @@ raise SystemExit(9)
         self.assertEqual(result["after"],result["before"])
 
     def test_fake_v2_journey_unchanged_and_incomplete_exports_preserve_store(self):
-        for config in ({}, {"incomplete":True}):
+        for config in ({}, {"incomplete":True}, {"fractional_expiry":True}):
             with self.subTest(config=config):
                 result=self._run_fake_v2_journey(config)
                 self.assertEqual(result["after"],result["before"])
                 self.assertEqual(result["inode_before"],result["inode_after"])
                 self.assertEqual(len([e for e in result["events"] if e["event"]=="export"]),2)
+                if config.get("fractional_expiry"):
+                    model=result["record"]["harnesses"][0]["model"]
+                    self.assertEqual(model["auth_persist_warning"],"auth-export-incomplete")
 
     def test_fake_v2_journey_interrupt_persists_once_and_reaps_child(self):
         result=self._run_fake_v2_journey({"rotate":True,"interrupt":True},interrupt=True)
@@ -348,12 +353,14 @@ raise SystemExit(9)
                  "value": {"type": "oauth", "methodID": "method", "access": "a", "refresh": "r", "expires": 0}}
         external = {"id": "e", "integrationID": "provider", "label": "External", "active": True,
                     "value": {"type": "external", "methodID": "method"}}
+        oauth_float_zero = {**oauth, "value": {**oauth["value"], "expires": 0.0}}
         def encoded(rows): return json.dumps(rows, allow_nan=True).encode()
-        for rows in ([key], [oauth], [key, external]):
+        for rows in ([key], [oauth], [oauth_float_zero], [key, external]):
             self.assertTrue(fj.credential_complete("opencode", encoded(rows), "v2"))
         rejected = ([], [external], [{**key, "value": {"type": "key", "key": ""}}],
                     [{**oauth, "value": {**oauth["value"], "access": ""}}],
                     [{**oauth, "value": {**oauth["value"], "expires": True}}],
+                    [{**oauth, "value": {**oauth["value"], "expires": 1.5}}],
                     [{**key, "id": ""}], [key, key], [{**key, "value": {"type": "unknown", "key": "x"}}])
         for rows in rejected:
             with self.subTest(rows=rows):

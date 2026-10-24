@@ -71,7 +71,8 @@ def credential_complete(harness: str, data: bytes, generation: str | None = None
                         or not isinstance(credential.get("access"), str) or not credential["access"]
                         or not isinstance(credential.get("refresh"), str) or not credential["refresh"]
                         or type(expiry) not in (int, float)
-                        or (isinstance(expiry, float) and not math.isfinite(expiry)) or expiry < 0):
+                        or (isinstance(expiry, float) and not math.isfinite(expiry)) or expiry < 0
+                        or (isinstance(expiry, float) and not expiry.is_integer())):
                     return False
                 transferable = True
             elif kind == "external":
