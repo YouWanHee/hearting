@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+from contextlib import chdir
 import json
 import socket
 import subprocess
@@ -288,7 +289,10 @@ class RuntimeSnapshotTest(unittest.TestCase):
             current.write_text("before\n", encoding="utf-8")
             socket_path = managed / "app-server.sock"
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            listener.bind(str(socket_path))
+            # Bind the same real socket without spending AF_UNIX's path budget
+            # on the runner's potentially long temporary-directory prefix.
+            with chdir(root):
+                listener.bind(str(socket_path.relative_to(root)))
             try:
                 record = activation._copy_snapshot(
                     state, root / "backup", 0,
