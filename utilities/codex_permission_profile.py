@@ -14,6 +14,7 @@ import subprocess
 PROFILE_NAME = "hearting_linked_commit"
 OWNER_OBSERVE_PROFILE_NAME = "hearting_owner_observe"
 OWNER_COMMIT_NO_NETWORK_PROFILE_NAME = "hearting_linked_commit_no_network"
+RECORDISH_PROFILE_NAME = "hearting_non_git_record"
 TURN_PERMISSIONS_MIN_VERSION = (0, 160, 0)
 
 
@@ -135,6 +136,50 @@ def owner_turn_profile_config(worktree: str, writable_roots: list[str],
     }
 
 
+def recordish_profile_config(worktree: str, writable_roots: list[str],
+                             route_file: str | None, *, network: bool = False) -> dict | None:
+    """Build a read-only Codex profile with only sealed artifact/runtime write roots."""
+    if not route_file or not named_profiles_available():
+        return None
+    try:
+        from dispatch_contract import launch_repository_identity
+        _identity, kind = launch_repository_identity(worktree, route_file)
+        if kind != "non-git":
+            return None
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        cwd = Path(worktree).resolve()
+        artifact = Path(route["artifact_root"]).resolve()
+        if artifact == cwd:
+            return None
+        artifact_ancestor = artifact in cwd.parents
+        allowed: set[str] = set()
+        for raw in writable_roots:
+            root = Path(raw).expanduser().resolve(strict=False)
+            # Never grant the cwd or an ancestor of it. An in-cwd grant must be
+            # contained by the route's canonical artifact root.
+            if root == cwd or root in cwd.parents:
+                continue
+            if root == cwd or cwd in root.parents:
+                if artifact_ancestor:
+                    continue
+                if not (root == artifact or artifact in root.parents):
+                    continue
+            allowed.add(str(root))
+        if str(artifact) not in allowed:
+            allowed.add(str(artifact))
+        filesystem = {root: "write" for root in sorted(allowed)}
+        if artifact_ancestor:
+            filesystem[str(cwd)] = "read"
+        return {
+            "default_permissions": RECORDISH_PROFILE_NAME,
+            "permissions": {RECORDISH_PROFILE_NAME: {
+                "extends": ":read-only",
+                "filesystem": filesystem,
+                "network": {"enabled": bool(network)},
+            }},
+        }
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+        return None
 def _profile(filesystem: dict, network: bool) -> dict:
     return {
         "default_permissions": PROFILE_NAME,

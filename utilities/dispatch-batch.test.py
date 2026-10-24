@@ -3312,6 +3312,14 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertTrue(stderr.rstrip().endswith("ERR"))
 
     def _subdivision_route_and_manifest(self, sessions):
+        # The admission baseline and aggregate audit model a sealed Git route;
+        # give this fixture a real HEAD so strict Git-observation failures stay
+        # distinct from an empty/non-Git test folder.
+        subprocess.run(["git", "-C", str(self.base), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(self.base), "config", "user.email", "fixture@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.base), "config", "user.name", "Fixture"], check=True)
+        subprocess.run(["git", "-C", str(self.base), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.base), "commit", "-q", "--allow-empty", "-m", "fixture"], check=True)
         node = dict(replica_node("plan", "codex"))
         node["completion_gate"] = "code-plan-check"
         node["subdivision"] = {
@@ -3321,6 +3329,8 @@ class DispatchBatchTest(unittest.TestCase):
         node2 = dict(replica_node("plan-replica", "claude"))
         node2["completion_gate"] = "code-plan-check"
         route = dict(self.route)
+        route["source_commit"] = subprocess.check_output(
+            ["git", "-C", str(self.base), "rev-parse", "HEAD"], text=True).strip()
         route["nodes"] = [node, node2]
         for session in sessions:
             Path(session["phase_brief"]).write_text("slice brief\n", encoding="utf-8")
