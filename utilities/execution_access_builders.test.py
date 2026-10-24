@@ -748,6 +748,34 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         self.assertIn({"action": "edit", "resource": "*", "effect": "ask"},
                       denied["agents"]["build"]["permissions"])
 
+    def test_opencode_recordish_overlay_denies_cwd_and_allows_only_artifacts_v1_v2(self) -> None:
+        base = {"permission": {"edit": {"*": "allow"},
+                                "write": {"*": "allow"},
+                                "patch": {"*": "allow"}},
+                "agent": {"build": {"permission": {"edit": "allow", "write": "allow",
+                                                        "patch": "allow"}}}}
+        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps(base)}):
+            v1 = json.loads(self.opencode.scoped_external_directory_config(
+                str(self.artifact), worktree=str(self.worktree), selected_agent="build",
+                recordish=True))
+        for tool in ("edit", "write", "patch"):
+            global_rules = v1["permission"][tool]
+            local_rules = v1["agent"]["build"]["permission"][tool]
+            for rules in (global_rules, local_rules):
+                self.assertEqual(rules[str(self.worktree.resolve())], "deny")
+                self.assertEqual(rules[f"{self.worktree.resolve()}/**"], "deny")
+                self.assertEqual(rules[str(self.artifact.resolve())], "allow")
+                self.assertEqual(rules[f"{self.artifact.resolve()}/**"], "allow")
+        with mock.patch.object(self.opencode.opencode_runtime, "is_v2", return_value=True), \
+             mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps({
+                 "permissions": [{"action": "edit", "resource": "*", "effect": "allow"}],
+             })}):
+            v2 = json.loads(self.opencode.scoped_external_directory_config(
+                str(self.artifact), worktree=str(self.worktree), recordish=True))
+        rules = v2["permissions"]
+        self.assertIn({"action": "edit", "resource": str(self.worktree.resolve()), "effect": "deny"}, rules)
+        self.assertIn({"action": "edit", "resource": str(self.artifact.resolve()), "effect": "allow"}, rules)
+
     def test_opencode_v2_action_interleaving_and_alias_collisions_keep_native_effects(self) -> None:
         import fnmatch
         readonly = self.root / "readonly-interleaved"

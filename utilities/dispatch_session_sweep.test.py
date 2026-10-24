@@ -384,6 +384,23 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         again, _ = SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-owner")
         self.assertEqual(again, [])
 
+    def test_records_past_the_prompt_budget_stay_pending_for_the_next_prompt(self):
+        # Claude cancels a prompt hook at 10 s; a slow sweep hands out what it reached instead.
+        self._seed()
+        later = "delivery-" + "b" * 32
+        child = "att-0000000000000000000000000000cccc"
+        receipt = _receipt()
+        receipt["children"] = [dict(receipt["children"][0], attempt_id=child)]
+        self._seed(delivery_id=later, attempt_ids=[child], row_revisions={child: "deadbeef"},
+                   receipt=receipt)
+        with mock.patch.object(SWEEP, "DELIVER_BUDGET_SECONDS", 0):
+            first, _ = SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-owner")
+            self.assertEqual(len(first), 1)
+            left = ({"delivery-" + "a" * 32, later} - {first[0]["delivery_id"]}).pop()
+            self.assertEqual(PD.read(self.root, "sess-owner", left)["state"], "pending")
+            second, _ = SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-owner")
+        self.assertEqual([record["delivery_id"] for record in second], [left])
+
     def test_sessionstart_activation_leaves_one_recovery_request_to_hook_finally(self):
         self.root.mkdir(parents=True, exist_ok=True)
         with mock.patch.object(HOOK, "resolve_agent_home", return_value=ROOT), \
