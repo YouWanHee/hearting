@@ -27,8 +27,16 @@ class JourneyTests(unittest.TestCase):
     def test_safe_root_rejects_home_and_nas(self):
         with self.assertRaises(ValueError):
             fj.safe_root(str(Path.home()), "root", [Path.home(), Path("/home/nas")])
-        if fj.platform.system() == "Linux":
-            self.assertEqual(fj.safe_root("/tmp", "local-root", [Path.home(), Path("/home/nas")]), Path("/tmp"))
+        # Isolated test runners may put HOME under /tmp, so use a private tree.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); fake_home = base / "home"; fake_home.mkdir()
+            forbidden = [fake_home, Path("/home/nas")]
+            for unsafe in (fake_home / "world", base):  # inside, or an ancestor of, a protected path
+                with self.assertRaises(ValueError):
+                    fj.safe_root(str(unsafe), "local-root", forbidden)
+            local = base / "local"
+            if fj.platform.system() == "Linux" and Path.home().resolve() not in local.parents:
+                self.assertEqual(fj.safe_root(str(local), "local-root", forbidden), local)
 
     def test_auth_allowlists_are_native_credential_files(self):
         self.assertEqual(fj.AUTH_NAMES["claude"], [".credentials.json"])
