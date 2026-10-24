@@ -55,6 +55,94 @@ class BatchLogDirAdmissionTest(unittest.TestCase):
             self.assertFalse(outside.exists())
 
 
+class PairModelProposalTest(unittest.TestCase):
+    def test_same_harness_pair_proposes_next_declared_model_without_changing_seals(self):
+        nodes = [
+            ({"id": "plan-a", "model_profile": "deep", "parallel_leg_index": 0}, "claude", "same", 1),
+            ({"id": "plan-b", "model_profile": "balanced-deep", "parallel_leg_index": 1}, "claude", "same", 1),
+        ]
+        profiles, diagnostic = BATCH._pair_model_proposals(nodes)
+        self.assertEqual(profiles, {"plan-b": "balanced"})
+        self.assertEqual(diagnostic["reason"], "proposed")
+        self.assertEqual([row[0]["model_profile"] for row in nodes], ["deep", "balanced-deep"])
+
+    def test_distinct_harness_pair_is_outside_model_rotation(self):
+        nodes = [
+            ({"id": "plan-a", "model_profile": "deep"}, "claude", "same", 1),
+            ({"id": "plan-b", "model_profile": "deep"}, "codex", "same", 1),
+        ]
+        profiles, diagnostic = BATCH._pair_model_proposals(nodes)
+        self.assertEqual(profiles, {})
+        self.assertEqual(diagnostic["reason"], "distinct-harness")
+
+    def test_concrete_model_pin_is_preserved_but_profile_only_selection_can_rotate(self):
+        from model_config import resolve_config
+        from model_profile import resolve_profile_values
+        config, _ = resolve_config("claude", source_root=ROOT)
+        pinned_model = resolve_profile_values("claude", config, "balanced-deep")["model"]
+        nodes = [
+            ({"id": "plan-a", "model_profile": "deep", "parallel_leg_index": 0}, "claude", "same", 1),
+            ({"id": "plan-b", "model_profile": "balanced-deep", "parallel_leg_index": 1}, "claude", "same", 1),
+        ]
+        profiles, diagnostic = BATCH._pair_model_proposals(nodes, route={
+            "selection_pins": {"contract_version": 1,
+                               "worker": {"harness": "claude", "model": pinned_model, "effort": None}}
+        })
+        self.assertEqual(profiles, {})
+        self.assertEqual(diagnostic["reason"], "explicit-model")
+        profiles, _ = BATCH._pair_model_proposals(nodes, route={
+            "explicit_profiles": {"plan-b": "balanced-deep"}
+        })
+        self.assertEqual(profiles, {"plan-b": "balanced"})
+
+    def test_limited_target_keeps_both_sealed_profiles(self):
+        nodes = [
+            ({"id": "plan-a", "model_profile": "deep", "parallel_leg_index": 0}, "claude", "same", 1),
+            ({"id": "plan-b", "model_profile": "balanced-deep", "parallel_leg_index": 1}, "claude", "same", 1),
+        ]
+        with mock.patch("dispatch_capacity_evidence.usage_states",
+                        return_value={"claude": "limited(model-quota)"}):
+            profiles, diagnostic = BATCH._pair_model_proposals(nodes, jobs=Path("/tmp/jobs.log"))
+        self.assertEqual(profiles, {})
+        self.assertEqual(diagnostic["reason"], "target-limited")
+
+    def test_no_different_declared_model_records_unavailable(self):
+        from model_config import resolve_config
+        config, receipt = resolve_config("claude", source_root=ROOT)
+        config = dict(config)
+        for profile in ("balanced-deep", "balanced", "light"):
+            config["CFG_MODEL_PROFILE_" + profile.upper().replace("-", "_")] = "deep:medium"
+        nodes = [
+            ({"id": "plan-a", "model_profile": "deep", "parallel_leg_index": 0}, "claude", "same", 1),
+            ({"id": "plan-b", "model_profile": "balanced-deep", "parallel_leg_index": 1}, "claude", "same", 1),
+        ]
+        with mock.patch("model_config.resolve_config", return_value=(config, receipt)):
+            profiles, diagnostic = BATCH._pair_model_proposals(nodes)
+        self.assertEqual(profiles, {})
+        self.assertEqual(diagnostic["reason"], "unavailable")
+
+    def _receipt(self, models):
+        args = SimpleNamespace(parallel_group="plan")
+        legs = [{"attempt_id": "att-a"}, {"attempt_id": "att-b"}]
+        results = [{"attempt_id": "att-a", "launch_state": "started", "registered": "1",
+                    "started": "1", "child_spawned": "1", "model": models[0], "node": "a"},
+                   {"attempt_id": "att-b", "launch_state": "started", "registered": "1",
+                    "started": "1", "child_spawned": "1", "model": models[1], "node": "b"}]
+        axes = []
+        receipt, _ = BATCH.batch_receipt(
+            args=args, lifecycle="detached", independence="persona", required_axes=["model"],
+            realized_axes=axes, degradation_reason="", legs=legs, results=results, admitted=2)
+        return receipt
+
+    def test_realized_model_axis_uses_actual_receipt_models(self):
+        receipt = self._receipt(("opus", "sonnet"))
+        self.assertIn("model", receipt["realized_independence_axes"])
+
+    def test_effort_or_variant_does_not_create_model_axis(self):
+        receipt = self._receipt(("opus", "opus"))
+        self.assertNotIn("model", receipt["realized_independence_axes"])
+
+
 def candidate(adapter: str, hop: str, ordinal: int) -> dict[str, object]:
     return {
         "fallback_hop": hop,
@@ -4509,7 +4597,8 @@ class NodeLaunchCommandTest(unittest.TestCase):
 
     def command(self, qa):
         leg = {"node": "retrieval", "adapter": "codex", "slug": "s", "attempt_id": "att-x",
-               "hop": "same-harness-headless", "ordinal": 0}
+               "hop": "same-harness-headless", "ordinal": 0,
+               "pair_model_profile": "balanced"}
         return BATCH.node_launch_command(
             route_path=Path("/r.json"), leg=leg, parent="owner", prompt_text="p",
             reviewed_evidence=None, jobs=Path("/jobs.log"), parent_attempt="att-parent",
@@ -4525,6 +4614,13 @@ class NodeLaunchCommandTest(unittest.TestCase):
 
     def test_unset_qa_is_omitted(self):
         self.assertNotIn("--qa", self.command(None))
+
+    def test_pair_profile_hint_is_dispatch_node_owned_before_separator(self):
+        command = self.command(None)
+        cut = command.index("--")
+        self.assertIn("--pair-model-profile", command[:cut])
+        self.assertEqual(command[command.index("--pair-model-profile") + 1], "balanced")
+        self.assertNotIn("--pair-model-profile", command[cut:])
 
 
 class SlicesOneCommandTest(unittest.TestCase):
