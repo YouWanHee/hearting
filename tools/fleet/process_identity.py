@@ -257,12 +257,7 @@ def _proc_argv(pid, *, max_bytes=32768):
     return argv
 
 
-def is_native_resume_argv(argv, harness, session_id=None):
-    """Validate a native launcher's original resume argv without rewriting it.
-
-    An absolute launcher path is accepted only by basename; callers must still
-    obtain the argv from the process-bound native session identity below.
-    """
+def _valid_native_launcher_argv(argv, harness):
     if (harness not in {"claude", "codex", "opencode"} or not isinstance(argv, list)
             or not argv or len(argv) > 64):
         return False
@@ -271,17 +266,113 @@ def is_native_resume_argv(argv, harness, session_id=None):
     if sum(len(arg.encode("utf-8", "surrogatepass")) for arg in argv) > 8192:
         return False
     executable = argv[0]
-    if not (executable == harness or
-            os.path.isabs(executable) and os.path.basename(executable) == harness):
+    return executable == harness or os.path.isabs(executable) and os.path.basename(executable) == harness
+
+
+def _canonical_resume_argv(harness, session_id):
+    return ([harness, "--resume", session_id] if harness == "claude" else
+            [harness, "resume", session_id] if harness == "codex" else
+            [harness, "--session", session_id])
+
+
+def _resume_selector(argv, harness, session_id):
+    """Return the selector token index, or canonical/None for ambiguous/sidless."""
+    args = argv[1:]
+    selectors = {"claude": {"--resume", "-r"}, "codex": set(),
+                 "opencode": {"--session", "-s"}}[harness]
+    value_options = {
+        "claude": {"--model", "-m", "--permission-mode", "--settings", "--setting-sources"},
+        "codex": {"-c", "--config", "--model", "--sandbox", "--ask-for-approval", "--color"},
+        "opencode": {"--model", "-m", "--agent", "--variant", "--format", "--dir", "-D"},
+    }[harness]
+    flags = {"claude": {"--verbose", "--debug", "--dangerously-skip-permissions", "--print"},
+             "codex": {"--full-auto", "--yolo", "--oss", "--search", "--no-alt-screen"},
+             "opencode": {"--help", "--version", "--print-logs"}}[harness]
+    found = []
+    ambiguous = False
+    continue_mode = False
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if token == "--":
+            if i + 1 < len(args):
+                ambiguous = True
+            break
+        if harness == "codex" and token in {"resume", "fork"}:
+            if token == "fork":
+                return _canonical_resume_argv(harness, session_id)
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                continue_mode = True
+                i += 1
+            else:
+                found.append((i + 1, None))
+                i += 2
+            continue
+        if token in {"--continue", "--last", "-c"} and harness != "codex":
+            continue_mode = True
+        if token in {"--fork-session", "--fork", "--fork=true"} or token.startswith("--fork=") and token != "--fork=false":
+            return _canonical_resume_argv(harness, session_id)
+        if token in selectors:
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                i += 1
+            else:
+                found.append((i + 1, None))
+                i += 2
+            continue
+        selector = next((option for option in selectors if token.startswith(option + "=")), None)
+        if selector:
+            found.append((i, selector + "="))
+            i += 1
+            continue
+        if token.startswith("-"):
+            key = token.split("=", 1)[0]
+            if key in value_options and "=" not in token:
+                if i + 1 >= len(args):
+                    ambiguous = True
+                    i += 1
+                else:
+                    i += 2
+                continue
+            if key in flags or "=" in token:
+                i += 1
+                continue
+            ambiguous = True
+            i += 1
+            continue
+        # Positional project paths, subcommands, and prompts are unsafe to replay.
+        ambiguous = True
+        i += 1
+    if not found:
+        return None
+    if len(found) != 1 or continue_mode or ambiguous:
+        return _canonical_resume_argv(harness, session_id)
+    index, prefix = found[0]
+    result = [harness, *args]
+    result[index + 1] = f"{prefix}{session_id}" if prefix else session_id
+    if len(result) > 64 or sum(len(arg.encode("utf-8", "surrogatepass")) for arg in result) > 8192:
+        return None
+    return result
+
+
+def is_native_resume_argv(argv, harness, session_id=None):
+    """Validate native launcher structure, or a usable wire command when SID is given."""
+    if not _valid_native_launcher_argv(argv, harness):
         return False
-    return session_id is None or isinstance(session_id, str) and session_id in argv
+    return session_id is None or (isinstance(session_id, str) and bool(session_id)
+                                  and "\0" not in session_id
+                                  and native_resume_wire_argv(argv, harness, session_id) is not None)
 
 
 def native_resume_wire_argv(argv, harness, session_id=None):
-    """Translate proven raw argv to Herdr's plain-command resume wire form."""
-    if not is_native_resume_argv(argv, harness, session_id):
+    """Build a bounded Herdr resume command using the current proven native SID."""
+    if (not _valid_native_launcher_argv(argv, harness) or not isinstance(session_id, str)
+            or not session_id or "\0" in session_id):
         return None
-    return [harness, *argv[1:]]
+    canonical = _canonical_resume_argv(harness, session_id)
+    if (len(canonical) > 64 or
+            sum(len(arg.encode("utf-8", "surrogatepass")) for arg in canonical) > 8192):
+        return None
+    return _resume_selector(argv, harness, session_id)
 
 
 def launch_context(pid, harness, session_id):

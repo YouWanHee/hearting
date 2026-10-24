@@ -41,6 +41,17 @@ smaller budget.
    - Does every risky step have a concrete verification method and rollback boundary?
    - Does the Verification section contain **concrete, executable test commands**?
      Vague descriptions like "test later" or an empty section are 🔴.
+   - **Reuse:** If the repository already implements the same function, does the
+     plan extend it? A new module or code path beside it needs a reason weighed
+     against a rough size comparison with extending. Report 🔴 when that
+     comparison is missing and the new path is most of the change, or when its
+     expected size is far beyond what the goal suggests.
+   - **Long runs:** Report 🔴 when the plan keeps a full training epoch, a long
+     regression suite, or another single run expected to exceed about 30 minutes
+     in the code stage without saying why, or repeats evidence a later stage or
+     leg already produces. Compare total verification time with the attempt
+     budget shown in the prompt.
+   - **Judge substance:** A missing estimate or table alone is not a finding.
    - Are source ownership and stage write boundaries respected?
 4. If the working tree (or an ancestor) contains
    `<artifact-root>/spec/pipeline_state.yaml`, read `spec/prd.md` and check the plan

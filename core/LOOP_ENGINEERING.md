@@ -31,11 +31,15 @@ describe how to reach them; judge any structure or change against these first.
    execution. There are no per-harness exception branches or duplicated
    judgments. (See §3 and §5.)
 
-For durable completion delivery, an exact recipient-side receipt remains valid
-after the transport claim expires or changes owner. The shared delivery record
-may settle only the matching delivery from that verified receipt; receiving a
-notice does not mean its work or follow-up has completed. Emission remains
-recoverable when no receipt exists.
+For durable completion delivery, an exact native receipt remains valid after
+the transport claim expires or changes owner. All carriers reuse that receipt
+through the delivery's existing immutable identity and `ack_received` CAS; an
+ACK write failure leaves the verified receipt usable for suppressing another
+send while settlement is retried naturally. Output, process exit, queue
+acceptance, or an incomplete native-history read is not receipt evidence.
+Receiving a notice settles delivery only: it does not complete the work or its
+follow-up. When native receipt evidence is absent or unknown, emission remains
+recoverable through the existing fallback.
 
 ## 1. The unit of a feature is a responsibility carried to the end
 
@@ -140,6 +144,13 @@ An observer lease transfer publishes the successor's existing PID/start record
 under the duty's existing update lock before that successor can claim it.
 The inherited descriptor and that record carry the transfer without another
 CLI input or a second recovery owner.
+
+When several consumers need the same expensive read, the existing runner may
+publish one narrow, identity-bound observation for them to reuse. Each detached
+watch still owns its native result, watch id, deadline, receipt, and ack; a
+shared projection only answers readiness and never settles another watch. A
+consumer with a missing or stale projection reconnects to its existing duty
+and observes again without replaying work already owned by its live runner.
 
 Session hooks request that existing recovery runner and return; they do not
 replay global settlement history before delivering and acknowledging the

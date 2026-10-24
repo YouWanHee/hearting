@@ -479,10 +479,18 @@ class ObligationStoreTest(unittest.TestCase):
             self.store.update("batch-1", result="failed")
 
     def test_ordinary_pane_without_registry_row_is_valid_native_evidence(self):
+        from peer_read_context import PeerReadContext
+
         jobs = self.root / "dispatch" / "jobs.log"
         work, state = obligations.bound_work_for_pane(
             "w1:p4", "codex", "thread-1", jobs=jobs)
         self.assertEqual((work, state), ((), "observed"))
+        shared_work, shared_state = obligations.bound_work_for_pane(
+            "w1:p4", "codex", "thread-1", jobs=jobs,
+            read_context=PeerReadContext(registry_append_only=True),
+            registry_append_only=True)
+        self.assertEqual((shared_work, shared_state), ((), "observed"),
+                         "a shared read context preserves a freshly observed absence")
         ready = obligations.pane_readiness(
             server="fixture-server", pane="w1:p4", harness="codex",
             session_id="thread-1", pid_birth="pid:9@start:4",
@@ -913,10 +921,14 @@ class ObligationStoreTest(unittest.TestCase):
         self.assertIsNone(self.store.claim_phase("retire-race", {"waiting"}, "exit-requested"))
 
     def test_unreadable_binding_source_is_unknown(self):
+        from peer_read_context import PeerReadContext
+
         jobs = self.root / "not-a-file"
         jobs.mkdir()
         work, state = obligations.bound_work_for_pane(
-            "w1:p4", "codex", "thread-1", jobs=jobs)
+            "w1:p4", "codex", "thread-1", jobs=jobs,
+            read_context=PeerReadContext(registry_append_only=True),
+            registry_append_only=True)
         self.assertEqual((work, state), ((), "unknown"))
         ready = obligations.pane_readiness(
             server="fixture-server", pane="w1:p4", harness="codex",
@@ -1265,7 +1277,11 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
 
     def test_parent_watch_uses_exact_delivery_without_rechecking_owner_closure(self):
         from dispatch_contract import ATTEMPT_SCHEMA_VERSION, ObservedAttemptLiveness
+        import dispatch_pending_delivery as pending
         jobs = self.root / "parent-delivery-jobs.log"
+        receipt = {"schema_version": 1, "attempt_id": "att-parent-delivery",
+                   "route_id": "rt-parent-delivery", "route_node": "execute"}
+        receipt_digest = pending._canonical_receipt_digest(receipt)
         metadata = {
             "attempt_schema_version": str(ATTEMPT_SCHEMA_VERSION), "dispatch_depth": "1",
             "transport": "headless", "execution_surface": "registered-headless",
@@ -1275,49 +1291,65 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
             "route_node": "execute", "attempt_id": "att-parent-delivery", "parent_sid": "sid-a",
             "parent_harness": "codex", "failure_class": "pass", "note": "completed-marker",
             "delivery_intent": "1", "delivery_id": "delivery-parent",
-            "delivery_receipt_digest": "digest-parent", "delivery_row_revision": "revision-parent",
+            "delivery_receipt_digest": receipt_digest,
+            "delivery_row_revision": "revision-parent",
             "parent_completion_delivery": "codex-native-queue",
         }
         jobs.write_text("2026-10-20T00:00:00Z\tdone\trepo\t-\tchild\t" + ",".join(
             f"{key}={value}" for key, value in metadata.items()) + "\n")
-        record = {"delivery_id": "delivery-parent", "attempt_ids": ["att-parent-delivery"],
-                  "recipient_kind": "codex-native-queue", "receipt_digest": "digest-parent",
-                  "row_revisions": {"att-parent-delivery": "revision-parent"}, "state": "acked"}
-        with mock.patch("dispatch_seat_handover._handover_binding_keys_for_session",
-                        return_value=(("rt-parent-delivery", "sha256:" + "b" * 64, "execute"),)), \
-             mock.patch("dispatch_seat_handover.effective_parent", return_value="sid-current"), \
-             mock.patch("dispatch_seat_handover.effective_parent_harness", return_value="codex"), \
-             mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
-                        ObservedAttemptLiveness("dead", "fixture", "quiescent", "fixture")), \
-             mock.patch("dispatch_terminal_commit.owner_completion_state",
-                        side_effect=AssertionError("parent readiness must not inspect closure")), \
-             mock.patch("dispatch_pending_delivery.read", return_value=record):
-            work, state = obligations.bound_work_for_pane("w3:p7", "codex", "sid-current", jobs=jobs)
+        pending.create(
+            root=jobs.parent, recipient_kind="codex-native-queue", recipient_key="sid-a",
+            delivery_id="delivery-parent", session_generation="",
+            session_generation_supported="0", attempt_ids=["att-parent-delivery"],
+            parent_attempt_id="att-parent-owner", route_id="rt-parent-delivery",
+            route_node="execute", receipt=receipt,
+            receipt_digest=receipt_digest,
+            row_revisions={"att-parent-delivery": "revision-parent"},
+        )
+
+        def observe():
+            with mock.patch("dispatch_seat_handover._handover_binding_keys_for_session",
+                            return_value=(("rt-parent-delivery", "sha256:" + "b" * 64, "execute"),)), \
+                 mock.patch("dispatch_seat_handover.effective_parent", return_value="sid-current"), \
+                 mock.patch("dispatch_seat_handover.effective_parent_harness", return_value="codex"), \
+                 mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
+                            ObservedAttemptLiveness("dead", "fixture", "quiescent", "fixture")), \
+                 mock.patch("dispatch_terminal_commit.owner_completion_state",
+                            side_effect=AssertionError(
+                                "parent readiness must not inspect owner closure")):
+                work, state = obligations.bound_work_for_pane(
+                    "w3:p7", "codex", "sid-current", jobs=jobs)
+            ready = obligations.pane_readiness(
+                server="fixture", pane="w3:p7", harness="codex",
+                session_id="sid-current", pid_birth="pid:9@start:4",
+                identity_verified=True, native_turn="idle", bound_work=work,
+                bindings_state=state)
+            return work, state, ready
+
+        work, state, ready = observe()
         self.assertEqual((len(work), state), (1, "observed"))
-        self.assertEqual((work[0].pane_relation, work[0].delivery_state), ("parent", "acked"))
-        ready = obligations.pane_readiness(server="fixture", pane="w3:p7", harness="codex",
-            session_id="sid-current", pid_birth="pid:9@start:4", identity_verified=True,
-            native_turn="idle", bound_work=work, bindings_state=state)
-        self.assertEqual((ready.state, ready.outcome), ("ready", "succeeded"))
-        for delivery_state in ("pending", "claimed", "unverified"):
-            with self.subTest(delivery_state=delivery_state):
-                record["state"] = delivery_state
-                with mock.patch("dispatch_seat_handover._handover_binding_keys_for_session",
-                                return_value=(("rt-parent-delivery", "sha256:" + "b" * 64, "execute"),)), \
-                     mock.patch("dispatch_seat_handover.effective_parent", return_value="sid-current"), \
-                     mock.patch("dispatch_seat_handover.effective_parent_harness", return_value="codex"), \
-                     mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
-                                ObservedAttemptLiveness("dead", "fixture", "quiescent", "fixture")), \
-                     mock.patch("dispatch_terminal_commit.owner_completion_state",
-                                side_effect=AssertionError("parent readiness must not inspect closure")), \
-                     mock.patch("dispatch_pending_delivery.read", return_value=record):
-                    open_work, open_state = obligations.bound_work_for_pane(
-                        "w3:p7", "codex", "sid-current", jobs=jobs)
-                open_ready = obligations.pane_readiness(server="fixture", pane="w3:p7", harness="codex",
-                    session_id="sid-current", pid_birth="pid:9@start:4", identity_verified=True,
-                    native_turn="idle", bound_work=open_work, bindings_state=open_state)
-                self.assertEqual((open_work[0].delivery_state, open_ready.state),
-                                 (delivery_state, "pending"))
+        self.assertEqual((work[0].pane_relation, work[0].delivery_state), ("parent", "pending"))
+        self.assertEqual(ready.state, "pending")
+
+        pending.claim(jobs.parent, "sid-a", "delivery-parent",
+                      claim_owner="parent-watch-test", lease_seconds=30)
+        claimed_work, _claimed_state, claimed_ready = observe()
+        self.assertEqual((claimed_work[0].delivery_state, claimed_ready.state),
+                         ("claimed", "pending"))
+
+        pending.ack(jobs.parent, "sid-a", "delivery-parent", acked_by="recipient-consumed")
+        acked_work, _acked_state, acked_ready = observe()
+        self.assertEqual((acked_work[0].delivery_state, acked_ready.state), ("acked", "ready"))
+
+        # A fresh ACK cannot satisfy a different result revision in jobs.log.
+        fields = jobs.read_text(encoding="utf-8").rstrip("\n").split("\t")
+        fields[5] = fields[5].replace(
+            "delivery_row_revision=revision-parent",
+            "delivery_row_revision=revision-replaced")
+        jobs.write_text("\t".join(fields) + "\n", encoding="utf-8")
+        mismatched_work, _mismatch_state, mismatched_ready = observe()
+        self.assertEqual((mismatched_work[0].delivery_state, mismatched_ready.state),
+                         ("unknown", "unknown"))
 
 
 if __name__ == "__main__":

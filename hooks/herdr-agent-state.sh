@@ -78,16 +78,15 @@ if isinstance(transcript, str) and transcript.strip():
 start_source = payload.get("source")
 if isinstance(start_source, str) and start_source in {"startup", "resume", "clear", "compact", "fork"}:
     params["session_start_source"] = start_source
-    if start_source == "resume":
-        try:
-            from fleet.process_identity import current_launch_context, native_resume_wire_argv
-            launch = current_launch_context("claude", session_id)
-            resume_argv = (launch or {}).get("argv")
-            wire_argv = native_resume_wire_argv(resume_argv, "claude", session_id)
-            if wire_argv is not None:
-                params["resume_argv"] = wire_argv
-        except Exception:
-            pass
+    try:
+        from fleet.process_identity import current_launch_context, native_resume_wire_argv
+        launch = current_launch_context("claude", session_id)
+        resume_argv = (launch or {}).get("argv")
+        wire_argv = native_resume_wire_argv(resume_argv, "claude", session_id)
+        if wire_argv is not None:
+            params["resume_argv"] = wire_argv
+    except Exception:
+        pass
 request = {
     "id": f"{source}:{int(time.time() * 1000)}:{random.randrange(1_000_000):06d}",
     "method": "pane.report_agent_session",

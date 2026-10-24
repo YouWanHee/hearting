@@ -28,6 +28,7 @@ shared-utility-deferred	directory_record_index.py
 shared-utility-deferred	codex_permission_profile.py
 shared-utility-deferred	compute-hosts
 shared-utility-deferred	context_alert.py
+shared-utility-deferred	conversation_reader.py
 shared-utility-deferred	dispatch-readiness.py
 shared-utility-deferred	dispatch_attempt_policy.py
 shared-utility-deferred	dispatch_capacity_evidence.py
@@ -36,6 +37,7 @@ shared-utility-deferred	dispatch_notice_state.py
 shared-utility-deferred	dispatch_owner_input.py
 shared-utility-deferred	dispatch_parent_completion.py
 shared-utility-deferred	dispatch_receipt_identity.py
+shared-utility-deferred	dispatch_recipient_receipt.py
 shared-utility-deferred	dispatch_replacement.py
 shared-utility-deferred	dispatch_resource_wait.py
 shared-utility-deferred	dispatch_replacement_batch.py
@@ -67,6 +69,7 @@ shared-utility-deferred	review_input.py
 shared-utility-deferred	review_watchdog.py
 shared-utility-deferred	session_tidy_idle.py
 shared-utility-deferred	session_tidy_policy.py
+shared-utility-deferred	session_history.py
 shared-utility-deferred	route_parent_close.py
 shared-utility-deferred	route_plan.py
 shared-utility-deferred	route_presence_gate.py
@@ -240,6 +243,7 @@ utility-deferred	resource_run_registry.py
 utility-deferred	resource_run_evidence.py
 utility-deferred	resource_runner.test.py
 utility-deferred	runtime_observation.py
+utility-deferred	shared_readiness.py
 utility-deferred	review_batch_revision_fixture.py
 utility-deferred	review_round_cap.py
 utility-deferred	review_round_cap.test.py
@@ -344,6 +348,7 @@ tool-deferred	ledger_invariant.test.py
 tool-deferred	migration-manifest.py
 tool-deferred	migration_manifest.test.py
 tool-deferred	native-skill-discovery.test.py
+tool-deferred	non-git-headless-acceptance.py
 tool-deferred	opencode-text-request.test.py
 tool-deferred	profile
 tool-deferred	release

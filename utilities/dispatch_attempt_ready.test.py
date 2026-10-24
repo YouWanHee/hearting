@@ -21,6 +21,8 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(READY)
 sys.path.insert(0, str(ROOT / "utilities"))
 import dispatch_contract as D  # noqa: E402
+import dispatch_registry_cache as REGISTRY  # noqa: E402
+from peer_read_context import PeerReadContext  # noqa: E402
 
 
 def sealed_cancellation_metadata(attempt: str) -> dict[str, str]:
@@ -273,6 +275,26 @@ class RuntimeWaitSharedJoinTest(unittest.TestCase):
 
     def selected(self):
         return READY.selected_rows(self.jobs, attempt_id=self.attempt)
+
+    def test_selected_generation_query_preserves_latest_and_reuses_context(self):
+        self.jobs.write_text(
+            "job\topen\t/repo\ttime\tselected\tparent=parent,attempt_id=one\n"
+            "job\tdone\t/repo\ttime\tselected\tparent=parent,attempt_id=one\n"
+            "job\topen\t/repo\ttime\tunrelated\tparent=other,attempt_id=two\n",
+            encoding="utf-8")
+        REGISTRY.clear_cache()
+        REGISTRY.reset_metrics()
+        context = PeerReadContext()
+        first = READY.selected_rows(
+            self.jobs, parent="parent", slug="selected", attempt_id="one",
+            read_context=context)
+        second = READY.selected_rows(
+            self.jobs, parent="parent", slug="selected", attempt_id="one",
+            read_context=context)
+        self.assertEqual([(fields[1], metadata["attempt_id"]) for fields, metadata in first],
+                         [("done", "one")])
+        self.assertEqual(first, second)
+        self.assertEqual(REGISTRY.metrics_snapshot()["full_metadata_parses"], 1)
 
     def test_terminal_commit_must_land_before_success_is_consumed(self):
         def commit(jobs, row):

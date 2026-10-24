@@ -195,7 +195,11 @@ class CurrentSessionTest(unittest.TestCase):
         import session_tidy
         rows = [{"harness": "claude", "sid": "old", "event": "summary", "cwd": self.cwd, "ts": 1},
                 {"harness": "claude", "sid": "other-project", "event": "summary", "cwd": "/proj/z", "ts": 1},
-                {"harness": "claude", "sid": "current", "event": "start", "source": "clear", "cwd": self.cwd, "ts": 2}]
+                {"harness": "claude", "sid": "current", "event": "start", "source": "clear", "cwd": self.cwd,
+                 "resume_argv": ["claude", "--resume", "old"], "ts": 2}]
+        with mock.patch.object(session_tidy, "_read_ledger_lines", return_value=rows):
+            self.assertEqual(session_tidy.session_start_context("claude", "current", "wB:p3N")["resume_argv"],
+                             ["claude", "--resume", "current"])
         with mock.patch.object(session_tidy, "_read_ledger_lines", return_value=rows), \
                 mock.patch("fleet.gitinfo.resolve_gitdir", side_effect=lambda cwd: (None, cwd)):
             edges = process_identity.pane_session_successors("claude", "wB:p3N", self.cwd,
@@ -271,7 +275,7 @@ class CurrentSessionTest(unittest.TestCase):
             # A later resume without proven launch context must not inherit an
             # earlier launch's argv or cwd merely because the SID is unchanged.
             rows.extend([{"harness": "claude", "sid": "current", "event": "start", "source": "resume",
-                          "session_seq": 800, "cwd": self.cwd, "ts": 8},
+                          "session_seq": 800, "cwd": self.cwd, "launch_cwd": "/stale-launch", "ts": 8},
                          {"harness": "claude", "sid": "current", "event": "prompt",
                           "cwd": self.cwd, "ts": 9}])
             session_tidy._fold_ledger(seat)

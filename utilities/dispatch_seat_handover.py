@@ -844,6 +844,29 @@ def pane_seat(env=None, harness: Optional[str] = None, sid: Optional[str] = None
     return seat if seat.kind in ("pane", "native") else None
 
 
+@contextlib.contextmanager
+def readiness_transition_lock(pane: str, server: str, socket_path: Optional[str] = None,
+                             *, wait: Optional[float] = None):
+    """Use the existing pane-seat lock while a watch checks and publishes readiness.
+
+    Handover and tidy-claim writers for this pane already take this lock. The
+    watch lock is per-watch and does not coordinate those writers.
+    """
+    if not isinstance(pane, str) or not pane or pane == "-":
+        raise ValueError("readiness-pane-identity-invalid")
+    st = _st()
+    env = {}
+    if isinstance(server, str) and server and server != "default":
+        env["AGENT_HERDR_SESSION"] = server
+    if isinstance(socket_path, str) and socket_path:
+        env["HERDR_SOCKET_PATH"] = socket_path
+    endpoint = st._endpoint_scope(env)
+    seat_key = (st._digest("pane", endpoint, pane) if endpoint
+                else st._digest("pane", pane))
+    with st.seat_lock(seat_key, wait=wait):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Bindings: which registered attempts a session answers for
 # ---------------------------------------------------------------------------
@@ -1534,7 +1557,10 @@ def resume_line(seat, harness: str, sid: str) -> str:
             for status, meta in registries[jobs].get(identity, ()):
                 if status not in OPEN_ROW_STATUSES and status != "done":
                     continue
-                if not owns(meta, sid, jobs) or (status == "done" and not _delivery_open(jobs, meta)):
+                # A finished attempt is shown only while its notice is owed and its route is
+                # still open: a closed route has nothing to resume, whatever record lingers.
+                if not owns(meta, sid, jobs) or (status == "done" and not (
+                        _delivery_open(jobs, meta) and _route_open(jobs, meta))):
                     continue
                 shown.setdefault((jobs, route_identity(meta)[0]), meta.get("route_file", ""))
         parts = []

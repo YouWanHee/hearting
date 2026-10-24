@@ -57,12 +57,13 @@ def settled_result(route, ledger):
                  and isinstance(entry["evidence"].get("parent_close_result"), dict)), None)
 
 
-def row_requested(metadata, jobs):
+def row_requested(metadata, jobs, *, registry_rows=None):
     if requested(metadata):
         return True
     route = {"route_id": metadata.get("parent_close_route_id") or metadata.get("owner_route_id") or metadata.get("route_id"),
              "route_hash": metadata.get("parent_close_route_hash") or metadata.get("owner_route_hash") or metadata.get("route_hash")}
-    value = intent(route, jobs) or _current_owner_intent(metadata, jobs)
+    value = intent(route, jobs) or _current_owner_intent(
+        metadata, jobs, registry_rows=registry_rows)
     return bool(value and metadata.get("attempt_id") in value["attempts"])
 
 
@@ -85,12 +86,13 @@ def cancellation_settled(metadata, jobs):
     return bool(result and result.get("state") == "cancelled")
 
 
-def _current_owner_intent(metadata, jobs):
+def _current_owner_intent(metadata, jobs, *, registry_rows=None):
     # Attachments and adopted advances leave launch rows unchanged. Resolve
     # their current owner before accepting an old child's late result.
     try:
         attempt = metadata.get("attempt_id")
-        rows = _rows(Path(jobs), {attempt} if attempt else set())
+        rows = _rows(Path(jobs), {attempt} if attempt else set(),
+                     registry_rows=registry_rows)
     except (OSError, ValueError):
         return None  # Ordinary join owns its registry-shape refusal.
     current, seen = metadata, set()
@@ -102,43 +104,50 @@ def _current_owner_intent(metadata, jobs):
         current = rows[parent][1]
     import owner_route_binding as OWNER
     try:
-        binding, _ = OWNER.resolve_owner_route_lifecycle(jobs, owner_attempt_id=current["attempt_id"])
+        binding, _ = OWNER.resolve_owner_route_lifecycle(
+            jobs, owner_attempt_id=current["attempt_id"], registry_rows=registry_rows)
     except OWNER.OwnerRouteBindingError:
         return None  # An unbound ordinary owner is not cancellation evidence.
     return intent({"route_id": binding.route_id, "route_hash": binding.route_hash}, jobs) if binding else None
 
 
-def _rows(jobs, attempts=None):
+def _rows(jobs, attempts=None, *, registry_rows=None):
     if not jobs.exists():
         return {}
-    view = registry_view(jobs)
-    if view.has_duplicate_attempts:
-        raise ValueError("parent-close-attempt-not-unique")
-    if attempts is None:
-        selected = ((record, record.completion_metadata()) for record in view.records)
+    if registry_rows is not None:
+        selected = [(list(fields), dict(metadata)) for fields, metadata in registry_rows]
+        ids = [metadata.get("attempt_id") for _fields, metadata in selected
+               if metadata.get("attempt_id")]
+        if len(ids) != len(set(ids)):
+            raise ValueError("parent-close-attempt-not-unique")
     else:
-        pending = list(dict.fromkeys(attempts))
-        seen = set()
-        selected = []
-        while pending:
-            aid = pending.pop()
-            if aid in seen:
-                continue
-            seen.add(aid)
-            candidates = view.completion_attempt_records(aid)
-            if len(candidates) > 1:
-                raise ValueError("parent-close-attempt-not-unique")
-            if not candidates:
-                continue
-            record = candidates[0]
-            metadata = record.completion_metadata()
-            selected.append((record, metadata))
-            parent = metadata.get("parent_attempt_id")
-            if parent not in (None, "", "-"):
-                pending.append(parent)
+        view = registry_view(jobs)
+        if view.has_duplicate_attempts:
+            raise ValueError("parent-close-attempt-not-unique")
+        if attempts is None:
+            selected = ((list(record.fields), record.completion_metadata()) for record in view.records)
+        else:
+            pending = list(dict.fromkeys(attempts))
+            seen = set()
+            selected = []
+            while pending:
+                aid = pending.pop()
+                if aid in seen:
+                    continue
+                seen.add(aid)
+                candidates = view.completion_attempt_records(aid)
+                if len(candidates) > 1:
+                    raise ValueError("parent-close-attempt-not-unique")
+                if not candidates:
+                    continue
+                record = candidates[0]
+                metadata = record.completion_metadata()
+                selected.append((list(record.fields), metadata))
+                parent = metadata.get("parent_attempt_id")
+                if parent not in (None, "", "-"):
+                    pending.append(parent)
     rows = {}
-    for record, metadata in selected:
-        fields = list(record.fields)
+    for fields, metadata in selected:
         aid = metadata.get("attempt_id")
         if aid:
             if aid in rows:
@@ -306,6 +315,8 @@ def linked_resources(route, path, jobs, attempts, *, all_known=False):
     try:
         config = compute.load_config()
     except compute.ConfigError:
+        return result
+    if compute._namespace_self(config):
         return result
     for meta_path in config["run_root"].glob("*/meta.json"):
         try:

@@ -34,7 +34,8 @@ _RUNNER_CONTROL_SCHEMA = 1
 _SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,160}\Z")
 _MAX_RECORD_BYTES = 128 * 1024
 _PENDING_STATES = frozenset({"pending", "unknown", "delivery-pending", "cleanup-pending"})
-_DUTY_KINDS = frozenset({"watch", "message", "retire", "registered-batch"})
+_DUTY_KINDS = frozenset({"watch", "message", "retire", "registered-batch",
+                         "readiness-observation"})
 _RUNNERS: list[subprocess.Popen] = []
 _DISTRIBUTION_MODULES = {}
 _MESSAGE_RECEIVER_PROVENANCE = "validated-peer-ref-receiver-v1"
@@ -1924,6 +1925,9 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
                         include_parent: bool = True,
                         read_context=None,
                         registry_append_only: bool = False,
+                        authority_out: dict | None = None,
+                        selected_rows: list[dict] | tuple[dict, ...] | None = None,
+                        expected_handover_keys: list | tuple | None = None,
                         ) -> tuple[tuple[RegisteredWorkObservation, ...], str]:
     """Read exact executor, registered-parent or handed-over attempt bindings.
 
@@ -1946,44 +1950,151 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
     else:
         jobs_path = Path(jobs).expanduser().resolve()
         state_root = jobs_path.parent
-    try:
-        view = registry_view(jobs_path, append_only=registry_append_only)
-        view.require_complete_text()
-    except FileNotFoundError:
+    if selected_rows is None:
+        try:
+            context_view = getattr(read_context, "registry_view", None)
+            view = (context_view(jobs_path, append_only=registry_append_only)
+                    if callable(context_view)
+                    else registry_view(jobs_path, append_only=registry_append_only))
+            if view is not None:
+                view.require_complete_text()
+        except FileNotFoundError:
+            view = None
+        except (OSError, UnicodeError):
+            return (), "unknown"
+        if view is None:
+            return (), "observed"
+        if view.malformed_rows:
+            return (), "unknown"
+    else:
         view = None
-    except (OSError, UnicodeError):
-        return (), "unknown"
-    if view is None:
-        return (), "observed"
-    if view.malformed_rows:
-        return (), "unknown"
+        if not isinstance(selected_rows, (list, tuple)):
+            return (), "unknown"
+        normalized_rows = []
+        for row in selected_rows:
+            if (not isinstance(row, dict)
+                    or not isinstance(row.get("status"), str)
+                    or not isinstance(row.get("metadata"), dict)
+                    or not isinstance(row.get("completion_metadata"), dict)
+                    or not isinstance(row.get("fields"), (list, tuple))):
+                return (), "unknown"
+            normalized_rows.append({
+                "status": row["status"],
+                "metadata": row["metadata"],
+                "completion_metadata": row["completion_metadata"],
+                "fields": list(row["fields"]),
+            })
+        try:
+            expected_keys = ([] if expected_handover_keys is None else
+                             [list(key) for key in expected_handover_keys])
+        except (TypeError, ValueError):
+            return (), "unknown"
+        import shared_readiness
+        if not shared_readiness.valid_watch_authority(
+                {"rows": normalized_rows, "handover_keys": expected_keys}):
+            return (), "unknown"
+        selected_rows = normalized_rows
 
     if read_context is None:
         from peer_read_context import PeerReadContext
         read_context = PeerReadContext(registry_append_only=registry_append_only)
     candidates = {}
-    for attempt_id in execution_attempt_ids:
-        for record in view.completion_attempt_records(attempt_id):
-            candidates[record.order] = record
+    if selected_rows is None:
+        for attempt_id in execution_attempt_ids:
+            for record in view.completion_attempt_records(attempt_id):
+                candidates[record.order] = (record.status, record)
+    else:
+        for order, row in enumerate(selected_rows):
+            candidates[order] = (row["status"], {
+                "metadata": row["metadata"],
+                "completion_metadata": row["completion_metadata"],
+                "fields": row["fields"],
+            })
+    binding_keys = ()
     if include_parent:
-        for record in view.completion_parent_records(session_id):
-            candidates[record.order] = record
         try:
             from dispatch_seat_handover import _handover_binding_keys_for_session
             binding_keys = _handover_binding_keys_for_session(
                 jobs_path, session_id, read_context=read_context)
+        except (OSError, ValueError, TypeError):
+            return (), "unknown"
+        if authority_out is not None:
+            authority_out["handover_keys"] = [list(key) for key in binding_keys]
+        if expected_handover_keys is not None:
+            try:
+                expected_keys = tuple(sorted(tuple(key) for key in expected_handover_keys))
+            except (TypeError, ValueError):
+                return (), "unknown"
+            if expected_keys != tuple(sorted(binding_keys)):
+                return (), "unknown"
+    if include_parent and selected_rows is None:
+        for record in view.completion_parent_records(session_id):
+            candidates[record.order] = (record.status, record)
+        try:
             for _status, record in view.handover_candidates(session_id, binding_keys):
-                candidates[record.order] = record
+                candidates[record.order] = (record.status, record)
         except (OSError, ValueError, TypeError):
             # The current registered-parent rows remain visible; a failed
             # handover observation cannot grant inherited ownership.
             pass
 
+    if view is not None and selected_rows is None and include_parent:
+        for status, record in tuple(candidates.values()):
+            metadata = (record.completion_metadata() if not isinstance(record, dict)
+                        else record["metadata"])
+            if (metadata.get("workflow_completion") != "runtime-v1"
+                    or metadata.get("worker_type") != "owner"):
+                continue
+            attempt_id = metadata.get("attempt_id", "")
+            route_id = metadata.get("owner_route_id") or metadata.get("route_id") or ""
+            route_hash = metadata.get("owner_route_hash") or metadata.get("route_hash") or ""
+            if attempt_id and route_id and route_hash:
+                for related in view.completion_related(attempt_id, route_id, route_hash):
+                    candidates[related.order] = (related.status, related)
+
+    selected_registry_rows = []
+    authority_rows = []
+    authority_complete = authority_out is not None
+    authority_size = None
+    if authority_complete:
+        import shared_readiness
+        authority_size = shared_readiness.bounded_json_size(
+            {"handover_keys": authority_out.get("handover_keys", []), "rows": []},
+            shared_readiness.MAX_WATCH_AUTHORITY_BYTES)
+        authority_complete = authority_size is not None
+    for status, record in (candidates[key] for key in sorted(candidates)):
+        if isinstance(record, dict):
+            metadata = dict(record["metadata"])
+            fields = list(record["fields"])
+            completion_metadata = dict(record["completion_metadata"])
+        else:
+            fields = list(record.fields)
+            metadata = parse_registry_metadata(record.fields[5])
+            completion_metadata = record.completion_metadata()
+        selected_registry_rows.append((fields, completion_metadata))
+        if authority_complete:
+            row = {"status": status, "metadata": metadata,
+                   "completion_metadata": completion_metadata, "fields": fields}
+            separator_size = 1 if authority_rows else 0
+            row_size = shared_readiness.bounded_json_size(
+                row, shared_readiness.MAX_WATCH_AUTHORITY_BYTES - authority_size - separator_size)
+            if row_size is None:
+                # Do not publish a valid-looking prefix of the selected rows.
+                authority_complete = False
+                authority_rows.clear()
+            else:
+                authority_rows.append(row)
+                authority_size += separator_size + row_size
+    if authority_out is not None:
+        authority_out["rows"] = authority_rows if authority_complete else None
+
     result: list[RegisteredWorkObservation] = []
-    for record in (candidates[key] for key in sorted(candidates)):
-        fields = record.fields
-        status = fields[1]
-        metadata = parse_registry_metadata(fields[5])
+    for status, record in (candidates[key] for key in sorted(candidates)):
+        if isinstance(record, dict):
+            metadata = record["metadata"]
+        else:
+            fields = record.fields
+            metadata = parse_registry_metadata(fields[5])
         executor = (metadata.get("attempt_id") in execution_attempt_ids
                     and metadata.get("harness") == harness)
         if include_parent:
@@ -2013,7 +2124,9 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
             closure_state = "pending"
         else:
             try:
-                closure = owner_completion_state(jobs_path, status, metadata).state
+                closure = owner_completion_state(
+                    jobs_path, status, metadata,
+                    selected_registry_rows=selected_registry_rows).state
             except Exception:
                 closure = "unknown"
             closure_state = ("settled" if closure in {"not-applicable", "complete"}

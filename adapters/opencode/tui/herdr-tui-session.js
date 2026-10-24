@@ -19,8 +19,39 @@ function nativeResumeWireArgv(argv, sessionID) {
       || argv.reduce((bytes, arg) => bytes + Buffer.byteLength(arg, "utf8"), 0) > 8192) return null;
   const executable = argv[0];
   if (executable !== AGENT && !(path.isAbsolute(executable) && path.basename(executable) === AGENT)) return null;
-  if (typeof sessionID !== "string" || !sessionID || !argv.includes(sessionID)) return null;
-  return [AGENT, ...argv.slice(1)];
+  if (typeof sessionID !== "string" || !sessionID || sessionID.includes("\0")) return null;
+  if (Buffer.byteLength(sessionID, "utf8") + Buffer.byteLength("opencode--session", "utf8") > 8192) return null;
+  const args = argv.slice(1), found = [];
+  const values = new Set(["--model", "-m", "--agent", "--variant", "--format", "--dir", "-D"]);
+  const flags = new Set(["--help", "--version", "--print-logs"]);
+  let ambiguous = false, continued = false;
+  for (let i = 0; i < args.length;) {
+    const token = args[i];
+    if (token === "--") { if (i + 1 < args.length) ambiguous = true; break; }
+    if (token === "--fork" || token === "--fork=true") return [AGENT, "--session", sessionID];
+    if (token.startsWith("--fork=") && token !== "--fork=false") return [AGENT, "--session", sessionID];
+    if (token === "--continue" || token === "--last" || token === "-c") continued = true;
+    if (token === "--session" || token === "-s") {
+      if (i + 1 < args.length && !args[i + 1].startsWith("-")) { found.push([i + 1, ""]); i += 2; }
+      else i += 1;
+      continue;
+    }
+    const selector = ["--session", "-s"].find((option) => token.startsWith(`${option}=`));
+    if (selector) { found.push([i, `${selector}=`]); i += 1; continue; }
+    if (token.startsWith("-")) {
+      const key = token.split("=", 1)[0];
+      if (values.has(key) && !token.includes("=")) { if (i + 1 < args.length) i += 2; else { ambiguous = true; i += 1; } continue; }
+      if (flags.has(key) || token.includes("=")) { i += 1; continue; }
+      ambiguous = true; i += 1; continue;
+    }
+    ambiguous = true; i += 1;
+  }
+  if (!found.length) return null;
+  if (found.length !== 1 || continued || ambiguous) return [AGENT, "--session", sessionID];
+  const [index, prefix] = found[0], result = [AGENT, ...args];
+  result[index + 1] = `${prefix}${sessionID}`;
+  return result.length <= 64 && result.reduce((bytes, arg) => bytes + Buffer.byteLength(arg, "utf8"), 0) <= 8192
+    ? result : null;
 }
 
 function nativeSessionLifecycle(sessionID) {
@@ -48,10 +79,8 @@ function nativeSessionLifecycle(sessionID) {
       result.session_start_source = record.sessionStartSource;
     }
     const argv = process.argv;
-    if (["resume", "select"].includes(result.session_start_source)) {
-      const wireArgv = nativeResumeWireArgv(argv, sessionID);
-      if (wireArgv) result.resume_argv = wireArgv;
-    }
+    const wireArgv = nativeResumeWireArgv(argv, sessionID);
+    if (wireArgv) result.resume_argv = wireArgv;
     return result;
   } catch { return {} }
 }

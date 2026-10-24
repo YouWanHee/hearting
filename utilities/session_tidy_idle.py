@@ -106,6 +106,64 @@ def _opencode_latest(sid: str) -> tuple[int | None, str, str, str]:
     return None, "", "", ""
 
 
+def _finished_text(payload: dict, parts: list) -> str:
+    moment = payload.get("time") if isinstance(payload.get("time"), dict) else {}
+    if payload.get("finish") != "stop" or not moment.get("completed") or payload.get("error"):
+        return ""
+    return "\n".join(part["text"] for part in parts
+                     if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+                     and not part.get("synthetic") and not part.get("ignored"))
+
+
+def _opencode_last_reply(sid: str) -> str:
+    """Text of this session's newest message when it is an assistant reply that finished normally.
+
+    OpenCode 2 writes ``session_message`` rows (content inline); older stores write
+    ``message`` + ``part``. The newer table is preferred when it exists."""
+    try:
+        import tidy_transcripts
+        database = Path(tidy_transcripts.opencode_db_path())
+        if database.is_symlink() or not database.is_file():
+            return ""
+        con = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=0.2)
+        try:
+            tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "session_message" in tables:
+                row = con.execute("SELECT type,data FROM session_message WHERE session_id=? AND type IN "
+                                  "('user','assistant') ORDER BY time_created DESC, id DESC LIMIT 1",
+                                  (sid,)).fetchone()
+                if row and row[0] == "assistant":
+                    payload = json.loads(row[1])
+                    if isinstance(payload, dict) and isinstance(payload.get("content"), list):
+                        return _finished_text(payload, payload["content"])
+                if row:
+                    return ""
+            if "message" not in tables:
+                return ""
+            row = con.execute("SELECT id,data FROM message WHERE session_id=? ORDER BY time_created DESC, id DESC "
+                              "LIMIT 1", (sid,)).fetchone()
+            if not row:
+                return ""
+            payload = json.loads(row[1])
+            if not isinstance(payload, dict) or payload.get("role") != "assistant":
+                return ""
+            parts = [json.loads(raw) for (raw,) in con.execute(
+                "SELECT data FROM part WHERE message_id=? ORDER BY id", (row[0],))]
+            return _finished_text(payload, parts)
+        finally:
+            con.close()
+    except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):
+        return ""
+
+
+def last_reply(harness: str, payload: dict, sid: str) -> str:
+    """The turn's final assistant text: Claude/Codex Stop input, OpenCode's finished message."""
+    if harness in ("claude", "codex"):
+        value = payload.get("last_assistant_message")
+        return value if isinstance(value, str) else ""
+    return _opencode_last_reply(sid)
+
+
 def _codex_provider() -> str:
     if tomllib is None:
         return "unknown"
@@ -164,7 +222,13 @@ def observe_payload(harness: str, payload: dict, *, now: float | None = None,
     if is_worker() or os.environ.get("AGENT_SESSION_ROLE", "").lower() in {
             "owner", "worker", "auxiliary", "reviewer"}:
         return "booking=skipped reason=worker"
-    from session_tidy import reconcile_compact_frontier
+    from session_tidy import accept_reply_card, reconcile_compact_frontier
+    try:
+        # A card written as the reply to an automatic tidy request is taken before the
+        # compact/idle bookings below look at this turn; an ordinary reply changes nothing.
+        accept_reply_card(harness, sid, cwd, last_reply(harness, payload, sid))
+    except Exception:  # noqa: BLE001 - optional; the request simply stays unanswered
+        pass
     compact_result = reconcile_compact_frontier(harness, sid, cwd, now=now, lock_wait=lock_wait)
     if compact_result and compact_result not in ("booking=skipped reason=new-input",
                                                   "booking=skipped reason=card-changed"):

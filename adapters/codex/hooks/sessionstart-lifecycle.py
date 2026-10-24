@@ -118,13 +118,13 @@ def forget_shown_candidates(payload: dict[str, Any]) -> None:
         pass
 
 
-def card_context(payload: dict[str, Any], current_cwd: str) -> str:
+def card_context(payload: dict[str, Any], current_cwd: str) -> tuple[str, str]:
     """Session card / tidy notice due at this start; independent of the memory opt-in."""
     sid = session_id(payload)
     if not sid or not SESSION_TIDY.is_file():
-        return ""
+        return "", ""
     command = [sys.executable, str(SESSION_TIDY), "hook", "--harness", "codex",
-               "--event", "start", "--session-id", sid, "--cwd", current_cwd]
+               "--event", "start", "--session-id", sid, "--cwd", current_cwd, "--format", "json"]
     source = nested_string(payload, "source")
     if source:
         command += ["--source", source]
@@ -137,8 +137,16 @@ def card_context(payload: dict[str, Any], current_cwd: str) -> str:
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4, check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
-    return result.stdout if result.returncode == 0 else ""
+        return "", ""
+    if result.returncode:
+        return "", ""
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except ValueError:
+        return "", ""
+    if not isinstance(payload, dict):
+        return "", ""
+    return (str(payload.get("additionalContext") or ""), str(payload.get("humanNotice") or ""))
 
 
 def env_truthy(name: str) -> bool:
@@ -155,12 +163,16 @@ def is_worker_session() -> bool:
     )
 
 
-def emit_context(event_name: str, parts: list[str]) -> None:
+def emit_context(event_name: str, parts: list[str], system_message: str = "") -> None:
     context = "\n".join(part.strip() for part in parts if part.strip())
-    if not context:
+    if not context and not system_message:
         return
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": context}},
-                     ensure_ascii=False), flush=True)
+    output = {"hookSpecificOutput": {"hookEventName": event_name}}
+    if context:
+        output["hookSpecificOutput"]["additionalContext"] = context
+    if system_message:
+        output["systemMessage"] = system_message
+    print(json.dumps(output, ensure_ascii=False), flush=True)
 
 
 def request_lifecycle_recovery() -> None:
@@ -190,10 +202,12 @@ def main() -> int:
             pass
 
     parts = []
+    human_notice = ""
     try:
         if not worker:
             forget_shown_candidates(payload)
-            parts.append(card_context(payload, current_cwd))
+            card, human_notice = card_context(payload, current_cwd)
+            parts.append(card)
             try:
                 utilities = ROOT / "utilities"
                 if str(utilities) not in sys.path:
@@ -213,7 +227,7 @@ def main() -> int:
             parts.append(local_evidence_context(current_cwd))
     finally:
         try:
-            emit_context("SessionStart", parts)
+            emit_context("SessionStart", parts, human_notice)
         finally:
             if not worker:
                 request_lifecycle_recovery()
