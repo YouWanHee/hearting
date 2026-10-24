@@ -899,8 +899,16 @@ def nested_owner_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
     )
     result = []
     seen = set()
+    opencode_roots = set(opencode_store_dirs)
     for path in candidates:
-        path = path.resolve()
+        if path in opencode_roots:
+            # Keep the final app directory lexical and recheck it at the
+            # adapter boundary. Never turn a leaf symlink into a wider mount.
+            path = path.parent.resolve(strict=False) / path.name
+            if path.is_symlink():
+                continue
+        else:
+            path = path.resolve()
         if path in summary_dirs or path in opencode_store_dirs or path.is_dir():
             if path not in seen:
                 seen.add(path)

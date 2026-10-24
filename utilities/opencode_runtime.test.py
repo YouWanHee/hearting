@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -50,20 +51,30 @@ class OpenCodeRunCodecTest(unittest.TestCase):
                                             "opencode-runtime-version-unavailable"):
                     runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
 
-    def test_launch_version_probe_reads_only_a_bounded_head(self):
+    def test_launch_version_probe_rejects_truncation_and_caps_capture_file(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "dispatch"
             root.mkdir()
             script = Path(temp) / "opencode"
             script.write_text(
-                "#!/usr/bin/env python3\nimport sys\n"
-                "sys.stdout.write('opencode 2.0.32\\n' + 'x' * (512 * 1024))\n",
+                "#!/usr/bin/env python3\nimport os, pathlib, sys, time\n"
+                "target = pathlib.Path(os.environ['TMPDIR']) / 'version.out'\n"
+                "sys.stdout.write('opencode 2.0.32\\n'); sys.stdout.flush()\n"
+                "deadline = time.monotonic() + 1\n"
+                "while target.stat().st_size < 16 and time.monotonic() < deadline: time.sleep(.001)\n"
+                "sys.stdout.write('x' * (512 * 1024)); sys.stdout.flush()\n"
+                "deadline = time.monotonic() + 1\n"
+                "while target.stat().st_size < 32 and time.monotonic() < deadline: time.sleep(.001)\n"
+                "time.sleep(.02)\n"
+                "pathlib.Path.cwd().joinpath('capture-size.txt').write_text(str(target.stat().st_size))\n",
                 encoding="utf-8",
             )
             script.chmod(0o700)
-            with unittest.mock.patch.object(runtime, "VERSION_PROBE_OUTPUT_LIMIT", 32):
-                self.assertEqual(runtime.probe_launch_version(
-                    binary=str(script), cwd=temp, state_root=root), (2, 0, 32))
+            with unittest.mock.patch.object(runtime, "VERSION_PROBE_OUTPUT_LIMIT", 32), \
+                    self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                           "opencode-runtime-version-unavailable"):
+                runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+            self.assertEqual(int((Path(temp) / "capture-size.txt").read_text()), 32)
             script.write_text(
                 "#!/usr/bin/env python3\nimport sys\n"
                 "sys.stdout.write('x' * 64 + '\\nopencode 2.0.32\\n')\n",
@@ -73,6 +84,50 @@ class OpenCodeRunCodecTest(unittest.TestCase):
                     self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
                                            "opencode-runtime-version-unavailable"):
                 runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_launch_version_probe_kills_descendant_after_normal_exit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            marker = Path(temp) / "descendant-survived"
+            script = Path(temp) / "opencode"
+            script.write_text(
+                "#!/usr/bin/env python3\nimport pathlib, subprocess, sys\n"
+                "subprocess.Popen([sys.executable, '-c', "
+                "'import pathlib,sys,time; time.sleep(.35); pathlib.Path(sys.argv[1]).write_text(\"alive\")', "
+                f"{str(marker)!r}])\n"
+                "print('opencode 2.0.32')\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            self.assertEqual(runtime.probe_launch_version(
+                binary=str(script), cwd=temp, state_root=root), (2, 0, 32))
+            time.sleep(0.45)
+            self.assertFalse(marker.exists())
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_launch_version_probe_timeout_kills_process_group(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            script.write_text(
+                "#!/usr/bin/env python3\nimport pathlib, subprocess, sys, time\n"
+                "subprocess.Popen([sys.executable, '-c', "
+                "'import pathlib,sys,time; time.sleep(.35); pathlib.Path(sys.argv[1]).write_text(\"alive\")', "
+                f"{str(Path(temp) / 'timeout-descendant-survived')!r}])\n"
+                "print('opencode 2.0.32', flush=True)\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            with self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                        "opencode-runtime-version-unavailable"):
+                runtime.probe_launch_version(binary=str(script), cwd=temp,
+                                             state_root=root, timeout=0.1)
+            time.sleep(0.45)
+            self.assertFalse((Path(temp) / "timeout-descendant-survived").exists())
             self.assertEqual(list(root.iterdir()), [])
 
     def test_v1_flags_and_v2_provider_variant_are_separate(self):

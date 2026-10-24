@@ -756,12 +756,19 @@ creates an unfocused tab, leaving existing panes and seat-successor records
 intact. Cards, watch and sender identity retain exact ownership checks; missing,
 foreign or unreadable hints leave placement unknown.
 
-An OpenCode child inside a Codex owner's workspace sandbox receives per-attempt
-XDG data/cache/state/config directories beneath the worktree. User configuration
-and existing authentication are linked for reading; generated dependency state
-stays in the attempt directory. The
-adapter prepares these paths before admission and reports preparation failures
-before spawning; the model does not diagnose or retry missing runtime storage.
+An OpenCode V2 child uses inherited user XDG data/state/cache, with writable
+access limited to the exact `opencode` leaves; a symlinked leaf is excluded
+rather than followed to a broader target. The config directory and whole HOME
+are not granted, and credentials or database files are not copied or linked.
+OpenCode V1 remains isolated under its worker home.
+
+Before model selection, each OpenCode launch probes its runtime version once
+with a private temporary HOME and XDG roots separate from the user stores. The
+combined stdout/stderr capture is limited to 64 KiB; overflow, timeout, or an
+unreadable version fails closed. On POSIX, the probe process group is
+terminated on both normal exit and timeout before its private directory is
+removed. The resulting `OPENCODE_RUNTIME_VERSION` binding is shared by model
+selection, context lookup, worker-home construction, and execution.
 
 **Dispatch responsibility:** execution, semantic outcome, and notification are
 separate facts.

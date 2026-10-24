@@ -16,12 +16,14 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from types import MappingProxyType
 from urllib.parse import quote
@@ -129,6 +131,18 @@ runtime_version.cache_clear = _runtime_version_probe.cache_clear
 VERSION_PROBE_OUTPUT_LIMIT = 64 * 1024
 
 
+def _kill_probe_process_group(process: subprocess.Popen) -> None:
+    """Stop the isolated version probe and descendants that inherited its pipe."""
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        return
+    if process.poll() is None:
+        process.kill()
+
+
 def probe_launch_version(*, binary: str = "opencode", cwd: str,
                          state_root: str | Path,
                          environ: Mapping[str, str] | None = None,
@@ -163,19 +177,70 @@ def probe_launch_version(*, binary: str = "opencode", cwd: str,
             for name in ("OPENCODE_DB", "OPENCODE_AUTH", "OPENCODE_DATA_DIR",
                          "OPENCODE_CONFIG_CONTENT", "OPENCODE_RUNTIME_VERSION"):
                 env.pop(name, None)
-            # Bounded read: a broken or substituted binary may print until
-            # the timeout; only the head can carry a version line.
+            # Drain both output streams while retaining at most the protocol
+            # limit. A file redirected directly from the child can grow
+            # without bound during the timeout, and accepting its first line
+            # would mistake a truncated result for a complete version.
             output = private / "version.out"
-            with output.open("wb") as sink:
-                result = subprocess.run(
-                    [executable, "--version"], cwd=cwd, env=env,
-                    stdout=sink, stderr=subprocess.STDOUT,
-                    timeout=timeout, check=False,
-                )
+            process = subprocess.Popen(
+                [executable, "--version"], cwd=cwd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                start_new_session=(os.name == "posix"), bufsize=0,
+            )
+            capture = {"bytes": 0, "truncated": False, "error": None}
+
+            def drain_output() -> None:
+                try:
+                    assert process.stdout is not None
+                    with output.open("wb") as sink:
+                        while True:
+                            chunk = process.stdout.read(8192)
+                            if not chunk:
+                                break
+                            remaining = VERSION_PROBE_OUTPUT_LIMIT - capture["bytes"]
+                            if remaining > 0:
+                                kept = chunk[:remaining]
+                                sink.write(kept)
+                                sink.flush()
+                                capture["bytes"] += len(kept)
+                            if len(chunk) > max(remaining, 0):
+                                capture["truncated"] = True
+                except BaseException as exc:  # surfaced after the bounded join
+                    capture["error"] = exc
+
+            reader = threading.Thread(target=drain_output, name="opencode-version-probe-output", daemon=True)
+            reader.start()
+            timed_out = False
+            cleanup_error = None
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:
+                try:
+                    _kill_probe_process_group(process)
+                except OSError as exc:
+                    cleanup_error = exc
+                    if process.poll() is None:
+                        process.kill()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1)
+                reader.join(timeout=1)
+                if reader.is_alive():
+                    if process.stdout is not None:
+                        process.stdout.close()
+                    reader.join(timeout=0.25)
+                elif process.stdout is not None:
+                    process.stdout.close()
             with output.open("rb") as handle:
                 head = handle.read(VERSION_PROBE_OUTPUT_LIMIT)
             version = parse_version(head.decode("utf-8", errors="replace"))
-            if result.returncode != 0 or version is None:
+            if (timed_out or reader.is_alive() or capture["error"] is not None
+                    or capture["truncated"] or cleanup_error is not None
+                    or process.returncode != 0 or version is None):
                 raise OpenCodeRuntimeError("opencode-runtime-version-unavailable")
             return version
     except OpenCodeRuntimeError:

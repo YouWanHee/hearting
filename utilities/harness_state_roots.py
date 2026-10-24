@@ -74,7 +74,16 @@ def nested_opencode_store_writable_dirs(args, environ=None) -> tuple[Path, ...]:
         Path(env.get("XDG_STATE_HOME") or home / ".local/state") / "opencode",
         Path(env.get("XDG_CACHE_HOME") or home / ".cache") / "opencode",
     )
-    return tuple(path.expanduser().resolve(strict=False) for path in roots)
+    result = []
+    for path in roots:
+        # Resolve the selected XDG base, but keep the final app directory as
+        # a path component. Resolving it would follow an `opencode` symlink
+        # into a broader target such as ~/.config or another user directory.
+        base = path.parent.expanduser().resolve(strict=False)
+        candidate = base / path.name
+        if not candidate.is_symlink():
+            result.append(candidate)
+    return tuple(result)
 
 
 def progress_writable_dirs(args) -> tuple[Path, ...]:

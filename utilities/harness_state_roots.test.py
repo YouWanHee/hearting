@@ -101,6 +101,30 @@ class HarnessStateRootsTest(unittest.TestCase):
                 codex.ensure_owner_writable_dirs(owner)
             self.assertTrue(all(path.is_dir() for path in roots))
 
+    def test_opencode_store_symlink_is_not_expanded_into_a_wider_writable_root(self):
+        xdg = Path(self._tmp.name) / "xdg"
+        target = self.home / ".config" / "opencode"
+        target.mkdir(parents=True)
+        data_root = xdg / "data" / "opencode"
+        data_root.parent.mkdir(parents=True)
+        data_root.symlink_to(target, target_is_directory=True)
+        env = {"HOME": str(self.home), "XDG_DATA_HOME": str(xdg / "data"),
+               "XDG_STATE_HOME": str(xdg / "state"), "XDG_CACHE_HOME": str(xdg / "cache")}
+        owner = self.args(worker_type="owner", nested_headless_network=True,
+                          nested_headless_network_eligible=True)
+        with mock.patch.dict("os.environ", env, clear=True):
+            roots = H.nested_opencode_store_writable_dirs(owner)
+            self.assertEqual(roots, (xdg / "state/opencode", xdg / "cache/opencode"))
+            self.assertNotIn(target, roots)
+            codex_spec = importlib.util.spec_from_file_location(
+                "codex_dispatch_headless_state_roots_symlink", ROOT / "adapters/codex/bin/dispatch-headless.py")
+            codex = importlib.util.module_from_spec(codex_spec)
+            codex_spec.loader.exec_module(codex)
+            with mock.patch.object(codex, "summary_writable_dirs", return_value=()):
+                writable = codex.nested_owner_writable_dirs(owner)
+            self.assertNotIn(target, writable)
+            self.assertNotIn(data_root.resolve(), writable)
+
     def test_only_an_adapter_that_confines_writes_opens_them(self):
         # The rule is shared; opening the directories is the realization of an
         # adapter whose declared enforcement confines writes.
