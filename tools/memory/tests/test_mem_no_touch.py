@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -199,6 +200,23 @@ class NoTouchCliTest(unittest.TestCase):
                               env={"MEM_STORE": str(old_store), "MEM_EXCHANGE_AUTO": "1"})
         self.assertEqual(result.returncode, 2)
         self.assertIn("read-only lookup failed", result.stderr)
+        self.assertEqual(self.snapshot([old_db]), before)
+
+    def test_no_touch_uses_body_fallback_when_optional_fts_indexes_are_absent(self):
+        old_store = self.root / "without-optional-indexes"
+        old_store.mkdir()
+        old_db = old_store / "memory.db"
+        shutil.copyfile(self.store / "memory.db", old_db)
+        with sqlite3.connect(old_db) as con:
+            for name in ("records_capsule_fts", "records_fts", "records_cjk"):
+                if con.execute("SELECT 1 FROM sqlite_master WHERE name=?", (name,)).fetchone():
+                    con.execute(f"DROP TABLE {name}")
+        before = self.snapshot([old_db])
+        result = self.run_mem("recall", "no-touch fixture", "--full", "--no-touch",
+                              env={"MEM_STORE": str(old_store)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.rid, result.stdout)
+        self.assertIn("no-touch fixture body", result.stdout)
         self.assertEqual(self.snapshot([old_db]), before)
 
     def test_ordinary_main_show_and_recall_keep_access_touch_and_events(self):
