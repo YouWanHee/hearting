@@ -4965,7 +4965,7 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     ids = [node["id"] for node in route["nodes"]]
     framed = shape == "framed"
-    graph = "→".join(ids) if route.get("composed") or framed else (ids[0] if ids else "-")
+    graph = "→".join(ids) if ids else "-"
     gates = ",".join(sorted({row["gate"] for row in route.get("human_gate_bindings") or []})) or "없음"
     card = (
         f"[경로] {route['capability']} · {shape}({route['effective_intensity']}) {graph}"
