@@ -2729,15 +2729,34 @@ class SeedOnlyCodeCleanupWorkStartTest(GF.fixture.ProducerTestBase):
             "manifest_snapshots": {path.name: path.read_bytes() for path in snapshot_dir.glob("*.json")},
         }
         campaign_dir.rename(moved_campaign)
+        campaign_index = campaigns / "INDEX.json"
+        if campaign_index.exists():
+            campaign_index.unlink()
+        self.assertFalse(campaign_index.exists(), "cleanup observation must start without the disposable index")
+        unrelated_references = self.add_unrelated_spec_references(
+            base_publication["shared_reference_id"])
 
-        with mock.patch.object(artifact_producer, "admit_shared",
-                               side_effect=AssertionError("seed-only cleanup must not publish shared refs")), \
-                mock.patch.object(artifact_producer, "list_references",
-                                  side_effect=AssertionError("seed-only cleanup must not census shared refs")), \
-                mock.patch.object(artifact_producer, "prepare_route_artifact_env",
-                                  side_effect=AssertionError("closed route must not be reopened")):
-            result = W.start_work(json.loads(route_path.read_text()), route_path, self.jobs)
+        with self.observe_shared_spec_enumeration() as enumerated:
+            with mock.patch.object(artifact_producer, "admit_shared",
+                                   side_effect=AssertionError("seed-only cleanup must not publish shared refs")), \
+                    mock.patch.object(artifact_producer, "list_references",
+                                      side_effect=AssertionError("seed-only cleanup must not census shared refs")), \
+                    mock.patch.object(artifact_producer, "prepare_route_artifact_env",
+                                      side_effect=AssertionError("closed route must not be reopened")):
+                result = W.start_work(json.loads(route_path.read_text()), route_path, self.jobs)
 
+        self.assertEqual(len(unrelated_references), 2)
+        self.assert_only_exact_spec_revision_enumerated(
+            enumerated, base_publication["shared_reference_id"],
+            base_publication["shared_reference_revision_id"])
+        manifest_doc = json.loads(before_records["cycle_manifest"])
+        self.assertIn(base_publication["shared_reference_id"],
+                      {row["shared_reference_id"] for row in manifest_doc["shared_references"]})
+        self.assertTrue(any(row["shared_reference_id"] == base_publication["shared_reference_id"]
+                            and row["shared_reference_revision_id"] ==
+                            base_publication["shared_reference_revision_id"]
+                            and row["content_digest"] == base_publication["content_digest"]
+                            for row in manifest_doc["shared_reference_revisions"]))
         self.assertEqual((result["state"], result["required_action"]),
                          ("completed", "advance-completed"), result)
         self.assertNotIn("shared_publication", result)

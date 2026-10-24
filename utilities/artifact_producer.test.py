@@ -179,6 +179,70 @@ class ProducerTestBase(unittest.TestCase):
         target.write_bytes(data)
         return target
 
+    def add_unrelated_spec_references(self, reference_id):
+        import shutil
+
+        source = self.root / "shared/spec" / reference_id
+        self.assertTrue(source.is_dir())
+        candidates = ["ref_" + "0" * 32, "ref_" + "f" * 32]
+        if reference_id == candidates[0]:
+            candidates[0] = "ref_" + "1" * 32
+        if reference_id == candidates[1]:
+            candidates[1] = "ref_" + "e" * 32
+        created = []
+        for unrelated_id in candidates:
+            target = source.parent / unrelated_id
+            self.assertFalse(target.exists())
+            shutil.copytree(source, target)
+            reference_path = target / "reference.json"
+            reference = json.loads(reference_path.read_text(encoding="utf-8"))
+            reference["shared_reference_id"] = unrelated_id
+            reference_path.write_text(json.dumps(reference, ensure_ascii=False, indent=2,
+                                                 sort_keys=True) + "\n", encoding="utf-8")
+            created.append(unrelated_id)
+        return created
+
+    @contextlib.contextmanager
+    def observe_shared_spec_enumeration(self):
+        shared_root = (self.root / "shared/spec").resolve()
+        visited = []
+        real_scandir = os.scandir
+        real_iterdir = Path.iterdir
+
+        def record(path):
+            try:
+                candidate = Path(os.fsdecode(path)).resolve()
+                candidate.relative_to(shared_root)
+            except (TypeError, ValueError, OSError):
+                pass
+            else:
+                visited.append(candidate)
+
+        def observe_scandir(path):
+            record(path)
+            return real_scandir(path)
+
+        def observe_iterdir(path):
+            record(path)
+            yield from real_iterdir(path)
+
+        with mock.patch.object(os, "scandir", side_effect=observe_scandir), \
+                mock.patch.object(Path, "iterdir", observe_iterdir):
+            yield visited
+
+    def assert_only_exact_spec_revision_enumerated(self, visited, reference_id, revision_id):
+        shared_root = (self.root / "shared/spec").resolve()
+        exact_revision = shared_root / reference_id / "revisions" / revision_id
+        unexpected = []
+        for path in visited:
+            try:
+                path.relative_to(exact_revision)
+            except ValueError:
+                unexpected.append(path.relative_to(shared_root).as_posix())
+        self.assertEqual(unexpected, [],
+                         f"unexpected shared/spec filesystem enumeration: {unexpected}; "
+                         f"observed={[p.relative_to(shared_root).as_posix() for p in visited]}")
+
     def seed_legacy(self, rel="plans/legacy.md", data="legacy body\n"):
         target = self.root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -2843,15 +2907,31 @@ class CompletedSpecPublicationTest(ProducerTestBase):
             "snapshots": {path.name: path.read_bytes() for path in snapshots.glob("*.json")},
         }
         campaign_dir.rename(moved_campaign)
+        campaign_index = campaigns / "INDEX.json"
+        if campaign_index.exists():
+            campaign_index.unlink()
+        self.assertFalse(campaign_index.exists(), "cleanup observation must start without the disposable index")
+        unrelated_references = self.add_unrelated_spec_references(admitted["shared_reference_id"])
 
-        with mock.patch.object(P, "list_references",
-                               side_effect=AssertionError("seed-only cleanup must not census shared refs")), \
-                mock.patch.object(P, "admit_shared",
-                                  side_effect=AssertionError("seed-only cleanup must not admit shared refs")):
-            self.assertEqual(self._publish(cycle, settle=False),
-                             {"cycle_id": cycle["cycle_id"], "status": "not-applicable"})
-            self.assertEqual(P.completed_route_spec_publication(route, settle=False),
-                             {"status": "not-applicable"})
+        with self.observe_shared_spec_enumeration() as enumerated:
+            with mock.patch.object(P, "list_references",
+                                   side_effect=AssertionError("seed-only cleanup must not census shared refs")), \
+                    mock.patch.object(P, "admit_shared",
+                                      side_effect=AssertionError("seed-only cleanup must not admit shared refs")):
+                self.assertEqual(self._publish(cycle, settle=False),
+                                 {"cycle_id": cycle["cycle_id"], "status": "not-applicable"})
+                self.assertEqual(P.completed_route_spec_publication(route, settle=False),
+                                 {"status": "not-applicable"})
+        self.assertEqual(len(unrelated_references), 2)
+        self.assert_only_exact_spec_revision_enumerated(
+            enumerated, admitted["shared_reference_id"], admitted["shared_reference_revision_id"])
+        manifest_doc = json.loads(before["manifest"])
+        self.assertIn(admitted["shared_reference_id"],
+                      {row["shared_reference_id"] for row in manifest_doc["shared_references"]})
+        self.assertTrue(any(row["shared_reference_id"] == admitted["shared_reference_id"]
+                            and row["shared_reference_revision_id"] == admitted["shared_reference_revision_id"]
+                            and row["content_digest"] == admitted["content_digest"]
+                            for row in manifest_doc["shared_reference_revisions"]))
 
         self.assertFalse((campaigns / campaign_rel).exists())
         self.assertTrue(moved_campaign.is_dir())

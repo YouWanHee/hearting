@@ -9316,62 +9316,56 @@ def _code_cycle_snapshot_publication_obligation(
         components = component_receipt
         base_tree = {}
     else:
-        found = None
+        sealed_references = {
+            row.get("shared_reference_id"): row
+            for row in document.get("shared_references", [])
+            if isinstance(row, Mapping) and row.get("kind") == "shared-spec"
+            and isinstance(row.get("shared_reference_id"), str)
+        }
+        exact_matches: Dict[Tuple[str, str, Optional[Tuple[str, ...]]], str] = {}
 
-        def match_reference(candidate: Mapping[str, Any]):
-            candidate_id = candidate.get("shared_reference_id")
-            revision_ids = candidate.get("revisions")
-            if not isinstance(candidate_id, str) or not isinstance(revision_ids, list):
-                return None
-            if not revision_ids and matches(candidate_id, None, None, None):
-                return (candidate, candidate_id, None, None, None)
-            for candidate_revision in revision_ids:
-                if not isinstance(candidate_revision, str):
-                    continue
-                revision_record = _read_json(
-                    root / "shared/spec" / candidate_id / "revisions" / candidate_revision
-                    / REVISION_RECORD_NAME)
-                content = revision_record.get("content_digest") if isinstance(revision_record, Mapping) else None
-                if isinstance(content, str) and matches(candidate_id, candidate_revision, content, None):
-                    return (candidate, candidate_id, candidate_revision, content, None)
-                if (isinstance(content, str) and component_receipt is not None
-                        and matches(candidate_id, candidate_revision, content, component_receipt)):
-                    return (candidate, candidate_id, candidate_revision, content, component_receipt)
-            return None
+        def add_exact(candidate_id: Any, candidate_revision: Any, content: Any) -> None:
+            if (not isinstance(candidate_id, str) or candidate_id not in sealed_references
+                    or not isinstance(candidate_revision, str) or not isinstance(content, str)):
+                return
+            if matches(candidate_id, candidate_revision, content, None):
+                exact_matches[(candidate_id, candidate_revision, None)] = content
+            elif (component_receipt is not None
+                  and matches(candidate_id, candidate_revision, content, component_receipt)):
+                exact_matches[(candidate_id, candidate_revision, component_receipt)] = content
 
-        seen_ids = set()
-        for candidate in reference_rows or ():
-            candidate_id = candidate.get("shared_reference_id")
-            if isinstance(candidate_id, str):
-                seen_ids.add(candidate_id)
-            found = match_reference(candidate)
-            if found is not None:
-                break
-        if found is None:
-            directory = root / "shared/spec"
-            try:
-                entries = sorted(directory.iterdir(), key=lambda path: path.name)
-            except OSError:
-                entries = []
-            for entry in entries:
-                if entry.name in seen_ids or entry.is_symlink() or not entry.is_dir():
-                    continue
-                candidate = _read_json(entry / "reference.json")
-                if (not isinstance(candidate, Mapping)
-                        or candidate.get("shared_reference_id") != entry.name):
-                    continue
-                found = match_reference(candidate)
-                if found is not None:
-                    break
-        if found is None:
-            return {"obligation": True}
-        reference, reference_id, revision_id, _content_digest, components = found
-        try:
-            if (revision_id is not None
-                    and revision_id not in reference.get("revisions", [])):
+        for row in document.get("shared_reference_revisions", []):
+            if isinstance(row, Mapping):
+                add_exact(row.get("shared_reference_id"),
+                          row.get("shared_reference_revision_id"), row.get("content_digest"))
+
+        if len(exact_matches) != 1:
+            if exact_matches or sealed_references:
                 return {"obligation": True}
-            base_tree, _base_record = _verified_shared_spec(root, reference_id, revision_id) \
-                if revision_id is not None else ({}, {})
+            # Pre-pin completed records remain an ordinary no-op when their
+            # campaign payload is gone. New seed operations retain their exact
+            # base through the existing shared-reference pin surface.
+            return {"obligation": False}
+
+        (reference_id, revision_id, components), expected_content_digest = next(iter(exact_matches.items()))
+        candidate = next((row for row in reference_rows or ()
+                          if isinstance(row, Mapping)
+                          and row.get("shared_reference_id") == reference_id), None)
+        reference = candidate if isinstance(candidate, Mapping) else _read_json(
+            _reference_path(root, "spec", reference_id))
+        if (not isinstance(reference, Mapping)
+                or reference.get("shared_reference_id") != reference_id
+                or revision_id not in reference.get("revisions", [])):
+            return {"obligation": True}
+        revision_record = _read_json(
+            root / "shared/spec" / reference_id / "revisions" / revision_id / REVISION_RECORD_NAME)
+        if (not isinstance(revision_record, Mapping)
+                or revision_record.get("shared_reference_id") != reference_id
+                or revision_record.get("shared_reference_revision_id") != revision_id
+                or revision_record.get("content_digest") != expected_content_digest):
+            return {"obligation": True}
+        try:
+            base_tree, _base_record = _verified_shared_spec(root, reference_id, revision_id)
         except (ProducerError, OSError, ValueError, KeyError, TypeError):
             return {"obligation": True}
 
