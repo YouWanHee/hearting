@@ -7488,12 +7488,12 @@ class ComposeRouteTest(TestRoute):
  def test_non_git_decision_is_single_and_conservative_classifier_is_purpose_based(self):
   cwd="/tmp/non-git-project"
   diagnosis={"state":"non-git","cwd":cwd,"detail":"fatal: not a git repository"}
-  direct=R._decide_non_git_compose(diagnosis,None,0,False,None)
+  direct=R._decide_non_git_compose(diagnosis,"direct",0,False,None)
   self.assertEqual(direct["kind"],"direct")
-  for request_shape,depth,attempt in (("framed",0,False),("solo",0,False),
-                                      (None,1,False),("direct",0,True)):
+  for request_shape,depth,attempt in ((None,0,False),("framed",0,False),("solo",0,False),
+                                      (None,1,False),("direct",1,False),("direct",0,True)):
    result=R._decide_non_git_compose(diagnosis,request_shape,depth,attempt,"autopilot-code")
-   expected = "worker-candidate" if request_shape in ("framed", "solo") else "refuse"
+   expected = "worker-candidate" if request_shape != "direct" else "refuse"
    self.assertEqual(result["kind"],expected)
    self.assertTrue(result["cause"].startswith("git 저장소 아님: "+cwd))
    if expected == "worker-candidate":
@@ -7570,7 +7570,7 @@ class ComposeRouteTest(TestRoute):
 
  def test_compose_start_with_empty_ancestor_git_marker_starts_direct(self):
   import work_start
-  exact="git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작"
+  exact="git 아닌 폴더 — 이 세션이 직접 진행. 작업자가 필요하면 --shape 없이 다시 시작(원본 수정은 git init 필요)"
   with tempfile.TemporaryDirectory(prefix="compose-ancestor-marker-") as tmp, \
        mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
    root=Path(tmp); parent=root/"parent"; cwd=parent/"project"
@@ -7613,7 +7613,7 @@ class ComposeRouteTest(TestRoute):
    self.assertIn("source=non-git-unresolved", "\n".join(R.compose_decision_lines(route)))
    decision={"kind":"direct","capability_unresolved":True}
    card=R.compose_card(route,non_git_decision=decision)
-   self.assertEqual(card.count("git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작"),1)
+   self.assertEqual(card.count("git 아닌 폴더 — 이 세션이 직접 진행. 작업자가 필요하면 --shape 없이 다시 시작(원본 수정은 git init 필요)"),1)
    self.assertEqual(card.count("작업 종류 미정 — `--capability`로 지정"),1)
    R.verify_route(route,R.ROOT)
 
