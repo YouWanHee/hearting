@@ -481,6 +481,20 @@ class ComputeHostsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("not initialized", result.stderr)
 
+    def test_self_command_probes_local_without_loading_inventory(self):
+        module = load_module()
+        expected = {"host": "fixture-machine", "reachable": True, "gpus": [{"index": 0}]}
+        output = io.StringIO()
+        with mock.patch.object(module.socket, "gethostname", return_value="fixture-machine"), \
+                mock.patch.object(module, "load_config", side_effect=AssertionError("inventory read")), \
+                mock.patch.object(module, "probe_host", return_value=expected) as probe, \
+                mock.patch("sys.stdout", output):
+            self.assertEqual(module.main(["self", "--json"]), 0)
+        probe.assert_called_once_with("fixture-machine", {"ssh_host": "local"}, (), ())
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["hosts"][0]["host"], "fixture-machine")
+        self.assertTrue(payload["hosts"][0]["self"])
+
     def test_static_listing_reads_the_inventory(self):
         result = self.run_tool("list", "--static", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1346,6 +1360,22 @@ class ComputeHostsTest(unittest.TestCase):
             if Path(entry) != self.fakebin)}
         if shutil.which("tmux", path=env["PATH"]) is None:
             self.skipTest("tmux is not installed")
+        # Probe the optional -e transport capability against a disposable server.
+        # Older tmux releases exit cleanly without accepting new-session -e, so
+        # detect that exact limitation instead of failing the stop semantics test.
+        server = "hearting-capability-%s" % os.getpid()
+        probe = subprocess.run(
+            ["tmux", "-L", server, "new-session", "-d", "-e", "HEARTING_PROBE=1",
+             "-s", "hearting-probe", "true"],
+            capture_output=True, text=True, timeout=5, env=env)
+        subprocess.run(["tmux", "-L", server, "kill-server"],
+                       capture_output=True, timeout=5, env=env)
+        if probe.returncode:
+            reason = probe.stderr.strip() or probe.stdout.strip() or "new-session -e rejected"
+            self.skipTest("installed tmux lacks new-session -e: " + reason)
+        home = self.root / "isolated-home"
+        home.mkdir(exist_ok=True)
+        env.update(HOME=str(home), AGENT_HOME=str(ROOT))
         result = self.run_tool("run", "here", "--name", "stopme", "--",
                                "bash", "-c", "sleep 30", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)

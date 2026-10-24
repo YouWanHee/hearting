@@ -10,6 +10,7 @@ This holds the static half in one user-owned file and measures the rest:
 
     list    inventory plus reachability, GPU load/VRAM, and exact process owners
     probe   the live GPU/process measurement alone, for one host or all of them
+    self    measure this machine without requiring an inventory
     claim   bind a detached root PID to its exact launcher session identity
     run     start a detached command on a host under a stable run id
     runs    what has been started, and which of those are still alive
@@ -2160,6 +2161,31 @@ def cmd_probe(args):
     return 0 if all(r["reachable"] for r in results) else 1
 
 
+def cmd_self(args):
+    """Measure this machine through the existing probe without loading inventory."""
+    name = socket.gethostname() or "local"
+    row = probe_host(name, {"ssh_host": LOCAL}, (), ())
+    row["self"] = True
+    if args.json:
+        print(json.dumps({"hosts": [row]}, ensure_ascii=False, sort_keys=True))
+        return 0
+    state = "up" if row.get("reachable") else "down (%s)" % (row.get("detail") or "unavailable")
+    print(f"{name}: {state}")
+    if row.get("reachable"):
+        print("  CPU %s%% · MEM %s/%s MiB" % (
+            row.get("cpu_utilization_pct", "—"), row.get("memory_used_mib", "—"),
+            row.get("memory_total_mib", "—")))
+        gpus = row.get("gpus") or []
+        if gpus:
+            for gpu in gpus:
+                print("  GPU %s %s · %s/%s MiB" % (
+                    gpu.get("index", "?"), gpu.get("name") or "unknown",
+                    gpu.get("memory_used_mib", "—"), gpu.get("memory_total_mib", "—")))
+        else:
+            print("  GPU unavailable" if row.get("detail") else "  no GPU")
+    return 0
+
+
 CLAIM_IDENTITY_SCRIPT = r"""
 python3 - <<'PY'
 import hashlib
@@ -2808,6 +2834,10 @@ def build_parser():
     p_probe.add_argument("hosts", nargs="*")
     p_probe.add_argument("--json", action="store_true")
     p_probe.set_defaults(func=cmd_probe)
+
+    p_self = sub.add_parser("self", help="Measure this machine without an inventory")
+    p_self.add_argument("--json", action="store_true")
+    p_self.set_defaults(func=cmd_self)
 
     p_claim = sub.add_parser(
         "claim", help="Bind a detached root PID to its exact launcher session")

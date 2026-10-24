@@ -103,9 +103,10 @@ scripting and snapshots work anywhere Python does.
 `compute-hosts` requires an explicit host choice and reads the user-owned
 `${XDG_CONFIG_HOME:-$HOME/.config}/hearting/compute-hosts.yaml`. Install seeds
 that file once as a fully commented template (two example hosts, English
-comments) and never modifies it afterwards; until a host is filled in, the tool
-and the Fleet panel report it as a template rather than failing. `harness
-config status` lists every user-owned config file with its state and the
+comments) and never modifies it afterwards; Fleet still shows this machine's
+read-only compute observation without inventory. Remote hosts and detached runs
+still need inventory configuration. `harness config status` lists every
+user-owned config file with its state and the
 command that seeds it. The installer does not edit shell startup files,
 schedule GPU work, or dispatch remote agents. Foreign PATH files
 and symlinks are preserved; full uninstall removes only the owned shared link,

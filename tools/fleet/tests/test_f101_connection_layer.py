@@ -359,8 +359,8 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     change in these four goldens; absent connection rows remain absent.
     Exception on record: 2026-10-19 provider status without an account observation
     reads `provider availability unknown`. The approved 2026-10-20 OpenCode header
-    cleanup now limits the default row to Go quota bars or `Go usage unavailable`;
-    provider/credential diagnostics remain in JSON. At each captured width only the
+    cleanup now limits the default row to Go quota bars or `Go usage unavailable` with
+    one approved failure reason; provider matrices remain in JSON. At each captured width only the
     OpenCode usage row changes; all other bytes are kept."""
 
     def _render(self, width):
