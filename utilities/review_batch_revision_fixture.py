@@ -296,7 +296,19 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         ROUTE._attempt_completion_path(
             self.route, gap['node'], gap['attempt_id'], jobs=self.jobs).unlink(missing_ok=True)
         self.fixture_row(gap['attempt_id'], status='done',
-            remove=('pid', 'pid_start', 'pid_ns', 'pid_observer_ns', 'failure_class',
+            # Counterfactual registration-only input: a previously settled
+            # transport is not evidence that this synthetic gap ran. Retaining
+            # its reap/group identity would correctly contradict no-start.
+            remove=('pid', 'pid_start', 'pid_scope', 'pid_host', 'pid_host_start',
+                    'pid_host_ns', 'pid_host_proof', 'pid_ns', 'pid_observer_ns',
+                    'pgid', 'pgid_host', 'launch_cgroup_b64', 'launch_cgroup_ns',
+                    'group_reap_proof', 'group_reap_pgid',
+                    'attempt_descendant_proof', 'attempt_descendant_observer_ns',
+                    'attempt_descendant_residue', 'attempt_descendant_residue_count',
+                    'attempt_descendant_residue_basis', 'attempt_descendant_residue_at',
+                    'reap_watch', 'reap_watch_pid', 'post_exit_receipt_substitute',
+                    'cleanup_receipt_b64', 'cleanup_receipt_digest',
+                    'process_exit', 'terminal_event', 'detected_by', 'failure_class',
                     'completion_marker', 'completion_marker_history'),
             launch_claimed='0', launch_started='0', launch_outcome='never-launched',
             note='opencode-context-limit-unavailable')
