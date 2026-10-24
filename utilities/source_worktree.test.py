@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -434,7 +435,9 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
                            "--artifact-root", str(self.artifact_root), "--unassigned", "--jobs", str(self.jobs)])
         self.assertEqual(len(self.route_files()), 2)
         self.assertEqual(len(self.start_calls), 2)
-        self.assertEqual(len(self.owner_attempt_rows()), 2)
+        launched = {re.search(r"(?:^|,)route_id=([^,\s]+)", row).group(1)
+                    for row in self.owner_attempt_rows()}
+        self.assertEqual(launched, {frame_route["route_id"], omitted_route["route_id"]})
         self.assertFalse(project.with_name(project.name + "-wt").exists())
 
     def test_non_git_direct_cleans_dispatch_hints_and_preserves_explicit_capability(self):
