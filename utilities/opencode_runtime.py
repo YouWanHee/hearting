@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import shutil
 import sqlite3
 import stat
