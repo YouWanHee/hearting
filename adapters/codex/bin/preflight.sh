@@ -584,7 +584,17 @@ EOF
       printf 'check=failed\nreason=codex-command-unavailable\nfailure_scope=runtime-global\ncodex_command=unavailable\nretry_on_isolated_worktree=0\nworktree=%s\n' "$worktree"
       exit 69
     fi
-    if ! git -C "$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git_error=$(git -C "$worktree" rev-parse --show-toplevel 2>&1) || git_status=$?
+    if [ "${git_status:-0}" -ne 0 ]; then
+      if [ ! -e "$worktree/.git" ] && [ ! -L "$worktree/.git" ] \
+        && printf '%s' "$git_error" | grep -qi 'not a git repository (or any'; then
+        if ! codex sandbox --help 2>/dev/null | grep -q -- '--permission-profile'; then
+          printf 'check=failed\nreason=codex-non-git-profile-unsupported\nfailure_scope=runtime-global\ncodex_command=ok\nworktree=%s\n' "$worktree"
+          exit 69
+        fi
+        printf 'check=ok\nrepository=non-git\nworktree=%s\n' "$worktree"
+        exit 0
+      fi
       printf 'check=failed\nreason=not-a-git-worktree\nfailure_scope=exact-worktree\ncodex_command=ok\nretry_on_isolated_worktree=1\nworktree=%s\n' "$worktree"
       exit 65
     fi

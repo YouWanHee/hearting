@@ -380,19 +380,38 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
                 self.assertEqual(self.owner_attempt_rows(), [])
         self.assertEqual(len(self.route_files()), 1)
 
-    def test_non_git_worker_shape_route_plan_and_registered_depth_refuse_before_route_write(self):
+    def test_non_git_mutating_worker_and_registered_direct_refuse_before_route_write(self):
         project = Path(self.tmp.name) / "non-git-refusal"
         project.mkdir()
         prompt = Path(self.tmp.name) / "non-git-refusal.md"
         prompt.write_text("Implement a reusable driver.\n", encoding="utf-8")
-        cases = (["--shape", "framed"], ["--shape", "solo"], ["--shape", "staged"])
-        for extra in cases:
+        self.evidence.write_text(json.dumps({"tuples": [{
+            "parent_harness": "claude", "parent_transport": "headless",
+            "parent_sandbox": "adapter-default", "child_harness": "codex",
+            "launch_authority": "conductor", "status": "supported",
+            "probe_source": "fixture", "probe_time": "2026-10-15T00:00:00Z",
+            "failure_class": "", "checked_worktree": str(project.resolve()),
+            "failure_scope": "none", "codex_command": "ok", "retry_on_isolated_worktree": 0,
+        }], "native_subagent": []}), encoding="utf-8")
+        for extra in (["--shape", "solo"], ["--shape", "staged"]):
             with self.subTest(extra=extra):
                 argv = ["capability-route.py", "compose", "--start", "--slug", "refused",
                         *extra, "--prompt-file", str(prompt), "--cwd", str(project),
+                        "--dispatch-evidence", str(self.evidence),
                         "--artifact-root", str(self.artifact_root), "--unassigned", "--jobs", str(self.jobs)]
-                with self.assertRaisesRegex(ValueError, "git 저장소 아님: .*depth-0"):
+                with self.assertRaisesRegex(ValueError, "git 저장소 아님: .*source-mutating worker route"):
                     self.main(argv)
+        framed_argv = ["capability-route.py", "compose", "--start", "--slug", "framed-recordish",
+                       "--shape", "framed", "--prompt-file", str(prompt), "--cwd", str(project),
+                       "--dispatch-evidence", str(self.evidence), "--artifact-root", str(self.artifact_root),
+                       "--unassigned", "--jobs", str(self.jobs)]
+        self.assertEqual(self.main(framed_argv), 0)
+        frame_route = self.start_calls[-1][0]
+        self.assertEqual((frame_route["source_commit"], frame_route["selection"]["shape"],
+                          frame_route["cwd"]), ("unversioned", "framed", str(project.resolve())))
+        from dispatch_contract import launch_repository_identity
+        self.assertEqual(launch_repository_identity(
+            project, self.start_calls[-1][1]), (str(project.resolve()), "non-git"))
         with mock.patch.dict(os.environ, {"AGENT_DISPATCH_DEPTH": "1"}):
             with self.assertRaisesRegex(ValueError, "git 저장소 아님: .*depth-0 부모"):
                 self.main(["capability-route.py", "compose", "--start", "--slug", "depth-refused",
@@ -403,7 +422,10 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
                 self.main(["capability-route.py", "compose", "--start", "--slug", "registered-refused",
                            "--shape", "direct", "--prompt-file", str(prompt), "--cwd", str(project),
                            "--artifact-root", str(self.artifact_root), "--unassigned", "--jobs", str(self.jobs)])
-        self.assertEqual((self.route_files(), self.start_calls, self.owner_attempt_rows()), ([], [], []))
+        self.assertEqual(len(self.route_files()), 1)
+        self.assertEqual(len(self.start_calls), 1)
+        self.assertEqual(len(self.owner_attempt_rows()), 1)
+        self.assertFalse(project.with_name(project.name + "-wt").exists())
 
     def test_non_git_direct_cleans_dispatch_hints_and_preserves_explicit_capability(self):
         project = Path(self.tmp.name) / "non-git-selection"
