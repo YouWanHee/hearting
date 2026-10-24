@@ -523,6 +523,7 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
     armed_rows = sup.read_armed(ledger)
     eligible = []
     differences = []
+    refusal_reason = "resource-compute-contract-unavailable"
     for node_id, armed in armed_rows.items():
         if (armed.get("predecessor_kind") != "resource"
                 or armed.get("resource_registry") != str(registry)
@@ -536,14 +537,29 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
         original = json.loads(registry.read_text(encoding="utf-8")).get("runs", {}).get(
             armed.get("predecessor_id"))
         parent = provenance.get("contract") or {}
-        if (not isinstance(original, dict) or original.get("resource_policy") != "supervised-owner"
-                or original.get("route") != str(Path(route_file).resolve(strict=True))
-                or original.get("node") != node_id or original.get("jobs") != str(jobs)
-                or provenance.get("run_id") != original.get("run_id")
-                or provenance.get("node") != node_id
-                or provenance.get("parent_attempt_id") != original.get("parent_attempt_id")
-                or parent.get("run_id") != original.get("run_id")
-                or parent.get("route_hash") != route.get("route_hash")):
+        candidate_bindings = [
+            ("resource_policy", "supervised-owner",
+             original.get("resource_policy") if isinstance(original, dict) else None),
+            ("resource.route", str(Path(route_file).resolve(strict=True)),
+             original.get("route") if isinstance(original, dict) else None),
+            ("resource.node", node_id, original.get("node") if isinstance(original, dict) else None),
+            ("resource.jobs", str(jobs), original.get("jobs") if isinstance(original, dict) else None),
+            ("provenance.run_id", original.get("run_id") if isinstance(original, dict) else None,
+             provenance.get("run_id")),
+            ("provenance.node", node_id, provenance.get("node")),
+            ("provenance.parent_attempt_id",
+             original.get("parent_attempt_id") if isinstance(original, dict) else None,
+             provenance.get("parent_attempt_id")),
+            ("contract.run_id", original.get("run_id") if isinstance(original, dict) else None,
+             parent.get("run_id")),
+            ("contract.route_hash", route.get("route_hash"), parent.get("route_hash")),
+        ]
+        candidate_differences = [{"field": field, "expected": expected, "actual": actual}
+                                 for field, expected, actual in candidate_bindings
+                                 if expected != actual]
+        if candidate_differences:
+            differences.extend(candidate_differences)
+            refusal_reason = "resource-compute-binding-conflict"
             continue
         if (parent.get("artifact_base") != armed.get("artifact_base")
                 or parent.get("declared_outputs") != list(node.get("outputs") or [])):
@@ -614,6 +630,10 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
             continue
         try:
             if armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(original):
+                differences.append({"field": "resource_binding",
+                                    "expected": OWNER_RESOURCE.resource_body_digest(original),
+                                    "actual": armed.get("resource_binding")})
+                refusal_reason = "resource-compute-binding-conflict"
                 continue
             if original.get("status") != "failed" or original.get("exit_code") in (None, 0):
                 continue
@@ -626,13 +646,36 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
         except (OSError, ValueError, KeyError, TypeError):
             continue
         eligible.append((node_id, armed, node, original))
+    if not eligible:
+        # After the adopted row has been armed, the current predecessor is no
+        # longer the original failed row named by compute provenance. Find the
+        # already-published identity by its exact route/node binding so replay
+        # can converge before treating that successful row as a new baseline.
+        replay_node_id = provenance.get("node")
+        replay_node = WS.route_node(route, replay_node_id) if isinstance(replay_node_id, str) else None
+        replay_armed = armed_rows.get(replay_node_id) if isinstance(replay_node_id, str) else None
+        replay_rows = [row for row in (json.loads(registry.read_text(encoding="utf-8")).get("runs") or {}).values()
+                       if isinstance(row, dict)
+                       and (row.get("execution") or {}).get("identity_key") == compute_execution_identity(
+                           {"execution": execution})
+                       and row.get("route") == str(Path(route_file).resolve(strict=True))
+                       and row.get("node") == replay_node_id and row.get("jobs") == str(jobs)
+                       and replay_armed is not None
+                       and replay_armed.get("predecessor_id") in {
+                           row.get("run_id"), (provenance.get("contract") or {}).get("run_id")}
+                       and row.get("status") == "succeeded"]
+        if len(replay_rows) == 1 and isinstance(replay_node, dict):
+            eligible.append((replay_node_id, replay_armed, replay_node, replay_rows[0]))
     if len(eligible) != 1:
         if eligible:
             fail_compute("resource-compute-baseline-ambiguous")
         if differences:
-            fail_compute("resource-compute-contract-mismatch", differences=differences,
+            fail_compute(refusal_reason if refusal_reason == "resource-compute-binding-conflict"
+                         else "resource-compute-contract-mismatch", differences=differences,
                          next_action="run the existing smoke/config flow for the changed contract")
-        fail_compute("resource-compute-contract-unavailable")
+        fail_compute(refusal_reason, differences=[{"field": "resource-candidate",
+                    "expected": "one exactly bound failed resource row", "actual": "no eligible row"}],
+                     next_action="repair the existing route/resource binding before retrying")
     node_id, armed, node, original = eligible[0]
 
     # A run's declared science outputs must already exist at their route-owned
@@ -745,7 +788,9 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
         fail_compute("resource-compute-binding-conflict")
     with ledger.lock():
         if sup.resource_continuation_cancelled(route, ledger):
-            fail_compute("resource-compute-route-closed")
+            fail_compute("resource-compute-route-closed", differences=[
+                {"field": "route.state", "expected": "open", "actual": "closed or cancelled"}],
+                next_action="continue only after the route owner opens a new authorized route")
         if sup.read_armed(ledger).get(node_id) != armed:
             fail_compute("resource-compute-binding-conflict")
         state = ledger.state()
@@ -777,9 +822,15 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
         with owner_input_lock(jobs, owner_wait["parent_attempt_id"]):
             parent_row, target = owner_input_target(jobs, owner_wait["parent_attempt_id"])
             if parent_row.status not in {"open", "running"} or not target:
-                fail("resource-compute-binding-conflict")
+                fail_compute("resource-compute-owner-input-unavailable", differences=[
+                    {"field": "owner_input.status", "expected": ["open", "running"],
+                     "actual": parent_row.status},
+                    {"field": "owner_input.target", "expected": "available", "actual": bool(target)}],
+                    next_action="resume the current owner input, then repeat the same compute-run start")
             if sup.resource_continuation_cancelled(route, ledger):
-                fail("resource-compute-route-closed")
+                fail_compute("resource-compute-route-closed", differences=[
+                    {"field": "route.state", "expected": "open", "actual": "closed or cancelled"}],
+                    next_action="continue only after the route owner opens a new authorized route")
             if not COMPUTE.run_snapshot_current(config, compute_run_id, execution):
                 fail_compute("resource-compute-evidence-changed",
                              next_action="reobserve the completed compute run before retrying")

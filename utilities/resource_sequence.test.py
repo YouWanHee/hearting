@@ -48,7 +48,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         (output / 'run.json').unlink()
         return route, path, jobs, registry, output, ledger
 
-    def live_owner(self, route, jobs, registry):
+    def live_owner(self, route, jobs, registry, *, harness='codex'):
         import dispatch_owner_input as INPUT
         identity = SUP.RR.proc_identity(os.getpid())
         attempt = 'att-owner'
@@ -58,8 +58,9 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             'attempt_schema_version': '2', 'dispatch_depth': '1',
             'transport': 'headless', 'execution_surface': 'registered-headless',
             'registered_worker': '1', 'fallback_hop': 'same-harness-headless',
-            'worker_type': 'owner', 'unit': '_kernel/owner', 'harness': 'codex',
-            'runtime_sandbox': 'workspace-write', 'completion_delivery': 'app-server-supervised',
+            'worker_type': 'owner', 'unit': '_kernel/owner', 'harness': harness,
+            'runtime_sandbox': 'workspace-write', 'completion_delivery':
+                'app-server-supervised' if harness == 'codex' else 'session-resume-supervised',
             'supervisor_lease': DC.SUPERVISOR_LEASE_KIND,
             'supervisor_lease_file': str(lease), 'supervisor_lease_nonce': nonce,
             'attempt_id': attempt, 'pid': str(identity['pid']), 'pid_start': identity['starttime'],
@@ -92,6 +93,201 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         armed['resource_binding'] = WAIT.resource_body_digest(resource_row)
         armed_path.write_text(json.dumps(armed))
         return attempt, owner_input
+
+    def test_compute_adopted_row_passes_normal_owner_successor_admission_once(self):
+        for harness in ('claude', 'codex', 'opencode'):
+            with self.subTest(owner_harness=harness), self.subfixture():
+                route, path, jobs, registry, output, ledger = self.fixture()
+                (output / 'run.json').write_bytes(b'{"state":"compute-result"}\n')
+                attempt, _owner_input = self.live_owner(route, jobs, registry, harness=harness)
+                data = json.loads(registry.read_text())
+                row = data['runs']['fixture-run']
+                row.update(status='succeeded', workflow_state='STAGE_SUCCEEDED', exit_code=0)
+                compute_dir = self.base / 'compute' / 'compute-fixture'
+                compute_dir.mkdir(parents=True)
+                (compute_dir / 'log').write_text('remote fixture complete\n')
+                (compute_dir / 'exit_code').write_text('0\n')
+                row.update(compute_run_id='compute-fixture', log=str(compute_dir / 'log'),
+                           sentinel=str(compute_dir / 'exit_code'))
+                row['execution'] = {
+                    'kind': 'compute-hosts', 'run_id': 'compute-fixture',
+                    'run_root': str(self.base / 'compute'), 'meta_sha256': 'm' * 64,
+                    'exit_sha256': 'e' * 64, 'receipt_sha256': 'r' * 64,
+                    'contract_sha256': 'c' * 64,
+                    'provenance': {'route_id': route['route_id'], 'route_hash': route['route_hash']},
+                }
+                compute_identity = SUP.RR.compute_execution_identity(row)
+                registry.write_text(json.dumps(data))
+                armed = SUP.read_armed(ledger)['full-run']
+                armed['resource_binding'] = WAIT.resource_body_digest(row)
+                armed_path = ledger.root / 'armed/full-run.json'
+                armed_path.write_text(json.dumps(armed))
+                args = SimpleNamespace(
+                    route_file=str(path), route_node='run-verify', attempt_id='att-verify',
+                    jobs=str(jobs), agent_home=ROOT, worktree=str(self.base), dispatch_depth=2,
+                    parent_slug='fixture-owner', parent_attempt_id=attempt,
+                    parent_harness=harness, parent_transport='headless',
+                    parent_sandbox='workspace-write', subsession_id=None,
+                )
+                marker = jobs.parent / 'completion' / route['route_id'] / 'full-run.json'
+                with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
+                     mock.patch('subprocess.check_output', return_value=str(self.base)), \
+                     mock.patch.object(SUP.RR, 'compute_execution_observation', return_value={
+                         'state': 'quiescent', 'reason': 'fixture-remote-empty'}):
+                    self.assertIsNone(RA.completion_gate(
+                        args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
+                    ))
+                    self.assertIsNone(RA.completion_gate(
+                        args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
+                    ))
+                self.assertTrue(marker.is_file())
+                self.assertEqual(json.loads(marker.read_bytes())['resource_execution_identity'],
+                                 compute_identity)
+                self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'STAGE_SUCCEEDED')
+                self.assertEqual(len(ledger.claims()), 1)
+                self.assertEqual(len(ledger.claim_history()), 1)
+
+    def test_compute_run_start_then_normal_owner_run_verify_start(self):
+        import artifact_producer
+        import resource_run_registry as RR
+        spec = importlib.util.spec_from_file_location('resource_runner_e2e', HERE / 'resource-runner.py')
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, _owner_input = self.live_owner(route, jobs, registry, harness='codex')
+        (output / 'run.json').write_bytes(b'{"state":"compute-result"}\n')
+        attestation = self.base / 'smoke-attestation.json'
+        attestation.write_text('{"fixture":true}\n')
+        attestation_hash = __import__('hashlib').sha256(attestation.read_bytes()).hexdigest()
+        old = json.loads(registry.read_text())['runs']['fixture-run']
+        command = ['compute-hosts', 'run', 'gpu-a', '--cwd', '/lab', '--env', 'env-a', '--',
+                   'python', 'train.py']
+        launch_request = {'smoke_attestation': str(attestation),
+                          'smoke_attestation_sha256': attestation_hash,
+                          'config_manifest': None, 'config_manifest_sha256': None}
+        old.update(status='failed', workflow_state='FAILED_RETRYABLE', failure_class='payload-exit',
+                   exit_code=3, command=command, launch_request=launch_request,
+                   config_ref='fixture-config', config_sha256='c' * 64,
+                   source_commit='fixture-commit', source_dirty=False,
+                   source_git_state='clean', config_layout='fixture-layout')
+        Path(old['sentinel']).write_text('3\n')
+        registry.write_text(json.dumps({'schema_version': 1, 'runs': {'fixture-run': old}}))
+        armed = SUP.read_armed(ledger)['full-run']
+        armed['resource_binding'] = WAIT.resource_body_digest(old)
+        (ledger.root / 'armed/full-run.json').write_text(json.dumps(armed))
+
+        compute_root = self.base / 'compute-runs'
+        compute_dir = compute_root / 'compute-fixture'
+        compute_dir.mkdir(parents=True)
+        (compute_dir / 'log').write_text('remote compute completed\n')
+        (compute_dir / 'exit_code').write_text('0\n')
+        declared_outputs = list(WS.route_node(route, 'full-run').get('outputs') or [])
+        output_rows = []
+        for relative in declared_outputs:
+            target = output / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.write_bytes(b'fixture-output\n')
+            output_rows.append({'path': relative,
+                'sha256': __import__('hashlib').sha256(target.read_bytes()).hexdigest(),
+                'state': 'present', 'size': target.stat().st_size})
+        sealed = {key: old.get(key) for key in ('command', 'cwd', 'config_ref', 'config_sha256',
+                 'source_commit', 'source_dirty', 'source_git_state', 'config_layout', 'launch_request')}
+        parent = {'route_id': route['route_id'], 'route_file': str(path.resolve()),
+                  'route_hash': route['route_hash'], 'node': 'full-run', 'run_id': 'fixture-run',
+                  'attempt_id': owner_attempt, 'sealed': sealed, 'artifact_base': str(output),
+                  'declared_outputs': declared_outputs,
+                  'inputs': [{'name': 'smoke_attestation', 'path': str(attestation),
+                              'sha256': attestation_hash, 'verified': True}]}
+        provenance = {'run_id': 'fixture-run', 'registry': str(registry.resolve()),
+                      'route_id': route['route_id'], 'route_file': str(path.resolve()),
+                      'route_hash': route['route_hash'], 'node': 'full-run',
+                      'parent_attempt_id': owner_attempt,
+                      'contract': parent}
+        execution_contract = {'command': ['python', 'train.py'], 'cwd': '/lab', 'env': 'env-a',
+            'share': False, 'resource_parent': parent,
+            'route': {'route_id': route['route_id'], 'route_file': str(path.resolve()),
+                      'route_hash': route['route_hash']}}
+        execution = {'kind': 'compute-hosts', 'run_id': 'compute-fixture',
+            'run_root': str(compute_root), 'host': 'gpu-a', 'meta_sha256': 'm' * 64,
+            'exit_sha256': 'e' * 64, 'receipt_sha256': 'r' * 64, 'contract_sha256': 'k' * 64,
+            'contract': execution_contract, 'receipt_state': 'finished', 'identity': {'pid': 4},
+            'outputs': output_rows,
+            'provenance': provenance, 'started_at': 1.0, 'ended_at': 2.0}
+        compute = SimpleNamespace(load_config=lambda: {'run_root': compute_root, 'hosts': {}},
+            execution_record=lambda *_args: {'state': 'quiescent', 'execution': execution,
+                                             'run_dir': str(compute_dir)},
+            run_snapshot_current=lambda *_args: True)
+        spec_loader = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda _module: None))
+        real_spec = importlib.util.spec_from_file_location
+        real_module = importlib.util.module_from_spec
+        def load_spec(name, location, *args, **kwargs):
+            if name == 'resource_runner_compute_hosts':
+                return spec_loader
+            return real_spec(name, location, *args, **kwargs)
+        def load_module(specification):
+            if specification is spec_loader:
+                return compute
+            return real_module(specification)
+        owner_wait = old['owner_wait']
+        owner_wait.update(parent_attempt_id=owner_attempt, session_id='same-native',
+                          route_id=route['route_id'], route_hash=route['route_hash'], jobs=str(jobs))
+        args = SimpleNamespace(jobs=str(jobs), parent_attempt_id=owner_attempt)
+        arm_attempts = 0
+        def arm_command(argv, **_kwargs):
+            nonlocal arm_attempts
+            if len(argv) > 1 and argv[1] == str(HERE / 'workflow-supervisor.py'):
+                arm_attempts += 1
+                if arm_attempts == 1:
+                    raise subprocess.TimeoutExpired(argv, 30)
+                self.assertEqual(SUP.main(argv[2:]), 0)
+                return subprocess.CompletedProcess(argv, 0)
+            raise AssertionError(f'unexpected child process from adoption: {argv!r}')
+        with mock.patch.object(WAIT, 'supervisor', return_value=SUP), \
+             mock.patch.object(WAIT, 'start_binding', return_value=owner_wait), \
+             mock.patch.object(RR, 'classify_identity', return_value=('exited', None, 'process-absent')), \
+             mock.patch.object(RR, 'resource_process_group_quiescent', return_value=True), \
+             mock.patch('importlib.util.spec_from_file_location', side_effect=load_spec), \
+             mock.patch('importlib.util.module_from_spec', side_effect=load_module), \
+             mock.patch.object(runner, 'verify_launch_input'), \
+             mock.patch.object(runner.subprocess, 'run', side_effect=arm_command), \
+             mock.patch.object(runner.subprocess, 'Popen') as spawned, \
+             mock.patch.object(artifact_producer, 'prepare_route_artifact_env', return_value={
+                 'AGENT_ARTIFACT_OUTPUT_DIR': str(output)}), \
+             mock.patch.dict(os.environ, {'AGENT_DISPATCH_JOBS': str(jobs),
+                 'AGENT_DISPATCH_COMPLETION_MODE': 'supervised'}, clear=False), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as before_arm:
+                runner.adopt_compute_run(registry, args, route, path, 'compute-fixture')
+            self.assertEqual(before_arm.exception.code, 65)
+            self.assertEqual(set(json.loads(registry.read_text())['runs']), {'fixture-run', 'fixture-run__a1'})
+            replay_before_arm = runner.adopt_compute_run(registry, args, route, path, 'compute-fixture')
+            self.assertTrue(replay_before_arm['replayed'])
+            self.assertEqual(spawned.call_count, 0)
+            replay_after_arm = runner.adopt_compute_run(registry, args, route, path, 'compute-fixture')
+            self.assertTrue(replay_after_arm['replayed'])
+            self.assertEqual(arm_attempts, 2)
+            self.assertEqual(spawned.call_count, 0)
+            owner_args = SimpleNamespace(route_file=str(path), route_node='run-verify',
+                attempt_id='att-verify', jobs=str(jobs), agent_home=ROOT, worktree=str(self.base),
+                dispatch_depth=2, parent_slug='fixture-owner', parent_attempt_id=owner_attempt,
+                parent_harness='codex', parent_transport='headless', parent_sandbox='workspace-write',
+                subsession_id=None)
+            with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
+                 mock.patch('subprocess.check_output', return_value=str(self.base)), \
+                 mock.patch.object(DC, 'canonical_repository_identity', return_value='fixture-repository'), \
+                 mock.patch.object(RR, 'compute_execution_observation', return_value={
+                     'state': 'quiescent', 'reason': 'fixture-remote-empty'}):
+                self.assertIsNone(RA.completion_gate(
+                    owner_args, 'start', ROOT, jobs, gate=DC.completion_marker_gate))
+        rows = json.loads(registry.read_text())['runs']
+        adopted = rows['fixture-run__a1']
+        self.assertEqual(adopted['execution']['run_id'], 'compute-fixture')
+        marker = jobs.parent / 'completion' / route['route_id'] / 'full-run.json'
+        self.assertEqual(json.loads(marker.read_bytes())['resource_execution_identity'],
+                         RR.compute_execution_identity(adopted))
+        self.assertEqual(len(ledger.claims()), 1)
+        self.assertEqual(len(ledger.claim_history()), 1)
 
     def next_body(self, registry, name, output, *, final=False):
         old = json.loads(registry.read_text())['runs']['fixture-run']

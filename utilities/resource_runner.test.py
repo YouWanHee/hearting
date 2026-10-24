@@ -3,6 +3,7 @@
 import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -106,7 +107,9 @@ class ComputeRunAdoptionTest(unittest.TestCase):
                       "resource_registry": str(self.registry), "jobs": str(self.jobs),
                       "artifact_base": str(self.output), "resource_binding": "body"}
 
-    def _run_adoption(self, *, cwd="/lab"):
+    def _run_adoption(self, *, cwd="/lab", owner_status="open", target="target",
+                      route_closed=False, binding_conflict=False, replay=False,
+                      interrupt_before_arm=False):
         import contextlib
         import resource_run_registry as RR
         import dispatch_resource_wait as OWNER_RESOURCE
@@ -120,7 +123,7 @@ class ComputeRunAdoptionTest(unittest.TestCase):
             ledger_for=lambda *_args: fake_ledger,
             read_armed=lambda _ledger: {"full-run": self.armed},
             resource_predecessors=lambda *_args: [(self.armed, self.original)],
-            resource_continuation_cancelled=lambda *_args: False,
+            resource_continuation_cancelled=lambda *_args: route_closed,
         )
         fake_compute = SimpleNamespace(load_config=lambda: {"run_root": self.root, "hosts": {}})
         fake_compute.execution_record = lambda *_args: {
@@ -129,7 +132,9 @@ class ComputeRunAdoptionTest(unittest.TestCase):
         fake_compute.run_snapshot_current = lambda *_args: True
         loader = SimpleNamespace(exec_module=lambda _module: None)
         fake_inputs = SimpleNamespace(_locked=lambda *_args: contextlib.nullcontext(),
-                                      _target=lambda *_args: (SimpleNamespace(status="open"), "target"))
+                                      _target=lambda *_args: (SimpleNamespace(status=owner_status), target))
+        if binding_conflict:
+            self.armed["resource_binding"] = "wrong-binding"
         fake_artifacts = SimpleNamespace(prepare_route_artifact_env=lambda *_args, **_kwargs: {
             "AGENT_ARTIFACT_OUTPUT_DIR": str(self.output)})
         patches = [
@@ -145,15 +150,37 @@ class ComputeRunAdoptionTest(unittest.TestCase):
             mock.patch("importlib.util.module_from_spec", return_value=fake_compute),
             mock.patch.dict(sys.modules, {"artifact_producer": fake_artifacts}),
             mock.patch.object(R.subprocess, "run"),
+            mock.patch.object(R.subprocess, "Popen"),
             mock.patch.object(R, "verify_launch_input"),
             mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs),
                                          "AGENT_DISPATCH_COMPLETION_MODE": "supervised"}, clear=False),
         ]
         entered = [patcher.start() for patcher in patches]
         self.addCleanup(lambda: [patcher.stop() for patcher in reversed(patches)])
+        arm_runner = entered[11]
+        process_spawn = entered[12]
+        arm_calls = 0
+        def run_arm(*args, **kwargs):
+            nonlocal arm_calls
+            arm_calls += 1
+            if interrupt_before_arm and arm_calls == 1:
+                raise subprocess.TimeoutExpired(args[0], 30)
+            return subprocess.CompletedProcess(args[0], 0)
+        arm_runner.side_effect = run_arm
         args = SimpleNamespace(jobs=str(self.jobs), parent_attempt_id="att-owner")
         with mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
-            R.adopt_compute_run(self.registry, args, self.route, self.route_file, "compute-1")
+            if interrupt_before_arm:
+                with self.assertRaises(SystemExit) as interrupted:
+                    R.adopt_compute_run(self.registry, args, self.route, self.route_file, "compute-1")
+                self.assertEqual(interrupted.exception.code, 65)
+                self.assertIn("resource-compute-binding-conflict", interrupted.exception.resource_message)
+            else:
+                R.adopt_compute_run(self.registry, args, self.route, self.route_file, "compute-1")
+            if replay or interrupt_before_arm:
+                R.adopt_compute_run(self.registry, args, self.route, self.route_file, "compute-1")
+        if interrupt_before_arm or replay:
+            self.assertEqual(arm_calls, 2)
+        self.assertEqual(process_spawn.call_count, 0)
         return json.loads(self.registry.read_text())["runs"]
 
     def test_same_contract_adopts_one_retry_without_payload_spawn(self):
@@ -164,6 +191,16 @@ class ComputeRunAdoptionTest(unittest.TestCase):
         self.assertEqual(adopted["parent_attempt_id"], "att-owner")
         self.assertEqual(runs["full-run"], self.original)
         self.assertEqual(self.sentinel.read_text(), "1\n")
+
+    def test_repeat_compute_run_reuses_the_published_row(self):
+        runs = self._run_adoption(replay=True)
+        self.assertEqual(list(runs), ["full-run", "full-run__a1"])
+        self.assertEqual(runs["full-run__a1"]["execution"]["run_id"], "compute-1")
+
+    def test_publish_then_arm_interruption_converges_on_one_row(self):
+        runs = self._run_adoption(interrupt_before_arm=True)
+        self.assertEqual(list(runs), ["full-run", "full-run__a1"])
+        self.assertEqual(runs["full-run__a1"]["execution"]["run_id"], "compute-1")
 
     def test_contract_mismatch_refuses_before_registry_or_sentinel_changes(self):
         prior_bytes = self.registry.read_bytes()
@@ -181,6 +218,46 @@ class ComputeRunAdoptionTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, 65)
         self.assertEqual(self.registry.read_bytes(), prior_bytes)
         self.assertEqual(self.sentinel.read_text(), "1\n")
+
+    def test_typed_refusals_preserve_registry_failed_row_sentinel_and_journal(self):
+        cases = (
+            ("binding", {"binding_conflict": True}, "resource-compute-binding-conflict"),
+            ("closed", {"route_closed": True}, "resource-compute-route-closed"),
+            ("owner-input", {"owner_status": "closed", "target": None},
+             "resource-compute-owner-input-unavailable"),
+        )
+        for name, options, reason in cases:
+            with self.subTest(name=name):
+                self.setUp()
+                if name == "binding":
+                    self.original["route"] = str(self.root / "foreign-route.json")
+                    self.registry.write_text(json.dumps({"schema_version": 1,
+                                                         "runs": {"full-run": self.original}}))
+                before_registry = self.registry.read_bytes()
+                before_failed = json.loads(before_registry)["runs"]["full-run"]
+                before_sentinel = self.sentinel.read_bytes()
+                before_jobs = self.jobs.read_bytes()
+                workflow = self.root / "workflow"
+                workflow.mkdir(exist_ok=True)
+                before_workflow = {path.relative_to(workflow).as_posix(): path.read_bytes()
+                                   for path in workflow.rglob("*") if path.is_file()}
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    with self.assertRaises(SystemExit) as caught:
+                        self._run_adoption(**options)
+                self.assertEqual(caught.exception.code, 65)
+                refusal = json.loads(caught.exception.resource_message)
+                self.assertEqual(refusal["reason"], reason)
+                self.assertTrue(refusal["differences"])
+                if name == "binding":
+                    self.assertIn("resource.route", {item["field"] for item in refusal["differences"]})
+                self.assertTrue(refusal["next_action"])
+                self.assertEqual(self.registry.read_bytes(), before_registry)
+                self.assertEqual(json.loads(self.registry.read_bytes())["runs"]["full-run"], before_failed)
+                self.assertEqual(self.sentinel.read_bytes(), before_sentinel)
+                self.assertEqual(self.jobs.read_bytes(), before_jobs)
+                self.assertEqual({path.relative_to(workflow).as_posix(): path.read_bytes()
+                                  for path in workflow.rglob("*") if path.is_file()}, before_workflow)
+                self.assertNotIn("full-run__a1", json.loads(self.registry.read_bytes())["runs"])
 
 
 class TestProgressLaunch(unittest.TestCase):

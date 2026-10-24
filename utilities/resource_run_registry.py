@@ -284,11 +284,15 @@ def classify_identity(run: dict, identity_reader=proc_identity) -> tuple[str, di
         return "stale", None, "recorded-identity-incomplete"
     execution = run.get("execution")
     if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
-        # Remote identities must never fall through to local /proc or its
-        # legacy missing-process-group compatibility path. Callers that need a
-        # terminal decision use resource_process_group_quiescent(), which
-        # performs a fresh host observation.
-        return "stale", None, "compute-hosts-observation-required"
+        # Remote identities never fall through to local /proc. Use the shared
+        # fresh host observation so admission, status, and settlement agree.
+        observed = compute_execution_observation(run)
+        if observed.get("state") == "quiescent":
+            return "exited", None, observed.get("reason", "compute-hosts-quiescent")
+        if (observed.get("state") == "not-quiescent"
+                and observed.get("reason") == "compute-run-process-group-populated"):
+            return "working", None, observed["reason"]
+        return "stale", None, observed.get("reason", "compute-hosts-observation-unavailable")
     if (not any(run.get(key) is not None for key in IDENTITY_KEYS)
             and resource_never_started(run)):
         return "exited", None, "launcher-recorded-not-started"

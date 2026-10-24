@@ -14,13 +14,24 @@ import resource_run_registry as registry
 
 
 class ResourceRegistryTest(unittest.TestCase):
-    def test_compute_execution_never_falls_through_to_local_pid_or_missing_group(self):
+    def test_compute_identity_uses_fresh_observation_without_local_pid_probe(self):
         row = {"execution": {"kind": "compute-hosts", "run_id": "compute-1"},
                "pid": None, "starttime": None, "command_hash": None,
                "resource_policy": "supervised-owner"}
         identity_reader = mock.Mock(side_effect=AssertionError("local PID probe"))
-        self.assertEqual(registry.classify_identity(row, identity_reader),
-                         ("stale", None, "compute-hosts-observation-required"))
+        with mock.patch.object(registry, "compute_execution_observation",
+                               return_value={"state": "quiescent", "reason": "fresh-empty"}):
+            self.assertEqual(registry.classify_identity(row, identity_reader),
+                             ("exited", None, "fresh-empty"))
+        with mock.patch.object(registry, "compute_execution_observation",
+                               return_value={"state": "unknown", "reason": "evidence-unavailable"}):
+            self.assertEqual(registry.classify_identity(row, identity_reader),
+                             ("stale", None, "evidence-unavailable"))
+        with mock.patch.object(registry, "compute_execution_observation",
+                               return_value={"state": "not-quiescent",
+                                             "reason": "compute-run-process-group-populated"}):
+            self.assertEqual(registry.classify_identity(row, identity_reader),
+                             ("working", None, "compute-run-process-group-populated"))
         identity_reader.assert_not_called()
         with mock.patch.object(registry, "compute_execution_observation",
                                return_value={"state": "populated"}):

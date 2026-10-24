@@ -666,8 +666,7 @@ def _checked_resource_row(armed, evidence, *, require_success=True):
     if (RESOURCE_RESUME.row_digest(row) != evidence.get("resource_sha256")
             or runner().read_sentinel(row.get("sentinel")) != evidence.get("exit_code")
             or (require_success and evidence.get("exit_code") != 0)
-            or (RR.classify_identity(row)[0] != "exited" if require_success
-                else not resource_predecessor_finished(row))):
+            or not resource_predecessor_finished(row)):
         return None
     return row
 
