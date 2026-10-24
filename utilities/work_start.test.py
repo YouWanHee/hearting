@@ -711,7 +711,7 @@ class WorkStartTest(unittest.TestCase):
                     stamp_harness[0] = True
                 result = W.start_work(self.route, self.path, self.jobs, run=select)
                 self.assertEqual(result["state"], "preparing", result)
-                self.assertEqual(launched, ["codex", "codex"] if headroom < 50 else ["claude", "claude"])
+                self.assertEqual(launched, ["codex", "claude"] if headroom < 50 else ["claude", "codex"])
                 first_launch = pending["launches"][0] if headroom == 30 else result["launches"][0]
                 self.assertIn("selection_source=configured-balanced", first_launch["receipt"])
                 self.assertIn("selection_source=configured-balanced", result["launches"][-1]["receipt"])
@@ -1428,19 +1428,18 @@ class WorkStartTest(unittest.TestCase):
     def adapters(self):
         return [c[c.index("--adapter") + 1] if "--adapter" in c else None for c in self.calls]
 
-    def test_a_pinned_tool_is_passed_to_both_frame_legs_and_then_the_owner(self):
+    def test_an_owner_pin_stays_with_the_owner_and_does_not_pin_frame_legs(self):
         pins = {"contract_version": 1,
                 "owner": {"harness": "opencode", "model": None, "effort": None}}
         self.route["selection_pins"] = pins
         for row in self.route["dispatch_evidence"]["tuples"]:
             row.update(parent_harness="opencode", launch_authority="conductor")
         self.start()
-        # Both legs run on the one tool the caller named (SD-160 allows a shared
-        # harness); with no pin they stay on automatic selection (no --adapter).
-        self.assertEqual(self.adapters(), ["opencode", "opencode"])
+        # Owner selection is retained, while both frame legs stay automatic.
+        self.assertEqual(self.adapters(), [None, None])
         self.ready = True; self.released = True
         self.start()
-        self.assertEqual(self.adapters(), ["opencode", "opencode", "opencode"])
+        self.assertEqual(self.adapters(), [None, None, "opencode"])
 
     def test_a_frame_pin_wins_over_the_owner_pin_for_the_frame_legs_only(self):
         self.route["selection_pins"] = {"contract_version": 1,

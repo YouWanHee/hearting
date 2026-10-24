@@ -1887,7 +1887,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         # pinned tool the route's evidence does not support is not forced: the
         # legs fall back to automatic selection and the result says so.
         pins = in_force.get("selection_pins") or {}
-        frame_pin = ((pins.get("frame") or pins.get("owner") or {}).get("harness"))
+        frame_pin = (pins.get("frame") or {}).get("harness")
         if frame_pin and frame_pin not in harnesses:
             result["frame_explicit_harness"] = f"unavailable:{frame_pin}"
             frame_pin = None
@@ -2279,8 +2279,12 @@ def _compose_again(route) -> str:
         argv += ["--graph", ",".join(route["composed_recipe"]["compose"]["graph"])]
     if shape == "staged" and route.get("effective_intensity"):
         argv += ["--intensity", route["effective_intensity"]]
-    elif shape == "framed" and len(RP.frame_legs(route)) == 2:
-        argv += ["--intensity", "strong"]           # both frame legs again
+    elif shape == "framed":
+        basis = {row.get("axis"): row for row in (route.get("selection") or {}).get("selection_basis", [])}
+        intensity = basis.get("compose-intensity", {})
+        if intensity.get("source") == "explicit" and intensity.get("signal") in {
+                "direct", "quick", "standard", "strong", "thorough", "adversarial"}:
+            argv += ["--intensity", intensity["signal"]]
     for token in RP.pin_tokens(route_authority.route_in_force(route).get("selection_pins")):
         argv += ["--pin", token]
     if route.get("route_plan") is not None:
