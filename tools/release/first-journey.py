@@ -438,9 +438,9 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                 installed = {"exit": 1, "seconds": 0, "output": "published installer unavailable"}
             else:
                 install_args[1] = "/journey/release-assets/install.sh"
-                installed = run(sandbox(install_args, world, env, cli_mounts), env=env, timeout=args.step_timeout)
+                installed = run(sandbox(install_args, world, env, cli=cli_mounts), env=env, timeout=args.step_timeout)
         else:
-            installed = run(sandbox(install_args, world, {**env, **install_extras}, cli_mounts), env={**env, **install_extras}, timeout=args.step_timeout)
+            installed = run(sandbox(install_args, world, {**env, **install_extras}, cli=cli_mounts), env={**env, **install_extras}, timeout=args.step_timeout)
         record["source_detail"] = {"resolved_tag": resolved_tag, "installer_sha256": installer_sha}
         record["source"]["tag"] = resolved_tag
         record["source"]["sha256"] = installer_sha
@@ -450,12 +450,12 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
         else:
             visible = []
             for name in ("claude", "codex", "opencode", "herdr"):
-                probe = run(sandbox(["sh", "-c", f"command -v {name}"], world, env, cli_mounts), env=env, timeout=args.step_timeout)
+                probe = run(sandbox(["sh", "-c", f"command -v {name}"], world, env, cli=cli_mounts), env=env, timeout=args.step_timeout)
                 if probe["exit"] == 0: visible.append(name)
             versions = {}
             for name in PROFILES[profile]:
                 if name in binaries:
-                    version = run(sandbox([binaries[name][1], "--version"], world, env, cli_mounts), env=env, timeout=args.step_timeout)
+                    version = run(sandbox([binaries[name][1], "--version"], world, env, cli=cli_mounts), env=env, timeout=args.step_timeout)
                     versions[name] = version["output"][-120:].strip().replace(str(world), "<world>") if version["exit"] == 0 else "unknown"
             expected_visible = ["claude"] if profile == "claude-only" else ["claude", "codex", "opencode"]
             record["environment"] = {"visible_cli_names": visible, "cli_versions": versions,
@@ -463,7 +463,7 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                                       "allowlist_names": sorted(env)}
             if visible != expected_visible: record["failures"].append({"reason": "cli-visibility-mismatch"})
             if platform.system() == "Linux":
-                probe = run(sandbox(["true"], world, env, cli_mounts, probes=True), env=env, timeout=args.step_timeout)
+                probe = run(sandbox(["true"], world, env, cli=cli_mounts, probes=True), env=env, timeout=args.step_timeout)
                 checks = {"real_home_empty": probe["exit"] == 0, "nas_empty": probe["exit"] == 0,
                           "home_write_not_host_visible": not (Path.home()/world.name).exists(), "nas_write_not_host_visible": not (Path("/home/nas")/world.name).exists(),
                           "forbidden_env_absent": not any(k.startswith(("HERDR_", "AGENT_", "CLAUDE_CODE_")) for k in env),
@@ -475,7 +475,7 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
             for runtime in runtimes:
                 for label, command in (("runtime-status", ["harness", "runtime", "status", "--runtime", runtime, "--json"]),
                                        ("strict-doctor", ["hearting", "runtime", "doctor", "--runtime", runtime, "--strict"])):
-                    checked = run(sandbox(command, world, env, cli_mounts), env=env, timeout=args.step_timeout)
+                    checked = run(sandbox(command, world, env, cli=cli_mounts), env=env, timeout=args.step_timeout)
                     tail = checked["output"][-400:].replace(str(world), "<world>")
                     fresh = None
                     if label == "runtime-status" and checked["exit"] == 0:
