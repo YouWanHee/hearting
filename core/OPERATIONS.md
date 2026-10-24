@@ -757,8 +757,8 @@ intact. Cards, watch and sender identity retain exact ownership checks; missing,
 foreign or unreadable hints leave placement unknown.
 
 An OpenCode V2 child uses inherited user XDG data/state/cache, with writable
-access limited to the exact `opencode` leaves; a symlinked leaf is excluded
-rather than followed to a broader target. The config directory and whole HOME
+access limited to the exact `opencode` leaves; symlinked leaves and stores
+overlapping native config paths are excluded. The config directory and whole HOME
 are not granted, and credentials or database files are not copied or linked.
 OpenCode V1 remains isolated under its worker home.
 
