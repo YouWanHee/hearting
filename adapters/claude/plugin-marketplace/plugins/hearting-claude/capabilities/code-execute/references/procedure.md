@@ -1,6 +1,6 @@
 # code-execute
 
-> **Stage-session entry (`standard+` dispatch, spec/stage-dispatch SD-2)**: Run in-session or as an isolated dispatch-depth-2 stage worker dispatched by the `autopilot-code` conductor. Resolve the plan path from arguments, read `plan.md` from disk, and never depend on prior-stage conversation. This is the only source-mutating stage. Its write class is assigned source files (including tracked docs/configuration examples), `checklist.md`, `dev_logs/`, `_internal/dev_reviews/`, and plan-frontmatter `status`. Source ownership is defined by scope and tracked content, not filename extension. A commit-expected single session commits all validated owned source paths; artifact shadows, runtime state, and unrelated dirty files are excluded. The stage runs as the compiled route's `dev/*` unit (sealed at compile); it never dispatches units itself, and any unforeseen narrow scaffolding uses an ephemeral native helper without unit semantics.
+> **Stage-session entry (`standard+` dispatch, spec/stage-dispatch SD-2)**: Run in-session or as an isolated dispatch-depth-2 stage worker dispatched by the `autopilot-code` conductor. Resolve the plan path from arguments, read `plan.md` from disk, and never depend on prior-stage conversation. This is the only source-mutating stage. Its write class is assigned source files (including tracked docs/configuration examples), `checklist.md`, and `dev_logs/`. Source ownership is defined by scope and tracked content, not filename extension. A commit-expected single session commits all validated owned source paths; artifact shadows, runtime state, and unrelated dirty files are excluded. The stage runs as the compiled route's `dev/*` unit (sealed at compile); it never dispatches units itself, and any unforeseen narrow scaffolding uses an ephemeral native helper without unit semantics.
 
 > **Plan resolution**: Treat [arguments-and-decisions.md#plan-resolution](../../autopilot-code/references/arguments-and-decisions.md) as the single authority for resolving `$ARG` to a plan path.
 
@@ -22,16 +22,13 @@ locations.
 ## Initialization
 
 1. Read the resolved plan at `$ARG`.
-2. Set `{log_dir}` to the task root two levels above `plan.md`.
-   - Example: `$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_refactor_engine/plan.md` → `$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_refactor_engine/`
+2. For a registered stage, write `checklist.md` and step logs only to the runtime-declared output locations under `$AGENT_ARTIFACT_OUTPUT_DIR`, within the node's declared outputs and write scope. For a standalone invocation, keep them in the plan's own folder.
 3. Detect resume state.
-   - If `{log_dir}/checklist.md` contains `[x]`, `[FAIL]`, or `[SKIP-DEP]`, update its `Safety commit:` line, skip completed steps, and continue at the first `[ ]` step.
+   - If the declared `checklist.md` contains `[x]`, `[FAIL]`, or `[SKIP-DEP]`, skip completed steps and continue at the first `[ ]` step.
    - Otherwise create a fresh checklist.
-4. Run `mkdir -p {log_dir}/dev_logs {log_dir}/_internal/dev_reviews` and write `{log_dir}/checklist.md` directly from the canonical plan:
+4. Write `checklist.md` directly from the canonical plan, creating only its parent directory when needed:
 
    ```text
-   Safety commit: {$SAFETY_COMMIT}
-
    Phase A: [description]
      [ ] Step 1: [file] — [what to change]
      [ ] Step 2: [file] — [what to change]
@@ -44,17 +41,17 @@ Use the checklist as the sole orchestration tracker. Keep plan files immutable d
 ## Execution Rules
 
 - Read the checklist before every step and execute steps in dependency order.
-- Implement each step as the node's `dev/*` unit (default `dev/backend`; the compiled route seals the member) with concrete file and change instructions.
-- Give each worker `{log_dir}/dev_logs/` and require a step log such as `dev_logs/step_01_model_py.md`.
-- Run independent steps in parallel when the active workflow supports in-session parallel delegation.
-- After a successful step, mark it `[x]`. The phase review owns syntax and import verification.
+- Implement each step within this node's sealed `dev/*` unit with concrete file and change instructions.
+- Record each step in the declared `dev_logs/` location, such as `step_01_model_py.md`.
+- Run the focused checks named by the plan for each step. The selected sibling review node owns implementation review.
+- After a successful step, mark it `[x]`.
 - Continue until every processable step has a terminal checklist mark.
 
 ## Assurance
 
 Use the intensity and selected stage graph as the assurance authority. A plan's
-`qa_level` is descriptive and does not override selected roles, reviewer counts,
-or the graph. Do not choose extra reviewers or passes from file count.
+`qa_level` is descriptive and does not override the graph. Do not choose extra
+reviewers or passes from file count.
 
 ## Handoff
 
@@ -66,7 +63,7 @@ within the compiled route and preserve unrelated work.
 
 ## Final Report
 
-Read the checklist and report the overall verdict in the selected audience language. List only `[FAIL]` and `[SKIP-DEP]` steps with reasons; when all steps succeeded, a concise success verdict is sufficient. End by recommending `code-test <plan file path>` for functional verification. In a standalone invocation, this is the only user-facing progress report.
+Read the checklist and report the bounded handoff in the selected audience language. List only `[FAIL]` and `[SKIP-DEP]` steps with reasons; when all steps succeeded, a concise success verdict is sufficient. For a registered stage, the owner selects the next node. For a standalone invocation, end by recommending `code-test <plan file path>` for functional verification; this is the only user-facing progress report.
 
 ## Task
 
