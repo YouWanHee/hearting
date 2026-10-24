@@ -1800,13 +1800,12 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         route, route_file, jobs, owner, cycle, _artifact, request = fixture._prepare_fixture("codex")
-        # The marker must be absent so the ordinary invalid-locator validator
-        # remains responsible for this first close attempt.
-        conda = Path(cycle["cycle_dir"]) / "artifacts" / "environment" / "conda-meta"
-        conda.mkdir(parents=True)
-        bad = conda / "bad|name.txt"
+        # Use an ordinary payload directory so structural runtime exclusion
+        # does not mask the invalid-locator refusal on current main.
+        evidence = Path(cycle["cycle_dir"]) / "artifacts" / "evidence" / "results"
+        evidence.mkdir(parents=True)
+        bad = evidence / "bad|name.txt"
         bad.write_bytes(b"preserve invalid locator payload")
-        self.assertFalse((conda / "history").exists())
 
         log = jobs.parent / "owner.jsonl"
         text = f"artifact: {bad}\nverdict: PASS\nblocker: none"
@@ -1826,14 +1825,14 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
             attempts = T._commit_state_path(request).parent / "attempts"
             records = [json.loads(path.read_text(encoding="utf-8")) for path in attempts.glob("*.json")]
             record = next(row for row in records if row.get("reason") == "producer-finalize-failed")
-            self.assertIn("output-invalid: locator-invalid-component:artifacts/environment/conda-meta/bad|name.txt",
+            self.assertIn("output-invalid: locator-invalid-component:artifacts/evidence/results/bad|name.txt",
                           record["detail"])
             diagnosis = T.inspect_owner_completion(jobs, "done", meta)
             self.assertNotEqual(diagnosis.get("checkpoint"), "file-count-limit", diagnosis)
             refusal = diagnosis.get("last_refusal")
             self.assertIsInstance(refusal, dict, diagnosis)
             self.assertEqual(refusal["reason"], "producer-finalize-failed")
-            self.assertIn("output-invalid: locator-invalid-component:artifacts/environment/conda-meta/bad|name.txt",
+            self.assertIn("output-invalid: locator-invalid-component:artifacts/evidence/results/bad|name.txt",
                           refusal["detail"])
             self.assertTrue(Path(refusal["record_path"]).is_file())
             self.assertEqual(Path(refusal["record_path"]), next(attempts.glob("*.json")))
@@ -1844,7 +1843,7 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
             receipt_digest = supervision.receipt_digest(receipt)
             notice = supervision.render_text(receipt)
             self.assertIn("output-invalid", notice)
-            self.assertIn("conda-meta/bad|name.txt", notice)
+            self.assertIn("artifacts/evidence/results/bad|name.txt", notice)
             self.assertIn(Path(refusal["record_path"]).name, notice)
             self.assertIn("Correct the reported locator", notice)
             self.assertIn("retries closure automatically", notice)

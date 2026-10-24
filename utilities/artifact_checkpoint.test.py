@@ -90,25 +90,6 @@ class InterimManifestTest(CheckpointTestBase):
                 loaded, reason = P.checkpoint_limits_from_config()
                 self.assertEqual((loaded, reason), (defaults, "invalid"))
 
-    def test_conda_history_marker_is_shared_by_checkpoint_candidates(self):
-        cycle = Path(self.result["cycle_dir"])
-        env = cycle / "artifacts" / "environment"
-        conda = env / "conda-meta"
-        conda.mkdir(parents=True)
-        (conda / "history").write_bytes(b"history is never payload")
-        bad = env / "bad|locator.txt"
-        bad.write_bytes(b"invalid and excluded")
-        report = self.write_output(self.result, "reports/final_report.md", b"report")
-        scan = P._checkpoint_scan(cycle, {}, P.CheckpointLimits())
-        self.assertNotIn("skip", scan)
-        self.assertEqual([fact[0] for fact in scan["facts"]], ["artifacts/reports/final_report.md"])
-        self.assertEqual(scan["excluded"]["self-excluded"], 1)
-        self.assertEqual(bad.read_bytes(), b"invalid and excluded")
-        emitted = P.checkpoint(self.root, cycle_id=self.cycle_id)
-        self.assertEqual(emitted["status"], "emitted", emitted)
-        self.assertEqual(set(_ids_by_path(self.interim())), {"artifacts/reports/final_report.md"})
-        self.assertEqual((conda / "history").read_bytes(), b"history is never payload")
-
     def test_checkpoint_user_limits_control_candidate_scan(self):
         self.write_output(self.result, "reports/one.md", b"one")
         self.write_output(self.result, "reports/two.md", b"two")
@@ -166,6 +147,19 @@ class InterimManifestTest(CheckpointTestBase):
                                                         max_file_bytes=32, max_total_bytes=32))
         self.assertEqual(result["status"], "emitted", result)
         self.assertEqual(set(_ids_by_path(self.interim())), {"artifacts/plans/report.md"})
+
+    def test_checkpoint_uses_structural_runtime_signals_and_interim_weight_suffixes(self):
+        cycle = Path(self.result["cycle_dir"])
+        checkout = cycle / "artifacts/dev_logs/runtime/external-source"
+        (checkout / ".git/objects").mkdir(parents=True)
+        (checkout / ".git/objects/pack").write_bytes(b"ignored")
+        self.write_output(self.result, "dev_logs/model.nemo", b"nemo")
+        self.write_output(self.result, "dev_logs/model.gguf", b"gguf")
+        self.write_output(self.result, "reports/summary.md", b"report")
+        scan = P._checkpoint_scan(cycle, {}, P.CheckpointLimits())
+        self.assertEqual([row[0] for row in scan["facts"]], ["artifacts/reports/summary.md"])
+        self.assertEqual(scan["excluded_roots"], ["artifacts/dev_logs/runtime/external-source"])
+        self.assertEqual(scan["excluded"]["binary"], 2)
 
     def test_checkpoint_prunes_raw_results_before_walk_and_byte_limits(self):
         cycle = Path(self.result["cycle_dir"])

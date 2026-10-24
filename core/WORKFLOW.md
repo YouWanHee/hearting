@@ -200,18 +200,18 @@ with its declared group and automatic owner close. Include `eval-run` only when
 the request needs new raw results, using its existing inputs and write scope.
 In a Git folder, the parent chooses the capability: omitting `--capability` in ordinary compose
 uses the fixed `autopilot-code` default, not a classifier of the task text; framed work
-leaves that choice to its frame. A depth-0 `compose --start` in a non-Git folder with no
-shape or `--shape direct` runs inline in the current session. Its task purpose selects the
-capability when clear; an explicit `--capability` and mode take precedence, and an unclear
-purpose is shown as unresolved while retaining the existing storage fallback. The session
-performs that capability's work and can close it through the normal inline `finish` path.
-The start card says `git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작`.
-An explicit worker shape, including a route-plan leg whose own shape is not direct, remains a
+leaves that choice to its frame. A depth-0 `compose --start --shape direct` in a non-Git
+folder runs inline in the current session. Its task purpose selects the capability when
+clear; an explicit `--capability` and mode take precedence, and an unclear purpose is shown
+as unresolved while retaining the existing storage fallback. The session performs that
+capability's work and can close it through the normal inline `finish` path. The start card
+says `git 아닌 폴더 — 이 세션이 직접 진행. 작업자가 필요하면 --shape 없이 다시 시작(원본 수정은 git init 필요)`.
+An omitted shape follows the Git default: the start is framed and its frame decides, as in a
+Git folder. Any other shape, including a route-plan leg whose own shape is not direct, is a
 worker request. In a non-Git folder, a compiled artifact-only worker route may run in the
 bound folder; a route whose compiled write scope mutates source is refused with the reason
 and the next action (`git init` and restart, or continue this session with `--shape direct`).
-The classification comes from the compiled write scope, not a capability-name list. An
-omitted shape keeps the existing direct-start behavior and is not silently changed to framed.
+The classification comes from the compiled write scope, not a capability-name list.
 A later compose in a Git repository follows the
 existing Git behavior.
 Likewise, code review within an implementation/debug cycle belongs to
@@ -249,12 +249,16 @@ purposes, negation, and quoted examples stay unresolved; they add no required qu
 Compose and start show intensity and its source, sealed node profiles, and the
 initial node/worker-dispatch/resource counts before launch. Unspecified intensity
 adds one nonblocking suggestion to consider `strong` for judgment or root-cause
-analysis; intensity does not change model profiles. These observations add no
+analysis, except framed routes which already start with two top-tier frame legs; intensity does not change model profiles. These observations add no
 approval or required input. New compose records retain the two input sources in
 the existing `selection_basis`; old routes display `sealed-route` when the
 original explicit/default choice was not recorded. Worker estimates count stage
 and frame legs, excluding the separately shown owner and any retries or later
 routes chosen by a frame.
+
+framed는 기본 두 갈래다. 작고 국소적인 일이면 `--intensity quick`을 붙일
+수 있고, 과제가 공통 규칙·spec·여러 어댑터를 건드리면 하팅이 두 갈래로
+지킨다.
 
 The precedence above decides which capability **owns the artifacts** of a
 request. It does not oblige the session to run that entry's whole recipe.
@@ -293,7 +297,7 @@ has no frame nodes, and neither has a `solo` or `staged` compose: those shapes
 compile without the recipe's frame pair (a route sealed earlier keeps the
 frame nodes it was sealed with).
 
-A `framed` route's one leg is `deep`; both legs of a two-leg `framed` route and of a preset recipe's own frame pair are `top`: a pin with a profile or an explicit profile wins and is not lowered automatically; a frame-rule `top` that stops at a usage limit is retried once at `deep` through the SD-157 replacement lineage, and the lowering is recorded. The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향과 경로를 조립해 제안합니다" and the cost line, "비용: frame 한 갈래 · 방향 확인 질문 1회" or, with both legs, "비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회".
+A `framed` route runs two `top` legs by default; the simplified one-leg route runs at `deep`. A preset recipe's own frame pair is also `top`: a pin with a profile or an explicit profile wins and is not lowered automatically; a frame-rule `top` that stops at a usage limit is retried once at `deep` through the SD-157 replacement lineage, and the lowering is recorded. The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향과 경로를 조립해 제안합니다" and the cost line, "비용: frame 한 갈래 · 방향 확인 질문 1회" or, with both legs, "비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회".
 
 **Staged assembly guidance.** Staged assembly guidance is for frame brief
 authors and routes whose capability and stages the person explicitly named.
