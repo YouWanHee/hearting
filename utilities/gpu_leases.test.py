@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import shlex
 from pathlib import Path
 import subprocess
@@ -550,6 +551,22 @@ class LeasesTest(unittest.TestCase):
             self.assertEqual(tool._run_gpu_observation("here", {})["suggested_gpu"], 1)
 
     def test_compute_cmd_run_auto_selects_and_refuses_busy_explicit_device_end_to_end(self):
+        tmux = shutil.which("tmux")
+        if tmux is None:
+            self.skipTest("tmux is not installed")
+        # This integration needs tmux's per-session environment transport. Probe
+        # that exact capability on a disposable server; old tmux versions may
+        # exit successfully while ignoring the unsupported -e option.
+        server = "hearting-cap-%s-%x" % (os.getpid(), abs(hash(self.id())))
+        probe = subprocess.run(
+            [tmux, "-L", server, "new-session", "-d", "-e", "HEARTING_PROBE=1",
+             "-s", "hearting-probe", "true"],
+            capture_output=True, text=True, timeout=5)
+        subprocess.run([tmux, "-L", server, "kill-server"],
+                       capture_output=True, timeout=5)
+        if probe.returncode:
+            reason = probe.stderr.strip() or probe.stdout.strip() or "new-session -e rejected"
+            self.skipTest("installed tmux lacks new-session -e: " + reason)
         spec = importlib.util.spec_from_file_location("_gpu_end_to_end_compute", Path(G.__file__).with_name("compute-hosts.py"))
         tool = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(tool)
