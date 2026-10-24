@@ -1023,15 +1023,26 @@ class TestRunner(unittest.TestCase):
             "command": [sys.executable, "-c", f"open({str(self.launch)!r},'w').write('wrong')"],
             "status": "launching", "workflow_state": "READY"}
         original = subprocess.Popen
+        watch_spawn_calls = []
         def spawn(argv, **kwargs):
-            if "watch" in argv: raise OSError("synthetic watch spawn failure")
+            if "watch" in argv:
+                watch_spawn_calls.append(tuple(argv))
+                raise OSError("synthetic watch spawn failure")
             return original(argv, **kwargs)
         with mock.patch.dict(os.environ, {"AGENT_HOME": str(ROOT), "AGENT_WORKFLOW_ROOT": str(self.base/"workflow"),
-                                         "AGENT_RESOURCE_RUN_INDEX": str(self.index)}), \
+                                         "AGENT_RESOURCE_RUN_INDEX": str(self.index), "CUDA_VISIBLE_DEVICES": ""}), \
+             mock.patch.object(R.gpu_leases, "local_observation",
+                               side_effect=AssertionError("CPU fixture reached local GPU observer")) as observer, \
              mock.patch.object(R.subprocess, "Popen", side_effect=spawn):
             R.start_verified(self.registry, args, route, self.resume_path, placeholder)
+            observer.assert_not_called()
+        self.assertEqual(len(watch_spawn_calls), 1)
+        self.assertIn("watch", watch_spawn_calls[0])
         self.assertFalse(self.launch.exists())
-        self.assertEqual(json.loads(self.registry.read_text())["runs"]["resume"]["status"], "failed")
+        failed = json.loads(self.registry.read_text())["runs"]["resume"]
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["launch_error"],
+                         {"type": "OSError", "message": "synthetic watch spawn failure"})
         self.assertEqual(self.jobs.read_text(), "")
 
     def setUp(self):
