@@ -260,6 +260,20 @@ class FrameLaunchGateTest(unittest.TestCase):
 
 
 class DispatchContractTest(unittest.TestCase):
+ def test_repository_diagnosis_keeps_git_non_git_and_broken_git_distinct(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td);repo=root/"repo";repo.mkdir()
+   subprocess.run(["git","init","-q",str(repo)],check=True)
+   child=repo/"nested";child.mkdir()
+   self.assertEqual(D.diagnose_repository_start(child)["state"],"git")
+   self.assertEqual(D.work_root_identity(child),str(repo.resolve()))
+   plain=root/"plain";plain.mkdir()
+   self.assertEqual(D.diagnose_repository_start(plain)["state"],"non-git")
+   with self.assertRaisesRegex(D.DispatchContractError,"non-git-route-identity-unbound"):
+    D.work_root_identity(plain)
+   broken=root/"broken";broken.mkdir();(broken/".git").mkdir()
+   self.assertEqual(D.diagnose_repository_start(broken)["state"],"error")
+
  def test_access_observation_exempts_exiting_and_vanished_processes_only(self):
   entry=Path("/proc/4242")
   stat_tail=lambda state,flags: "4242 (fixture) %s 1 2 3 4 5 %d 7 8 9 10 11 12 13 14 15 16 17 18 99" % (state,flags)

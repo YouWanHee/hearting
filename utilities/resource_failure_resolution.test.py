@@ -154,6 +154,7 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 module._resolve_compose_plan = lambda *args: (None, None)
+module._compose_git_diagnosis = lambda cwd: {"state": "git", "root": str(cwd)}
 def capture(**kwargs):
     print(json.dumps(kwargs["work_request"]["text"]))
     raise SystemExit(0)

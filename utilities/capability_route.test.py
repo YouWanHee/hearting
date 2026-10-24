@@ -7485,6 +7485,138 @@ class FixtureRegistryGuardTest(unittest.TestCase):
 
 class ComposeRouteTest(TestRoute):
  """SD-135: `compose` seals a preset-free shape/subgraph through the same sealer."""
+ def test_non_git_decision_is_single_and_conservative_classifier_is_purpose_based(self):
+  cwd="/tmp/non-git-project"
+  diagnosis={"state":"non-git","cwd":cwd,"detail":"fatal: not a git repository"}
+  direct=R._decide_non_git_compose(diagnosis,None,0,False,None)
+  self.assertEqual(direct["kind"],"direct")
+  for request_shape,depth,attempt in (("framed",0,False),("solo",0,False),
+                                      (None,1,False),("direct",0,True)):
+   result=R._decide_non_git_compose(diagnosis,request_shape,depth,attempt,"autopilot-code")
+   expected = "worker-candidate" if request_shape in ("framed", "solo") else "refuse"
+   self.assertEqual(result["kind"],expected)
+   self.assertTrue(result["cause"].startswith("git 저장소 아님: "+cwd))
+   if expected == "worker-candidate":
+    self.assertIn("--shape direct",result["next"])
+   else:
+    self.assertIn("depth-0",result["next"])
+  self.assertEqual(R._decide_non_git_compose({"state":"git"},None,0,False,None)["kind"],"git")
+  self.assertEqual(R._decide_non_git_compose({"state":"error","detail":"permission denied"},None,0,False,None)["kind"],"error")
+  cases={
+   "기술 동향 조사 후 핵심 내용을 정리한다.":("autopilot-research","technology"),
+   "시장 조사 결과를 정리한다.":("autopilot-research","market"),
+   "고정 metric으로 두 모델 결과를 비교한다.":("autopilot-lab","eval"),
+   "Implement a reusable evaluation driver.":("autopilot-code","dev"),
+   "Fix only typos in the existing report.":("autopilot-refine","default"),
+   "Write an independent paper.":("autopilot-draft","paper"),
+   "Inspect existing code structure.":("analyze-project","code"),
+   "Analyze the existing codebase structure.":("analyze-project","code"),
+   "Analyze existing documentation structure.":("analyze-project","doc"),
+   "Inspect existing paper structure.":("analyze-project","paper"),
+   "Package existing results as a ZIP.":("autopilot-ship","package"),
+  }
+  for task,expected in cases.items():
+   with self.subTest(task=task): self.assertEqual(R._classify_non_git_task(task),expected)
+  for task in ("계속 진행", "분석해줘", "Do not research this; fix code instead.",
+               'The task says "market research" but do not do that.',
+               "Research the topic and implement a reusable tool."):
+   with self.subTest(task=task): self.assertIsNone(R._classify_non_git_task(task))
+  failed = self.nested(parent="codex", child="codex", status="unsupported", failure="worktree-not-found")
+  with self.assertRaisesRegex(ValueError, "dispatch-evidence-exact-worktree-reprobe-required.*worktree-not-found"):
+   R._fallback_chain({"tuples":[failed],"native_subagent":[]}, expected_worktree=R.ROOT, require_scope=True)
+
+ def test_compose_git_diagnosis_uses_git_exhaustion_and_only_checks_cwd_metadata(self):
+  with tempfile.TemporaryDirectory(prefix="compose-git-diagnosis-") as tmp:
+   parent=Path(tmp); cwd=parent/"project"; cwd.mkdir()
+   (parent/".git").mkdir()
+   diagnosis=R._compose_git_diagnosis(cwd)
+   self.assertEqual(diagnosis["state"],"non-git",diagnosis)
+   (cwd/".git").mkdir()
+   diagnosis=R._compose_git_diagnosis(cwd)
+   decision=R._decide_non_git_compose({**diagnosis,"cwd":str(cwd)},None,0,False,None)
+   self.assertEqual(decision["kind"],"error")
+   self.assertIn(str(cwd),decision["detail"])
+
+ def test_compose_git_diagnosis_rejects_ancestor_gitfile_with_missing_gitdir(self):
+  with tempfile.TemporaryDirectory(prefix="compose-gitfile-diagnosis-") as tmp:
+   parent=Path(tmp); cwd=parent/"project"; cwd.mkdir()
+   (parent/".git").write_text("gitdir: /definitely-missing-hearting-gitdir\n")
+   diagnosis=R._compose_git_diagnosis(cwd)
+   decision=R._decide_non_git_compose({**diagnosis,"cwd":str(cwd)},None,0,False,None)
+   self.assertEqual(decision["kind"],"error",diagnosis)
+   self.assertIn(str(cwd),decision["detail"])
+   # Git versions differ on naming the missing gitdir (some print "(null)"); keep the raw error.
+   self.assertIn("not a git repository",decision["detail"])
+
+ def test_compose_git_diagnosis_accepts_mount_boundary_exhaustion_message(self):
+  completed=subprocess.CompletedProcess(["git"],128,"",
+   "fatal: not a git repository (or any parent up to mount point /home)\n"
+   "Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n")
+  with tempfile.TemporaryDirectory(prefix="compose-mount-diagnosis-") as tmp, \
+       mock.patch.object(R.subprocess,"run",return_value=completed):
+   diagnosis=R._compose_git_diagnosis(tmp)
+  self.assertEqual(diagnosis["state"],"non-git",diagnosis)
+
+ def test_compose_git_probe_uses_c_locale_without_changing_parent_environment(self):
+  with tempfile.TemporaryDirectory(prefix="compose-locale-diagnosis-") as tmp, \
+       mock.patch.dict(os.environ,{"LC_ALL":"ko_KR.UTF-8","LANGUAGE":"ko"}):
+   before=(os.environ.get("LC_ALL"),os.environ.get("LANGUAGE"))
+   with mock.patch.object(R.subprocess,"run",return_value=subprocess.CompletedProcess(
+       ["git"],128,"","fatal: not a git repository (or any of the parent directories): .git\n")) as run:
+    R._compose_git_diagnosis(tmp)
+   self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"],"C")
+   self.assertNotIn("LANGUAGE",run.call_args.kwargs["env"])
+   self.assertEqual((os.environ.get("LC_ALL"),os.environ.get("LANGUAGE")),before)
+
+ def test_compose_start_with_empty_ancestor_git_marker_starts_direct(self):
+  import work_start
+  exact="git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작"
+  with tempfile.TemporaryDirectory(prefix="compose-ancestor-marker-") as tmp, \
+       mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
+   root=Path(tmp); parent=root/"parent"; cwd=parent/"project"
+   cwd.mkdir(parents=True); (parent/".git").mkdir()
+   artifacts=root/"artifacts"; prompt=root/"task.md"; prompt.write_text("Continue this task")
+   route=self.compose(shape="direct",graph=None,artifact_root=str(artifacts),
+                      work_request={"text":prompt.read_text(),"owner_harness":None})
+   argv=[str(P),"compose","--shape","direct","--campaign-key","ancestor-test","--slug","ancestor",
+         "--cwd",str(cwd),"--artifact-root",str(artifacts),"--start","--prompt-file",str(prompt),
+         "--jobs",str(root/"jobs.log")]
+   def start(*args,**kwargs):
+    return {"state":"inline","required_action":"execute-inline","route_id":route["route_id"]}
+   out,err=io.StringIO(),io.StringIO()
+   with mock.patch.object(sys,"argv",argv),mock.patch.object(R,"compose_route",return_value=route), \
+        mock.patch.object(work_start,"start_work",side_effect=start),mock.patch.object(R,"_record_route_chain"), \
+        mock.patch.object(R,"_route_autoclose"),contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+    self.assertEqual(R.main(),0)
+   self.assertEqual(json.loads(out.getvalue())["state"],"inline")
+   self.assertEqual(err.getvalue().count(exact),1)
+
+ def test_non_git_classified_research_modes_compile_and_seal_as_direct(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   for mode in ("academic","market","technology"):
+    with self.subTest(mode=mode):
+     route=self.compose(capability="autopilot-research",capability_mode=mode,shape="direct",graph=None,
+                        slug="research-"+mode,artifact_root=tmp,capability_source="non-git-task-classification")
+     self.assertEqual((route["capability"],route["effective_intensity"]),("autopilot-research","direct"))
+     self.assertEqual(len(route["nodes"]),1)
+     self.assertEqual(next(row for row in route["selection"]["selection_basis"]
+                           if row["axis"]=="compose-capability")["source"],"non-git-task-classification")
+     R.verify_route(route,R.ROOT)
+
+ def test_non_git_unresolved_capability_marker_and_exact_card_lines(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   route=self.compose(capability="autopilot-code",capability_mode="dev",shape="direct",graph=None,
+                      slug="unresolved",artifact_root=tmp,capability_source="non-git-unresolved",
+                      work_request={"text":"계속 진행","owner_harness":None})
+   basis=next(row for row in route["selection"]["selection_basis"] if row["axis"]=="compose-capability")
+   self.assertEqual(basis["source"],"non-git-unresolved")
+   self.assertIn("source=non-git-unresolved", "\n".join(R.compose_decision_lines(route)))
+   decision={"kind":"direct","capability_unresolved":True}
+   card=R.compose_card(route,non_git_decision=decision)
+   self.assertEqual(card.count("git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작"),1)
+   self.assertEqual(card.count("작업 종류 미정 — `--capability`로 지정"),1)
+   R.verify_route(route,R.ROOT)
+
  def test_automatic_depth_two_evidence_uses_enabled_prospective_owner_pool(self):
   readiness = self.evidence()
   enabled = ("claude", "codex", "opencode")
@@ -7666,6 +7798,16 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(route["nodes"][0]["continuation"],{"kind":"inline-next"})
   self.assertEqual(route["nodes"][-1]["write_scope"],["owner-close.md"])
   R.verify_route(route,R.ROOT)
+
+ def test_strong_research_extension_runs_after_the_appended_owner_close(self):
+  # SR_CorrNet_SD: claim-verify was no longer terminal once owner-close followed its group.
+  for intensity in ("strong","thorough"):
+   with self.subTest(intensity=intensity):
+    route=self.compose(capability="autopilot-research",capability_mode="market",intensity=intensity,
+                       graph="retrieval,synthesis,report,claim-verify")
+    self.assertEqual(route["nodes"][-1]["id"],"owner-close")
+    self.assertEqual([row["after"] for row in route["conditional_extensions"]],[["owner-close"]])
+    R.verify_route(route,R.ROOT)
 
  def test_auto_owner_close_report_scope_keeps_dependency_projection(self):
   route=self.compose(capability="autopilot-lab",capability_mode="eval",intensity="strong",
@@ -8026,14 +8168,15 @@ class ComposeRouteTest(TestRoute):
  def test_compose_start_keeps_new_campaign_notice_before_its_own_cycle_creation(self):
   import artifact_producer, work_start
   with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
-   root=Path(tmp); artifacts=root/"artifacts"; prompt=root/"task.md"; prompt.write_text("One approved inline edit")
+   root=Path(tmp); git_root=root/"git-root"; git_root.mkdir(); subprocess.run(["git","init","-q",str(git_root)],check=True)
+   artifacts=root/"artifacts"; prompt=root/"task.md"; prompt.write_text("One approved inline edit")
    route=self.compose(shape="direct",graph=None,artifact_root=str(artifacts),campaign_key="new-start",
                       work_request={"text":prompt.read_text(),"owner_harness":None})
    def start(route,path,jobs,**kwargs):
     artifact_producer.prepare_route_artifact_env(path,start=True,jobs=jobs)
     return {"state":"inline","required_action":"execute-inline","route_id":route["route_id"]}
    argv=[str(P),"compose","--shape","direct","--campaign-key","new-start","--slug","notice",
-         "--cwd",str(R.ROOT),"--artifact-root",str(artifacts),"--start","--prompt-file",str(prompt),"--jobs",str(root/"jobs.log")]
+         "--cwd",str(git_root),"--artifact-root",str(artifacts),"--start","--prompt-file",str(prompt),"--jobs",str(root/"jobs.log")]
    notices=[]
    for _ in range(2):
     out,err=io.StringIO(),io.StringIO()
@@ -8546,14 +8689,15 @@ class ComposeRouteTest(TestRoute):
  def test_auto_consumer_notices_are_once_before_explain_and_start(self):
   import work_start
   with tempfile.TemporaryDirectory() as tmp,mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
-   root=Path(tmp);prompt=root/"task.md";prompt.write_text("Plan and test the change")
+   root=Path(tmp);git_root=root/"git-root";git_root.mkdir();subprocess.run(["git","init","-q",str(git_root)],check=True)
+   prompt=root/"task.md";prompt.write_text("Plan and test the change")
    route=self.compose(graph="plan,test,report",intensity="strong",artifact_root=str(root/"artifacts"))
    notice="strong group plan: auto-added plan-check (review-consumer-not-selected; registry consumer)"
    for harness in ("claude","codex","opencode"):
     for action in ("explain","start"):
      out,err=io.StringIO(),io.StringIO()
      argv=[str(P),"compose","--shape","staged","--intensity","strong","--capability","autopilot-code",
-      "--capability-mode","dev","--graph","plan,test,report","--cwd",str(R.ROOT),
+      "--capability-mode","dev","--graph","plan,test,report","--cwd",str(git_root),
       "--artifact-root",str(root/"artifacts"),"--unassigned","--parent-harness",harness,
       "--prompt-file",str(prompt),"--jobs",str(root/"jobs.log"),"--"+action]
      receipt={"state":"waiting-owner","parent_next":"end-turn"}
@@ -10468,6 +10612,22 @@ class TerminalGateRegistrySnapshotTest(unittest.TestCase):
    self.assertTrue(all(tuple(lines)==snapshot.lines for lines in seen["marker_lines"]))
    self.assertEqual(len(seen["owner_view"].records),2,
                     "owner absence checks must receive the full view, not its selected owner row")
+
+
+class NonGitArtifactDeltaTest(unittest.TestCase):
+ def test_artifact_snapshot_delta_tracks_create_modify_delete_and_skips_symlinks(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td);output=root/"cycle"/"artifacts";output.mkdir(parents=True)
+   keep=output/"keep.md";keep.write_text("same\n")
+   changed=output/"changed.md";changed.write_text("before\n")
+   deleted=output/"deleted.md";deleted.write_text("gone\n")
+   outside=root/"outside.md";outside.write_text("outside\n")
+   (output/"linked.md").symlink_to(outside)
+   baseline={"changed_files":R._artifact_output_snapshot(output)}
+   changed.write_text("after\n");deleted.unlink()
+   created=output/"created.md";created.write_text("new\n")
+   delta=R._artifact_delta(baseline,output)
+   self.assertEqual(delta,{changed,deleted,created})
 
 
 if __name__=="__main__": unittest.main()
