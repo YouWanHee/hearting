@@ -3882,8 +3882,8 @@ class FallbackTest(unittest.TestCase):
    ))
   self.assertEqual(self.arg(calls[0],"--attempt-id"),old)
   self.assertIsNone(self.arg(calls[0],"--automatic-retry-of"))
- def test_a_closed_interrupted_attempt_is_retried_once_on_the_same_tuple(self):
-  # `dead-interrupted` is a runtime failure, not a spent launch tuple: the next
+ def test_timeout_retry_preserves_progress_predecessor(self):
+  # A timeout is a runtime failure, not a spent launch tuple: the next
   # start retries the same tuple as a new attempt bound to the stopped one.
   with self.dispatch_env():
    path,route,node=self.standard_route()
@@ -3895,8 +3895,8 @@ class FallbackTest(unittest.TestCase):
              f"route_id={route['route_id']},route_node=plan,parent_attempt_id=att-fallback-parent,"
              "parent_harness=codex,parent_transport=headless,parent_sandbox=workspace-write,"
              "child_harness=codex,launch_authority=conductor,"
-             f"launch_claimed=1,attempt_id={old},note=dead-interrupted,failure_class=runtime,"
-             "reconcile_reason=interrupted\n")
+             f"launch_claimed=1,attempt_id={old},note=dead-timeout,failure_class=runtime,"
+             "reconcile_reason=timeout\n")
    self.assertEqual(F.registry_failures(self.jobs,route["route_id"],"plan"),{})
    calls=[]
    code,out,err=self.start(path,patches=(

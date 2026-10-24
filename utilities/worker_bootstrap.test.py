@@ -28,6 +28,22 @@ _OPA_SPEC.loader.exec_module(OPA)
 
 
 class WorkerBootstrapTest(unittest.TestCase):
+    def test_stage_attempt_budget_prompt_and_legacy_rendering(self):
+        from datetime import datetime, timezone
+        args = SimpleNamespace(worker_type="stage", foreground_timeout=3600)
+        rendered = W.runtime_progress_prompt(
+            args, now=datetime(2026, 10, 22, 5, 0, tzinfo=timezone.utc))
+        self.assertIn("3600 seconds (60 minutes)", rendered)
+        self.assertIn("approximate deadline: 2026-10-22 06:00:00 UTC", rendered)
+        self.assertIn("waiting with sleep, use this budget", rendered)
+        self.assertIn("No per-tool heartbeat", W.runtime_progress_prompt())
+        self.assertNotIn("execution budget", W.runtime_progress_prompt(
+            SimpleNamespace(worker_type="owner", foreground_timeout=3600)))
+        short = W.runtime_progress_prompt(
+            SimpleNamespace(worker_type="stage", foreground_timeout=90),
+            now=datetime(2026, 10, 22, 5, 0, tzinfo=timezone.utc))
+        self.assertIn("90 seconds (1.5 minutes)", short)
+
     def test_stage_commit_policy_normalizes_sealed_and_legacy_inputs(self):
         args = SimpleNamespace(worker_type="stage", commit_expected=True,
                                subsession_id=None, stage_authority=1)

@@ -819,9 +819,30 @@ class DispatchJob:
     _context_evidence: Optional[ContextEvidence] = field(default=None, repr=False, compare=False)
     _dispatch_context_owned: bool = field(default=False, repr=False, compare=False)
     _refresh_source: Optional[dict] = field(default=None, repr=False, compare=False)
+    # The runtime's row_is_registered_only verdict for this registry row: a pre-registered
+    # serial successor that has not launched yet (no process, no log).
+    _registered_only: bool = field(default=False, repr=False, compare=False)
 
     def to_dict(self):
         return _public_value(self)
+
+
+def current_attempt_rank(job):
+    """Order of one route node's attempts; the highest is the node's current attempt.
+
+    An attempt that has started outranks one that is only registered: a continuation or
+    planned serial chain registers every sub-session up front, so the last registered row
+    is not yet the running one. Among started (or among registered-only) attempts the
+    canonical registry, then the later registry row, then the shorter age wins."""
+    priority = getattr(job, "registry_priority", None)
+    order = getattr(job, "registry_order", None)
+    elapsed = getattr(job, "elapsed_min", None)
+    return (
+        not getattr(job, "_registered_only", False),
+        -(priority if priority is not None else 0),
+        order if order is not None else -1,
+        -(elapsed if elapsed is not None else 10**9),
+    )
 
 
 @dataclass

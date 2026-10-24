@@ -3621,8 +3621,13 @@ class WatchMessageTransportSettlementTest(_WatchMixin, unittest.TestCase):
         import session_tidy
 
         env = self._env("idle")
+        # The shared obligation runner these commands start can reach a duty before
+        # its ACK; a census without the recipient would cancel it as
+        # recipient-session-absent, so list the recipient's session.
         env.update({"HERDR_PANE_ID": "fixture:watch-transport-seat",
-                    "AGENT_DISPATCH_CALLER_HARNESS": "claude"})
+                    "AGENT_DISPATCH_CALLER_HARNESS": "claude",
+                    "FAKE_HERDR_PANES": json.dumps(
+                        [{"pane_id": "w1:p9", "agent_session": {"value": "steward-1"}}])})
         proc = self._run("watch", target, env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         fields = self._fields(proc.stdout.splitlines()[0])
