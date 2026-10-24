@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import fcntl
+import contextlib
 from contextlib import ExitStack
 import importlib.util
 import json
@@ -33,6 +34,39 @@ _STEWARD_SPEC = importlib.util.spec_from_file_location(
 peer_steward = importlib.util.module_from_spec(_STEWARD_SPEC)
 _STEWARD_SPEC.loader.exec_module(peer_steward)
 peer_message = peer_steward.peer_message
+
+
+def _assert_fixture_path(path, label, fixture_root, *, dir_fd=None, cache=None):
+    """Resolve the path the syscall sees, including a relative dir_fd target."""
+    fixture_root = Path(fixture_root).resolve(strict=False)
+    is_fd_path = isinstance(path, int)
+    if is_fd_path:
+        try:
+            resolved = Path(f"/proc/self/fd/{path}").resolve(strict=True)
+        except OSError as exc:
+            raise AssertionError(f"{label} refers to an unavailable file descriptor") from exc
+    else:
+        raw = Path(os.fsdecode(os.fspath(path))).expanduser()
+        if raw.is_absolute():
+            resolved = raw.resolve(strict=False)
+        elif dir_fd is not None:
+            try:
+                directory = Path(f"/proc/self/fd/{int(dir_fd)}").resolve(strict=True)
+            except OSError as exc:
+                raise AssertionError(f"{label} refers to an unavailable directory descriptor") from exc
+            if not directory.is_dir():
+                raise AssertionError(f"{label} dir_fd does not refer to a directory: {directory}")
+            resolved = (directory / raw).resolve(strict=False)
+        else:
+            resolved = raw.resolve(strict=False)
+
+    if not resolved.is_relative_to(fixture_root):
+        raise AssertionError(f"{label} escaped the temporary fixture: {resolved}")
+    # An FD number can be closed and reused for an unrelated directory. Never
+    # memoize an FD-relative resolution under only its textual basename.
+    if cache is not None and not is_fd_path and dir_fd is None:
+        cache[str(resolved)] = resolved
+    return resolved
 
 
 class RunnerWorkloadCorrectionTest(unittest.TestCase):
@@ -83,6 +117,91 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
     def _session_id(label, index):
         digest = hashlib.sha256(f"synthetic-{label}-{index}".encode()).hexdigest()
         return f"{digest[:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
+
+    def test_fixture_path_guard_binds_dir_fd_targets_and_fd_reuse(self):
+        fixture = self.base / "fd-guard-fixture"
+        first_dir = fixture / "first"
+        second_dir = fixture / "second"
+        first_dir.mkdir(parents=True)
+        second_dir.mkdir()
+        (first_dir / "same-name").write_text("first", encoding="utf-8")
+        (second_dir / "same-name").write_text("second", encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix="hearting-fd-guard-outside-") as outside_name:
+            outside = Path(outside_name)
+            (outside / "same-name").write_text("outside", encoding="utf-8")
+            first_fd = os.open(first_dir, os.O_RDONLY | os.O_DIRECTORY)
+            second_fd = os.open(second_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                first_target = _assert_fixture_path(
+                    "same-name", "first same basename", fixture,
+                    dir_fd=first_fd, cache={})
+                second_target = _assert_fixture_path(
+                    "same-name", "second same basename", fixture,
+                    dir_fd=second_fd, cache={})
+                self.assertNotEqual(first_target, second_target)
+                self.assertEqual(first_target, first_dir / "same-name")
+                self.assertEqual(second_target, second_dir / "same-name")
+                outside_fd = os.open(outside, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with self.assertRaises(AssertionError):
+                        _assert_fixture_path("same-name", "outside directory fd", fixture,
+                                             dir_fd=outside_fd)
+                finally:
+                    os.close(outside_fd)
+                with self.assertRaises(AssertionError):
+                    _assert_fixture_path(outside / "same-name", "absolute outside path",
+                                         fixture, dir_fd=first_fd)
+                with self.assertRaises(AssertionError):
+                    _assert_fixture_path(os.path.relpath(outside / "same-name", first_dir),
+                                         "parent escape",
+                                         fixture, dir_fd=first_fd)
+
+                file_fd = os.open(first_dir / "same-name", os.O_RDONLY)
+                try:
+                    self.assertEqual(_assert_fixture_path(
+                        file_fd, "opened file descriptor", fixture),
+                        first_dir / "same-name")
+                finally:
+                    os.close(file_fd)
+
+                temporary_name, final_name = "publish.tmp", "published.json"
+                temporary_fd = os.open(temporary_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=first_fd)
+                try:
+                    os.write(temporary_fd, b"fixture-publish")
+                finally:
+                    os.close(temporary_fd)
+                self.assertEqual(_assert_fixture_path(
+                    temporary_name, "FD temporary", fixture, dir_fd=first_fd),
+                    first_dir / temporary_name)
+                os.replace(temporary_name, final_name,
+                           src_dir_fd=first_fd, dst_dir_fd=first_fd)
+                self.assertEqual(_assert_fixture_path(
+                    final_name, "FD replacement", fixture, dir_fd=first_fd),
+                    first_dir / final_name)
+                os.unlink(final_name, dir_fd=first_fd)
+                self.assertFalse((first_dir / final_name).exists())
+            finally:
+                os.close(first_fd)
+                os.close(second_fd)
+
+            cache = {}
+            reused_fd = os.open(first_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                _assert_fixture_path("same-name", "cached first fd", fixture,
+                                     dir_fd=reused_fd, cache=cache)
+                os.close(reused_fd)
+                outside_fd = os.open(outside, os.O_RDONLY | os.O_DIRECTORY)
+                if outside_fd != reused_fd:
+                    os.dup2(outside_fd, reused_fd)
+                    os.close(outside_fd)
+                self.assertEqual(os.fstat(reused_fd).st_ino, outside.stat().st_ino)
+                with self.assertRaises(AssertionError):
+                    _assert_fixture_path("same-name", "reused fd", fixture,
+                                         dir_fd=reused_fd, cache=cache)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(reused_fd)
 
     def _message(self, index, *, state="pending", receipt="target-form-open",
                  dispatch_binding=None, initial_observation=None):
@@ -264,16 +383,20 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
 
         # Existing completed rows are included because the real store scan reads
         # them even though only unfinished duties are returned to the runner.
-        for kind, count, prefix in (("message", 362, "completed-message"),
-                                    ("registered-batch", 253, "completed-batch"),
-                                    ("retire", 85, "completed-retire")):
+        self.completed_terminal_ids = []
+        terminal_fixture_rows = (("message", 362, "completed-message"),
+                                 ("registered-batch", 253, "completed-batch"),
+                                 ("retire", 85, "completed-retire"))
+        for kind, count, prefix in terminal_fixture_rows:
             for index in range(count):
                 duty_id = prefix + "-" + hashlib.sha256(
                     f"{prefix}-{index}".encode()).hexdigest()[:32]
                 duty = self.store.create(duty_id, kind, {}, {})
                 self.store.update(duty["id"], state="complete")
+                self.completed_terminal_ids.append(duty_id)
         cancelled = self.store.create("cancelled-retire-synthetic", "retire", {}, {})
         self.store.update(cancelled["id"], state="cancelled")
+        self.cancelled_fixture_id = cancelled["id"]
         return registered_ids, carrier, active_attempt
 
     def _create_open_retire_delivery(self, index):
@@ -327,12 +450,25 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
     def _run_real_runner_workload(self, *, recurring_negative):
         registered_ids, _carrier, _attempt = self._seed_workload(
             recurring_negative=recurring_negative)
+        fixture_record_count = (len(registered_ids) + len(self.message_duties)
+                                + len(self.completed_retire_ids)
+                                + len(self.completed_terminal_ids) + 1)
+        expected_active_ids = (set(registered_ids)
+                               | {duty_id for duty_id, _ref, _target in self.message_duties}
+                               | set(self.completed_retire_ids))
+        expected_cold_active_ids = (expected_active_ids if recurring_negative else
+                                    expected_active_ids - set(self.completed_retire_ids))
         # The active row carries this host's pid, start tick and namespace, so
         # only the ~23 MB padding is fixed; the exact byte count varies by host.
         self.assertEqual(self.jobs.stat().st_size, 23_499_871)
         self.assertEqual(len(list(peer_message._pending_dir().glob("*.json"))), 188)
         self.assertEqual(len(list(peer_message._transfer_path("0" * 32).parent.glob("*.json"))), 188)
-        self.assertEqual(len(list(self.store.root.glob("*.json"))), 902)
+        self.assertEqual(len(list(self.store.root.glob("*.json"))), fixture_record_count)
+        self.assertEqual(
+            {row["id"] for row in self.store.list(fast_active_only=True)},
+            expected_active_ids,
+            "the fixture's active index target is its registered, message, and unresolved retire set",
+        )
         self.assertEqual(len(self.store.list(states={"complete"})), 702)
         self.assertEqual(len(self.store.list(states={"cancelled"})), 1)
         self.assertEqual(len(self.completed_retire_ids), 2)
@@ -371,23 +507,30 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         write_targets = set()
         observed_roots = set()
         validated_fixture_paths = {}
+        fd_readiness_events = []
+        completed_followup_write_ids = set()
         monitoring = [False]
         phase = ["setup"]
 
-        def assert_fixture_path(path, label):
-            key = os.fspath(path)
-            cached = validated_fixture_paths.get(key)
-            if cached is not None:
-                return cached
+        def assert_fixture_path(path, label, *, dir_fd=None):
             guard_cpu_started = time.process_time()
-            resolved = Path(key).expanduser().resolve(strict=False)
-            self.assertTrue(resolved.is_relative_to(fixture_root),
-                            f"{label} escaped the temporary fixture: {resolved}")
-            validated_fixture_paths[key] = resolved
+            resolved = _assert_fixture_path(
+                path, label, fixture_root, dir_fd=dir_fd,
+                cache=validated_fixture_paths)
             if monitoring[0] and phase[0] == "runner":
                 counts["fixture_path_guard_cpu_seconds"] += time.process_time() - guard_cpu_started
             observed_roots.add(str(resolved))
             return resolved
+
+        def record_readiness_fd_path(operation, target, directory_fd):
+            if directory_fd is None or "readiness-v1" not in target.parts:
+                return
+            directory = os.fstat(directory_fd)
+            fd_readiness_events.append({
+                "operation": operation, "path": str(target),
+                "dir_fd": directory_fd, "directory_dev": directory.st_dev,
+                "directory_ino": directory.st_ino,
+            })
 
         initial_roots, _source = peer_message.steward_marker_roots()
         for root in initial_roots:
@@ -403,8 +546,11 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             "context_attempt_row_lookups": 0, "registry_line_calls": 0,
             "jobs_file_reads": 0, "obligation_writes": 0,
             "store_update_calls": 0,
+            "retire_followup_completion_writes": 0,
             "input_obligation_writes": 0, "input_pending_writes": 0,
             "input_transfer_writes": 0, "write_open_calls": 0,
+            "write_atomic_with_dir_fd": 0, "write_atomic_without_dir_fd": 0,
+            "reconcile_retry_state_passes": 0,
             "replace_calls": 0, "unlink_calls": 0,
             "completed_retire_recoveries": 0, "handover_authority_calls": 0,
             "record_retire_calls": 0,
@@ -421,6 +567,7 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         window = 20.0
         measurement = {}
         runner_store = []
+        main_active_discovery_ids = []
         lock_identities = []
         lock_events = []
         authority_counts = {}
@@ -512,15 +659,26 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                 counts["transfer_record_reads"] += 1
             return original_transfer(ref, roots=roots)
 
-        def checked_write(path, value):
-            target = assert_fixture_path(path, "obligation write")
+        def checked_write(path, value, *, dir_fd=None):
+            target = assert_fixture_path(path, "obligation write", dir_fd=dir_fd)
+            record_readiness_fd_path("atomic-write", target, dir_fd)
             if monitoring[0]:
                 if phase[0] == "input":
                     counts["input_obligation_writes"] += 1
                 elif phase[0] == "runner":
                     counts["obligation_writes"] += 1
+                    counts["write_atomic_with_dir_fd" if dir_fd is not None
+                           else "write_atomic_without_dir_fd"] += 1
+                    observation = (value.get("observation") or {}) if isinstance(value, dict) else {}
+                    if (isinstance(value, dict) and value.get("state") == "complete"
+                            and value.get("result") in {"normal-exit", "target-already-gone"}
+                            and observation.get("terminal_followup") == "complete"):
+                        duty_id = value.get("id")
+                        if duty_id not in completed_followup_write_ids:
+                            completed_followup_write_ids.add(duty_id)
+                            counts["retire_followup_completion_writes"] += 1
                 write_targets.add(str(target))
-            return original_write(path, value)
+            return original_write(path, value, dir_fd=dir_fd)
 
         def checked_read_record(path):
             assert_fixture_path(path, "obligation record read")
@@ -530,19 +688,30 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
 
         def checked_store_list(store, *args, **kwargs):
             assert_fixture_path(store.root, "obligation listing root")
-            if not runner_store:
+            is_main_unfiltered_list = not args and not kwargs
+            if not runner_store and is_main_unfiltered_list:
                 runner_store.append(store)
-            if monitoring[0] and phase[0] == "runner":
+            is_runner_store = bool(runner_store and store is runner_store[0])
+            if (is_runner_store and monitoring[0] and phase[0] == "runner"):
                 counts["store_list_calls"] += 1
             cpu_started = time.process_time()
+            before_metrics = store.discovery_metrics() if is_runner_store else None
             try:
-                return original_store_list(store, *args, **kwargs)
+                result = original_store_list(store, *args, **kwargs)
+                after_metrics = store.discovery_metrics() if is_runner_store else None
+                if (is_runner_store and is_main_unfiltered_list
+                        and not main_active_discovery_ids
+                        and after_metrics["json_reads"] > before_metrics["json_reads"]):
+                    main_active_discovery_ids.append(
+                        tuple(row.get("id") for row in result if isinstance(row, dict)))
+                return result
             finally:
-                if monitoring[0] and phase[0] == "runner":
+                if (is_runner_store and monitoring[0] and phase[0] == "runner"):
                     counts["store_list_cpu_seconds"] += time.process_time() - cpu_started
 
         def checked_store_update(store, duty_id, **kwargs):
-            if monitoring[0] and phase[0] == "runner":
+            if (runner_store and store is runner_store[0]
+                    and monitoring[0] and phase[0] == "runner"):
                 counts["store_update_calls"] += 1
             return original_store_update(store, duty_id, **kwargs)
 
@@ -635,15 +804,22 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                 counts["batch_activation_calls"] += 1
             return None
 
-        def checked_reconcile(store, duties=None, *, read_context=None):
-            if monitoring[0] and phase[0] == "runner":
+        def checked_reconcile(store, duties=None, *, read_context=None, retry_state=None):
+            if not runner_store:
+                runner_store.append(store)
+            if (runner_store[0] is store
+                    and monitoring[0] and phase[0] == "runner"):
                 counts["passes"] += 1
                 counts["passes_after_input" if event else "passes_before_input"] += 1
+                if retry_state is not None:
+                    counts["reconcile_retry_state_passes"] += 1
             cpu_started = time.process_time()
             try:
-                return original_reconcile(store, duties, read_context=read_context)
+                return original_reconcile(store, duties, read_context=read_context,
+                                          retry_state=retry_state)
             finally:
-                if monitoring[0] and phase[0] == "runner":
+                if (runner_store[0] is store
+                        and monitoring[0] and phase[0] == "runner"):
                     counts["reconcile_cpu_seconds"] += time.process_time() - cpu_started
 
         def checked_external_reconcile(*args, **kwargs):
@@ -694,22 +870,30 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         def checked_os_open(path, flags, *args, **kwargs):
             write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
             if flags & write_flags and monitoring[0]:
-                target = assert_fixture_path(path, "write open")
+                directory_fd = kwargs.get("dir_fd")
+                target = assert_fixture_path(path, "write open", dir_fd=directory_fd)
+                record_readiness_fd_path("open", target, directory_fd)
                 counts["write_open_calls"] += 1
                 write_targets.add(str(target))
             return real_os_open(path, flags, *args, **kwargs)
 
         def checked_replace(source, destination, *args, **kwargs):
             if monitoring[0]:
-                src = assert_fixture_path(source, "atomic write source")
-                dst = assert_fixture_path(destination, "atomic write destination")
+                src_dir_fd = kwargs.get("src_dir_fd")
+                dst_dir_fd = kwargs.get("dst_dir_fd")
+                src = assert_fixture_path(source, "atomic write source", dir_fd=src_dir_fd)
+                dst = assert_fixture_path(destination, "atomic write destination", dir_fd=dst_dir_fd)
+                record_readiness_fd_path("replace", src, src_dir_fd)
+                record_readiness_fd_path("replace", dst, dst_dir_fd)
                 counts["replace_calls"] += 1
                 write_targets.update((str(src), str(dst)))
             return real_os_replace(source, destination, *args, **kwargs)
 
         def checked_unlink(path, *args, **kwargs):
             if monitoring[0]:
-                target = assert_fixture_path(path, "write cleanup target")
+                directory_fd = kwargs.get("dir_fd")
+                target = assert_fixture_path(path, "write cleanup target", dir_fd=directory_fd)
+                record_readiness_fd_path("unlink", target, directory_fd)
                 counts["unlink_calls"] += 1
                 write_targets.add(str(target))
             return real_os_unlink(path, *args, **kwargs)
@@ -944,12 +1128,21 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                          - cold["registry"]["full_metadata_parses"], 0)
         self.assertEqual(steady["registry"]["metadata_rows_parsed"]
                          - cold["registry"]["metadata_rows_parsed"], 0)
-        self.assertEqual(cold["store"]["json_reads"], 902)
-        self.assertEqual(cold["store"]["json_parses"], 902)
+        self.assertTrue(main_active_discovery_ids,
+                        "the main runner pass must expose its active-index target")
+        discovered_active_ids = set(main_active_discovery_ids[0])
+        self.assertEqual(discovered_active_ids, expected_cold_active_ids,
+                         "cold discovery must match fixture membership and the case-required "
+                         "retire followups")
+        expected_cold_json_records = len(expected_cold_active_ids)
+        self.assertEqual(cold["store"]["json_reads"], expected_cold_json_records,
+                         (len(expected_cold_active_ids), cold["store"]))
+        self.assertEqual(cold["store"]["json_parses"], expected_cold_json_records)
         self.assertEqual(steady["store"]["json_reads"] - cold["store"]["json_reads"], 0)
         self.assertEqual(steady["store"]["json_parses"] - cold["store"]["json_parses"], 0)
         self.assertGreater(steady["store"]["stat_calls"] - cold["store"]["stat_calls"], 0)
         self.assertGreaterEqual(counts["passes"], 4)
+        self.assertEqual(counts["reconcile_retry_state_passes"], counts["passes"])
         self.assertGreaterEqual(counts["passes_before_input"], 4)
         self.assertGreater(counts["passes_after_input"], 0)
         self.assertLessEqual(counts["message_resumes"], 194 * counts["passes"])
@@ -968,21 +1161,58 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         self.assertEqual(counts["watch_activation_calls"], 0)
         self.assertEqual(counts["jobs_file_reads"], 0,
                          "registry content is read through the fd generation reader")
-        self.assertEqual(cold["counts"]["obligation_writes"], 0,
-                         "cold unchanged duties must not checkpoint")
-        self.assertEqual(steady["counts"]["obligation_writes"]
-                         - cold["counts"]["obligation_writes"], 0,
-                         "steady unchanged duties must not checkpoint")
-        self.assertEqual(counts["obligation_writes"], 1,
+        self.assertEqual(counts["write_atomic_without_dir_fd"], 0)
+        self.assertEqual(
+            cold["counts"]["obligation_writes"]
+            - cold["counts"]["retire_followup_completion_writes"], 0,
+            "the first resolved retire followups are counted separately from unchanged duties",
+        )
+        self.assertEqual(
+            (steady["counts"]["obligation_writes"]
+             - steady["counts"]["retire_followup_completion_writes"])
+            - (cold["counts"]["obligation_writes"]
+               - cold["counts"]["retire_followup_completion_writes"]),
+            0,
+            "steady unchanged duties must not checkpoint",
+        )
+        self.assertEqual(
+            counts["obligation_writes"] - counts["retire_followup_completion_writes"], 1,
                          "only the changed duty may checkpoint after the measurement windows")
         self.assertEqual(counts["input_obligation_writes"], 1)
         self.assertEqual(counts["input_pending_writes"], 1)
         self.assertEqual(counts["input_transfer_writes"], 1)
-        self.assertEqual(counts["store_update_calls"], 1)
+        self.assertEqual(
+            counts["store_update_calls"] - counts["retire_followup_completion_writes"], 1)
         self.assertTrue(discovered_roots)
         self.assertTrue(write_targets)
         self.assertTrue(all(Path(path).resolve(strict=False).is_relative_to(fixture_root)
                             for path in discovered_roots | write_targets | observed_roots))
+        readiness_replaces = [entry for entry in fd_readiness_events
+                              if entry["operation"] == "replace"]
+        readiness_temporary = next(
+            (entry for entry in readiness_replaces
+             if Path(entry["path"]).name.startswith(".readiness-")
+             and Path(entry["path"]).name.endswith(".tmp")), None)
+        readiness_final = next(
+            (entry for entry in readiness_replaces
+             if Path(entry["path"]).name == "runner.json"), None)
+        self.assertIsNotNone(readiness_temporary,
+                             "the real runner incarnation temporary must publish through dir_fd")
+        self.assertIsNotNone(readiness_final,
+                             "the real runner incarnation target must publish through dir_fd")
+        self.assertEqual(Path(readiness_temporary["path"]).parent,
+                         Path(readiness_final["path"]).parent)
+        self.assertEqual((readiness_temporary["directory_dev"],
+                          readiness_temporary["directory_ino"]),
+                         (readiness_final["directory_dev"],
+                          readiness_final["directory_ino"]))
+        print("readiness_fd_publish_provenance=" + json.dumps({
+            "temporary_path": readiness_temporary["path"],
+            "final_path": readiness_final["path"],
+            "directory_dev": readiness_final["directory_dev"],
+            "directory_ino": readiness_final["directory_ino"],
+            "operation": "replace(src_dir_fd,dst_dir_fd)",
+        }, sort_keys=True, separators=(",", ":")))
         self.assertGreaterEqual(event["pass_at_create"], 4)
         self.assertIn("processed_at", event)
         input_latency = event["processed_at"] - event["created_at"]
@@ -1047,6 +1277,22 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             self.assertEqual(counts["handover_authority_calls"], 2)
         self.assertTrue(all(self.store.get(duty_id)["state"] == "unknown"
                             for duty_id, _ref, _target in self.message_duties))
+        expected_final_active_ids = expected_cold_active_ids | {event["duty_id"]}
+        for index, duty_id in enumerate(self.completed_retire_ids):
+            completed_followup = not recurring_negative or index == 0
+            retire_observation = self.store.get(duty_id)["observation"]
+            if completed_followup:
+                self.assertEqual(retire_observation.get("terminal_followup"), "complete")
+                expected_final_active_ids.discard(duty_id)
+            else:
+                self.assertIsNone(retire_observation.get("terminal_followup"),
+                                 "the still-ineligible fixture duty keeps its seeded state")
+                expected_final_active_ids.add(duty_id)
+        self.assertEqual(
+            {row["id"] for row in self.store.list(fast_active_only=True)},
+            expected_final_active_ids,
+            "the post-change handover must update the final active index exactly",
+        )
         final_registered = [self.store.get(duty_id)["state"] for duty_id in registered_ids]
         self.assertEqual(final_registered.count("unknown"), 5)
         self.assertEqual(final_registered.count("pending"), 1)
@@ -1103,7 +1349,9 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             f"real-runner-workload-correction case={case_name} "
             f"runner_pid={start_pid} starttime={cold['before_fields'][19]} HZ={ticks} "
             "one_core=100% child_cpu=excluded(no child spawned) "
-            f"registry_bytes={self.jobs.stat().st_size} obligations=902 readable_transfers=188 "
+            f"registry_bytes={self.jobs.stat().st_size} obligations={fixture_record_count} "
+            f"active_obligations={len(expected_active_ids)} "
+            f"measured_active_obligations={len(discovered_active_ids)} readable_transfers=188 "
             f"successor_locks={len(set(successor_locks))} seat_locks={len(set(seat_locks))} "
             f"completed_retire_handover={successful_handover_count} "
             f"cold_window={cold['elapsed']:.2f}s cold_cpu={cold_cpu:.3f}% "
@@ -1145,9 +1393,13 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             f"lock_acquisitions_cold={sum(row['window'] == 'cold' for row in lock_events)} "
             f"lock_acquisitions_steady={sum(row['window'] == 'steady' for row in lock_events)} "
             f"lock_identities={sorted(set(lock_identities))} "
-            f"unchanged_checkpoint_skips={counts['message_resumes'] - counts['store_update_calls']} "
+            f"unchanged_checkpoint_skips={counts['message_resumes'] - (counts['store_update_calls'] - counts['retire_followup_completion_writes'])} "
             f"input_obligation_writes={counts['input_obligation_writes']} "
             f"runner_obligation_writes={counts['obligation_writes']} "
+            f"retire_followup_completion_writes={counts['retire_followup_completion_writes']} "
+            f"write_atomic_with_dir_fd={counts['write_atomic_with_dir_fd']} "
+            f"write_atomic_without_dir_fd={counts['write_atomic_without_dir_fd']} "
+            f"reconcile_retry_state_passes={counts['reconcile_retry_state_passes']} "
             f"input_pending_writes={counts['input_pending_writes']} "
             f"input_transfer_writes={counts['input_transfer_writes']} "
             f"write_open_calls={counts['write_open_calls']} replace_calls={counts['replace_calls']} "
