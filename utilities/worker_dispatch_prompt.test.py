@@ -6,6 +6,7 @@ import json
 import importlib.util
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -62,7 +63,18 @@ def _live_csv_records_from_output(output):
     return records
 
 
-def _live_coverage_rows(coverage):
+def _live_fixture_name(label, workdir):
+    label = str(label).strip()
+    if label.startswith("`") and label.endswith("`"):
+        label = label[1:-1]
+    try:
+        relative = (Path(workdir) / label).resolve().relative_to(Path(workdir).resolve())
+    except (OSError, ValueError):
+        return label
+    return relative.as_posix() if relative.as_posix() in LIVE_TODO_COUNTS else label
+
+
+def _live_coverage_rows(coverage, workdir):
     lines = str(coverage or "").splitlines()
     header = None
     header_line = None
@@ -90,7 +102,7 @@ def _live_coverage_rows(coverage):
             continue
         if max(file_column, count_column) >= len(cells):
             continue
-        filename = cells[file_column]
+        filename = _live_fixture_name(cells[file_column], workdir)
         raw_count = cells[count_column]
         count = int(raw_count) if re.fullmatch(r"\d+", raw_count) else None
         evidence = cells[evidence_column] if evidence_column is not None and evidence_column < len(cells) else ""
@@ -138,6 +150,13 @@ def _live_solo_findings(workdir, final_text, events):
         if not isinstance(item, dict) or item.get("type") != "command_execution":
             continue
         command = str(item.get("command") or "")
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = []
+        if (len(argv) == 3 and Path(argv[0]).name in {"sh", "bash", "zsh"}
+                and argv[1] in {"-c", "-lc"}):
+            command = argv[2]
         output = str(item.get("aggregated_output") or item.get("output") or "")
         tools.append((index, command, output, item.get("exit_code"), item.get("status")))
 
@@ -149,17 +168,29 @@ def _live_solo_findings(workdir, final_text, events):
         findings.append(f"O1 command/result event for sum([1,2]) -> {LIVE_O1_RESULT} is missing")
     o1_index = o1[-1][0] if o1 else len(events)
 
+    observations = []
+    for i, command, output, code, status in tools:
+        if not successful((i, command, output, code, status)):
+            continue
+        if i > o1_index:
+            observations.append((command, output))
+        elif i == o1_index:
+            # A sequential shell batch is still work performed after O1. Require
+            # its literal command first and its output before the later data.
+            lines = output.splitlines()
+            if (re.match(re.escape(LIVE_O1_COMMAND) + r"\s*(?:;|&&|\n)", command.lstrip())
+                    and lines and lines[0].strip() == str(LIVE_O1_RESULT)):
+                observations.append((command, "\n".join(lines[1:])))
+
     csv_path = Path(workdir) / "rows.csv"
-    later_csv = [(i, cmd, out) for i, cmd, out, code, status in tools
-                 if i > o1_index and csv_path.name in cmd
-                 and successful((i, cmd, out, code, status))]
+    later_csv = [(cmd, out) for cmd, out in observations if csv_path.name in cmd]
     if not later_csv:
         findings.append("O2 CSV inspection event after O1 is missing")
     else:
         expected_csv_records = [("category", "value")]
         expected_csv_records.extend((category, str(value)) for category, value in LIVE_CSV_ROWS)
         if not any(_live_csv_records_from_output(out) == expected_csv_records
-                   for _, _, out in later_csv):
+                   for _, out in later_csv):
             findings.append("O2 successful rows.csv output does not establish all six fixture records")
 
     totals_path = Path(workdir) / "totals.json"
@@ -177,23 +208,21 @@ def _live_solo_findings(workdir, final_text, events):
     except OSError as exc:
         coverage = ""
         findings.append(f"O3 coverage.md is missing: {exc}")
-    coverage_header, coverage_rows, total_rows = _live_coverage_rows(coverage)
+    coverage_header, coverage_rows, total_rows = _live_coverage_rows(coverage, workdir)
     if coverage_header is None:
         findings.append("O3 coverage.md exact File/TODO count table header is missing")
     counts = LIVE_TODO_COUNTS
     for filename, count in counts.items():
-        observations = []
-        for i, command, output, code, status in tools:
-            if i <= o1_index or filename not in command or not successful((i, command, output, code, status)):
-                continue
+        counts_observed = []
+        for command, output in observations:
             for line in output.splitlines():
-                match = re.fullmatch(rf"\s*{re.escape(filename)}\s*:\s*(\d+)\s*", line)
-                if match:
-                    observations.append(int(match.group(1)))
-        if not observations:
+                match = re.fullmatch(r"\s*(.+?)\s*:\s*(\d+)\s*", line)
+                if match and _live_fixture_name(match.group(1), workdir) == filename:
+                    counts_observed.append(int(match.group(2)))
+        if not counts_observed:
             findings.append(f"O3 successful TODO count observation for {filename} after O1 is missing")
-        elif set(observations) != {count}:
-            findings.append(f"O3 observed TODO count for {filename} differs from fixture-derived {count}: {observations!r}")
+        elif set(counts_observed) != {count}:
+            findings.append(f"O3 observed TODO count for {filename} differs from fixture-derived {count}: {counts_observed!r}")
 
         reported = coverage_rows.get(filename, [])
         if not reported:
@@ -204,7 +233,7 @@ def _live_solo_findings(workdir, final_text, events):
             for reported_count, evidence in reported:
                 if reported_count is None:
                     findings.append(f"O3 coverage table count cell for {filename} is not an exact integer")
-                elif reported_count != count or (observations and reported_count not in observations):
+                elif reported_count != count or (counts_observed and reported_count not in counts_observed):
                     findings.append(
                         f"O3 coverage count for {filename}={reported_count} does not match "
                         f"its observation and fixture-derived count {count}")
@@ -232,6 +261,12 @@ def _live_solo_findings(workdir, final_text, events):
 
     try:
         report = json.loads(final, object_pairs_hook=unique_object)
+        if isinstance(report, dict) and isinstance(report.get("O3"), dict):
+            reported_counts = report["O3"].get("counts")
+            if isinstance(reported_counts, dict):
+                report["O3"]["counts"] = unique_object(
+                    [(_live_fixture_name(name, workdir), value)
+                     for name, value in reported_counts.items()])
     except ValueError:
         report = None
     expected_report = {
@@ -801,6 +836,46 @@ class LiveSoloResultComparatorFixtureTest(unittest.TestCase):
             self.assertEqual(_live_solo_findings(root, final, events), [])
             self.assertEqual(_live_solo_judgment(0, [], events), "PASS")
             self.assertEqual(_live_solo_findings(root, f"```json\n{final}\n```", events), [])
+
+            # Native shells may batch sequential duties and label the same files
+            # with absolute paths. Neither representation changes what was done.
+            absolute_report = json.loads(final)
+            absolute_report["O3"]["counts"] = {
+                str(root / name): count for name, count in LIVE_TODO_COUNTS.items()}
+            absolute_coverage = coverage
+            for name in LIVE_TODO_COUNTS:
+                absolute_coverage = absolute_coverage.replace(f"| {name} |", f"| `{root / name}` |")
+            (root / "coverage.md").write_text(absolute_coverage, encoding="utf-8")
+            batched_events = [
+                command_event(LIVE_O1_COMMAND + "; cat rows.csv", f"{LIVE_O1_RESULT}\n" + LIVE_CSV_FIXTURE),
+                command_event("python3 count-all-inputs", "\n".join(
+                    f"{root / name}: {count}" for name, count in LIVE_TODO_COUNTS.items())),
+            ]
+            absolute_final = json.dumps(absolute_report)
+            self.assertEqual(_live_solo_findings(root, absolute_final, batched_events), [])
+            shell_wrapped = [dict(event, item=dict(event["item"])) for event in batched_events]
+            shell_wrapped[0]["item"]["command"] = "/bin/sh -c " + shlex.quote(
+                shell_wrapped[0]["item"]["command"])
+            self.assertEqual(_live_solo_findings(root, absolute_final, shell_wrapped), [])
+
+            reversed_batch = [dict(event, item=dict(event["item"])) for event in batched_events]
+            reversed_batch[0]["item"].update(
+                command="cat rows.csv; " + LIVE_O1_COMMAND,
+                aggregated_output=LIVE_CSV_FIXTURE + f"{LIVE_O1_RESULT}\n")
+            self.assertTrue(_live_solo_findings(root, absolute_final, reversed_batch))
+            external_file = root.parent / "other-fixture" / "first.txt"
+            wrong_path = [dict(event, item=dict(event["item"])) for event in batched_events]
+            wrong_path[1]["item"]["aggregated_output"] = wrong_path[1]["item"]["aggregated_output"].replace(
+                str(root / "first.txt"), str(external_file))
+            self.assertTrue(_live_solo_findings(root, absolute_final, wrong_path))
+            alias_collision = json.loads(absolute_final)
+            alias_collision["O3"]["counts"]["first.txt"] = 9
+            self.assertTrue(_live_solo_findings(root, json.dumps(alias_collision), batched_events))
+            external_report = json.loads(absolute_final)
+            external_report["O3"]["counts"][str(external_file)] = external_report["O3"]["counts"].pop(
+                str(root / "first.txt"))
+            self.assertTrue(_live_solo_findings(root, json.dumps(external_report), batched_events))
+            (root / "coverage.md").write_text(coverage, encoding="utf-8")
 
             for status in ("not complete", "incomplete", "blocked"):
                 contradictory = json.loads(final)
