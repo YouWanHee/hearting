@@ -47,7 +47,7 @@ Invoke `code-test`, then reproduce the original scenario:
 
 If verification fails or the original error persists:
 
-1. Read `Safety commit: {hash}` from `checklist.md` and restore only changed paths with `git checkout <safety-commit> -- <changed paths>`.
+1. Use the dev log to reverse only the failed fix's own edits when they are clearly attributable. Preserve unrelated or ambiguous contents, including other edits in the same file, and record what remains; do not check out or restore whole files or the tree.
 2. Write `pipeline_summary.md` with `status: unresolved` before user output.
 3. Report the diagnosis, attempted fix, why it failed, and manual investigation steps.
 

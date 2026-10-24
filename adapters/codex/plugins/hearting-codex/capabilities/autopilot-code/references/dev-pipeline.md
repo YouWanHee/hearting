@@ -381,7 +381,7 @@ Read plan frontmatter after harvest:
 
 - `done` → impl-review, then Step 4;
 - `partial` → impl-review, then Step 4 for completed work;
-- `failed` → source has been rolled back. Write failed `pipeline_summary.md`, report, and stop before test or report.
+- `failed` → execute did not complete; source may contain partial edits. Write a failed `pipeline_summary.md` recording the remaining state, report, and stop before test or report.
 
 The compiled route also contains the `impl-review` review node unconditionally (unit
 `qa/code-review`, completion gate `code-impl-review`) between `execute` and `test`; `test`
@@ -420,7 +420,7 @@ quick reports verify-lite failure without retry. Other graphs may open at most o
 4. Reset checklist marks to `[ ]`.
 5. Pause for explicit user refine, or invoke one bounded code-refine.
 6. Redispatch code-execute, then code-test.
-7. On pass, continue. On a second failure, roll back, write a failed summary noting both attempts, and stop before code-report.
+7. On pass, continue. On a second failure, keep the remaining state without a broad restore, write a failed summary noting both attempts and what remains, and stop before code-report.
 
 ### Step 5: code-report
 
@@ -443,7 +443,7 @@ Write the dev-mode summary, then report its path and a two- or three-line verdic
 
 ### Step 7: Refresh `analysis_project/code/`
 
-After reporting, inspect changed files from dev logs or `git diff <safety-commit>..HEAD --name-only`.
+After reporting, inspect changed files from dev logs or `git diff <execute-launch_head>..HEAD --name-only`, using execute's recorded `launch_head` as the diff base.
 
 | Change | Route |
 |---|---|

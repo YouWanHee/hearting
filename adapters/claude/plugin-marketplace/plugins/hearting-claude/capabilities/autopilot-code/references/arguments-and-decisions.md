@@ -76,7 +76,7 @@ The pipeline pauses only for genuine ambiguity or an explicit user-refine reques
 | Existing partial plan | Create a new plan for `failed_steps`. |
 | Debug diagnosis unambiguous | Proceed automatically. |
 | Debug diagnosis ambiguous | Always list candidates and ask which to investigate. |
-| Debug verification fails | Roll back and report. |
+| Debug verification fails | Reverse only clearly attributable failed-fix edits recorded in the dev log; preserve unrelated or ambiguous state and report what remains. |
 | Environment issue | Report repair steps; do not edit code. |
 
 Record actual pauses in the summary's Decision Points table. Do not log every automatic branch as a gated decision.
