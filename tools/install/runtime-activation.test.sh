@@ -282,9 +282,12 @@ harness uninstall claude > "$TMP/uninstall-union.log" 2>&1 \
   || { cat "$TMP/uninstall-union.log" >&2; fail "union uninstall failed"; }
 test "$(readlink "$HOME/.claude/README.md")" = "$SRC/README.md" \
   || fail "uninstall did not restore the untouched installer-owned README.md target"
-test ! -e "$HOME/.claude/manifest.json" && test ! -L "$HOME/.claude/manifest.json" \
-  || fail "uninstall restored over a manifest.json the user repointed after activation"
+test -L "$HOME/.claude/manifest.json" \
+  || fail "uninstall removed a manifest.json the user repointed after activation"
+test "$(readlink "$HOME/.claude/manifest.json")" = "/nonexistent/user-repointed-manifest" \
+  || fail "uninstall changed the user's repointed manifest.json target"
 ok "uninstall restores an untouched union member's installer target and leaves a user repoint alone"
+rm -f "$HOME/.claude/manifest.json"
 
 # A legacy/incomplete journal has no exact preimage/postimage proof. Recovery
 # must fail closed without touching the union-only destination; an operator can
