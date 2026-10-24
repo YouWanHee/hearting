@@ -104,10 +104,11 @@ launcher와 공용 `compute-hosts` operator launcher도 함께 설치합니다. 
 `${XDG_CONFIG_HOME:-$HOME/.config}/hearting/compute-hosts.yaml`을 읽습니다.
 설치와 update는 이 inventory를 만들거나 바꾸지 않고, shell startup 파일도
 수정하지 않습니다. 자동 GPU scheduler나 remote agent dispatch는 없습니다.
-inventory가 비어 있어도 Fleet는 이 기계의 읽기 전용 compute 관측을 보여 주며,
-원격 host와 detached run에는 계속 inventory 설정이 필요합니다.
 외부 PATH 파일과 symlink는 보존되며, 전체 uninstall만 소유한 공용 link를
 제거하고 부분 runtime uninstall은 이를 유지합니다.
+
+Inventory가 비어 있어도 Fleet는 이 기계의 읽기 전용 compute 관측을 보여 주며,
+원격 host와 detached run에는 계속 inventory 설정이 필요합니다.
 
 `hearting update`는 새 release를 staging에서 검증한 뒤 active pointer를
 전환하고 실패하면 이전 release로 rollback합니다. 이미 열린 agent session이

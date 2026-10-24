@@ -302,14 +302,16 @@ Choose a host explicitly. The installer seeds the user-owned
 `${XDG_CONFIG_HOME:-$HOME/.config}/hearting/compute-hosts.yaml` once as a
 commented template and never edits it again; it does not edit shell startup
 files, schedule GPU work, or dispatch remote agents. A template that still has
-no hosts is reported as `template` by `compute-hosts` and `harness verify`.
-Fleet still shows this machine's read-only compute observation without
-inventory; remote hosts and detached runs require inventory configuration.
+no hosts is reported as `template` by `compute-hosts`, `harness verify`, and
+the Fleet COMPUTE RESOURCES panel, never as an error.
 
 For a non-self host, `compute-hosts run` places a validated managed `AGENT_HOME`
 code copy under the shared `run_root` for the payload; it does not install into
 the remote home or change the installer's `current`/activation. Self hosts keep
 their pinned release path. Unmanaged checkouts are forwarded as-is.
+
+Fleet shows this machine's read-only compute observation even without inventory.
+Remote hosts and detached runs still require inventory configuration.
 
 ## User-owned config registry — `harness config status`
 

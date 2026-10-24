@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 import re
 import shlex
-import shutil
 import sqlite3
 import stat
 import subprocess
@@ -98,11 +97,7 @@ def parse_version(value: str | None) -> tuple[int, int, int] | None:
 
 
 def resolve_binary(binary: str = "opencode", environ=None) -> str:
-    """Resolve the CLI using explicit selection, PATH, then the user-local bin.
-
-    Explicit arguments and OPENCODE_BIN are authoritative, even when invalid;
-    callers must not silently switch installations after an explicit choice.
-    """
+    """Resolve explicit binding, PATH, then an executable in the user's home."""
     if binary != "opencode":
         return binary
     env = os.environ if environ is None else environ
@@ -113,51 +108,35 @@ def resolve_binary(binary: str = "opencode", environ=None) -> str:
         return found
     home = env.get("HOME")
     if home:
-        local_binary = Path(home) / ".opencode" / "bin" / "opencode"
+        candidate = Path(home) / ".opencode" / "bin" / "opencode"
         try:
-            regular_executable = stat.S_ISREG(local_binary.stat().st_mode)
+            regular = stat.S_ISREG(candidate.stat().st_mode)
         except OSError:
-            regular_executable = False
-        if regular_executable and os.access(local_binary, os.X_OK):
-            return str(local_binary)
+            regular = False
+        if regular and os.access(candidate, os.X_OK):
+            return str(candidate)
     return binary
 
 
-@lru_cache(maxsize=32)
-def _runtime_version_cached(binary: str, environment: tuple) -> tuple[int, int, int] | None:
-    env = dict(environment)
-    configured_version = env.get("OPENCODE_RUNTIME_VERSION")
-    if configured_version:
-        return parse_version(configured_version)
-    # Never execute an unrelated command selected by an explicit override.
+@lru_cache(maxsize=16)
+def runtime_version(binary: str = "opencode") -> tuple[int, int, int] | None:
+    """Read the executable version once per process; never start a session."""
+    configured = os.environ.get("OPENCODE_RUNTIME_VERSION")
+    if configured:
+        return parse_version(configured)
+    # Test/injected command overrides are often scripts with unrelated
+    # ``--version`` semantics. Never execute an arbitrary command merely to
+    # identify it as OpenCode; callers can pass a known version through the
+    # runtime-owned environment when their executable is not named opencode.
     if Path(binary).name != "opencode":
         return None
     try:
         result = subprocess.run([binary, "--version"], check=False, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                timeout=3, env=env)
+                                timeout=3, env=os.environ.copy())
     except (OSError, subprocess.TimeoutExpired):
         return None
     return parse_version((result.stdout or "") + "\n" + (result.stderr or ""))
-
-
-def runtime_version(binary: str = "opencode") -> tuple[int, int, int] | None:
-    """Read the executable version once per process; never start a session."""
-    env = os.environ
-    executable = resolve_binary(binary, environ=env)
-    return _runtime_version_cached(executable, tuple(sorted(env.items())))
-
-
-# Preserve the familiar cache control used by fixture callers.
-runtime_version.cache_clear = _runtime_version_cached.cache_clear
-
-
-def _runtime_version_for(binary: str, environ) -> tuple[int, int, int] | None:
-    configured = environ.get("OPENCODE_RUNTIME_VERSION")
-    if configured:
-        return parse_version(configured)
-    executable = resolve_binary(binary, environ=environ)
-    return _runtime_version_cached(executable, tuple(sorted(environ.items())))
 
 
 def is_v2(binary: str = "opencode", version: tuple[int, int, int] | None = None,
@@ -174,6 +153,54 @@ def is_v2(binary: str = "opencode", version: tuple[int, int, int] | None = None,
     # downgrade or migration. An unavailable version probe stays unknown and
     # must never turn a retained V2 database into a V2 CLI assumption.
     return bool(version and version[0] >= 2)
+
+
+@lru_cache(maxsize=32)
+def _runtime_version_for_environment(binary: str, environment: tuple):
+    env = dict(environment)
+    configured = env.get("OPENCODE_RUNTIME_VERSION")
+    if configured:
+        return parse_version(configured)
+    if Path(binary).name != "opencode":
+        return None
+    try:
+        result = subprocess.run([binary, "--version"], check=False, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=3, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_version((result.stdout or "") + "\n" + (result.stderr or ""))
+
+
+def _runtime_version_for(binary: str, environ):
+    configured = environ.get("OPENCODE_RUNTIME_VERSION")
+    if configured:
+        return parse_version(configured)
+    executable = resolve_binary(binary, environ=environ)
+    if environ is os.environ:
+        return runtime_version(binary)
+    return _runtime_version_for_environment(executable, tuple(sorted(environ.items())))
+
+
+# Keep the upstream probe cache entry point, while resolving the default CLI
+# binding before its probe. Explicit OPENCODE_RUNTIME_VERSION remains first.
+runtime_version_probe_compat = runtime_version
+
+
+def _runtime_version_with_resolver(binary: str = "opencode"):
+    configured = os.environ.get("OPENCODE_RUNTIME_VERSION")
+    if configured:
+        return parse_version(configured)
+    return runtime_version_probe_compat(resolve_binary(binary, environ=os.environ))
+
+
+def _clear_runtime_version_caches():
+    runtime_version_probe_compat.cache_clear()
+    _runtime_version_for_environment.cache_clear()
+
+
+_runtime_version_with_resolver.cache_clear = _clear_runtime_version_caches
+runtime_version = _runtime_version_with_resolver
 
 
 # OpenCode V2 permissions are an ordered row stream. Keep its interpretation

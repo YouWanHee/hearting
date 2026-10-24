@@ -4,8 +4,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-import sys
 import subprocess
+import sys
 import tempfile
 import unittest
 import unittest.mock
@@ -16,18 +16,6 @@ import opencode_runtime as runtime
 
 
 class OpenCodeRunCodecTest(unittest.TestCase):
-    def setUp(self):
-        runtime.runtime_version.cache_clear()
-        self.addCleanup(runtime.runtime_version.cache_clear)
-
-    @staticmethod
-    def _cli(path, output="2.0.32", executable=True):
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"#!/bin/sh\nprintf '{output}\\n'\n")
-        path.chmod(0o755 if executable else 0o644)
-        return path
-
     def test_v1_flags_and_v2_provider_variant_are_separate(self):
         v1 = runtime.run_argv(binary="opencode", cwd="/work", agent="build",
                               model="opencode-go/model", variant="high", pure=True,
@@ -62,6 +50,21 @@ class OpenCodeRunCodecTest(unittest.TestCase):
             self.assertFalse(runtime.is_v2())
         with unittest.mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "2.0.32"}):
             self.assertTrue(runtime.is_v2())
+
+    def test_v2_default_variant_has_no_suffix(self):
+        self.assertEqual(runtime.model_reference("openai/gpt-6.1-sol", "runtime-default"),
+                         "openai/gpt-6.1-sol")
+        self.assertEqual(runtime.model_reference("opencode/model#old", "high"),
+                         "opencode/model#high")
+
+
+    @staticmethod
+    def _cli(path, output="2.0.32", executable=True):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"#!/bin/sh\nprintf '{output}\\n'\n")
+        path.chmod(0o755 if executable else 0o644)
+        return path
 
     def test_v2_cli_resolves_from_fixture_home_when_missing_from_path(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as empty_path:
@@ -146,11 +149,41 @@ class OpenCodeRunCodecTest(unittest.TestCase):
                 self.assertFalse(runtime.is_v2(environ=env))
             self.assertFalse(marker.exists())
 
-    def test_v2_default_variant_has_no_suffix(self):
-        self.assertEqual(runtime.model_reference("openai/gpt-6.1-sol", "runtime-default"),
-                         "openai/gpt-6.1-sol")
-        self.assertEqual(runtime.model_reference("opencode/model#old", "high"),
-                         "opencode/model#high")
+    def test_v1_flags_and_v2_provider_variant_are_separate(self):
+        v1 = runtime.run_argv(binary="opencode", cwd="/work", agent="build",
+                              model="opencode-go/model", variant="high", pure=True,
+                              version=(1, 19, 0))
+        self.assertIn("--pure", v1)
+        self.assertIn("--dir", v1)
+        self.assertIn("--variant", v1)
+        v2 = runtime.run_argv(binary="opencode", cwd="/work", agent="build",
+                              model="opencode-go/model", variant="high", session="ses_exact",
+                              title="hearting-worker-att-x", pure=True, version=(2, 0, 32))
+        self.assertNotIn("--pure", v2)
+        self.assertNotIn("--standalone", v2)
+        self.assertNotIn("--dir", v2)
+        self.assertNotIn("--variant", v2)
+        self.assertEqual(v2[v2.index("--model") + 1], "opencode-go/model#high")
+        self.assertEqual(v2[v2.index("--session") + 1], "ses_exact")
+        self.assertEqual(v2[v2.index("--title") + 1], "hearting-worker-att-x")
+        private_v2 = runtime.run_argv(binary="opencode", model="fixture/model",
+                                      standalone=True, version=(2, 0, 32))
+        self.assertIn("--standalone", private_v2)
+        self.assertEqual(private_v2[private_v2.index("--model") + 1], "fixture/model")
+        self.assertNotIn("--standalone", runtime.run_argv(
+            binary="opencode", model="fixture/model", standalone=True, version=(1, 19, 0)))
+
+    def test_database_generation_never_selects_cli_generation(self):
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "1.19.0"}), \
+             unittest.mock.patch.object(runtime, "credential_store_present", return_value=True):
+            self.assertFalse(runtime.is_v2())
+        with unittest.mock.patch.dict(os.environ, {}, clear=True), \
+             unittest.mock.patch.object(runtime, "runtime_version", return_value=None), \
+             unittest.mock.patch.object(runtime, "credential_store_present", return_value=True):
+            self.assertFalse(runtime.is_v2())
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "2.0.32"}):
+            self.assertTrue(runtime.is_v2())
+
 
 
 class OpenCodeFullPartsTest(unittest.TestCase):
