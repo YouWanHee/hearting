@@ -23,6 +23,46 @@ OBS = {"reachable": True, "gpus": [
     {"index": 1, "uuid": "GPU-one", "free_mib": 23000, "utilization_gpu_pct": 0, "processes": []}]}
 
 
+class ComputePayloadReceiptTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def payload_namespace(self):
+        namespace = {}
+        exec(compile(G.serialized_payload_source(), "serialized-payload", "exec"), namespace)
+        namespace["identity"] = lambda _pid: {
+            "pid": 123, "starttime": "456", "process_group": 123,
+            "pid_namespace": "pid:[fixture]", "boot_id": "boot-fixture", "state": "S"}
+        namespace["bind"] = lambda *_args: None
+        namespace["release"] = mock.Mock()
+        return namespace
+
+    def test_payload_keeps_running_and_records_receipt_even_when_receipt_io_fails(self):
+        namespace = self.payload_namespace()
+        namespace["write_receipt"] = mock.Mock(side_effect=OSError("receipt storage unavailable"))
+        with mock.patch.object(namespace["subprocess"], "call", return_value=0):
+            result = namespace["payload"]("/unused/state.json", None, "true",
+                                           str(self.root / "run" / "launch-receipt.json"), "run-1")
+        self.assertEqual(result, 0)
+        namespace["release"].assert_called_once_with("/unused/state.json", None)
+        self.assertEqual(namespace["write_receipt"].call_count, 2)
+
+    def test_payload_receipt_records_exact_wrapper_identity_and_terminal_exit(self):
+        namespace = self.payload_namespace()
+        receipt_path = self.root / "run" / "launch-receipt.json"
+        receipt_path.parent.mkdir()
+        with mock.patch.object(namespace["subprocess"], "call", return_value=0):
+            self.assertEqual(namespace["payload"]("/unused/state.json", None, "true",
+                                                   str(receipt_path), "run-2"), 0)
+        receipt = json.loads(receipt_path.read_text())
+        self.assertEqual(receipt["run_id"], "run-2")
+        self.assertEqual(receipt["identity"]["process_group"], 123)
+        self.assertEqual(receipt["identity"]["boot_id"], "boot-fixture")
+        self.assertEqual((receipt["state"], receipt["exit_code"]), ("finished", 0))
+
+
 class LeasesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -750,7 +790,9 @@ class PathNamespaceSerializationTest(unittest.TestCase):
                                                   "/target/runs/fixture-run")), events)
                     self.assertIn(("enter", ({"/target": "/lab"}, "/target/runs", "/work",
                                                "/target/runs/fixture-run")), events)
-                    self.assertIn(("payload", (str(state_path), lease, "echo inner")), events)
+                    self.assertIn(("payload", (str(state_path), lease, "echo inner",
+                                                 "/target/runs/fixture-run/launch-receipt.json",
+                                                 "fixture-run")), events)
                 else:
                     self.assertEqual(result.exception.code, 125)
                     self.assertEqual([event for event in events if event[0] == "payload"], [])

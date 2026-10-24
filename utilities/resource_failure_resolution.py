@@ -198,12 +198,40 @@ def retry_step(route, armed, jobs, reason):
     while f"{base}__a{ordinal}" in runs:
         ordinal += 1
     retry = f"{base}__a{ordinal}"
+    compute_hint = ""
+    try:
+        import route_parent_close
+        route_file = armed.get("route_file") or route.get("_route_file")
+        failed_row = runs.get(run_id) if isinstance(runs, dict) else {}
+        attempts = {value for value in (
+            armed.get("parent_attempt_id"),
+            (armed.get("owner_wait") or {}).get("parent_attempt_id"),
+            (failed_row.get("owner_wait") or {}).get("parent_attempt_id"),
+            failed_row.get("parent_attempt_id"),
+        ) if isinstance(value, str) and value}
+        if route_file and attempts:
+            candidates = route_parent_close.linked_resources(
+                route, Path(route_file), jobs, attempts)
+            ids = sorted({row["run_id"] for row in candidates
+                          if row.get("kind") == "compute" and row.get("state") == "finished"
+                          and isinstance(row.get("run_id"), str)})
+            if ids:
+                compute_hint = (
+                    "\nCompleted compute-hosts run candidates (unverified; choose explicitly): "
+                    + ", ".join(f"{run_id}: resource-runner start --compute-run {shlex.quote(run_id)}"
+                                 for run_id in ids)
+                    + "."
+                )
+    except Exception:
+        # An advisory discovery failure never hides the original recovery.
+        compute_hint = ""
     task = (f"Continue the approved task from {route['route_id']}. Resource {run_id} remains failed: {reason}. "
             f"Retain its registry, sentinel, outputs and all historical PASS/FAIL records unchanged. "
             f"Reuse its checked configuration and smoke inputs, run a distinct resource attempt {retry} "
             "in this new cycle's output directory, and revalidate every selected downstream stage against "
             "the new output bytes. Historical PASS markers do not complete this leg. Original task:\n"
-            + str((route.get("work_request") or {}).get("text") or route.get("slug", "")))
+            + str((route.get("work_request") or {}).get("text") or route.get("slug", ""))
+            + compute_hint)
     argv = ["hearting", "run", "capability-route", "compose", "--start", "--shape", "staged",
             "--capability", route["capability"], "--capability-mode", route["capability_mode"],
             "--intensity", route["effective_intensity"], "--graph", ",".join(nodes),

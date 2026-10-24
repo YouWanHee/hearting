@@ -288,6 +288,7 @@ def resume_recovered_resource_owner(route, ledger):
 
 def resource_evidence(armed):
     """Terminal evidence for a detached resource child, settled if it is gone."""
+    import dispatch_resource_wait as OWNER_RESOURCE
     registry = Path(armed["resource_registry"])
     run_id = armed["predecessor_id"]
     try:
@@ -297,12 +298,41 @@ def resource_evidence(armed):
         return {"terminal": False, "reason": f"resource-registry-unreadable:{exc}"}
     if not isinstance(row, dict):
         return {"terminal": False, "reason": "resource-run-absent"}
+    execution = row.get("execution")
+    if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+        if (row.get("resource_policy") != "supervised-owner"
+                or row.get("route") != armed.get("route_file")
+                or row.get("node") != armed.get("node")
+                or row.get("jobs") != armed.get("jobs")
+                or row.get("compute_run_id") != execution.get("run_id")
+                or row.get("sentinel") != str(Path(execution.get("run_root", ""))
+                                                / str(execution.get("run_id", "")) / "exit_code")
+                or row.get("log") != str(Path(execution.get("run_root", ""))
+                                           / str(execution.get("run_id", "")) / "log")
+                or (execution.get("provenance") or {}).get("route_id") != armed.get("route_id")
+                or (execution.get("provenance") or {}).get("route_hash") != armed.get("route_hash")
+                or row.get("status") not in ("succeeded", "failed")
+                or armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(row)):
+            return {"terminal": False, "reason": "compute-resource-binding-mismatch"}
+        observation = RR.compute_execution_observation(row)
+        identity = RR.compute_execution_identity(row)
+        if observation.get("state") != "quiescent" or not identity:
+            return {"terminal": False, "reason": observation.get("reason", "compute-run-observation-unavailable"),
+                    "liveness": observation.get("state"), "identity": identity}
+        return {"terminal": True, "succeeded": row.get("status") == "succeeded",
+                "identity": identity, "liveness": "exited", "quiescent": True,
+                "exit_code": row.get("exit_code"), "sentinel": row.get("sentinel"),
+                "sentinel_present": bool(row.get("sentinel")) and Path(str(row["sentinel"])).is_file(),
+                "ended_at": row.get("ended_at"), "failure_class": row.get("failure_class"),
+                "never_started": False, "reason": "compute-hosts-process-group-empty",
+                "log": row.get("log"), "parent_attempt_id": row.get("parent_attempt_id"),
+                "resource_sha256": RESOURCE_RESUME.row_digest(row),
+                "execution_observation": observation}
     resume = row.get("resource_policy") in {"verified-resume", "supervised-owner"}
     if resume and (row.get("route") != armed.get("route_file") or row.get("node") != armed.get("node")
                    or row.get("jobs") != armed.get("jobs")):
         return {"terminal": False, "reason": "resource-binding-mismatch"}
     if row.get("resource_policy") == "supervised-owner":
-        import dispatch_resource_wait as OWNER_RESOURCE
         if armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(row):
             return {"terminal": False, "reason": "resource-body-binding-mismatch"}
     if resume and row.get("status") == "launching":

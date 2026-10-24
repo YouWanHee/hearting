@@ -29,6 +29,8 @@ import route_authority as RA
 
 
 class ResourceSequenceTest(FIX.WorkflowFixture):
+    EMPTY_LAUNCH_REQUEST = {"smoke_attestation": None, "smoke_attestation_sha256": None,
+                            "config_manifest": None, "config_manifest_sha256": None}
     _resume_fixture = FIX.TestSupervisorAdvance._resume_fixture
     _settle_resource_owner = FIX.TestSupervisorAdvance._settle_resource_owner
 
@@ -100,7 +102,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                 if final else 'pass')
         return {**{key: old[key] for key in keep if key in old}, 'run_id': name,
                 'command': [sys.executable, '-c', code], 'log': str(log), 'sentinel': str(log) + '.exit',
-                'status': 'launching', 'workflow_state': 'READY', 'resource_policy': 'supervised-owner'}
+                'status': 'launching', 'workflow_state': 'READY', 'resource_policy': 'supervised-owner',
+                'launch_request': dict(self.EMPTY_LAUNCH_REQUEST)}
 
     def arm(self, path, registry, *, node='full-run', run_id='fixture-run', extra=()):
         argv = ['arm', '--route', str(path), '--node', node, '--predecessor-kind', 'resource',
@@ -519,7 +522,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                     target = self.base / 'next-registry.json'
                     target.write_text(json.dumps({'runs': {}}))
                 if queued:
-                    body.update(launch_state='queued', status='launching', launch_request={})
+                    body.update(launch_state='queued', status='launching',
+                                launch_request=dict(self.EMPTY_LAUNCH_REQUEST))
                     self.assertTrue(WAIT.controller_intent(body))
                     target.write_text(json.dumps({'runs': {'next': body}}))
                     self.arm(path, target, run_id='next', extra=('--jobs', str(jobs), '--artifact-base', str(output)))
@@ -549,7 +553,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                     target = self.base / 'retry-registry.json'
                     target.write_text(json.dumps({'runs': {}}))
                 if queued:
-                    body.update(launch_state='queued', status='launching', launch_request={})
+                    body.update(launch_state='queued', status='launching',
+                                launch_request=dict(self.EMPTY_LAUNCH_REQUEST))
                     target.write_text(json.dumps({'runs': {'retry': body}}))
                     self.arm(path, target, run_id='retry', extra=('--jobs', str(jobs), '--artifact-base', str(output)))
                 else:
@@ -604,6 +609,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                     controller = None
                     if controller_mode:
                         body['launch_state'] = 'queued'
+                        body['launch_request'] = dict(self.EMPTY_LAUNCH_REQUEST)
                         data = json.loads(registry.read_text())
                         data['runs']['next'] = body
                         registry.write_text(json.dumps(data))

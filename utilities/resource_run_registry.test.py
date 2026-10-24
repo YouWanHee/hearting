@@ -14,6 +14,33 @@ import resource_run_registry as registry
 
 
 class ResourceRegistryTest(unittest.TestCase):
+    def test_compute_execution_never_falls_through_to_local_pid_or_missing_group(self):
+        row = {"execution": {"kind": "compute-hosts", "run_id": "compute-1"},
+               "pid": None, "starttime": None, "command_hash": None,
+               "resource_policy": "supervised-owner"}
+        identity_reader = mock.Mock(side_effect=AssertionError("local PID probe"))
+        self.assertEqual(registry.classify_identity(row, identity_reader),
+                         ("stale", None, "compute-hosts-observation-required"))
+        identity_reader.assert_not_called()
+        with mock.patch.object(registry, "compute_execution_observation",
+                               return_value={"state": "populated"}):
+            self.assertFalse(registry.resource_process_group_quiescent(row))
+        with mock.patch.object(registry, "compute_execution_observation",
+                               return_value={"state": "quiescent"}):
+            self.assertTrue(registry.resource_process_group_quiescent(row))
+
+    def test_compute_run_projection_does_not_probe_a_local_pid(self):
+        execution = {"kind": "compute-hosts", "run_id": "compute-1",
+                     "host": "gpu-a", "receipt_state": "finished"}
+        with mock.patch.object(registry, "proc_identity",
+                               side_effect=AssertionError("local PID probe")):
+            row = registry.normalize_run("resource-1", {"execution": execution},
+                                         Path("/fixture/registry.json"))
+        self.assertEqual(row["compute_run_id"], "compute-1")
+        self.assertEqual(row["compute_host"], "gpu-a")
+        self.assertEqual(row["liveness"], "exited")
+        self.assertIsNone(row["pid"])
+
     def test_never_started_without_identity_is_exited_but_partial_identity_stays_stale(self):
         row = {
             "resource_policy": "supervised-owner", "status": "failed",

@@ -12642,15 +12642,20 @@ def main():
                         if attempt_id and not jobs:
                             jobs=inherited_jobs
                 if a.check:
+                    if node.get("kind") != "review-worker":
+                        # Owner closure answers only a blocking review. This
+                        # read-only question has no answer for a resource node.
+                        result = {"result": "not-applicable", "read_only": True,
+                                  "route_id": route["route_id"], "node_id": a.node,
+                                  "reason": "owner-closure-review-nodes-only"}
+                        if node.get("kind") == "resource-runner":
+                            result["next_action"] = (
+                                "use the resource node's existing start path; a completed compute-hosts "
+                                "candidate may be supplied with --compute-run <run-id>")
+                        print(json.dumps(result, sort_keys=True))
+                        return
                     if not jobs or not attempt_id or a.output or review_claim or explicit_attempt_metadata or a.subsession_manifest:
                         raise ValueError("owner-closure-check-requires-exact-jobs-attempt-and-no-overrides")
-                    if node.get("kind") != "review-worker":
-                        # Owner closure only answers a blocking review; this read-only question has no
-                        # answer elsewhere. Say so instead of refusing with an unrelated reason.
-                        print(json.dumps({"result": "not-applicable", "read_only": True, "route_id": route["route_id"],
-                                          "node_id": a.node, "reason": "owner-closure-review-nodes-only"},
-                                         sort_keys=True))
-                        return
                     proof = owner_closure_plan(route, node, evidence, jobs, attempt_id)
                     print(json.dumps({"result": "ready", "read_only": True, "route_id": route["route_id"],
                                       "node_id": a.node, "owner_closure_proof": proof}, sort_keys=True))

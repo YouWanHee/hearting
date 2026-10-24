@@ -436,6 +436,91 @@ class RunGPUObservationTest(unittest.TestCase):
         self.assertIsNone(json.loads(text)["gpu_observation"]["suggested_gpu"])
 
 
+class ComputeRunQuiescenceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.module = load_module()
+        self.run_id = "fixture-compute-run"
+        self.run_dir = self.root / self.run_id
+        self.run_dir.mkdir()
+        self.identity = {"pid": 12, "starttime": "44", "process_group": 12,
+                         "pid_namespace": "pid:[77]", "boot_id": "boot-fixture"}
+        output = self.root / "science.json"
+        output.write_text('{"result":1}\n')
+        output_row = {"path": "science.json", "sha256": self.module.hashlib.sha256(
+            output.read_bytes()).hexdigest(), "size": output.stat().st_size, "state": "present"}
+        parent_contract = {"artifact_base": str(self.root), "declared_outputs": ["science.json"]}
+        contract = {"resource_parent": parent_contract}
+        contract_sha = self.module.hashlib.sha256(json.dumps(
+            contract, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+        meta = {"run_id": self.run_id, "host": "fixture",
+                "provenance": {"resource": {"contract": parent_contract}},
+                "execution_contract": contract, "contract_sha256": contract_sha}
+        (self.run_dir / "meta.json").write_text(json.dumps(meta))
+        (self.run_dir / "exit_code").write_text("0\n")
+        (self.run_dir / "launch-receipt.json").write_text(json.dumps({
+            "schema_version": 1, "run_id": self.run_id, "host": "fixture", "identity": self.identity,
+            "state": "finished", "exit_code": 0,
+        }))
+        (self.run_dir / "outputs.json").write_text(json.dumps({
+            "schema_version": 1, "run_id": self.run_id, "outputs": [output_row]}))
+        self.config = {"run_root": self.root, "hosts": {"fixture": {"ssh_host": "host"}}}
+        self.expected = {
+            "meta_sha256": self.module.hashlib.sha256((self.run_dir / "meta.json").read_bytes()).hexdigest(),
+            "exit_sha256": self.module.hashlib.sha256((self.run_dir / "exit_code").read_bytes()).hexdigest(),
+            "receipt_sha256": self.module.hashlib.sha256((self.run_dir / "launch-receipt.json").read_bytes()).hexdigest(),
+            "outputs_sha256": self.module.hashlib.sha256((self.run_dir / "outputs.json").read_bytes()).hexdigest(),
+            "contract": contract, "provenance": {"contract": parent_contract},
+        }
+
+    def observe(self, payload):
+        return self.module.observe_run_quiescence(
+            self.config, self.run_id, expected=self.expected,
+            remote_call=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                [], 0, json.dumps(payload), ""))
+
+    def test_resource_parent_lineage_requires_exact_route_registry_owner_and_node(self):
+        jobs = self.root / "jobs.log"
+        jobs.write_text("")
+        route_file = self.root / "route.json"
+        route_file.write_text(json.dumps({"route_id": "rt-parent", "route_hash": "sha256:parent",
+            "nodes": [{"id": "full-run", "kind": "resource-runner",
+                       "continuation": {"kind": "supervised"}, "outputs": ["science.json"]}]}))
+        registry = self.root / "resource-runs.json"
+        owner = {"parent_attempt_id": "att-owner", "jobs": str(jobs),
+                 "route_id": "rt-parent", "route_hash": "sha256:parent"}
+        row = {"run_id": "parent-run", "resource_policy": "supervised-owner",
+               "route": str(route_file), "node": "full-run", "jobs": str(jobs),
+               "parent_attempt_id": "att-owner", "owner_wait": owner,
+               "status": "running", "command": ["compute-hosts", "run"]}
+        registry.write_text(json.dumps({"runs": {"parent-run": row}}))
+        values = {"HEARTING_RESOURCE_RUN_ID": "parent-run",
+                  "HEARTING_RESOURCE_REGISTRY": str(registry)}
+        route = {"route_id": "rt-parent", "route_file": str(route_file)}
+        parent = self.module._resource_parent(values, route)
+        self.assertEqual(parent["contract"]["route_hash"], "sha256:parent")
+        owner["parent_attempt_id"] = "att-foreign"
+        row["owner_wait"] = owner
+        registry.write_text(json.dumps({"runs": {"parent-run": row}}))
+        self.assertIsNone(self.module._resource_parent(values, route))
+
+    def test_quiescence_requires_matching_fresh_remote_empty_group(self):
+        result = self.observe({"state": "empty", "reason": "observed-empty"})
+        self.assertEqual(result["state"], "quiescent")
+        self.assertEqual(result["identity"], self.identity)
+
+    def test_live_or_unknown_remote_group_never_proves_quiescence(self):
+        self.assertEqual(self.observe({"state": "populated"})["state"], "not-quiescent")
+        self.assertEqual(self.observe({"state": "unknown"})["state"], "unknown")
+
+    def test_changed_exit_bytes_invalidate_the_observation(self):
+        (self.run_dir / "exit_code").write_text("1\n")
+        result = self.observe({"state": "empty"})
+        self.assertEqual(result["reason"], "compute-run-evidence-changed")
+
+
 class ComputeHostsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

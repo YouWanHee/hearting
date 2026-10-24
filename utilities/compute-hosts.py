@@ -28,6 +28,7 @@ import argparse
 import concurrent.futures
 import datetime
 import fcntl
+import hashlib
 import importlib.util
 import ipaddress
 import json
@@ -37,6 +38,8 @@ import shlex
 import socket
 import subprocess
 import sys
+import stat
+import tempfile
 import time
 from pathlib import Path
 
@@ -672,12 +675,154 @@ def _launcher_route(values=None):
     if not route_file:
         return None
     try:
-        route_id = json.loads(Path(route_file).read_text(encoding="utf-8")).get("route_id")
+        route_document = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        route_id = route_document.get("route_id")
     except (OSError, ValueError, AttributeError):
         return None
     if not isinstance(route_id, str) or not route_id:
         return None
     return {"route_id": route_id, "route_file": str(route_file), "source": source}
+
+
+def _resource_parent(values=None, route=None):
+    """Return the exact supervised-resource parent for compute-run lineage."""
+    values = os.environ if values is None else values
+    run_id = values.get("HEARTING_RESOURCE_RUN_ID")
+    registry = values.get("HEARTING_RESOURCE_REGISTRY")
+    if not run_id and not registry:
+        return None
+    if not run_id or not registry or not isinstance(route, dict):
+        return None
+    try:
+        registry_input = Path(registry).expanduser()
+        if registry_input.is_symlink():
+            return None
+        registry_path = registry_input.resolve(strict=True)
+        if registry_path.is_symlink() or not registry_path.is_file():
+            return None
+        document = json.loads(registry_path.read_text(encoding="utf-8"))
+        row = document["runs"][run_id]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(row, dict):
+        return None
+    owner = row.get("owner_wait") or {}
+    route_file = route.get("route_file")
+    try:
+        if Path(route_file).is_symlink():
+            return None
+        resolved_route = str(Path(route_file).resolve(strict=True))
+        route_document = json.loads(Path(resolved_route).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, AttributeError):
+        return None
+    route_hash = route_document.get("route_hash")
+    route_node = next((item for item in route_document.get("nodes", [])
+                       if isinstance(item, dict) and item.get("id") == row.get("node")), None)
+    try:
+        jobs = str(Path(row.get("jobs", "")).resolve(strict=True))
+    except (OSError, TypeError, ValueError):
+        return None
+    if (row.get("run_id") != run_id or row.get("resource_policy") != "supervised-owner"
+            or row.get("route") != resolved_route
+            or not isinstance(route_node, dict) or route_node.get("kind") != "resource-runner"
+            or (route_node.get("continuation") or {}).get("kind") != "supervised"
+            or owner.get("route_id") != route.get("route_id")
+            or owner.get("route_hash") != route_hash
+            or owner.get("jobs") != jobs
+            or owner.get("parent_attempt_id") != row.get("parent_attempt_id")
+            or not isinstance(owner.get("route_hash"), str)
+            or row.get("status") not in {"running", "launching"}):
+        return None
+    sealed = {key: row.get(key) for key in (
+        "command", "cwd", "config_ref", "config_sha256", "source_commit", "source_dirty",
+        "source_git_state", "config_layout", "launch_request")}
+    parent_contract = {"route_id": route["route_id"], "route_file": resolved_route,
+                       "route_hash": route_hash, "node": row.get("node"),
+                       "run_id": run_id, "attempt_id": row.get("parent_attempt_id"),
+                       "sealed": sealed}
+    sealed_inputs = []
+    launch_request = row.get("launch_request") or {}
+    for name in ("smoke_attestation", "config_manifest"):
+        input_path = launch_request.get(name)
+        expected_sha = launch_request.get(name + "_sha256")
+        if input_path is None and expected_sha is None:
+            continue
+        item = {"name": name, "path": input_path, "sha256": expected_sha, "verified": False}
+        try:
+            path = Path(input_path)
+            info = path.lstat()
+            raw = path.read_bytes()
+            item["verified"] = (stat.S_ISREG(info.st_mode) and not path.is_symlink()
+                                 and hashlib.sha256(raw).hexdigest() == expected_sha)
+        except (OSError, TypeError, ValueError):
+            pass
+        sealed_inputs.append(item)
+    parent_contract["inputs"] = sealed_inputs
+    route_outputs = next((item.get("outputs") for item in route_document.get("nodes", [])
+                          if isinstance(item, dict) and item.get("id") == row.get("node")), [])
+    artifact_base = values.get("AGENT_ARTIFACT_OUTPUT_DIR")
+    if isinstance(route_outputs, list) and artifact_base:
+        try:
+            artifact_base = str(Path(artifact_base).resolve(strict=True))
+            safe_outputs = [item for item in route_outputs if isinstance(item, str) and item
+                            and not Path(item).is_absolute()
+                            and ".." not in Path(item).parts]
+            if len(safe_outputs) == len(route_outputs):
+                parent_contract["artifact_base"] = artifact_base
+                parent_contract["declared_outputs"] = safe_outputs
+        except (OSError, TypeError, ValueError):
+            pass
+    return {"run_id": run_id, "registry": str(registry_path),
+            "route_id": route["route_id"], "route_file": resolved_route,
+            "route_hash": owner["route_hash"], "node": row.get("node"),
+            "parent_attempt_id": row.get("parent_attempt_id"),
+            "contract": parent_contract}
+
+
+def _record_compute_outputs(run_dir, meta):
+    """Snapshot exact route-owned output bytes after the compute exit is observed."""
+    parent = (((meta.get("provenance") or {}).get("resource") or {}).get("contract") or {})
+    base_text = parent.get("artifact_base")
+    outputs = parent.get("declared_outputs")
+    rows = []
+    if not isinstance(base_text, str) or not isinstance(outputs, list) or not outputs:
+        rows.append({"state": "unavailable", "reason": "sealed-output-contract-missing"})
+    else:
+        base = Path(base_text)
+        for relative in outputs:
+            try:
+                path = base / relative
+                resolved = path.resolve(strict=True)
+                if not resolved.is_relative_to(base.resolve(strict=True)):
+                    raise ValueError("output outside sealed artifact base")
+                cursor = base
+                for part in Path(relative).parts:
+                    cursor = cursor / part
+                    if cursor.is_symlink():
+                        raise ValueError("output symlink")
+                info = resolved.stat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("output is not a regular file")
+                raw = resolved.read_bytes()
+                rows.append({"path": relative, "sha256": hashlib.sha256(raw).hexdigest(),
+                             "size": len(raw), "state": "present"})
+            except (OSError, TypeError, ValueError) as exc:
+                rows.append({"path": relative, "state": "missing", "reason": type(exc).__name__})
+    document = {"schema_version": 1, "run_id": meta.get("run_id"), "outputs": rows,
+                "observed_at": time.time()}
+    target = Path(run_dir) / "outputs.json"
+    fd, temporary = tempfile.mkstemp(prefix=".outputs.", dir=str(Path(run_dir)))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(document, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+    return document
 
 
 def _socket_inodes(pid, proc_root=Path("/proc")):
@@ -2002,6 +2147,9 @@ def cmd_run(args):
     run_provenance = {"agent_home": provenance.get("AGENT_HOME"),
                       "attempt_id": provenance.get("AGENT_DISPATCH_ATTEMPT_ID"),
                       "session": session, "route": _launcher_route()}
+    resource_parent = _resource_parent(route=run_provenance["route"])
+    if resource_parent:
+        run_provenance["resource"] = resource_parent
     if str(os.environ.get("AGENT_DISPATCH_DEPTH") or "0") != "0":
         run_provenance["notify"] = session
     # Provenance rides the same preamble as the compute identity, so it
@@ -2026,6 +2174,17 @@ def cmd_run(args):
             raise ConfigError(f"host {name} declares no conda root for --env")
         setup.append(f". {shlex.quote(conda)}/etc/profile.d/conda.sh")
         setup.append(f"conda activate {shlex.quote(env)}")
+    execution_contract = None
+    if resource_parent:
+        execution_contract = {
+            "schema_version": 1,
+            "route": {key: resource_parent[key] for key in ("route_id", "route_file", "route_hash")},
+            "resource_parent": resource_parent["contract"],
+            "command": command, "cwd": workdir, "env": env, "share": bool(share),
+        }
+        resource_parent["contract_sha256"] = hashlib.sha256(
+            json.dumps(execution_contract, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")).encode("utf-8")).hexdigest()
     setup.append("__HEARTING_GPU_SETUP__")
     preamble = " && ".join(setup)
     body = f"{preamble} && {rendered}" if preamble else rendered
@@ -2054,6 +2213,10 @@ def cmd_run(args):
     }
     tmux_environment.update({key: provenance.get(key, "")
                              for key in PROVENANCE_CLEAR_KEYS})
+    tmux_environment.update({
+        "HEARTING_RESOURCE_RUN_ID": resource_parent["run_id"] if resource_parent else "",
+        "HEARTING_RESOURCE_REGISTRY": resource_parent["registry"] if resource_parent else "",
+    })
     tmux_environment.update({
         "HEARTING_COMPUTE_RUN_ID": run_id,
         "HEARTING_COMPUTE_HOST": name,
@@ -2100,10 +2263,14 @@ def cmd_run(args):
     meta = {"run_id": run_id, "host": name, "command": command,
             "cwd": workdir, "env": env, "gpus": admission["gpus"],
             "gpu_lease": admission.get("gpu_lease"), "share": share,
+            "launch_receipt": admission.get("receipt"),
             "tmux_transport": admission.get("tmux_transport"),
             "gpu_observation": gpu_observation,
             "provenance": run_provenance,
             "started_at": datetime.datetime.now().isoformat(timespec="seconds")}
+    if execution_contract is not None:
+        meta["execution_contract"] = execution_contract
+        meta["contract_sha256"] = resource_parent["contract_sha256"]
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "meta.json").write_text(
@@ -2139,14 +2306,15 @@ def _spawn_completion_watch(run_dir, meta, *, environ=None, spawn=subprocess.Pop
     """
     env = os.environ if environ is None else environ
     provenance = meta.get("provenance") or {}
+    records_outputs = (provenance.get("resource") is not None)
     session = provenance.get("session")
     if str(env.get("AGENT_DISPATCH_DEPTH") or "0") != "0":
         session = provenance.get("notify")
-        if not session:
+        if not session and not records_outputs:
             return False
-    if (not isinstance(session, dict)
+    if (not records_outputs and (not isinstance(session, dict)
             or session.get("harness") not in {"claude", "codex", "opencode"}
-            or not isinstance(session.get("id"), str) or not session.get("id")):
+            or not isinstance(session.get("id"), str) or not session.get("id"))):
         return False
     if str(env.get("AGENT_DISPATCH_DEPTH") or "0") != "0":
         try:
@@ -2185,12 +2353,15 @@ def cmd_watch_run(args, *, sleep=time.sleep, now=time.time):
         code = exit_path.read_text(encoding="utf-8").strip()
     except (OSError, ValueError):
         return 0
+    if ((meta.get("provenance") or {}).get("resource") is not None):
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            _record_compute_outputs(run_dir, meta)
     provenance = meta.get("provenance") or {}
     route = provenance.get("route") or {}
     session = provenance.get("notify") or provenance.get("session") or {}
+    run_id = meta.get("run_id") or run_dir.name
     if not session.get("harness") or not session.get("id"):
         return 0
-    run_id = meta.get("run_id") or run_dir.name
     stop = _read_stop_reason(run_dir)
     text = (f"run {run_id} on {meta.get('host', '-')} ended with exit {code}"
             + (f" ({stop})" if stop else "")
@@ -2227,9 +2398,239 @@ def _run_state(config, run_id):
         except (OSError, ValueError):
             exit_code = None
     stop_reason = _read_stop_reason(run_dir)
+    receipt = None
+    receipt_path = run_dir / "launch-receipt.json"
+    if receipt_path.is_file():
+        try:
+            candidate = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if (isinstance(candidate, dict) and candidate.get("schema_version") == 1
+                    and candidate.get("run_id") == run_id
+                    and isinstance(candidate.get("identity"), dict)):
+                receipt = candidate
+        except (OSError, ValueError):
+            pass
     return {"run_id": run_id, "dir": run_dir, "meta": meta,
             "exit_code": exit_code, "stop_reason": stop_reason,
+            "launch_receipt": receipt,
             "state": "finished" if exit_code is not None else "running"}
+
+
+def observe_run_quiescence(config, run_id, expected=None, *, remote_call=None):
+    """Freshly validate a compute run's immutable files and remote process group."""
+    if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
+        return {"state": "unknown", "reason": "compute-run-id-invalid"}
+    run_dir = Path(config["run_root"]) / run_id
+    try:
+        paths = {name: run_dir / name for name in
+                 ("meta.json", "exit_code", "launch-receipt.json", "outputs.json")}
+        for path in paths.values():
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+                return {"state": "unknown", "reason": "compute-run-file-unsafe"}
+        raw = {name: path.read_bytes() for name, path in paths.items()}
+        meta = json.loads(raw["meta.json"])
+        receipt = json.loads(raw["launch-receipt.json"])
+        output_receipt = json.loads(raw["outputs.json"])
+        exit_text = raw["exit_code"].decode("ascii").strip()
+        exit_code = int(exit_text)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return {"state": "unknown", "reason": "compute-run-evidence-unavailable"}
+    hashes = {"meta_sha256": hashlib.sha256(raw["meta.json"]).hexdigest(),
+              "exit_sha256": hashlib.sha256(raw["exit_code"]).hexdigest(),
+              "receipt_sha256": hashlib.sha256(raw["launch-receipt.json"]).hexdigest(),
+              "outputs_sha256": hashlib.sha256(raw["outputs.json"]).hexdigest()}
+    if expected and any(expected.get(key) != value for key, value in hashes.items()):
+        return {"state": "unknown", "reason": "compute-run-evidence-changed", **hashes}
+    if not isinstance(meta, dict) or not isinstance(receipt, dict):
+        return {"state": "unknown", "reason": "compute-run-evidence-malformed", **hashes}
+    identity = receipt.get("identity")
+    contract = meta.get("execution_contract")
+    resource_parent = (meta.get("provenance") or {}).get("resource")
+    parent_contract = resource_parent.get("contract") if isinstance(resource_parent, dict) else None
+    if (meta.get("run_id") != run_id or not isinstance(receipt.get("host"), str)
+            or not receipt.get("host")
+            or not isinstance(contract, dict)
+            or contract != (expected or {}).get("contract")
+            or meta.get("contract_sha256") != hashlib.sha256(json.dumps(
+                contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+            or not isinstance(parent_contract, dict)
+            or contract.get("resource_parent") != parent_contract
+            or resource_parent != (expected or {}).get("provenance")
+            or receipt.get("schema_version") != 1
+            or receipt.get("run_id") != run_id or receipt.get("state") != "finished"
+            or receipt.get("exit_code") != exit_code or exit_code != 0
+            or not isinstance(identity, dict)
+            or not all(identity.get(key) not in (None, "") for key in
+                       ("pid", "starttime", "process_group", "pid_namespace", "boot_id"))):
+        return {"state": "not-quiescent", "reason": "compute-run-terminal-evidence-incomplete", **hashes}
+    if _read_stop_reason(run_dir):
+        return {"state": "not-quiescent", "reason": "compute-run-stopped", **hashes}
+    parent_contract = ((meta.get("execution_contract") or {}).get("resource_parent") or {})
+    expected_outputs = parent_contract.get("declared_outputs")
+    output_rows = output_receipt.get("outputs") if isinstance(output_receipt, dict) else None
+    if (not isinstance(output_receipt, dict) or output_receipt.get("schema_version") != 1
+            or output_receipt.get("run_id") != run_id
+            or not isinstance(expected_outputs, list)
+            or [item.get("path") for item in output_rows or [] if isinstance(item, dict)] != expected_outputs
+            or any(not isinstance(item, dict) or item.get("state") != "present"
+                   or not isinstance(item.get("sha256"), str) for item in output_rows or [])):
+        return {"state": "not-quiescent", "reason": "compute-run-output-missing-or-unsealed", **hashes}
+    try:
+        artifact_base = Path(parent_contract["artifact_base"]).resolve(strict=True)
+        for item in output_rows:
+            path = artifact_base / item["path"]
+            resolved = path.resolve(strict=True)
+            if (not resolved.is_relative_to(artifact_base)
+                    or any((artifact_base.joinpath(*Path(item["path"]).parts[:index])).is_symlink()
+                           for index in range(1, len(Path(item["path"]).parts) + 1))):
+                return {"state": "not-quiescent", "reason": "compute-run-output-unsafe", **hashes}
+            output_raw = resolved.read_bytes()
+            if (hashlib.sha256(output_raw).hexdigest() != item["sha256"]
+                    or len(output_raw) != item.get("size")):
+                return {"state": "not-quiescent", "reason": "compute-run-output-changed", **hashes}
+    except (OSError, KeyError, TypeError, ValueError):
+        return {"state": "not-quiescent", "reason": "compute-run-output-unavailable", **hashes}
+    host = next((record for name, record in config["hosts"].items()
+                 if name == meta.get("host")), None)
+    if not isinstance(host, dict):
+        return {"state": "unknown", "reason": "compute-run-host-unconfigured", **hashes}
+    remote_identity = {**identity, "host": receipt["host"]}
+    probe = r'''import json, os, socket, sys
+expected=json.loads(sys.argv[1])
+def result(state, reason): print(json.dumps({"state":state,"reason":reason})); raise SystemExit(0)
+try:
+    host=socket.gethostname().lower().split(".")[0]
+    if host != expected["host"]:
+        result("unknown","compute-run-hostname-changed")
+    boot=open("/proc/sys/kernel/random/boot_id").read().strip()
+    namespace=os.readlink("/proc/self/ns/pid")
+    if boot != str(expected["boot_id"]) or namespace != expected["pid_namespace"]:
+        result("unknown","compute-run-host-generation-changed")
+    pid=int(expected["pid"]); group=int(expected["process_group"])
+    proc="/proc/%d" % pid
+    if os.path.exists(proc):
+        raw=open(proc+"/stat").read(); fields=raw.rsplit(") ",1)[1].split()
+        if fields[19] != str(expected["starttime"]) or int(fields[2]) != group:
+            result("unknown","compute-run-leader-identity-changed")
+    members=[]
+    for name in os.listdir("/proc"):
+        if not name.isdigit(): continue
+        try:
+            raw=open("/proc/"+name+"/stat").read(); fields=raw.rsplit(") ",1)[1].split()
+            if int(fields[2]) == group and fields[0] not in ("Z","X"):
+                members.append(name)
+        except FileNotFoundError: pass
+        except PermissionError: result("unknown","compute-run-procfs-inaccessible")
+    result("populated" if members else "empty","compute-run-process-group-populated" if members else "compute-run-process-group-empty")
+except (OSError, ValueError, IndexError, KeyError, TypeError):
+    result("unknown","compute-run-observation-unavailable")
+'''
+    call = remote if remote_call is None else remote_call
+    try:
+        result = call(host, "python3 -c " + shlex.quote(probe) + " "
+                      + shlex.quote(json.dumps(remote_identity, sort_keys=True)), timeout=PROBE_TIMEOUT)
+        observation = json.loads(result.stdout.strip().splitlines()[-1]) if result.returncode == 0 else {}
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        observation = {}
+    if observation.get("state") != "empty":
+        return {"state": "not-quiescent" if observation.get("state") == "populated" else "unknown",
+                "reason": observation.get("reason") or "compute-run-observation-unavailable", **hashes}
+    return {"state": "quiescent", "reason": observation["reason"],
+            "identity": identity, "exit_code": exit_code, **hashes}
+
+
+def execution_record(config, run_id):
+    """Build adoption evidence only from a complete, freshly quiescent run."""
+    state = _run_state(config, run_id)
+    meta = state.get("meta") or {}
+    receipt = state.get("launch_receipt")
+    provenance = meta.get("provenance") or {}
+    parent = provenance.get("resource")
+    contract = meta.get("execution_contract")
+    if (not isinstance(parent, dict) or not isinstance(contract, dict)
+            or not isinstance(meta.get("contract_sha256"), str)
+            or parent.get("run_id") != parent.get("contract", {}).get("run_id")
+            or contract.get("resource_parent") != parent.get("contract")
+            or contract.get("route", {}).get("route_id") != parent.get("route_id")
+            or contract.get("route", {}).get("route_hash") != parent.get("route_hash")):
+        return {"state": "unavailable", "reason": "compute-run-contract-unavailable"}
+    canonical_contract = json.dumps(contract, ensure_ascii=False, sort_keys=True,
+                                    separators=(",", ":")).encode("utf-8")
+    contract_sha = hashlib.sha256(canonical_contract).hexdigest()
+    if contract_sha != meta.get("contract_sha256") or state.get("stop_reason"):
+        return {"state": "unavailable", "reason": "compute-run-contract-or-stop-mismatch"}
+    run_dir = Path(config["run_root"]) / run_id
+    try:
+        meta_raw = (run_dir / "meta.json").read_bytes()
+        exit_raw = (run_dir / "exit_code").read_bytes()
+        receipt_raw = (run_dir / "launch-receipt.json").read_bytes()
+        outputs_raw = (run_dir / "outputs.json").read_bytes()
+        receipt = json.loads(receipt_raw)
+        output_receipt = json.loads(outputs_raw)
+        exit_code = int(exit_raw.decode("ascii").strip())
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return {"state": "unavailable", "reason": "compute-run-files-unavailable"}
+    if (exit_code != 0 or state.get("exit_code") != 0 or not isinstance(receipt, dict)
+            or receipt.get("state") != "finished" or receipt.get("exit_code") != 0):
+        return {"state": "unavailable", "reason": "compute-run-exit-not-zero"}
+    execution = {
+        "kind": "compute-hosts", "run_id": run_id,
+        "run_root": str(Path(config["run_root"]).resolve(strict=True)),
+        "host": meta.get("host"), "remote_host": receipt.get("host"),
+        "meta_sha256": hashlib.sha256(meta_raw).hexdigest(),
+        "exit_sha256": hashlib.sha256(exit_raw).hexdigest(),
+        "receipt_sha256": hashlib.sha256(receipt_raw).hexdigest(),
+        "outputs_sha256": hashlib.sha256(outputs_raw).hexdigest(),
+        "outputs": output_receipt.get("outputs") if isinstance(output_receipt, dict) else None,
+        "contract_sha256": contract_sha, "contract": contract,
+        "receipt_state": receipt.get("state"), "identity": receipt.get("identity"),
+        "provenance": parent, "started_at": receipt.get("started_at"),
+        "ended_at": receipt.get("ended_at"),
+    }
+    observation = observe_run_quiescence(config, run_id, expected=execution)
+    if observation.get("state") != "quiescent":
+        return {"state": observation.get("state", "unknown"),
+                "reason": observation.get("reason", "compute-run-not-quiescent"),
+                "execution": execution}
+    return {"state": "quiescent", "execution": execution,
+            "observation": observation, "run_dir": str(run_dir)}
+
+
+def run_snapshot_current(config, run_id, execution):
+    """Cheap local byte recheck for the short registry/ledger publication lock."""
+    run_dir = Path(config["run_root"]) / run_id
+    names = {"meta_sha256": "meta.json", "exit_sha256": "exit_code",
+             "receipt_sha256": "launch-receipt.json", "outputs_sha256": "outputs.json"}
+    try:
+        for field, name in names.items():
+            path = run_dir / name
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+                return False
+            if hashlib.sha256(path.read_bytes()).hexdigest() != execution.get(field):
+                return False
+        outputs = execution.get("outputs")
+        contract = execution.get("contract") or {}
+        parent = contract.get("resource_parent") or {}
+        base = Path(parent["artifact_base"]).resolve(strict=True)
+        if (not isinstance(outputs, list)
+                or [item.get("path") for item in outputs if isinstance(item, dict)]
+                   != parent.get("declared_outputs")):
+            return False
+        for item in outputs:
+            path = base / item["path"]
+            resolved = path.resolve(strict=True)
+            parts = Path(item["path"]).parts
+            has_link = any(base.joinpath(*parts[:index]).is_symlink()
+                           for index in range(1, len(parts) + 1))
+            if (item.get("state") != "present" or not resolved.is_relative_to(base)
+                    or has_link
+                    or hashlib.sha256(resolved.read_bytes()).hexdigest() != item.get("sha256")):
+                return False
+        return _read_stop_reason(run_dir) is None
+    except (OSError, KeyError, TypeError, ValueError):
+        return False
 
 
 def _stop_reason_path(run_dir):
