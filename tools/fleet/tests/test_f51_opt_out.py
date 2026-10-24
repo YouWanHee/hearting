@@ -136,7 +136,7 @@ class F51OptOutTest(unittest.TestCase):
             # B status band. The normal renderer still reports the disabled API above.
             explorer = self._run(["--once", "--no-usage-api", "--explorer"])
             self.assertEqual(explorer.count("no usage api"), 0)
-            self.assertIn("EXPLORER", explorer)
+            self.assertIn("VIEWS", explorer)
 
             json_out = self._run(["--json", "--no-usage-api"])
         data = json.loads(json_out)

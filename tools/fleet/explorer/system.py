@@ -7,7 +7,7 @@ the snapshot does not carry is shown as ``?`` — never as 0 and never as a succ
 
 from collections.abc import Mapping
 
-from .output import clip
+from .grid import clip_cells as clip
 
 HARNESS_ABBR = {"claude": "CL", "codex": "CX", "opencode": "OC"}
 LIVENESS_GLYPH = {"working": "⠇", "idle": "·", "unknown": "?", "blocked": "◑"}

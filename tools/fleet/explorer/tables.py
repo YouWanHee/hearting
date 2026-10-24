@@ -1,5 +1,4 @@
 """Overview and list-view tables for the immutable explorer projection."""
-from collections.abc import Mapping
 from .grid import CellGrid
 
 X = 34
@@ -134,7 +133,9 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
                 percent_key = gauge_key if int(context) >= 50 else "dim"
                 grid.put(x + c["ctx"] + 9, y, f"{int(context):3d}%", percent_key)
             elif context is not None:
-                grid.put(x + c["ctx"], y, f"{int(context):3d}%", "dim")
+                narrow_key = ("g_blocked" if int(context) >= 80 else
+                              "g_idle" if int(context) >= 50 else "dim")
+                grid.put(x + c["ctx"], y, f"{int(context):3d}%", narrow_key)
             grid.put(x + use - len(str(session.get("age") or "")), y,
                      str(session.get("age") or ""), "dim")
             if c["now"] is not None:
@@ -179,35 +180,26 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
     meta = f"  {open_routes} open" + (f" · {stopped} stopped leg{'s' if stopped != 1 else ''}"
                                       if stopped else "")
     meta_end = grid.put(label_x, y, meta, "dim", limit=right)
+    grid.put(meta_end, y, " ", "branch_s")
+    for cell_x in range(meta_end + 1, right):
+        grid.put(cell_x, y, "─", "line")
     mix = _harness_mix(route_rows)
     mix_width = sum(len(text) for text, _key in mix)
-    mix_x = max(meta_end + 2, right - mix_width - 4)
-    if mix_x + mix_width + 1 >= right:          # no room for the harness count: the rule runs on instead
-        mix, mix_width, mix_x = [], 0, right
-    grid.put(meta_end, y, " ", "branch_s")
-    for cell_x in range(meta_end + 1, mix_x - 1):
-        grid.put(cell_x, y, "─", "line")
-    grid.put(mix_x - 1, y, " ", "dim")
-    cursor = mix_x
-    for text, key in mix:
-        cursor = grid.put(cursor, y, text, key, limit=right)
-    grid.put(cursor, y, " ", "branch_s", limit=right)
-    for cell_x in range(cursor + 1, right):
-        grid.put(cell_x, y, "─", "line")
-    grid.put(cursor, y, " ", "branch_s", limit=right)
-    for cell_x in range(cursor + 1, right):
-        grid.put(cell_x, y, "─", "line")
+    mix_x = x + use - 2 - mix_width
+    if mix_x - x >= 40:                      # only where it clears the section's own title
+        cursor = mix_x
+        for text, key in mix:
+            cursor = grid.put(cursor, y, text, key, limit=right)
     y += 1
     if scoped_page:
         from types import SimpleNamespace
         live_routes = tuple(route for route in vm.routes if route.get("state") != "done")
         from dataclasses import replace
-        draw_routes(grid, replace(vm, routes=live_routes),
-                    SimpleNamespace(view="repo:" + str(vm.repos[0].get("id", "")),
-                                    opened_for=lambda _key, default="": default),
-                    x=x, y=y)
-        y += len(live_routes) * 2 + 2
-        y += 1
+        y = draw_routes(grid, replace(vm, routes=live_routes),
+                        SimpleNamespace(view="repo:" + str(vm.repos[0].get("id", "")),
+                                        opened_for=state.opened_for),
+                        x=x, y=y) + 1
+        recent_y = y
         grid.put(x, y, "── ", "line")
         recent_end = grid.put(x + 3, y, "RECENT", "head", limit=right)
         grid.put(recent_end, y, "  ", "dim", limit=right)
@@ -220,14 +212,11 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
             if not repo.get("done") or not repo_label(repo.get("name")) or y >= grid.rows - 5:
                 continue
             grid.add_hit(y, x, right, ("scope", "repo:" + str(repo.get("id", repo.get("name", "")))))
-            grid.put(x + 1, y, "✓", "done")
-            grid.put(x + 3, y, str(repo.get("name", "")) + "/", "soft")
-            grid.put(x + 18, y, _clip(str(repo.get("done") or ""), max(0, right - x - 30)),
-                     "title_dim", limit=right - 8)
-            age = str(repo.get("age") or "")
-            grid.put(right - 1 - len(age), y, age, "dim")
+            _recent_row(grid, repo, x, use, y)
             y += 1
-        y += 5
+        y = recent_y + 7           # the brief starts a fixed seven rows under RECENT's header
+        if recent_y + 9 >= grid.rows - 5:
+            return                 # ... and only where its own header and a row still fit
         scoped_seats = tuple(seat for seat in vm.seats
                              if len(seat) > 1 and str(seat[1]) == str(vm.repos[0].get("id", "")))
         generations = sum(int(seat[2]) for seat in scoped_seats if len(seat) > 2)
@@ -242,7 +231,7 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
         y += 1
         previous_repo = None
         c_id, c_h, c_gen = 17, 24, 33
-        gen_width = min(24, max(8, use - c_gen - 3 - 3 - 14 - 3 - 16))
+        gen_width = max(8, min(24, use - c_gen - 3 - 3 - 18))
         c_last = c_gen + 3 + gen_width + 3
         for seat in scoped_seats:
             if y >= grid.rows - 5:
@@ -263,18 +252,8 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
             count = int(seat[2]) if len(seat) > 2 else 0
             grid.put(x + c_gen, y, f"{count:2d} ", "soft")
             marks = tuple(seat[6]) if len(seat) > 6 else tuple((vm.generations or {}).get(tag, ()))
-            shown = marks[-gen_width:]
-            for index, generation in enumerate(shown):
-                if isinstance(generation, Mapping):
-                    harness = str(generation.get("harness") or session.get("harness") or "·")
-                    kind = str(generation.get("kind") or "new")
-                else:
-                    parts = generation if isinstance(generation, (tuple, list)) else (generation,)
-                    harness = str(parts[0]) if parts else "·"
-                    kind = str(parts[1]) if len(parts) > 1 else "new"
-                glyph = {"new": "●", "cont": "○", "existing": "◆"}.get(kind, "●")
-                hue = {"claude": "c", "codex": "m", "opencode": "l"}.get(harness, "d")
-                grid.put(x + c_gen + 3 + index, y, glyph, (hue, int(index == len(shown) - 1), 0))
+            from .history import _gen_strip
+            _gen_strip(grid, x + c_gen + 3, y, marks, gen_width, session.get("harness") or "·")
             last_clear = str(seat[3] if len(seat) > 3 else "·")
             if x + c_last + _seg_width("clear " + last_clear) < right:       # nothing cut: it fits or is left out
                 grid.put(x + c_last, y, "clear " + last_clear, "dim", limit=right)
@@ -303,15 +282,17 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
     for repo in repos:
         if not repo.get("done") or not repo_label(repo.get("name")) or y >= grid.rows - 5:
             continue
-        grid.put(x + 1, y, "✓", "done")
-        grid.put(x + 3, y, str(repo.get("name", "")) + "/", "soft")
-        age = str(repo.get("age") or "")
-        age_x = right - 1 - len(age)
-        done_room = max(0, age_x - (x + 18) - 4)
-        grid.put(x + 18, y, _clip(str(repo.get("done") or ""), done_room),
-                 "title_dim", limit=right - 8)
-        grid.put(age_x, y, age, "dim")
+        _recent_row(grid, repo, x, use, y)
         y += 1
+
+
+def _recent_row(grid, repo, x, use, y):
+    """One completed repo: mark, name (12 cells), what finished, and how long ago."""
+    grid.put(x + 1, y, "✓", "done")
+    grid.put(x + 3, y, _clip(str(repo.get("name", "")) + "/", 12), "soft")
+    grid.put(x + 3 + 12 + GAP, y, _clip(str(repo.get("done") or ""), use - 3 - 12 - 2 * GAP - 8), "now_sub")
+    age = str(repo.get("age") or "")
+    grid.put(x + use - len(age), y, age, "dim")
 
 
 def _harness_mix(routes):
@@ -329,14 +310,15 @@ def _harness_mix(routes):
                 if str(key).startswith("hb_") and str(text) in counts:
                     counts[str(text)] += 1
                     break
-    return [("owner·worker ", "dim"),
+    return [(" owner·worker ", "dim"),
             ("claude", "hb_claude" if counts["claude"] else "dim"),
             (f" {counts['claude']}", "soft" if counts["claude"] else "dim"), (" · ", "dim"),
             ("codex", "hb_codex" if counts["codex"] else "dim"),
             (f" {counts['codex']}", "soft" if counts["codex"] else "dim"),
             (" · ", "dim"),
             ("opencode", "hb_opencode" if counts["opencode"] else "dim"),
-            (f" {counts['opencode']}", "soft" if counts["opencode"] else "dim")]
+            (f" {counts['opencode']}", "soft" if counts["opencode"] else "dim"),
+            (" ", "branch_s")]
 
 
 def _wrap_cells(text, width):
@@ -418,7 +400,7 @@ def _draw_route_line(grid, x0, x1, y, route, tag=True, repo=True, steward=False)
         x += 12 + GAP
     age = str(route.get("age") or "")
     title_width = max(16, min(48, (x1 - x) // 3))
-    title_width = min(title_width, max(1, x1 - x - AGE_W - GAP))     # never into the AGE cell
+    title_width = min(title_width, max(1, x1 - _seg_width(age) - 1 - x))     # the title ends before AGE starts
     grid.put(x, y, _clip(str(route.get("title") or "·"), title_width), "soft")
     x += title_width + GAP
     _draw_route_progress(grid, x, x1 - AGE_W - GAP, y, route)
@@ -578,8 +560,8 @@ def _overview_columns(use):
 
 
 def _clip(text, width):
-    from .output import clip
-    return clip(str(text), max(0, int(width)))
+    from .grid import clip_cells
+    return clip_cells(text, int(width))
 
 
 def _tint_row(grid, y, x0, x1, tint):
@@ -589,12 +571,14 @@ def _tint_row(grid, y, x0, x1, tint):
             grid.cells[y][xx] = (glyph, key, tint)
 
 
+_VIEW_NAMES = ("OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "COMPUTE", "MEMORY", "MODELS",
+               "SYSTEM")
+
+
 def draw_routes(grid, vm, state, x=34, y=3):
     routes = tuple(vm.routes or ())
     use = max(0, grid.cols - x - 2)
     right, bottom = x + use + 1, grid.rows - 5
-    if use < 75:
-        return _draw_routes_compact(grid, vm, state, routes, x, y, use, right, bottom)
     cols = _route_columns(use)
     slim = cols["slim"]
     grid.fill(x, right, y, " ", tint=234)
@@ -604,7 +588,9 @@ def draw_routes(grid, vm, state, x=34, y=3):
         headers.append((cols["ctx"], "CTX"))
     headers += [(cols["prog"], "PROGRESS"), (use - 2, "AGE")]
     for col, name in headers:
-        grid.put(x + col, y, name, "head", tint=234, limit=right)
+        # a label that would run into the AGE label is left out, never overlapped
+        edge = right if name == "AGE" else x + use - 2 - 1
+        grid.put(x + col, y, name, "head", tint=234, limit=edge)
     y += 1
     repos = [r.get("id", r.get("name", "")) for r in vm.repos]
     order = repos + sorted({str(route.get("repo") or "") for route in routes} - set(repos))
@@ -614,8 +600,7 @@ def draw_routes(grid, vm, state, x=34, y=3):
         if not mine:
             continue
         if not getattr(state, "no_repo_group", False) and repo_label(repo):
-            if str(getattr(state, "view", "")) not in ("OVERVIEW", "ROUTES", "QUESTIONS", "HISTORY",
-                                                          "PEERS", "COMPUTE", "MEMORY", "MODELS", "SYSTEM"):
+            if str(getattr(state, "view", "")) not in _VIEW_NAMES:
                 grid.add_hit(y, x, right, ("scope", "repo:" + str(repo)))
             grid.put(x + 1, y, "┈ ", "line")
             end = grid.put(x + 3, y, str(repo) + "/", "title_dim")
@@ -627,6 +612,11 @@ def draw_routes(grid, vm, state, x=34, y=3):
             is_open = opened == ident
             action = (("route", ident) if getattr(state, "no_repo_group", False) else
                       ("fold", "ropen:" + state.view, ident))
+            # A page's route list also links an unfolded route to its own page; that hit comes first so it wins.
+            link = (is_open and not getattr(state, "no_repo_group", False) and
+                    str(getattr(state, "view", "")) not in _VIEW_NAMES)
+            if link:
+                grid.add_hit(y + 1, x + use - 7, right, ("route", ident))
             grid.add_hit(y, x, right, action)
             grid.add_hit(y + 1, x, right, action)
             if is_open:
@@ -654,10 +644,11 @@ def draw_routes(grid, vm, state, x=34, y=3):
             if suffix:
                 kind_parts.append(("(" + suffix + ")", "dim"))
             cursor = x + cols["kind"]
+            age_edge = x + use - len(str(route.get("age") or "")) - 1       # nothing runs into AGE
             for text, style in kind_parts:
-                cursor = grid.put(cursor, y, text, style, limit=x + cols["own"] - GAP)
+                cursor = grid.put(cursor, y, text, style, limit=min(x + cols["own"] - GAP, age_edge))
             _draw_owner(grid, x + cols["own"], y, route, cols["narrow"], slim,
-                        x + (cols["ctx"] if not slim else cols["prog"]) - GAP)
+                        min(x + (cols["ctx"] if not slim else cols["prog"]) - GAP, age_edge))
             if not slim:
                 context = route.get("owner_context")
                 if context:
@@ -686,8 +677,7 @@ def draw_routes(grid, vm, state, x=34, y=3):
             cursor = grid.put(cursor, y, _clip(label, max(0, route_end - cursor)),
                               "title_dim", limit=route_end)
             if unit:
-                grid.put(cursor, y, " · " + _clip(str(unit), max(0, route_end - cursor - 3)),
-                         "dim", limit=route_end)
+                grid.put(cursor, y, _clip(" · " + str(unit), route_end - cursor), "dim")
             worker_running = route.get("activity") == "running" and any(
                 "running" in str(text) for text, _style in (worker[2] if len(worker) > 2 else ()))
             worker_stage = str(route.get("worker_stage") or "·")
@@ -723,9 +713,11 @@ def draw_routes(grid, vm, state, x=34, y=3):
             for text, style in (worker[2] if len(worker) > 2 else ()):
                 if "running" in str(text) and route.get("worker_stage_key"):
                     style = route["worker_stage_key"]
-                grid.put(cursor, y, text, style, limit=x + use)
+                grid.put(cursor, y, text, style, limit=x + use - (9 if link else 0))
                 from .grid import cell_width
                 cursor += sum(cell_width(char) for char in str(text))
+            if link:
+                grid.put(x + use - 6, y, "open ▸", "accent")
             if is_open:
                 _tint_row(grid, y - 1, x - 1, right, 236)
                 _tint_row(grid, y, x - 1, right, 236)
@@ -739,70 +731,10 @@ def draw_routes(grid, vm, state, x=34, y=3):
     return y
 
 
-def _draw_routes_compact(grid, vm, state, routes, x, y, use, right, bottom):
-    grid.fill(x, right, y, " ", tint=234)
-    for off, label in ((3, "ID"), (11, "ROUTE"), (use - 8, "AGE")):
-        grid.put(x + off, y, label, "head", tint=234, limit=right)
-    y += 1
-    order = [repo.get("id", repo.get("name", "")) for repo in vm.repos]
-    order += sorted({str(route.get("repo") or "") for route in routes} - set(order))
-    opened = state.opened_for("ropen:" + state.view)
-    for repo in order:
-        mine = [route for route in routes if str(route.get("repo") or "") == str(repo)]
-        if not mine:
-            continue
-        if y >= bottom:
-            return y
-        if repo_label(repo):
-            grid.put(x + 1, y, "┈ ", "line")
-            end = grid.put(x + 3, y, str(repo) + "/", "title_dim")
-            for xx in range(end + 1, right):
-                grid.put(xx, y, "┈", "line")
-            y += 1
-        for route in mine:
-            if y + 1 >= bottom:
-                return y
-            ident = str(route.get("id") or "·")
-            action = ("fold", "ropen:" + state.view, ident)
-            grid.add_hit(y, x, right, action)
-            grid.add_hit(y + 1, x, right, action)
-            selected = opened == ident
-            marker, style = {"running": ("⠏", "g_spin"), "idle": ("●", "g_work_off"),
-                             "blocked": ("●", "g_blocked"), "done": ("✓", "done"),
-                             "dead": ("✕", "g_dead")}.get(
-                route.get("activity") if route.get("activity") == "running" else route.get("state"),
-                ("●", "g_work_off"))
-            grid.put(x + 3, y, marker, style)
-            tag = str(route.get("session_tag") or route.get("past_from") or "")
-            grid.put(x + 5, y, "[", "dim")
-            grid.put(x + 6, y, tag, "soft")
-            grid.put(x + 6 + len(tag), y, "]", "dim")
-            age = str(route.get("age") or "")
-            age_x = x + use - len(age)
-            title_start = x + 10
-            title_end = max(title_start, age_x - 2)
-            grid.put(title_start, y, _clip(str(route.get("title") or "·"), title_end - title_start),
-                     "soft", limit=title_end)
-            grid.put(age_x, y, age, "dim", limit=right)
-            if selected:
-                _tint_row(grid, y, x - 1, right, 236)
-            y += 1
-            worker = route.get("worker") or ()
-            summary = " · ".join(part for part in (str(worker[0] if worker else "worker"),
-                              str(route.get("worker_unit") or "·"),
-                              str(route.get("worker_stage") or "·")) if part)
-            grid.put(x + 10, y, "└ " + summary, "dim", limit=right)
-            if selected:
-                _tint_row(grid, y, x - 1, right, 236)
-            y += 1
-    return y
-
 
 def draw_questions(grid, vm, state, x=34, y=3):
     use = max(0, grid.cols - x - 2)
     right, bottom = x + use + 1, grid.rows - 5
-    if use < 75:
-        return _draw_questions_compact(grid, vm, state, x, y, use, right, bottom)
     questions = tuple(vm.questions or ())
     grid.put(x, y, "── ", "line")
     cursor = grid.put(x + 3, y, "WAITING", "sect")
@@ -875,12 +807,12 @@ def draw_questions(grid, vm, state, x=34, y=3):
         grid.put(pane_start, y, pane, "soft", limit=right)
         pane_hit_start = x + 20 + len(pane) + 2
         grid.add_hit(y, pane_hit_start, pane_hit_start + len("(open ▸)"), ("pane", tag, pane))
-        cursor = grid.put(pane_start + len(pane), y, "  ", "branch_s", limit=right)
-        grid.put(cursor, y, "(open ▸)", "hearting", limit=right)
+        cursor = grid.put(pane_start + len(pane), y, "  ", "branch_s", limit=x + use)
+        grid.put(cursor, y, "(open ▸)", "hearting", limit=x + use)
         y += 1
         grid.put(x + 10, y, "answer:", "label")
         grid.put(x + 20, y, "⏎", "hearting")
-        grid.put(x + 21, y, " go to its pane and answer there", "dim")
+        grid.put(x + 21, y, " go to its pane and answer there", "dim", limit=x + use)
         y += 1
     y += 1
     answered = tuple(vm.answered or ())
@@ -922,84 +854,6 @@ def draw_questions(grid, vm, state, x=34, y=3):
                 y += 1
             if is_open:
                 _tint_row(grid, first_row, x - 1, right, 236)
-
-
-def _draw_questions_compact(grid, vm, state, x, y, use, right, bottom):
-    questions = tuple(vm.questions or ())
-    grid.put(x, y, "── ", "line")
-    cursor = grid.put(x + 3, y, "WAITING", "sect")
-    cursor = grid.put(cursor, y, f"  {len(questions)}", "dim")
-    grid.put(cursor, y, " ", "branch_s")
-    grid.fill(x, right, y + 1, " ", tint=234)
-    compact_headers = [(3, "ID"), (10, "HARNESS"), (24, "KIND")]
-    if use < 60:
-        compact_headers.append((35, "WAIT"))
-    else:
-        compact_headers.append((35, "WAIT"))
-        compact_headers.append((44, "SESSION"))
-    for off, label in compact_headers:
-        grid.put(x + off, y + 1, label, "head", tint=234, limit=right)
-    y += 2
-    closed = state.opened_for("qshut:" + state.view, "")
-    for question in questions:
-        if y >= bottom:
-            return
-        tag = str(question.get("tag") or "·")
-        harness = str(question.get("h") or "·")
-        is_open = closed != tag
-        grid.add_hit(y, x, right, ("fold", "qshut:" + state.view, tag))
-        grid.put(x + 1, y, "▶" if is_open else "●", "soft" if is_open else "blocked")
-        grid.put(x + 3, y, f"[{tag}]", "soft")
-        grid.put(x + 10, y, harness + "·" + str(question.get("e") or ""), "hb_" + harness,
-                 limit=x + 23)
-        grid.put(x + 24, y, str(question.get("kind") or "·"), "blocked", limit=x + 34)
-        grid.put(x + 35, y, str(question.get("wait") or "·"), "soft", limit=x + 43)
-        if use >= 60:
-            grid.put(x + 44, y, _clip(str(question.get("title") or "·"), max(0, use - 45)),
-                     "hb_" + harness, limit=right)
-        if is_open:
-            _tint_row(grid, y, x - 1, right, 236)
-        y += 1
-        if not is_open:
-            continue
-        for label, value, style in (("title:", question.get("title"), "soft"),
-                                    ("now:", question.get("now"), "soft")):
-            if y >= bottom:
-                return
-            grid.put(x + 4, y, label, "label")
-            grid.put(x + 12, y, _clip(str(value or "·"), max(0, use - 14)), style, limit=right)
-            y += 1
-        if y < bottom:
-            pane = str(question.get("pane") or "·")
-            grid.put(x + 4, y, "pane:", "label")
-            pane_x = x + 12
-            grid.put(pane_x, y, pane, "soft", limit=right)
-            grid.put(pane_x + len(pane), y, "  ", "branch_s", limit=right)
-            open_x = pane_x + len(pane) + 2
-            grid.put(open_x, y, "(open ▸)", "hearting", limit=right)
-            grid.add_hit(y, open_x, open_x + len("(open ▸)"), ("pane", tag, pane))
-            y += 1
-        if y < bottom:
-            grid.put(x + 4, y, "answer:", "label")
-            grid.put(x + 12, y, "⏎", "hearting")
-            grid.put(x + 13, y, " go to its pane", "dim", limit=right)
-            y += 1
-    if y + 2 < bottom:
-        grid.put(x, y, "── ANSWERED TODAY", "sect", limit=right)
-        y += 1
-        for repo, records in tuple(vm.answered or ()):
-            for index, record in enumerate(records):
-                if y >= bottom:
-                    return
-                at, text = record[:2]
-                ident = f"{repo}:{index}"
-                lines = _wrap(str(text), max(1, use - 24))
-                grid.put(x + 3, y, str(at), "dim")
-                grid.put(x + 10, y, repo_label(repo), "soft", limit=x + 22)
-                grid.put(x + 24, y, _clip(str(text), max(0, right - (x + 24))), "title_dim", limit=right)
-                if len(lines) > 1:
-                    grid.add_hit(y, x, right, ("fold", "aopen:" + state.view, ident))
-                y += 1
 
 
 def _wrap(text, width):

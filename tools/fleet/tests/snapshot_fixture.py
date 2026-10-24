@@ -8,16 +8,27 @@ from types import UnionType
 from typing import Union
 import time
 
+import importlib
+
 try:
-    from fleet.explorer.nav import card_title
-    from fleet import projection, render
-    from fleet.collectors import dispatch, resolve_parent_edges
-    from fleet.refresh import LiveSnapshot
-except ModuleNotFoundError:
     from tools.fleet.explorer.nav import card_title
     from tools.fleet import projection, render
     from tools.fleet.collectors import dispatch, resolve_parent_edges
     from tools.fleet.refresh import LiveSnapshot
+except ModuleNotFoundError:
+    from fleet.explorer.nav import card_title
+    from fleet import projection, render
+    from fleet.collectors import dispatch, resolve_parent_edges
+    from fleet.refresh import LiveSnapshot
+
+# Every class below comes from the package this fixture's LiveSnapshot comes from, so a row built
+# here is an instance of the classes the production adapter uses whatever sys.path put it there.
+_PACKAGE = LiveSnapshot.__module__.rsplit(".", 1)[0]
+
+
+def _symbols(module, *names):
+    loaded = importlib.import_module(f"{_PACKAGE}.{module}")
+    return tuple(getattr(loaded, name) for name in names)
 
 
 def _typed(value, annotation):
@@ -49,7 +60,7 @@ def _typed(value, annotation):
         return {_typed(k, kt): _typed(v, vt) for k, v in value.items()}
     if isinstance(annotation, type) and is_dataclass(annotation) and isinstance(value, dict):
         if annotation.__name__ == "WorkProjection":
-            from tools.fleet.model import ActiveNodeProjection, ProgressProjection
+            ActiveNodeProjection, ProgressProjection = _symbols("model", "ActiveNodeProjection", "ProgressProjection")
             value = dict(value)
             value["active_nodes"] = tuple(_typed(item, ActiveNodeProjection)
                                           for item in value.get("active_nodes", ()))
@@ -71,10 +82,7 @@ def replay_snapshot(payload, *, detail_bundle=None, now=None):
         payload = json.loads(Path(payload).read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise TypeError("snapshot bundle must be a mapping or JSON path")
-    try:
-        from fleet.model import Session, DispatchJob, ResourceJob
-    except ModuleNotFoundError:
-        from tools.fleet.model import Session, DispatchJob, ResourceJob
+    Session, DispatchJob, ResourceJob = _symbols("model", "Session", "DispatchJob", "ResourceJob")
     snapshot_fields = get_type_hints(LiveSnapshot)
     rows = {
         "sessions": Session, "jobs": DispatchJob, "resources": ResourceJob,
@@ -96,10 +104,7 @@ def replay_snapshot(payload, *, detail_bundle=None, now=None):
     if unknown:
         snapshot.observations = dict(snapshot.observations or {}, replay_unknown=unknown)
 
-    try:
-        from fleet.explorer.types import ExplorerDetail, FocusResult, FocusKey
-    except ModuleNotFoundError:
-        from tools.fleet.explorer.types import ExplorerDetail, FocusResult, FocusKey
+    ExplorerDetail, FocusResult, FocusKey = _symbols("explorer.types", "ExplorerDetail", "FocusResult", "FocusKey")
     detail_data = detail_bundle or payload.get("detail") or {}
     focus_data = detail_data.get("focus") if isinstance(detail_data, dict) else None
     focus = None
@@ -264,7 +269,7 @@ def replay_source_bundle(state, history_data, logs_hist, raw_f5, *, now=None):
         if dialogue is not None:
             source_records["dialogue"] = {"index": 0, "harness": dialogue.get("harness"),
                                            "sid": dialogue.get("sid"), "lines": dialogue.get("lines")}
-        from tools.fleet.explorer.types import FocusKey, FocusResult, Health
+        FocusKey, FocusResult, Health = _symbols("explorer.types", "FocusKey", "FocusResult", "Health")
         focus = FocusResult(key=FocusKey(str(harness), str(sid)), epoch=0,
             snapshot_generation=0, output=tuple(raw_doc.get("lines") or ()),
             health=Health("success"), events=tuple(), source_records=source_records)
@@ -282,10 +287,7 @@ def replay_source_bundle(state, history_data, logs_hist, raw_f5, *, now=None):
     snapshot.summary = state_doc.get("summary")
     from dataclasses import replace
     from types import SimpleNamespace
-    try:
-        from tools.fleet.model import WorkProjection
-    except ModuleNotFoundError:
-        from fleet.model import WorkProjection
+    (WorkProjection,) = _symbols("model", "WorkProjection")
     routes_by_id = {str(row["route_id"]): row for row in route_rows
                     if isinstance(row, dict) and row.get("route_id")}
     for entity in (*snapshot.sessions, *snapshot.jobs):
@@ -300,7 +302,7 @@ def replay_source_bundle(state, history_data, logs_hist, raw_f5, *, now=None):
         for rid, row in routes_by_id.items()]
     snapshot.observations = dict(snapshot.observations or {}, replay_sources=normalized["observations"]["replay_sources"],
                                  replay_source_records=normalized["observations"]["replay_source_records"])
-    from tools.fleet.explorer.types import ExplorerDetail
+    (ExplorerDetail,) = _symbols("explorer.types", "ExplorerDetail")
     explorer_detail = ExplorerDetail(
         focus=explorer_detail.focus, seats=explorer_detail.seats,
         config=explorer_detail.config, panes=explorer_detail.panes,

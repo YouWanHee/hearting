@@ -5,7 +5,7 @@ KEY_ALIASES = {
     "muted": "dim", "label": "dim", "faint": "name_dim", "head": "section_head",
     "now_sub": "name_dim",
     "now_sub": "name_dim",
-    "soft": "loc_repo", "title_dim": "name_dim", "line": "dim", "accent": "accent",
+    "soft": "loc_repo", "title_dim": "name_dim", "line": "dim", "accent": "hearting_name",
     "danger": "g_blocked", "blocked": "g_blocked", "warning": "lvl_y_dim", "success": "grp_live",
     "idle": "g_work_off", "done": "grp_live", "dead": "g_dead", "work": "g_work",
     "hearting": "hearting_name", "ver": "version_release", "spin": "g_spin",
@@ -14,7 +14,7 @@ KEY_ALIASES = {
     "claude": "claude", "codex": "codex", "opencode": "opencode",
     "colhead": "section_head", "sect": "section_head",
     "lvl_g": "grp_live", "lvl_y": "g_idle", "lvl_r": "g_dead",
-    "chip_on": "hearting_name", "eff_medium": "branch_s",
+    "lvl_r_flat": "g_blocked", "chip_on": "hearting_name", "eff_medium": "branch_s",
     "fam_opus": "hb_claude", "fam_gpt": "g_idle", "bold": "section_head", "code": "hb_opencode", "tool": "g_work",
 }
 

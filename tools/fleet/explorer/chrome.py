@@ -386,7 +386,7 @@ def draw_explorer(grid: CellGrid, vm, state):
                     glyph, key, _tint = grid.cells[y][col]
                     grid.cells[y][col] = (glyph, key, 236)
             drag = tuple(getattr(state, "drag", ()) or ())
-            if len(drag) >= 9 and drag[0] == "tree" and drag[1] == "repo":
+            if len(drag) >= 9 and drag[0] == "tree" and drag[1] == "repo" and drag[8]:
                 if drag[2] == str(repo_id):
                     for col in range(width):
                         glyph, key, _tint = grid.cells[y][col]
@@ -426,7 +426,7 @@ def draw_explorer(grid: CellGrid, vm, state):
                     glyph, key, _tint = grid.cells[y][col]
                     grid.cells[y][col] = (glyph, key, 236)
             drag = tuple(getattr(state, "drag", ()) or ())
-            if len(drag) >= 9 and drag[0] == "tree" and drag[1] == "session":
+            if len(drag) >= 9 and drag[0] == "tree" and drag[1] == "session" and drag[8]:
                 if drag[2] == tag:
                     for col in range(width):
                         glyph, key, _tint = grid.cells[y][col]
@@ -487,10 +487,8 @@ def draw_explorer(grid: CellGrid, vm, state):
                     grid.put(15 - shift + len(sub_label) + len(str(who)) + 1, y, "⠏" if activity == "running" else "●", sub_mark)
                     y += 1
     drag = tuple(getattr(state, "drag", ()) or ())
-    if y < cut:
-        grid.add_hit(y, 0, width, ("order-end",))
-        if len(drag) >= 9 and drag[0] == "tree" and drag[7] and drag[6] == "end":
-            grid.put(1, y, "↳", "accent", limit=width - 1)
+    if y < cut and len(drag) >= 9 and drag[0] == "tree" and drag[8] and drag[7] and drag[6] == "end":
+        grid.put(1, y, "↳", "accent", limit=width - 1)
     if cut < tree_bottom and cut >= tree_top:
         grid.put(4, cut, f"… {hidden_rows} more rows", "dim", limit=width - 1)
 

@@ -36,6 +36,11 @@ def load_reference(path: Path):
                 del sys.modules[name]
         except OSError:
             continue
+    # The reference imports its helpers by bare name (``mock2`` ...). Another copy of the same files
+    # loaded earlier in this process (a test importing the cycle copy) would answer those imports
+    # with its own, already mutated modules; drop every module of that name, wherever it came from.
+    for stem in {item.stem for item in resolved.glob("*.py")} - {"__init__"}:
+        sys.modules.pop(stem, None)
     sys.path.insert(0, str(path))
     spec = importlib.util.spec_from_file_location("fleet_reference_renderer", path / "mock13.py")
     if spec is None or spec.loader is None:
@@ -282,6 +287,18 @@ def _peer_cards(renderer):
     return cards
 
 
+def _head_title(renderer, pick):
+    """The title the route detail's top band names (the reference words it apart from the row's)."""
+    head = renderer.ROUTE_HEAD.get(pick)
+    return str(head[-2][0]) if head else None
+
+
+def _head_trailer(renderer, pick):
+    """The dim text the route detail's top band carries after the title."""
+    head = renderer.ROUTE_HEAD.get(pick)
+    return str(head[-1][0]).strip() if head else None
+
+
 def _fixture_values(renderer):
     """Project complete, already scrubbed reference records into the stable VM shape."""
     gpu_processes = []
@@ -354,7 +371,10 @@ def _fixture_values(renderer):
                        "worker_stage_key": stage_key,
                        "worker_step_key": step_key,
                        "owner_context": renderer.OWNER_CTX.get(pick),
-                       "subworker": subworker})
+                       "subworker": subworker,
+                       "detail_title": _head_title(renderer, pick),
+                       "detail_trailer": _head_trailer(renderer, pick),
+                       "detail_after": renderer.ROUTE_AFTER.get(pick)})
     seats = [list(row) for row in renderer.seats_by_repo()]
     generations = {}
     for seat in seats:
@@ -510,7 +530,7 @@ def capture(reference: Path, cols: int, view="OVERVIEW", ui=None, scope=None, uo
     if scrub:
         renderer.grammar = scrubbed_grammar
     grid, hits = renderer.render_state(scope, view, cols, 45, bool(uopen))
-    if scrub and view == "MEMORY":
+    if scrub and view == "MEMORY" and not scope:
         # Public fixture records keep their original display width but do not
         # publish memory project names or record bodies from the live source.
         for row in range(4, 41):
@@ -951,7 +971,15 @@ def build(reference: Path, output: Path) -> dict:
                 "The `attempts` record carries the route it belongs to (`route`: f5). The reference draws "
                 "one owner's raw output, on that route's page; the live builder names the route of the "
                 "owner output the selection reader returned, so a route page never shows another "
-                "route's lines."
+                "route's lines.\n\n"
+                "A route record may carry `detail_title`, `detail_trailer` and `detail_after`: the words "
+                "on the top band of an opened route and the note beside its stage band, which the "
+                "reference words apart from the row's own title and age for some routes. A source "
+                "without them gets the derived words.\n\n"
+                "parity_matrix.py compares the same view model with the approved reference for every "
+                "state the reference's own click targets reach, at 80, 100, 140 and 168 columns; "
+                "where the reference overlaps or overflows itself the rows are excluded and Fleet "
+                "must draw clean there."
             ),
         },
     }

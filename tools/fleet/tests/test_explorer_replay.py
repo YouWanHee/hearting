@@ -90,6 +90,23 @@ class ReplayContract(unittest.TestCase):
         self.assertEqual(result["model_counts"], {"opencode": 1})
 
 
+class ReplayClassIdentity(unittest.TestCase):
+    def test_rows_are_built_from_the_adapters_classes_whatever_the_import_path(self):
+        import importlib
+        import sys
+        root = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(root))                 # `fleet` as a second top-level name for the same package
+        try:
+            other = importlib.import_module("fleet.model")
+        finally:
+            sys.path.remove(str(root))
+        from tools.fleet.model import Session
+        self.assertIsNot(other.Session, Session)
+        snapshot, _detail = replay_snapshot({"sessions": [{"harness": "claude", "pid": 1}]})
+        self.assertIsInstance(snapshot.sessions[0], Session)
+        self.assertNotIsInstance(snapshot.sessions[0], other.Session)
+
+
 class KeyedLedger(unittest.TestCase):
     def test_a_pure_reorder_is_one_entry_and_no_field_cascade(self):
         from tools.fleet.tests.parity_compare import diff_view_models_keyed

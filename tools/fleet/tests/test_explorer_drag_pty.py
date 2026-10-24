@@ -107,8 +107,14 @@ class ExplorerDragPtyTests(unittest.TestCase):
                 tint_sgr = "48;2;%d;%d;%d" % tuple(rgb)
                 self.assertTrue(all(tint_sgr in cell[0] for cell in reference_cells[ref_grab][:32]),
                                 reference_cells[ref_grab][:32])
+                self.assertEqual([tint_sgr in cell[0] for cell in reference_cells[ref_grab][:32]],
+                                 [cell[2] == 236 for cell in fleet_grab["cells"][:32]])
+                self.assertEqual([cell[1] for cell in reference_cells[ref_grab][:4]],
+                                 [cell[0] for cell in fleet_grab["cells"][:4]])
                 self.assertEqual(reference_cells[ref_drop][1][1], "↳")
                 self.assertEqual(fleet_drop["cells"][1][0], "↳")
+                self.assertEqual([cell[1] for cell in reference_cells[ref_drop][:4]],
+                                 [cell[0] for cell in fleet_drop["cells"][:4]])
         finally:
             sys.path.remove(str(REFERENCE_DIR))
 

@@ -225,10 +225,12 @@ _PARSED_REGISTRY_SEGMENTS = {}
 _PARSED_REGISTRY_ROWS_LIMIT = 32
 
 
-def _parse_registry_lines(path, lines, generation, *, first_line=1,
+def _parse_registry_lines(path, lines, generation, *, first_line=0,
                           complete_line_count=None, segments=None):
     """Parse registry rows once, retaining physical line positions."""
     rows = []
+    # Match the legacy registry_order contract: enumerate the physical lines from
+    # zero, including blank and malformed lines, before filtering invalid rows.
     for line_number, line in enumerate(lines, first_line):
         fields = tuple(line.split("\t"))
         if len(fields) != 6:
@@ -306,11 +308,11 @@ def parsed_registry_rows(path):
                     prefix_key = candidate
                     prefix_lines = _PARSED_REGISTRY_LINE_COUNTS.get(candidate, 0)
                     prefix_rows = tuple(row for row in _PARSED_REGISTRY_ROWS[candidate]
-                                        if row[0] <= prefix_lines)
+                                        if row[0] < prefix_lines)
                     break
     if prefix_key is not None and prefix_lines <= len(lines):
         suffix = _parse_registry_lines(
-            path, lines[prefix_lines:], generation, first_line=prefix_lines + 1,
+            path, lines[prefix_lines:], generation, first_line=prefix_lines,
             complete_line_count=view.line_count - int(view.has_partial_tail),
             segments=view._segments)
         result = tuple(prefix_rows) + tuple(suffix)

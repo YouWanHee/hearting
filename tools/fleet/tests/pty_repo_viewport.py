@@ -911,6 +911,13 @@ class PtyRun:
             self.mouse(0, sx, sy)
             held = self.wait_for("repo press holds a pending tree drag",
                                  lambda s: s.get("explorer", {}).get("tree_drag"))
+            held_cells = held["explorer"]["order"]["tree_cells"]
+            source_row = next(hit[0] for hit in held["explorer"]["hits"]
+                              if hit[3][:2] == ["scope", source[3][1]])
+            prior_cells = root["explorer"]["order"]["tree_cells"]
+            self.check("repo press leaves the frame unchanged until motion",
+                       held_cells[source_row] == prior_cells[source_row],
+                       {"before": prior_cells[source_row], "press": held_cells[source_row]})
             self.mouse(32, tx, ty)
             preview = self.wait_for("repo drag previews a valid insertion",
                                     lambda s: len(s.get("explorer", {}).get("tree_drag", [])) >= 9

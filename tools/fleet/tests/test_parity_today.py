@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tools.fleet.tests.parity_compare import diff_frames
-from tools.fleet.tests.parity_today import _frame_from_reference, _jsonable
+from tools.fleet.tests.parity_today import _frame_from_reference, _jsonable, classify
 
 
 class TodayParityPlumbingTests(unittest.TestCase):
@@ -22,6 +22,72 @@ class TodayParityPlumbingTests(unittest.TestCase):
             hidden: object
         value = Value(3, object())
         self.assertEqual(_jsonable(value), {"count": 3, "hidden": None})
+
+
+def _record(width=140, rows=45, cells=(), hits=None):
+    blank = " " * width
+    reference, fleet2 = [blank] * rows, [blank] * rows
+    differences = [{"kind": "cell", "row": row, "column": column, "expected": [a, ka, None], "actual": [b, kb, None]}
+                   for row, column, a, ka, b, kb in cells]
+    if hits is not None:
+        differences.append({"kind": "hits", "expected": hits[0], "actual": hits[1]})
+    for row, column, a, _ka, b, _kb in cells:
+        reference[row] = reference[row][:column] + a + reference[row][column + 1:]
+        fleet2[row] = fleet2[row][:column] + b + fleet2[row][column + 1:]
+    return {"state": "OVERVIEW", "width": width, "rows": rows, "reference_rows": reference, "fleet2_rows": fleet2,
+            "reference_edge": [False] * rows, "differences": differences}
+
+
+class ClassificationTests(unittest.TestCase):
+    def test_a_known_style_difference_gets_a_reason_and_an_owner(self):
+        document = classify([_record(cells=[(1, 21, "━", "g_blocked", "━", "grp_live")])])
+        self.assertEqual(document["summary"]["unexplained"], 0)
+        entry = document["entries"][0]
+        self.assertEqual((entry["rule"], entry["class"]), ("usage-gauge-80", "fleet2-defect"))
+        self.assertTrue(entry["owner"].endswith("chrome.py"))
+
+    def test_a_difference_no_rule_explains_stays_unexplained(self):
+        document = classify([_record(cells=[(20, 50, "a", "dim", "b", "dim")])])
+        self.assertEqual(document["summary"]["unexplained"], 1)
+
+    def test_a_hit_difference_on_a_row_whose_cells_are_equal_is_not_derived(self):
+        hit = [30, 34, 100, ["scope", "x"]]
+        document = classify([_record(hits=([hit], []))])
+        self.assertEqual([entry["class"] for entry in document["entries"]], ["unexplained"])
+
+    def test_a_hit_difference_on_an_explained_row_follows_its_cells(self):
+        hit = [1, 34, 100, ["usage"]]
+        document = classify([_record(cells=[(1, 21, "━", "g_blocked", "━", "grp_live")], hits=([hit], []))])
+        self.assertEqual(sorted(entry["class"] for entry in document["entries"]), ["derived", "fleet2-defect"])
+
+    def test_reference_hits_beyond_the_screen_are_the_recorded_narrow_width_defect(self):
+        hit = [6, 71, 88, ["ui", "sel", "top/codex"]]
+        document = classify([_record(width=80, hits=([hit], []))])
+        self.assertEqual((document["entries"][0]["class"], document["entries"][0]["rule"]), ("excluded", "hit-outside-screen"))
+
+
+class InjectionPieces(unittest.TestCase):
+    def test_a_state_outside_the_five_the_copy_knows_draws_as_an_idle_dot(self):
+        from tools.fleet.tests.reference_injection import _session_row
+        row = _session_row({"tag": "aa", "harness": "claude", "state": "stale", "context": None, "window": None})
+        self.assertEqual((row["st"], row["ctx"], row["win"]), ("idle", None, 1.0))
+
+    def test_a_route_row_keeps_the_captures_own_words(self):
+        from tools.fleet.tests.reference_injection import _route_record
+        record = _route_record({"id": "rt-1", "state": "working", "harness": "codex", "legs": [["code", "active", "2/6"]],
+                                "stages": [{"name": "plan", "st": "done"}], "activity": "running", "tree_label": "code"})
+        self.assertEqual((record["act"], record["tree_label"], record["legs"]), ("running", "code", [("code", "active", "2/6")]))
+
+    def test_the_status_words_follow_the_capture(self):
+        from types import SimpleNamespace
+        from tools.fleet.tests.reference_injection import _status
+        renderer = SimpleNamespace(mock5=SimpleNamespace(SEATS=[("aa", "r", 3, "·", False)]))
+        vm = {"sessions": [{"steward": True}], "routes": [{"state": "dead"}, {"state": "working"}], "questions": [],
+              "compute": [], "system": {"peer_delivery": {}, "install": {"version": "v9"}}}
+        status = _status(renderer, vm, 0)
+        self.assertEqual(status["OVERVIEW"], "1 session · 2 routes · 0 questions")
+        self.assertEqual(status["ROUTES"], "2 open · 1 stopped leg")
+        self.assertEqual(status["SYSTEM"], "v9 · · deliveries pending")
 
 
 if __name__ == "__main__":

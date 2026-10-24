@@ -1,8 +1,8 @@
 """Read-only COMPUTE, MEMORY, and SYSTEM projections for Fleet explorer."""
 from collections.abc import Mapping
 
-from .grid import CellGrid, cell_width, put_fit
-from .output import clip
+from .grid import CellGrid, put_fit
+from .grid import clip_cells as clip
 
 
 def _table_head(grid, x, width, y, columns):
@@ -24,14 +24,14 @@ def _pct_key(value):
     return "lvl_r" if value >= 80 else "lvl_y" if value >= 50 else "lvl_g"
 
 
-def _gauge(grid, x, y, width, value, tint=None):
+def _gauge(grid, x, y, width, value, tint=None, limit=None):
     if value is None:
-        grid.put(x, y, "·" * width, "dim", tint=tint)
+        grid.put(x, y, "·" * width, "dim", tint=tint, limit=limit)
         return
     pct = max(0, min(100, value))
     filled = width if pct >= 100 else 0 if pct <= 0 else max(1, min(width - 1, int(width * pct / 100 + .5)))
-    grid.put(x, y, "━" * filled, _pct_key(value), tint=tint)
-    grid.put(x + filled, y, "─" * (width - filled), "dim", tint=tint)
+    grid.put(x, y, "━" * filled, _pct_key(value), tint=tint, limit=limit)
+    grid.put(x + filled, y, "─" * (width - filled), "dim", tint=tint, limit=limit)
 
 
 def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
@@ -70,14 +70,7 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
             grid.put(x + 16, y, "·" if model is None else str(model), gpu_styles.get(model_key, model_key or "dim"))
             grid.put(x + 31, y, " · " if util is None else f"{int(util):3d}%",
                      "soft" if status == "working" else "dim")
-            if x + 38 + 10 + 11 > grid.cols - 1:
-                # No room for the gauge and the GB text: the percentage alone.
-                if used is None or total in (None, 0):
-                    grid.put(x + 38, y, "·", "dim")
-                else:
-                    pct = 100 * float(used) / float(total)
-                    grid.put(x + 38, y, f"{pct:3.0f}%", _pct_key(pct))
-            elif used is None or total in (None, 0):
+            if used is None or total in (None, 0):
                 _gauge(grid, x + 38, y, 10, None)
                 grid.put(x + 51, y, "·", "dim")
             else:
@@ -133,15 +126,13 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
                     value = f"{values[0]:g}/{values[1]:g} {unit}"
                 else:
                     value = "·"
-                if start + len(label) + 1 + width + 1 + len(value) > grid.cols - 1:
-                    break                      # a block that does not fit is left out, never cut
-                cursor = grid.put(start, y, label + " ", "label")
+                cursor = grid.put(start, y, label + " ", "label", limit=x + use + 1)
                 if value != "·":
-                    _gauge(grid, cursor, y, width, 100 * float(values[0]) / float(values[1]))
+                    _gauge(grid, cursor, y, width, 100 * float(values[0]) / float(values[1]), limit=x + use + 1)
                 else:
-                    _gauge(grid, cursor, y, width, None)
+                    _gauge(grid, cursor, y, width, None, limit=x + use + 1)
                 cursor += width + 1
-                cursor = grid.put(cursor, y, value, "dim")
+                cursor = grid.put(cursor, y, value, "dim", limit=x + use + 1)
             y += 1
     if not hosts:
         grid.put(x + 1, y, "·", "dim")
@@ -166,8 +157,7 @@ def draw_memory(grid: CellGrid, vm, state=None, x=34, y=3):
     if records is None:
         grid.put(x + 1, y, "·", "dim")
         return
-    narrow = use < 75           # the TYPE column is the one a narrow screen gives up
-    c_time, c_action, c_type, c_record = (12, 18, None, 27) if narrow else (14, 21, 32, 55)
+    c_time, c_action, c_type, c_record = 14, 21, 32, 55
     y = _table_head(grid, x, use, y, ((1, "PROJECT"), (c_time, "TIME"), (c_action, "ACTION")) +
                     (((c_type, "TYPE"),) if c_type else ()) + ((c_record, "RECORD"),))
     for project_index, project in enumerate(records):
@@ -180,13 +170,13 @@ def draw_memory(grid: CellGrid, vm, state=None, x=34, y=3):
         for row_index, row in enumerate(rows or ()):
             when, action, kind, text = (tuple(row) + (None,) * 4)[:4]
             if row_index == 0:
-                grid.put(x + 1, y, clip(str(name), min(12, c_time - 2)), "soft")
+                grid.put(x + 1, y, clip(str(name), 12), "soft")
             grid.put(x + c_time, y, "·" if when is None else str(when), "dim")
             grid.put(x + c_action, y, "+ saved" if action == "saved" else "· changed", "done" if action == "saved" else "dim")
             if c_type:
                 grid.put(x + c_type, y, "·" if kind is None else str(kind), "dim")
-            grid.put(x + c_record, y, "·" if text is None else clip(str(text), max(0, use - c_record)),
-                     "soft" if action == "saved" else "now_sub", limit=x + use)
+            grid.put(x + c_record, y, "·" if text is None else clip(str(text), use - c_record),
+                     "soft" if action == "saved" else "now_sub", limit=x + use + 1)
             y += 1
     summary = (vm.system or {}).get("memory_summary") if isinstance(vm.system, Mapping) else None
     if isinstance(summary, Mapping):
@@ -195,7 +185,7 @@ def draw_memory(grid: CellGrid, vm, state=None, x=34, y=3):
                 f"{summary.get('projects', '·')} projects · "
                 f"{summary.get('expired', '·')} expired" + (f" at {expired_at}" if expired_at else "") +
                 f" (lifecycle) · {summary.get('latest', '·')} latest shown")
-        grid.put(x + 1, y, clip(text, max(0, use - 1)), "dim")
+        grid.put(x + 1, y, text, "dim", limit=x + use + 1)
 
 
 def draw_system(grid: CellGrid, vm, state=None, x=34, y=3):

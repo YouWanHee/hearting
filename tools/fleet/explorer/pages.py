@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping
 from .grid import cell_width
-from .output import clip
+from .grid import clip_cells as clip
 from .tables import repo_rule_label
 from .tables import _clip, _tint_row, draw_overview, draw_routes
 
@@ -12,7 +12,7 @@ def draw_scope(grid, vm, state):
     kind, _, ident = scope.partition(":")
     x, right, bottom = 34, max(34, grid.cols - 1), max(0, grid.rows - 5)
     if kind == "repo":
-        _repo_page(grid, vm, ident, x, right, bottom)
+        _repo_page(grid, vm, ident, x, right, bottom, state)
     elif kind == "session":
         _session_page(grid, vm, ident, x, right, bottom, state)
     elif kind == "route":
@@ -38,7 +38,7 @@ def _section(grid, x, right, y, title, detail=""):
     return y + 1
 
 
-def _repo_page(grid, vm, ident, x, right, bottom):
+def _repo_page(grid, vm, ident, x, right, bottom, nav=None):
     repo = next((item for item in vm.repos
                  if str(item.get("id", item.get("name", ""))) == ident), None)
     if repo is None:
@@ -50,8 +50,10 @@ def _repo_page(grid, vm, ident, x, right, bottom):
     questions = tuple(item for item in vm.questions if item.get("project") == ident)
     scoped_vm = replace(vm, repos=(repo,), sessions=sessions, routes=routes,
                         questions=questions)
+    folds = dict(getattr(nav, "folds", ()) or ())
     draw_overview(grid, scoped_vm, state=type("ScopedOverview", (), {
         "opened": "", "scope": "repo:" + ident,
+        "opened_for": staticmethod(lambda key, default="": folds.get(str(key), default)),
     })(), x=x, y=3)
     for column in range(1, 9):
         glyph, _key, _tint = grid.cells[3][column]
@@ -83,7 +85,8 @@ def _session_page(grid, vm, tag, x, right, bottom, state=None):
                                      (str(pane or "·"), "soft" if pane else "dim")], right)
     if pane:
         open_x = grid.put(cursor, y, "  (open ▸)", "hearting", limit=right)
-        grid.add_hit(y, cursor + 2, open_x, ("pane", tag, str(pane)))
+        if open_x <= right - 1:          # the link is a target only where all of it is drawn in the pane
+            grid.add_hit(y, cursor + 2, open_x, ("pane", tag, str(pane)))
     y += 1
     session_state = str(session.get("state") or "·")
     ask = bool(session.get("ask"))
@@ -129,58 +132,49 @@ def _session_page(grid, vm, tag, x, right, bottom, state=None):
         end = _draw_route_subset(grid, vm, routes, x, y, bottom, view_key=tag, state=state)
         # An opened route unfolds its detail in place, so the next section starts below what was drawn.
         fixed = y + len(routes) * 2 + 2
-        y = end + 1 if end and end > fixed else fixed
-    if y < bottom:
-        links = tuple(edge for edge in tuple((vm.peer_edges or {}).get("links", ()))
-                      if any(isinstance(end, (list, tuple)) and str(end[0]) == tag
-                             for end in edge[:2]))
-        y = _section(grid, x, right, y + 1, "PEERS",
-                     str(len(links)) + (" link" if len(links) == 1 else " links") if links else "none")
-        for edge in links[:4]:
-            if y >= bottom:
-                break
-            if right - x < 75:
-                y = _link_compact(grid, vm, edge, x, right, y, bottom)
-                continue
-            for edge_x, endpoint in ((x + 3, edge[0]), (x + 19, edge[1])):
-                if isinstance(endpoint, (list, tuple)):
-                    session_tag, endpoint_harness = str(endpoint[0]), str(endpoint[1])
-                    edge_x = grid.put(edge_x, y, "[", "dim")
-                    steward = any(str(item.get("tag")) == session_tag and item.get("steward")
-                                  for item in vm.sessions)
-                    edge_x = grid.put(edge_x, y, session_tag, "steward" if steward else "soft")
-                    edge_x = grid.put(edge_x, y, "]", "dim")
-                    grid.put(edge_x, y, " " + endpoint_harness,
-                             "hb_" + endpoint_harness, limit=right)
-                else:
-                    grid.put(edge_x, y, _clip(str(endpoint), 14), "dim", limit=right)
-            grid.put(x + 16, y, "→", "soft")
-            kind = str(edge[2])
-            kind_key = {"steer": "soft", "notice": "dim", "handover": "hb_claude",
-                        "watch ⚑": "steward"}.get(kind, "dim")
-            grid.put(x + 40, y, kind, kind_key, limit=right)
-            grid.put(x + 51, y, str(edge[3]), "dim", limit=right)
-            grid.put(x + 64, y, _clip(str(edge[4]), max(0, right - x - 65)), "now_sub", limit=right)
+        y = end if end and end > fixed else fixed
+    # The reference draws every section below unguarded; whatever passes the pane's foot is cut
+    # and flagged by the frame, never left out here.
+    links = tuple(edge for edge in tuple((vm.peer_edges or {}).get("links", ()))
+                  if any(isinstance(end, (list, tuple)) and str(end[0]) == tag
+                         for end in edge[:2]))
+    y = _section(grid, x, right, y + 1, "PEERS",
+                 str(len(links)) + (" link" if len(links) == 1 else " links") if links else "none")
+    for edge in links[:4]:
+        for edge_x, endpoint in ((x + 3, edge[0]), (x + 19, edge[1])):
+            if isinstance(endpoint, (list, tuple)):
+                session_tag, endpoint_harness = str(endpoint[0]), str(endpoint[1])
+                edge_x = grid.put(edge_x, y, "[", "dim")
+                steward = any(str(item.get("tag")) == session_tag and item.get("steward")
+                              for item in vm.sessions)
+                edge_x = grid.put(edge_x, y, session_tag, "steward" if steward else "soft")
+                edge_x = grid.put(edge_x, y, "]", "dim")
+                grid.put(edge_x, y, " " + endpoint_harness,
+                         "hb_" + endpoint_harness, limit=right)
+            else:
+                grid.put(edge_x, y, _clip(str(endpoint), 14), "dim", limit=right)
+        grid.put(x + 16, y, "→", "soft")
+        kind = str(edge[2])
+        kind_key = {"steer": "soft", "notice": "dim", "handover": "hb_claude",
+                    "watch ⚑": "steward"}.get(kind, "dim")
+        grid.put(x + 40, y, kind, kind_key, limit=right)
+        grid.put(x + 51, y, str(edge[3]), "dim", limit=right)
+        grid.put(x + 64, y, _clip(str(edge[4]), max(0, right - x - 65)), "now_sub", limit=right)
+        y += 1
+    gpu_rows = tuple(session.get("gpu") or ())
+    if gpu_rows:
+        y = _section(grid, x, right, y + 1, "GPU", str(len(gpu_rows)) + " in use")
+        for gpu in gpu_rows:
+            cursor = x + 3
+            for text, key in gpu:
+                key = {"host": "loc_repo", "gpu_ada": "h_claude"}.get(str(key), key)
+                cursor = grid.put(cursor, y, str(text), key, limit=right - 1)
             y += 1
-    if y < bottom:
-        gpu_rows = tuple(session.get("gpu") or ())
-        if gpu_rows:
-            y = _section(grid, x, right, y + 1, "GPU", str(len(gpu_rows)) + " in use")
-            for gpu in gpu_rows:
-                if y >= bottom:
-                    break
-                cursor = x + 3
-                for text, key in gpu:
-                    key = {"host": "loc_repo", "gpu_ada": "h_claude"}.get(str(key), key)
-                    cursor = grid.put(cursor, y, str(text), key, limit=right)
-                y += 1
     pane_lines = tuple(session.get("pane_lines") or ())
-    if pane_lines and y < bottom:
+    if pane_lines:
         y = _section(grid, x, right, y + 1, "PANE " + str(pane or "·"),
                      str(session.get("pane_meta") or ""))
         for line, key in pane_lines:
-            if y >= bottom:
-                break
             grid.put(x + 3, y, _clip(str(line), max(0, right - x - 4)), key, limit=right)
             y += 1
     y += 1
@@ -194,29 +188,6 @@ def _session_page(grid, vm, tag, x, right, bottom, state=None):
         from .history import draw_seat_expand
         draw_seat_expand(grid, vm, state, tag, x, right - x - 1, y + 1, history_bottom, seat,
                          harness)
-
-
-def _link_compact(grid, vm, edge, x, right, y, bottom):
-    """A link on a narrow page: ends and arrow on one row, kind · when · note under them."""
-    cursor = x + 3
-    for index, endpoint in enumerate(edge[:2]):
-        if index:
-            cursor = grid.put(cursor, y, " → ", "soft", limit=right)
-        if isinstance(endpoint, (list, tuple)):
-            tag, harness = str(endpoint[0]), str(endpoint[1])
-            steward = any(str(item.get("tag")) == tag and item.get("steward") for item in vm.sessions)
-            cursor = grid.put(cursor, y, "[", "dim", limit=right)
-            cursor = grid.put(cursor, y, tag, "steward" if steward else "soft", limit=right)
-            cursor = grid.put(cursor, y, "]", "dim", limit=right)
-            cursor = grid.put(cursor, y, " " + harness, "hb_" + harness, limit=right)
-        else:
-            cursor = grid.put(cursor, y, _clip(str(endpoint), 14), "dim", limit=right)
-    y += 1
-    if y < bottom:
-        detail = " · ".join(str(part) for part in edge[2:5] if part not in (None, ""))
-        grid.put(x + 5, y, _clip(detail, max(0, right - x - 6)), "dim", limit=right)
-        y += 1
-    return y
 
 
 def _route_page(grid, vm, ident, x, right, bottom, state):
@@ -419,8 +390,6 @@ def _stage_grid(grid, x0, y, stages, room, bottom, loops=()):
     if avail - (nrows - 1) < 6 * nrows:
         pitch_gap = 0
     h = max(4, min(10, (avail - pitch_gap * (nrows - 1)) // nrows))
-    if any("group" in stage for stage in stages):
-        h = max(h, 9)          # two stacked boxes need their own rows; what falls below is cut, not overlapped
     pos = []
     hh = (h - 1) // 2
     for index, stage in enumerate(stages):
@@ -433,7 +402,8 @@ def _stage_grid(grid, x0, y, stages, room, bottom, loops=()):
             _stage_box(grid, bx, by, w, hh, index, group[0])
             _stage_box(grid, bx, by + h - hh, w, hh, index, group[1])
             grid.put(bx + 2, by + hh, "∥ 2-way · %s" % (
-                "both pass" if all(item.get("st") == "done" for item in group) else "…"), "dim")
+                "both pass" if all(item.get("st") == "done" for item in group) else "…"), "dim",
+                limit=bx + w - 1)
         else:
             _stage_box(grid, bx, by, w, h, index, stage)
 
@@ -626,12 +596,15 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
     if tag:
         head += [("[", "tag_b"), (str(tag), "soft"), ("]", "tag_b"), (" › ", "line")]
     leg_count = sum(1 for item in route.get("legs") or () if str(item[0]) != "frame")
-    if any(node.get("kind") == "gate" for node in nodes):
+    if route.get("detail_trailer") is not None:
+        # The source states how long the route ran and what its record holds; nothing is derived.
+        trailer = "  " + str(route["detail_trailer"]).strip()
+    elif any(node.get("kind") == "gate" for node in nodes):
         trailer = f"  {route.get('age') or '·'} · {leg_count} leg · human gate answered"
     else:
         count = len(route.get("legs") or ())
         trailer = f"  {route.get('age') or '·'} · {count} leg{'s' if count != 1 else ''}"
-    head += [(str(route.get("title") or "·"), "head"), (trailer, "dim")]
+    head += [(str(route.get("detail_title") or route.get("title") or "·"), "head"), (trailer, "dim")]
     if route.get("shape"):
         head.append((" · " + str(route["shape"]), "dim"))
     title_start = x + 2
@@ -703,14 +676,14 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
             grid.put(centre, band_y + _BAND_H - 1, "┬", line)
             grid.put(centre, band_y + _BAND_H, "│", line)
     band_end = x + 3 + len(nodes) * (width + _BAND_GAP) - _BAND_GAP
-    after = _route_after(route, nodes)
+    after = route["detail_after"] if "detail_after" in route else _route_after(route, nodes)
     if after:
-        start = band_end + 3
-        grid.put(start, y + 2, clip(after, max(0, right - start)), "dim", limit=right)
+        # A note that outruns the frame is cut at the screen edge, over the frame's right rail.
+        grid.put(band_end + 3, y + 2, str(after), "dim")
 
     node = nodes[selected]
     panel_left, panel_right = x + 2, right - 2
-    panel_y = y + _BAND_H + (3 if use < 50 else 2)
+    panel_y = y + _BAND_H + 2
     style = ("d", 0, 0)
     for yy in range(panel_y + 1, bottom):
         grid.put(panel_left, yy, "│", style)

@@ -1,4 +1,9 @@
-"""Bounds checks for the P2 list views at supported terminal widths."""
+"""Bounds checks for the list views at supported terminal widths.
+
+At 80 and 100 columns the views draw what the approved reference draws; where that drawing
+overlaps itself the views stay clean instead. ``parity_matrix.py`` compares every reachable
+state with the reference; these checks only keep every frame inside the screen.
+"""
 import unittest
 
 from tools.fleet.explorer.frame import draw
@@ -36,32 +41,6 @@ class ListSizes(unittest.TestCase):
                         self.assertEqual(len(frame.text_rows()[42]), cols)
                         self.assertEqual(len(frame.text_rows()[43]), cols)
                         self.assertEqual(len(frame.text_rows()[44]), cols)
-                        if cols <= 100 and view == "ROUTES":
-                            body = frame.text_rows()
-                            x = 34
-                            use = cols - x - 2
-                            route_header = body[4]
-                            route_spans = ((x + 3, x + 5), (x + 11, x + 16),
-                                           (x + use - 8, x + use - 5))
-                            self.assertEqual(route_header[route_spans[0][0]:route_spans[0][1]], "ID")
-                            self.assertEqual(route_header[route_spans[1][0]:route_spans[1][1]], "ROUTE")
-                            self.assertEqual(route_header[route_spans[2][0]:route_spans[2][1]], "AGE")
-                            for left, right in zip(route_spans, route_spans[1:]):
-                                self.assertLessEqual(left[1], right[0])
-                        if cols <= 100 and view == "QUESTIONS":
-                            header = frame.text_rows()[5]
-                            q_spans = ((37, 39), (44, 51), (58, 62), (69, 73))
-                            for (lo, hi), label in zip(q_spans, ("ID", "HARNESS", "KIND", "WAIT")):
-                                self.assertEqual(header[lo:hi], label)
-                            for left, right in zip(q_spans, q_spans[1:]):
-                                self.assertLessEqual(left[1], right[0])
-                        if cols <= 100 and view == "HISTORY":
-                            header = frame.text_rows()[4]
-                            h_spans = ((37, 39), (46, 53), (58, 61), (66, 76))
-                            for (lo, hi), label in zip(h_spans, ("ID", "HARNESS", "GEN", "LAST CLEAR")):
-                                self.assertEqual(header[lo:hi], label)
-                            for left, right in zip(h_spans, h_spans[1:]):
-                                self.assertLessEqual(left[1], right[0])
 
 
 class QuietSizes(unittest.TestCase):

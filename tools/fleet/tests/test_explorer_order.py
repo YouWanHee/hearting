@@ -52,6 +52,24 @@ class ExplorerOrderTests(unittest.TestCase):
         self.assertFalse(clicked.drag)
         self.assertEqual(effects, ())
 
+    def test_tree_drag_highlight_begins_on_first_motion(self):
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.view_model import load_fixture
+        fixture = Path(__file__).parent / "fixtures" / "explorer" / "view_model.json"
+        vm = load_fixture(fixture)
+        initial = draw(vm, NavState(), 140, 45)
+        repo_hit = next(hit for hit in initial.hits if hit.action[:1] == ("scope",)
+                        and str(hit.action[1]).startswith("repo:"))
+        pressed, _ = reduce(NavState(), {"type": "mouse", "phase": "press", "x": 2,
+                                         "y": repo_hit.y}, initial)
+        pressed_frame = draw(vm, pressed, 140, 45)
+        self.assertEqual(pressed_frame.cells, initial.cells)
+        moved, _ = reduce(pressed, {"type": "mouse", "phase": "press", "motion": True,
+                                    "x": 4, "y": repo_hit.y}, initial)
+        moved_frame = draw(vm, moved, 140, 45)
+        grabbed = next(hit for hit in moved_frame.hits if hit.action == repo_hit.action)
+        self.assertTrue(all(cell[2] == 236 for cell in moved_frame.cells[grabbed.y][:32]))
+
     def test_repo_drag_commits_and_cross_repo_session_drop_is_refused(self):
         frame = CellFrame((), (Hit(4, 0, 32, ("scope", "repo:a")),
                                Hit(5, 0, 32, ("scope", "repo:b")),
@@ -67,6 +85,18 @@ class ExplorerOrderTests(unittest.TestCase):
         state, effects = reduce(state, {"type": "mouse", "phase": "release", "x": 2, "y": 5,
                                         "ordering": ordering}, frame)
         self.assertEqual(effects, (("reorder", "repo", "a", "a", "b"),))
+        ended_target_state, _ = reduce(NavState(), {"type": "mouse", "phase": "press", "x": 2,
+                                                    "y": 4, "ordering": ordering}, frame)
+        ended_target_state, _ = reduce(ended_target_state,
+                                      {"type": "mouse", "phase": "press", "motion": True,
+                                       "x": 2, "y": 5, "ordering": ordering}, frame)
+        _ended_target_state, ended_effects = reduce(
+            ended_target_state, {"type": "mouse", "phase": "release", "x": 2, "y": 5,
+                                 "ordering": {"repo_by_tag": {}, "tag_keys": {}}}, frame)
+        self.assertEqual(ended_effects, (("reorder", "repo", "a", "a", "b"),))
+        self.assertEqual(order.move_repo({"repos": ["a", "c"], "sessions": {}},
+                                         ended_effects[0][3], ended_effects[0][4])["repos"],
+                         ["c", "a"])
         state, _ = reduce(NavState(), {"type": "mouse", "phase": "press", "x": 2, "y": 6,
                                        "ordering": ordering}, frame)
         state, _ = reduce(state, {"type": "mouse", "phase": "press", "motion": True,
@@ -76,14 +106,14 @@ class ExplorerOrderTests(unittest.TestCase):
                                         "ordering": ordering}, frame)
         self.assertEqual(effects, ())
 
-    def test_order_end_hit_commits_last_insertion(self):
-        frame = CellFrame((), (Hit(4, 0, 32, ("scope", "repo:a")),
-                               Hit(8, 0, 32, ("order-end",))), 40, 20)
+    def test_empty_rail_below_tree_commits_last_insertion_without_hit(self):
+        frame = CellFrame((), (Hit(4, 0, 32, ("scope", "repo:a")),), 40, 20)
         state, _ = reduce(NavState(), {"type": "mouse", "phase": "press", "x": 2, "y": 4,
                                        "ordering": {}}, frame)
         state, _ = reduce(state, {"type": "mouse", "phase": "press", "motion": True,
                                   "x": 2, "y": 8, "ordering": {}}, frame)
         self.assertEqual(state.drag[6:8], ("end", True))
+        self.assertFalse(any(hit.action[:1] == ("order-end",) for hit in frame.hits))
         _state, effects = reduce(state, {"type": "mouse", "phase": "release", "x": 2, "y": 8,
                                          "ordering": {}}, frame)
         self.assertEqual(effects, (("reorder", "repo", "a", "a", "end"),))

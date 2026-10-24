@@ -1,22 +1,19 @@
 """Seat and generation list for the HISTORY view."""
 
 from collections.abc import Mapping
-from .tables import _clip, _tint_row, repo_label, repo_rule_label
+from .tables import _clip, _tint_row, repo_rule_label
 
 
 def draw_history(grid, vm, state, x=34, y=3):
     use = max(0, grid.cols - x - 2)
     right, bottom = x + use + 1, grid.rows - 6
-    if use < 75:
-        return _draw_history_compact(grid, vm, state, x, y, use, right, bottom)
     grid.fill(x, right, y, " ", tint=234)
     seats = tuple(vm.seats or ())
     opened = state.opened_for("hopen:" + state.view)
     c_id = 18
     c_h, c_gen = c_id + 4 + 3, c_id + 4 + 3 + 8 + 3
-    gen_width = min(24, max((len((vm.generations or {}).get(str(seat[0]), ())) for seat in seats), default=0),
-                    max(8, use - c_gen - 3 - 3 - 14 - 3 - 16))
-    gen_width = max(gen_width, len("GENERATIONS"))
+    gen_width = max(8, min(24, max((len((vm.generations or {}).get(str(seat[0]), ())) for seat in seats),
+                                   default=0), use - c_gen - 3 - 3 - 14 - 3 - 16))
     c_last = c_gen + 3 + gen_width + 3
     c_card = c_last + 14 + 3
     for off, label in ((2, "REPO"), (c_id, "ID"), (c_h, "HARNESS"), (c_gen, "GENERATIONS"),
@@ -50,21 +47,9 @@ def draw_history(grid, vm, state, x=34, y=3):
         grid.put(x + c_h, y, harness, "hb_" + harness)
         grid.put(x + c_gen, y, f"{generation_count:2d} ", "soft")
         root_marks = tuple(seat[6]) if len(seat) > 6 else tuple((vm.generations or {}).get(tag, ()))
-        shown = root_marks[-gen_width:]
-        cursor = x + c_gen + 3
-        for index, generation in enumerate(shown):
-            if isinstance(generation, Mapping):
-                gen_harness = str(generation.get("harness") or harness)
-                kind = str(generation.get("kind") or "new")
-            else:
-                details = generation if isinstance(generation, (list, tuple)) else (generation,)
-                gen_harness = str(details[0]) if details else harness
-                kind = str(details[1]) if len(details) > 1 else "new"
-            glyph = {"new": "●", "cont": "○", "existing": "◆"}.get(kind, "●")
-            hue = {"claude": "c", "codex": "m", "opencode": "l"}.get(gen_harness, "d")
-            cursor = grid.put(cursor, y, glyph, (hue, int(index == len(shown) - 1), 0))
-        grid.put(x + c_last, y, _clip(last_clear, 14), "dim")
-        grid.put(x + c_card, y, _clip(title, max(0, right - (x + c_card) - 1)),
+        _gen_strip(grid, x + c_gen + 3, y, root_marks, gen_width, harness)
+        grid.put(x + c_last, y, last_clear, "dim", limit=right)
+        grid.put(x + c_card, y, _clip(title, use - c_card) if title != "·" else "·",
                  "soft" if title != "·" else "dim", limit=right)
         if is_open:
             _tint_row(grid, y, x - 1, right, 236)
@@ -81,6 +66,26 @@ def draw_history(grid, vm, state, x=34, y=3):
         cursor = grid.put(cursor, y + 1, " a running session took over (retire)   ", "dim", limit=footer_end)
         cursor = grid.put(cursor, y + 1, "colour", "soft", limit=footer_end)
         grid.put(cursor, y + 1, " = harness   ·   click a row: its generations here", "dim", limit=footer_end)
+
+
+def _gen_strip(grid, x, y, marks, room, harness):
+    """One mark per generation, newest bold; a seat with more generations than room leads with ``…``."""
+    shown = marks
+    if len(marks) > room:
+        x = grid.put(x, y, "…", "dim")
+        shown = marks[-(room - 1):]
+    for index, generation in enumerate(shown):
+        if isinstance(generation, Mapping):
+            gen_harness = str(generation.get("harness") or harness)
+            kind = str(generation.get("kind") or "new")
+        else:
+            details = generation if isinstance(generation, (list, tuple)) else (generation,)
+            gen_harness = str(details[0]) if details else harness
+            kind = str(details[1]) if len(details) > 1 else "new"
+        glyph = {"new": "●", "cont": "○", "existing": "◆"}.get(kind, "●")
+        hue = {"claude": "c", "codex": "m", "opencode": "l"}.get(gen_harness, "d")
+        x = grid.put(x, y, glyph, (hue, int(index == len(shown) - 1), 0))
+    return x
 
 
 def draw_seat_expand(grid, vm, state, tag, x, use, y, bottom, seat, harness):
@@ -129,14 +134,9 @@ def draw_seat_expand(grid, vm, state, tag, x, use, y, bottom, seat, harness):
         grid.put(x0 + 20, y, {"new": "●", "cont": "○", "existing": "◆"}.get(kind, "●"), (hue, 1, 0))
         cursor = grid.put(x0 + 22, y, h, "hb_" + h)
         grid.put(cursor + 1, y, sid, "dim")
-        # A narrow pane has no room for both: the card title takes the connection's place.
-        wide = right - x0 >= 75 + 12
-        if wide:
-            grid.put(x0 + 42, y, _clip(connection, 30), "blocked" if kind == "existing" else "dim")
-        title_x = x0 + (75 if wide else 42)
-        if title_x < right - 1:
-            grid.put(title_x, y, _clip(title, max(0, (use - 75 - 6) if wide else right - title_x - 1)),
-                     "soft" if isinstance(gen, Mapping) and gen.get("card") else "dim", limit=right)
+        grid.put(x0 + 42, y, _clip(connection, 30), "blocked" if kind == "existing" else "dim", limit=right)
+        grid.put(x0 + 75, y, _clip(title, use - 75 - 6),
+                 "soft" if isinstance(gen, Mapping) and gen.get("card") else "dim", limit=right)
         if index == selected:
             _tint_row(grid, y, x0 - 1, right, 234)
         y += 1
@@ -145,62 +145,3 @@ def draw_seat_expand(grid, vm, state, tag, x, use, y, bottom, seat, harness):
         return y + 1
     from .pages import draw_history_detail
     return draw_history_detail(grid, vm, state, tag, x0, right, y, bottom)
-
-
-def _draw_history_compact(grid, vm, state, x, y, use, right, bottom):
-    seats = tuple(vm.seats or ())
-    opened = state.opened_for("hopen:" + state.view)
-    grid.fill(x, right, y, " ", tint=234)
-    for off, label in ((3, "ID"), (12, "HARNESS"), (24, "GEN"), (32, "LAST CLEAR")):
-        grid.put(x + off, y, label, "head", tint=234, limit=right)
-    y += 1
-    last_repo = None
-    for seat in seats:
-        if y + 1 >= bottom:
-            return
-        tag, repo = str(seat[0]), str(seat[1])
-        if repo != last_repo:
-            if repo_label(repo):
-                grid.put(x + 1, y, "┈ ", "line")
-                end = grid.put(x + 3, y, repo + "/", "title_dim")
-                for xx in range(end + 1, right):
-                    grid.put(xx, y, "┈", "line")
-                y += 1
-            last_repo = repo
-        selected = opened == tag
-        action = ("fold", "hopen:" + state.view, tag)
-        grid.add_hit(y, x, right, action)
-        grid.add_hit(y + 1, x, right, action)
-        if selected:
-            _tint_row(grid, y, x - 1, right, 236)
-            _tint_row(grid, y + 1, x - 1, right, 236)
-        grid.put(x + 3, y, f"[{tag}]", "soft")
-        session = next((item for item in vm.sessions if item.get("tag") == tag), {})
-        harness = str(session.get("harness") or "·")
-        grid.put(x + 12, y, harness, "hb_" + harness)
-        count = int(seat[2]) if len(seat) > 2 else 0
-        grid.put(x + 24, y, f"{count:2d}", "soft")
-        grid.put(x + 32, y, _clip(str(seat[3] if len(seat) > 3 else "·"), max(0, right - x - 32)),
-                 "dim", limit=right)
-        y += 1
-        title = str(seat[5] or "·") if len(seat) > 5 else "·"
-        grid.put(x + 12, y, _clip(title, max(0, use - 14)), "soft", limit=right)
-        y += 1
-        if selected:
-            generations = tuple((vm.generations or {}).get(tag, ()))
-            for index in range(len(generations) - 1, -1, -1):
-                if y >= bottom:
-                    return
-                gen = generations[index]
-                if isinstance(gen, Mapping):
-                    h = str(gen.get("harness") or harness)
-                    kind = str(gen.get("kind") or "new")
-                else:
-                    details = gen if isinstance(gen, (list, tuple)) else (gen,)
-                    h = str(details[0]) if details else harness
-                    kind = str(details[1]) if len(details) > 1 else "new"
-                mark = {"new": "●", "cont": "○", "existing": "◆"}.get(kind, "●")
-                grid.put(x + 14, y, mark, "soft")
-                grid.put(x + 16, y, h, "hb_" + h)
-                grid.put(x + 25, y, "now" if index == len(generations) - 1 else str(index + 1), "dim")
-                y += 1

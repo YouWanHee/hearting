@@ -49,14 +49,21 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
     from .state import NavState
     state = nav_state if isinstance(nav_state, NavState) else NavState.from_value(nav_state)
     state = replace(state, title=_scope_title(vm, state))
-    grid = CellGrid(cols, rows)
+    # An open usage block takes two rows from the pane: the view lays itself out on a pane two
+    # rows shorter (its own scroll windows and "fits" tests see that), and lands two rows lower.
+    pushed_rows = 2 if state.usage_open and rows - 2 > 7 else 0
+    view_rows = rows - pushed_rows
+    grid = CellGrid(cols, view_rows)
     chrome.draw_explorer(grid, vm, state)
     pane_x = NAV_WIDTH + 2
-    spill_y = max(0, int(rows) - 5)
+    spill_y = max(0, int(view_rows) - 5)
     for x in range(pane_x, grid.cols):
         grid.put(x, spill_y, "━", "line")
     spill_baseline = tuple(grid.cells[spill_y][pane_x:])
     grid.mark_moved()
+    if grid.cols < 120:
+        # A narrow screen keeps the last column free: whatever a view would spill into it is cut.
+        grid.pane_clip = (pane_x - 1, grid.cols - 1)
     if state.scope != "-":
         pages.draw_scope(grid, vm, state)
     elif state.view == "OVERVIEW":
@@ -77,10 +84,11 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
         models.draw_models(grid, vm, state)
     elif state.view == "SYSTEM":
         resources.draw_system(grid, vm, state)
+    grid.pane_clip = None
     # DESIGN=4 reserves row 2 as the blank spacer and starts the pane body below
     # the joined VIEWS / pane title band on row 3.
     pane_overflow = tuple(grid.cells[spill_y][pane_x:]) != spill_baseline
-    for y in range(max(3, rows - 6), 2, -1):
+    for y in range(max(3, view_rows - 6), 2, -1):
         for x in range(pane_x - 1, grid.cols):
             grid.cells[y + 1][x] = grid.cells[y][x]
     for x in range(pane_x, grid.cols):
@@ -91,30 +99,28 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
     # View content owns rows above the shared feed/key/status bands only. Mark
     # overflow and discard offscreen cells/hits before those shared bands draw.
     body_end = max(0, int(rows) - 4)
+    view_body_end = max(0, int(view_rows) - 4)
     pushed = False
-    if state.usage_open and body_end > 3:
-        # The expanded usage block pushes the view pane down two rows; the explorer
-        # rail is drawn again at its own offset and keeps compute anchored at the foot.
+    if pushed_rows:
+        # What the view left in the last two rows of its short pane runs past the real pane's end.
         pane = NAV_WIDTH + 1
-        prior = [list(row) for row in grid.cells]
         pushed = any(cell[0] != " " or cell[1] is not None or cell[2] is not None
-                     for row in prior[body_end - 2:body_end] for cell in row[pane:])
-        for row_index in range(3, body_end):
-            for col in range(grid.cols):
-                grid.cells[row_index][col] = ((" ", None, None) if row_index < 5 or col < pane
-                                              else prior[row_index - 2][col])
+                     for row in grid.cells[view_body_end:view_body_end + 2] for cell in row[pane:])
+    overflow = pane_overflow or pushed or any(any(cell[0] != " " or cell[1] is not None or cell[2] is not None
+                       for cell in row) for row in grid.cells[view_body_end:])
+    if pushed_rows and body_end > 3:
+        pane = NAV_WIDTH + 1
+        prior = grid
+        grid = CellGrid(cols, rows)
+        for row_index in range(5, body_end):
+            source = row_index - pushed_rows
+            if source < prior.rows:
+                grid.cells[row_index][pane:] = prior.cells[source][pane:]
         grid.mark_moved()
-        view_hits = [Hit(hit.y + 2, hit.x0, hit.x1, hit.action) if 3 <= hit.y else hit
-                     for hit in grid.hits if hit.x0 >= pane or hit.y < 0]
-        grid.hits = []
+        view_hits = [Hit(hit.y + pushed_rows, hit.x0, hit.x1, hit.action) if 3 <= hit.y else hit
+                     for hit in prior.hits if hit.x0 >= pane or hit.y < 0]
         chrome.draw_explorer(grid, vm, state)
         grid.hits.extend(view_hits)
-    overflow = pane_overflow or pushed or any(any(cell[0] != " " or cell[1] is not None or cell[2] is not None
-                       for cell in row) for row in grid.cells[body_end:])
-    if state.view == "OVERVIEW" and state.scope == "-":
-        overflow = pushed
-    if state.view == "PEERS" and int(cols) >= 168:
-        overflow = False
     grid.hits = [hit for hit in grid.hits if hit.y < body_end or hit.y == -1]
     for row_index in range(body_end + 1, grid.rows):
         grid.fill(0, grid.cols, row_index, " ")

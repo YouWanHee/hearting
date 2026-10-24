@@ -12,6 +12,25 @@ def cell_width(char):
     return existing_width(char)
 
 
+def clip_cells(text, room):
+    """Cut ``text`` to ``room`` cells, always ending in ``…`` when something was cut.
+
+    A room of zero or less still leaves the ``…``: the approved drawing never returns an empty
+    string for text that did not fit, however little room is left.
+    """
+    text = str(text)
+    if cell_width(text) <= room:
+        return text
+    out, used = [], 0
+    for char in text:
+        cells = cell_width(char)
+        if used + cells > room - 1:
+            break
+        out.append(char)
+        used += cells
+    return "".join(out) + "…"
+
+
 @dataclass(frozen=True)
 class Hit:
     y: int
@@ -28,12 +47,17 @@ class CellGrid:
         self.cells = [[(" ", None, background) for _ in range(self.cols)] for _ in range(self.rows)]
         self.hits = []
         self.trace = CellGrid.default_trace   # ownership checks in tests; None in production
+        self.pane_clip = None                 # (first column, edge): pane text never crosses the edge
 
     def put(self, x, y, text, key=None, tint=None, limit=None):
         x, y = int(x), int(y)
         if y < 0 or y >= self.rows:
             return x
         right = self.cols if limit is None else min(self.cols, int(limit))
+        if self.pane_clip is not None and x >= self.pane_clip[0]:
+            right = min(right, self.pane_clip[1])
+        if x >= right:
+            return x                          # a column the pane or screen does not have: nothing to draw
         style = normalize_style(key, tint)
         text = str(text)
         trace = self.trace

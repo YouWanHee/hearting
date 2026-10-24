@@ -166,6 +166,14 @@ def _reduce(state, event, frame=None):
                             target_kind, target = "session", value
                     elif action[:1] == ("order-end",):
                         target, valid = "end", True
+                    elif (hit is None and x < 32 and
+                          y > max((item.y for item in getattr(frame, "hits", ())
+                                   if item.action[:1] == ("scope",) and len(item.action) > 1 and
+                                   (str(item.action[1]).startswith("repo:") or
+                                    ":" not in str(item.action[1]))), default=-1)):
+                        # Empty rail cells below the last tree row are the end
+                        # insertion point; they deliberately have no hit box.
+                        target, valid = "end", True
                     if target_kind == drag[1]:
                         if target_kind == "repo":
                             valid = target != drag[2]
