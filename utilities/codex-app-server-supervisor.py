@@ -9,9 +9,11 @@ from codex_permission_profile import (
     OWNER_COMMIT_NO_NETWORK_PROFILE_NAME,
     OWNER_OBSERVE_PROFILE_NAME,
     PROFILE_NAME,
+    RECORDISH_PROFILE_NAME,
     commit_profile_config,
     config_arguments,
     owner_turn_profile_config,
+    recordish_profile_config,
     turn_permissions_available,
 )
 from worker_runtime_home import codex_worker_arguments
@@ -765,6 +767,18 @@ def configure_permission_profiles(args: argparse.Namespace, command: list[str]) 
     """Prepare owner profiles; enable turn selection only on known-capable runtimes."""
     args.turn_permissions_supported = False
     args.owner_turn_permission_profiles = None
+    if getattr(args, "route_file", None):
+        from dispatch_contract import diagnose_repository_start
+        if diagnose_repository_start(args.worktree).get("state") == "non-git":
+            profile = recordish_profile_config(
+                args.worktree, list(args.writable_root), args.route_file,
+                network=bool(args.network_access),
+            )
+            if profile is None:
+                raise SupervisorError("codex-non-git-recordish-profile-unsupported")
+            args.native_permission_profile = profile
+            args.recordish_profile_active = True
+            return
     owner_state = getattr(args, "owner_runtime_permission_state", None)
     if (owner_state is not None
             and getattr(args, "owner_runtime_base_sandbox", args.sandbox) == "workspace-write"):
@@ -799,7 +813,10 @@ def configure_permission_profiles(args: argparse.Namespace, command: list[str]) 
 def resource_sandbox_command(args, row):
     """Apply this owner's selected native policy; no tool namespace inheritance."""
     from codex_permission_profile import PROFILE_NAME
-    if args.sandbox == "danger-full-access":
+    if getattr(args, "recordish_profile_active", False):
+        options = [*config_arguments(args.native_permission_profile), "-P", RECORDISH_PROFILE_NAME]
+        enforcement = "os-sandbox"
+    elif args.sandbox == "danger-full-access":
         options = ["-P", ":danger-full-access"]
         enforcement = "none"
     elif args.sandbox in {"workspace-write", "read-only"}:
@@ -866,7 +883,8 @@ def run_turn(
             )
     if selected_profile is not None:
         params["permissions"] = selected_profile
-    elif owner_projection is not None or getattr(args, "native_permission_profile", None) is None:
+    elif ((owner_projection is not None and not getattr(args, "recordish_profile_active", False))
+          or getattr(args, "native_permission_profile", None) is None):
         params["sandboxPolicy"] = sandbox_policy(args)
     if args.approval != "inherit" and getattr(args, "native_permission_profile", None) is None:
         params["approvalPolicy"] = args.approval

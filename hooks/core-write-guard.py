@@ -81,6 +81,50 @@ def violation(target: str, cwd: str) -> str:
             if _within(path, root):
                 return (f"hearting: {path} is an installed release copy; edit the source "
                         f"checkout and reinstall instead.")
+        route_file = os.environ.get("AGENT_ROUTE_FILE") or os.environ.get("AGENT_OWNER_ROUTE_FILE")
+        registered = os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER", "").lower() in {"1", "true"}
+        if route_file and registered:
+            route_record = None
+            try:
+                agent_home = Path(os.environ.get("AGENT_HOME") or Path(__file__).resolve().parents[1])
+                sys.path.insert(0, str(agent_home / "utilities"))
+                from dispatch_contract import validated_unversioned_route
+                route_record = json.loads(Path(route_file).expanduser().read_text(encoding="utf-8"))
+                route_cwd = route_record.get("cwd") if isinstance(route_record, dict) else None
+                if not isinstance(route_cwd, str) or not route_cwd:
+                    raise ValueError("bound route has no cwd")
+                route = validated_unversioned_route(route_cwd)
+            except Exception:
+                route = None
+                if any(os.environ.get(key) for key in (
+                        "AGENT_ROUTE_ID", "AGENT_OWNER_ROUTE_ID", "AGENT_ROUTE_HASH",
+                        "AGENT_OWNER_ROUTE_HASH")):
+                    return "hearting: 등록된 route를 검증할 수 없어 원본 편집을 막았습니다. " \
+                           "현재 cycle 출력 경로를 확인하고 다시 시작하세요."
+            if (route is None and isinstance(route_record, dict)
+                    and route_record.get("source_commit") == "unversioned"
+                    and any(os.environ.get(key) for key in (
+                        "AGENT_ROUTE_ID", "AGENT_OWNER_ROUTE_ID", "AGENT_ROUTE_HASH",
+                        "AGENT_OWNER_ROUTE_HASH"))):
+                return "hearting: 등록된 route를 검증할 수 없어 원본 편집을 막았습니다. " \
+                       "현재 cycle 출력 경로를 확인하고 다시 시작하세요."
+            if route is not None:
+                route_cwd = Path(os.path.realpath(route.get("cwd", "")))
+                artifact = Path(os.path.realpath(route.get("artifact_root", "")))
+                lexical = Path(os.path.abspath(
+                    Path(target).expanduser() if Path(target).expanduser().is_absolute()
+                    else base / Path(target).expanduser()
+                ))
+                lexical_in_artifact = _within(lexical, artifact)
+                resolved_in_artifact = _within(path, artifact)
+                if ((lexical_in_artifact != resolved_in_artifact)
+                        or ((_within(lexical, route_cwd) or _within(path, route_cwd))
+                            and not (lexical_in_artifact and resolved_in_artifact))):
+                    output = (os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR")
+                              or os.environ.get("AGENT_ARTIFACT_CYCLE_DIR")
+                              or str(artifact))
+                    return (f"hearting: non-Git 기록형 route에서는 원본을 편집할 수 없습니다: {path}. "
+                            f"이번 cycle 출력에 쓰세요: {output}")
         linked = _linked_worktree(base)
         if not linked:
             return ""

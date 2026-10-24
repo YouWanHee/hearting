@@ -69,6 +69,22 @@ class CommitPolicyTest(unittest.TestCase):
         self.assertFalse(commit_policy.no_commit_stage(
             argparse.Namespace(worker_type="stage", write_scope="reports/**", worktree=str(self.linked))))
 
+    def test_verified_unversioned_route_is_known_idle_but_never_commit_or_publish(self):
+        route_file = str(self.primary / "route.json")
+        for worker_type in ("owner", "stage", "frame"):
+            args = self.args(worker_type, self.primary, route_file=route_file)
+            with mock.patch.object(commit_policy, "git_operation_state", return_value=(None, False)), \
+                 mock.patch("dispatch_contract.validated_unversioned_route",
+                            return_value={"source_commit": "unversioned"}):
+                projection = commit_policy.runtime_permission_projection(args)
+                prompt = commit_policy.prompt_clause(args)
+            self.assertEqual(projection, {
+                "git_operation": None, "git_state_known": True,
+                "observation_only": False, "may_commit": False,
+                "task_publish_scope": None,
+            })
+            self.assertNotIn("Git operation in progress", prompt)
+
     def test_approved_document_commit_is_path_limited_and_preserves_other_work(self):
         git = ["git", "-C", str(self.linked)]
         readme = self.linked / "README.md"
