@@ -140,7 +140,7 @@ def sandbox(argv: list[str], world: Path, env: dict[str, str], cwd: Path | None 
         args += ["--setenv", "JOURNEY_PROBE_HOME", real_home,
                  "--setenv", "JOURNEY_PROBE_NAS", "/home/nas",
                  "--setenv", "JOURNEY_PROBE_NAME", world.name]
-        probe = "import os,pathlib; h=pathlib.Path(os.environ['JOURNEY_PROBE_HOME']); n=pathlib.Path(os.environ['JOURNEY_PROBE_NAS']); assert not list(h.iterdir()); assert not list(n.iterdir()); (h/os.environ['JOURNEY_PROBE_NAME']).write_text('x'); (n/os.environ['JOURNEY_PROBE_NAME']).write_text('x'); assert 'herdr' not in os.environ['PATH'].split(':')"
+        probe = "import os,pathlib,json,shutil; h=pathlib.Path(os.environ['JOURNEY_PROBE_HOME']); n=pathlib.Path(os.environ['JOURNEY_PROBE_NAS']); r={'real_home_empty':not list(h.iterdir()),'nas_empty':not list(n.iterdir())}; h.joinpath(os.environ['JOURNEY_PROBE_NAME']).write_text('x'); n.joinpath(os.environ['JOURNEY_PROBE_NAME']).write_text('x'); r['herdr_absent_from_path']=shutil.which('herdr') is None; print(json.dumps(r))"
         return args + ["python3", "-c", probe]
     return args + argv
 
@@ -464,11 +464,17 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
             if visible != expected_visible: record["failures"].append({"reason": "cli-visibility-mismatch"})
             if platform.system() == "Linux":
                 probe = run(sandbox(["true"], world, env, cli=cli_mounts, probes=True), env=env, timeout=args.step_timeout)
-                checks = {"real_home_empty": probe["exit"] == 0, "nas_empty": probe["exit"] == 0,
+                probe_values = {}
+                try: probe_values = json.loads(probe["output"].splitlines()[-1])
+                except (ValueError, IndexError): pass
+                checks = {"real_home_empty": probe_values.get("real_home_empty") is True,
+                          "nas_empty": probe_values.get("nas_empty") is True,
                           "home_write_not_host_visible": not (Path.home()/world.name).exists(), "nas_write_not_host_visible": not (Path("/home/nas")/world.name).exists(),
                           "forbidden_env_absent": not any(k.startswith(("HERDR_", "AGENT_", "CLAUDE_CODE_")) for k in env),
-                          "herdr_absent_from_path": shutil.which("herdr", path=env["PATH"]) is None}
+                          "herdr_absent_from_path": probe_values.get("herdr_absent_from_path") is True}
                 record["isolation"]["checks"] = [{"check": k, "passed": v} for k,v in checks.items()]
+                record["isolation"]["probe_exit"] = probe["exit"]
+                record["isolation"]["probe_detail"] = probe["output"][-240:].replace(str(world), "<world>")
                 record["isolation"]["d3"] = all(checks.values())
                 if not record["isolation"]["d3"]: record["failures"].append({"reason": "isolation-probe-failed"})
             runtimes = PROFILES[profile]
@@ -488,9 +494,10 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
             if settings.exists():
                 try:
                     cfg = json.loads(settings.read_text())
-                    hooks = json.dumps(cfg)
-                    paths = re.findall(r"\$HOME/[^\" ]+", hooks)
-                    missing = [p for p in paths if not (home / p[6:]).is_file()]
+                    commands = [hook.get("command", "") for entries in cfg.get("hooks", {}).values()
+                                for entry in entries for hook in entry.get("hooks", []) if isinstance(hook, dict)]
+                    paths = [p for command in commands for p in re.findall(r"\$HOME/([^\"\s]+)", command)]
+                    missing = [p for p in paths if not (home / p).is_file()]
                     if missing: record["failures"].append({"reason": "claude-hook-command-missing", "count": len(missing)})
                 except (ValueError, OSError): record["failures"].append({"reason": "claude-settings-invalid"})
         # Demo test is explicitly observed before and after; baseline failure is expected.
@@ -626,7 +633,8 @@ def write_report(record: dict, output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
     raw = json.dumps(record, indent=2, sort_keys=True) + "\n"
     (output / "journey.json").write_text(raw, encoding="utf-8")
-    lines = [f"# First journey: {record['profile']}", "", f"- Source: {record['source']}",
+    source_kind = record["source"].get("kind") if isinstance(record["source"], dict) else record["source"]
+    lines = [f"# First journey: {record['profile']}", "", f"- Source: {source_kind}",
              f"- Resolved tag: {record.get('source_detail', {}).get('resolved_tag', 'unknown')}",
              f"- Installer SHA-256: {record.get('source_detail', {}).get('installer_sha256', 'unknown')}",
              f"- Isolation: {record['isolation']['level']} (d3={record['isolation']['d3']})",
