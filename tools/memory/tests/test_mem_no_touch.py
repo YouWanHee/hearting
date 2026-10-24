@@ -8,6 +8,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 MEM = Path(__file__).resolve().parents[1] / "mem.py"
@@ -94,6 +96,46 @@ class NoTouchCliTest(unittest.TestCase):
         self.assertEqual(recall.returncode, 0, recall.stderr)
         self.assertIn("wal-only-newest", recall.stdout)
         self.assertEqual(self.snapshot(self.paths), before)
+
+    def test_concurrent_wal_appends_return_one_complete_read_snapshot(self):
+        ready = threading.Event()
+        finished = threading.Event()
+        writer_error = []
+        final_files = {}
+
+        def append_while_reading():
+            try:
+                writer = sqlite3.connect(self.store / "memory.db")
+                try:
+                    writer.execute("PRAGMA journal_mode=WAL")
+                    writer.execute("PRAGMA wal_autocheckpoint=0")
+                    for version in range(1, 181):
+                        writer.execute(
+                            "UPDATE records SET body=? WHERE id=?",
+                            (f"concurrent-body-{version:03d}-complete", self.rid),
+                        )
+                        writer.commit()
+                        if version == 1:
+                            ready.set()
+                        time.sleep(0.004)
+                finally:
+                    writer.close()
+                final_files.update(self.snapshot(self.paths))
+            except Exception as exc:  # surfaced in the owning test thread
+                writer_error.append(exc)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=append_while_reading, daemon=True)
+        worker.start()
+        self.assertTrue(ready.wait(timeout=5))
+        result = self.run_mem("show", self.rid, "--no-touch")
+        worker.join(timeout=5)
+        self.assertTrue(finished.is_set(), "fixture WAL writer did not stop")
+        self.assertFalse(writer_error, writer_error)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"concurrent-body-\d{3}-complete")
+        self.assertEqual(self.snapshot(self.paths), final_files)
 
     def test_no_touch_respects_project_pending_superseded_and_injection_fences(self):
         created = {}
