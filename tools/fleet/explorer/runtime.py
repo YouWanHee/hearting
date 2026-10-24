@@ -14,45 +14,86 @@ import time
 class ExplorerRuntime:
     """Behaviour-preserving runtime hooks for the explorer."""
 
+    def __init__(self):
+        self._identity_generation = object()
+        self._identity_detail = None
+        self._identity_tags = None
+        self._identity_by_tag = None
+        self._order_path = None
+        self._order_signature = object()
+        self._order_value = None
+
+    @staticmethod
+    def _file_signature(path):
+        try:
+            info = path.stat()
+        except OSError:
+            return None
+        return (info.st_dev, info.st_ino, info.st_size,
+                getattr(info, "st_mtime_ns", int(info.st_mtime * 1e9)),
+                getattr(info, "st_ctime_ns", int(info.st_ctime * 1e9)))
+
+    def _load_order(self, order):
+        path = order.order_path()
+        signature = self._file_signature(path)
+        if path != self._order_path or signature != self._order_signature:
+            self._order_value = order.load_order(path)
+            self._order_path = path
+            self._order_signature = signature
+        return self._order_value
+
     def prepare(self, snapshot, detail, *, vm, generation, now):
         """Return the already-built model and collection readiness for this generation."""
         model = vm
         try:
             from . import live, order
-            resolver = live._resolver(snapshot)
-            _rows, by_tag = live._session_records(snapshot, now or time.time(), resolver)
-            source_rows = tuple(live._records(live._get(snapshot, "sessions", default=())))
-            for source in source_rows:
-                explicit = live._text(live._get(source, "session_tag", "tag"))
-                sid = live._text(live._get(source, "session_id", "sid", "id"))
-                if explicit:
-                    by_tag.setdefault(explicit, {"session": source, "sid": sid})
-                if sid:
-                    by_tag.setdefault(sid, {"session": source, "sid": sid})
+            tags = tuple(str(row.get("tag", "")) for row in model.sessions)
+            cached = (generation == self._identity_generation and detail is self._identity_detail
+                      and tags == self._identity_tags)
+            if not cached:
+                resolver = live._resolver(snapshot)
+                _rows, by_tag = live._session_records(snapshot, now or time.time(), resolver)
+                source_rows = tuple(live._records(live._get(snapshot, "sessions", default=())))
+                for source in source_rows:
+                    explicit = live._text(live._get(source, "session_tag", "tag"))
+                    sid = live._text(live._get(source, "session_id", "sid", "id"))
+                    if explicit:
+                        by_tag.setdefault(explicit, {"session": source, "sid": sid})
+                    if sid:
+                        by_tag.setdefault(sid, {"session": source, "sid": sid})
+                identity_by_tag = {}
+                for row in model.sessions:
+                    tag = str(row.get("tag", ""))
+                    identity = by_tag.get(tag, {})
+                    source = identity.get("session")
+                    sid = identity.get("sid")
+                    harness = str(row.get("harness") or "")
+                    if sid:
+                        stable = "sid:" + harness + ":" + str(sid)
+                    elif source is not None:
+                        stable = "process:" + ":".join(str(live._get(source, key, default=""))
+                                                           for key in ("harness", "pid", "proc_start", "managed_dir"))
+                    else:
+                        # Unknown identity remains ephemeral for this generation and is never
+                        # persisted as a display-tag key.
+                        stable = "unidentified:" + harness + ":" + tag
+                    identity_by_tag[tag] = stable
+                self._identity_generation = generation
+                self._identity_detail = detail
+                self._identity_tags = tags
+                self._identity_by_tag = identity_by_tag
             sessions = []
             tag_keys, repo_by_tag, tags_by_key = {}, {}, {}
             for row in model.sessions:
                 tag = str(row.get("tag", ""))
-                identity = by_tag.get(tag, {})
-                source = identity.get("session")
-                sid = identity.get("sid")
-                harness = str(row.get("harness") or "")
-                if sid:
-                    stable = "sid:" + harness + ":" + str(sid)
-                elif source is not None:
-                    stable = "process:" + ":".join(str(live._get(source, key, default=""))
-                                                       for key in ("harness", "pid", "proc_start", "managed_dir"))
-                else:
-                    # Unknown identity remains ephemeral for this generation and is never
-                    # persisted as a display-tag key.
-                    stable = "unidentified:" + harness + ":" + tag
+                stable = self._identity_by_tag[tag]
                 session = dict(row)
                 session["order_key"] = stable
                 sessions.append(session)
                 tag_keys[tag] = stable
                 repo_by_tag[tag] = str(row.get("repo_id", row.get("repo", "")))
                 tags_by_key[stable] = tag
-            saved = order.load_order()
+            saved = self._load_order(order)
             reconciled = order.reconcile_order(saved, model.repos, sessions)
             ordered_sessions = reconciled["sessions"]
             ordered_tags = [str(row.get("tag", "")) for row in ordered_sessions]
@@ -110,6 +151,9 @@ class ExplorerRuntime:
             elif kind == "session":
                 saved = order.move_session(saved, repo, source, target)
             order.save_order(saved)
+            # A drag writes the authoritative order. Reload on the next compose so
+            # the cached view follows the same disk-backed path as external changes.
+            self._order_signature = object()
         return None
 
     def loading_frame(self, cols, rows):
