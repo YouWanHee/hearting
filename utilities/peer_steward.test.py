@@ -10146,6 +10146,35 @@ class RetireTerminalFollowupRegressionTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(completed["observation"]["terminal_followup"], "complete")
         self.assertNotIn(duty["id"], {row["id"] for row in store.list()})
 
+    def test_watch_root_symlink_loop_stays_active_until_same_path_is_repaired(self):
+        store, duty, identity = self.completed_duty()
+        watch_root = self.tmp_root / "watch-root"
+        watch_root.symlink_to(watch_root)
+        self.assertFalse(watch_root.is_dir())
+        with self.assertRaises(OSError) as raised:
+            with os.scandir(watch_root):
+                pass
+        self.assertEqual(raised.exception.errno, errno.ELOOP)
+
+        absent_successor = self.tmp_root / "absent-successor.json"
+        with mock.patch.object(peer_steward, "_watch_root", return_value=watch_root), \
+             mock.patch.object(peer_steward, "_seat_successor_path",
+                               return_value=absent_successor):
+            pending = peer_steward._mark_completed_retire_followup(
+                store, duty, identity, "completed-retire", "none")
+            self.assertEqual(pending["observation"]["terminal_followup"], "pending")
+            self.assertIn(duty["id"], {row["id"] for row in store.list()})
+
+            watch_root.unlink()
+            watch_root.mkdir()
+            with mock.patch.object(peer_steward, "_retire_handover", return_value="none"):
+                peer_steward._resume_retire_obligation(
+                    pending, store, persist_followup=True)
+
+        completed = store.get(duty["id"])
+        self.assertEqual(completed["observation"]["terminal_followup"], "complete")
+        self.assertNotIn(duty["id"], {row["id"] for row in store.list()})
+
 
 class RegisteredUnknownRetryTest(_TmpRootMixin, unittest.TestCase):
     def test_unknown_batch_rechecks_changed_exact_row_without_duty_change(self):

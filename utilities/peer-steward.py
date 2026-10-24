@@ -4983,8 +4983,6 @@ def cmd_join(args):
 
 
 def _watch_entries(root):
-    if not root.is_dir():
-        return []
     entries = []
     def _mtime(path):
         try:
@@ -4995,9 +4993,12 @@ def _watch_entries(root):
     # Path.glob suppresses filesystem errors raised while scanning, making an
     # unreadable existing root indistinguishable from a readable empty one.
     # Enumerate directly so callers can keep retryable work pending on failure.
-    with os.scandir(root) as directory:
-        json_paths = [root / entry.name for entry in directory
-                      if entry.name.endswith(".json")]
+    try:
+        with os.scandir(root) as directory:
+            json_paths = [root / entry.name for entry in directory
+                          if entry.name.endswith(".json")]
+    except FileNotFoundError:
+        return []
     for arm_path in sorted(json_paths, key=_mtime, reverse=True):
         name = arm_path.name
         if (name.endswith(".receipt.json") or name.endswith(".ack.json")
