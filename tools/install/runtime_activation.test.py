@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import os
 from contextlib import chdir
+import hashlib
 import json
 import socket
 import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
@@ -806,7 +808,7 @@ class RuntimeActivationOwnershipTest(unittest.TestCase):
                 self.assertEqual(report["freshness"], "missing")
                 self.assertEqual(report["user_changed"], [])
 
-    def test_status_excludes_destinations_refresh_would_adopt(self):
+    def test_prior_owned_drift_is_preservable_before_same_id_adoption(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             home = root / "runtime-home"
@@ -859,8 +861,260 @@ class RuntimeActivationOwnershipTest(unittest.TestCase):
                         activation._preservable_user_changes(
                             state, [desired], {prior["dest"]: prior}
                         ),
-                        {},
+                        {prior["dest"]: prior},
                     )
+
+    def test_same_id_user_copy_survives_repeated_refresh_and_removal_reports(self):
+        source_root = Path(__file__).resolve().parents[2]
+        old_bytes = (
+            b"// installed by herdr\n// HERDR_INTEGRATION_ID=opencode\n"
+            b"// HERDR_INTEGRATION_VERSION=12\n// old release\n"
+        )
+        user_bytes = (
+            b"// installed by herdr\n// HERDR_INTEGRATION_ID=opencode\n"
+            b"// HERDR_INTEGRATION_VERSION=9\n// user customization\n"
+        )
+
+        for removal in ("deactivate", "uninstall"):
+            with self.subTest(removal=removal), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with fixture_env.patched_environment(root / "fixture", source_root):
+                    home = activation.paths.runtime_home("opencode")
+                    dest = home / "plugins/herdr-agent-state.js"
+                    releases = []
+                    for version in (12, 13, 14):
+                        release = root / f"release-{version}" / "herdr-agent-state.js"
+                        release.parent.mkdir(parents=True, exist_ok=True)
+                        release.write_bytes(
+                            b"// installed by herdr\n// HERDR_INTEGRATION_ID=opencode\n"
+                            + f"// HERDR_INTEGRATION_VERSION={version}\n".encode()
+                            + f"// release {version}\n".encode()
+                        )
+                        releases.append(release)
+                    current = {"entry": None, "revision": "fixture-v12"}
+
+                    def desired(*_args, **_kwargs):
+                        return [current["entry"]]
+
+                    patches = (
+                        mock.patch.object(activation, "_desired_entries", side_effect=desired),
+                        mock.patch.object(activation, "_linked_entries", side_effect=desired),
+                        mock.patch.object(activation, "_discovered_harness_links", return_value=[]),
+                        mock.patch.object(activation, "_unexpected_harness_links", return_value=[]),
+                        mock.patch.object(activation, "duplicate_sources", return_value=[]),
+                        mock.patch.object(activation, "source_revision",
+                                          side_effect=lambda *_args: current["revision"]),
+                        mock.patch.object(activation, "_capture_replaced_installer_targets",
+                                          return_value={}),
+                        mock.patch.object(activation, "_activation_protected_paths", return_value=[]),
+                        mock.patch.object(activation, "_validate_source_symlinks"),
+                        mock.patch.object(activation, "_prepare_runtime_config", return_value=[]),
+                        mock.patch.object(activation.user_model_config, "seed_model_config",
+                                          return_value={}),
+                        mock.patch.object(activation.retired_memory_state, "retire"),
+                        mock.patch.object(activation.model_config, "resolve_config",
+                                          return_value=(None, SimpleNamespace(
+                                              source="fixture", reason="fixture"))),
+                    )
+                    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                         patches[5], patches[6], patches[7], patches[8], patches[9], \
+                         patches[10], patches[11], patches[12]:
+                        current["entry"] = {
+                            "dest": str(dest), "source": str(releases[0]), "kind": "copy",
+                            "surface": "herdr-fixture", "mode": 0o644,
+                        }
+                        activation.activate("opencode", "linked", str(source_root))
+                        state_path = activation._state_path("opencode")
+                        original_record = next(
+                            item for item in activation._load_json(state_path)["owned_paths"]
+                            if item["dest"] == str(dest)
+                        )
+                        dest.write_bytes(user_bytes)
+
+                        before = activation.status("opencode")
+                        self.assertEqual(before["user_changed"], [str(dest)])
+                        self.assertEqual(before["preserved"], [str(dest)])
+                        self.assertIn(f"preserved user-changed: {dest}", before["report_lines"])
+
+                        for version, release in zip((13, 14), releases[1:]):
+                            current["entry"] = {
+                                "dest": str(dest), "source": str(release), "kind": "copy",
+                                "surface": "herdr-fixture", "mode": 0o644,
+                            }
+                            current["revision"] = f"fixture-v{version}"
+                            refreshed = activation.refresh("opencode")
+                            self.assertEqual(dest.read_bytes(), user_bytes)
+                            self.assertIn(str(dest), refreshed["user_changed"])
+                            self.assertIn(str(dest), refreshed["preserved"])
+                            self.assertIn(f"preserved user-changed: {dest}", refreshed["report_lines"])
+                            carried = next(
+                                item for item in activation._load_json(state_path)["owned_paths"]
+                                if item["dest"] == str(dest)
+                            )
+                            self.assertEqual(carried, original_record)
+
+                        if removal == "deactivate":
+                            result = activation.deactivate("opencode")
+                            report_lines = result["report_lines"]
+                        else:
+                            args = installer.build_parser().parse_args(["uninstall", "opencode"])
+                            with mock.patch.object(
+                                installer.manifest, "load_ownership_manifest",
+                                return_value=(None, None),
+                            ):
+                                result = installer.cmd_uninstall(args)
+                            report_lines = result["lines"]
+                        preserved = result.get("preserved", [])
+                        preserved_paths = [
+                            item if isinstance(item, str) else item.get("path")
+                            for item in preserved
+                        ]
+                        self.assertIn(str(dest), preserved_paths)
+                        self.assertIn(f"preserved user-changed: {dest}", report_lines)
+                        self.assertEqual(dest.read_bytes(), user_bytes)
+
+    def test_fresh_same_id_adoption_keeps_snapshot_rollback_and_clean_updates(self):
+        source_root = Path(__file__).resolve().parents[2]
+        prefix = b"// installed by herdr\n// HERDR_INTEGRATION_ID=opencode\n"
+        old_bytes = prefix + b"// HERDR_INTEGRATION_VERSION=8\n// old Herdr copy\n"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with fixture_env.patched_environment(root / "fixture", source_root):
+                home = activation.paths.runtime_home("opencode")
+                dest = home / "plugins/herdr-agent-state.js"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(old_bytes)
+                releases = []
+                for version in (13, 14):
+                    release = root / f"release-{version}" / "herdr-agent-state.js"
+                    release.parent.mkdir(parents=True, exist_ok=True)
+                    release.write_bytes(prefix + f"// HERDR_INTEGRATION_VERSION={version}\n".encode()
+                                        + f"// release {version}\n".encode())
+                    releases.append(release)
+                current = {"entry": None, "revision": "fixture-v13"}
+
+                def desired(*_args, **_kwargs):
+                    return [current["entry"]]
+
+                patches = (
+                    mock.patch.object(activation, "_desired_entries", side_effect=desired),
+                    mock.patch.object(activation, "_linked_entries", side_effect=desired),
+                    mock.patch.object(activation, "_discovered_harness_links", return_value=[]),
+                    mock.patch.object(activation, "_unexpected_harness_links", return_value=[]),
+                    mock.patch.object(activation, "duplicate_sources", return_value=[]),
+                    mock.patch.object(activation, "source_revision",
+                                      side_effect=lambda *_args: current["revision"]),
+                    mock.patch.object(activation, "_capture_replaced_installer_targets",
+                                      return_value={}),
+                    mock.patch.object(activation, "_activation_protected_paths", return_value=[]),
+                    mock.patch.object(activation, "_validate_source_symlinks"),
+                    mock.patch.object(activation, "_prepare_runtime_config", return_value=[]),
+                    mock.patch.object(activation.user_model_config, "seed_model_config",
+                                      return_value={}),
+                    mock.patch.object(activation.retired_memory_state, "retire"),
+                    mock.patch.object(activation.model_config, "resolve_config",
+                                      return_value=(None, SimpleNamespace(
+                                          source="fixture", reason="fixture"))),
+                )
+                with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                     patches[5], patches[6], patches[7], patches[8], patches[9], \
+                     patches[10], patches[11], patches[12]:
+                    current["entry"] = {
+                        "dest": str(dest), "source": str(releases[0]), "kind": "copy",
+                        "surface": "herdr-fixture", "mode": 0o644,
+                    }
+                    with mock.patch.dict(os.environ, {"HARNESS_RUNTIME_FAIL_AFTER": "1"}):
+                        with self.assertRaisesRegex(activation.ActivationError,
+                                                    "injected failure after operation 1"):
+                            activation.activate("opencode", "linked", str(source_root))
+                    self.assertEqual(dest.read_bytes(), old_bytes)
+                    self.assertFalse(activation._state_path("opencode").exists())
+
+                    adopted = activation.activate("opencode", "linked", str(source_root))
+                    self.assertEqual(dest.read_bytes(), releases[0].read_bytes())
+                    self.assertEqual(adopted["preserved"], [])
+
+                    current["entry"] = {
+                        "dest": str(dest), "source": str(releases[1]), "kind": "copy",
+                        "surface": "herdr-fixture", "mode": 0o644,
+                    }
+                    current["revision"] = "fixture-v14"
+                    refreshed = activation.refresh("opencode")
+                    self.assertEqual(dest.read_bytes(), releases[1].read_bytes())
+                    self.assertEqual(refreshed["preserved"], [])
+                    owned = next(item for item in activation._load_json(
+                        activation._state_path("opencode"))["owned_paths"]
+                                 if item["dest"] == str(dest))
+                    self.assertEqual(owned["source"], str(releases[1]))
+                    self.assertEqual(owned["digest"], hashlib.sha256(releases[1].read_bytes()).hexdigest())
+
+    def test_shared_prior_owned_adoption_guard_covers_all_runtime_surfaces(self):
+        source_root = Path(__file__).resolve().parents[2]
+        markers = {"claude": "claude", "codex": "codex", "opencode": "opencode"}
+        for runtime, integration_id in markers.items():
+            with self.subTest(runtime=runtime), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with fixture_env.patched_environment(root / "fixture", source_root):
+                    home = activation.paths.runtime_home(runtime)
+                    prefix = "//" if runtime == "opencode" else "#"
+                    old = (f"{prefix} installed by herdr\n"
+                           f"{prefix} HERDR_INTEGRATION_ID={integration_id}\n"
+                           f"{prefix} HERDR_INTEGRATION_VERSION=8\nold\n").encode()
+                    user = (f"{prefix} installed by herdr\n"
+                            f"{prefix} HERDR_INTEGRATION_ID={integration_id}\n"
+                            f"{prefix} HERDR_INTEGRATION_VERSION=4\nuser edit\n").encode()
+                    source = root / "release" / f"{runtime}.js"
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.write_bytes((f"{prefix} installed by herdr\n"
+                                        f"{prefix} HERDR_INTEGRATION_ID={integration_id}\n"
+                                        f"{prefix} HERDR_INTEGRATION_VERSION=9\nnew\n").encode())
+                    dest = home / "plugins" / f"{runtime}.js"
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(user)
+                    entry = {"dest": str(dest), "source": str(source), "kind": "copy",
+                             "surface": "fake-shared-api", "mode": 0o644}
+                    prior = {"dest": str(dest), "source": str(source), "kind": "copy",
+                             "surface": "fake-shared-api",
+                             "digest": hashlib.sha256(old).hexdigest()}
+                    state = {"schema": activation.SCHEMA, "runtime": runtime,
+                             "mode": "linked", "scope": "global",
+                             "source_root": str(root / "release"),
+                             "active_root": str(root / "release"),
+                             "active_revision": "fixture-v8", "owned_paths": [prior],
+                             "managed_config": {}}
+                    state_path = activation._state_path(runtime)
+                    current = [entry]
+                    patches = (
+                        mock.patch.object(activation, "_desired_entries", return_value=current),
+                        mock.patch.object(activation, "_linked_entries", return_value=current),
+                        mock.patch.object(activation, "_discovered_harness_links", return_value=[]),
+                        mock.patch.object(activation, "_unexpected_harness_links", return_value=[]),
+                        mock.patch.object(activation, "duplicate_sources", return_value=[]),
+                        mock.patch.object(activation, "source_revision", return_value="fixture-v9"),
+                        mock.patch.object(activation.model_config, "resolve_config",
+                                          return_value=(None, SimpleNamespace(
+                                              source="fixture", reason="fixture"))),
+                        mock.patch.object(activation, "_claude_settings_health",
+                                          return_value=(False, [])),
+                        mock.patch.object(activation, "_codex_identity_health",
+                                          return_value=(False, [])),
+                    )
+                    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                         patches[5], patches[6], patches[7], patches[8]:
+                        activation._atomic_json(state_path, state)
+                        before = activation.status(runtime)
+                        self.assertEqual(before["user_changed"], [str(dest)])
+                        self.assertIn(f"preserved user-changed: {dest}", before["report_lines"])
+                        activation._apply_transaction(
+                            runtime, current, state, "linked", "global",
+                            source_roots=(source.parent,),
+                            commit_callback=lambda owned: activation._atomic_json(
+                                state_path, {**state, "owned_paths": owned}
+                            ),
+                        )
+                        self.assertEqual(dest.read_bytes(), user)
+                        self.assertEqual(activation._load_json(state_path)["owned_paths"], [prior])
 
     def test_status_does_not_mark_carried_user_changed_stale_link_missing(self):
         with tempfile.TemporaryDirectory() as temporary:
