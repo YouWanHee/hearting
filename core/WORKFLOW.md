@@ -200,18 +200,18 @@ with its declared group and automatic owner close. Include `eval-run` only when
 the request needs new raw results, using its existing inputs and write scope.
 In a Git folder, the parent chooses the capability: omitting `--capability` in ordinary compose
 uses the fixed `autopilot-code` default, not a classifier of the task text; framed work
-leaves that choice to its frame. A depth-0 `compose --start` in a non-Git folder with no
-shape or `--shape direct` runs inline in the current session. Its task purpose selects the
-capability when clear; an explicit `--capability` and mode take precedence, and an unclear
-purpose is shown as unresolved while retaining the existing storage fallback. The session
-performs that capability's work and can close it through the normal inline `finish` path.
-The start card says `git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작`.
-An explicit worker shape, including a route-plan leg whose own shape is not direct, remains a
+leaves that choice to its frame. A depth-0 `compose --start --shape direct` in a non-Git
+folder runs inline in the current session. Its task purpose selects the capability when
+clear; an explicit `--capability` and mode take precedence, and an unclear purpose is shown
+as unresolved while retaining the existing storage fallback. The session performs that
+capability's work and can close it through the normal inline `finish` path. The start card
+says `git 아닌 폴더 — 이 세션이 직접 진행. 작업자가 필요하면 --shape 없이 다시 시작(원본 수정은 git init 필요)`.
+An omitted shape follows the Git default: the start is framed and its frame decides, as in a
+Git folder. Any other shape, including a route-plan leg whose own shape is not direct, is a
 worker request. In a non-Git folder, a compiled artifact-only worker route may run in the
 bound folder; a route whose compiled write scope mutates source is refused with the reason
 and the next action (`git init` and restart, or continue this session with `--shape direct`).
-The classification comes from the compiled write scope, not a capability-name list. An
-omitted shape keeps the existing direct-start behavior and is not silently changed to framed.
+The classification comes from the compiled write scope, not a capability-name list.
 A later compose in a Git repository follows the
 existing Git behavior.
 Likewise, code review within an implementation/debug cycle belongs to
