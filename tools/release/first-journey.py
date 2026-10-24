@@ -531,14 +531,25 @@ def telemetry(world: Path, harness: str) -> dict:
         if not databases:
             return {"status": "unknown", "total": None, "sessions": 0, "reason": "opencode-db-missing"}
         totals = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0}; sessions = 0
-        used_v2 = False
+        sources = []
         try:
             for db in databases:
                 con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
                 try:
                     tables = {row[0] for row in con.execute("select name from sqlite_master where type='table'")}
                     table = "session_v2" if "session_v2" in tables else "session"
-                    used_v2 = used_v2 or table == "session_v2"
+                    sources.append((db, table))
+                finally:
+                    con.close()
+            generations = {"v2" if table == "session_v2" else "v1" for _, table in sources}
+            if len(generations) > 1:
+                return {"status": "unknown", "total": None, "sessions": 0,
+                        "reason": "mixed-opencode-generations"}
+            for db in databases:
+                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                try:
+                    tables = {row[0] for row in con.execute("select name from sqlite_master where type='table'")}
+                    table = "session_v2" if "session_v2" in tables else "session"
                     columns = {row[1] for row in con.execute(f"pragma table_info({table})")}
                     required = {"tokens_input", "tokens_output", "tokens_reasoning"}
                     if table == "session_v2":
@@ -556,7 +567,7 @@ def telemetry(world: Path, harness: str) -> dict:
             return {"status": "unknown", "total": None, "sessions": 0, "reason": "unsupported-opencode-schema"}
         return {"status": "measured" if sessions else "unknown", **totals,
                 "total": sum(totals.values()) if sessions else None,
-                "total_formula": "input+output+reasoning+cache_read+cache_write (session_v2 table)" if used_v2 else "input+output+reasoning (session table)", "sessions": sessions,
+                "total_formula": "input+output+reasoning+cache_read+cache_write (session_v2 table)" if generations == {"v2"} else "input+output+reasoning (session table)", "sessions": sessions,
                 "reason": None if sessions else "no-opencode-sessions"}
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fleet"))
     from token_budget import parse_codex_token_count
@@ -1025,9 +1036,9 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                         if harness == "claude": env["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
                         elif harness == "codex": env["CODEX_HOME"] = str(home / ".codex")
                         else: env["XDG_DATA_HOME"] = str(home / ".local/share")
-                        export_argv = sandbox([cli_map[harness][1], "auth", "export", "--standalone"], world, env, cli=cli_mounts) if generation == "v2" else None
+                        export_argv = sandbox([binaries[harness][1], "auth", "export", "--standalone"], world, env, cli=cli_mounts) if generation == "v2" else None
                         if generation == "v2":
-                            imported, import_error = import_v2_credentials(store, world, cli_map[harness][1], env, cli_mounts)
+                            imported, import_error = import_v2_credentials(store, world, binaries[harness][1], env, cli_mounts)
                             if not imported:
                                 model["status"] = import_error
                                 record["harnesses"].append({"name": harness, "model": model})

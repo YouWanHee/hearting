@@ -58,6 +58,10 @@ the sum of those exposed buckets, not a cost or account quota. Worlds are
 removed on success and retained on failure by default; use
 `--keep-world never|always` to change this.
 
+If separate OpenCode databases in one world expose different generations
+(V1 `session` and V2 `session_v2`), token usage is reported as unknown rather
+than combining the tables under one formula.
+
 The demo starts with `Helo` and a test expecting `Hello`. The runner records the
 failing baseline and judges local refs, worktrees, and commits against the
 original focused test bytes. Each harness starts one session; only that session

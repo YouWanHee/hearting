@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import json
 import os
@@ -160,6 +161,185 @@ class JourneyTests(unittest.TestCase):
             result = fj.telemetry(Path(tmp), "opencode")
         self.assertEqual((result["status"], result["total"], result["reason"]),
                          ("unknown", None, "unsupported-opencode-schema"))
+
+    def test_opencode_telemetry_reports_mixed_database_generations_as_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home/.local/share/opencode"; home.mkdir(parents=True)
+            old_db = home / "old/opencode.db"; old_db.parent.mkdir()
+            con = fj.sqlite3.connect(old_db)
+            con.execute("create table session (id text, tokens_input integer, tokens_output integer, tokens_reasoning integer)")
+            con.execute("insert into session values ('old', 900, 900, 900)"); con.commit(); con.close()
+            new_db = home / "new/opencode.db"; new_db.parent.mkdir()
+            con = fj.sqlite3.connect(new_db)
+            con.execute("create table session_v2 (id text, tokens_input integer, tokens_output integer, tokens_reasoning integer, tokens_cache_read integer, tokens_cache_write integer)")
+            con.execute("insert into session_v2 values ('new', 1, 2, 3, 4, 5)"); con.commit(); con.close()
+            result = fj.telemetry(Path(tmp), "opencode")
+        self.assertEqual((result["status"], result["total"], result["reason"]),
+                         ("unknown", None, "mixed-opencode-generations"))
+
+    def _run_fake_v2_journey(self, config=None, *, interrupt=False, contend=False):
+        if fj.platform.system() != "Linux" or not fj.shutil.which("bwrap"):
+            self.skipTest("end-to-end sandbox requires Linux bwrap")
+        config = config or {}
+        root = Path(tempfile.mkdtemp(prefix="journey-v2-unit-")); os.chmod(root, 0o700)
+        auth = root / "auth"; auth.mkdir(mode=0o700)
+        store = auth / "opencode/credentials-v2.json"; store.parent.mkdir(mode=0o700)
+        original = json.dumps([{"id":"fixture", "integrationID":"provider", "label":"fake key",
+                               "active":True, "value":{"type":"key", "key":"fixture-only"}}]).encode()
+        store.write_bytes(original); os.chmod(store, 0o600); inode_before=store.stat().st_ino
+        fake = root / "opencode"
+        fake.write_text("""#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+args=sys.argv[1:]; home=pathlib.Path(os.environ['HOME']); world=home.parent
+cfg=json.loads((world/'fake-config.json').read_text()); data=pathlib.Path(os.environ['XDG_DATA_HOME'])/'opencode'; data.mkdir(parents=True,exist_ok=True)
+trace=home/'trace.jsonl'
+def log(event, **kw):
+ with trace.open('a') as f: f.write(json.dumps({'event':event,'argv':args,'time':time.time(),**kw})+'\\n')
+if args==['--version']:
+ log('version'); print('opencode v2.0.32'); raise SystemExit(0)
+if args[:2]==['auth','import']:
+ p=pathlib.Path(args[-1]); log('import',temp=str(p),exists=p.exists(),mode=oct(p.stat().st_mode&0o777))
+ if cfg.get('import_exit'): raise SystemExit(cfg['import_exit'])
+ (data/'state.json').write_bytes(p.read_bytes()); (data/'import-path').write_text(str(p)); raise SystemExit(0)
+if args[:2]==['auth','export']:
+ p=pathlib.Path((data/'import-path').read_text()); payload=(data/'state.json').read_bytes()
+ if cfg.get('incomplete') and cfg.get('task_done'): payload=b'[]'
+ log('export',temp_exists=p.exists(),size=len(payload)); sys.stdout.buffer.write(payload); raise SystemExit(0)
+if args[:1]==['run']:
+ if '--help' in args: log('run-help'); print('Usage --standalone --format --session'); raise SystemExit(0)
+ first='--session' not in args; log('run',first=first,standalone='--standalone' in args)
+ (home/'.runtime/routes').mkdir(parents=True,exist_ok=True); (home/'.runtime/routes/f.json').write_text('{}')
+ if first and cfg.get('rotate'):
+  state=json.loads((data/'state.json').read_text()); state[0]['value']['key']+='-rotated'; state[0]['label']+=' rotated'; (data/'state.json').write_text(json.dumps(state))
+ if first and cfg.get('incomplete'): cfg['task_done']=True; (world/'fake-config.json').write_text(json.dumps(cfg))
+ if first and cfg.get('interrupt'):
+  (home/'pid').write_text(str(os.getpid())); time.sleep(30)
+ if cfg.get('run_sleep'): time.sleep(cfg['run_sleep'])
+ text='[Run confirmation]\\nTask: fix\\nWhy: typo\\nRoute: direct\\nScope: greet\\nDone: test\\n→ Proceed / Revise: <x> / Stop' if first else 'Done.'
+ print(json.dumps({'type':'text','sessionID':'session-1','part':{'text':text}})); raise SystemExit(0)
+raise SystemExit(9)
+"""); fake.chmod(0o700)
+        world_ref = {}; judge_n = [0]; contender = {}
+        prior = {"which":fj.shutil.which, "run":fj.run, "judge":fj.judge_repo,
+                 "profiles":fj.PROFILES["all"], "tasks":fj.TASK_HARNESSES["all"]}
+        original_mkdtemp = fj.tempfile.mkdtemp
+        def which(name): return str(fake) if name == "opencode" else (None if name in ("claude", "codex") else prior["which"](name))
+        def run(argv, **kwargs):
+            tail = argv[argv.index("--") + 1:] if "--" in argv else list(argv)
+            if tail and tail[0] == "sh" and any(str(x).endswith("install.sh") for x in tail):
+                return {"exit":0,"seconds":0,"output":"fixture install"}
+            if tail and tail[0] in ("harness","hearting"):
+                return {"exit":0,"seconds":0,"output":json.dumps({"freshness":"fresh"}) if "status" in tail else ""}
+            if len(tail)>=3 and tail[:2]==["sh","-c"] and "command -v" in tail[2]:
+                name=tail[2].split()[-1]
+                return {"exit":0 if name in ("claude","codex","opencode") else 1,"seconds":0,"output":"/usr/bin/fake"}
+            return prior["run"](argv, **kwargs)
+        def mkdtemp(*args, **kwargs):
+            path=Path(original_mkdtemp(*args, **kwargs))
+            if str(kwargs.get("prefix", "")).startswith("first-journey-"):
+                world_ref["path"]=path; (path/"fake-config.json").write_text(json.dumps(config))
+            return str(path)
+        def judge(*_a, **_k):
+            judge_n[0]+=1; passed=judge_n[0]>=2
+            return {"code_fixed":passed,"focused_test_passed":passed,"candidate":"fixture" if passed else None,
+                    "candidates":[],"worktrees":1,"local_refs":[],"reason":None,"seconds":0}
+        fj.PROFILES["all"]=("opencode",); fj.TASK_HARNESSES["all"]=["opencode"]
+        fj.shutil.which=which; fj.run=run; fj.judge_repo=judge; fj.tempfile.mkdtemp=mkdtemp
+        previous_usr1 = signal.getsignal(signal.SIGUSR1)
+        timer = None; contender_thread = None
+        try:
+            if interrupt:
+                signal.signal(signal.SIGUSR1, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+                def interrupt_task():
+                    deadline=time.monotonic()+20
+                    while time.monotonic()<deadline:
+                        path=world_ref.get("path")
+                        if path and (path/'home/pid').exists():
+                            time.sleep(.2); os.kill(os.getpid(),signal.SIGUSR1); return
+                        time.sleep(.01)
+                timer=threading.Thread(target=interrupt_task,daemon=True); timer.start()
+            if contend:
+                def try_lock():
+                    deadline=time.monotonic()+20
+                    while time.monotonic()<deadline:
+                        path=world_ref.get("path"); trace=path/'home/trace.jsonl' if path else None
+                        if trace and trace.exists() and '"event": "run"' in trace.read_text():
+                            lock=(auth/'.lock').open('a'); start=time.monotonic()
+                            fj.fcntl.flock(lock, fj.fcntl.LOCK_EX); contender['acquired']=time.time(); lock.close(); return
+                        time.sleep(.01)
+                contender_thread=threading.Thread(target=try_lock,daemon=True); contender_thread.start()
+            if interrupt:
+                try: record=fj.journey_profile("all", argparse.Namespace(source="checkout",ref="HEAD",model_free=False,auth_root=str(auth),local_root=str(root),keep_world="always",step_timeout=60,task_timeout=60,prompt="task",tag="latest"), Path(__file__).resolve().parents[2])
+                except KeyboardInterrupt: record={"interrupted":True}
+            else:
+                record=fj.journey_profile("all", argparse.Namespace(source="checkout",ref="HEAD",model_free=False,auth_root=str(auth),local_root=str(root),keep_world="always",step_timeout=60,task_timeout=60,prompt="task",tag="latest"), Path(__file__).resolve().parents[2])
+        finally:
+            if timer: timer.join(timeout=5)
+            if contender_thread: contender_thread.join(timeout=25)
+            signal.signal(signal.SIGUSR1, previous_usr1)
+            fj.shutil.which=prior["which"]; fj.run=prior["run"]; fj.judge_repo=prior["judge"]
+            fj.tempfile.mkdtemp=original_mkdtemp; fj.PROFILES["all"]=prior["profiles"]; fj.TASK_HARNESSES["all"]=prior["tasks"]
+        world=world_ref.get("path"); events=[]
+        if world and (world/'home/trace.jsonl').exists(): events=[json.loads(x) for x in (world/'home/trace.jsonl').read_text().splitlines()]
+        child_reaped=None
+        if world:
+            marker=str(world).encode(); survivors=[]
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit() or int(entry.name)==os.getpid(): continue
+                try:
+                    if marker in (entry/"cmdline").read_bytes() or marker in (entry/"environ").read_bytes():
+                        survivors.append(entry.name)
+                except OSError: pass
+            child_reaped=not survivors
+        lock_fd=(auth/".lock").open("a")
+        try:
+            fj.fcntl.flock(lock_fd,fj.fcntl.LOCK_EX|fj.fcntl.LOCK_NB); lock_released=True
+        except BlockingIOError: lock_released=False
+        finally: lock_fd.close()
+        result={"record":record,"events":events,"world":world,"before":original,"after":store.read_bytes(),
+                "inode_before":inode_before,"inode_after":store.stat().st_ino,"contender":contender,
+                "child_reaped":child_reaped,"lock_released":lock_released,"auth":auth}
+        shutil.rmtree(root,ignore_errors=True)
+        return result
+
+    def test_fake_v2_journey_profile_orders_import_task_and_locked_final_export(self):
+        result=self._run_fake_v2_journey({"rotate":True})
+        events=result["events"]; names=[e["event"] for e in events]
+        self.assertEqual(names,["version","run-help","import","export","run","run","export"])
+        self.assertEqual(events[2]["mode"],"0o600"); self.assertTrue(events[2]["exists"])
+        self.assertFalse(events[3]["temp_exists"])
+        self.assertEqual([e["first"] for e in events if e["event"]=="run"],[True,False])
+        self.assertTrue(all(e["standalone"] for e in events if e["event"]=="run"))
+        self.assertIn(b"fixture-only-rotated",result["after"])
+        self.assertNotEqual(result["inode_before"],result["inode_after"])
+
+    def test_fake_v2_journey_import_failure_preserves_store_and_skips_task(self):
+        result=self._run_fake_v2_journey({"import_exit":7})
+        self.assertEqual([e["event"] for e in result["events"]],["version","run-help","import"])
+        self.assertEqual(result["after"],result["before"])
+
+    def test_fake_v2_journey_unchanged_and_incomplete_exports_preserve_store(self):
+        for config in ({}, {"incomplete":True}):
+            with self.subTest(config=config):
+                result=self._run_fake_v2_journey(config)
+                self.assertEqual(result["after"],result["before"])
+                self.assertEqual(result["inode_before"],result["inode_after"])
+                self.assertEqual(len([e for e in result["events"] if e["event"]=="export"]),2)
+
+    def test_fake_v2_journey_interrupt_persists_once_and_reaps_child(self):
+        result=self._run_fake_v2_journey({"rotate":True,"interrupt":True},interrupt=True)
+        self.assertTrue(result["record"].get("interrupted"))
+        self.assertEqual(len([e for e in result["events"] if e["event"]=="export"]),2)
+        self.assertIn(b"fixture-only-rotated",result["after"])
+        self.assertTrue(result["lock_released"])
+        self.assertTrue(result["child_reaped"])
+
+    def test_fake_v2_journey_lock_contention_waits_through_final_export(self):
+        result=self._run_fake_v2_journey({"rotate":True,"run_sleep":2},contend=True)
+        # The flock contender can acquire only after journey_profile released the store lock.
+        exports=[e for e in result["events"] if e["event"]=="export"]
+        self.assertEqual(len(exports),2)
+        self.assertGreater(result["contender"].get("acquired",0),exports[-1]["time"])
 
     def test_v2_completeness_requires_transferable_native_credentials(self):
         key = {"id": "k", "integrationID": "provider", "label": "Key", "active": True,
