@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -133,8 +134,8 @@ class FramedBase(T.ProducerTestBase):
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
         self.activate()
 
-    # Both frame legs, as before the one-leg default: most tests here exercise the pair.
-    FRAME_INTENSITY = "strong"
+    # Exercise the default framed route unless a test asks for an explicit intensity.
+    FRAME_INTENSITY = None
 
     def compose(self, **kw):
         arguments = dict(
@@ -160,6 +161,20 @@ class FramedBase(T.ProducerTestBase):
             (output / "shards" / node).mkdir(parents=True, exist_ok=True)
             (output / "shards" / node / "direction-brief.md").write_text(f"# {node} {brief}\n", encoding="utf-8")
         (output / "shards/frame/intent.md").write_text(intent + "\n", encoding="utf-8")
+
+
+def legacy_framed_route(base, intensity):
+    """Build a historical sealed fixture from today's route, then remove only the newer basis row."""
+    route = base.compose(intensity=intensity)
+    basis = route["selection"]["selection_basis"]
+    basis[:] = [row for row in basis if row.get("axis") != "frame-legs"]
+    if intensity == "quick":
+        # The old no-intensity default was one deep leg, even though quick is today's one-leg recipe.
+        intensity_row = next(row for row in basis if row.get("axis") == "compose-intensity")
+        intensity_row.update(signal="standard", source="shape-default")
+    route["route_hash"] = R.route_hash(route)
+    route["route_id"] = R.ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
+    return route
 
 
 class FramedRouteCompileTest(FramedBase):
@@ -241,11 +256,10 @@ class FramedRouteCompileTest(FramedBase):
         self.assertEqual(self.compose(campaign_key=None, parent_cycle_id="cyc_" + "a" * 32)["parent_cycle_id"],
                          "cyc_" + "a" * 32)
 
-    def test_intensity_picks_one_frame_leg_or_both_top_legs(self):
-        """User decision 2026-10-07: one leg for ordinary work, both top legs for uncertain or
-        hard-to-reverse work. The framed route itself is sealed at standard either way."""
-        for intensity, ids in ((None, ONE_LEG_IDS), ("direct", ONE_LEG_IDS), ("quick", ONE_LEG_IDS),
-                               ("standard", ONE_LEG_IDS), ("strong", NODE_IDS), ("thorough", NODE_IDS)):
+    def test_intensity_picks_default_pair_and_guarded_quick_exception(self):
+        """Only an explicit quick/direct request without protected facts can narrow the frame."""
+        for intensity, ids in ((None, NODE_IDS), ("direct", ONE_LEG_IDS), ("quick", ONE_LEG_IDS),
+                               ("standard", NODE_IDS), ("strong", NODE_IDS), ("thorough", NODE_IDS)):
             with self.subTest(intensity=intensity):
                 route = self.compose(intensity=intensity)
                 self.assertEqual([n["id"] for n in route["nodes"]], ids)
@@ -260,7 +274,7 @@ class FramedRouteCompileTest(FramedBase):
                 self.assertEqual(RP.frame_legs(route), tuple(ids[:-1]))
         with self.assertRaisesRegex(ValueError, "invalid intensity"):
             self.compose(intensity="bogus")
-        one = self.compose(intensity=None)
+        one = self.compose(intensity="quick")
         self.assertFalse(RP.valid_frame_legs({"nodes": []}, ["frame"]))           # a lone leg only on a framed route
         self.assertTrue(RP.valid_frame_legs(one, ["frame"]))
         tampered = json.loads(json.dumps(one))
@@ -281,6 +295,34 @@ class FramedRouteCompileTest(FramedBase):
             slug="other", cwd=R.ROOT, artifact_root=self.root, spec_read="fixture", unassigned=True,
             dispatch_evidence={"tuples": [T.nested("claude", "codex")]})
         self.assertNotIn("frame이 방향과 경로를 조립해", R.compose_card(staged))
+
+    def test_basis_free_historical_framed_routes_verify_and_keep_the_old_card_label(self):
+        """Fixture method: strip frame-legs from today's sealed compose result and reseal with existing hash/id."""
+        for intensity, legs, expected_intensity in (
+                ("quick", ("frame",), None), ("strong", tuple(FRAME_IDS), "strong")):
+            with self.subTest(intensity=intensity):
+                route = legacy_framed_route(self, intensity)
+                basis = {row.get("axis"): row for row in route["selection"]["selection_basis"]}
+                self.assertNotIn("frame-legs", basis)
+                self.assertEqual((basis["compose-intensity"].get("source"),
+                                  basis["compose-intensity"].get("signal")),
+                                 ("shape-default", "standard") if intensity == "quick"
+                                 else ("explicit", "strong"))
+                verified = R.verify_route(json.loads(json.dumps(route)), R.ROOT)
+                self.assertEqual(RP.frame_legs(verified), legs)
+                nodes = {node["id"]: node for node in verified["nodes"]}
+                self.assertEqual({nodes[node]["model_profile"] for node in legs},
+                                 {"deep"} if len(legs) == 1 else {"top"})
+                lines = R.compose_decision_lines(verified)
+                size = next(line for line in lines if line.startswith("  규모:"))
+                count_word = "한" if len(legs) == 1 else "두"
+                self.assertIn(f"frame {count_word} 갈래(이전 규칙으로 만든 경로)", size)
+                self.assertFalse(any("강도 안내" in line for line in lines))
+                command = shlex.split(W._compose_again(verified))
+                if expected_intensity is None:
+                    self.assertNotIn("--intensity", command)
+                else:
+                    self.assertEqual(command[command.index("--intensity") + 1], expected_intensity)
 
     def test_the_internal_capability_is_reachable_only_through_the_framed_shape(self):
         for shape, graph in (("direct", None), ("solo", None), ("staged", None), ("staged", "frame,route-decision")):
@@ -344,7 +386,7 @@ class FramedRouteCompileTest(FramedBase):
                 "--dispatch-evidence", str(evidence), "--prompt-file", str(task), "--slug", "cli-framed"]
         one = subprocess.run(base + ["--unassigned", "--explain"], text=True, capture_output=True, env=env, check=False)
         self.assertEqual(one.returncode, 0, one.stderr)
-        self.assertIn("비용: frame 한 갈래 · 방향 확인 질문 1회", one.stderr)
+        self.assertIn("비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회", one.stderr)
         base += ["--intensity", "strong"]
         done = subprocess.run(
             base + ["--campaign-key", "cli-key", "--capability", "autopilot-refine", "--graph", "review",
@@ -1123,9 +1165,16 @@ class FramedStartTest(FramedBase):
     def test_an_autoclosed_framed_route_composes_again_as_a_framed_route(self):
         command = W._compose_again(self.route)
         self.assertIn("--shape framed", command)
-        self.assertIn("--intensity strong", command)          # both frame legs again
+        self.assertNotIn("--intensity", command)              # preserve the original unspecified intensity
         self.assertNotIn("--capability", command)
         self.assertNotIn("route-frame", command)
+        explicit = json.loads(json.dumps(self.route))
+        explicit["selection"]["selection_basis"] = [
+            row for row in explicit["selection"]["selection_basis"]
+            if row.get("axis") != "compose-intensity"
+        ] + [{"axis": "compose-intensity", "signal": "quick", "source": "explicit"}]
+        command = W._compose_again(explicit)
+        self.assertIn("--intensity quick", command)
 
 
 if __name__ == "__main__":

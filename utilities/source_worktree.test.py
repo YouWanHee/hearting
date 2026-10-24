@@ -435,6 +435,10 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
                            "--artifact-root", str(self.artifact_root), "--unassigned", "--jobs", str(self.jobs)])
         self.assertEqual(len(self.route_files()), 2)
         self.assertEqual(len(self.start_calls), 2)
+        # Only the two framed routes' own frame legs launched; the refused routes wrote none.
+        frame_legs = [node for route in (frame_route, omitted_route) for node in route["nodes"]
+                      if node["id"] != "route-decision"]
+        self.assertEqual(len(self.owner_attempt_rows()), len(frame_legs))
         launched = {re.search(r"(?:^|,)route_id=([^,\s]+)", row).group(1)
                     for row in self.owner_attempt_rows()}
         self.assertEqual(launched, {frame_route["route_id"], omitted_route["route_id"]})
