@@ -243,6 +243,11 @@ class ProducerTestBase(unittest.TestCase):
                          f"unexpected shared/spec filesystem enumeration: {unexpected}; "
                          f"observed={[p.relative_to(shared_root).as_posix() for p in visited]}")
 
+    def report_shared_spec_enumeration(self, visited):
+        shared_root = (self.root / "shared/spec").resolve()
+        paths = sorted({path.relative_to(shared_root).as_posix() for path in visited})
+        print(f"shared/spec enumerated paths: {json.dumps(paths)}")
+
     def seed_legacy(self, rel="plans/legacy.md", data="legacy body\n"):
         target = self.root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -2925,6 +2930,7 @@ class CompletedSpecPublicationTest(ProducerTestBase):
         self.assertEqual(len(unrelated_references), 2)
         self.assert_only_exact_spec_revision_enumerated(
             enumerated, admitted["shared_reference_id"], admitted["shared_reference_revision_id"])
+        self.report_shared_spec_enumeration(enumerated)
         manifest_doc = json.loads(before["manifest"])
         self.assertIn(admitted["shared_reference_id"],
                       {row["shared_reference_id"] for row in manifest_doc["shared_references"]})

@@ -2749,6 +2749,7 @@ class SeedOnlyCodeCleanupWorkStartTest(GF.fixture.ProducerTestBase):
         self.assert_only_exact_spec_revision_enumerated(
             enumerated, base_publication["shared_reference_id"],
             base_publication["shared_reference_revision_id"])
+        self.report_shared_spec_enumeration(enumerated)
         manifest_doc = json.loads(before_records["cycle_manifest"])
         self.assertIn(base_publication["shared_reference_id"],
                       {row["shared_reference_id"] for row in manifest_doc["shared_references"]})
