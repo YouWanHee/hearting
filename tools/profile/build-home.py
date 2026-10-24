@@ -738,7 +738,7 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
             sys.path.insert(0, str(utilities))
         import opencode_runtime
         try:
-            v2_runtime = opencode_runtime.is_v2()
+            v2_runtime = opencode_runtime.is_v2(environ=env)
         except Exception:
             v2_runtime = False
         source = Path(env.get('OPENCODE_CONFIG_DIR') or Path(env.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'opencode')

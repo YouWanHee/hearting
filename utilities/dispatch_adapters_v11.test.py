@@ -23,6 +23,13 @@ ADAPTERS={
 FAKE_WORKER_TIMEOUT="30"
 
 
+def fake_shell(harness, payload):
+ # Version inspection is preparation, not a worker payload or counted spawn.
+ version = ('[ "$1" = --version ] && { echo 1.19.0; exit 0; }\n'
+            if harness == "opencode" else "")
+ return "#!/bin/sh\n" + version + payload
+
+
 class AdapterV11Test(unittest.TestCase):
  def test_stage_attempt_budget_prompt(self):
   for harness in ADAPTERS:
@@ -215,7 +222,7 @@ class AdapterV11Test(unittest.TestCase):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
    fakebin=root/"bin"; fakebin.mkdir(); fake=fakebin/harness
-   fake.write_text("#!/bin/sh\nexec sleep 60\n",encoding="utf-8"); fake.chmod(0o755)
+   fake.write_text(fake_shell(harness,"exec sleep 60\n"),encoding="utf-8"); fake.chmod(0o755)
    self.seed_parent(jobs,repo,harness=harness)
    wrapper=self.load_wrapper(harness)
    command=self.command(harness,"start",repo,jobs,logs)+["--foreground-timeout","5"]
@@ -446,7 +453,9 @@ class AdapterV11Test(unittest.TestCase):
     source_home=root/"user-runtime-home"; source_home.mkdir()
     runtime_expression=f"os.environ.get({runtime_key!r}, '')"
     fake.write_text(
-     "#!/usr/bin/python3\nimport json,os\n"
+     "#!/usr/bin/python3\nimport json,os,sys\n"
+     f"if {harness == 'opencode'!r} and sys.argv[1:] == ['--version']:\n"
+     " print('1.19.0'); raise SystemExit(0)\n"
      f"open({str(capture)!r},'w',encoding='utf-8').write(json.dumps({{"
      f"'git_optional_locks':os.environ.get('GIT_OPTIONAL_LOCKS'),"
      f"'worker_home':os.environ.get('HEARTING_WORKER_HOME'),"
@@ -1068,7 +1077,7 @@ class AdapterV11Test(unittest.TestCase):
   for repetition in range(3):
    with self.subTest(repetition=repetition), tempfile.TemporaryDirectory() as td:
     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"; fakebin=root/"bin"; fakebin.mkdir()
-    fake=fakebin/"opencode"; fake.write_text("#!/bin/sh\nexit 0\n",encoding="utf-8"); fake.chmod(0o755)
+    fake=fakebin/"opencode"; fake.write_text(fake_shell("opencode","exit 0\n"),encoding="utf-8"); fake.chmod(0o755)
     wrapper=self.load_wrapper("opencode")
     argv=["dispatch-headless.py","--start","--worktree",str(repo),"--slug","opencode-owner",
           "--capability","autopilot-code","--capability-mode","dev","--intensity","standard",
@@ -1208,7 +1217,7 @@ class AdapterV11Test(unittest.TestCase):
   root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
   fakebin=root/"bin"; fakebin.mkdir(); count=root/"child-count"
   fake=fakebin/fake_cli
-  fake.write_text("#!/bin/sh\nprintf 'child\\n' >> \"$FAKE_CHILD_COUNT\"\n",encoding="utf-8")
+  fake.write_text(fake_shell(harness,"printf 'child\\n' >> \"$FAKE_CHILD_COUNT\"\n"),encoding="utf-8")
   fake.chmod(0o755)
   command=self.command(harness,"start",repo,jobs,logs)
   self.seed_parent(jobs,repo,harness=harness)
@@ -1394,7 +1403,7 @@ class AdapterV11Test(unittest.TestCase):
     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
     fakebin=root/"bin"; fakebin.mkdir()
     fake=fakebin/harness
-    fake.write_text("#!/bin/sh\nexec sleep 60\n",encoding="utf-8"); fake.chmod(0o755)
+    fake.write_text(fake_shell(harness,"exec sleep 60\n"),encoding="utf-8"); fake.chmod(0o755)
     wrapper=self.load_wrapper(harness)
     import json
     from dispatch_capacity_evidence import launch_scope
@@ -1474,7 +1483,7 @@ class AdapterV11Test(unittest.TestCase):
     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
     fakebin=root/"bin"; fakebin.mkdir()
     fake=fakebin/harness
-    fake.write_text("#!/bin/sh\nexec sleep 60\n",encoding="utf-8"); fake.chmod(0o755)
+    fake.write_text(fake_shell(harness,"exec sleep 60\n"),encoding="utf-8"); fake.chmod(0o755)
     wrapper=self.load_wrapper(harness)
     if harness=="opencode":
      attempt_id="att-opencode-governor-transfer-never-launched"
