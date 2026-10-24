@@ -103,8 +103,11 @@ class LedgerPathTest(EnvTmpTestCase):
             before = json.dumps(first)
             after = json.dumps(second)
             self.assertEqual(len(before), len(after))
+            cached_stat = os.stat(path)
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(after + "\n")
+            os.utime(path, ns=(cached_stat.st_atime_ns,
+                               cached_stat.st_mtime_ns + 1_000_000_000))
             self.assertEqual(route_chain.read_tail("claude", "cache-session", None)[0]["route_id"],
                              "rt-other")
             self.assertEqual(loads.call_count, 1)
