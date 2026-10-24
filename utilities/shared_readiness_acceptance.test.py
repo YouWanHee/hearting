@@ -765,7 +765,7 @@ def _paired_performance_errors(measurement):
                 break
         try:
             cpu_helper = _load_cpu_helper()
-            derived = cpu_helper._density_acceptance(candidate)
+            derived = cpu_helper._density_acceptance({"candidate": candidate})
         except (KeyError, TypeError, ValueError) as exc:
             derived = None
             errors["d2"].append(f"scheduler-density raw timing is malformed: {exc}")
