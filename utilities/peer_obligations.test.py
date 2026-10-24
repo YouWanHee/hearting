@@ -726,6 +726,50 @@ class ObligationStoreTest(unittest.TestCase):
         self.assertEqual(refs, [duties[0]["id"], record["delivery_id"]])
         self.assertEqual(stored["state"], "sent-ambiguous")
 
+    def test_runner_preserves_notice_when_herdr_pane_id_is_missing_or_invalid(self):
+        from types import SimpleNamespace
+        import dispatch_pending_delivery as pending
+        import session_notice
+
+        env = {"HOME": str(self.root / "home"),
+               "XDG_STATE_HOME": str(self.root / "xdg-state"),
+               "AGENT_DISPATCH_JOBS": str(self.jobs)}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
+            record = session_notice.notify("claude", "sid-notice", key="run:malformed-pane",
+                subject="compute run", text="finished", jobs=self.jobs)
+            store = obligations.ObligationStore(self.jobs.parent)
+            sessions = self.root / "xdg-state" / "hearting" / "session-tidy" / "sessions"
+            sessions.mkdir(parents=True, exist_ok=True)
+            (sessions / "known-seat.jsonl").write_text(
+                json.dumps({"event": "start", "harness": "claude", "sid": "sid-notice"}) + "\n")
+            self.jobs.write_text(
+                "2026-10-24T00:00:00Z\topen\t/w\t/w\tslug\t"
+                "attempt_id=att-known,parent_sid=sid-notice,parent_completion_delivery=claude-parent-runtime,"
+                "dispatch_depth=1,worker_type=owner,route_id=rt-known,route_hash=sha256:known\n")
+            peer_steward._discover_session_notice_duties(store)
+            duties = store.list(kinds={"session-notice"})
+            cases = [("missing", None), ("none", None), ("integer", 9),
+                     ("list", []), ("empty", ""), ("placeholder", "-")]
+            for label, pane in cases:
+                with self.subTest(pane_id=label):
+                    agent = {"agent": "claude", "agent_session": {"value": "sid-notice"}}
+                    if label != "missing":
+                        agent["pane_id"] = pane
+                    inventory = {"result": {"agents": [agent]}}
+                    with mock.patch.object(peer_steward, "_herdr_argv", return_value=["herdr"]), \
+                         mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
+                             stdout=json.dumps(inventory), returncode=0)), \
+                         mock.patch.object(peer_steward, "_resolve_target") as resolve:
+                        peer_steward._resume_session_notice_obligations(duties, store)
+                    resolve.assert_not_called()
+                    duty = store.get(duties[0]["id"])
+                    self.assertEqual(duty["state"], "pending")
+                    self.assertEqual(duty["observation"]["reason"], "recipient-unavailable")
+                    self.assertEqual(duty["observation"]["recipient_sid"], "sid-notice")
+                    stored = pending.read(self.jobs.parent, "sid-notice", record["delivery_id"])
+                    self.assertEqual(stored["state"], "pending")
+
     def test_registered_completion_retains_exact_native_turn_before_ack(self):
         from types import SimpleNamespace
         import dispatch_completion_join as join
