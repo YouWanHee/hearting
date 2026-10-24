@@ -427,10 +427,19 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
 
     # F-100b: herdr attachment — one `herdr agent list` per snapshot, exact session-id
     # match; additive enrichment that never touches liveness or row existence.
+    herdr_session_observation = None
     try:
         from . import herdr as _herdr
         observed = _herdr.enrich(sessions, wait_timeout=0.0 if fast_first else 0.2)
         if isinstance(observed, dict):
+            herdr_session_observation = {
+                "complete": observed.get("complete") is True,
+                "live": frozenset(
+                    (str(s.harness).lower(), str(s.session_id))
+                    for s in sessions
+                    if getattr(s, "harness", None) and getattr(s, "session_id", None)
+                ),
+            }
             observations["herdr"] = _observation_health(
                 job_key, "herdr", observed.get("last_error") if not observed.get("complete") else None)
     except Exception as exc:
@@ -644,6 +653,7 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
         from . import dispatch
         jobs = dispatch.collect(jobs_path=jobs_path, harness_filter=harness_filter,
                                 session_rows=sessions,
+                                session_observation=herdr_session_observation,
                                 **({"fast_first": True} if fast_first else {}))
         # Capture the collector's output at its boundary, never in render or
         # from the independent detail worker. Older readers keep the attributes.

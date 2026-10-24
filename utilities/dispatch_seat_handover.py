@@ -1074,6 +1074,32 @@ def _lineage_holder(rows_by_seat: dict, key: tuple, registered: str, harness: st
         row = latest
         holder = str(row.get("sid") or registered)
         harness = str(row.get("harness") or harness)
+    # Explicit bindings are authority independent of the row's source (in
+    # particular, ``retire`` records can bind a cross-harness handover). Follow
+    # subsequent same-seat handovers from that holder, except retire rows which
+    # describe the already-accounted-for pane departure. Tidy succession remains
+    # the final same-harness edge for unbound clear history.
+    if latest is not None:
+        latest_match = None
+        for ledger_key, ledger_rows in graph.ledger_rows.items():
+            for index, item in enumerate(ledger_rows):
+                if item.get("sid") and _row_binds_key(item, key):
+                    order = (float(item.get("ts", 0) or 0), index, ledger_key)
+                    if latest_match is None or order > latest_match[0]:
+                        latest_match = (order, ledger_rows)
+        ledger_rows = latest_match[1] if latest_match is not None else ()
+        latest_order = latest_match[0][:2] if latest_match is not None else (
+            float(row.get("ts", 0) or 0), -1)
+        seen = {registered, holder}
+        for index, later in enumerate(ledger_rows):
+            if (float(later.get("ts", 0) or 0), index) <= latest_order:
+                continue
+            sid = str(later.get("sid") or "")
+            if (later.get("event") == "handover" and later.get("from") == holder
+                    and sid and sid not in seen and later.get("source") != "retire"):
+                holder = sid
+                harness = str(later.get("harness") or harness)
+                seen.add(sid)
     end, state = _chain_end(graph, harness, holder)
     return (registered if state == "unresolved" else end), harness
 
@@ -1084,7 +1110,7 @@ def _effective(meta: dict, jobs=None, *, read_context=None, extra_seats=()) -> t
     route to a Claude successor), so the rows of every seat with a snapshot are read together;
     only an exact binding on registry file, route id, route hash and node moves a job."""
     registered = str(meta.get("parent_sid") or "")
-    harness = str(meta.get("parent_harness") or "")
+    harness = _registered_parent_harness(meta)
     if not registered or jobs is None or not eligible_row(meta):
         return registered, harness
     try:
@@ -1092,7 +1118,28 @@ def _effective(meta: dict, jobs=None, *, read_context=None, extra_seats=()) -> t
         return _lineage_holder({}, key,
                                registered, harness, read_context=read_context)
     except Exception:  # noqa: BLE001 - the registered answer is always safe
-        return registered, str(meta.get("parent_harness") or "")
+        return registered, _registered_parent_harness(meta)
+
+
+def _registered_parent_harness(meta: dict) -> str:
+    """Recover the parent harness from real depth-1 registry rows.
+
+    Current rows commonly omit ``parent_harness`` while retaining the runtime
+    harness and completion carrier. Keep the explicit value authoritative, then
+    use the carrier table as the stable fallback.
+    """
+    explicit = str(meta.get("parent_harness") or meta.get("main_runtime_harness") or "")
+    if explicit:
+        return explicit
+    carrier = meta.get("parent_completion_delivery")
+    if not isinstance(carrier, str) or not carrier:
+        return ""
+    try:
+        from harness_capabilities import HARNESSES, parent_completion
+        return next((harness for harness in HARNESSES
+                     if parent_completion(harness).get("carrier") == carrier), "")
+    except (ImportError, KeyError, TypeError, ValueError):
+        return ""
 
 
 def effective_parent(meta: dict, jobs=None, *, read_context=None) -> str:
@@ -1147,7 +1194,7 @@ def record_recipient(record: dict, storage_key: str, *, harness: str,
             targets.add(storage_key)
             continue
         registered = storage_key
-        row_harness = str(meta.get("parent_harness") or harness)
+        row_harness = _registered_parent_harness(meta) or harness
         try:
             key = (_jobs_key(jobs), *route_identity(meta))
             target, target_harness = _lineage_holder(
@@ -1263,9 +1310,39 @@ def storage_recipients(session: str, env=None, harness: Optional[str] = None) ->
 
 
 def _chain_to(rows: list, session: str) -> list:
-    """Normalized edge rows on the unique confirmed ancestry ending at ``session``."""
+    """Authority handovers plus tidy edges on the unique ancestry to ``session``.
+
+    Binding-carrying handover rows are explicit authority regardless of source.
+    Tidy succession/handover edges remain available where a row has no binding.
+    """
     graph = lineage_graph()
-    harnesses = {harness for harness, _origin, target in graph.edges if target == session}
+    candidates = []
+    for ledger_key, ledger_rows in graph.ledger_rows.items():
+        for index, row in enumerate(ledger_rows):
+            if row.get("event") != "handover":
+                continue
+            edge = _st().tidy_lineage_edge(row)
+            has_bindings = any(isinstance(binding, dict)
+                               for binding in row.get("bindings") or ())
+            if edge is None and not has_bindings:
+                continue
+            harness, origin, target = edge or (
+                row.get("harness"), row.get("from"), row.get("sid"))
+            if all(isinstance(value, str) and value for value in (harness, origin, target)):
+                candidates.append((harness, origin, target, ledger_key, index, row))
+    # Succession is a tidy edge with no handover row counterpart.
+    handover_pairs = {(h, origin, target) for h, origin, target, *_ in candidates}
+    for harness, origin, target in graph.edges:
+        if (harness, origin, target) in handover_pairs:
+            continue
+        matches = []
+        for ledger_key, ledger_rows in graph.ledger_rows.items():
+            for index, row in enumerate(ledger_rows):
+                if _st().tidy_lineage_edge(dict(row)) == (harness, origin, target):
+                    matches.append((harness, origin, target, ledger_key, index, row))
+        if matches:
+            candidates.append(max(matches, key=lambda item: (float(item[5].get("ts", 0) or 0), item[4])))
+    harnesses = {harness for harness, _origin, target, *_ in candidates if target == session}
     if not harnesses:
         harnesses = {str(row.get("harness")) for row in rows
                      if row.get("sid") == session and row.get("harness")}
@@ -1275,23 +1352,24 @@ def _chain_to(rows: list, session: str) -> list:
     if (harness, session) in graph.unresolved:
         return []
     reverse = {}
-    for edge_harness, origin, target in graph.edges:
+    for edge_harness, origin, target, ledger_key, index, row in candidates:
         if edge_harness == harness:
-            reverse.setdefault(target, set()).add(origin)
+            reverse.setdefault(target, {}).setdefault(origin, []).append(
+                (float(row.get("ts", 0) or 0), index, ledger_key, row))
     chain, cursor, seen = [], session, {session}
-    while len(reverse.get(cursor, ())) == 1:
+    if len(reverse.get(cursor, {})) > 1:
+        return []
+    while len(reverse.get(cursor, {})) == 1:
         origin = next(iter(reverse[cursor]))
         if origin in seen:
             return []
-        matches = []
-        for ledger_key, ledger_rows in graph.ledger_rows.items():
-            for index, row in enumerate(ledger_rows):
-                if _st().tidy_lineage_edge(row) == (harness, origin, cursor):
-                    matches.append((float(row.get("ts", 0) or 0), index, ledger_key, row))
+        matches = reverse[cursor][origin]
         if matches:
             chain.append(dict(max(matches, key=lambda item: item[:3])[3]))
         seen.add(origin)
         cursor = origin
+        if len(reverse.get(cursor, {})) > 1:
+            return []
     return chain
 
 

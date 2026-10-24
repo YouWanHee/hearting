@@ -3629,7 +3629,11 @@ def _mem_repo_rows(events, sid_titles, limit=_MEM_REPO_ROW_LIMIT, term_width=Non
 
 def _delivery_pending_rows(counts):
     if isinstance(counts, dict) and counts.get("pending", 0):
-        return [[("  delivery pending: %d · awaiting recipient" % counts["pending"], "lvl_y")]]
+        line = "  delivery pending: %d · awaiting recipient" % counts["pending"]
+        no_recipient = counts.get("no_recipient")
+        if isinstance(no_recipient, int) and not isinstance(no_recipient, bool):
+            line += " · 받을 세션 없음 %d" % no_recipient
+        return [[(line, "lvl_y")]]
     return []
 
 

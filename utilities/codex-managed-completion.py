@@ -40,6 +40,7 @@ from dispatch_completion_join import (  # noqa: E402
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
 import dispatch_batch_obligations as batch_obligations  # noqa: E402
+import dispatch_session_sweep  # noqa: E402
 from dispatch_supervision import StopWaiting
 import codex_queue_delivery
 from codex_queue_dispatch import resolve_queue_socket
@@ -240,30 +241,34 @@ class NoticeWatcher:
     def _run(self) -> None:
         if not self.recipient:
             return
-        directory = pending_delivery.record_directory(self.root, self.recipient)
         while not self.stop.is_set():
             try:
-                if directory.is_dir() and not directory.is_symlink():
-                    paths = self._candidate_paths(directory)
-                    for path in paths:
-                        self._one(path)
+                for path, storage_key in self._candidate_paths():
+                    self._one(path, storage_key=storage_key)
             except (OSError, ValueError) as exc:
                 self._record_error(type(exc).__name__)
             self.stop.wait(min(max(self.args.interval, 0.05), 2.0))
 
-    def _candidate_paths(self, directory: Path) -> list[Path]:
-        """Bound work while rotating eligible records to avoid lexical starvation."""
-        all_paths = sorted(directory.glob("delivery-*.json"))
+    def _candidate_paths(self, _directory: Path | None = None) -> list[tuple[Path, str]]:
+        """Rotate a bounded set of open records currently addressed to this session."""
+        records, _count = dispatch_session_sweep.addressed_records(
+            self.root, "codex-native-queue", self.recipient)
         eligible = []
-        for path in all_paths:
-            try:
-                value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, UnicodeDecodeError):
+        for record in records:
+            storage_key = record.get(dispatch_session_sweep.STORAGE_KEY)
+            delivery_id = record.get("delivery_id")
+            receipt = record.get("receipt")
+            if (isinstance(receipt, dict) and receipt.get("kind") == "notice"
+                    and not getattr(self.args, "queue_socket", None)):
+                continue  # Route-free notices use the native queue carrier, not the typed gateway.
+            if (not isinstance(storage_key, str) or not storage_key
+                    or not isinstance(delivery_id, str) or not delivery_id
+                    or not notice_receipt.is_notice(receipt)
+                    or record.get("state") not in {"pending", "claimed", "sent-ambiguous"}):
                 continue
-            receipt = value.get("receipt") if isinstance(value, dict) else None
-            if (isinstance(receipt, dict) and notice_receipt.is_notice(receipt)
-                    and value.get("state") in {"pending", "claimed", "sent-ambiguous"}):
-                eligible.append(path)
+            eligible.append((pending_delivery.record_path(self.root, storage_key, delivery_id),
+                             storage_key))
+        eligible.sort(key=lambda item: (str(item[0]), item[1]))
         if not eligible:
             return []
         start = self._scan_cursor % len(eligible)
@@ -271,9 +276,10 @@ class NoticeWatcher:
         self._scan_cursor = (start + len(selected)) % len(eligible)
         return selected
 
-    def _one(self, path: Path) -> None:
+    def _one(self, path: Path, *, storage_key: str | None = None) -> None:
         sent = False
         retry_failure = "notice-not-consumed"
+        storage_key = storage_key or self.recipient
         try:
             queue_socket = getattr(self.args, "queue_socket", None)
             capability = (
@@ -287,15 +293,30 @@ class NoticeWatcher:
             receipt = record.get("receipt") if isinstance(record, dict) else None
             if not notice_receipt.is_notice(receipt):
                 return
-            notice_receipt.validate_pending_record(
-                record, jobs=self.args.jobs,
-                expected_thread_id=self.recipient,
-                expected_epoch=self.epoch,
-                expected_attempts=self.attempts,
-                expected_sealed_batch_id=self.args.sealed_batch_id,
-            )
-            target = queue_target(self.args.jobs, self.attempts, self.recipient) if queue_socket else ""
-            retry_context = f"{self.recipient}:{self.epoch}:{target}"
+            if receipt.get("kind") == "notice":
+                import session_notice
+                session_notice.validate_pending_record(record)
+                storage_epoch = int(record.get("session_generation") or 0)
+            else:
+                storage_epoch = (self.epoch if storage_key == self.recipient
+                                 else int(record.get("session_generation") or 0))
+                expected_attempts = set(record.get("attempt_ids") or ())
+                if not expected_attempts and storage_key == self.recipient:
+                    expected_attempts = self.attempts
+                notice_receipt.validate_pending_record(
+                    record, jobs=self.args.jobs,
+                    expected_thread_id=storage_key,
+                    expected_epoch=storage_epoch,
+                    expected_attempts=expected_attempts,
+                    expected_sealed_batch_id=str(receipt.get("sealed_batch_id") or ""),
+                )
+            claim_epoch = storage_epoch if receipt.get("kind") != "notice" else self.epoch
+            target = (queue_target(self.args.jobs, self.attempts, self.recipient,
+                                   record=record, storage_key=storage_key)
+                      if queue_socket else "")
+            if queue_socket and not target:
+                raise CompletionError("notice-recipient-unavailable")
+            retry_context = f"{storage_key}:{claim_epoch}:{target}"
             # Reclaim only after checking the live monotonic deadline.  The
             # old carrier's lease may still be valid, so a fresh watcher must
             # preserve that claim; using deadline+1 here incorrectly steals a
@@ -308,46 +329,64 @@ class NoticeWatcher:
                         "pending-delivery-claim-refused", "lease-not-expired"
                     )
                 record = pending_delivery.reclaim(
-                    self.root, self.recipient, record["delivery_id"],
+                    self.root, storage_key, record["delivery_id"],
                     now_ns=time.monotonic_ns(),
                 )
             claimed = pending_delivery.claim(
-                self.root, self.recipient, record["delivery_id"],
+                self.root, storage_key, record["delivery_id"],
                 claim_owner=self.owner,
                 lease_seconds=300.0 if queue_socket else 30.0,
                 require_generation_proof=True,
-                live_recipient_generation=(self.recipient, str(self.epoch)),
+                live_recipient_generation=(storage_key, str(claim_epoch)),
                 jobs=self.args.jobs,
                 retry_context=retry_context,
             )
-            notice_receipt.validate_pending_record(
-                claimed, jobs=self.args.jobs,
-                expected_thread_id=self.recipient,
-                expected_epoch=self.epoch,
-                expected_attempts=self.attempts,
-                expected_sealed_batch_id=self.args.sealed_batch_id,
-            )
-            if queue_socket:
-                context = notice_receipt.context(
-                    receipt, notice_receipt.gateway_delivery_id(receipt)
+            if receipt.get("kind") == "notice":
+                session_notice.validate_pending_record(claimed)
+            else:
+                expected_attempts = set(claimed.get("attempt_ids") or ())
+                if not expected_attempts and storage_key == self.recipient:
+                    expected_attempts = self.attempts
+                notice_receipt.validate_pending_record(
+                    claimed, jobs=self.args.jobs,
+                    expected_thread_id=storage_key,
+                    expected_epoch=storage_epoch,
+                    expected_attempts=expected_attempts,
+                    expected_sealed_batch_id=str(receipt.get("sealed_batch_id") or ""),
                 )
-                additional = context.get("additionalContext")
-                values = [value.get("value") for value in additional.values()
-                          if isinstance(value, dict) and isinstance(value.get("value"), str)] \
-                    if isinstance(additional, dict) else []
+            if queue_socket:
+                if receipt.get("kind") == "notice":
+                    values = [session_notice.render_text(receipt)]
+                else:
+                    context = notice_receipt.context(
+                        receipt, notice_receipt.gateway_delivery_id(receipt)
+                    )
+                    additional = context.get("additionalContext")
+                    values = [value.get("value") for value in additional.values()
+                              if isinstance(value, dict) and isinstance(value.get("value"), str)] \
+                        if isinstance(additional, dict) else []
                 if len(values) != 1:
                     raise CompletionError("native-queue-notice-context-invalid")
+                fresh_target = queue_target(
+                    self.args.jobs, self.attempts, self.recipient,
+                    record=claimed, storage_key=storage_key)
+                if fresh_target != target:
+                    raise CompletionError("native-queue-target-changed")
                 fence_identity = pending_delivery.submission_fence_identity(claimed, target)
                 fence = pending_delivery.read_submission_fence(
-                    self.root, self.recipient, claimed["delivery_id"],
+                    self.root, storage_key, claimed["delivery_id"],
                     expected_identity=fence_identity)
                 allow_add = fence is None or fence["state"] == "not-accepted"
                 prepared_attempt = None
 
                 def before_add():
                     nonlocal sent, prepared_attempt
+                    if queue_target(
+                            self.args.jobs, self.attempts, self.recipient,
+                            record=claimed, storage_key=storage_key) != target:
+                        raise CompletionError("native-queue-target-changed")
                     prepared = pending_delivery.prepare_submission_fence(
-                        self.root, self.recipient, claimed["delivery_id"],
+                        self.root, storage_key, claimed["delivery_id"],
                         claim_owner=self.owner, expected_identity=fence_identity)
                     prepared_attempt = prepared["attempt"]
                     sent = True
@@ -364,14 +403,14 @@ class NoticeWatcher:
                     if (prepared_attempt is not None and not exc.ambiguous
                             and exc.reason.startswith("queue-rpc-refused:thread/queue/add:")):
                         pending_delivery.record_submission_not_accepted(
-                            self.root, self.recipient, claimed["delivery_id"],
+                            self.root, storage_key, claimed["delivery_id"],
                             claim_owner=self.owner, expected_identity=fence_identity,
                             expected_attempt=prepared_attempt, reason=exc.reason)
                         sent = False
                     raise
                 if queue_result.get("status") in {"queued", "consumed"}:
                     pending_delivery.record_submission_accepted(
-                        self.root, self.recipient, claimed["delivery_id"],
+                        self.root, storage_key, claimed["delivery_id"],
                         claim_owner=self.owner, expected_identity=fence_identity,
                         queue_submission_id=queue_result.get("queued_submission_id"),
                         source=("queue-response" if prepared_attempt is not None
@@ -382,13 +421,13 @@ class NoticeWatcher:
                         and not queue_result.get("already_pending")):
                     try:
                         pending_delivery.record_send(
-                            self.root, self.recipient, claimed["delivery_id"],
+                            self.root, storage_key, claimed["delivery_id"],
                             source="codex-native-queue-notice-accepted",
                             event_id=str(queue_result.get("queued_submission_id") or claimed["delivery_id"]))
                     except (pending_delivery.PendingDeliveryError, OSError):
                         pass  # Timing is evidence, never delivery or execution authority.
                 if queue_result.get("status") == "consumed":
-                    pending_delivery.ack(self.root, self.recipient, claimed["delivery_id"],
+                    pending_delivery.ack(self.root, storage_key, claimed["delivery_id"],
                                          acked_by=self.owner)
                     return
                 queued = codex_queue_delivery.list_queue(
@@ -403,18 +442,18 @@ class NoticeWatcher:
                     )
                     if turn is not None:
                         pending_delivery.record_submission_accepted(
-                            self.root, self.recipient, claimed["delivery_id"],
+                            self.root, storage_key, claimed["delivery_id"],
                             claim_owner=self.owner, expected_identity=fence_identity,
                             source="exact-observation",
                             expected_attempt=prepared_attempt,
                         )
                         pending_delivery.ack(
-                            self.root, self.recipient, claimed["delivery_id"],
+                            self.root, storage_key, claimed["delivery_id"],
                             acked_by=self.owner,
                         )
                         return
                 pending_delivery.mark_sent_ambiguous(
-                    self.root, self.recipient, claimed["delivery_id"],
+                    self.root, storage_key, claimed["delivery_id"],
                     claim_owner=self.owner,
                 )
                 retry_failure = "native-queue-notice-consumption-pending"
@@ -431,12 +470,12 @@ class NoticeWatcher:
             sent = True
             if result.get("status") == "accepted":
                 pending_delivery.ack(
-                    self.root, self.recipient, claimed["delivery_id"],
+                    self.root, storage_key, claimed["delivery_id"],
                     acked_by=self.owner,
                 )
             elif result.get("status") == "sent-ambiguous":
                 pending_delivery.mark_sent_ambiguous(
-                    self.root, self.recipient, claimed["delivery_id"],
+                    self.root, storage_key, claimed["delivery_id"],
                     claim_owner=self.owner,
                 )
             elif result.get("status") == "retryable":
@@ -456,7 +495,7 @@ class NoticeWatcher:
                     self._record_error(reason)
                     return
                 pending_delivery.reject_claimed(
-                    self.root, self.recipient, claimed["delivery_id"],
+                    self.root, storage_key, claimed["delivery_id"],
                     claim_owner=self.owner, reason=reason)
         except Exception as exc:
             retry_failure = str(exc) or type(exc).__name__
@@ -464,17 +503,17 @@ class NoticeWatcher:
                 try:
                     if record.get("state") == "pending":
                         resolved = pending_delivery.claim(
-                            self.root, self.recipient, record["delivery_id"],
+                            self.root, storage_key, record["delivery_id"],
                             claim_owner=self.owner, lease_seconds=30.0,
                             require_generation_proof=True,
-                            live_recipient_generation=(self.recipient, str(self.epoch)),
+                            live_recipient_generation=(storage_key, str(claim_epoch)),
                             jobs=self.args.jobs)
                     elif "claimed" in locals():
                         resolved = claimed
                     else:
                         raise ValueError("supervision-resolution-owned-by-other-carrier")
                     pending_delivery.reject_claimed(
-                        self.root, self.recipient, resolved["delivery_id"],
+                        self.root, storage_key, resolved["delivery_id"],
                         claim_owner=self.owner, reason="supervision-resolved")
                 except (ValueError, pending_delivery.PendingDeliveryError):
                     pass
@@ -482,12 +521,12 @@ class NoticeWatcher:
             if sent:
                 try:
                     pending_delivery.mark_sent_ambiguous(
-                        self.root, self.recipient, claimed["delivery_id"], claim_owner=self.owner)
+                        self.root, storage_key, claimed["delivery_id"], claim_owner=self.owner)
                 except Exception:
                     pass
             elif "claimed" in locals():
                 try:
-                    pending_delivery.reclaim(self.root, self.recipient, claimed["delivery_id"],
+                    pending_delivery.reclaim(self.root, storage_key, claimed["delivery_id"],
                                          now_ns=time.monotonic_ns())
                 except Exception:
                     pass
@@ -495,7 +534,7 @@ class NoticeWatcher:
         finally:
             if getattr(self.args, "queue_socket", None) and "claimed" in locals():
                 try:
-                    pending_delivery.release_claim(self.root, self.recipient,
+                    pending_delivery.release_claim(self.root, storage_key,
                         claimed["delivery_id"], claim_owner=self.owner,
                         failure_reason=retry_failure)
                 except pending_delivery.PendingDeliveryError as exc:
@@ -922,11 +961,36 @@ def deliver_with_retry(
         time.sleep(min(max(args.delivery_retry_interval, 0.05), remaining))
 
 
-def queue_target(jobs: Path, attempts: set[str], registered: str) -> str:
+def queue_target(jobs: Path, attempts: set[str], registered: str, *,
+                 record: dict | None = None, storage_key: str | None = None) -> str:
     """The Codex thread that receives a completion: the registered parent, or its same-seat
     successor after a /clear.  Storage, claim and ack stay under the registered parent (the
     record's own signature and digest); only the queue the item is put into changes.  Looked up
     again on every pass, so a handover that happens while waiting is seen before the send."""
+    if record is not None:
+        if not storage_key:
+            return ""
+        try:
+            import dispatch_seat_handover as handover
+            recipient = handover.record_recipient(record, storage_key, harness="codex")
+            if not recipient:
+                return ""
+            receipt = record.get("receipt") if isinstance(record, dict) else None
+            if isinstance(receipt, dict) and receipt.get("kind") == "notice":
+                return recipient
+            record_attempts = record.get("attempt_ids")
+            if not isinstance(record_attempts, list) or not record_attempts:
+                return ""
+            rows = handover.latest_rows(jobs)
+            owners = {(handover.effective_parent(rows[attempt][1], jobs),
+                       handover.effective_parent_harness(rows[attempt][1], jobs))
+                      for attempt in record_attempts if attempt in rows}
+            if len(owners) == 1:
+                owner, harness = owners.pop()
+                return (owner or storage_key) if harness == "codex" and (owner or storage_key) == recipient else ""
+            return ""
+        except Exception:  # noqa: BLE001 - an unknown target must remain pending
+            return ""
     try:
         import dispatch_seat_handover as handover
         rows = handover.latest_rows(jobs)

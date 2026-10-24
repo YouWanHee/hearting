@@ -3691,6 +3691,7 @@ class SeatHandoverTest(TidyCase):
         out, rows = self.start("sid-B")
         self.assertEqual([(r["from"], r["sid"], r["source"]) for r in rows], [("sid-A", "sid-B", "clear")])
         self.assertEqual(self.effective(meta), "sid-B")
+
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
             self.assertTrue(self.handover.owns(meta, "sid-B", self.jobs))
             self.assertFalse(self.handover.owns(meta, "sid-A", self.jobs))    # the registered parent no longer owns after handover
@@ -3698,6 +3699,18 @@ class SeatHandoverTest(TidyCase):
         self.assertEqual(meta["parent_sid"], "sid-A")                    # the registry row is untouched
         again, rows2 = self.start("sid-B", event="prompt", source="")
         self.assertEqual(len(rows2), 1)                                  # the same A -> B again is a no-op
+
+    def test_real_registry_row_without_parent_harness_uses_completion_carrier(self):
+        meta = self.row("att-real-row")
+        meta.pop("parent_harness")
+        meta["parent_completion_delivery"] = "claude-parent-runtime"
+        self.rows[-1] = self.rows[-1].replace(",parent_harness=claude", "")
+        self.rows[-1] = self.rows[-1].replace(",route_file=", ",parent_completion_delivery=claude-parent-runtime,route_file=")
+        self.jobs.write_text("\n".join(self.rows) + "\n", encoding="utf-8")
+        self.snapshot(now=st.now_epoch() - 5)
+        self.start("sid-B")
+        self.assertEqual(self.handover.effective_parent_harness(meta, self.jobs), "claude")
+        self.assertEqual(self.effective(meta), "sid-B")
 
     def test_the_card_gets_the_verified_route_and_the_existing_resume_command(self):
         self.row("att-1", route_file="/tmp/rt-1.json")

@@ -59,11 +59,20 @@ def notify(harness: str, session_id: str, *, key: str, subject: str, text: str,
                         "key": key})
     digest = hashlib.sha256(f"{KIND}\0{key}".encode()).hexdigest()
     tag = "notice-" + digest[:32]
-    return pending_delivery.create(
-        _registry(jobs).parent, recipient_kind=carrier, recipient_key=session_id,
+    registry = _registry(jobs)
+    record = pending_delivery.create(
+        registry.parent, recipient_kind=carrier, recipient_key=session_id,
         delivery_id="delivery-" + digest, session_generation="", session_generation_supported="0",
         attempt_ids=[tag], parent_attempt_id=tag, route_id=route_id or "route-free", route_node=KIND,
         receipt=receipt, receipt_digest=receipt_digest(receipt), row_revisions={tag: KIND})
+    try:
+        from peer_obligations import retain_session_notice
+        retain_session_notice(registry, harness, session_id, record)
+    except Exception:
+        # Duty creation and runner startup are best-effort recovery hooks. The
+        # immutable pending record remains available to the next sweep.
+        pass
+    return record
 
 
 def render_text(receipt: dict) -> str:

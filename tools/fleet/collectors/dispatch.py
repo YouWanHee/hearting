@@ -3768,7 +3768,7 @@ def _annotate_orphan_conductors(jobs, now, jobs_path=None):
             j.resume_boundary = boundary or "-"
 
 
-def _pending_delivery_counts(paths):
+def _pending_delivery_counts(paths, *, session_observation=None):
     """SD-111 P6: read-only pending/expired visibility. Never transitions
     any state -- glob + json.loads only, mirroring the enumeration pattern
     `dispatch_completion_join.reconcile_pending_delivery()` already uses
@@ -3821,8 +3821,34 @@ def _pending_delivery_counts(paths):
     pending = 0
     expired = 0
     retained_batch_duties = 0
+    no_recipient = None
+    live_sessions = None
+    graph = None
+    if isinstance(session_observation, dict) and session_observation.get("complete") is True:
+        observed_live = session_observation.get("live")
+        if isinstance(observed_live, (set, frozenset, tuple, list)):
+            normalized_live = set()
+            try:
+                for item in observed_live:
+                    harness, sid = item
+                    if not isinstance(harness, str) or not isinstance(sid, str) or not harness or not sid:
+                        raise ValueError("invalid live session identity")
+                    normalized_live.add((harness.lower(), sid))
+            except (TypeError, ValueError):
+                normalized_live = None
+            if normalized_live is not None:
+                live_sessions = normalized_live
+                no_recipient = 0
+                try:
+                    from dispatch_seat_handover import lineage_graph
+                    graph = lineage_graph()
+                except Exception:
+                    graph = None
+                    no_recipient = None
     all_records = set()
     seen_roots = set()
+    seen_no_recipient = set()
+    no_recipient_unknown = False
     for path in paths:
         try:
             root = dispatch_state_root(path)
@@ -3867,6 +3893,38 @@ def _pending_delivery_counts(paths):
             state = record.get("state")
             if state in {"pending", "claimed", "sent-ambiguous"}:
                 pending += 1
+                if no_recipient is not None and graph is not None:
+                    identity = (delivery_id, recipient_digest)
+                    if identity not in seen_no_recipient:
+                        seen_no_recipient.add(identity)
+                        kind = record.get("recipient_kind") or ""
+                        harness = kind.split("-", 1)[0].lower()
+                        if harness not in {"claude", "codex", "opencode"}:
+                            no_recipient_unknown = True
+                            continue
+                        storage_candidates = {
+                            sid for candidate_harness, sid in graph.ledger_keys
+                            if candidate_harness == harness
+                            and hashlib.sha256(sid.encode("utf-8")).hexdigest() == recipient_digest
+                        }
+                        storage_candidates.update(
+                            sid for candidate_harness, sid in live_sessions
+                            if candidate_harness == harness
+                            and hashlib.sha256(sid.encode("utf-8")).hexdigest() == recipient_digest
+                        )
+                        if len(storage_candidates) != 1:
+                            no_recipient_unknown = True
+                            continue
+                        storage_sid = next(iter(storage_candidates))
+                        try:
+                            from dispatch_seat_handover import record_recipient
+                            recipient_sid = record_recipient(record, storage_sid, harness=harness)
+                        except Exception:
+                            recipient_sid = None
+                        if recipient_sid is None:
+                            no_recipient_unknown = True
+                        elif (harness, recipient_sid) not in live_sessions:
+                            no_recipient += 1
             elif state == "expired":
                 expired += 1
 
@@ -3879,8 +3937,11 @@ def _pending_delivery_counts(paths):
         if (delivery_id, recipient_digest) not in all_records:
             unmaterialized += 1
 
+    if no_recipient_unknown:
+        no_recipient = None
     return {"pending": pending + unmaterialized, "expired": expired,
-            "retained_batch_duties": retained_batch_duties}
+            "retained_batch_duties": retained_batch_duties,
+            "no_recipient": no_recipient}
 
 
 def _fill_locations(jobs):
@@ -4093,7 +4154,8 @@ def attempt_decision_payload(status, metadata, state_evidence=None):
     }
 
 
-def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False):
+def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False,
+             session_observation=None):
     """Return merged [DispatchJob]. harness_filter does not restrict dispatch — the section
     is cross-harness by design (jobs, not sessions).
 
@@ -4334,7 +4396,8 @@ def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fa
     # change. Enumeration failure fails open: keep every job row, drop the count.
     try:
         if not fast_first:
-            collect.last_pending_delivery = _pending_delivery_counts(paths)
+            collect.last_pending_delivery = _pending_delivery_counts(
+                paths, session_observation=session_observation)
     except Exception:
         collect.last_pending_delivery = None
     return jobs
@@ -4343,10 +4406,11 @@ def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fa
 _ARTIFACT_READ_CACHE = artifact_reader.ReadCache() if artifact_reader is not None else None
 
 
-def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False):
+def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False,
+            session_observation=None):
     """One inventory observation per root/tick; unchanged records reuse it live."""
     from contextlib import ExitStack
-    args = (jobs_path, harness_filter, session_rows, fast_first)
+    args = (jobs_path, harness_filter, session_rows, fast_first, session_observation)
     import artifact_producer
     with ExitStack() as stack:
         if artifact_reader is not None:

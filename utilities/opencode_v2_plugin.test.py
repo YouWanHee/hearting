@@ -27,6 +27,16 @@ def fixture_tempdir(stack):
 
 
 class OpenCodeV2PluginTest(unittest.TestCase):
+    def test_completion_carrier_queries_shared_lineage_and_bounds_negative_cache(self):
+        source = (ROOT / "adapters/opencode/plugins/hearting-guards.js").read_text(encoding="utf-8")
+        self.assertIn('command("recipients", sid)', source)
+        self.assertIn('const recipientCache = new Map()', source)
+        self.assertIn("cached.generation !== current.generation", source)
+        self.assertIn("CARRIER_RECIPIENT_CACHE_MS", source)
+        self.assertIn("CARRIER_NEGATIVE_CACHE_MS", source)
+        self.assertIn("cached.negativeUntil = now + CARRIER_NEGATIVE_CACHE_MS", source)
+        self.assertIn("for (const digest of cached.digests)", source)
+
     def test_pending_peer_delivery_releases_only_prewrite_reservations(self):
         node = shutil.which("node")
         if not node:

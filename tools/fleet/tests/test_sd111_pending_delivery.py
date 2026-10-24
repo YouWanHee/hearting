@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 from unittest import mock
@@ -83,12 +84,14 @@ class PendingDeliveryCountsTest(unittest.TestCase):
 
     def test_no_records_no_intent_rows_returns_zero(self):
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 0, "expired": 0, "retained_batch_duties": 0})
+        self.assertEqual(counts, {"pending": 0, "expired": 0, "retained_batch_duties": 0,
+                                  "no_recipient": None})
 
     def test_materialized_pending_record_counted_once(self):
         pending_delivery.create(**_record(root=self.state_root))
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 1, "expired": 0, "retained_batch_duties": 0})
+        self.assertEqual(counts, {"pending": 1, "expired": 0, "retained_batch_duties": 0,
+                                  "no_recipient": None})
 
     def test_notice_remains_visible_without_any_parent_session(self):
         from fleet import render
@@ -118,7 +121,8 @@ class PendingDeliveryCountsTest(unittest.TestCase):
             liveness="known",
         )
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 0, "expired": 1, "retained_batch_duties": 0})
+        self.assertEqual(counts, {"pending": 0, "expired": 1, "retained_batch_duties": 0,
+                                  "no_recipient": None})
         # A-9 visibility clause: the file still exists on disk.
         record_path = pending_delivery.record_path(
             self.state_root, "sess-p6", record["delivery_id"]
@@ -137,7 +141,8 @@ class PendingDeliveryCountsTest(unittest.TestCase):
             "delivery_id": "delivery-" + "b" * 32,
         })
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 1, "expired": 0, "retained_batch_duties": 0})
+        self.assertEqual(counts, {"pending": 1, "expired": 0, "retained_batch_duties": 0,
+                                  "no_recipient": None})
 
     def test_intent_row_and_its_own_materialized_record_counted_once_not_twice(self):
         record = pending_delivery.create(**_record(root=self.state_root))
@@ -148,19 +153,22 @@ class PendingDeliveryCountsTest(unittest.TestCase):
             "delivery_id": record["delivery_id"],
         })
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 1, "expired": 0, "retained_batch_duties": 0})
+        self.assertEqual(counts, {"pending": 1, "expired": 0, "retained_batch_duties": 0,
+                                  "no_recipient": None})
 
     def test_enumeration_failure_fails_open_missing_directory(self):
         missing_jobs = self.state_root / "does-not-exist" / "jobs.log"
         counts = dispatch._pending_delivery_counts([str(missing_jobs)])
-        self.assertEqual(counts, {"pending": 0, "expired": 0, "retained_batch_duties": 0})
+        self.assertEqual(counts, {"pending": 0, "expired": 0, "retained_batch_duties": 0,
+                                  "no_recipient": None})
 
     def test_corrupt_record_file_skipped_not_raised(self):
         pending_root = self.state_root / "pending-delivery" / ("f" * 64)
         pending_root.mkdir(parents=True, exist_ok=True)
         (pending_root / "delivery-broken.json").write_text("not json", encoding="utf-8")
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 0, "expired": 0, "retained_batch_duties": 0})
+        self.assertEqual(counts, {"pending": 0, "expired": 0, "retained_batch_duties": 0,
+                                  "no_recipient": None})
 
     def test_retained_batch_duties_counted_while_complete_ones_are_not(self):
         obligations = self.state_root / "supervisor-state" / "obligations"
@@ -174,7 +182,8 @@ class PendingDeliveryCountsTest(unittest.TestCase):
                 encoding="utf-8")
         (obligations / "batch-broken.json").write_text("not json", encoding="utf-8")
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 0, "expired": 0, "retained_batch_duties": 3})
+        self.assertEqual(counts, {"pending": 0, "expired": 0, "retained_batch_duties": 3,
+                                  "no_recipient": None})
 
     def test_collect_stashes_counts_on_the_module_like_last_malformed(self):        # A-9/A-21 visibility clause: `collect()` (fleet's one read-only
         # entry point, F-27's control module is the only fleet surface with
@@ -186,10 +195,61 @@ class PendingDeliveryCountsTest(unittest.TestCase):
             with mock.patch.object(dispatch, "_scan_processes", return_value=[]):
                 dispatch.collect(jobs_path=str(self.jobs_path))
             self.assertEqual(
-                dispatch.collect.last_pending_delivery, {"pending": 1, "expired": 0, "retained_batch_duties": 0}
+                dispatch.collect.last_pending_delivery,
+                {"pending": 1, "expired": 0, "retained_batch_duties": 0,
+                 "no_recipient": None}
             )
         finally:
             dispatch.collect.last_pending_delivery = None
+
+    def _count_with_graph(self, storage_sid, recipient_sid, live=(), duplicate_paths=False):
+        record = pending_delivery.create(**_record(root=self.state_root,
+                                                    recipient_key=storage_sid))
+        path = pending_delivery.record_path(self.state_root, storage_sid, record["delivery_id"])
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        graph = SimpleNamespace(ledger_keys={("claude", storage_sid): ()})
+        paths = [str(self.jobs_path), str(self.jobs_path)] if duplicate_paths else [str(self.jobs_path)]
+        with mock.patch("dispatch_seat_handover.lineage_graph", return_value=graph), \
+                mock.patch("dispatch_seat_handover.record_recipient",
+                           return_value=recipient_sid):
+            counts = dispatch._pending_delivery_counts(
+                paths, session_observation={"complete": True, "live": set(live)})
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        return counts
+
+    def test_dead_storage_and_confirmed_dead_chain_end_count_once(self):
+        counts = self._count_with_graph("dead-A", "dead-C", duplicate_paths=True)
+        self.assertEqual(counts["no_recipient"], 1)
+        self.assertEqual(counts["pending"], 1)
+
+    def test_live_successor_and_live_untidied_storage_are_excluded(self):
+        successor = self._count_with_graph("dead-A", "live-C", live={("claude", "live-C")})
+        self.assertEqual(successor["no_recipient"], 0)
+
+    def test_live_untidied_storage_is_excluded(self):
+        untidied = self._count_with_graph("live-A", "live-A", live={("claude", "live-A")})
+        self.assertEqual(untidied["no_recipient"], 0)
+
+    def test_unresolved_recipient_and_missing_census_remain_unknown(self):
+        unresolved = self._count_with_graph("dead-A", None)
+        self.assertIsNone(unresolved["no_recipient"])
+        pending_delivery.create(**_record(root=self.state_root))
+        missing = dispatch._pending_delivery_counts([str(self.jobs_path)])
+        self.assertIsNone(missing["no_recipient"])
+
+    def test_render_and_overview_show_known_count_but_never_unknown_as_zero(self):
+        from fleet import render
+        from fleet.explorer.overview import build_overview
+        known = {"pending": 2, "expired": 0, "no_recipient": 1}
+        with mock.patch.object(render, "_PROCESS_VIEW", False):
+            lines = render._delivery_pending_rows(known)
+            text = "\n".join(segment[0] for line in lines for segment in line)
+        self.assertIn("받을 세션 없음 1", text)
+        overview = "\n".join(build_overview({"pending_delivery": known}))
+        self.assertIn("받을 세션 없음 1", overview)
+        unknown = {"pending": 2, "expired": 0, "no_recipient": None}
+        self.assertNotIn("no recipient", str(render._delivery_pending_rows(unknown)))
+        self.assertNotIn("받을 세션 없음", "\n".join(build_overview({"pending_delivery": unknown})))
 
 
 if __name__ == "__main__":

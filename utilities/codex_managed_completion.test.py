@@ -1737,6 +1737,67 @@ class NativeQueueDeliveryTest(unittest.TestCase):
             with mock.patch.object(handover, "effective_parent", side_effect=OSError("boom")):
                 self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), SESSION)
 
+    def test_notice_watcher_reads_and_acks_the_original_key_through_a_real_tidy_lineage(self) -> None:
+        import dispatch_seat_handover as handover
+        import session_notice
+
+        module = load_completion_module()
+        old_session = "thread-managed-before-clear"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xdg = root / "xdg"
+            ledger_dir = xdg / "hearting" / "session-tidy" / "sessions"
+            ledger_dir.mkdir(parents=True)
+            (ledger_dir / "fixture-seat.jsonl").write_text(json.dumps({
+                "event": "succession", "source": "tidy-clear", "harness": "codex",
+                "from": old_session, "sid": SESSION, "ts": 1,
+            }) + "\n", encoding="utf-8")
+            jobs = root / "dispatch" / "jobs.log"
+            jobs.parent.mkdir()
+            jobs.write_text("", encoding="utf-8")
+            receipt = {
+                "schema_version": 1, "kind": "notice", "subject": "remote run",
+                "text": "completed", "required_action": "read-notice", "key": "fixture-run",
+            }
+            delivery_id = "delivery-" + hashlib.sha256(b"notice\0fixture-run").hexdigest()
+            notice_attempt = "notice-" + hashlib.sha256(b"notice\0fixture-run").hexdigest()[:32]
+            pending = module.pending_delivery
+            pending.create(
+                jobs.parent, recipient_kind="codex-native-queue", recipient_key=old_session,
+                delivery_id=delivery_id, session_generation="", session_generation_supported="0",
+                attempt_ids=[notice_attempt], parent_attempt_id=notice_attempt,
+                route_id="route-free", route_node="notice", receipt=receipt,
+                receipt_digest=session_notice.receipt_digest(receipt),
+                row_revisions={notice_attempt: "notice"},
+            )
+            args = SimpleNamespace(
+                jobs=jobs, parent_session_id=SESSION, sealed_batch_id="batch-current",
+                queue_socket=Path("/tmp/app-server.sock"), interval=0.01,
+            )
+            seat = SimpleNamespace(key="fixture-seat")
+            def consume(*_args, **kwargs):
+                kwargs["before_add"]()
+                return {"status": "consumed", "turn_id": "turn-fixture"}
+
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(xdg)}), \
+                 mock.patch.object(handover, "pane_seat", return_value=seat), \
+                 mock.patch.object(handover, "_lineage_seats", return_value={}), \
+                 mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
+                                   side_effect=consume) as send:
+                handover._LINEAGE_GRAPH_CACHE.clear()
+                watcher = module.NoticeWatcher(args, {"unrelated-managed-attempt"}, capability=None)
+                candidates = watcher._candidate_paths()
+                self.assertEqual(candidates, [(pending.record_path(jobs.parent, old_session, delivery_id),
+                                               old_session)])
+                watcher._one(*candidates[0][:1], storage_key=candidates[0][1])
+                handover._LINEAGE_GRAPH_CACHE.clear()
+
+            self.assertEqual(send.call_args.kwargs["thread_id"], SESSION)
+            self.assertEqual(send.call_args.kwargs["message"], "remote run: completed (required_action=read-notice)")
+            stored = pending.read(jobs.parent, old_session, delivery_id)
+            self.assertEqual(stored["state"], "acked")
+            self.assertIsNone(pending.read(jobs.parent, SESSION, delivery_id))
+
     def test_accepted_send_is_not_repeated_during_history_outage(self) -> None:
         from types import SimpleNamespace
 
@@ -1926,6 +1987,7 @@ class NativeQueueDeliveryTest(unittest.TestCase):
                      "additionalContext": {"notice": {"value": "typed notice"}},
                  }), \
                  mock.patch.object(module.notice_receipt, "gateway_delivery_id", return_value="notice-id"), \
+                 mock.patch.object(module, "queue_target", return_value=SESSION), \
                  mock.patch.object(module.pending_delivery, "claim", return_value={
                      "delivery_id": delivery_id, "state": "claimed", "receipt": receipt,
                  }), \

@@ -640,6 +640,92 @@ class ObligationStoreTest(unittest.TestCase):
         self.assertEqual(duty["intent"]["identity"]["attempt_id"], "att-fixture")
         ensure.assert_called_once_with(jobs.parent)
 
+    def test_registered_completion_duty_uses_current_parent_when_caller_sid_is_stale(self):
+        from types import SimpleNamespace
+        carrier = "fixture-parent-runtime"
+        jobs = self.root / "dispatch" / "jobs.log"
+        row = SimpleNamespace(status="running", metadata={
+            "parent_completion_delivery": carrier})
+        with mock.patch("dispatch_completion_join.current_attempt_row", return_value=row), \
+             mock.patch("dispatch_seat_handover.effective_parent", return_value="sid-successor"), \
+             mock.patch("harness_capabilities.parent_completion",
+                        return_value={"carrier": carrier}), \
+             mock.patch.object(obligations, "ensure_normal_runner"):
+            self.assertTrue(obligations.retain_registered_completion(
+                jobs, "att-stale-caller", "sid-original", carrier))
+        duty = obligations.ObligationStore(jobs.parent).list(kinds={"registered-batch"})[0]
+        self.assertEqual(duty["intent"]["identity"]["session_id"], "sid-successor")
+
+    def test_notice_runtime_binding_carries_per_record_original_storage_identity(self):
+        recipient = {"harness": "claude", "session_id": "sid-current"}
+        duty = "session-notice-" + "a" * 32
+        delivery = "delivery-original"
+        producer = {"schema": "session-notice-runtime-v1", "duty_id": duty,
+            "jobs": str(self.jobs.resolve()), "records": [{"duty_id": duty,
+                "storage_sid": "sid-original", "delivery_id": delivery,
+                "receipt_digest": "b" * 64}], "recipient": recipient}
+        sender = {"harness": "runtime", "session_id": None, "name": "Hearting runtime"}
+        refs = [duty, delivery]
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "notice_producer_test_peer_message", _HERE / "peer-message.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertTrue(module._valid_session_notice_producer_binding(
+            producer, sender, recipient, refs))
+        self.assertFalse(module._valid_session_notice_producer_binding(
+            producer, sender, recipient, [duty]))
+
+    def test_runner_recovers_legacy_notice_and_wakes_exact_lineage_pane(self):
+        from types import SimpleNamespace
+        import dispatch_pending_delivery as pending
+        import session_notice
+        env = {"HOME": str(self.root / "home"),
+               "XDG_STATE_HOME": str(self.root / "xdg-state"),
+               "AGENT_DISPATCH_JOBS": str(self.jobs)}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
+            record = session_notice.notify("claude", "sid-notice", key="run:legacy",
+                subject="compute run", text="finished", jobs=self.jobs)
+            store = obligations.ObligationStore(self.jobs.parent)
+            sessions = self.root / "xdg-state" / "hearting" / "session-tidy" / "sessions"
+            sessions.mkdir(parents=True, exist_ok=True)
+            (sessions / "known-seat.jsonl").write_text(
+                json.dumps({"event": "start", "harness": "claude", "sid": "sid-notice"}) + "\n")
+            (self.root / "jobs.log").write_text(
+                "2026-10-24T00:00:00Z\topen\t/w\t/w\tslug\t"
+                "attempt_id=att-known,parent_sid=sid-notice,parent_completion_delivery=claude-parent-runtime,"
+                "dispatch_depth=1,worker_type=owner,route_id=rt-known,route_hash=sha256:known\n")
+            for path in store.root.glob("session-notice-*.json"):
+                path.unlink()
+            peer_steward._discover_session_notice_duties(store)
+            duties = store.list(kinds={"session-notice"})
+            sent = []
+            def courier(args, *, expected_recipient, on_prepared, producer_binding=None):
+                body = Path(args.body_file).read_text(encoding="utf-8")
+                sent.append((body, expected_recipient, producer_binding, args.ref))
+                on_prepared("a" * 32)
+                return 0
+            inventory = {"result": {"agents": [{"agent": "claude",
+                "agent_session": {"value": "sid-notice"}, "pane_id": "pane-notice"}]}}
+            with mock.patch.object(peer_steward, "_herdr_argv", return_value=["herdr"]), \
+                 mock.patch.object(peer_steward.subprocess, "run",
+                    return_value=SimpleNamespace(stdout=json.dumps(inventory))), \
+                 mock.patch.object(peer_steward, "_resolve_target",
+                    return_value=("claude", "sid-notice", "notice")), \
+                 mock.patch.object(peer_steward, "cmd_prompt", side_effect=courier):
+                peer_steward._resume_session_notice_obligations(duties, store)
+            stored = pending.read(self.jobs.parent, "sid-notice", record["delivery_id"])
+        self.assertEqual(len(duties), 1)
+        self.assertEqual(len(sent), 1)
+        body, target, producer, refs = sent[0]
+        self.assertIn("compute run: finished", body)
+        self.assertEqual(target, ("claude", "sid-notice"))
+        self.assertEqual(producer["schema"], "session-notice-runtime-v1")
+        self.assertEqual(producer["records"][0]["storage_sid"], "sid-notice")
+        self.assertEqual(refs, [duties[0]["id"], record["delivery_id"]])
+        self.assertEqual(stored["state"], "sent-ambiguous")
+
     def test_registered_completion_retains_exact_native_turn_before_ack(self):
         from types import SimpleNamespace
         import dispatch_completion_join as join

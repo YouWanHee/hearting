@@ -13,9 +13,9 @@ refusal -- not a successful claim -- is this package's observable output
 No blocking vocabulary anywhere in this module. A caller never receives an
 exception from :func:`sweep`; every failure mode (unreadable directory,
 corrupt record, lock contention) is swallowed and folded into ``"refused"``.
-Enumeration is bounded to the caller's own ``recipient_digest`` directory
-only (O(own records), §13.33.1-(3)) -- this module never walks any other
-session's records and never reads ``jobs.log``.
+Enumeration is bounded to the caller's own key and the confirmed predecessor
+keys returned by ``storage_recipients`` (O(addressed records), §13.33.1-(3));
+this module never scans unrelated session directories and never reads ``jobs.log``.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import json
 import hashlib
 import os
 from pathlib import Path
+import re
 import sys
 import time
 
@@ -508,6 +509,35 @@ def _followup(root: Path, record: dict) -> str:
         return ""
 
 
+_COMPUTE_RUN_NOTICE_RE = re.compile(
+    r"^run (?P<run_id>[A-Za-z0-9_-]+) on (?P<host>[A-Za-z0-9_.-]+) "
+    r"ended with exit (?P<exit>[0-9]+)(?: \([^()\n]*\))?"
+    r"(?:; started by attempt [^;\n]+ in route [^;\n]+)?"
+    r"; read it with: compute-hosts tail (?P<tail>[A-Za-z0-9_-]+)$"
+)
+
+
+def _compute_run_notice(record: dict) -> dict | None:
+    """Classify only the canonical, fully self-identifying compute-run notice."""
+    receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
+    receipt_key = receipt.get("key")
+    if (receipt.get("kind") != "notice" or not isinstance(receipt_key, str)
+            or receipt_key.split(":", 1)[0] != "compute-run"
+            or receipt.get("subject") != "compute run"):
+        return None
+    match = _COMPUTE_RUN_NOTICE_RE.fullmatch(receipt.get("text", ""))
+    if (not match or match.group("tail") != match.group("run_id")
+            or receipt_key != f"compute-run:{match.group('run_id')}"):
+        return None
+    run_id, host = match.group("run_id"), match.group("host")
+    identity = re.fullmatch(r"(?P<host>.+)-(?P<stamp>[0-9]{8}-[0-9]{6})(?:-(?P<label>.*))?", run_id)
+    if not identity or identity.group("host") != host:
+        return None
+    return {"host": host, "stamp": identity.group("stamp"),
+            "label": identity.group("label") or "", "exit": int(match.group("exit")),
+            "run_id": run_id}
+
+
 def delivery_context(batches: list[tuple[Path, list[dict]]]) -> str:
     """The one text a parent receives for its delivered records, whichever runtime carries it.
 
@@ -515,9 +545,9 @@ def delivery_context(batches: list[tuple[Path, list[dict]]]) -> str:
     answered, completions are consumed, so they get separate instructions.
     """
 
-    gate_lines: list[str] = []
-    notice_lines: list[str] = []
-    lines: list[str] = []
+    gate_lines: list[tuple[str, str]] = []
+    notice_records: list[tuple[Path, dict]] = []
+    lines: list[tuple[str, str]] = []
     followups: list[str] = []
     from dispatch_recipient_receipt import receipt_marker
 
@@ -535,22 +565,64 @@ def delivery_context(batches: list[tuple[Path, list[dict]]]) -> str:
         for record in records:
             text = bound_text(root, record)
             if is_human_gate_record(record):
-                gate_lines.append(text)
+                gate_lines.append((str(record.get("delivery_id", "")), text))
                 continue
             if (record.get("receipt") or {}).get("kind") == "notice":
-                notice_lines.append(text)
+                notice_records.append((root, record))
                 continue
-            lines.append(text)
+            lines.append((str(record.get("delivery_id", "")), text))
             follow = _followup(root, record)
             if follow and follow not in followups:
                 followups.append(follow)
     blocks: list[str] = []
     if gate_lines:
-        blocks.append(GATE_DELIVERY_HEADER + "\n" + "\n".join(f"- {line}" for line in gate_lines))
-    if notice_lines:
-        blocks.append(NOTICE_DELIVERY_HEADER + "\n" + "\n".join(f"- {line}" for line in notice_lines))
+        blocks.append(GATE_DELIVERY_HEADER + "\n" + "\n".join(
+            f"- {line}" for _delivery_id, line in sorted(gate_lines)))
+    if notice_records:
+        individual: list[tuple[tuple, str]] = []
+        groups: dict[tuple, list[tuple[dict, dict]]] = {}
+        for root, record in notice_records:
+            run = _compute_run_notice(record)
+            if run and run["exit"] == 0:
+                receipt = record.get("receipt") or {}
+                key = (receipt.get("subject"), run["host"], run["label"],
+                       receipt.get("required_action"), 0)
+                groups.setdefault(key, []).append((run, {"root": root, "record": record}))
+            else:
+                receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
+                text = bound_text(root, record)
+                individual.append(((0, str(receipt.get("text", "")),
+                                    str(record.get("delivery_id", ""))), text))
+        for key, members in groups.items():
+            members.sort(key=lambda item: (item[0]["stamp"], item[0]["run_id"],
+                                           str(item[1]["record"].get("delivery_id", ""))))
+            if len(members) < 3:
+                for run, pair in members:
+                    record = pair["record"]
+                    receipt = record.get("receipt") or {}
+                    individual.append(((0, str(receipt.get("text", "")),
+                                        str(record.get("delivery_id", ""))),
+                                       bound_text(pair["root"], record)))
+                continue
+            runs = [run for run, _pair in members]
+            latest = runs[-1]
+            label = key[2] or "(unlabeled)"
+            summary = (f"compute run summary: {len(runs)} runs on {key[1]} label={label}; "
+                       f"exit 0:{len(runs)}; time {runs[0]['stamp']}..{latest['stamp']}; "
+                       f"latest {latest['run_id']}; compute-hosts tail {latest['run_id']}")
+            markers = []
+            for _run, pair in members:
+                text = bound_text(pair["root"], pair["record"])
+                markers.extend(line for line in text.splitlines()
+                               if line.startswith("HEARTING_RECEIPT_V1 "))
+            individual.append(((1, key, latest["run_id"]), summary + "\n" + "\n".join(markers)))
+        ordered_notices = sorted(individual, key=lambda item: item[0])
+        if ordered_notices:
+            blocks.append(NOTICE_DELIVERY_HEADER + "\n" + "\n".join(
+                f"- {line}" for _sort_key, line in ordered_notices))
     if lines:
-        blocks.append(COMPLETION_DELIVERY_HEADER + "\n" + "\n".join(f"- {line}" for line in lines)
+        blocks.append(COMPLETION_DELIVERY_HEADER + "\n" + "\n".join(
+            f"- {line}" for _delivery_id, line in sorted(lines))
                       + "".join("\n" + follow for follow in followups))
     return "\n\n".join(blocks)
 
@@ -827,7 +899,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     import argparse
     parser = argparse.ArgumentParser(description=main.__doc__)
-    parser.add_argument("action", choices=("roots", "activate", "deliver", "ack", "release", "settle"))
+    parser.add_argument("action", choices=("roots", "recipients", "activate", "deliver", "ack", "release", "settle"))
     parser.add_argument("--recipient-kind", default="")
     parser.add_argument("--session", default="")
     args = parser.parse_args(argv)
@@ -839,6 +911,19 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--session is required")
     if args.recipient_kind not in pending_delivery.RECIPIENT_KINDS:
         parser.error(f"unknown recipient kind {args.recipient_kind}")
+    if args.action == "recipients":
+        if args.recipient_kind != "opencode-turn":
+            parser.error("recipients is an internal OpenCode carrier action")
+        from dispatch_seat_handover import _lineage_signature, storage_recipients, _st
+        sessions = _st().state_root() / "sessions"
+        # Use the same file generation consumed by the shared lineage reader.
+        signature = _lineage_signature(sessions)
+        generation = hashlib.sha256(json.dumps(signature, separators=(",", ":")).encode()).hexdigest()
+        digests = sorted({hashlib.sha256(storage.encode()).hexdigest()
+                          for storage, _allowed in storage_recipients(
+                              args.session, harness="opencode")})
+        print(json.dumps({"generation": generation, "digests": digests}))
+        return 0
     if args.action == "settle":
         try:
             handed = json.load(sys.stdin)

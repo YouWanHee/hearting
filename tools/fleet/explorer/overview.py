@@ -134,5 +134,9 @@ def build_overview(snapshot=None, focus_result=None, *, sid=None, steward_error=
     lines.extend(obligation_lines(obligations))
     delivery = _get(snapshot, "pending_delivery")
     if isinstance(delivery, Mapping) and (delivery.get("pending") or delivery.get("expired")):
-        lines.append(f"전달 기록 대기 {delivery.get('pending', 0)} · 만료 {delivery.get('expired', 0)}")
+        line = f"전달 기록 대기 {delivery.get('pending', 0)} · 만료 {delivery.get('expired', 0)}"
+        no_recipient = delivery.get("no_recipient")
+        if isinstance(no_recipient, int) and not isinstance(no_recipient, bool):
+            line += f" · 받을 세션 없음 {no_recipient}"
+        lines.append(line)
     return tuple(lines)

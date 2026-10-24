@@ -2288,6 +2288,14 @@ An exact ACK or explicit no-delivery decision makes the committed outcome ready
 without waiting for route closure. Missing or unreadable delivery evidence stays
 unknown, and executor readiness keeps its existing closure rules.
 
+Route-free session notices keep their original storage SID, delivery id, receipt
+digest and ACK identity while the current recipient follows the confirmed same-
+harness lineage. New notices retain a duty in the existing peer obligation
+runner; activation also discovers valid open records left by older writers. The
+runner rechecks the recipient and one exact live pane before sending. An exact
+received peer reference or native history receipt ACKs stored records; queued
+or ambiguous transfers remain pending.
+
 **S1** no execution authority — a steward never edits the target root's source, artifact,
 registry, or spec, and never asks the target session to do what its own session refused
 or blocked (cross-session permission laundering forbidden); a blocked action reflects

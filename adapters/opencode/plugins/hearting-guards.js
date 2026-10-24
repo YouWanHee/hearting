@@ -1360,6 +1360,8 @@ const CARRIER_ENV = "AGENT_PARENT_COMPLETION_CARRIER"
 const CARRIER_KIND = "opencode-turn"
 const CARRIER_INTERVAL_MS = 5000
 const CARRIER_ROOTS_RETRY_MS = 60000
+const CARRIER_RECIPIENT_CACHE_MS = 10000
+const CARRIER_NEGATIVE_CACHE_MS = 1200
 const sweepRel = path.join("utilities", "dispatch_session_sweep.py")
 const OWED_STATES = new Set(["pending", "claimed", "sent-ambiguous"])
 
@@ -1405,6 +1407,7 @@ function createCompletionCarrier(ctx) {
   const sessions = new Set()
   const status = new Map()
   const busy = new Set()
+  const recipientCache = new Map()
   let roots = null
   let rootsAt = 0
   let timer = null
@@ -1434,18 +1437,42 @@ function createCompletionCarrier(ctx) {
       roots = (await command("roots", sid)) || []
       log("roots", sid, roots.length ? "resolved" : "unavailable", { roots })
     }
-    const digest = createHash("sha256").update(sid).digest("hex")
+    if (!sid) return false
+    const now = Date.now()
+    const current = await command("recipients", sid)
+    let cached = recipientCache.get(sid)
+    if (current && typeof current.generation === "string" && Array.isArray(current.digests)) {
+      if (!cached || cached.generation !== current.generation || now >= cached.expiresAt) {
+        cached = {
+          generation: current.generation,
+          digests: current.digests.filter(value => /^[0-9a-f]{64}$/.test(value)),
+          expiresAt: now + CARRIER_RECIPIENT_CACHE_MS,
+          negativeUntil: 0,
+        }
+        recipientCache.set(sid, cached)
+      }
+    } else if (!cached || now >= cached.expiresAt) {
+      log("skip", sid, "lineage-unavailable")
+      return false
+    }
+    if (!cached || now < cached.negativeUntil) return false
     for (const base of roots) {
-      let names = []
-      try { names = readdirSync(path.join(base, "pending-delivery", digest)) } catch { continue }
-      for (const name of names) {
-        if (!name.startsWith("delivery-") || !name.endsWith(".json")) continue
-        try {
-          const record = JSON.parse(readFileSync(path.join(base, "pending-delivery", digest, name), "utf8"))
-          if (record?.recipient_kind === CARRIER_KIND && OWED_STATES.has(record.state)) return true
-        } catch {}
+      for (const digest of cached.digests) {
+        let names = []
+        try { names = readdirSync(path.join(base, "pending-delivery", digest)) } catch { continue }
+        for (const name of names) {
+          if (!name.startsWith("delivery-") || !name.endsWith(".json")) continue
+          try {
+            const record = JSON.parse(readFileSync(path.join(base, "pending-delivery", digest, name), "utf8"))
+            if (record?.recipient_kind === CARRIER_KIND && OWED_STATES.has(record.state)) {
+              cached.negativeUntil = 0
+              return true
+            }
+          } catch {}
+        }
       }
     }
+    cached.negativeUntil = now + CARRIER_NEGATIVE_CACHE_MS
     return false
   }
 

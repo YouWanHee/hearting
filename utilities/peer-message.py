@@ -66,6 +66,7 @@ _PEER_TRAILER_RE = re.compile(
     r"(?P<sid>[^\s)]+)(?:\s+(?P<name>[^)]*?))?\s*\)")
 _EXACT_RECEIVER_PROVENANCE = "validated-peer-ref-receiver-v1"
 _RUNTIME_PRODUCER_SCHEMA = "registered-runtime-completion-v1"
+_SESSION_NOTICE_PRODUCER_SCHEMA = "session-notice-runtime-v1"
 
 
 def _session_handle():
@@ -224,9 +225,49 @@ def _valid_runtime_producer_binding(binding, sender, recipient=None, refs=None):
     return True
 
 
+def _valid_session_notice_producer_binding(binding, sender, recipient=None, refs=None):
+    """Validate per-record route-free notice provenance without jobs attempts."""
+    keys = {"schema", "duty_id", "jobs", "records", "recipient"}
+    if (not isinstance(binding, dict) or set(binding) != keys
+            or binding.get("schema") != _SESSION_NOTICE_PRODUCER_SCHEMA
+            or not isinstance(sender, dict) or sender.get("harness") != "runtime"
+            or sender.get("session_id") not in (None, "")
+            or sender.get("name") != "Hearting runtime"):
+        return False
+    if (not isinstance(binding.get("duty_id"), str)
+            or not re.fullmatch(r"session-notice-[0-9a-f]{32}", binding["duty_id"])
+            or not isinstance(binding.get("jobs"), str) or not Path(binding["jobs"]).is_absolute()
+            or not isinstance(binding.get("recipient"), dict)
+            or not _valid_transfer_endpoint(binding["recipient"])):
+        return False
+    rows = binding.get("records")
+    if not isinstance(rows, list) or not rows or len(rows) > 32:
+        return False
+    required = {"duty_id", "storage_sid", "delivery_id", "receipt_digest"}
+    refs = set(refs or ())
+    for row in rows:
+        if (not isinstance(row, dict) or set(row) != required
+                or not re.fullmatch(r"session-notice-[0-9a-f]{32}", str(row.get("duty_id") or ""))
+                or not all(isinstance(row.get(key), str) and row[key]
+                           for key in ("storage_sid", "delivery_id"))
+                or not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}",
+                                    str(row.get("receipt_digest") or ""))
+                or row["duty_id"] not in refs or row["delivery_id"] not in refs):
+            return False
+    if binding["duty_id"] not in refs:
+        return False
+    if recipient is not None and any(binding["recipient"].get(key) != recipient.get(key)
+                                     for key in ("harness", "session_id")):
+        return False
+    return True
+
+
 def _valid_transfer_sender(endpoint, producer_binding=None, recipient=None, refs=None):
     # An external shell has no session to attribute; the recipient remains exact.
     if isinstance(endpoint, dict) and endpoint.get("harness") == "runtime":
+        if isinstance(producer_binding, dict) and producer_binding.get("schema") == _SESSION_NOTICE_PRODUCER_SCHEMA:
+            return _valid_session_notice_producer_binding(
+                producer_binding, endpoint, recipient, refs)
         return _valid_runtime_producer_binding(producer_binding, endpoint, recipient, refs)
     if producer_binding is not None:
         return False

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -1323,6 +1324,104 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
 
     def seed_turn(self, **overrides):
         return self._seed(self.SID, recipient_kind="opencode-turn", **overrides)
+
+    def _compute_notice(self, run_id, host, code=0, session_id=None):
+        import session_notice
+        text = (f"run {run_id} on {host} ended with exit {code}"
+                f"; read it with: compute-hosts tail {run_id}")
+        row = session_notice.notify(
+            "opencode", session_id or self.SID, key=f"compute-run:{run_id}", subject="compute run",
+            text=text, required_action="report-to-user", jobs=self.root / "jobs.log")
+        return {**row, SWEEP.STORAGE_KEY: session_id or self.SID}
+
+    def test_compute_run_notices_bundle_deterministically_and_preserve_each_marker(self):
+        records = [self._compute_notice(
+            f"gpu-a-20261024-12000{i}-resnet-e4-w4", "gpu-a") for i in (1, 2, 3)]
+        records += [self._compute_notice(
+            f"gpu-a-20261024-12000{i}-resnet-e4-w5", "gpu-a") for i in (4, 5)]
+        records.append(self._compute_notice("gpu-a-20261024-120006-resnet-e4-w4", "gpu-a", 2))
+        forward = SWEEP.delivery_context([(self.root, records)])
+        reverse = SWEEP.delivery_context([(self.root, list(reversed(records)))])
+        self.assertEqual(forward, reverse)
+        self.assertIn("compute run summary: 3 runs on gpu-a label=resnet-e4-w4", forward)
+        self.assertIn("exit 0:3", forward)
+        self.assertIn("compute-hosts tail gpu-a-20261024-120003-resnet-e4-w4", forward)
+        self.assertEqual(forward.count("HEARTING_RECEIPT_V1 "), len(records))
+        self.assertIn("exit 2", forward)
+        self.assertIn("resnet-e4-w5", forward)
+        self.assertEqual(forward.count("run gpu-a-20261024-120004-resnet-e4-w5"), 1)
+
+    def test_idle_opencode_finds_and_acks_notice_under_lineage_predecessor(self):
+        predecessor = "ses-oc-before-clear"
+        record = self._compute_notice("gpu-a-20261024-130000-resnet-e4", "gpu-a",
+                                      session_id=predecessor)
+        sessions = Path(os.environ["XDG_STATE_HOME"]) / "hearting" / "session-tidy" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / "pane-ledger.jsonl").write_text(json.dumps({
+            "event": "succession", "source": "tidy-clear", "harness": "opencode",
+            "from": predecessor, "sid": self.SID,
+        }) + "\n", encoding="utf-8")
+        import dispatch_seat_handover as handover
+        seat = SimpleNamespace(kind="pane", key="fixture-pane")
+        with mock.patch.object(handover, "pane_seat", return_value=seat):
+            addressed, _count = SWEEP.addressed_records(self.root, "opencode-turn", self.SID)
+            self.assertEqual([item["delivery_id"] for item in addressed], [record["delivery_id"]])
+            claimed, _count = SWEEP.sweep_deliver(self.root, "opencode-turn", self.SID)
+            self.assertEqual([item["delivery_id"] for item in claimed], [record["delivery_id"]])
+            self.assertEqual(SWEEP.ack_delivered(self.root, self.SID, claimed,
+                                                 acked_by="fixture-opencode"), 1)
+        stored = PD.read(self.root, predecessor, record["delivery_id"])
+        self.assertEqual(stored["state"], "acked")
+
+    def test_plugin_refreshes_changed_lineage_and_expires_negative_owed_cache(self):
+        predecessor = "ses-oc-cache-origin"
+        sessions = Path(os.environ["XDG_STATE_HOME"]) / "hearting" / "session-tidy" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        ledger = sessions / "pane-cache.jsonl"
+        ledger.write_text(json.dumps({"event": "succession", "source": "tidy-clear",
+                                      "harness": "opencode", "from": predecessor,
+                                      "sid": self.SID}) + "\n", encoding="utf-8")
+        body = r'''
+const sid = "ses-oc-parent";
+        const ledger = `${process.env.XDG_STATE_HOME}/hearting/session-tidy/sessions/pane-cache.jsonl`;
+        const out = {env: {}};
+        await hooks["shell.env"]({sessionID: sid}, out);
+await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
+await new Promise(r => setTimeout(r, 250));
+writeFileSync(ledger, JSON.stringify({event: "succession", source: "tidy-clear",
+  harness: "opencode", from: "ses-oc-cache-origin", sid: "ses-oc-next"}) + "\n");
+await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
+await new Promise(r => setTimeout(r, 250));
+assert.equal(prompts.length, 0, "a cached predecessor digest survived a lineage generation change");
+const created = childProcess.spawnSync("python3", ["-c", `import os,sys; from pathlib import Path; ` +
+  `sys.path.insert(0, os.path.join(os.environ["AGENT_HOME"], "utilities")); ` +
+  `import session_notice; session_notice.notify("opencode", "${sid}", ` +
+  `key="cache-expiry", subject="cache", text="arrived", jobs=Path(os.environ["HARNESS_STATE_ROOT"])/"jobs.log")`],
+  {encoding: "utf8"});
+assert.equal(created.status, 0, created.stderr);
+await new Promise(r => setTimeout(r, 1350));
+await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
+for (let i = 0; i < 100 && !prompts.length; i++) await new Promise(r => setTimeout(r, 50));
+''';
+        const_result = self.run_plugin(body)
+        self.assertEqual(len(const_result["prompts"]), 1,
+                         f"negative cache expiry did not reveal the new record: {const_result['logs']}")
+
+    def test_internal_recipients_action_returns_lineage_digest_and_generation(self):
+        output = io.StringIO()
+        with mock.patch.object(SWEEP, "_state_roots", return_value=[self.root]), \
+                mock.patch("dispatch_seat_handover._lineage_signature",
+                           return_value=("/isolated/sessions", (("a.jsonl", 7, 9),))), \
+                mock.patch("dispatch_seat_handover.storage_recipients",
+                           return_value=[(self.SID, None), ("ses-predecessor", frozenset())]), \
+                mock.patch.dict(os.environ, {"HARNESS_STATE_ROOT": str(self.root)}), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(SWEEP.main(["recipients", "--recipient-kind", "opencode-turn",
+                                         "--session", self.SID]), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["digests"], sorted(hashlib.sha256(s.encode()).hexdigest()
+                                                    for s in (self.SID, "ses-predecessor")))
+        self.assertTrue(result["generation"])
 
     def state(self):
         return PD.read(self.root, self.SID, "delivery-" + "a" * 32)["state"]

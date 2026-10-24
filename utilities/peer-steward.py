@@ -7605,6 +7605,7 @@ def _runner_duties(store, duties=None):
         duties = store.list()
     return [duty for duty in duties
             if (duty.get("intent", {}).get("kind") in {"message", "retire", "registered-batch",
+                                                         "session-notice",
                                                          shared_readiness.DUTY_KIND}
                 or duty.get("id", "").startswith(("message-", "delay-")))]
 
@@ -7752,10 +7753,13 @@ def _reconcile_obligations(store, duties=None, *, read_context=None):
     """Advance only the accepted duties owned by this runner."""
     if duties is None:
         duties = store.list()
+    notice_duties = []
     for duty in duties:
         try:
             kind = duty.get("intent", {}).get("kind")
-            if kind == "message" or duty.get("id", "").startswith(("message-", "delay-")):
+            if kind == "session-notice":
+                notice_duties.append(duty)
+            elif kind == "message" or duty.get("id", "").startswith(("message-", "delay-")):
                 _resume_message_obligation(duty, store, read_context=read_context)
             elif kind == "retire":
                 with peer_obligations.legacy_runner_lock(store) as acquired:
@@ -7768,6 +7772,188 @@ def _reconcile_obligations(store, duties=None, *, read_context=None):
                 store.update(duty["id"], observer_error="observer-unavailable")
             except Exception:
                 pass
+    if notice_duties:
+        _resume_session_notice_obligations(notice_duties, store, read_context=read_context)
+
+
+def _discover_session_notice_duties(store):
+    """Recover valid open notice records written before duty retention existed."""
+    import dispatch_pending_delivery as pending
+    import session_notice
+    from dispatch_seat_handover import (_registered_parent_harness, latest_rows,
+                                        lineage_graph, record_recipient)
+    state_root = store.root.parent.parent.resolve()
+    jobs = state_root / "jobs.log"
+    candidates = set(lineage_graph().ledger_keys)
+    try:
+        for status, meta in latest_rows(jobs).values():
+            sid = str(meta.get("parent_sid") or "")
+            harness = _registered_parent_harness(meta)
+            if sid and harness:
+                candidates.add((harness, sid))
+    except (OSError, ValueError, KeyError, RuntimeError):
+        pass
+    for harness, storage_sid in candidates:
+        try:
+            entries = sorted(pending.record_directory(state_root, storage_sid).glob("delivery-*.json"))
+        except (OSError, pending.PendingDeliveryError):
+            continue
+        for entry in entries:
+            try:
+                record = pending.read(state_root, storage_sid, entry.stem)
+                if (not record or record.get("state") not in pending.OPEN_STATES
+                        or record.get("receipt", {}).get("kind") != "notice"
+                        or not record.get("recipient_kind")):
+                    continue
+                session_notice.validate_pending_record(record)
+                if record_recipient(record, storage_sid, harness=harness) is None:
+                    continue
+                peer_obligations.retain_session_notice(jobs, harness, storage_sid, record)
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                continue
+
+
+def _resume_session_notice_obligations(duties, store, *, read_context=None):
+    """Deliver notices through the existing herdr census and peer courier."""
+    import dispatch_pending_delivery as pending
+    from dispatch_notice_state import keep_claim
+    from dispatch_seat_handover import record_recipient
+    from dispatch_session_sweep import STORAGE_KEY, IDENTITY_KEY, delivery_context
+    import session_notice
+
+    root = store.root.parent.parent.resolve()
+    jobs = root / "jobs.log"
+    candidates = []
+    for duty in duties:
+        intent = duty.get("intent") or {}
+        identity = intent.get("identity") or {}
+        harness, storage_sid = identity.get("harness"), identity.get("storage_sid")
+        if (identity.get("state_root") != str(root) or not harness or not storage_sid
+                or intent.get("carrier") is None):
+            continue
+        try:
+            record = pending.read(root, storage_sid, identity["delivery_id"])
+            if (not record or record.get("receipt_digest") != identity.get("receipt_digest")
+                    or record.get("state") not in pending.OPEN_STATES
+                    or record.get("recipient_kind") != intent.get("carrier")):
+                if record and record.get("state") in {"acked", "rejected", "expired"}:
+                    store.update(duty["id"], state="complete", delivery=record["state"], cleanup="complete")
+                continue
+            session_notice.validate_pending_record(record)
+            recipient_sid = record_recipient(record, storage_sid, harness=harness,
+                                             read_context=read_context)
+            if recipient_sid:
+                candidates.append((duty, harness, storage_sid, recipient_sid, record))
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            continue
+    if not candidates:
+        return
+    # A pass sends one bounded body to one exact recipient. Additional records
+    # for that recipient are included in the same courier transfer.
+    candidates.sort(key=lambda item: (item[1], item[3], item[4]["delivery_id"]))
+    first = candidates[0]
+    duty, harness, _storage, recipient_sid, _record = first
+    batch = [item for item in candidates if item[1] == harness and item[3] == recipient_sid][:8]
+    pending_transfers = []
+    for item in batch:
+        obs = item[0].get("observation") or {}
+        ref = obs.get("transfer_ref")
+        if ref:
+            message = peer_message._read_pending(ref, roots=[root], state_root=root)
+            if message and message.get("state") == "received":
+                peer_obligations.acknowledge_session_notice_delivery(message, roots=[root])
+                return
+            # Accepted and ambiguous transfers are never redirected or resent.
+            if message and message.get("state") in {"queued", "unverified"}:
+                return
+            if message and message.get("state") == "pending":
+                pending_transfers.append(message)
+    old_server = _HERDR_SESSION
+    _server = os.environ.get("AGENT_HERDR_SESSION") or "default"
+    globals()["_HERDR_SESSION"] = None if _server == "default" else _server
+    try:
+        result = subprocess.run(_herdr_argv("agent", "list"), capture_output=True,
+                                text=True, timeout=5)
+        agents = (json.loads(result.stdout).get("result") or {}).get("agents") or []
+        matches = [agent for agent in agents if agent.get("agent") == harness
+                   and (agent.get("agent_session") or {}).get("value") == recipient_sid]
+        if len(matches) != 1:
+            for item in batch:
+                store.update(item[0]["id"], observation={"reason": "recipient-unavailable",
+                    "recipient_sid": recipient_sid})
+            return
+        pane = matches[0]["pane_id"]
+        if _resolve_target(pane)[:2] != (harness, recipient_sid):
+            return
+        if pending_transfers:
+            for message in pending_transfers:
+                _schedule_message_obligation(message, pane, pane)
+            return
+        claimed = []
+        producer_records = []
+        refs = []
+        for item_duty, item_harness, storage_sid, item_sid, original in batch:
+            fresh = pending.read(root, storage_sid, original["delivery_id"])
+            if (not fresh or fresh.get("receipt_digest") != original.get("receipt_digest")
+                    or record_recipient(fresh, storage_sid, harness=item_harness,
+                                        read_context=None) != item_sid
+                    or _resolve_target(pane)[:2] != (harness, recipient_sid)):
+                continue
+            owner = "retained-rewake:" + item_duty["id"]
+            try:
+                claim = pending.claim(root, storage_sid, fresh["delivery_id"], claim_owner=owner,
+                    lease_seconds=30, require_generation_proof=False, jobs=jobs,
+                    retry_context=f"{harness}:{recipient_sid}:{pane}:{item_duty['id']}")
+                if not keep_claim(root, storage_sid, fresh["delivery_id"], claim, owner, jobs=jobs):
+                    continue
+                stored = dict(claim)
+                identity = pending.received_ack_identity(stored, storage_sid, fresh["delivery_id"])
+                view = {**claim, STORAGE_KEY: storage_sid, IDENTITY_KEY: identity}
+                claimed.append((item_duty, storage_sid, fresh["delivery_id"], owner, stored, view))
+                producer_records.append({"duty_id": item_duty["id"], "storage_sid": storage_sid,
+                    "delivery_id": fresh["delivery_id"], "receipt_digest": fresh["receipt_digest"]})
+                refs.extend((item_duty["id"], fresh["delivery_id"]))
+            except (OSError, ValueError, RuntimeError):
+                continue
+        if not claimed:
+            return
+        body = delivery_context([(root, [entry[5] for entry in claimed])])
+        producer = {"schema": peer_message._SESSION_NOTICE_PRODUCER_SCHEMA,
+            "duty_id": claimed[0][0]["id"], "jobs": str(jobs.resolve()),
+            "records": producer_records,
+            "recipient": {"harness": harness, "session_id": recipient_sid}}
+        sender = {"harness": "runtime", "session_id": None, "name": "Hearting runtime"}
+        if not peer_message._valid_session_notice_producer_binding(producer, sender,
+                producer["recipient"], refs):
+            for _, storage_sid, delivery_id, owner, *_ in claimed:
+                pending.release_claim(root, storage_sid, delivery_id, claim_owner=owner)
+            return
+        prepared = []
+        def bind_transfer(ref):
+            for item_duty, storage_sid, delivery_id, _owner, _stored, _view in claimed:
+                store.update(item_duty["id"], observation={"transfer_ref": ref,
+                    "storage_sid": storage_sid, "delivery_id": delivery_id,
+                    "recipient_sid": recipient_sid, "producer_binding": producer})
+            prepared.append(ref)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body_file:
+            body_file.write(body)
+            body_file.flush()
+            ref_args = [arg for ref in dict.fromkeys(refs) for arg in ("--ref", ref)]
+            args = build_parser().parse_args(["prompt", pane, "--body-file", body_file.name,
+                                               *ref_args])
+            code = cmd_prompt(args, expected_recipient=(harness, recipient_sid),
+                              on_prepared=bind_transfer, producer_binding=producer)
+        for item_duty, storage_sid, delivery_id, owner, *_ in claimed:
+            current = pending.read(root, storage_sid, delivery_id)
+            if current and current.get("state") == "acked":
+                continue
+            if prepared or code in {0, 3}:
+                pending.mark_sent_ambiguous(root, storage_sid, delivery_id, claim_owner=owner)
+                store.update(item_duty["id"], state="pending", delivery="peer-courier", cleanup="pending")
+            else:
+                pending.release_claim(root, storage_sid, delivery_id, claim_owner=owner)
+    finally:
+        globals()["_HERDR_SESSION"] = old_server
 def _runner_lock_current(store, lock_fd):
     """The lock this runner holds is still the state root's runner lock file."""
     try:
@@ -7812,6 +7998,7 @@ def cmd_obligation_runner(args):
                 os.close(wake_fd)
             return 0
         store.begin_read_pass()
+        _discover_session_notice_duties(store)
         duties = store.list()
         from peer_read_context import PeerReadContext
         from runtime_observation import ObservationContext
