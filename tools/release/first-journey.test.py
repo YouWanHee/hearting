@@ -271,12 +271,34 @@ class JourneyTests(unittest.TestCase):
         rejected = {
             "claude": (b"{}", b'{"claudeAiOauth":{"accessToken":"fake-access"}}'),
             "codex": (b"{}", b'{"tokens":{"access_token":"","refresh_token":"fake-refresh"}}'),
-            "opencode": (b"{}",),
+            "opencode": (
+                b"{}", b'{"account":{"type":"api"}}',
+                b'{"account":{"type":"api","key":""}}',
+                b'{"account":{"type":"api","key":"fixture-key","metadata":{"field":1}}}',
+                b'{"account":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh"}}',
+                b'{"account":{"type":"oauth","access":"fixture-access","expires":0}}',
+                b'{"account":{"type":"oauth","access":"","refresh":"fixture-refresh","expires":0}}',
+                b'{"account":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh","expires":"0"}}',
+                b'{"account":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh","expires":0,"accountId":1}}',
+                b'{"account":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh","expires":true}}',
+                b'{"account":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh","expires":-1}}',
+                b'{"account":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh","expires":0.5}}',
+                b'{"account":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh","expires":NaN}}',
+                b'{"account":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh","expires":Infinity}}',
+                b'{"account":{"type":"wellknown","key":"fixture-key"}}',
+                b'{"account":{"type":"wellknown","key":"","token":"fixture-token"}}',
+                b'{"account":{"type":"wellknown","key":"fixture-key","token":""}}',
+                b'{"account":{"type":"unknown"}}', b'{"account":{"type":{}}}',
+                b'{"good":{"type":"api","key":"fixture-key"},"partial":{"type":"api"}}',
+            ),
         }
         complete = {
             "claude": b'{"claudeAiOauth":{"accessToken":"fake-access","refreshToken":"fake-refresh"}}',
             "codex": b'{"tokens":{"access_token":"fake-access","refresh_token":"fake-refresh"}}',
-            "opencode": b'{"account":{"type":"fake"}}',
+            "opencode": (b'{"api":{"type":"api","key":"fixture-key","metadata":{"field":"value"}},'
+                         b'"oauth":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh",'
+                         b'"expires":0.0,"accountId":"fixture-account","enterpriseUrl":"https://example.invalid"},'
+                         b'"wellknown":{"type":"wellknown","key":"fixture-key","token":"fixture-token"}}'),
         }
         for harness, candidates in rejected.items():
             for candidate in candidates:

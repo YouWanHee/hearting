@@ -50,8 +50,32 @@ def credential_complete(harness: str, data: bytes) -> bool:
                 and isinstance(tokens.get("access_token"), str) and bool(tokens["access_token"])
                 and isinstance(tokens.get("refresh_token"), str) and bool(tokens["refresh_token"]))
     if harness == "opencode":
-        return bool(value) and all(isinstance(item, dict) and isinstance(item.get("type"), str)
-                                   for item in value.values())
+        # Match the native auth variants before replacing an intact login.
+        required = {"api": ("key",), "oauth": ("access", "refresh"),
+                    "wellknown": ("key", "token")}
+        for item in value.values():
+            if not isinstance(item, dict):
+                return False
+            kind = item.get("type")
+            if not isinstance(kind, str) or kind not in required:
+                return False
+            if any(not isinstance(item.get(key), str) or not item[key]
+                   for key in required[kind]):
+                return False
+            if kind == "oauth":
+                expires = item.get("expires")
+                if (type(expires) not in (int, float) or expires < 0
+                        or (isinstance(expires, float) and not expires.is_integer())):
+                    return False
+                if any(key in item and not isinstance(item[key], str)
+                       for key in ("accountId", "enterpriseUrl")):
+                    return False
+            if kind == "api" and "metadata" in item:
+                metadata = item["metadata"]
+                if (not isinstance(metadata, dict)
+                        or any(not isinstance(field, str) for field in metadata.values())):
+                    return False
+        return bool(value)
     return False
 
 
