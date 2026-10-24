@@ -1275,8 +1275,11 @@ def row(attempt):
         "workflow_completion=runtime-v1", "note=completed-supervisor"))
     return f"2026-10-20T00:00:00Z\tdone\t/repo\t/wt\towner\t{meta}\n"
 
-matrix = {}
-for owner_count, terminal_count in ((0, 0), (1000, 0), (0, 1000), (1000, 1000)):
+cell_specs = ((0, 0), (1000, 0), (0, 1000), (1000, 1000))
+cases = {}
+dependency_roots = {}
+proof_calls = {}
+for owner_count, terminal_count in cell_specs:
     case = root_text / f"owners-{owner_count}-terminal-{terminal_count}"
     case.mkdir(parents=True)
     state_root, jobs = case / "peer-state", case / "jobs.log"
@@ -1297,28 +1300,49 @@ for owner_count, terminal_count in ((0, 0), (1000, 0), (0, 1000), (1000, 1000)):
     store.list()
     store.reset_discovery_metrics()
     context = batch.OwnerSettlementReadContext()
-    proof_calls = {"count": 0}
-    def settled(*_args, **_kwargs):
-        proof_calls["count"] += 1
-        return False
-    if hasattr(batch, "_owner_settlement_dependency_paths"):
-        def exact_dependency(_jobs, _status, metadata):
-            suffix = metadata["attempt_id"].removeprefix("owner-")
-            return (dependencies / f"owner-{suffix}.json",)
-        dependency_patch = mock.patch.object(batch,
-            "_owner_settlement_dependency_paths", side_effect=exact_dependency)
-    else:
-        dependency_patch = mock.patch.object(batch, "_pending_owner_settlements",
-            wraps=batch._pending_owner_settlements)
-    samples = []
-    with mock.patch.object(dispatch_terminal_commit, "owner_completion_pending",
-                           side_effect=settled), dependency_patch:
-        batch._resume_owner_settlements(jobs, context=context)
-        for repeat in range(7):
+    cell = f"owners-{owner_count}-terminal-{terminal_count}"
+    jobs_key = str(jobs.resolve())
+    cases[cell] = {"owner_count": owner_count, "terminal_count": terminal_count,
+                   "jobs": jobs, "store": store, "context": context,
+                   "samples": []}
+    dependency_roots[jobs_key] = dependencies
+    proof_calls[jobs_key] = 0
+
+def settled(jobs, *_args, **_kwargs):
+    proof_calls[str(Path(jobs).resolve())] += 1
+    return False
+
+def exact_dependency(jobs, _status, metadata):
+    base = dependency_roots[str(Path(jobs).resolve())]
+    suffix = metadata["attempt_id"].removeprefix("owner-")
+    return (base / f"owner-{suffix}.json",)
+
+if hasattr(batch, "_owner_settlement_dependency_paths"):
+    dependency_patch = mock.patch.object(batch,
+        "_owner_settlement_dependency_paths", side_effect=exact_dependency)
+else:
+    dependency_patch = mock.patch.object(batch, "_pending_owner_settlements",
+        wraps=batch._pending_owner_settlements)
+
+with mock.patch.object(dispatch_terminal_commit, "owner_completion_pending",
+                       side_effect=settled), dependency_patch:
+    for case in cases.values():
+        batch._resume_owner_settlements(case["jobs"], context=case["context"])
+
+    # Interleave matched cells to keep warm-up and timer drift from aligning
+    # with one density level; each repetition measures all four cells.
+    cell_names = tuple(cases)
+    for repeat in range(7):
+        order = tuple(cell_names[(repeat + offset) % len(cell_names)]
+                      for offset in range(len(cell_names)))
+        for cell_name in order:
+            case = cases[cell_name]
+            jobs, store, context = case["jobs"], case["store"], case["context"]
             with jobs.open("a", encoding="utf-8") as handle:
                 handle.write(f"2026-10-21T00:00:00Z\tdone\t/repo\t/wt\t"
                              f"unrelated-{repeat}\tattempt_id=unrelated-{repeat}\n")
-            proof_before = proof_calls["count"]
+            jobs_key = str(jobs.resolve())
+            proof_before = proof_calls[jobs_key]
             store.create(f"pass-active-{repeat}", "message", {}, {})
             store.reset_discovery_metrics()
             started = time.perf_counter()
@@ -1328,10 +1352,10 @@ for owner_count, terminal_count in ((0, 0), (1000, 0), (0, 1000), (1000, 1000)):
             after = store.discovery_metrics()
             terminal_stats = max(0, after.get("stat_calls", 0)
                                 - len(active_records) - 1)
-            samples.append({
+            case["samples"].append({
                 "repeat": repeat + 1,
                 "second_pass_seconds": elapsed,
-                "historical_proof_calls": proof_calls["count"] - proof_before,
+                "historical_proof_calls": proof_calls[jobs_key] - proof_before,
                 "store_stat_calls": after.get("stat_calls", 0),
                 "terminal_stat_calls": terminal_stats,
                 "terminal_cache_hits": after.get("terminal_cache_hits", 0),
@@ -1340,8 +1364,13 @@ for owner_count, terminal_count in ((0, 0), (1000, 0), (0, 1000), (1000, 1000)):
                 "active_index_entries": after.get("active_index_entries", 0),
                 "active_full_scans": after.get("active_full_scans", 0),
             })
-    matrix[f"owners-{owner_count}-terminal-{terminal_count}"] = {
-        "owner_count": owner_count, "terminal_count": terminal_count,
+
+matrix = {}
+for cell_name, case in cases.items():
+    samples = case["samples"]
+    matrix[cell_name] = {
+        "owner_count": case["owner_count"],
+        "terminal_count": case["terminal_count"],
         "repetitions": samples,
         "mean_second_pass_seconds": statistics.mean(
             row["second_pass_seconds"] for row in samples),
