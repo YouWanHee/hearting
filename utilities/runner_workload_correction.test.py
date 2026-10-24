@@ -456,6 +456,8 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         expected_active_ids = (set(registered_ids)
                                | {duty_id for duty_id, _ref, _target in self.message_duties}
                                | set(self.completed_retire_ids))
+        expected_cold_active_ids = (expected_active_ids if recurring_negative else
+                                    expected_active_ids - set(self.completed_retire_ids))
         # The active row carries this host's pid, start tick and namespace, so
         # only the ~23 MB padding is fixed; the exact byte count varies by host.
         self.assertEqual(self.jobs.stat().st_size, 23_499_871)
@@ -1129,16 +1131,12 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
         self.assertTrue(main_active_discovery_ids,
                         "the main runner pass must expose its active-index target")
         discovered_active_ids = set(main_active_discovery_ids[0])
-        self.assertLessEqual(discovered_active_ids, expected_active_ids)
-        excluded_fixture_ids = expected_active_ids - discovered_active_ids
-        self.assertLessEqual(excluded_fixture_ids, set(self.completed_retire_ids))
-        for duty_id in excluded_fixture_ids:
-            self.assertEqual(
-                self.store.get(duty_id)["observation"].get("terminal_followup"), "complete")
-        expected_cold_json_records = len(discovered_active_ids)
+        self.assertEqual(discovered_active_ids, expected_cold_active_ids,
+                         "cold discovery must match fixture membership and the case-required "
+                         "retire followups")
+        expected_cold_json_records = len(expected_cold_active_ids)
         self.assertEqual(cold["store"]["json_reads"], expected_cold_json_records,
-                         (len(discovered_active_ids), sorted(excluded_fixture_ids),
-                          cold["store"]))
+                         (len(expected_cold_active_ids), cold["store"]))
         self.assertEqual(cold["store"]["json_parses"], expected_cold_json_records)
         self.assertEqual(steady["store"]["json_reads"] - cold["store"]["json_reads"], 0)
         self.assertEqual(steady["store"]["json_parses"] - cold["store"]["json_parses"], 0)
@@ -1279,6 +1277,22 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             self.assertEqual(counts["handover_authority_calls"], 2)
         self.assertTrue(all(self.store.get(duty_id)["state"] == "unknown"
                             for duty_id, _ref, _target in self.message_duties))
+        expected_final_active_ids = expected_cold_active_ids | {event["duty_id"]}
+        for index, duty_id in enumerate(self.completed_retire_ids):
+            completed_followup = not recurring_negative or index == 0
+            retire_observation = self.store.get(duty_id)["observation"]
+            if completed_followup:
+                self.assertEqual(retire_observation.get("terminal_followup"), "complete")
+                expected_final_active_ids.discard(duty_id)
+            else:
+                self.assertIsNone(retire_observation.get("terminal_followup"),
+                                 "the still-ineligible fixture duty keeps its seeded state")
+                expected_final_active_ids.add(duty_id)
+        self.assertEqual(
+            {row["id"] for row in self.store.list(fast_active_only=True)},
+            expected_final_active_ids,
+            "the post-change handover must update the final active index exactly",
+        )
         final_registered = [self.store.get(duty_id)["state"] for duty_id in registered_ids]
         self.assertEqual(final_registered.count("unknown"), 5)
         self.assertEqual(final_registered.count("pending"), 1)

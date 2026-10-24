@@ -10109,6 +10109,43 @@ class RetireTerminalFollowupRegressionTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(completed["observation"]["terminal_followup"], "complete")
         self.assertNotIn(duty["id"], {row["id"] for row in store.list()})
 
+    def test_inaccessible_watch_enumeration_stays_active_until_readable_retry(self):
+        store, duty, identity = self.completed_duty()
+        watch_root = self.tmp_root / "watch-root"
+        watch_root.mkdir()
+        absent_successor = self.tmp_root / "absent-successor.json"
+        real_scandir = os.scandir
+        scans = []
+
+        def fail_first_watch_scan(path):
+            if isinstance(path, (str, os.PathLike)) and Path(path) == watch_root:
+                scans.append(Path(path))
+                if len(scans) == 1:
+                    raise PermissionError("fixture denies watch-root enumeration")
+            return real_scandir(path)
+
+        with mock.patch.object(peer_steward, "_watch_root", return_value=watch_root), \
+             mock.patch.object(peer_steward, "_seat_successor_path",
+                               return_value=absent_successor), \
+             mock.patch.object(peer_steward.os, "scandir",
+                               side_effect=fail_first_watch_scan):
+            pending = peer_steward._mark_completed_retire_followup(
+                store, duty, identity, "completed-retire", "none")
+            self.assertEqual(pending["observation"]["terminal_followup"], "pending")
+            self.assertIn(duty["id"], {row["id"] for row in store.list()})
+            self.assertEqual(scans, [watch_root])
+
+            with mock.patch.object(peer_steward, "_retire_handover", return_value="none"):
+                peer_steward._resume_retire_obligation(
+                    pending, store, persist_followup=True)
+
+        self.assertEqual(scans, [watch_root, watch_root])
+        self.assertEqual(peer_steward._watch_entries(watch_root), [])
+        self.assertEqual(peer_steward._watch_entries(watch_root / "missing"), [])
+        completed = store.get(duty["id"])
+        self.assertEqual(completed["observation"]["terminal_followup"], "complete")
+        self.assertNotIn(duty["id"], {row["id"] for row in store.list()})
+
 
 class RegisteredUnknownRetryTest(_TmpRootMixin, unittest.TestCase):
     def test_unknown_batch_rechecks_changed_exact_row_without_duty_change(self):

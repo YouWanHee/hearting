@@ -4992,7 +4992,13 @@ def _watch_entries(root):
         except OSError:      # vanished between glob and stat (review n3)
             return 0.0
 
-    for arm_path in sorted(root.glob("*.json"), key=_mtime, reverse=True):
+    # Path.glob suppresses filesystem errors raised while scanning, making an
+    # unreadable existing root indistinguishable from a readable empty one.
+    # Enumerate directly so callers can keep retryable work pending on failure.
+    with os.scandir(root) as directory:
+        json_paths = [root / entry.name for entry in directory
+                      if entry.name.endswith(".json")]
+    for arm_path in sorted(json_paths, key=_mtime, reverse=True):
         name = arm_path.name
         if (name.endswith(".receipt.json") or name.endswith(".ack.json")
                 or name.endswith(".observation.json") or name.startswith(".")):
@@ -5003,7 +5009,8 @@ def _watch_entries(root):
     seen = {wid for wid, _ in entries}
     # Tolerate receipt-without-arm: a caller killed between spawn and the arm
     # write leaves a self-describing receipt and no record.
-    for receipt_path in sorted(root.glob("*.receipt.json")):
+    for receipt_path in sorted(path for path in json_paths
+                               if path.name.endswith(".receipt.json")):
         watch_id = receipt_path.name[: -len(".receipt.json")]
         if watch_id not in seen:
             entries.append((watch_id, None))
