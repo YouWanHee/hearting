@@ -26,9 +26,15 @@ if str(MEM_MODULE_DIR) not in sys.path:
 if str(MEM_MODULE_DIR.parents[1] / "utilities") not in sys.path:
     sys.path.append(str(MEM_MODULE_DIR.parents[1] / "utilities"))
 
+# Scout reads must not create even import bytecode beneath runtime state.
+_CLI_NO_TOUCH = (len(sys.argv) > 1 and sys.argv[1] in {"show", "recall"}
+                 and "--no-touch" in sys.argv[2:])
+if _CLI_NO_TOUCH:
+    sys.dont_write_bytecode = True
+
 # A managed release must stay byte-identical, so a direct run (the `mem` PATH
 # launcher, the SessionStart hook) keeps bytecode in state like harness.sh does.
-if __name__ == "__main__" and not (os.environ.get("PYTHONPYCACHEPREFIX")
+if __name__ == "__main__" and not _CLI_NO_TOUCH and not (os.environ.get("PYTHONPYCACHEPREFIX")
                                    or os.environ.get("PYTHONDONTWRITEBYTECODE")):
     _state_root = (os.environ.get("HARNESS_STATE_ROOT")
                    or (os.environ.get("XDG_STATE_HOME")
@@ -2913,7 +2919,7 @@ def recall(query, tier=None, scope=None, cwd=None, sessions=False, limit=20,
             _recall_sessions(query, cwd)
         return hits
 
-    con = get_con()
+    con = get_con() if touch else _migration_read_connection()
     try:
         encc = project_key(Path.cwd()) if cwd else None
 
@@ -3052,7 +3058,8 @@ def recall(query, tier=None, scope=None, cwd=None, sessions=False, limit=20,
                     seen_ids.add(nr[0])
                     tagged.append((3, nr[7], -(nr[6] or 1), nr))
     finally:
-        con.close()
+        if touch:
+            con.close()
 
     # Lexicographic rank: bucket, ascending score, then descending strength.
     ranked = sorted(tagged, key=lambda e: (e[0], e[1], e[2]))
@@ -3060,7 +3067,7 @@ def recall(query, tier=None, scope=None, cwd=None, sessions=False, limit=20,
 
     full_bodies = {}
     if full and rows_final:
-        con_body = get_con()
+        con_body = get_con() if touch else con
         try:
             ids = [row[0] for row in rows_final[:limit]]
             ph = ",".join("?" for _ in ids)
@@ -3070,7 +3077,8 @@ def recall(query, tier=None, scope=None, cwd=None, sessions=False, limit=20,
                 f"SELECT id, body FROM records WHERE id IN ({ph}) AND {fence}",
                 [*ids, *fence_params]).fetchall())
         finally:
-            con_body.close()
+            if touch:
+                con_body.close()
 
     # Preserve the legacy five-field return while retaining auxiliary output fields.
     hit_ids = []
@@ -3084,18 +3092,21 @@ def recall(query, tier=None, scope=None, cwd=None, sessions=False, limit=20,
     # Recall updates last_accessed as a cold-decay signal, but remains fail-open.
     if touch:
         _touch_records(hit_ids)
-    _append_recall_event({
-        "at": datetime.datetime.now().isoformat(timespec="seconds"),
-        "event": "explicit-recall",
-        "runtime": os.environ.get("MEM_RECALL_RUNTIME", "unknown"),
-        "result_count": len(hit_ids),
-        "accessed_ids": hit_ids if touch else [],
-        "full": bool(full),
-        "sessions": bool(sessions),
-        "topic": topic or "",
-        "include_superseded": bool(include_superseded),
-        "gate_id": gate_id or "",
-    })
+    else:
+        con.close()
+    if touch:
+        _append_recall_event({
+            "at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "event": "explicit-recall",
+            "runtime": os.environ.get("MEM_RECALL_RUNTIME", "unknown"),
+            "result_count": len(hit_ids),
+            "accessed_ids": hit_ids,
+            "full": bool(full),
+            "sessions": bool(sessions),
+            "topic": topic or "",
+            "include_superseded": bool(include_superseded),
+            "gate_id": gate_id or "",
+        })
 
     if json_output:
         print(json.dumps({"results": [
@@ -4250,12 +4261,12 @@ def _visible_record(con, rid, all_projects=False, include_superseded=False):
         [rid, *params]).fetchone()
 
 
-def show_record(rid, all_projects=False, include_superseded=False, gate_id=None):
+def show_record(rid, all_projects=False, include_superseded=False, gate_id=None, *, touch=True):
     """Print one visible record in full. Reading never consumes a pending delivery."""
     if not DB.exists():
         print(f"[show] visible record not found: {rid}")
         return False
-    con = get_con()
+    con = get_con() if touch else _migration_read_connection()
     try:
         row = _visible_record(con, rid, all_projects=all_projects,
                               include_superseded=include_superseded)
@@ -4263,9 +4274,10 @@ def show_record(rid, all_projects=False, include_superseded=False, gate_id=None)
             print(f"[show] visible record not found: {rid}")
             return False
         meta, body = _row_to_meta(row)
-        con.execute("UPDATE records SET last_accessed=? WHERE id=?", (today(), rid))
-        con.commit()
-        meta["last_accessed"] = today()
+        if touch:
+            con.execute("UPDATE records SET last_accessed=? WHERE id=?", (today(), rid))
+            con.commit()
+            meta["last_accessed"] = today()
     finally:
         con.close()
     print(f"# {meta['id']}")
@@ -4277,12 +4289,13 @@ def show_record(rid, all_projects=False, include_superseded=False, gate_id=None)
         if value not in (None, "", []):
             print(f"{key}: {json.dumps(value, ensure_ascii=False) if isinstance(value, list) else value}")
     print("\n" + body, end="" if body.endswith("\n") else "\n")
-    _append_recall_event({
-        "at": datetime.datetime.now().isoformat(timespec="seconds"),
-        "event": "show", "runtime": os.environ.get("MEM_RECALL_RUNTIME", "unknown"),
-        "accessed_ids": [rid], "all_projects": bool(all_projects),
-        "include_superseded": bool(include_superseded), "gate_id": gate_id or "",
-    })
+    if touch:
+        _append_recall_event({
+            "at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "event": "show", "runtime": os.environ.get("MEM_RECALL_RUNTIME", "unknown"),
+            "accessed_ids": [rid], "all_projects": bool(all_projects),
+            "include_superseded": bool(include_superseded), "gate_id": gate_id or "",
+        })
     return True
 
 
@@ -10107,6 +10120,7 @@ def _cli_main():
     sh.add_argument("--all", action="store_true", help="Remove only the project fence; flagged records stay excluded")
     sh.add_argument("--include-superseded", action="store_true")
     sh.add_argument("--gate-id")
+    sh.add_argument("--no-touch", action="store_true", help="Read without changing memory or runtime state")
 
     cs = sub.add_parser("consume", help="Mark a pending handoff or thread as applied")
     cs.add_argument("id")
@@ -10277,9 +10291,10 @@ def _cli_main():
     # A failed background exchange is reported once, by the next command a
     # person or agent runs. Hook-driven reads (candidates, inject) stay silent:
     # nobody sees their stderr, so they must not use the notice up.
-    if args.cmd not in ("candidates", "inject", "recall-gate"):
+    no_touch_read = args.cmd in ("show", "recall") and getattr(args, "no_touch", False)
+    if not no_touch_read and args.cmd not in ("candidates", "inject", "recall-gate"):
         _exchange_consume_notice()
-    if args.cmd in ("recall", "candidates", "inject"):
+    if not no_touch_read and args.cmd in ("recall", "candidates", "inject"):
         _exchange_read_trigger()
 
     if args.cmd == "add":
@@ -10298,11 +10313,17 @@ def _cli_main():
         write_record("working", "project", args.type, args.body,
                      requires_consume=args.requires_consume, journal_action="note")
     elif args.cmd == "recall":
-        recall(args.query, tier=args.tier, scope=args.scope,
-               cwd=not args.all, sessions=args.sessions, limit=args.limit,
-               full=args.full, touch=not args.no_touch,
-               json_output=args.json_output, topic=args.topic,
-               include_superseded=args.include_superseded)
+        try:
+            recall(args.query, tier=args.tier, scope=args.scope,
+                   cwd=not args.all, sessions=args.sessions, limit=args.limit,
+                   full=args.full, touch=not args.no_touch,
+                   json_output=args.json_output, topic=args.topic,
+                   include_superseded=args.include_superseded)
+        except (sqlite3.Error, sync_v2.SyncInvariantError) as exc:
+            if not args.no_touch:
+                raise
+            sys.stderr.write(f"[recall] read-only lookup failed: {exc}\n")
+            sys.exit(2)
     elif args.cmd == "candidates":
         candidates(args.query, limit=args.limit, max_bytes=args.max_bytes,
                    runtime=args.runtime, session_id=args.session_id,
@@ -10327,9 +10348,16 @@ def _cli_main():
     elif args.cmd == "topics":
         topics(args.query, limit=args.limit, include_superseded=args.include_superseded)
     elif args.cmd == "show":
-        sys.exit(0 if show_record(args.id, all_projects=args.all,
-                                  include_superseded=args.include_superseded,
-                                  gate_id=args.gate_id) else 1)
+        try:
+            shown = show_record(args.id, all_projects=args.all,
+                                include_superseded=args.include_superseded,
+                                gate_id=args.gate_id, touch=not args.no_touch)
+        except (sqlite3.Error, sync_v2.SyncInvariantError) as exc:
+            if not args.no_touch:
+                raise
+            sys.stderr.write(f"[show] read-only lookup failed: {exc}\n")
+            sys.exit(2)
+        sys.exit(0 if shown else 1)
     elif args.cmd == "consume":
         sys.exit(0 if consume(args.id) else 1)
     elif args.cmd == "supersede":
