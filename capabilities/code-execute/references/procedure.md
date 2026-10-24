@@ -8,7 +8,7 @@
 
 ## Slice Mode
 
-If the assignment is a parallel sub-session slice (a phase brief, fixed files, `stage_authority=0`), this is all you do: edit only the fixed files, run only the slice's verify command, and report the changed files and the verify result. Skip the Git Safety Checkpoint, phase commits and rollback below — a slice makes no git writes (no add, commit, checkout, restore, stash, reset), reads git state with `GIT_OPTIONAL_LOCKS=0`, and leaves `checklist.md` and the dev log to the owner. If a file outside the list is needed, stop and hand off.
+If the assignment is a parallel sub-session slice (a phase brief, fixed files, `stage_authority=0`), this is all you do: edit only the fixed files, run only the slice's verify command, and report the changed files and the verify result. A slice makes no git writes (no add, commit, checkout, restore, stash, reset), reads git state with `GIT_OPTIONAL_LOCKS=0`, and leaves `checklist.md` and the dev log to the owner. If a file outside the list is needed, stop and hand off.
 
 ## Source state and commit ownership
 
