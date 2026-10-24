@@ -897,6 +897,7 @@ class RuntimeActivationOwnershipTest(unittest.TestCase):
                              if item.get("kind") == "symlink")
                 dest = Path(owned["dest"])
                 original_source = owned["source"]
+                # destructive-ok: reason=simulate a user replacing an activated link; boundary=dest leaf in this TemporaryDirectory's fixture HOME
                 dest.unlink()
                 user_bytes = b"user-owned replacement\n"
                 dest.write_bytes(user_bytes)
@@ -929,11 +930,13 @@ class RuntimeActivationOwnershipTest(unittest.TestCase):
                 dest = Path(owned["dest"])
                 external = root / "outside-user-target"
                 external.write_text("user target\n", encoding="utf-8")
+                # destructive-ok: reason=repoint this test's activated link; boundary=dest leaf in this TemporaryDirectory's fixture HOME
                 dest.unlink()
                 dest.symlink_to(external)
 
                 for target in (external, root / "dangling-user-target"):
                     if dest.is_symlink():
+                        # destructive-ok: reason=change this test's simulated user link target; boundary=dest leaf in this TemporaryDirectory's fixture HOME
                         dest.unlink()
                     dest.symlink_to(target)
                     raw_target = os.readlink(dest)

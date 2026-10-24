@@ -287,6 +287,7 @@ test -L "$HOME/.claude/manifest.json" \
 test "$(readlink "$HOME/.claude/manifest.json")" = "/nonexistent/user-repointed-manifest" \
   || fail "uninstall changed the user's repointed manifest.json target"
 ok "uninstall restores an untouched union member's installer target and leaves a user repoint alone"
+# destructive-ok: reason=reset the repointed test link for the next scenario; boundary=fixture HOME/.claude/manifest.json under mktemp TMP
 rm -f "$HOME/.claude/manifest.json"
 
 # A legacy/incomplete journal has no exact preimage/postimage proof. Recovery
