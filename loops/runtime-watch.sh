@@ -68,8 +68,8 @@ fetch_hash() {
     # its own closing tag, never at a later one.
     mark=$(printf '\001')
     normalized=$(printf '%s' "$body" | tr '\n' ' ' \
-      | sed -e "s#</[sS][cC][rR][iI][pP][tT][^>]*>#$mark#g" -e "s#<[sS][cC][rR][iI][pP][tT][^$mark]*$mark# #g" \
-            -e "s#</[sS][tT][yY][lL][eE][^>]*>#$mark#g" -e "s#<[sS][tT][yY][lL][eE][^$mark]*$mark# #g" \
+      | sed -E -e "s#</[sS][cC][rR][iI][pP][tT]([[:space:]/][^>]*)?>#$mark#g" -e "s#<[sS][cC][rR][iI][pP][tT][[:space:]/>][^$mark]*$mark# #g" \
+               -e "s#</[sS][tT][yY][lL][eE]([[:space:]/][^>]*)?>#$mark#g" -e "s#<[sS][tT][yY][lL][eE][[:space:]/>][^$mark]*$mark# #g" \
             -e 's/<[^>]*>/ /g' \
       | tr -d "$mark" | tr -s '[:space:]' ' ')
   fi
