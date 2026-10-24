@@ -38,6 +38,7 @@ import sys
 import time
 import unicodedata
 from collections import Counter
+from collections.abc import Mapping
 from .display import label as _user_label, project as _user_project, gpu_owner as _gpu_owner_label
 
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
@@ -6650,6 +6651,9 @@ _EXPLORER_MODEL = None       # the view model of the last frame: it names the se
 _EXPLORER_ORDER = []         # main-session ids in first-seen order, so the navigation does not reshuffle
 _EXPLORER_SIZE = None
 _EXPLORER_EARLIER = False    # the output pane was scrolled past its first row: read further back once
+_EXPLORER_RUNTIME = None
+_EXPLORER_GENERATION = 0
+_EXPLORER_READINESS = {"ready": True}
 
 
 def set_explorer_mode(enabled=True):
@@ -6702,6 +6706,14 @@ def _explorer_view(snapshot):
     if getattr(snapshot, "hearting", None) is None and isinstance(_HEARTING, dict):
         extras["hearting"] = dict(_HEARTING)         # the install info the default board's header uses
     return _ExplorerView(snapshot, **extras) if extras else snapshot
+
+
+def _explorer_runtime():
+    global _EXPLORER_RUNTIME
+    if _EXPLORER_RUNTIME is None:
+        from .explorer.runtime import ExplorerRuntime
+        _EXPLORER_RUNTIME = ExplorerRuntime()
+    return _EXPLORER_RUNTIME
 
 
 def _explorer_targets(nav_rows):
@@ -6911,11 +6923,19 @@ def _explorer_compose(snapshot, cols, rows, state=None, focus_result=None, last_
     """Project collected facts through the immutable view model into the cell renderer."""
     from .explorer import frame as explorer_frame, live
     global _SELECTABLE, _EXPLORER_NAV_ROWS, _EXPLORER_STATE, _EXPLORER_ALL_ROWS
+    global _EXPLORER_GENERATION, _EXPLORER_MODEL, _EXPLORER_READINESS, _EXPLORER_ORDER
     state = _explorer_state_for(state, cols)
     view = _explorer_view(snapshot)
     model = live.build_view_model(view, accepted_detail=focus_result, now=now)
-    global _EXPLORER_MODEL
+    runtime = _explorer_runtime()
+    model, readiness = runtime.prepare(
+        snapshot, focus_result, vm=model, generation=_EXPLORER_GENERATION, now=now)
+    _EXPLORER_READINESS = readiness
     _EXPLORER_MODEL = model
+    from .explorer.runtime import tag_cycle
+    cycle = tag_cycle(getattr(model, "ordering", None))
+    if cycle:
+        _EXPLORER_ORDER = list(cycle)
     _EXPLORER_STATE = state
     frame = explorer_frame.draw(model, state, cols, rows, beat=int(_BLINK_ON))
     _EXPLORER_NAV_ROWS = _EXPLORER_ALL_ROWS = ()
@@ -7003,15 +7023,22 @@ def _explorer_reveal(state, rows):
                    nav_fold=tuple(x for x in state.nav_fold if x not in opened))
 
 
-def _draw_explorer(stdscr, snapshot):
+def _draw_explorer(stdscr, snapshot, frame=None):
     global _EXPLORER_FRAME, _EXPLORER_STATE, _EXPLORER_SIZE, _CURSOR_ID
     h, w = stdscr.getmaxyx()
     if h <= 0 or w <= 0:
         return
     state = _explorer_state_for(_EXPLORER_STATE, w)
     _EXPLORER_SIZE = (h, w)
-    frame = _explorer_compose(snapshot, w, h, state, _EXPLORER_RESULT)
+    if frame is None:
+        frame = _explorer_compose(snapshot, w, h, state, _EXPLORER_RESULT)
+    _draw_explorer_frame(stdscr, frame, snapshot)
+
+
+def _draw_explorer_frame(stdscr, frame, snapshot):
+    global _EXPLORER_FRAME
     _EXPLORER_FRAME = frame
+    h, w = stdscr.getmaxyx()
     stdscr.erase()
     if frame.cells:
         for y, row in enumerate(frame.cells[:h]):
@@ -10697,7 +10724,17 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
     if h <= 0 or w <= 1:
         return
     if _EXPLORER_ENABLED:
-        _draw_explorer(stdscr, snapshot or LiveSnapshot(sessions=sessions, jobs=jobs))
+        current = snapshot or LiveSnapshot(sessions=sessions, jobs=jobs)
+        state = _explorer_state_for(_EXPLORER_STATE, w)
+        frame = _explorer_compose(current, w, h, state, _EXPLORER_RESULT)
+        readiness = _EXPLORER_READINESS
+        ready = (readiness.get("ready", True) if isinstance(readiness, Mapping)
+                 else getattr(readiness, "ready", True))
+        if not ready:
+            loading = _explorer_runtime().loading_frame(w, h)
+            if loading is not None:
+                frame = loading
+        _draw_explorer(stdscr, current, frame=frame)
         return
     stdscr.erase()
     now = time.monotonic()
@@ -10948,12 +10985,14 @@ def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
                 return
             order = tuple("session:" + str(item) for item in _EXPLORER_ORDER)
             _EXPLORER_STATE, _effects = reduce(state, {**event, "order": order}, _EXPLORER_FRAME)
+            _explorer_runtime().apply_effects(_effects, _EXPLORER_MODEL)
         return
     key = _explorer_key_name(ch)
     if key:
         order = tuple("session:" + str(item) for item in _EXPLORER_ORDER)
         _EXPLORER_STATE, _effects = reduce(state, {"type": "key", "key": key,
                                                     "order": order}, _EXPLORER_FRAME)
+        _explorer_runtime().apply_effects(_effects, _EXPLORER_MODEL)
 
 
 def _explorer_note_earlier(before, key):
@@ -10972,6 +11011,7 @@ def _explorer_note_earlier(before, key):
 
 def _loop(stdscr, collect_all, hfilter, section, interval):
     global _OFFSET, _BLINK_ON, _RESUME_ORDER, _RELOAD_FRAME, _HIT_VALID, _EXPLORER_RESULT, _EXPLORER_EARLIER
+    global _EXPLORER_GENERATION
     curses.curs_set(0)
     _init_colors()
     live_order = _RESUME_ORDER or _LiveOrderState()
@@ -10991,7 +11031,12 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     detail_generation = 0
 
     def collect_snapshot():
-        snapshot = as_snapshot(collect_all(harness_filter=hfilter, fast_first=True))
+        options = {"harness_filter": hfilter}
+        if _EXPLORER_ENABLED:
+            options.update(_explorer_runtime().collection_options(first_complete=(generation == 0)))
+        else:
+            options["fast_first"] = True
+        snapshot = as_snapshot(collect_all(**options))
         snapshot.hearting = dict(_HEARTING) if isinstance(_HEARTING, dict) else None
         # Publication makes these rows immutable to the detail worker. Every
         # basic tick stays cheap even while that worker is delayed on NAS.
@@ -11110,6 +11155,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             detail_update = detail_pump.poll(detail_generation)
             if detail_update is not None:
                 detail_generation, latest_detail = detail_update
+            _EXPLORER_GENERATION = generation
             if update is not None or detail_update is not None:
                 snapshot = details.merge(basic_snapshot, latest_detail)
                 latest_view[0] = snapshot

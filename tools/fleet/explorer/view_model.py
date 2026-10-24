@@ -69,6 +69,8 @@ class ExplorerViewModel:
     events: tuple = ()
     pane_graph: tuple = ()
     source_records: object = None
+    ordering: object = None
+    readiness: object = None
 
     def __post_init__(self):
         if self.peer_edges is None:

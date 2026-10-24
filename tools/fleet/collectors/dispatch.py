@@ -27,6 +27,7 @@ import sqlite3
 import stat
 import sys
 import time
+from types import MappingProxyType
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -216,6 +217,29 @@ def _parse_pipe_meta_uncached(pipe):
 
 
 _parse_pipe_meta_cached = functools.lru_cache(maxsize=8192)(_parse_pipe_meta_uncached)
+
+
+def parsed_registry_rows(path):
+    """Return an immutable parsed snapshot of valid six-field registry rows.
+
+    During a collector pass the shared pinned registry generation is used; direct
+    callers read the path once. Metadata uses the existing pipe parser so current
+    legacy and key/value forms retain their established meaning.
+    """
+    lines = _pinned_registry_lines(path)
+    if lines is None:
+        try:
+            lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return ()
+    rows = []
+    for line_number, line in enumerate(lines, 1):
+        fields = tuple(line.split("\t"))
+        if len(fields) != 6:
+            continue
+        metadata = MappingProxyType(dict(_parse_pipe_meta(fields[5] or "")))
+        rows.append((line_number, fields, metadata))
+    return tuple(rows)
 
 
 def _parse_pipe(pipe):
