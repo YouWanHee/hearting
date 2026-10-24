@@ -357,6 +357,9 @@ RULES = [
     ("question-empty-now", "copy-limitation", None,
      "a waiting question whose `now` text is empty: the reference draws nothing after `now:` (all 22:53 questions carried text); fleet2 draws `·`",
      lambda r, b: r["state"] == "QUESTIONS" and _has(r"now:\s*$", b["reference"][0]) and _has(r"now:\s+·", b["fleet2"][0])),
+    ("question-header-overflow", "excluded", None,
+     "80/100 columns: the reference's QUESTIONS header runs to the screen edge; fleet2 keeps its header inside the pane",
+     lambda r, b: r["width"] in (80, 100) and r["state"] == "QUESTIONS" and b["pane"] == "right" and b["ref_edge"]),
     ("question-answer-line-80", "excluded", None,
      "80 columns: the question detail line `answer: ⏎ go to its pane and answer there` is cut by the reference at the pane edge",
      lambda r, b: r["width"] == 80 and r["state"] == "QUESTIONS" and any(_has("answer:", x) for x in b["reference"])),
@@ -440,13 +443,20 @@ def classify(records):
                 except (KeyError, IndexError, TypeError):
                     continue
             if matched:
-                rule_id, cls, owner, reason = matched[0][:4]
+                # For narrow captures, an observed reference-edge/overlap rule takes
+                # precedence over content rules that can describe the same band.
+                # This keeps the reference's own layout defects out of fleet2 counts.
+                narrow_reference_defect = record["width"] in (80, 100) and (
+                    band["ref_edge"] or any(_has(r"AGEH|TCTXE", line) for line in band["reference"]))
+                selected = next((rule for rule in matched if rule[1] == "excluded"), matched[0]) \
+                    if narrow_reference_defect else matched[0]
+                rule_id, cls, owner, reason = selected[:4]
             else:
                 rule_id, cls, owner, reason = "unexplained", "unexplained", None, "no rule explains this band"
             entries.append({"state": record["state"], "width": record["width"], "kind": "cells", "pane": band["pane"],
                             "rows": [band["rows"][0], band["rows"][-1]], "cells": band["cells"],
                             "text_equal": band["text_equal"], "rule": rule_id, "class": cls, "owner": owner,
-                            "also": [rule[0] for rule in matched[1:]],
+                            "also": [rule[0] for rule in matched if rule is not selected] if matched else [],
                             "reason": reason, "reference": band["reference"][:3], "fleet2": band["fleet2"][:3]})
             counts[cls] = counts.get(cls, 0) + 1
         if hits:

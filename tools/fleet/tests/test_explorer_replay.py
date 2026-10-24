@@ -130,6 +130,19 @@ class KeyedLedger(unittest.TestCase):
         self.assertEqual(crosswalk["row1"]["route_id"], "rt-1")
         self.assertEqual([path for path, _l, _r in differences], ["/routes/row1/id", "/routes/row1/age"])
 
+    def test_reference_route_words_equal_to_the_derived_words_are_not_a_difference(self):
+        from tools.fleet.tests.parity_compare import diff_view_models_keyed
+        route = {"id": "r1", "session_tag": "09", "title": "t", "age": "42m", "shape": "staged",
+                 "legs": [["frame", "done", None], ["code", "active", None]]}
+        words = {"detail_title": "t", "detail_trailer": "42m · 2 legs", "detail_after": "before this leg: frame ✓ — outside this snapshot"}
+        left = {"routes": [dict(route, **words)], "nodes": {"r1": [{"kind": "leg"}]}}
+        right = {"routes": [dict(route)], "nodes": {"r1": [{"kind": "leg"}]}}
+        self.assertEqual(diff_view_models_keyed(left, right)[0], [])
+        # words that say more than the record derives stay a difference
+        left["routes"][0]["detail_title"] = "a title the record does not carry"
+        paths = [path for path, _l, _r in diff_view_models_keyed(left, right)[0]]
+        self.assertEqual(paths, ["/routes/r1/detail_title"])
+
     def test_class_two_is_refused_when_the_reference_text_has_a_source(self):
         from tools.fleet.tests.parity_compare import build_live_ledger
         rules = [{"id": "no-source", "match": "^/sessions/a/title$", "classification": 2, "reason": "none"}]

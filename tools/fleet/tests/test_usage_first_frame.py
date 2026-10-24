@@ -38,7 +38,7 @@ class UsageFirstFrameTests(unittest.TestCase):
             None, vm=self.vm, generation=0, now=6.0)
         self.assertTrue(readiness["ready"])
         snapshot = SimpleNamespace(usage_snapshots={}, sessions=())
-        self.assertEqual(usage_text(snapshot), "사용량 ?")
+        self.assertEqual(usage_text(snapshot), "·")
 
 
 if __name__ == "__main__":

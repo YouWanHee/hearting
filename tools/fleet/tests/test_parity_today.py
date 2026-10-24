@@ -39,6 +39,32 @@ def _record(width=140, rows=45, cells=(), hits=None):
 
 
 class ClassificationTests(unittest.TestCase):
+    def test_narrow_reference_defects_precede_content_rules_but_clean_edges_keep_real_defects(self):
+        answered = _record(width=80, cells=[(10, 40, "x", "dim", "y", "dim")])
+        answered["state"] = "QUESTIONS"
+        answered["reference_rows"][10] = " " * 33 + "ANSWERED TODAY 20" + " " * 30
+        answered["fleet2_rows"][10] = " " * 33 + "ANSWERED TODAY 20" + " " * 30
+        answered["reference_edge"][10] = True
+
+        context = _record(width=100, cells=[(10, 40, "x", "dim", "y", "dim")])
+        context["state"] = "session"
+        context["reference_rows"][10] = " " * 33 + "context: unknown · last clear ·" + " " * 40
+        context["fleet2_rows"][10] = " " * 33 + "context: unknown" + " " * 60
+        context["reference_edge"][10] = True
+
+        clean_context = _record(width=100, cells=[(10, 40, "x", "dim", "y", "dim")])
+        clean_context["state"] = "session"
+        clean_context["reference_rows"][10] = " " * 33 + "context: unknown · last clear ·"
+        clean_context["fleet2_rows"][10] = " " * 33 + "context: unknown"
+
+        docs = [classify([record]) for record in (answered, context, clean_context)]
+        self.assertEqual(docs[0]["entries"][0]["class"], "excluded")
+        self.assertEqual(docs[0]["entries"][0]["rule"], "question-header-overflow")
+        self.assertEqual(docs[1]["entries"][0]["class"], "excluded")
+        self.assertIn(docs[1]["entries"][0]["rule"], {"narrow-header-overflow", "routes-narrow"})
+        self.assertEqual((docs[2]["entries"][0]["class"], docs[2]["entries"][0]["rule"]),
+                         ("fleet2-defect", "session-context-line"))
+
     def test_a_known_style_difference_gets_a_reason_and_an_owner(self):
         document = classify([_record(cells=[(1, 21, "━", "g_blocked", "━", "grp_live")])])
         self.assertEqual(document["summary"]["unexplained"], 0)

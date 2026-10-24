@@ -100,8 +100,7 @@ def draw_seat_expand(grid, vm, state, tag, x, use, y, bottom, seat, harness):
         usage = (vm.system or {}).get("usage_api") if isinstance(vm.system, Mapping) else None
         stamp = usage.get("freshness") if isinstance(usage, Mapping) else None
         note = f"{stamp} 전에 남은 카드 본문이 없습니다." if stamp else "읽은 카드 본문이 없습니다."
-        grid.put(cursor, y, _clip(f"  · last clear {last_clear}   {note}", max(0, x + use - cursor)), "dim",
-                 limit=x + use + 1)
+        grid.put(cursor, y, f"  · last clear {last_clear}   {note}", "dim", limit=x + use + 1)
         return y + 1
     right = x + use + 1
     selected_generation = state.opened_for("ui:gen:" + tag)

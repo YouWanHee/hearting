@@ -183,6 +183,41 @@ def _peer_pairs(expected, actual):
     return left, right
 
 
+def _derived_route_words(route, nodes):
+    """The three words fleet2's route page draws when a record carries no ``detail_*`` of its own."""
+    from tools.fleet.explorer.pages import _route_after
+    legs = tuple(route.get("legs") or ())
+    if any(node.get("kind") == "gate" for node in nodes):
+        leg_count = sum(1 for item in legs if str(item[0]) != "frame")
+        trailer = f"{route.get('age') or '·'} · {leg_count} leg · human gate answered"
+    else:
+        trailer = f"{route.get('age') or '·'} · {len(legs)} leg{'s' if len(legs) != 1 else ''}"
+    return {"detail_title": route.get("title"), "detail_trailer": trailer,
+            "detail_after": _route_after(route, tuple(nodes)) or None}
+
+
+def _without_derived_words(expected):
+    """Drop the reference's ``detail_*`` words that equal what the route page derives from the same
+    record: the live VM draws them from title/age/legs/nodes, so the fields carry no extra fact and
+    any real difference in those sources still shows on its own row."""
+    routes = expected.get("routes")
+    if not isinstance(routes, list):
+        return expected
+    nodes = expected.get("nodes") or {}
+    trimmed = []
+    for route in routes:
+        if not isinstance(route, dict) or not any(key in route for key in _DETAIL_WORDS):
+            trimmed.append(route)
+            continue
+        derived = _derived_route_words(route, nodes.get(route.get("id")) or ())
+        trimmed.append({key: value for key, value in route.items()
+                        if key not in _DETAIL_WORDS or (value or None) != derived[key]})
+    return dict(expected, routes=trimmed)
+
+
+_DETAIL_WORDS = ("detail_title", "detail_trailer", "detail_after")
+
+
 def diff_view_models_keyed(expected, actual):
     """Identity-aligned VM differences: (section path, expected, actual) triples.
 
@@ -192,6 +227,7 @@ def diff_view_models_keyed(expected, actual):
     Returns (differences, crosswalk).
     """
     out = []
+    expected = _without_derived_words(expected)
     crosswalk = _alias_route_rows(expected.get("routes") or (), actual.get("routes") or ())
     for section in sorted(set(expected) | set(actual)):
         if section.startswith("_"):
