@@ -72,6 +72,10 @@ def _append_self_instrumentation(
 
 
 DELIVER_LEASE_SECONDS = 120.0
+# Claude cancels a prompt hook at 10 s and then nothing reaches the turn or is acked,
+# so the same records come back on every prompt. Records not reached within this
+# budget stay pending for the next prompt instead.
+DELIVER_BUDGET_SECONDS = 6.0
 STORAGE_KEY = "_storage_key"     # added to a returned copy only: the directory a record is stored under
 
 
@@ -372,6 +376,8 @@ def sweep_deliver(
     # that the seat handover bound to it. Those stay stored (and acked) under the registered
     # parent; only the receiving session differs.
     for current in addressed:
+        if claimed and time.monotonic_ns() - start_ns > DELIVER_BUDGET_SECONDS * 1_000_000_000:
+            break
         storage_key = current[STORAGE_KEY]
         delivery_id = current["delivery_id"]
         if settle_observed(current)["received"]:

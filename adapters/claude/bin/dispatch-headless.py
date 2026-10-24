@@ -580,7 +580,7 @@ def dispatch_prompt(
         if args.profile
         else "profile=-"
     )
-    heartbeat = runtime_progress_prompt()
+    heartbeat = runtime_progress_prompt(args)
     completion_delivery = getattr(args, "resolved_completion_delivery", "poll-fallback")
     supervised = completion_delivery == "session-resume-supervised"
     owner_standard_plus = (
@@ -1413,12 +1413,12 @@ def main(argv: list[str]) -> int:
     worktree = Path(args.worktree)
     if not worktree.is_dir():
         return fail("worktree-not-found", 66, worktree=args.worktree)
-    if subprocess.run(
-        ["git", "-C", args.worktree, "rev-parse", "--is-inside-work-tree"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ).returncode != 0:
-        return fail("not-a-git-worktree", 65, worktree=args.worktree)
+    try:
+        from dispatch_contract import launch_repository_identity
+        args.repository_identity, args.repository_kind = launch_repository_identity(
+            args.worktree, args.route_file or os.environ.get("AGENT_OWNER_ROUTE_FILE"))
+    except DispatchContractError as exc:
+        return fail(exc.reason, 65, detail=exc.detail, worktree=args.worktree, child_spawned="0")
     try:
         args.artifact_root = resolve_artifact_root(args.worktree)
         args.report_bundle_root = resolve_report_bundle_root(args.route_file, args.route_node)
@@ -1602,10 +1602,7 @@ def main(argv: list[str]) -> int:
     args.parent_binding = None
     if args.dispatch_depth == 2 and action in ("register", "start"):
         try:
-            repo = subprocess.check_output(
-                ["git", "-C", args.worktree, "rev-parse", "--show-toplevel"],
-                text=True,
-            ).strip()
+            repo = args.repository_identity
             args.parent_binding = resolve_live_parent_attempt(
                 jobs,
                 parent_slug=args.parent_slug or "",

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import errno
 import fcntl
+import functools
 import hashlib
 import json
 import math
@@ -1274,10 +1275,19 @@ def resolve_parent_extinction(
     return ParentExtinctionEvidence("unproven", "parent-extinction-unproven:" + process.reason, parent_id)
 
 
-def parse_registry_metadata(pipe: str) -> dict[str, str]:
-    """Parse the stable six-column registry's comma-delimited metadata."""
+@functools.lru_cache(maxsize=8192)
+def _registry_metadata_items(pipe: str) -> tuple[tuple[str, str], ...]:
+    return tuple(dict(part.split("=", 1) for part in pipe.split(",") if "=" in part).items())
 
-    return dict(part.split("=", 1) for part in pipe.split(",") if "=" in part)
+
+def parse_registry_metadata(pipe: str) -> dict[str, str]:
+    """Parse the stable six-column registry's comma-delimited metadata.
+
+    One prompt-hook sweep reads the same rows many times; the parse is cached by
+    the row text and every caller still gets its own dict.
+    """
+
+    return dict(_registry_metadata_items(pipe))
 
 
 # SD-156: attempt registration's source-lineage fields. One name per fact, so
@@ -1903,6 +1913,122 @@ def canonical_repository_identity(path: str | Path) -> str:
     if not common.is_absolute():
         common = candidate / common
     return str(common.resolve(strict=False))
+
+
+def diagnose_repository_start(path: str | Path) -> dict[str, str]:
+    """Distinguish a normal non-Git folder from a broken/unavailable Git probe."""
+    candidate = Path(path).expanduser().resolve(strict=False)
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    env.pop("LANGUAGE", None)
+    try:
+        result = subprocess.run(["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+                                text=True, capture_output=True, timeout=60, env=env)
+        if result.returncode == 0:
+            bare = subprocess.run(["git", "-C", str(candidate), "rev-parse", "--is-bare-repository"],
+                                  text=True, capture_output=True, timeout=60, env=env)
+            if bare.returncode or bare.stdout.strip() == "true":
+                return {"state": "error", "detail": (bare.stderr or "bare Git repository").strip()}
+            return {"state": "git", "root": result.stdout.strip()}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"state": "error", "detail": f"{type(exc).__name__}: {exc}"}
+    stderr = result.stderr or ""
+    if ("not a git repository (or any" in stderr.lower()
+            and not os.path.lexists(candidate / ".git")):
+        return {"state": "non-git", "detail": stderr}
+    return {"state": "error", "detail": stderr or f"git exited {result.returncode}"}
+
+
+def validated_unversioned_route(path: str | Path, *, environ=None) -> dict | None:
+    """Return a currently valid bound unversioned route, otherwise no authority."""
+    if diagnose_repository_start(path).get("state") != "non-git":
+        return None
+    env = os.environ if environ is None else environ
+    route_file = env.get("AGENT_ROUTE_FILE") or env.get("AGENT_OWNER_ROUTE_FILE")
+    if not route_file:
+        return None
+    try:
+        route_path = Path(route_file).expanduser().resolve(strict=True)
+        route = json.loads(route_path.read_text(encoding="utf-8"))
+        sealed = _route_module().verify_route(route, expected_cwd=str(path))
+        if sealed.get("source_commit") != "unversioned":
+            return None
+        expected_id = env.get("AGENT_ROUTE_ID") or env.get("AGENT_OWNER_ROUTE_ID")
+        expected_hash = env.get("AGENT_ROUTE_HASH") or env.get("AGENT_OWNER_ROUTE_HASH")
+        if expected_id and expected_id != sealed.get("route_id"):
+            return None
+        if expected_hash and expected_hash != sealed.get("route_hash"):
+            return None
+        return sealed
+    except (OSError, ValueError, TypeError, DispatchContractError, json.JSONDecodeError):
+        return None
+
+
+def work_root_identity(path: str | Path, *, route: dict | None = None,
+                       route_file: str | Path | None = None,
+                       allow_sealed_repo_fallback: bool = False) -> str:
+    """Git toplevel identity, or canonical cwd for a validated unversioned route."""
+    candidate = Path(path).expanduser().resolve(strict=False)
+    if route_file:
+        return launch_repository_identity(candidate, route_file)[0]
+    if isinstance(route, dict) and route.get("source_commit") == "unversioned":
+        try:
+            sealed = _route_module().verify_route(route, expected_cwd=str(candidate))
+        except (ValueError, TypeError) as exc:
+            raise DispatchContractError("non-git-route-identity-unbound", str(exc)) from exc
+        if sealed.get("source_commit") == "unversioned":
+            return str(candidate)
+        raise DispatchContractError("non-git-route-identity-unbound")
+    if isinstance(route, dict):
+        try:
+            result = subprocess.check_output(
+                ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+                text=True, stderr=subprocess.DEVNULL,
+            ).strip()
+            if result:
+                return str(Path(result).resolve(strict=False))
+        except (OSError, subprocess.SubprocessError) as exc:
+            if allow_sealed_repo_fallback and route.get("repo"):
+                diagnosis = diagnose_repository_start(candidate)
+                if diagnosis.get("state") in {"error", "non-git"}:
+                    return str(Path(route["repo"]).expanduser().resolve(strict=False))
+            raise DispatchContractError("repository-identity-unavailable", str(exc)) from exc
+        raise DispatchContractError("repository-identity-unavailable", "empty Git toplevel")
+    diagnosis = diagnose_repository_start(candidate)
+    if diagnosis["state"] == "git":
+        return str(Path(diagnosis["root"]).resolve(strict=False))
+    if diagnosis["state"] != "non-git":
+        raise DispatchContractError("repository-identity-unavailable", diagnosis.get("detail", ""))
+    sealed = validated_unversioned_route(candidate)
+    if not isinstance(sealed, dict) or sealed.get("source_commit") != "unversioned":
+        raise DispatchContractError("non-git-route-identity-unbound")
+    return str(candidate)
+
+
+def launch_repository_identity(path: str | Path, route_file: str | Path | None) -> tuple[str, str]:
+    """Resolve launch identity while admitting only a validated artifact-only non-Git route."""
+    candidate = Path(path).expanduser().resolve(strict=False)
+    diagnosis = diagnose_repository_start(candidate)
+    if diagnosis["state"] == "git":
+        return str(Path(diagnosis["root"]).resolve(strict=False)), "git"
+    if diagnosis["state"] != "non-git" or not route_file:
+        raise DispatchContractError("not-a-git-worktree", diagnosis.get("detail", ""))
+    try:
+        route = json.loads(Path(route_file).expanduser().read_text(encoding="utf-8"))
+        sealed = _route_module().verify_route(route, expected_cwd=str(candidate))
+        if sealed.get("source_commit") != "unversioned":
+            raise ValueError("route is not sealed unversioned")
+        if _route_module()._isolates_worktree(sealed):
+            raise ValueError("source-mutating route")
+        expected_id = os.environ.get("AGENT_ROUTE_ID") or os.environ.get("AGENT_OWNER_ROUTE_ID")
+        expected_hash = os.environ.get("AGENT_ROUTE_HASH") or os.environ.get("AGENT_OWNER_ROUTE_HASH")
+        if expected_id and expected_id != sealed.get("route_id"):
+            raise ValueError("route id binding mismatch")
+        if expected_hash and expected_hash != sealed.get("route_hash"):
+            raise ValueError("route hash binding mismatch")
+    except (OSError, ValueError, TypeError, DispatchContractError, json.JSONDecodeError) as exc:
+        raise DispatchContractError("non-git-route-invalid", str(exc)) from exc
+    return str(candidate), "non-git"
 
 
 def process_start_ticks(pid: int) -> str | None:
@@ -7270,7 +7396,9 @@ def frame_harness_admission(route: dict, jobs: Path, lines: list[str],
 
 
 def record_frame_launch_degradation(route: dict, jobs: Path, proof_ids: list[str],
-                                    first_attempt: str, harness: str) -> None:
+                                    first_attempt: str, harness: str,
+                                    reason: str = "frame-single-available-harness",
+                                    detail: str | None = None) -> None:
     """Record launch-time frame degradation through the existing contract writer.
 
     SD-93d makes this observation best effort; admission remains authoritative.
@@ -7279,9 +7407,9 @@ def record_frame_launch_degradation(route: dict, jobs: Path, proof_ids: list[str
     record_degradation(route_id=route["route_id"], route_hash=route["route_hash"],
         route_node="frame-alternative", dispatch_depth=1, writer="dispatch_contract.py",
         jobs=jobs, fallback_hop="same-harness-headless",
-        execution_surface="registered-headless", reason="frame-single-available-harness",
+        execution_surface="registered-headless", reason=reason,
         prior_attempt_ids=proof_ids, attempt_trace=[first_attempt], harness=harness,
-        detail=json.dumps({"proof_ids": proof_ids}))
+        detail=detail or json.dumps({"proof_ids": proof_ids}))
 
 
 def _frame_pair_attempt_gate(route: dict, node: dict, markers: dict,

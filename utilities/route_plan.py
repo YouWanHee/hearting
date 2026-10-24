@@ -28,10 +28,17 @@ SCHEMA = "route_decision_v1"
 CAPABILITY = "route-frame"
 SHAPE = "framed"
 NODE_IDS = ("frame", "frame-alternative", "route-decision")
-# A framed route runs one frame leg by default, and both legs for uncertain or hard-to-reverse
-# work (user decision 2026-10-07). A recipe's own frame pair is always both legs.
+# A new framed route runs both legs by default. Explicit direct/quick may narrow to one
+# deep leg when the request has no protected path, multi-adapter paths, or spec/ship hint.
+# A recipe's own frame pair is always both legs.
 ONE_LEG_NODE_IDS = ("frame", "route-decision")
 FRAME_PAIR = ("frame", "frame-alternative")
+_FRAME_PATH = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:\./|/|`)?(?:core|capabilities|roles|spec)/[^\s`'\"<>),;]+"
+    r"|(?<![A-Za-z0-9_.-])(?:\./|~/|/|`)?(?:[A-Za-z0-9_.-]+/)*prd\.md(?![A-Za-z0-9_.-])",
+    re.I,
+)
+_ADAPTER_PATH = re.compile(r"(?<![A-Za-z0-9_.-])adapters/(claude|codex|opencode)(?=/|\b)")
 TERMINAL_NODE = "route-decision"
 RECORD_RELATIVE = "shards/frame/route-decision.json"
 MAX_RECORD_BYTES = 262144
@@ -61,6 +68,10 @@ _SECTION_HEAD = re.compile(r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:\*\*)?[ \t]*8[ \t]*[
 # Section 8 under a title in any language: a heading or a numbered line that starts with 8.
 _SECTION_NUMBER = re.compile(r"^[ \t]{0,3}(?:#{1,6}[ \t]*(?:\*\*)?[ \t]*8(?![0-9])|(?:\*\*)?[ \t]*8[ \t]*[.):])[^\n]*", re.M)
 _NEXT_SECTION = re.compile(r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:\*\*)?[ \t]*(?:9|1[0-9])[ \t]*[.):]", re.M)
+# The same two as markdown headings only: a numbered list line `8.` or `9.` is not a section.
+_HEADING_NUMBER = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]*(?:\*\*)?[ \t]*8(?![0-9])[^\n]*", re.M)
+_NEXT_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]*(?:\*\*)?[ \t]*(?:9|1[0-9])[ \t]*[.):]", re.M)
+_NUMBERED_HEADING = re.compile(r"^[ \t]{0,3}(#{1,6})[ \t]*(?:\*\*)?[ \t]*[0-9]+(?![0-9])[^\n]*", re.M)
 _FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*([A-Za-z0-9_-]*)[ \t]*$")
 
 
@@ -87,6 +98,28 @@ def valid_frame_legs(route, legs) -> bool:
     """Whether `legs` is a frame set this route may have: the pair, or `frame` alone on a framed route."""
     legs = set(legs)
     return legs == set(FRAME_PAIR) or (legs == {"frame"} and is_framed_route(route))
+
+
+def frame_leg_decision(given_intensity, request_text="", routing_hints=None):
+    """Return the sealed frame width, its source, and a stable human-readable reason."""
+    if given_intensity is None:
+        return 2, "default", "기본"
+    if given_intensity not in {"direct", "quick", "standard", "strong", "thorough", "adversarial"}:
+        raise ValueError("invalid intensity")
+    if given_intensity not in {"direct", "quick"}:
+        return 2, "explicit", f"--intensity {given_intensity} 표시"
+    text = str(request_text or "")
+    match = _FRAME_PATH.search(text)
+    if match:
+        reason = re.sub(r"[`\n\r]+", "", match.group(0))[:72]
+        return 2, "automatic", f"자동 지킴: --intensity {given_intensity}이지만 과제에 {reason}"
+    adapters = list(dict.fromkeys(_ADAPTER_PATH.findall(text)))
+    if len(adapters) >= 2:
+        return 2, "automatic", f"자동 지킴: --intensity {given_intensity}이지만 과제에 어댑터 둘 이상"
+    hints = routing_hints or {}
+    if hints.get("capability") in {"autopilot-spec", "autopilot-ship"}:
+        return 2, "automatic", f"자동 지킴: --intensity {given_intensity}이지만 과제에 {hints['capability']} 작업"
+    return 1, "explicit", f"간단 표시 --intensity {given_intensity}"
 
 
 def _canonical(value) -> bytes:
@@ -209,14 +242,31 @@ def none_text(reason) -> str:
 
 
 def _section8(text: str):
-    """Section 8 of a brief, found by its title or, under a title in another language, by its
-    number; None when the brief has no section 8 heading at all."""
-    head = _SECTION_HEAD.search(text) or _SECTION_NUMBER.search(text)
-    if head is None:
+    """Find section 8, preferring a Markdown heading over a title or plain number.
+
+    Alternate endings tolerate numbered lists inside that section, but cannot
+    cross another section heading to borrow its proposal. Return None when no
+    section 8 header is present.
+    """
+    heads = []
+    for pattern in (_HEADING_NUMBER, _SECTION_HEAD, _SECTION_NUMBER):
+        heads = list(pattern.finditer(text))
+        if heads:
+            break
+    readings = []
+    for head in heads:
+        rest = text[head.end():]
+        heading = re.match(r"^[ \t]{0,3}(#{1,6})", head.group())
+        boundary = next((match for match in _NUMBERED_HEADING.finditer(rest)
+                         if heading is None or len(match[1]) <= len(heading[1])), None)
+        if boundary:
+            rest = rest[:boundary.start()]
+        for ending in (_NEXT_SECTION, _NEXT_HEADING):
+            tail = ending.search(rest)
+            readings.append(rest[:tail.start()] if tail else rest)
+    if not readings:
         return None
-    rest = text[head.end():]
-    tail = _NEXT_SECTION.search(rest)
-    section = rest[:tail.start()] if tail else rest
+    section = next((reading for reading in readings if _proposal_blocks(reading)), readings[0])
     if len(section.encode("utf-8")) > MAX_SECTION_BYTES:
         raise ProposalError("section-too-large")
     return section

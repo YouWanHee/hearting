@@ -24,6 +24,108 @@ FAKE_WORKER_TIMEOUT="30"
 
 
 class AdapterV11Test(unittest.TestCase):
+ def test_stage_attempt_budget_prompt(self):
+  for harness in ADAPTERS:
+   with self.subTest(harness=harness), tempfile.TemporaryDirectory() as td:
+    wrapper=self.load_wrapper(harness)
+    args=wrapper.parser().parse_args([
+     "--worktree",td,"--slug","budget-fixture","--capability","autopilot-code",
+     "--capability-mode","dev","--worker-mode","dev/backend","--worker-type","stage",
+     "--dispatch-depth","2","--parent","owner","--owner","autopilot-code",
+     "--assigned-contract","code-execute","--route-node","execute","--unit","dev/backend",
+     "--attempt-id","att-budget-fixture","--foreground-timeout","600",
+     "--prompt-text","budget prompt fixture","--qa","standard",
+    ])
+    args.artifact_root=td
+    if harness == "opencode":
+     prompt,_=wrapper.prompt(args)
+    else:
+     prompt,_=wrapper.dispatch_prompt(args, ("budget prompt fixture", "inline"))
+    self.assertIn("600 seconds (10 minutes)",prompt)
+    self.assertIn("approximate deadline:",prompt)
+    self.assertIn("waiting with sleep, use this budget",prompt)
+
+ def test_stage_retry_progress_prompts(self):
+  import artifact_context
+  import dispatch_replacement as recovery
+  from datetime import datetime, timedelta, timezone
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; blocks=[]
+   launch_head=subprocess.check_output(["git","-C",str(repo),"rev-parse","HEAD"],text=True).strip()
+   expected_commits=[]
+   for subject in ("first commit","second commit"):
+    path=repo/(subject.split()[0]+".py"); path.write_text(subject+"\n")
+    subprocess.run(["git","-C",str(repo),"add",path.name],check=True)
+    subprocess.run(["git","-C",str(repo),"commit","-qm",subject],check=True)
+    commit=subprocess.check_output(["git","-C",str(repo),"rev-parse","HEAD"],text=True).strip()
+    expected_commits.append((commit,subject))
+   (repo/"source").mkdir()
+   (repo/"source/pending.py").write_text("uncommitted source\n")
+   output=root/"cycle"/"artifacts"; (output/"dev_logs").mkdir(parents=True)
+   changed_output=output/"dev_logs/changed.md"
+   changed_output.write_text("changed cycle output\n")
+   fixed_now=datetime.now(timezone.utc)
+   start=fixed_now-timedelta(minutes=5)
+   os.utime(changed_output,(start.timestamp()+10,start.timestamp()+10))
+   class FrozenDateTime(datetime):
+    @classmethod
+    def now(cls,tz=None): return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+   route={"route_id":"rt-retry-fixture","route_hash":"fixture","artifact_root":str(root),
+          "cwd":str(repo),"nodes":[{"id":"execute","outputs":["dev_logs/**"],
+          "write_scope":["source/**","dev_logs/**"]}]}
+   route_path=root/"route.json"; route_path.write_text(json.dumps(route))
+   source={"attempt_id":"att-progress","worker_type":"stage","route_node":"execute",
+           "note":"dead-timeout","failure_class":"runtime","route_file":str(route_path),
+           "route_id":route["route_id"],"launch_head":launch_head}
+   jobs.write_text(start.isoformat()+"\tdone\t"+str(repo)+"\t"+str(repo)+"\tstage\t"+
+                   # The elapsed interval is fixed so the six real blocks compare byte-for-byte.
+                   ",".join(f"{k}={v}" for k,v in source.items())+"\n")
+   fake_claim={"replacement_attempt_id":"att-next","family_id":"family-fixture"}
+   with mock.patch.object(recovery,"datetime",FrozenDateTime), \
+        mock.patch.object(recovery.DC._route_module(),"verify_route"), \
+        mock.patch.object(artifact_context,"resolve_context",
+                         return_value=SimpleNamespace(output_dir=output)):
+    for harness in ADAPTERS:
+     wrapper=self.load_wrapper(harness)
+     wrapper_source=Path(wrapper.__file__).read_text()
+     self.assertIn("prompt_text += recovery_instructions(args)",wrapper_source)
+     for path_kind in ("hop","replacement"):
+      args=SimpleNamespace(automatic_retry_of="att-progress",worker_type="stage",
+                           jobs_path=jobs,attempt_id="att-next" if path_kind=="replacement" else "att-hop")
+      reservation=mock.patch.object(recovery,"source_reservation",
+                                    return_value=None if path_kind=="hop" else {"family_id":"family-fixture"})
+      family_path=mock.patch.object(recovery,"_record_path",return_value=root/"family.json")
+      checked=mock.patch.object(recovery,"_check_record",return_value=fake_claim)
+      replay=mock.patch.object(recovery,"launch_input",return_value={"retry_brief":""})
+      with reservation,family_path,checked,replay:
+       context=recovery.recovery_instructions(args)
+      prompt_args=wrapper.parser().parse_args([
+       "--worktree",str(repo),"--slug","retry-fixture","--capability","autopilot-code",
+       "--capability-mode","dev","--worker-mode","dev/backend","--worker-type","stage",
+       "--dispatch-depth","2","--parent","owner","--owner","autopilot-code",
+       "--assigned-contract","code-execute","--route-node","execute","--unit","dev/backend",
+       "--attempt-id","att-next","--foreground-timeout","600",
+       "--prompt-text","retry prompt fixture","--qa","standard",
+      ])
+      prompt_args.artifact_root=str(art)
+      if harness == "opencode":
+       assembled,_=wrapper.prompt(prompt_args)
+      else:
+       assembled,_=wrapper.dispatch_prompt(prompt_args,("retry prompt fixture","inline"))
+      # This is the same recovery append performed by each adapter's prompt assembly.
+      assembled += context
+      self.assertIn("retry prompt fixture",assembled)
+      self.assertIn("Observed prior-attempt progress",assembled)
+      for commit,subject in expected_commits:
+       self.assertIn(f"  - {commit} {subject}",assembled)
+      self.assertIn("source/pending.py",assembled)
+      self.assertIn("dev_logs/changed.md",assembled)
+      self.assertIn("- end unavailable; observed at",assembled)
+      self.assertIn("- interval since recorded start:",assembled)
+      blocks.append((harness,path_kind,context[context.index("## Observed prior-attempt progress"):]))
+   self.assertEqual(len(blocks),6)
+   self.assertEqual(len({block for _,_,block in blocks}),1)
+
  def test_owner_binding_tuple_refusal_details_reach_all_wrappers(self):
   for harness in ADAPTERS:
    for depth,worker,raw in ((2,"stage",False),(1,"stage",False),(1,"owner",True),(2,"stage",True)):
@@ -543,6 +645,78 @@ class AdapterV11Test(unittest.TestCase):
   self.assertIn(f"--add-dir {DC.dispatch_state_root(args.jobs_path)}",command)
   self.assertNotIn(f"--add-dir {ROOT / '.dispatch'}",command)
   self.assertNotIn("network_access=true",command)
+ def test_codex_non_git_exec_uses_read_only_named_profile_and_skips_git_check(self):
+  wrapper=self.load_wrapper("codex")
+  profile={"default_permissions":"hearting_non_git_record",
+           "permissions":{"hearting_non_git_record":{"extends":":read-only",
+           "filesystem":{"/artifacts":"write","/state":"write"},
+           "network":{"enabled":False}}}}
+  args=type("Args",(),{
+   "worktree":"/docs","artifact_root":"/artifacts","nested_headless_network":False,
+   "agent_home":ROOT,"dispatch_depth":2,"route_id":"rt-1","attempt_id":"att-stage-1",
+   "command_attempt_id":"att-stage-1","jobs_path":Path("/state/jobs.log"),
+   "sandbox":"workspace-write","repository_kind":"non-git","route_file":"/sealed/route.json",
+   "resolved_model_settings":{"source":"inherit","context_window":"800000"},"approval":"inherit"})()
+  with mock.patch.object(wrapper,"recordish_profile_config",return_value=profile):
+   command=wrapper.shell_command(args,Path("/prompt"),Path("/log"))
+  self.assertIn("--skip-git-repo-check",command)
+  self.assertIn('default_permissions="hearting_non_git_record"',command)
+  self.assertNotIn("--sandbox workspace-write",command)
+ def test_codex_non_git_enclosing_child_reuses_parent_sandbox_without_profile(self):
+  wrapper=self.load_wrapper("codex")
+  args=type("Args",(),{
+   "worktree":"/docs","artifact_root":"/artifacts","nested_headless_network":False,
+   "agent_home":ROOT,"dispatch_depth":2,"route_id":"rt-1","attempt_id":"att-stage-1",
+   "command_attempt_id":"att-stage-1","jobs_path":Path("/state/jobs.log"),
+   "sandbox":"workspace-write","repository_kind":"non-git","route_file":"/sealed/route.json",
+   "launch_lifecycle":"foreground-scoped","parent_harness":"codex",
+   "parent_transport":"headless","parent_sandbox":"workspace-write",
+   "resolved_model_settings":{"source":"inherit","context_window":"800000"},"approval":"inherit"})()
+  with mock.patch.dict(os.environ,{"AGENT_DISPATCH_CHILD":"1"},clear=False), \
+       mock.patch.object(wrapper,"recordish_profile_config",side_effect=AssertionError("profile must be inherited")):
+   command=wrapper.shell_command(args,Path("/prompt"),Path("/log"))
+  self.assertIn("--sandbox danger-full-access",command)
+  self.assertIn("--skip-git-repo-check",command)
+  self.assertNotIn("default_permissions",command)
+ def test_codex_non_git_enclosing_stage_one_turn_omits_recordish_route_input(self):
+  wrapper=self.load_wrapper("codex")
+  args=type("Args",(),{
+   "worktree":"/docs","artifact_root":"/artifacts","nested_headless_network":False,
+   "agent_home":ROOT,"dispatch_depth":2,"route_id":"rt-1","route_hash":"sha256:1",
+   "attempt_id":"att-stage-1","command_attempt_id":"att-stage-1",
+   "jobs_path":Path("/state/jobs.log"),"sandbox":"workspace-write",
+   "repository_kind":"non-git","route_file":"/sealed/route.json",
+   "launch_lifecycle":"foreground-scoped","parent_harness":"codex",
+   "parent_transport":"headless","parent_sandbox":"workspace-write",
+   "resolved_stage_telemetry_transport":"app-server-one-turn",
+   "resolved_model_settings":{"source":"inherit","context_window":"800000"},
+   "approval":"inherit"})()
+  with mock.patch.dict(os.environ,{"AGENT_DISPATCH_CHILD":"1"},clear=False), \
+       mock.patch.object(wrapper.commit_policy,"launch_permission_projection",
+                         return_value={"observation_only":False}), \
+       mock.patch.object(wrapper,"recordish_profile_config",side_effect=AssertionError("profile must be inherited")):
+   command=wrapper.shell_command(args,Path("/prompt"),Path("/log"))
+  self.assertIn("--one-turn",command)
+  self.assertIn("--sandbox danger-full-access",command)
+  self.assertNotIn("--route-file",command)
+  self.assertNotIn("default_permissions",command)
+ def test_codex_non_git_non_enclosing_stage_one_turn_keeps_recordish_route_input(self):
+  wrapper=self.load_wrapper("codex")
+  args=type("Args",(),{
+   "worktree":"/docs","artifact_root":"/artifacts","nested_headless_network":False,
+   "agent_home":ROOT,"dispatch_depth":2,"route_id":"rt-1","route_hash":"sha256:1",
+   "attempt_id":"att-stage-1","command_attempt_id":"att-stage-1",
+   "jobs_path":Path("/state/jobs.log"),"sandbox":"workspace-write",
+   "repository_kind":"non-git","route_file":"/sealed/route.json",
+   "resolved_stage_telemetry_transport":"app-server-one-turn",
+   "resolved_model_settings":{"source":"inherit","context_window":"800000"},
+   "approval":"inherit"})()
+  with mock.patch.dict(os.environ,{"AGENT_DISPATCH_CHILD":"0"},clear=False), \
+       mock.patch.object(wrapper.commit_policy,"launch_permission_projection",
+                         return_value={"observation_only":False}):
+   command=wrapper.shell_command(args,Path("/prompt"),Path("/log"))
+  self.assertIn("--one-turn",command)
+  self.assertIn("--route-file /sealed/route.json",command)
  def test_foreground_codex_child_reuses_checked_outer_sandbox(self):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td);repo,_art=self.fixture(root)

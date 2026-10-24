@@ -678,6 +678,66 @@ class TestOrphanAndCompleteness(unittest.TestCase):
         self.assertIn("cycle-completion-incomplete", _codes(m.validate_lineage(doc)))
 
 
+def _completed(doc, required_roles):
+    doc["cycle"]["state"] = "completed"
+    doc["cycle"]["outcome_criterion"]["required_artifact_roles"] = required_roles
+    for sequence, event_id, event_type, actor in (
+        (3, "evt_" + "8" * 32, "cycle.completed", {"kind": "user", "id": "u"}),
+        (4, "evt_" + "7" * 32, "route.terminal.recorded", {"kind": "producer", "id": "p"}),
+    ):
+        doc["events"].append(
+            {
+                "event_id": event_id,
+                "stream_id": doc["events"][0]["stream_id"],
+                "stream_sequence": sequence,
+                "event_type": event_type,
+                "target_id": doc["cycle"]["cycle_id"],
+                "actor": actor,
+                "recorded_at": "2026-08-11T00:0{0}:00Z".format(sequence - 1),
+                "provenance": doc["events"][0]["provenance"],
+                "evidence_ids": [],
+                "payload": {},
+            }
+        )
+    return doc
+
+
+class TestCompletedCycleRoles(unittest.TestCase):
+    def test_every_required_role_with_a_revision_completes_the_cycle(self):
+        doc = _completed(_valid_document(), ["primary", "secondary"])
+        self.assertNotIn("cycle-completion-incomplete", _codes(m.validate_lineage(doc)))
+
+    def test_a_repeated_artifact_id_keeps_the_role_of_its_first_row(self):
+        doc = _completed(_valid_document(), ["tertiary"])
+        doc["artifacts"].append(dict(doc["artifacts"][0], role="tertiary"))
+        self.assertIn("cycle-completion-incomplete", _codes(m.validate_lineage(doc)))
+
+    def test_role_lookup_reads_each_artifact_row_a_bounded_number_of_times(self):
+        # A completed cycle can hold hundreds of thousands of files; a scan of
+        # artifacts[] per revision kept such a closure busy for hours.
+        class CountingRow(dict):
+            reads = 0
+
+            def get(self, *args):
+                CountingRow.reads += 1
+                return super().get(*args)
+
+        doc = _completed(_valid_document(), ["primary"])
+        alloc = idm.IdAllocator()
+        artifact, revision = doc["artifacts"][1], doc["artifact_revisions"][1]
+        for _ in range(2000):
+            artifact_id = alloc.allocate("artifact")
+            doc["artifacts"].append(dict(artifact, artifact_id=artifact_id))
+            doc["artifact_revisions"].append(
+                dict(revision, artifact_id=artifact_id,
+                     artifact_revision_id=alloc.allocate("artifact_revision"))
+            )
+        doc["artifacts"] = [CountingRow(row) for row in doc["artifacts"]]
+        self.assertNotIn("cycle-completion-incomplete", _codes(m.validate_lineage(doc)))
+        # The per-revision scan read about two million rows here.
+        self.assertLess(CountingRow.reads, 20 * len(doc["artifacts"]))
+
+
 class TestDuplicatesAndSequence(unittest.TestCase):
     def test_rejects_duplicate_stable_id_within_manifest(self):
         doc = _valid_document()
