@@ -320,8 +320,9 @@ def _retry_message(route, run_id, retry, nodes, reason):
 def retry_step(route, armed, jobs, reason):
     """Select correction, resume, or compose from route and owner receipt state.
 
-    Exact closed routes compose. A live or unanswered BLOCKED/FAIL owner gets
-    its existing correction command. Other open or unobservable states,
+    Ordinary exact closed routes compose; cancellation remains protected even
+    after closure. A live or unanswered BLOCKED/FAIL owner gets its existing
+    correction command. Other open or unobservable states,
     including retained answers, gates, cancellation, and waits, resume the
     route. Only a proven PASS owner's rejected settlement keeps the agreed
     compose exception until same-route settlement recovery is implemented.
@@ -371,6 +372,14 @@ def retry_step(route, armed, jobs, reason):
         try:
             import dispatch_notice_state
             outcome = dispatch_notice_state.closed_outcome(guidance_path, guidance_route)
+            if outcome:
+                import route_authority
+                protection = route_authority.decide_continuation(
+                    guidance_route, action="owner", facts={"cancelled":
+                        outcome.get("disposition") == "cancelled"
+                        or outcome.get("state") == "cancelled"})
+                if protection.state == "protected":
+                    return resume("resume-protected")
         except Exception:
             return resume("resume-unobservable")
     if outcome and not outcome.get("finish_pending"):

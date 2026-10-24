@@ -457,6 +457,31 @@ module.main()
             pending = R.retry_step(route, armed, jobs, "changed output")
         self.assertEqual(pending["continuation"], "resume")
 
+    def test_exact_cancelled_closure_resumes_with_and_without_an_owner(self):
+        route, path, jobs, registry, ledger, armed = self.owner_fixture()
+        outcome = path.with_name(path.stem + ".outcome.json")
+        outcome.write_text(json.dumps({
+            "route_id": route["route_id"], "route_hash": route["route_hash"],
+            "state": "cancelled", "disposition": "cancelled",
+            "terminal_gate_proven": False,
+        }))
+        for owner_state in ("missing", "blocked", "pass"):
+            with self.subTest(owner_state=owner_state):
+                jobs.write_text("")
+                if owner_state == "blocked":
+                    self.owner_row(jobs, route, path, note="dead-worker-blocked")
+                elif owner_state == "pass":
+                    self.owner_row(jobs, route, path, failure_class="pass")
+                protected = [path, jobs, registry, outcome, ledger.journal_path]
+                before = {item: item.read_bytes() for item in protected}
+
+                step = R.retry_step(route, armed, jobs, "changed output")
+
+                self.assertEqual(step["continuation"], "resume-protected")
+                self.assertIn("capability-route.py start --route", step["command"])
+                self.assertNotIn("compose --start", step["command"])
+                self.assertEqual({item: item.read_bytes() for item in protected}, before)
+
     def test_only_a_proven_pass_settlement_uses_the_agreed_compose_exception(self):
         import dispatch_replacement as DR
         import route_parent_close

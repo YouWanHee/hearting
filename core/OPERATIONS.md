@@ -1517,7 +1517,8 @@ gets its existing `correction_command` with a same-route instruction for a new
 revalidation. For BLOCKED owners, check `owner_report` before sending the
 prepared answer. Other open or unobservable states, including retained answers,
 human gates, cancellation and waits, use the route's existing
-`resume_command`. An exactly closed route uses the existing compose surface to
+`resume_command`. Cancellation remains protected even when its exact route
+closure exists. An ordinarily closed route uses the existing compose surface to
 open a new route. The agreed exception is a rejected settlement from an owner
 whose PASS is proven by the shared verdict reader: it keeps the existing
 compose guidance until same-route PASS-settlement recovery is implemented.
