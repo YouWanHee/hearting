@@ -5577,6 +5577,113 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
             self.assertEqual(passes, [1, 2, 3])
             self.assertEqual(sleep.call_count, 2)
 
+    def test_actual_runner_rotates_blocked_notice_and_delivers_later_once(self):
+        import dispatch_pending_delivery as pending
+        import session_notice
+
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner", return_value=False):
+            blocked = session_notice.notify(
+                "claude", "sid-a-storage", key="runner-blocked",
+                subject="blocked notice", text="keep original recipient key", jobs=self.jobs_path)
+            blocked_retry = session_notice.notify(
+                "claude", "sid-a-storage", key="runner-blocked",
+                subject="blocked notice", text="keep original recipient key", jobs=self.jobs_path)
+            later = session_notice.notify(
+                "claude", "sid-z-storage", key="runner-later",
+                subject="later notice", text="deliver through fixture courier", jobs=self.jobs_path)
+
+        self.assertEqual(blocked["delivery_id"], blocked_retry["delivery_id"])
+        store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        blocked_path = pending.record_path(self.tmp_root, "sid-a-storage",
+                                           blocked["delivery_id"])
+        blocked_before = (blocked_path.read_bytes(), blocked_path.stat().st_mtime_ns)
+        deliveries = []
+        waits = []
+        inventory = {"result": {"agents": [{
+            "agent": "claude", "agent_session": {"value": "sid-z-live"},
+            "pane_id": "pane-z-live",
+        }]}}
+
+        def courier(args, *, expected_recipient, on_prepared, producer_binding=None):
+            deliveries.append({
+                "body": Path(args.body_file).read_text(encoding="utf-8"),
+                "recipient": expected_recipient,
+                "refs": list(args.ref),
+                "producer": producer_binding,
+            })
+            on_prepared("transfer-z-live")
+            return 0
+
+        def stop_after_four_bounded_passes(_delay):
+            waits.append(_delay)
+            if len(waits) == 4:
+                # This lock belongs only to this fake root. Its removal makes the
+                # real runner take its existing replaced-root exit path next pass.
+                lock_path.unlink()
+
+        def recipient_for_storage(_record, storage_sid, *, harness, read_context=None):
+            return {"sid-a-storage": "sid-a-blocked",
+                    "sid-z-storage": "sid-z-live"}.get(storage_sid)
+
+        with lock_path.open("w", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with mock.patch.object(peer_steward, "_herdr_argv",
+                                   return_value=["herdr", "agent", "list"]), \
+                 mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
+                     stdout=json.dumps(inventory), returncode=0)), \
+                 mock.patch("dispatch_seat_handover.record_recipient",
+                            side_effect=recipient_for_storage), \
+                 mock.patch.object(peer_steward, "_resolve_target",
+                                   return_value=("claude", "sid-z-live", "fixture")), \
+                 mock.patch.object(peer_steward.peer_message, "_read_pending",
+                                   return_value={"state": "queued"}) as transfer_lookup, \
+                 mock.patch.object(peer_steward, "cmd_prompt", side_effect=courier), \
+                 mock.patch.object(peer_steward, "_external_obligation_snapshot",
+                                   return_value={}), \
+                 mock.patch.object(peer_steward, "_external_obligation_signature",
+                                   return_value=()), \
+                 mock.patch.object(peer_steward,
+                                   "_external_obligation_snapshot_unchanged",
+                                   return_value=True), \
+                 mock.patch.object(peer_steward, "_reconcile_external_obligations"), \
+                 mock.patch.object(peer_steward, "_publish_watch_readiness"), \
+                 mock.patch.object(peer_steward, "_runner_readiness_fds", return_value=[]), \
+                 mock.patch.object(peer_steward.time, "sleep",
+                                   side_effect=stop_after_four_bounded_passes):
+                self.assertEqual(peer_steward.cmd_obligation_runner(SimpleNamespace(
+                    state_root=self.tmp_root, lock_fd=lock.fileno())), 0)
+
+        self.assertEqual(len(waits), 4, "the actual runner completed four bounded passes")
+        transfer_lookup.assert_called_once_with(
+            "transfer-z-live", roots=[self.tmp_root], state_root=self.tmp_root)
+        self.assertEqual(len(deliveries), 1, "queued fixture delivery is never sent twice")
+        self.assertEqual(deliveries[0]["recipient"], ("claude", "sid-z-live"))
+        self.assertIn("later notice: deliver through fixture courier", deliveries[0]["body"])
+        self.assertEqual(deliveries[0]["producer"]["recipient"], {
+            "harness": "claude", "session_id": "sid-z-live"})
+        self.assertEqual(deliveries[0]["producer"]["records"][0]["storage_sid"],
+                         "sid-z-storage")
+
+        duties = store.list(kinds={"session-notice"})
+        by_storage = {duty["intent"]["identity"]["storage_sid"]: duty for duty in duties}
+        self.assertEqual(by_storage["sid-a-storage"]["state"], "pending")
+        self.assertEqual(by_storage["sid-a-storage"]["observation"]["reason"],
+                         "recipient-unavailable")
+        self.assertEqual(by_storage["sid-z-storage"]["state"], "pending")
+        self.assertEqual(by_storage["sid-z-storage"]["observation"]["transfer_ref"],
+                         "transfer-z-live")
+        self.assertEqual((blocked_path.read_bytes(), blocked_path.stat().st_mtime_ns),
+                         blocked_before)
+        stored_later = pending.read(self.tmp_root, "sid-z-storage", later["delivery_id"])
+        self.assertEqual(stored_later["recipient_digest"],
+                         pending.recipient_digest("sid-z-storage"))
+        self.assertEqual(stored_later["receipt_digest"], later["receipt_digest"])
+        self.assertFalse(pending.record_path(
+            self.tmp_root, "sid-z-live", later["delivery_id"]).exists())
+
     def pending_message(self):
         store = peer_steward.peer_obligations.ObligationStore()
         duty = store.create("message-fixture", "message",

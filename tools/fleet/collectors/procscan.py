@@ -14,6 +14,20 @@ from ..model import Session, etime_to_min, EXEC_WAIT_COMMS
 
 HARNESSES = ("claude", "codex", "opencode")
 _DELETED = " (deleted)"
+_PS_ETIME_RE = re.compile(r"(?:\d+-)?(?:\d+:)?\d+:\d{2}\Z")
+
+
+class _CensusRows(list):
+    """List-compatible observation rows with explicit census evidence."""
+
+    def __init__(self, rows=(), *, complete=False, reasons=()):
+        super().__init__(rows)
+        self.census_complete = complete is True
+        self.census_reasons = tuple(dict.fromkeys(reasons))
+
+    def mark_incomplete(self, reason):
+        self.census_complete = False
+        self.census_reasons = tuple(dict.fromkeys((*self.census_reasons, reason)))
 
 # Managed (client-server) Codex keeps one state dir per session and carries its socket
 # paths in argv: `--listen unix://<dir>/app-server.sock` on the session process that owns
@@ -361,15 +375,41 @@ def _ps_lines():
     env = dict(os.environ, COLUMNS="100000")
     argv = _user_ps_args("pid=,comm=,etime=,args=")
     if argv is None:
-        return []
+        return _CensusRows(complete=False, reasons=("effective-uid-unavailable",))
     try:
-        out = subprocess.run(
+        result = subprocess.run(
             argv,
             capture_output=True, text=True, timeout=5, env=env,
-        ).stdout
-    except Exception:
-        return []
-    return out.splitlines()
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = getattr(exc, "stdout", None)
+        if output is None:
+            output = getattr(exc, "output", None)
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", "replace")
+        lines = output.splitlines() if isinstance(output, str) else ()
+        return _CensusRows(lines, complete=False, reasons=("ps-timeout",))
+    except Exception as exc:
+        return _CensusRows(complete=False,
+                           reasons=("ps-error-" + type(exc).__name__,))
+
+    output = getattr(result, "stdout", None)
+    if isinstance(output, str):
+        lines = output.splitlines()
+        reasons = []
+    elif isinstance(output, bytes):
+        lines = output.decode("utf-8", "replace").splitlines()
+        reasons = ["ps-output-not-text"]
+    else:
+        lines = []
+        reasons = ["ps-output-unavailable"]
+
+    returncode = getattr(result, "returncode", None)
+    if not isinstance(returncode, int) or isinstance(returncode, bool):
+        reasons.append("ps-returncode-unavailable")
+    elif returncode != 0:
+        reasons.append("ps-nonzero-exit")
+    return _CensusRows(lines, complete=not reasons, reasons=reasons)
 
 
 # --- F-47 exec visibility (v30) --------------------------------------------------------
@@ -876,29 +916,49 @@ def scan(harness_filter=None):
     if os.name == "nt":
         # Windows: MSYS `ps` has no -eo/comm and there is no /proc — reconstruct
         # session existence from on-disk state (see _scan_disk).
-        return _scan_disk(harness_filter)
-    sessions = []
+        return _CensusRows(_scan_disk(harness_filter), complete=False,
+                           reasons=("disk-state-is-not-process-census",))
+    raw_lines = _ps_lines()
+    sessions = _CensusRows(
+        complete=getattr(raw_lines, "census_complete", False) is True,
+        reasons=getattr(raw_lines, "census_reasons", ("process-census-unverified",)),
+    )
+    try:
+        selected_harnesses = tuple(harness_filter) if harness_filter else ()
+    except TypeError:
+        selected_harnesses = ()
+        sessions.mark_incomplete("harness-filter-unreadable")
+    if selected_harnesses and not set(HARNESSES).issubset(
+            {name for name in selected_harnesses if isinstance(name, str)}):
+        sessions.mark_incomplete("harness-filter-partial")
     orca_panes = []                      # (Session, ORCA_RELAY_SOCKET_PATH) rows
     pid_tty = _pid_ttys()
     det_ttys = _detached_ttys()
     tree = proc_tree()                   # F-47: one ps for the whole parent/child map
     kids = children_index(tree)
-    for line in _ps_lines():
+    for line in raw_lines:
         line = line.strip()
         if not line:
             continue
         parts = line.split(None, 3)          # pid, comm, etime, args
         if len(parts) < 3:
+            sessions.mark_incomplete("process-row-malformed")
             continue
         pid_s, comm, etime = parts[0], parts[1], parts[2]
         args = parts[3] if len(parts) > 3 else ""
-        if comm not in HARNESSES:
-            continue
-        if harness_filter and comm not in harness_filter:
-            continue
         try:
             pid = int(pid_s)
         except ValueError:
+            sessions.mark_incomplete("process-row-pid-invalid")
+            continue
+        if pid <= 0:
+            sessions.mark_incomplete("process-row-pid-invalid")
+            continue
+        if not _PS_ETIME_RE.fullmatch(etime):
+            sessions.mark_incomplete("process-row-malformed")
+        if comm not in HARNESSES:
+            continue
+        if selected_harnesses and comm not in selected_harnesses:
             continue
         # A defunct process (the shared Codex daemon never reaps the app-server children it
         # replaced) has no cwd, environ or session: not a row.

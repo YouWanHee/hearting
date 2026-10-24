@@ -3824,7 +3824,11 @@ def _pending_delivery_counts(paths, *, session_observation=None):
     no_recipient = None
     live_sessions = None
     graph = None
-    if isinstance(session_observation, dict) and session_observation.get("complete") is True:
+    if (isinstance(session_observation, dict)
+            and session_observation.get("complete") is True
+            and session_observation.get("herdr_complete") is True
+            and session_observation.get("process_complete") is True
+            and session_observation.get("native_sid_complete") is True):
         observed_live = session_observation.get("live")
         if isinstance(observed_live, (set, frozenset, tuple, list)):
             normalized_live = set()

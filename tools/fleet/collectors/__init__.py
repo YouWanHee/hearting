@@ -350,6 +350,42 @@ def apply_peer_rows(sessions, by_key):
             )[:8]
 
 
+def _session_census_observation(sessions, herdr_observed):
+    """Join this process snapshot to herdr and native session identities.
+
+    ``herdr_observed.complete`` covers herdr's own observation only. It cannot
+    certify the separately collected process rows, so the downstream absence
+    count is complete only when both observations and every row identity are
+    complete in this same collection pass.
+    """
+    herdr_complete = (isinstance(herdr_observed, dict)
+                      and herdr_observed.get("complete") is True)
+    process_complete = getattr(sessions, "census_complete", False) is True
+    reasons = list(getattr(sessions, "census_reasons", ()))
+    live = set()
+    native_sid_complete = True
+    for session in sessions:
+        harness = getattr(session, "harness", None)
+        sid = getattr(session, "session_id", None)
+        if (not isinstance(harness, str) or harness.lower() not in procscan.HARNESSES
+                or not isinstance(sid, str) or not sid.strip()):
+            native_sid_complete = False
+            continue
+        live.add((harness.lower(), sid))
+    if not process_complete and not reasons:
+        reasons.append("process-census-unverified")
+    if not native_sid_complete:
+        reasons.append("native-session-id-unobserved")
+    return {
+        "complete": herdr_complete and process_complete and native_sid_complete,
+        "herdr_complete": herdr_complete,
+        "process_complete": process_complete,
+        "process_reasons": tuple(dict.fromkeys(reasons)),
+        "native_sid_complete": native_sid_complete,
+        "live": frozenset(live),
+    }
+
+
 def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False):
     """Return (sessions, jobs).
 
@@ -427,19 +463,12 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
 
     # F-100b: herdr attachment — one `herdr agent list` per snapshot, exact session-id
     # match; additive enrichment that never touches liveness or row existence.
-    herdr_session_observation = None
+    herdr_observed = None
     try:
         from . import herdr as _herdr
         observed = _herdr.enrich(sessions, wait_timeout=0.0 if fast_first else 0.2)
         if isinstance(observed, dict):
-            herdr_session_observation = {
-                "complete": observed.get("complete") is True,
-                "live": frozenset(
-                    (str(s.harness).lower(), str(s.session_id))
-                    for s in sessions
-                    if getattr(s, "harness", None) and getattr(s, "session_id", None)
-                ),
-            }
+            herdr_observed = observed
             observations["herdr"] = _observation_health(
                 job_key, "herdr", observed.get("last_error") if not observed.get("complete") else None)
     except Exception as exc:
@@ -645,6 +674,7 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
         pass
 
     # --- dispatch section ---
+    herdr_session_observation = _session_census_observation(sessions, herdr_observed)
     jobs = []
     previous = _JOB_OBSERVATIONS.get(job_key)
     job_error = None

@@ -23,7 +23,8 @@ _UTILITIES_DIR = os.path.join(os.path.dirname(_TOOLS_DIR), "utilities")
 if _UTILITIES_DIR not in sys.path:
     sys.path.insert(0, _UTILITIES_DIR)
 
-from fleet.collectors import dispatch  # noqa: E402
+from fleet import collectors  # noqa: E402
+from fleet.collectors import dispatch, procscan  # noqa: E402
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
 
 
@@ -202,18 +203,33 @@ class PendingDeliveryCountsTest(unittest.TestCase):
         finally:
             dispatch.collect.last_pending_delivery = None
 
-    def _count_with_graph(self, storage_sid, recipient_sid, live=(), duplicate_paths=False):
+    def _count_with_graph(self, storage_sid, recipient_sid, live=(), duplicate_paths=False,
+                          session_observation=None, graph_sids=None,
+                          recipient_by_storage=None):
         record = pending_delivery.create(**_record(root=self.state_root,
                                                     recipient_key=storage_sid))
         path = pending_delivery.record_path(self.state_root, storage_sid, record["delivery_id"])
         before = (path.read_bytes(), path.stat().st_mtime_ns)
-        graph = SimpleNamespace(ledger_keys={("claude", storage_sid): ()})
+        graph = SimpleNamespace(ledger_keys={
+            ("claude", sid): () for sid in (graph_sids or (storage_sid,))
+        })
         paths = [str(self.jobs_path), str(self.jobs_path)] if duplicate_paths else [str(self.jobs_path)]
+        if session_observation is None:
+            session_observation = {
+                "complete": True,
+                "herdr_complete": True,
+                "process_complete": True,
+                "native_sid_complete": True,
+                "live": set(live),
+            }
+        def resolve_recipient(_record, key, *, harness, read_context=None):
+            return (recipient_by_storage or {}).get(key, recipient_sid)
+
         with mock.patch("dispatch_seat_handover.lineage_graph", return_value=graph), \
                 mock.patch("dispatch_seat_handover.record_recipient",
-                           return_value=recipient_sid):
+                           side_effect=resolve_recipient):
             counts = dispatch._pending_delivery_counts(
-                paths, session_observation={"complete": True, "live": set(live)})
+                paths, session_observation=session_observation)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         return counts
 
@@ -236,6 +252,110 @@ class PendingDeliveryCountsTest(unittest.TestCase):
         pending_delivery.create(**_record(root=self.state_root))
         missing = dispatch._pending_delivery_counts([str(self.jobs_path)])
         self.assertIsNone(missing["no_recipient"])
+
+    def test_failed_empty_and_complete_empty_census_have_different_results(self):
+        complete_empty = collectors._session_census_observation(
+            procscan._CensusRows(complete=True), {"complete": True})
+        failed_empty = collectors._session_census_observation(
+            procscan._CensusRows(complete=False, reasons=("ps-error-OSError",)),
+            {"complete": True})
+
+        self.assertTrue(complete_empty["complete"])
+        self.assertEqual(self._count_with_graph(
+            "dead-A", "dead-C", session_observation=complete_empty)["no_recipient"], 1)
+        self.assertFalse(failed_empty["complete"])
+        self.assertEqual(self._count_with_graph(
+            "dead-A", "dead-C", session_observation=failed_empty)["no_recipient"], None)
+
+    def test_complete_observed_census_counts_dead_and_excludes_live_recipient(self):
+        sessions = procscan._CensusRows(
+            [SimpleNamespace(harness="claude", session_id="live-C")], complete=True)
+        observation = collectors._session_census_observation(sessions, {"complete": True})
+
+        dead = self._count_with_graph(
+            "dead-A", "dead-C", session_observation=observation)
+        live = self._count_with_graph(
+            "live-A", "live-C", session_observation=observation,
+            graph_sids=("dead-A", "live-A"),
+            recipient_by_storage={"dead-A": "dead-C", "live-A": "live-C"})
+
+        self.assertEqual((observation["complete"], observation["live"]),
+                         (True, frozenset({("claude", "live-C")})))
+        self.assertEqual(dead["no_recipient"], 1)
+        self.assertEqual(live["pending"], 2)
+        self.assertEqual(live["no_recipient"], 1)
+
+    def test_process_and_native_sid_gaps_with_complete_herdr_stay_unknown(self):
+        incomplete_scans = (
+            procscan._CensusRows(complete=False, reasons=("effective-uid-unavailable",)),
+            procscan._CensusRows(complete=False, reasons=("ps-error-OSError",)),
+            procscan._CensusRows(complete=False, reasons=("ps-nonzero-exit",)),
+            procscan._CensusRows(complete=False, reasons=("ps-timeout",)),
+            procscan._CensusRows(complete=False, reasons=("process-row-malformed",)),
+            procscan._CensusRows(complete=False, reasons=("process-row-pid-invalid",)),
+            procscan._CensusRows(complete=False, reasons=("harness-filter-partial",)),
+        )
+        for rows in incomplete_scans:
+            with self.subTest(reason=rows.census_reasons):
+                observation = collectors._session_census_observation(rows, {"complete": True})
+                self.assertTrue(observation["herdr_complete"])
+                self.assertFalse(observation["process_complete"])
+                self.assertIsNone(self._count_with_graph(
+                    "dead-A", "dead-C", session_observation=observation)["no_recipient"])
+
+        unknown_sid = procscan._CensusRows(
+            [SimpleNamespace(harness="claude", session_id=None)], complete=True)
+        observation = collectors._session_census_observation(unknown_sid, {"complete": True})
+        self.assertTrue(observation["process_complete"])
+        self.assertFalse(observation["native_sid_complete"])
+        self.assertIsNone(self._count_with_graph(
+            "dead-A", "dead-C", session_observation=observation)["no_recipient"])
+
+        missing_herdr = collectors._session_census_observation(
+            procscan._CensusRows(complete=True), {"complete": False})
+        self.assertIsNone(self._count_with_graph(
+            "dead-A", "dead-C", session_observation=missing_herdr)["no_recipient"])
+
+    def test_complete_census_counts_only_dead_recipients_and_preserves_sources(self):
+        dead = pending_delivery.create(**_record(root=self.state_root,
+                                                  recipient_key="dead-A"))
+        expired = pending_delivery.create(**_record(
+            root=self.state_root, recipient_key="expired-A",
+            delivery_id="delivery-" + "c" * 32))
+        pending_delivery.expire_if_due(
+            self.state_root, "expired-A", expired["delivery_id"],
+            actor="dispatch-reconcile", reason="recipient-session-gone", liveness="known")
+        self._write_jobs_row({
+            "attempt_id": "att-census-source",
+            "delivery_intent": "1",
+            "parent_sid": "dead-A",
+            "delivery_id": dead["delivery_id"],
+        })
+        obligations = self.state_root / "supervisor-state" / "obligations"
+        obligations.mkdir(parents=True, exist_ok=True)
+        retained = obligations / ("batch-" + "d" * 32 + ".json")
+        retained.write_text(json.dumps({"schema_version": 1, "state": "unknown"}),
+                            encoding="utf-8")
+        before_jobs = (self.jobs_path.read_bytes(), self.jobs_path.stat().st_mtime_ns)
+        json_paths = sorted(self.state_root.rglob("*.json"))
+        before_json = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in json_paths}
+        observation = collectors._session_census_observation(
+            procscan._CensusRows(complete=False, reasons=("ps-timeout",)),
+            {"complete": True})
+
+        counts = dispatch._pending_delivery_counts(
+            [str(self.jobs_path)], session_observation=observation)
+
+        self.assertEqual(counts, {"pending": 1, "expired": 1, "retained_batch_duties": 1,
+                                  "no_recipient": None})
+        self.assertEqual((self.jobs_path.read_bytes(), self.jobs_path.stat().st_mtime_ns),
+                         before_jobs)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
+                          for path in json_paths}, before_json)
+        self.assertEqual(pending_delivery.read(
+            self.state_root, "dead-A", dead["delivery_id"])["state"], "pending")
+        self.assertEqual(pending_delivery.read(
+            self.state_root, "expired-A", expired["delivery_id"])["state"], "expired")
 
     def test_render_and_overview_show_known_count_but_never_unknown_as_zero(self):
         from fleet import render
