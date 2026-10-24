@@ -563,6 +563,8 @@ def _enrich_v2(sess, tick, db):
             sess.shell_job_observation = {
                 "state": observed.get("state", "unknown"),
                 "reason": observed.get("reason", "runtime-generation-unresolved")}
+        if observed.get("state") == "observed" and generation == "v1":
+            return False
         _attempt_sidecar_fallback(sess)
         return True
     if observed.get("state") != "observed" or observed.get("generation") != "v2":
@@ -1026,6 +1028,7 @@ def enrich(sess, tick=None):
     # "not-implemented"`), so this always reads None today — the call is here so the
     # harness-parity contract (D) and a future writer both have one call site, matching
     # claude/codex's tier-1 read at the top of their own `enrich`.
+    sess._session_cwd = (None, None)
     sid = _resolve_current_identity(sess)
     _clear_session_enrichment(sess)
     rec = _current_registry_record(sess, sid)

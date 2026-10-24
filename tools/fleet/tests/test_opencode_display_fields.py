@@ -507,6 +507,126 @@ class CurrentSessionBindingTest(unittest.TestCase):
         self.assertEqual(session.cwd, "/selected/project")
         self.assertEqual(db.read_bytes(), before)
 
+    def test_repeated_exact_sid_enrichment_clears_missing_selected_directory(self):
+        from fleet import session_cwd
+
+        db = self.root / "opencode-repeated-cwd.db"
+        with sqlite3.connect(db) as con:
+            con.execute("CREATE TABLE credential (id TEXT, integration_id TEXT, value TEXT)")
+            con.execute(
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, "
+                "slug TEXT, title TEXT, agent TEXT, model TEXT, time_created INT, "
+                "time_updated INT, cost REAL, tokens_input INT, tokens_output INT, "
+                "tokens_reasoning INT)")
+            con.execute(
+                "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, "
+                "seq INT, time_created INT, time_updated INT, data TEXT)")
+            con.execute("INSERT INTO credential VALUES ('id','provider','fixture-only')")
+            con.execute("INSERT INTO session_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "ses_b", "/B", None, "slug-b", "native-b", "build",
+                json.dumps({"id": "model-b", "providerID": "provider"}),
+                1000, 2000, 0.2, 7, 3, 1))
+            con.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)", (
+                "msg-b", "ses_b", "assistant", 1, 1500, 2000,
+                json.dumps({"content": [{"type": "text", "text": "selected B"}],
+                            "tokens": {"total": 123},
+                            "time": {"created": 1500, "completed": 2000}})))
+
+        session = self._session(prior="ses_a")
+        session.cwd = "/launch/project"
+        shell_key = opencode._v2_shell_key(str(db), "ses_b", None)
+        self.addCleanup(opencode._V2_SHELL_TASKS.pop, shell_key, None)
+        with mock.patch.object(opencode, "session_of_process",
+                               return_value=("ses_b", "opencode-tui-selection")), \
+                mock.patch.object(opencode, "_proc_start_ticks", return_value="123"), \
+                mock.patch.object(opencode, "_db", return_value=str(db)), \
+                mock.patch.object(opencode.session_registry, "read", return_value=None), \
+                mock.patch("fleet.context_policy.read_policy", return_value=None), \
+                self._title_patches()[0], self._title_patches()[1], self._title_patches()[2]:
+            opencode.enrich(session)
+            self.assertEqual(session._session_cwd, ("ses_b", "/B"))
+            with sqlite3.connect(db) as con:
+                con.execute("UPDATE session_v2 SET directory=NULL WHERE id='ses_b'")
+            before_second_read = db.read_bytes()
+            opencode.enrich(session)
+
+        self.assertEqual(session.session_id, "ses_b")
+        self.assertEqual((session.title, session.active_context_tokens), ("Title B", 123))
+        self.assertEqual(session._refresh_source["session_id"], "ses_b")
+        self.assertEqual(session._session_cwd, (None, None))
+        self.assertEqual(session.cwd, "/launch/project")
+        session_cwd.project([session])
+        self.assertEqual(session.cwd, "/launch/project")
+        self.assertEqual(db.read_bytes(), before_second_read)
+
+    def test_credential_mixed_database_exact_v1_session_uses_v1_reader(self):
+        db = self.root / "opencode-credential-v1.db"
+        with sqlite3.connect(db) as con:
+            con.execute("CREATE TABLE credential (id TEXT, integration_id TEXT, value TEXT)")
+            con.execute("INSERT INTO credential VALUES ('id','provider','fixture-only')")
+            con.execute(
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, "
+                "slug TEXT, title TEXT, agent TEXT, model TEXT, time_created INT, "
+                "time_updated INT, cost REAL, tokens_input INT, tokens_output INT, "
+                "tokens_reasoning INT)")
+            con.execute(
+                "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, "
+                "seq INT, time_created INT, time_updated INT, data TEXT)")
+            con.execute("INSERT INTO session_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "ses_a", "/A", None, "slug-a", "native-a", "build",
+                json.dumps({"id": "model-a", "providerID": "provider"}),
+                1000, 9000, 0.9, 90, 0, 0))
+            con.execute(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, "
+                "slug TEXT, agent TEXT, model TEXT, time_created INTEGER, time_updated INTEGER, "
+                "summary TEXT, title TEXT, cost REAL, tokens_input INTEGER, "
+                "tokens_output INTEGER, tokens_reasoning INTEGER)")
+            con.execute(
+                "CREATE TABLE message (id TEXT, session_id TEXT, role TEXT, "
+                "time_updated INTEGER, data TEXT)")
+            con.execute("CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, data TEXT)")
+            con.execute("INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "ses_v1", "/V1", None, "slug-v1", "build",
+                json.dumps({"id": "model-v1", "providerID": "provider"}),
+                1000, 2000, "native summary v1", "native v1", 0.2, 17, 3, 0))
+            con.execute("INSERT INTO message VALUES (?,?,?,?,?)", (
+                "msg-v1", "ses_v1", "assistant", 2000,
+                json.dumps({"tokens": {"total": 23}, "finish": "stop"})))
+            con.execute("INSERT INTO part VALUES (?,?,?,?)", (
+                "part-v1", "msg-v1", "ses_v1",
+                json.dumps({"type": "text", "text": "exact V1 content"})))
+
+        before = db.read_bytes()
+        runtime = opencode._opencode_v2_runtime()
+        observation = runtime.read_session_observation("ses_v1", db_path=db)
+        self.assertEqual((observation.get("state"), observation.get("generation")),
+                         ("observed", "v1"))
+        session = self._session(prior="ses_a")
+        with mock.patch.object(opencode, "session_of_process",
+                               return_value=("ses_v1", "opencode-tui-selection")), \
+                mock.patch.object(opencode, "_proc_start_ticks", return_value="123"), \
+                mock.patch.object(opencode, "_db", return_value=str(db)), \
+                mock.patch.object(opencode.session_registry, "read", return_value=None), \
+                mock.patch("fleet.context_policy.read_policy", return_value=None), \
+                mock.patch.object(opencode.titles, "last_title", return_value="Title V1"), \
+                mock.patch.object(opencode.titles, "fresh_summary_with_ts",
+                                  return_value=("Summary V1", 2.0)), \
+                mock.patch.object(runtime, "read_session_observation",
+                                  wraps=runtime.read_session_observation) as reader:
+            opencode.enrich(session)
+
+        reader.assert_called_once()
+        self.assertEqual(session.session_id, "ses_v1")
+        self.assertEqual((session.title, session.summary), ("Title V1", "Summary V1"))
+        self.assertEqual(session.active_context_tokens, 23)
+        self.assertEqual(session._refresh_source["kind"], "opencode-db")
+        self.assertEqual(session._refresh_source["session_id"], "ses_v1")
+        self.assertEqual(session._refresh_source["table"], "part")
+        self.assertEqual(session.shell_jobs, [])
+        self.assertEqual(session.shell_job_observation["reason"],
+                         "v1-background-native-record-not-observed")
+        self.assertEqual(db.read_bytes(), before)
+
     def test_registry_requires_live_pid_start_and_current_session_before_apply(self):
         self._add("ses_a", updated=999999, context=99)
         self._add("ses_b", updated=1000, context=22)
