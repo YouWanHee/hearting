@@ -770,6 +770,134 @@ class ObligationStoreTest(unittest.TestCase):
                     stored = pending.read(self.jobs.parent, "sid-notice", record["delivery_id"])
                     self.assertEqual(stored["state"], "pending")
 
+    def test_notice_runner_rotates_past_blocked_recipient_groups(self):
+        from types import SimpleNamespace
+        import dispatch_pending_delivery as pending
+        import session_notice
+
+        cases = ("pane-unavailable", "invalid-pane", "target-changed",
+                 "queued", "unverified", "pending")
+        for case in cases:
+            with self.subTest(blocker=case):
+                case_root = self.root / ("notice-fairness-" + case)
+                case_root.mkdir()
+                jobs = case_root / "jobs.log"
+                jobs.touch()
+                env = {
+                    "HOME": str(case_root / "home"),
+                    "XDG_STATE_HOME": str(case_root / "state"),
+                    "XDG_DATA_HOME": str(case_root / "data"),
+                    "XDG_CONFIG_HOME": str(case_root / "config"),
+                    "XDG_CACHE_HOME": str(case_root / "cache"),
+                    "HARNESS_STATE_ROOT": str(case_root / "harness"),
+                    "AGENT_PEER_LEDGER_ROOT": str(case_root / "peer-ledger"),
+                    "AGENT_DISPATCH_JOBS": str(jobs),
+                }
+                with mock.patch.dict(os.environ, env), \
+                     mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
+                    front_record = session_notice.notify(
+                        "claude", "sid-a-blocked", key="notice:" + case + ":front",
+                        subject="front", text="blocked", jobs=jobs)
+                    back_record = session_notice.notify(
+                        "claude", "sid-z-live", key="notice:" + case + ":back",
+                        subject="back", text="deliver", jobs=jobs)
+                    self.assertIsNotNone(front_record)
+                    self.assertIsNotNone(back_record)
+                    store = obligations.ObligationStore(case_root)
+                    duties = store.list(kinds={"session-notice"})
+                    by_sid = {duty["intent"]["identity"]["storage_sid"]: duty
+                              for duty in duties}
+                    front_duty = by_sid["sid-a-blocked"]
+                    back_duty = by_sid["sid-z-live"]
+                    transfer_ref = "front-transfer-" + case
+                    transfer_state = {"queued": "queued", "unverified": "unverified",
+                                      "pending": "pending"}.get(case)
+                    if transfer_state:
+                        store.update(front_duty["id"], observation={
+                            "transfer_ref": transfer_ref,
+                            "storage_sid": "sid-a-blocked",
+                            "delivery_id": front_record["delivery_id"],
+                            "recipient_sid": "sid-a-blocked",
+                        })
+
+                    front_transfer = {
+                        "ref": transfer_ref, "state": transfer_state,
+                        "to": {"harness": "claude", "session_id": "sid-a-blocked"},
+                    }
+                    transfer_reads = []
+
+                    def read_transfer(ref, **_kwargs):
+                        if ref == transfer_ref:
+                            transfer_reads.append(ref)
+                            return dict(front_transfer)
+                        return None
+
+                    agents = [{"agent": "claude", "agent_session": {"value": "sid-z-live"},
+                               "pane_id": "pane-z-live"}]
+                    if case != "pane-unavailable":
+                        front_pane = "-" if case == "invalid-pane" else "pane-a-blocked"
+                        agents.insert(0, {"agent": "claude",
+                                          "agent_session": {"value": "sid-a-blocked"},
+                                          "pane_id": front_pane})
+                    inventory = {"result": {"agents": agents}}
+
+                    def resolve(pane):
+                        if pane == "pane-a-blocked" and case == "target-changed":
+                            return "claude", "sid-changed", "target-changed"
+                        return "claude", {"pane-a-blocked": "sid-a-blocked",
+                                           "pane-z-live": "sid-z-live"}.get(pane), "current"
+
+                    sent = []
+
+                    def courier(_args, *, expected_recipient, on_prepared,
+                                producer_binding=None):
+                        sent.append((expected_recipient, producer_binding))
+                        on_prepared("back-transfer-" + case)
+                        return 0
+
+                    selection = {"state_root": str(case_root / "stale-root"),
+                                 "runner_incarnation": "old-runner",
+                                 "last_group": ("claude", "sid-z-live")}
+                    with mock.patch.object(peer_steward, "_herdr_argv", return_value=["herdr"]), \
+                         mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
+                             stdout=json.dumps(inventory), returncode=0)), \
+                         mock.patch.object(peer_steward, "_resolve_target", side_effect=resolve), \
+                         mock.patch.object(peer_steward.peer_message, "_read_pending",
+                                           side_effect=read_transfer), \
+                         mock.patch.object(peer_steward, "_schedule_message_obligation") as schedule, \
+                         mock.patch.object(peer_steward, "cmd_prompt", side_effect=courier):
+                        for _pass in range(3):
+                            current = store.list(kinds={"session-notice"})
+                            peer_steward._reconcile_obligations(
+                                store, current, notice_selection=selection,
+                                runner_incarnation="runner-" + case)
+
+                    self.assertEqual([item[0] for item in sent],
+                                     [("claude", "sid-z-live")])
+                    self.assertEqual(sent[0][1]["recipient"],
+                                     {"harness": "claude", "session_id": "sid-z-live"})
+                    self.assertEqual(selection["state_root"], str(case_root.resolve()))
+                    self.assertEqual(selection["runner_incarnation"], "runner-" + case)
+                    self.assertEqual(selection["last_group"], ("claude", "sid-a-blocked"))
+                    self.assertEqual(store.get(front_duty["id"])["state"], "pending")
+                    self.assertEqual(store.get(back_duty["id"])["observation"]["transfer_ref"],
+                                     "back-transfer-" + case)
+                    original = pending.read(case_root, "sid-a-blocked",
+                                            front_record["delivery_id"])
+                    self.assertEqual(original["state"], "pending")
+                    self.assertEqual(original["receipt_digest"], front_record["receipt_digest"])
+                    self.assertIsNone(pending.read(case_root, "sid-z-live",
+                                                   front_record["delivery_id"]))
+                    front_observation = store.get(front_duty["id"])["observation"] or {}
+                    self.assertEqual(front_observation.get("transfer_ref"),
+                                     transfer_ref if transfer_state else None)
+                    if case in {"queued", "unverified", "pending"}:
+                        self.assertEqual(transfer_reads, [transfer_ref, transfer_ref])
+                    if case == "pending":
+                        self.assertEqual(schedule.call_count, 2)
+                    else:
+                        schedule.assert_not_called()
+
     def test_registered_completion_retains_exact_native_turn_before_ack(self):
         from types import SimpleNamespace
         import dispatch_completion_join as join

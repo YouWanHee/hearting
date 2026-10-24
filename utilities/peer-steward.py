@@ -7787,7 +7787,8 @@ def _reconcile_external_obligations(store, *, service_current=None, snapshot=Non
             pass
 
 
-def _reconcile_obligations(store, duties=None, *, read_context=None):
+def _reconcile_obligations(store, duties=None, *, read_context=None,
+                           notice_selection=None, runner_incarnation=None):
     """Advance only the accepted duties owned by this runner."""
     if duties is None:
         duties = store.list()
@@ -7811,7 +7812,9 @@ def _reconcile_obligations(store, duties=None, *, read_context=None):
             except Exception:
                 pass
     if notice_duties:
-        _resume_session_notice_obligations(notice_duties, store, read_context=read_context)
+        _resume_session_notice_obligations(
+            notice_duties, store, read_context=read_context,
+            selection=notice_selection, runner_incarnation=runner_incarnation)
 
 
 def _discover_session_notice_duties(store):
@@ -7851,7 +7854,8 @@ def _discover_session_notice_duties(store):
                 continue
 
 
-def _resume_session_notice_obligations(duties, store, *, read_context=None):
+def _resume_session_notice_obligations(duties, store, *, read_context=None,
+                                       selection=None, runner_incarnation=None):
     """Deliver notices through the existing herdr census and peer courier."""
     import dispatch_pending_delivery as pending
     from dispatch_notice_state import keep_claim
@@ -7886,12 +7890,35 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None):
             continue
     if not candidates:
         return
-    # A pass sends one bounded body to one exact recipient. Additional records
-    # for that recipient are included in the same courier transfer.
+    # A pass sends one bounded body to one exact recipient. Keep only a
+    # runner-local selection cursor so an open first group cannot starve later
+    # recipients. It carries no delivery or authorization evidence; candidates
+    # and every record/target are re-read through the normal path each pass.
     candidates.sort(key=lambda item: (item[1], item[3], item[4]["delivery_id"]))
-    first = candidates[0]
-    duty, harness, _storage, recipient_sid, _record = first
-    batch = [item for item in candidates if item[1] == harness and item[3] == recipient_sid][:8]
+    groups = {}
+    for item in candidates:
+        groups.setdefault((item[1], item[3]), []).append(item)
+    group_keys = sorted(groups)
+    state_root = str(root.resolve())
+    if selection is not None:
+        if (selection.get("state_root") != state_root
+                or selection.get("runner_incarnation") != runner_incarnation):
+            selection.clear()
+            selection.update(state_root=state_root,
+                              runner_incarnation=runner_incarnation,
+                              last_group=None)
+        last_group = selection.get("last_group")
+        if not (isinstance(last_group, tuple) and len(last_group) == 2
+                and all(isinstance(value, str) for value in last_group)):
+            last_group = None
+    else:
+        last_group = None
+    group_key = next((key for key in group_keys if last_group is not None and key > last_group),
+                     group_keys[0])
+    if selection is not None:
+        selection["last_group"] = group_key
+    harness, recipient_sid = group_key
+    batch = groups[group_key][:8]
     pending_transfers = []
     for item in batch:
         obs = item[0].get("observation") or {}
@@ -8032,6 +8059,8 @@ def cmd_obligation_runner(args):
             store.root, os.getpid(), process_start_ticks(os.getpid()) or "", runner_incarnation)
     except OSError:
         runner_incarnation = ""
+    notice_selection = {"state_root": str(store.root.parents[1].resolve()),
+                        "runner_incarnation": runner_incarnation, "last_group": None}
     settlement_context = dispatch_batch_obligations.OwnerSettlementReadContext()
     while True:
         if not _runner_lock_current(store, args.lock_fd):
@@ -8047,7 +8076,9 @@ def cmd_obligation_runner(args):
         from runtime_observation import ObservationContext
         read_context = PeerReadContext(registry_append_only=True)
         observation_context = ObservationContext()
-        _reconcile_obligations(store, duties, read_context=read_context)
+        _reconcile_obligations(store, duties, read_context=read_context,
+                               notice_selection=notice_selection,
+                               runner_incarnation=runner_incarnation)
         readiness_duties = [duty for duty in duties
                             if (duty.get("intent") or {}).get("kind") == shared_readiness.DUTY_KIND]
         if readiness_duties and runner_incarnation:
