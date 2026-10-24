@@ -2632,6 +2632,7 @@ _JOIN_EXIT = {"timeout": 3, "agent-not-found": 2, "herdr-unavailable": 4,
 _WATCH_WAKE_FD = None
 _WATCH_TRANSITION_LOCK_BUDGET_SEC = 0.2
 _WATCH_RECEIPT_CONTENDED = "contended"
+_WATCH_RECEIPT_PENDING = "pending"
 _WATCH_RECEIPT_EXPIRED = "watch-deadline"
 
 
@@ -4472,7 +4473,7 @@ def cmd_watch_run(args):
                     state, agent = "timeout", expected_agent
                     return "expired"
                 readiness_transition_pending = True
-                if result == _WATCH_RECEIPT_CONTENDED:
+                if result in {_WATCH_RECEIPT_CONTENDED, _WATCH_RECEIPT_PENDING}:
                     awaiting_readiness = True
                     return "retry"
                 receipt_rejected = True
@@ -6096,6 +6097,7 @@ def _watch_publish_ready_receipt(target, native_state, arm, expected, server,
                                  watch_id, paths, receipt, *, deadline=None):
     """Refresh mutable authority and publish the receipt under its writer locks."""
     reason = "shared-readiness-authority-lock-unavailable"
+    readiness_pending = False
     if deadline is not None and time.monotonic() >= deadline:
         return _WATCH_RECEIPT_EXPIRED
     try:
@@ -6113,6 +6115,7 @@ def _watch_publish_ready_receipt(target, native_state, arm, expected, server,
                 return _WATCH_RECEIPT_EXPIRED
             if readiness.state != "ready":
                 reason = readiness.reason or "shared-readiness-pending"
+                readiness_pending = readiness.state == "pending"
             else:
                 if deadline is not None and time.monotonic() >= deadline:
                     return _WATCH_RECEIPT_EXPIRED
@@ -6133,7 +6136,7 @@ def _watch_publish_ready_receipt(target, native_state, arm, expected, server,
         **(_read_json(paths.observation) or {}),
         "state": "pending", "reason": reason, "observed_ts": _utc_now(),
     })
-    return False
+    return _WATCH_RECEIPT_PENDING if readiness_pending else False
 
 
 _FLUSH_MAX_ROWS = 4
