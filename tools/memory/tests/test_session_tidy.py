@@ -4124,6 +4124,10 @@ class SeatHandoverTest(TidyCase):
                  for n in range(3)]
         self.write_snapshot(PANE, "sid-A", [self.binding(metas[0])])
         self.write_snapshot(PANE_BESIDE, "sid-A", [self.binding(metas[1])])
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            st.record_event(self.seat(PANE), "claude", "sid-A", "start", cwd=str(self.cwd), now=100)
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE_BESIDE}):
+            st.record_event(self.seat(PANE_BESIDE), "claude", "sid-A", "start", cwd=str(self.cwd), now=101)
         reads = mock.patch.object(st, "_read_ledger_lines", wraps=st._read_ledger_lines)
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}), reads as counted:
             context = PeerReadContext()
@@ -4133,6 +4137,52 @@ class SeatHandoverTest(TidyCase):
             counted.reset_mock()
             self.handover.current_bindings("claude", "sid-A", self.jobs)
             self.assertLessEqual(counted.call_count, 2)                # a context of its own reads each once
+
+    def test_shared_graph_marks_fork_merge_and_cycle_unresolved(self):
+        from peer_read_context import PeerReadContext
+        owner = self.owner_row("att-ambiguous", status="running", parent="sid-A")
+        self.append_row(PANE, {"ts": 1, "from": "sid-A", "sid": "sid-B", "harness": "claude",
+                               "source": "clear", "bindings": []})
+        self.append_row(PANE_BESIDE, {"ts": 2, "from": "sid-A", "sid": "sid-C", "harness": "claude",
+                                      "source": "reservation", "bindings": []})
+        self.append_row("test:pane-third", {"ts": 3, "from": "sid-B", "sid": "sid-D", "harness": "claude",
+                                            "source": "first-message", "bindings": []})
+        self.append_row("test:pane-third", {"ts": 4, "from": "sid-C", "sid": "sid-D", "harness": "claude",
+                                            "source": "clear", "bindings": []})
+        self.append_row("test:pane-third", {"ts": 5, "from": "sid-D", "sid": "sid-A", "harness": "claude",
+                                            "source": "clear", "bindings": []})
+        with self.iso.patched_environ():
+            graph = self.handover.lineage_graph(read_context=PeerReadContext())
+            self.assertIn(("claude", "sid-A", "sid-B"), graph.edges)
+            for sid in ("sid-A", "sid-B", "sid-C", "sid-D"):
+                self.assertEqual(self.handover.chain_end("claude", sid)[1], "unresolved")
+                self.assertEqual(self.handover._lineage_successor({}, sid, "claude"), sid)
+            self.assertEqual(self.handover.effective_parent(owner, self.jobs), "sid-A")
+            self.assertFalse(self.handover.owns(owner, "sid-B", self.jobs))
+        self.assertIsInstance(graph.unresolved, frozenset)
+        self.assertIsInstance(graph.ledger_keys, type(__import__("types").MappingProxyType({})))
+        projected = st._project_seat_lineage([
+            {"event": "start", "harness": "claude", "sid": sid, "ts": index}
+            for index, sid in enumerate(("sid-A", "sid-B", "sid-C", "sid-D"), 1)
+        ] + [dict(row) for rows in graph.ledger_rows.values() for row in rows], {}, {},
+            sid="sid-B", graph=graph)
+        self.assertNotEqual(projected[0]["relation"], "confirmed")
+
+    def test_lineage_card_projects_pane_moved_chain_from_all_ledgers(self):
+        with self.library():
+            first, second = self.seat(PANE), self.seat(PANE_BESIDE)
+            st.record_event(first, "claude", "sid-A", "start", source="startup", cwd=str(self.cwd), now=100)
+            st.record_event(first, "claude", "sid-B", "start", source="clear", cwd=str(self.cwd), now=200)
+            st._append_ledger_entry(first, {"ts": 201, "event": "handover", "harness": "claude",
+                                             "sid": "sid-B", "from": "sid-A", "source": "clear"})
+            st.record_event(second, "claude", "sid-C", "start", source="clear", cwd=str(self.cwd), now=300)
+            st._append_ledger_entry(second, {"ts": 301, "event": "succession", "harness": "claude",
+                                              "sid": "sid-C", "from": {"harness": "claude", "sid": "sid-B"},
+                                              "source": "tidy-clear"})
+            lineage = st.seat_lineage(second, harness="claude", sid="sid-C")
+        self.assertEqual(lineage[0]["sid"], "sid-C")
+        self.assertEqual(lineage[0]["relation"], "confirmed")
+        self.assertEqual(lineage[0]["predecessor"], {"harness": "claude", "sid": "sid-B"})
 
     def test_ownership_checks_never_resolve_a_project_key(self):
         owner, _frame = self.chain(owner_status="running")

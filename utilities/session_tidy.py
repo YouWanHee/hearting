@@ -71,6 +71,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from typing import Callable, Iterator, Optional
 
 SCHEMA = 1
@@ -760,29 +761,27 @@ def latest_session(seat: Seat, harness: Optional[str] = None) -> Optional[dict]:
 
 
 def _project_seat_lineage(rows: list[dict], cards: dict, locations: dict,
-                          *, harness=None, sid=None) -> list[dict]:
+                          *, harness=None, sid=None, graph=None) -> list[dict]:
     """Pure projection of already-read seat rows, cards and transcript locations."""
     grouped = {}
     starts = {}
     edges = {}
     outgoing = {}
+    if graph is not None:
+        for edge_harness, source, target in graph.edges:
+            edges.setdefault((edge_harness, target), set()).add(source)
+            outgoing.setdefault((edge_harness, source), set()).add(target)
     for row in rows:
         name, session = str(row.get("harness") or ""), str(row.get("sid") or "")
         if not name or not session:
             continue
         key = (name, session)
-        if row.get("event") in {"handover", "succession"}:
-            if (row.get("event") == "succession" and row.get("source") != "tidy-clear"):
-                continue
-            if (row.get("event") == "handover" and row.get("source") not in {
-                    "clear", "reservation", "first-message"}):
-                continue
-            source = row.get("from")
-            if isinstance(source, dict):
-                source = source.get("sid") if source.get("harness") == name else None
-            if isinstance(source, str) and source and source != session:
-                edges.setdefault(key, set()).add(source)
-                outgoing.setdefault((name, source), set()).add(session)
+        edge = None if graph is not None else tidy_lineage_edge(row)
+        if edge is not None:
+            edge_harness, source, target = edge
+            if edge_harness == name:
+                edges.setdefault((name, target), set()).add(source)
+                outgoing.setdefault((name, source), set()).add(target)
             continue
         item = grouped.setdefault(key, {"sid": session, "harness": name,
                                         "started_at": None, "source": "unknown",
@@ -820,7 +819,10 @@ def _project_seat_lineage(rows: list[dict], cards: dict, locations: dict,
         key = (item["harness"], item["sid"])
         predecessors = edges.get(key, set())
         item["predecessor"] = None
-        if (len(predecessors) == 1
+        unresolved = graph is not None and key in graph.unresolved
+        if unresolved:
+            item["relation"] = "unknown"
+        elif (len(predecessors) == 1
                 and len(outgoing.get((item["harness"], next(iter(predecessors))), ())) == 1):
             item["relation"] = "confirmed"
             item["predecessor"] = {"harness": item["harness"], "sid": next(iter(predecessors))}
@@ -829,6 +831,30 @@ def _project_seat_lineage(rows: list[dict], cards: dict, locations: dict,
         elif index + 1 < len(output) and output[index + 1]["harness"] == item["harness"]:
             item["relation"] = "chronological"
     return output
+
+
+def tidy_lineage_edge(row: dict) -> Optional[tuple[str, str, str]]:
+    """Normalize the only ledger rows that establish a same-harness lineage edge."""
+    if not isinstance(row, Mapping):
+        return None
+    event, source_kind = row.get("event"), row.get("source")
+    if event == "succession":
+        if source_kind != "tidy-clear":
+            return None
+    elif event == "handover":
+        if not isinstance(source_kind, str) or source_kind not in {"clear", "reservation", "first-message"}:
+            return None
+    else:
+        return None
+    harness, target = row.get("harness"), row.get("sid")
+    origin = row.get("from")
+    if isinstance(origin, dict):
+        if origin.get("harness") != harness:
+            return None
+        origin = origin.get("sid")
+    if not all(isinstance(value, str) and value for value in (harness, origin, target)):
+        return None
+    return harness, origin, target
 
 
 def _lineage_card_status(path: Path) -> str:
@@ -877,15 +903,31 @@ def _lineage_transcript(harness: str, sid: str, hint: str) -> dict:
 
 
 def seat_lineage(seat: Seat, *, harness=None, sid=None) -> list[dict]:
-    """Read the seat's bounded existing lineage without updating any state."""
-    rows = _read_ledger_lines(seat)
-    sessions = session_summary(seat)
+    """Read bounded session cards and the shared normalized lineage across all ledgers."""
+    directory = state_root() / "sessions"
+    ledger_seats = {seat.key: seat}
+    try:
+        for path in sorted(directory.glob("*.jsonl")):
+            if path.is_file() and not path.is_symlink():
+                ledger_seats.setdefault(path.stem, Seat("pane", path.stem))
+    except OSError:
+        pass
+    rows, sessions, session_seats = [], {}, {}
+    for ledger_seat in ledger_seats.values():
+        ledger_rows = _read_ledger_lines(ledger_seat)
+        rows.extend(ledger_rows)
+        for session_key, summary in session_summary(ledger_seat).items():
+            current = sessions.get(session_key)
+            if current is None or float(summary.get("last_seen", 0) or 0) >= float(
+                    current.get("last_seen", 0) or 0):
+                sessions[session_key] = summary
+                session_seats[session_key] = ledger_seat
     cards, locations = {}, {}
     for key, summary in sessions.items():
         name, session = key
         if harness and name != harness:
             continue
-        author_seat = dataclasses.replace(seat, harness=name, sid=session)
+        author_seat = dataclasses.replace(session_seats.get(key, seat), harness=name, sid=session)
         current_path = card_json_path(author_seat)
         history_path = state_root() / "card-history" / card_key(author_seat)
         found = []
@@ -924,7 +966,13 @@ def seat_lineage(seat: Seat, *, harness=None, sid=None) -> list[dict]:
             cards[key] = ([{"generation": max(generations), "path": None, "status": "expired"}]
                           if generations else [])
         locations[key] = _lineage_transcript(name, session, str(summary.get("transcript") or ""))
-    return _project_seat_lineage(rows, cards, locations, harness=harness, sid=sid)
+    graph = None
+    try:
+        import dispatch_seat_handover
+        graph = dispatch_seat_handover.lineage_graph()
+    except Exception:  # noqa: BLE001 - card remains a read-only best-effort projection
+        pass
+    return _project_seat_lineage(rows, cards, locations, harness=harness, sid=sid, graph=graph)
 
 
 def _confirmed_predecessor(lineage: list[dict], harness: str, sid: str) -> Optional[dict]:

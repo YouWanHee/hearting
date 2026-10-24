@@ -177,12 +177,19 @@ def _timestamp_note(record: dict) -> str:
             + "; receipt source=" + value("receive_source") + ". Missing legacy values stay unknown.")
 
 
+def _recipient_harness(recipient_kind: str) -> str | None:
+    for harness in ("claude", "codex", "opencode"):
+        if recipient_kind.startswith(harness):
+            return harness
+    return None
+
+
 def addressed_records(root: Path, recipient_kind: str, session_id: str) -> tuple[list[dict], int]:
     """Read the current session's open notices without claiming or consuming them."""
     from dispatch_seat_handover import record_for_session, storage_recipients
     records, count = [], 0
-    for storage_key, allowed in storage_recipients(
-            session_id, harness="codex" if recipient_kind.startswith("codex") else None):
+    harness = _recipient_harness(recipient_kind)
+    for storage_key, allowed in storage_recipients(session_id, harness=harness):
         try:
             directory = pending_delivery.record_directory(root, storage_key)
             entries = sorted(directory.glob("delivery-*.json"))
@@ -196,7 +203,9 @@ def addressed_records(root: Path, recipient_kind: str, session_id: str) -> tuple
                 continue
             if (record and record.get("recipient_kind") == recipient_kind
                     and record.get("state") in pending_delivery.OPEN_STATES
-                    and record_for_session(record, allowed)):
+                    and record_for_session(record, allowed, session=session_id,
+                                           harness=harness,
+                                           storage_key=storage_key)):
                 records.append({**record, STORAGE_KEY: storage_key})
     return records, count
 
@@ -655,7 +664,7 @@ def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
 
     # Open records are already enumerated above. Look up only marker-selected
     # terminal records so an ACKed member can validate the old complete batch.
-    harness = "codex" if recipient_kind.startswith("codex") else None
+    harness = _recipient_harness(recipient_kind)
     recipients = storage_recipients(session_id, harness=harness)
     for delivery_id in candidate_ids - by_id.keys():
         for root in roots:
@@ -664,7 +673,9 @@ def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
                     record = pending_delivery.read(root, storage, delivery_id)
                     if (record is None or record.get("state") != "acked"
                             or record.get("recipient_kind") != recipient_kind
-                            or not record_for_session(record, allowed)):
+                            or not record_for_session(record, allowed, session=session_id,
+                                                      harness=harness,
+                                                      storage_key=storage)):
                         continue
                     by_id.setdefault(delivery_id, []).append(
                         (root, {**record, STORAGE_KEY: storage}))

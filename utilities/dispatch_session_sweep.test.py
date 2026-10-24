@@ -630,6 +630,7 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         bound = frozenset({"att-0000000000000000000000000000bbbb"})
         with mock.patch.object(handover, "storage_recipients",
                                return_value=[("sess-owner", bound)]), \
+                mock.patch.object(handover, "record_recipient", return_value="sess-new"), \
                 mock.patch.object(PD.time, "time_ns", return_value=retry["next_attempt_at_ns"] - 1):
             handed, _ = SWEEP.sweep_deliver(
                 self.root, "claude-parent-runtime", "sess-new")
@@ -715,6 +716,38 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(SWEEP.ack_delivered(self.root, "sess-owner", claimed, acked_by="test"), 1)
         self.assertEqual(SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-owner")[0], [])
 
+    def test_succession_only_notice_is_delivered_and_acked_under_its_original_key(self):
+        import dispatch_seat_handover as handover
+        import session_tidy as tidy
+        from session_notice import notify
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs = self.root / "jobs.log"
+        jobs.touch()
+        os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
+        seat = tidy.Seat("pane", "succession-only-seat", pane="w1:pSuccession", harness="claude")
+        ledger = tidy._ledger_path(seat)
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        tidy._append_ledger_entry(seat, {
+            "event": "succession", "source": "tidy-clear", "harness": "claude",
+            "from": {"harness": "claude", "sid": "sess-old"}, "sid": "sess-new", "ts": 1,
+        })
+        notice = notify("claude", "sess-old", key="succession-notice", subject="run finished",
+                        text="exit 0", jobs=jobs)
+        self.assertIsNotNone(notice)
+        with mock.patch.object(handover, "pane_seat", return_value=seat):
+            records, count = SWEEP.sweep_deliver(
+                self.root, "claude-parent-runtime", "sess-new")
+            self.assertEqual(count, 1)
+            self.assertEqual([record["delivery_id"] for record in records], [notice["delivery_id"]])
+            self.assertEqual(records[0][SWEEP.STORAGE_KEY], "sess-old")
+            self.assertEqual(SWEEP.ack_delivered(
+                self.root, "sess-new", records, acked_by="successor-consumed"), 1)
+            self.assertEqual(SWEEP.sweep_deliver(
+                self.root, "claude-parent-runtime", "sess-new")[0], [])
+        self.assertEqual(PD.read(self.root, "sess-old", notice["delivery_id"])["state"], "acked")
+        self.assertIsNone(PD.read(self.root, "sess-new", notice["delivery_id"]))
+
     def test_a_successor_at_the_same_pane_receives_the_stored_record_and_acks_it_under_the_old_key(self):
         # After a /clear the record stays stored (and acked) under the registered parent; the
         # handover binds only the attempts it names to the new session.
@@ -726,7 +759,11 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
                    row_revisions={"att-0000000000000000000000000000cccc": "beef"})
         bound = frozenset({"att-0000000000000000000000000000bbbb"})
         with mock.patch.object(handover, "storage_recipients",
-                               return_value=[("sess-new", None), ("sess-old", bound)]):
+                               return_value=[("sess-new", None), ("sess-old", bound)]), \
+                mock.patch.object(handover, "record_recipient",
+                                  side_effect=lambda record, _storage, **_kwargs:
+                                  "sess-new" if set(record.get("attempt_ids") or ()) <= bound
+                                  else "sess-old"):
             records, count = SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-new")
             self.assertEqual([r["delivery_id"] for r in records], ["delivery-" + "a" * 32])
             self.assertEqual(count, 2)                                  # both are seen; only the bound one is taken
@@ -809,24 +846,28 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
 
             addressed, count = SWEEP.addressed_records(self.root, "claude-parent-runtime", "sess-new")
             self.assertEqual(count, 4)
+            # An eligible, unbound depth-1 attempt follows the confirmed chain too;
+            # its record is still claimed and acked under its original storage SID.
             self.assertEqual({record["delivery_id"] for record in addressed}, {
-                "delivery-" + "a" * 32, "delivery-" + "b" * 32, "delivery-" + "c" * 32,
+                "delivery-" + "a" * 32, "delivery-" + "b" * 32,
+                "delivery-" + "c" * 32, "delivery-" + "d" * 32,
             })
             records, sweep_count = SWEEP.sweep_deliver(
                 self.root, "claude-parent-runtime", "sess-new")
             self.assertEqual(sweep_count, 4)
             self.assertEqual({record["delivery_id"] for record in records}, {
-                "delivery-" + "a" * 32, "delivery-" + "b" * 32, "delivery-" + "c" * 32,
+                "delivery-" + "a" * 32, "delivery-" + "b" * 32,
+                "delivery-" + "c" * 32, "delivery-" + "d" * 32,
             })
             self.assertEqual({record[SWEEP.STORAGE_KEY] for record in records}, {"sess-old"})
-            self.assertEqual(SWEEP.ack_delivered(self.root, "sess-new", records, acked_by="clear-12-test"), 3)
+            self.assertEqual(SWEEP.ack_delivered(self.root, "sess-new", records, acked_by="clear-12-test"), 4)
             self.assertEqual(SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-new")[0], [])
 
-        for suffix in "abc":
+        for suffix in "abcd":
             stored = PD.read(self.root, "sess-old", "delivery-" + suffix * 32)
             self.assertEqual(stored["state"], "acked")
             self.assertIsNone(PD.read(self.root, "sess-new", stored["delivery_id"]))
-        self.assertEqual(PD.read(self.root, "sess-old", "delivery-" + "d" * 32)["state"], "pending")
+        self.assertEqual(PD.read(self.root, "sess-old", "delivery-" + "d" * 32)["state"], "acked")
 
     def test_without_a_handover_another_session_still_receives_nothing(self):
         self._seed(session_id="sess-old")

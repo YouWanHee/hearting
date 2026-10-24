@@ -18,6 +18,7 @@ class PeerReadContext:
         self._handover_snapshots = None
         self._handover_ledgers = {}
         self._lineage_ledgers = None
+        self._lineage_graphs = {}
         self._recipient_censuses = {}
         self._transfer_roots = None
         self._peer_notice_records = None
@@ -95,3 +96,10 @@ class PeerReadContext:
         if self._lineage_ledgers is None:
             self._lineage_ledgers = loader()
         return self._lineage_ledgers
+
+    def lineage_graph(self, signature, loader):
+        """Reuse one immutable graph per sessions-directory generation in this pass."""
+        key = tuple(signature)
+        if key not in self._lineage_graphs:
+            self._lineage_graphs = {key: loader()}
+        return self._lineage_graphs[key]
