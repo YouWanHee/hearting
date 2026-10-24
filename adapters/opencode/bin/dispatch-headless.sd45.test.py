@@ -9,55 +9,9 @@ WH_S=importlib.util.spec_from_file_location("opencode_dispatch_headless",Path(__
 from dispatch_contract import ROUTE_IDENTITY_METADATA_KEYS
 
 
-class NestedRuntimeTest(unittest.TestCase):
-    def setUp(self):
-        # These cases assert the V1 private XDG layout. Keep them bound to
-        # that supported fixture even when the installed CLI is V2.
-        self.runtime = mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "1.19.0"},
-                                       clear=False)
-        self.runtime.start()
-        self.addCleanup(self.runtime.stop)
-
-    def test_attempt_state_is_writable_without_copying_auth_or_changing_config(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); worktree = root / "worktree"; worktree.mkdir()
-            source = root / "original-data" / "opencode"; source.mkdir(parents=True)
-            auth = source / "auth.json"; auth.write_text('{"fixture":{}}')
-            env = {"XDG_DATA_HOME": str(source.parent), "XDG_CONFIG_HOME": str(root / "user-config")}
-            user_config = Path(env["XDG_CONFIG_HOME"]) / "opencode"
-            user_config.mkdir(parents=True)
-            config_file = user_config / "opencode.json"
-            config_file.write_text('{"model":"fixture/light"}')
-            state_root = root / "dispatch-state"
-            state_root.mkdir()
-            values = WH.prepare_nested_runtime(worktree, "att-runtime-one", env, state_root)
-            self.assertEqual(env["XDG_DATA_HOME"], str(source.parent))
-            projected = Path(values["XDG_CONFIG_HOME"]) / "opencode" / "opencode.json"
-            self.assertTrue(projected.is_symlink())
-            self.assertEqual(projected.resolve(), config_file)
-            self.assertEqual(values['COMPUTE_HOSTS_CONFIG'], str(root / 'user-config/hearting/compute-hosts.yaml'))
-            for key, path in values.items():
-                if key == 'COMPUTE_HOSTS_CONFIG':
-                    continue
-                self.assertTrue(Path(path).is_relative_to(state_root))
-                self.assertEqual(Path(path).stat().st_mode & 0o777, 0o700)
-            link = Path(values["XDG_DATA_HOME"]) / "opencode" / "auth.json"
-            self.assertTrue(link.is_symlink())
-            self.assertEqual(link.resolve(), auth)
-            self.assertEqual(WH.prepare_nested_runtime(worktree, "att-runtime-one", env, state_root), values)
-            other = WH.prepare_nested_runtime(worktree, "att-runtime-two", env, state_root)
-            self.assertNotEqual(values, other)
-            self.assertEqual(auth.read_text(), '{"fixture":{}}')
-
-    def test_runtime_path_escape_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); worktree = root / "worktree"; worktree.mkdir()
-            outside = root / "outside"; outside.mkdir()
-            state_root = root / "dispatch-state"
-            state_root.mkdir()
-            (state_root / "opencode-runtime").symlink_to(outside, target_is_directory=True)
-            with self.assertRaisesRegex(WH.DispatchContractError, "outside-state-root"):
-                WH.prepare_nested_runtime(worktree, "att-runtime", {}, state_root)
+class OpenCodeGenerationBindingTest(unittest.TestCase):
+    def test_codex_specific_nested_runtime_preparation_is_removed(self):
+        self.assertFalse(hasattr(WH, "prepare_nested_runtime"))
 
 
 def isolated_dispatch_env(**updates):
@@ -539,6 +493,10 @@ class OpenCodePermissionDefault(unittest.TestCase):
 class ForegroundReviewStartPathTest(unittest.TestCase):
     def setUp(self):
         from fixtures.opencode_native_context import launch_context
+        launch_version = mock.patch.object(
+            WH.opencode_runtime, "probe_launch_version", return_value=(2, 0, 32))
+        launch_version.start()
+        self.addCleanup(launch_version.stop)
         native = mock.patch.object(WH.opencode_context, "prepare_launch_context", side_effect=launch_context)
         native.start()
         self.addCleanup(native.stop)

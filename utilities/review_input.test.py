@@ -406,6 +406,10 @@ class ReviewInputTest(unittest.TestCase):
                     'fallback_hop':'same-harness-headless','fallback_ordinal':1,'quick':False,
                     'terminal_attempt_limit':None,'replacement_attempt_limit':0,'replacement_notes':frozenset()}))
                 stack.enter_context(mock.patch.object(wrapper.shutil,'which',return_value='/bin/true'))
+                if harness == 'opencode':
+                    # Keep this input-fence test independent of an installed CLI.
+                    stack.enter_context(mock.patch.object(wrapper.opencode_runtime,
+                        'probe_launch_version',return_value=(1,19,0)))
                 stack.enter_context(mock.patch.object(wrapper,'shell_command',return_value='true'))
                 for name in ('check_runtime_projection','ensure_runtime_home_projection'):
                     if hasattr(wrapper,name):stack.enter_context(mock.patch.object(wrapper,name,return_value=0 if name=='check_runtime_projection' else None))
