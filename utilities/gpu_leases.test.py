@@ -4,7 +4,6 @@ import importlib.util
 import io
 import json
 import os
-import shutil
 import shlex
 from pathlib import Path
 import subprocess
@@ -690,28 +689,16 @@ class LeasesTest(unittest.TestCase):
             self.assertEqual(tool._run_gpu_observation("here", {})["suggested_gpu"], 1)
 
     def test_compute_cmd_run_auto_selects_and_refuses_busy_explicit_device_end_to_end(self):
-        tmux = shutil.which("tmux")
-        if tmux is None:
-            self.skipTest("tmux is not installed")
-        # Only skip when the platform cannot start an isolated disposable
-        # server. The launch itself exercises the supported shell transport,
-        # including tmux versions without new-session -e.
-        server = "hearting-cap-%s-%x" % (os.getpid(), abs(hash(self.id())))
-        probe = subprocess.run([tmux, "-L", server, "start-server"],
-                               capture_output=True, text=True, timeout=5)
-        try:
-            if probe.returncode:
-                reason = probe.stderr.strip() or probe.stdout.strip() or "disposable server unavailable"
-                self.skipTest("cannot start disposable tmux server: " + reason)
-        finally:
-            subprocess.run([tmux, "-L", server, "kill-server"],
-                           capture_output=True, timeout=5)
         spec = importlib.util.spec_from_file_location("_gpu_end_to_end_compute", Path(G.__file__).with_name("compute-hosts.py"))
         tool = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(tool)
-        launch_server = G.tmux_server_name(self.state)
-        self.addCleanup(subprocess.run, [tmux, "-L", launch_server, "kill-server"],
-                        capture_output=True, timeout=5)
+        tmux = next((Path(directory) / "tmux" for directory in os.get_exec_path()
+                     if (Path(directory) / "tmux").is_file()
+                     and os.access(Path(directory) / "tmux", os.X_OK)), None)
+        if tmux is not None:
+            launch_server = G.tmux_server_name(self.state)
+            self.addCleanup(subprocess.run, [str(tmux), "-L", launch_server, "kill-server"],
+                            capture_output=True, timeout=5)
         finish = self.root / "finish"
         code = ("import os,time; from pathlib import Path; print(os.environ['CUDA_VISIBLE_DEVICES'],flush=True); "
                 "end=time.monotonic()+10; p=Path(%r); "
@@ -720,9 +707,11 @@ class LeasesTest(unittest.TestCase):
                                cwd=None, env=None, gpus=None, share=False, dry_run=False, json=True)
         real_run = subprocess.run
         def local_remote(_host, script, **kwargs):
+            path = str(self.no_tmux_bin)
+            if tmux is not None:
+                path += os.pathsep + str(tmux.parent)
             return real_run(["bash", "-c", script], capture_output=True, text=True, timeout=10,
-                            env={**os.environ, "PATH": str(self.no_tmux_bin) + os.pathsep +
-                                 str(Path(tmux).parent)})
+                            env={**os.environ, "PATH": path})
         output, warning = io.StringIO(), io.StringIO()
         with mock.patch.object(tool, "load_config", return_value={"run_root": self.root / "managed-runs",
                          "hosts": {"fixture": {"ssh_host": "local"}}}), \
