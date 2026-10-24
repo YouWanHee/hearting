@@ -419,9 +419,13 @@ def reconcile(route, ledger, gates, jobs, module, *, compute_observations=None):
                 retry_armed['resource_registry'] = armed['resource_registry']
             if armed.get("predecessor_kind") != "resource":
                 raise ValueError('resource-watch-binding-mismatch')
-            planned[node_id] = prove(route, ledger, armed, failure, gates, jobs, module,
-                                     snapshots=snapshots,
-                                     compute_observations=compute_observations)
+            if compute_observations and node_id in compute_observations:
+                planned[node_id] = prove(route, ledger, armed, failure, gates, jobs, module,
+                                         snapshots=snapshots,
+                                         compute_observations=compute_observations)
+            else:
+                planned[node_id] = prove(route, ledger, armed, failure, gates, jobs, module,
+                                         snapshots=snapshots)
             retries[node_id] = retry_armed
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise UnresolvedResource(node_id, str(exc), retry_step(route, retry_armed, jobs, str(exc))) from exc

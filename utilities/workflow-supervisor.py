@@ -592,8 +592,11 @@ def cmd_arm(args):
         if args.predecessor_kind == "resource" and target.exists():
             prior = json.loads(target.read_text())
             if any(_comparable_armed(prior, record).get(k) != record.get(k) for k in record if k != "armed_at"):
-                replace_resource_predecessor(route, ledger, prior, record, resource,
-                    preobserved=prior_observation)
+                if prior_observation is not None:
+                    replace_resource_predecessor(route, ledger, prior, record, resource,
+                        preobserved=prior_observation)
+                else:
+                    replace_resource_predecessor(route, ledger, prior, record, resource)
             else:
                 print(json.dumps({"armed": args.node, "replayed": True,
                                   **output_receipt,
@@ -1520,8 +1523,14 @@ def admit_owner_successor_start(route, successor, jobs, owner_attempt_id, owner_
                     and (stage_evidence.get("owner_successor_start") is True
                          or stage_evidence.get("owner_terminal_settlement") is True)
                 )
-                if not owner_settled and reconcile_legacy_supervised_resource_success(
-                        route, ledger, armed, observed_evidence=(preobserved or (None, None))[1]):
+                captured_predecessor = preobserved.get(predecessor)
+                reconciled = (
+                    reconcile_legacy_supervised_resource_success(
+                        route, ledger, armed, observed_evidence=captured_predecessor[1])
+                    if captured_predecessor is not None else
+                    reconcile_legacy_supervised_resource_success(route, ledger, armed)
+                )
+                if not owner_settled and reconciled:
                     # The old marker is now history. The ordinary read-only
                     # marker gate below will refuse this start and the owner can
                     # continue the approved resource sequence on the same route.
@@ -1555,10 +1564,16 @@ def admit_owner_successor_start(route, successor, jobs, owner_attempt_id, owner_
                         _claim_owner_successors(route, ledger, armed, predecessor, stage_evidence)
                         admitted = True
                         continue
-                    if _admit_owner_resource_stage_locked(
+                    captured_predecessor = preobserved.get(predecessor)
+                    if captured_predecessor is not None:
+                        admitted_stage = _admit_owner_resource_stage_locked(
                             route, ledger, armed, predecessor, jobs, owner_attempt_id,
-                            owner_session_id, preobserved.get(predecessor),
-                    ):
+                            owner_session_id, captured_predecessor)
+                    else:
+                        admitted_stage = _admit_owner_resource_stage_locked(
+                            route, ledger, armed, predecessor, jobs, owner_attempt_id,
+                            owner_session_id)
+                    if admitted_stage:
                         admitted = True
             except INPUT.InputError as error:
                 raise SupervisorError("resource-owner-input-unavailable") from error
@@ -1639,7 +1654,7 @@ def _poll_once_locked(route, ledger, *, compute_observations=None):
             row = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))[
                 "runs"][armed["predecessor_id"]]
         except (OSError, ValueError, KeyError, TypeError):
-            return {"terminal": False, "reason": "resource-run-absent"}
+            return resource_evidence(armed)
         execution = row.get("execution") if isinstance(row, dict) else None
         if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
             return {"terminal": False, "reason": "compute-resource-binding-changed"}
@@ -1666,24 +1681,39 @@ def _poll_once_locked(route, ledger, *, compute_observations=None):
     results = []
     for node_id, armed in sorted(read_armed(ledger).items()):
         state = ledger.state()["nodes"].get(node_id, {}).get("state")
-        observed_evidence = evidence_for(armed) if armed.get("predecessor_kind") == "resource" else None
+        captured = compute_observations.get(node_id)
+        observed_evidence = (captured[1] if captured and captured[0] == armed else
+                             {"terminal": False, "reason": "compute-resource-binding-changed"}
+                             if captured else None)
         if (state == "STAGE_SUCCEEDED" and armed.get("predecessor_kind") == "resource"):
-            if reconcile_legacy_supervised_resource_success(
-                    route, ledger, armed, observed_evidence=observed_evidence):
+            reconciled = (
+                reconcile_legacy_supervised_resource_success(
+                    route, ledger, armed, observed_evidence=observed_evidence)
+                if observed_evidence is not None else
+                reconcile_legacy_supervised_resource_success(route, ledger, armed)
+            )
+            if reconciled:
                 state = ledger.state()["nodes"].get(node_id, {}).get("state")
         if state in ("STAGE_SUCCEEDED", "FAILED_TERMINAL", "CANCELLED"):
             results.append({"node": node_id, "action": "settled", "state": state})
             continue
         if state in {"FAILED_RETRYABLE", "READY", "RUNNING"}:
-            recovered = reopen_resource_output_failure(
-                route, ledger, armed, observed_evidence=observed_evidence)
+            recovered = (
+                reopen_resource_output_failure(
+                    route, ledger, armed, observed_evidence=observed_evidence)
+                if observed_evidence is not None else
+                reopen_resource_output_failure(route, ledger, armed)
+            )
             if state == "FAILED_RETRYABLE" and not recovered:
                 results.append({"node": node_id, "action": "halted", "state": state})
                 continue
         if armed["continuation_kind"] == "human-gate":
             results.append({"node": node_id, "action": "human-gate"})
             continue
-        _evaluate(route, ledger, armed, results, observed_evidence=observed_evidence)
+        if observed_evidence is not None:
+            _evaluate(route, ledger, armed, results, observed_evidence=observed_evidence)
+        else:
+            _evaluate(route, ledger, armed, results)
     return results
 
 

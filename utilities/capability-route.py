@@ -12642,6 +12642,8 @@ def main():
                         if attempt_id and not jobs:
                             jobs=inherited_jobs
                 if a.check:
+                    if a.output or review_claim or explicit_attempt_metadata or a.subsession_manifest:
+                        raise ValueError("owner-closure-check-requires-exact-jobs-attempt-and-no-overrides")
                     if node.get("kind") != "review-worker":
                         # Owner closure answers only a blocking review. This
                         # read-only question has no answer for a resource node.
@@ -12654,7 +12656,7 @@ def main():
                                 "candidate may be supplied with --compute-run <run-id>")
                         print(json.dumps(result, sort_keys=True))
                         return
-                    if not jobs or not attempt_id or a.output or review_claim or explicit_attempt_metadata or a.subsession_manifest:
+                    if not jobs or not attempt_id:
                         raise ValueError("owner-closure-check-requires-exact-jobs-attempt-and-no-overrides")
                     proof = owner_closure_plan(route, node, evidence, jobs, attempt_id)
                     print(json.dumps({"result": "ready", "read_only": True, "route_id": route["route_id"],

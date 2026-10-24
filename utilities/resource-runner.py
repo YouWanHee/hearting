@@ -267,8 +267,11 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             if reboot_evidence(previous):
                 settle(registry, previous['run_id'], previous, data=data)
         from route_authority import require_resource_predecessors
-        require_resource_predecessors([*matches, *history], placeholder,
-                                      observations=captured_compute)
+        if captured_compute:
+            require_resource_predecessors([*matches, *history], placeholder,
+                                          observations=captured_compute)
+        else:
+            require_resource_predecessors([*matches, *history], placeholder)
         data["runs"][args.run_id] = placeholder
         return True, placeholder
     with ledger.lock() if ledger else contextlib.nullcontext():
