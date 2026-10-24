@@ -611,6 +611,7 @@ class BatchObligationTest(unittest.TestCase):
         dependency.write_text("sealed", encoding="utf-8")
         registry_cache.clear_cache()
         context = obligations.OwnerSettlementReadContext()
+        context._dependency_watcher_fallback = True
         with mock.patch.object(obligations, "_owner_settlement_dependency_paths",
                                return_value=(dependency,)), \
              mock.patch("dispatch_terminal_commit.owner_completion_pending",
@@ -670,13 +671,19 @@ class BatchObligationTest(unittest.TestCase):
 
             passes = (settled_count + obligations._SETTLED_DEPENDENCY_CHECKS_PER_PASS - 1) // \
                      obligations._SETTLED_DEPENDENCY_CHECKS_PER_PASS
+            completed_passes = None
             for index in range(passes):
                 with self.jobs.open("a", encoding="utf-8") as stream:
                     stream.write(f"t\tdone\t/repo\t/wt\tchild\t"
                                  f"attempt_id=att-unrelated-{index}\n")
                 obligations._resume_owner_settlements(self.jobs, context=context)
+                if target_checks > 1:
+                    completed_passes = index + 1
+                    break
 
         self.assertEqual(passes, 2)
+        self.assertIsNotNone(completed_passes, "the invalidated owner reaches settlement")
+        self.assertLessEqual(completed_passes, passes)
         self.assertEqual(historical.count(target), 3,
                          "the changed owner is rechecked and sent to settlement")
         self.assertEqual(context.metrics()["dependency_invalidations"], 1)

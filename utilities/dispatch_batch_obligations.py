@@ -10,6 +10,7 @@ from collections import deque
 from pathlib import Path
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,14 @@ _ID_RE = re.compile(r"batch-[0-9a-f]{32}\Z")
 _MAX_BYTES = 128 * 1024
 _PENDING = {"observing", "delivery-pending", "unknown"}
 _SETTLED_DEPENDENCY_CHECKS_PER_PASS = 64
+_DEPENDENCY_WATCH_MASK = 0x00000002 | 0x00000004 | 0x00000008 | 0x00000040 | 0x00000080 \
+                         | 0x00000100 | 0x00000200 | 0x00000400 | 0x00000800
+_INOTIFY_EVENT_HEADER = struct.Struct("iIII")
+_IN_Q_OVERFLOW = 0x00004000
+_IN_WATCH_INVALID = 0x00008C00
+_LOCAL_WATCH_FILESYSTEMS = frozenset({
+    "btrfs", "ext2", "ext3", "ext4", "f2fs", "overlay", "tmpfs", "xfs", "zfs",
+})
 
 
 class BatchObligationError(ValueError):
@@ -655,6 +664,14 @@ class OwnerSettlementReadContext:
         self._pass_file_generations = {}
         self._dependency_queues = {}
         self._dependency_queued = set()
+        self._dependency_watch_fd = None
+        self._dependency_watch_add = None
+        self._dependency_watch_dirs = {}
+        self._dependency_watch_paths = {}
+        self._dependency_watch_keys = {}
+        self._dependency_watch_fs_support = {}
+        self._dependency_dirty_paths = set()
+        self._dependency_watcher_fallback = False
         self._metrics = {"historical_checks": 0, "settled_cache_hits": 0,
                          "dependency_checks": 0, "dependency_invalidations": 0}
 
@@ -664,14 +681,20 @@ class OwnerSettlementReadContext:
 
     @staticmethod
     def _current_generations(paths, cache=None):
-        from runtime_observation import file_generation
         generations = []
         for path in paths:
-            key = str(Path(path).absolute())
+            key = os.fspath(path)
+            if not os.path.isabs(key):
+                key = os.path.abspath(os.path.expanduser(key))
             if cache is not None and key in cache:
                 generation = cache[key]
             else:
-                generation = file_generation(path)
+                # stat follows symlinks and captures replacement or rewrites;
+                # resolving every dependency first adds two path walks per
+                # check without changing the observed file generation.
+                info = os.stat(key)
+                generation = (key, (info.st_dev, info.st_ino, info.st_size,
+                                    info.st_mtime_ns, info.st_ctime_ns))
                 if cache is not None:
                     cache[key] = generation
             generations.append(generation)
@@ -683,12 +706,141 @@ class OwnerSettlementReadContext:
             current = self._current_generations(paths, cache)
         except OSError:
             return False
-        self._metrics["dependency_checks"] += len({str(Path(path).absolute())
-                                                    for path in paths})
+        self._metrics["dependency_checks"] += len(paths)
         return current == generations
 
     def begin_dependency_pass(self):
         self._pass_file_generations.clear()
+
+    def _ensure_dependency_watcher(self):
+        if self._dependency_watcher_fallback:
+            return False
+        if self._dependency_watch_fd is not None:
+            return self._dependency_watch_fd >= 0
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+            init = libc.inotify_init1
+            init.argtypes = (ctypes.c_int,)
+            init.restype = ctypes.c_int
+            add = libc.inotify_add_watch
+            add.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32)
+            add.restype = ctypes.c_int
+            fd = init(os.O_NONBLOCK | os.O_CLOEXEC)
+            if fd < 0:
+                raise OSError(ctypes.get_errno(), "inotify-init-failed")
+            self._dependency_watch_fd = fd
+            self._dependency_watch_add = add
+            self._dependency_watch_libc = libc
+            return True
+        except (AttributeError, OSError, TypeError, ValueError):
+            self._dependency_watch_fd = -1
+            self._dependency_watcher_fallback = True
+            return False
+
+    def _dependency_watch_supported(self, directory):
+        supported = self._dependency_watch_fs_support.get(directory)
+        if supported is not None:
+            return supported
+        try:
+            path = os.path.realpath(directory)
+            best_mount = ""
+            filesystem = None
+            for line in Path("/proc/self/mountinfo").read_text(
+                    encoding="utf-8").splitlines():
+                fields = line.split()
+                separator = fields.index("-")
+                mount = (fields[4].replace(r"\040", " ").replace(r"\011", "\t")
+                         .replace(r"\012", "\n").replace(r"\134", "\\"))
+                if ((path == mount or path.startswith(mount.rstrip(os.sep) + os.sep))
+                        and len(mount) >= len(best_mount)):
+                    best_mount = mount
+                    filesystem = fields[separator + 1]
+            supported = filesystem in _LOCAL_WATCH_FILESYSTEMS
+        except (OSError, ValueError, IndexError):
+            supported = False
+        self._dependency_watch_fs_support[directory] = supported
+        return supported
+
+    def _register_dependency_watch(self, key, paths):
+        if not self._ensure_dependency_watcher():
+            return
+        watched = set()
+        for path in paths:
+            targets = (path, os.path.realpath(path))
+            for target in targets:
+                directory, name = os.path.split(target)
+                directory = directory or "."
+                if not self._dependency_watch_supported(directory):
+                    self._dependency_watcher_fallback = True
+                    return
+                wd = self._dependency_watch_dirs.get(directory)
+                if wd is None:
+                    wd = self._dependency_watch_add(
+                        self._dependency_watch_fd, os.fsencode(directory),
+                        _DEPENDENCY_WATCH_MASK)
+                    if wd < 0:
+                        self._dependency_watcher_fallback = True
+                        self._dependency_watch_keys[key] = tuple(watched)
+                        self._forget_dependency_watch(key)
+                        return
+                    self._dependency_watch_dirs[directory] = wd
+                pair = (wd, name)
+                self._dependency_watch_paths.setdefault(pair, set()).add(key)
+                watched.add(pair)
+        self._dependency_watch_keys[key] = tuple(watched)
+
+    def _forget_dependency_watch(self, key):
+        for pair in self._dependency_watch_keys.pop(key, ()):
+            owners = self._dependency_watch_paths.get(pair)
+            if owners is not None:
+                owners.discard(key)
+                if not owners:
+                    self._dependency_watch_paths.pop(pair, None)
+                    self._dependency_dirty_paths.discard(pair)
+
+    def _poll_dependency_events(self):
+        fd = self._dependency_watch_fd
+        if fd is None or fd < 0 or self._dependency_watcher_fallback:
+            return
+        event_header = _INOTIFY_EVENT_HEADER
+        while True:
+            try:
+                events = os.read(fd, 65536)
+            except BlockingIOError:
+                break
+            except OSError:
+                self._dependency_watcher_fallback = True
+                break
+            if not events:
+                break
+            offset = 0
+            while offset + event_header.size <= len(events):
+                wd, mask, _cookie, name_length = event_header.unpack_from(events, offset)
+                offset += event_header.size
+                name = os.fsdecode(events[offset:offset + name_length].split(b"\0", 1)[0])
+                offset += name_length
+                if mask & _IN_Q_OVERFLOW:
+                    self._dependency_watcher_fallback = True
+                    break
+                if mask & _IN_WATCH_INVALID:
+                    self._dependency_watcher_fallback = True
+                    break
+                if not name:
+                    continue
+                pair = (wd, name)
+                if pair in self._dependency_watch_paths:
+                    self._dependency_dirty_paths.add(pair)
+            if self._dependency_watcher_fallback:
+                break
+
+    def __del__(self):
+        fd = getattr(self, "_dependency_watch_fd", None)
+        if isinstance(fd, int) and fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def settled_owner_current(self, jobs: Path, status: str, raw: str, metadata: dict,
                               related_rows) -> bool:
@@ -710,7 +862,9 @@ class OwnerSettlementReadContext:
     def remember_settled_owner(self, jobs: Path, status: str, raw: str,
                                metadata: dict, related_rows, dependencies) -> bool:
         key = (str(jobs.resolve(strict=False)), metadata.get("attempt_id", ""))
-        paths = tuple(dependencies)
+        paths = tuple(dict.fromkeys(
+            os.path.abspath(os.path.expanduser(os.fspath(path)))
+            for path in dependencies))
         try:
             generations = self._current_generations(paths, self._pass_file_generations)
         except OSError:
@@ -719,6 +873,7 @@ class OwnerSettlementReadContext:
         aliases = tuple(sorted({metadata.get(field, "") for field in
             ("route_id", "route_hash", "owner_route_id", "owner_route_hash") if metadata.get(field)}))
         self.forget_owner(jobs, metadata.get("attempt_id", ""))
+        self._register_dependency_watch(key, paths)
         self._settled[key] = ((status, raw), self._fingerprint_rows(related_rows),
                               paths, generations, aliases)
         self._queue_settled_dependency_check(key)
@@ -737,12 +892,18 @@ class OwnerSettlementReadContext:
 
     def _validate_settled_dependency_batch(self, jobs: Path) -> bool:
         """Rotate a fixed-size dependency check batch through settled owners."""
+        self._poll_dependency_events()
         root = str(jobs.resolve(strict=False))
         queue = self._dependency_queues.get(root)
         if not queue:
             return any(item_root == root for item_root, _attempt in self._invalidated_owners)
+        if not self._dependency_watcher_fallback and not self._dependency_dirty_paths:
+            queue.rotate(-min(_SETTLED_DEPENDENCY_CHECKS_PER_PASS, len(queue)))
+            return bool(queue)
+        self.begin_dependency_pass()
         examined = 0
         invalidated = False
+        generations = self._pass_file_generations
         while queue and examined < _SETTLED_DEPENDENCY_CHECKS_PER_PASS:
             key = queue.popleft()
             self._dependency_queued.discard(key)
@@ -750,7 +911,34 @@ class OwnerSettlementReadContext:
             entry = self._settled.get(key)
             if entry is None:
                 continue
-            if not self._dependencies_current(entry):
+            if not self._dependency_watcher_fallback:
+                dirty = any(pair in self._dependency_dirty_paths
+                            for pair in self._dependency_watch_keys.get(key, ()))
+                if dirty:
+                    self._metrics["dependency_invalidations"] += 1
+                    self._invalidated_owners.add(key)
+                    self.forget_owner(jobs, key[1])
+                    invalidated = True
+                    continue
+                self._queue_settled_dependency_check(key)
+                continue
+            paths, expected = entry[2], entry[3]
+            current = []
+            try:
+                for path, expected_generation in zip(paths, expected):
+                    generation = generations.get(path)
+                    if generation is None:
+                        info = os.stat(path)
+                        generation = (path, (info.st_dev, info.st_ino, info.st_size,
+                                             info.st_mtime_ns, info.st_ctime_ns))
+                        generations[path] = generation
+                    current.append(generation)
+                    if generation != expected_generation:
+                        break
+            except OSError:
+                current = []
+            self._metrics["dependency_checks"] += len(current)
+            if tuple(current) != expected:
                 self._metrics["dependency_invalidations"] += 1
                 self._invalidated_owners.add(key)
                 self.forget_owner(jobs, key[1])
@@ -762,7 +950,16 @@ class OwnerSettlementReadContext:
     def forget_owner(self, jobs: Path, attempt_id: str):
         key = (str(jobs.resolve(strict=False)), attempt_id)
         entry = self._settled.pop(key, None)
+        self._forget_dependency_watch(key)
         if entry is not None:
+            if key in self._dependency_queued:
+                queue = self._dependency_queues.get(key[0])
+                if queue is not None:
+                    try:
+                        queue.remove(key)
+                    except ValueError:
+                        pass
+                self._dependency_queued.discard(key)
             for alias in entry[4]:
                 owners = self._route_owners.get((key[0], alias))
                 if owners is not None:
