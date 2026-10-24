@@ -389,7 +389,7 @@ test -x "$ROOT/tools/figure-semantic-verify.py"
 test -f "$ROOT/tools/figure-semantic-manifest.schema.json"
 test -L "$ROOT/adapters/claude/tools/figure-semantic-verify.py"
 grep -Fq '### Step 4c: Report figure semantic gate' "$ROOT/capabilities/autopilot-draft/references/pipeline-steps.md"
-grep -Fq 'PNG existence, dimensions, count, and links alone are not a pass' "$ROOT/skills/code-test/SKILL.md"
+grep -Fq 'PNG existence, dimensions, count, and links alone are not a pass' "$ROOT/capabilities/code-test/references/procedure.md"
 cmp -s "$ROOT/adapters/codex/skills/analyze-project/SKILL.md" \
   "$ROOT/adapters/codex/plugins/hearting-codex/skills/analyze-project/SKILL.md"
 cmp -s "$ROOT/adapters/claude/skills/code-test/SKILL.md" \
