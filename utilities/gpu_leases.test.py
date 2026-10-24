@@ -35,6 +35,11 @@ class LeasesTest(unittest.TestCase):
                              ("id", "/usr/bin/id"), ("sh", "/bin/sh"),
                              ("tr", "/usr/bin/tr"), ("env", "/usr/bin/env")):
             (self.no_tmux_bin / name).symlink_to(target)
+        tmux = next((Path(directory) / "tmux" for directory in os.get_exec_path()
+                     if (Path(directory) / "tmux").is_file()
+                     and os.access(Path(directory) / "tmux", os.X_OK)), None)
+        if tmux is not None:
+            (self.no_tmux_bin / "tmux").symlink_to(tmux)
 
     def acquire(self, **kwargs):
         return G.acquire(self.state, OBS, **kwargs)
@@ -692,9 +697,9 @@ class LeasesTest(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("_gpu_end_to_end_compute", Path(G.__file__).with_name("compute-hosts.py"))
         tool = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(tool)
-        tmux = next((Path(directory) / "tmux" for directory in os.get_exec_path()
-                     if (Path(directory) / "tmux").is_file()
-                     and os.access(Path(directory) / "tmux", os.X_OK)), None)
+        tmux = self.no_tmux_bin / "tmux"
+        if not tmux.is_file():
+            tmux = None
         if tmux is not None:
             launch_server = G.tmux_server_name(self.state)
             self.addCleanup(subprocess.run, [str(tmux), "-L", launch_server, "kill-server"],
@@ -707,11 +712,8 @@ class LeasesTest(unittest.TestCase):
                                cwd=None, env=None, gpus=None, share=False, dry_run=False, json=True)
         real_run = subprocess.run
         def local_remote(_host, script, **kwargs):
-            path = str(self.no_tmux_bin)
-            if tmux is not None:
-                path += os.pathsep + str(tmux.parent)
             return real_run(["bash", "-c", script], capture_output=True, text=True, timeout=10,
-                            env={**os.environ, "PATH": path})
+                            env={**os.environ, "PATH": str(self.no_tmux_bin)})
         output, warning = io.StringIO(), io.StringIO()
         with mock.patch.object(tool, "load_config", return_value={"run_root": self.root / "managed-runs",
                          "hosts": {"fixture": {"ssh_host": "local"}}}), \
