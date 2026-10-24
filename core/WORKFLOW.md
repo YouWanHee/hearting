@@ -477,7 +477,8 @@ default drift verdict, the spec-read gate (it refuses with
 it unchanged, unless the caller named what was read; the governing candidates
 come from `artifact_cutover.prd_candidates`, so a shared revision supersedes a
 legacy copy and only adds one `[경로]` card line with its path. A checkout PRD
-outside the artifact root is informational and is not a marker-gate input), and both
+outside the artifact root is informational and is not a marker-gate input;
+absence evidence distinguishes that checkout file from a governing PRD), and both
 eligibility probes (`dispatch-readiness`). The result is sealed, verified,
 bound, and guarded exactly like a recipe route: `selection.route_origin`
 records `compose` or `preset`, `selection.shape` records the shape, a staged

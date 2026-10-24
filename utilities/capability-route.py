@@ -3574,6 +3574,8 @@ def compose_spec_read(cwd, artifact_root, explicit):
         return {"satisfied": True, "source": SPEC_READ_MARKER_PREFIX + ",".join(sorted(set(present)))}
     if shared:
         return {"satisfied": True, "source": SPEC_READ_SHARED_PREFIX + ",".join(sorted(set(shared)))}
+    if (Path(cwd) / "spec" / "prd.md").is_file():
+        return {"satisfied": True, "source": "compose-auto: no governing artifact-root PRD; checkout spec/prd.md is informational"}
     return {"satisfied": True, "source": "compose-auto: no spec/prd.md under cwd or artifact root"}
 
 

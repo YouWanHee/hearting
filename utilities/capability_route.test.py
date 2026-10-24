@@ -10732,13 +10732,16 @@ class SpecReadCandidateAlignmentTest(unittest.TestCase):
    checkout=Path(tmp)/"repo"
    (checkout/"spec").mkdir(parents=True)
    (checkout/"spec"/"prd.md").write_text("# checkout\n",encoding="utf-8")
-   self.assertEqual(self.auto_read(checkout,root)["source"],
-                    "compose-auto: no spec/prd.md under cwd or artifact root")
    linked=Path(tmp)/"linked-checkout"
    (linked/"spec").mkdir(parents=True)
    (linked/"spec"/"prd.md").write_text("# linked checkout\n",encoding="utf-8")
-   self.assertEqual(self.auto_read(linked,root)["source"],
-                    "compose-auto: no spec/prd.md under cwd or artifact root")
+   for cwd in (checkout,linked):
+    with self.subTest(cwd=cwd.name):
+     self.assertTrue((cwd/"spec"/"prd.md").is_file())
+     result=self.auto_read(cwd,root)
+     self.assertTrue(result["satisfied"],result)
+     self.assertEqual(result["source"],
+                      "compose-auto: no governing artifact-root PRD; checkout spec/prd.md is informational")
 
  def test_legacy_only_spec_keeps_session_and_mtime_guard(self):
   with tempfile.TemporaryDirectory() as tmp:
