@@ -808,6 +808,18 @@ def _allocation_fields(policy):
     return fields
 
 
+def _read_tidy_points():
+    """Read the context alert thresholds; unavailable or malformed source stays unknown."""
+    try:
+        points = utility("context_alert").THRESHOLDS
+    except (ImportError, AttributeError, OSError):
+        return None
+    if not isinstance(points, (tuple, list)) or len(points) != 2 or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in points):
+        return None
+    return tuple(points)
+
+
 def read_model_config():
     """MODELS view data from the harnesses' models.conf and the dispatch defaults (read once, cached)."""
     import importlib.util
@@ -876,7 +888,7 @@ def read_model_config():
             "profile_map": profile_map, "model_choices": choices, "main_only": main_only,
             "efforts": list(_EFFORTS), "pools": pools, "effort_keys": dict(_EFFORT_KEYS), "shown": shown,
             "context": context, "context_source": dict(_CONTEXT_SOURCE), "catalog_sources": catalog_sources,
-            "tidy": None,
+            "tidy": _read_tidy_points(),
             "token_units": dict(_TOKEN_UNITS), "allocation": allocation}
 
 

@@ -1,8 +1,27 @@
 """Read-only COMPUTE, MEMORY, and SYSTEM projections for Fleet explorer."""
+import re
 from collections.abc import Mapping
 
-from .grid import CellGrid, put_fit
+from .grid import CellGrid
 from .grid import clip_cells as clip
+
+
+_DIGEST = re.compile(r"[0-9a-f]{12,}")
+
+
+def short_cmd(command):
+    """The script first, paths cut to their names, digest arguments dropped, short options kept;
+    a command with no script keeps its program."""
+    parts = [part.rstrip("/").rsplit("/", 1)[-1] if "/" in part else part for part in command.split()]
+    first = next((index for index, part in enumerate(parts) if part.endswith(".py")), 0)
+    shown = []
+    for part in parts[first:]:
+        if _DIGEST.fullmatch(part.split("=")[-1]):
+            if shown and shown[-1].startswith("-") and "=" not in part:
+                shown.pop()
+            continue
+        shown.append(part)
+    return " ".join(shown)
 
 
 def _table_head(grid, x, width, y, columns):
@@ -92,12 +111,7 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
                 sid = str(process.get("session_id") or process.get("session") or "")
                 cwd = str(process.get("cwd") or "")
                 repo = cwd.rstrip("/").rsplit("/", 1)[-1] if cwd else "·"
-                command = str(process.get("command") or "·")
-                tokens = command.split()
-                if len(tokens) > 1 and tokens[0].rsplit("/", 1)[-1] in (
-                        "python", "python3", "node", "bash", "sh"):
-                    command = " ".join(tokens[1:])
-                command = command.split(" --", 1)[0].rsplit("/", 1)[-1] or "·"
+                command = short_cmd(str(process.get("command") or "")) or "·"
                 age = str(process.get("age") or process.get("time") or "")
                 vram = str(process.get("vram") or "·")
                 tail = vram.rjust(8) + (("  " + age.rjust(6)) if grid.cols - x - 2 >= 120 else "")
@@ -209,7 +223,9 @@ def draw_system(grid: CellGrid, vm, state=None, x=34, y=3):
         nonlocal y
         for label, parts in values:
             cursor = grid.put(x + 3, y, label, "label")
-            put_fit(grid, x + 3 + lab_width, y, parts, limit=grid.cols - 1)
+            cursor = x + 3 + lab_width
+            for text, key in parts:               # a field line runs to the pane edge and is cut there
+                cursor = grid.put(cursor, y, text, key, limit=grid.cols - 1)
             y += 1
     section("hearting", "install")
     y += 1

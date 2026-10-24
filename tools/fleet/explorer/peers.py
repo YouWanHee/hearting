@@ -76,13 +76,13 @@ def _draw_card(grid, session, tag, bx, by, box_w, right, border, extra, owners):
     put(xx, by, " ", "branch_s")
     put(bx + 2, by + 1, _clip(str(session.get("title") or "·"), box_w - 4), "hb_" + harness)
     context = session.get("context")
-    gauge_width = max(1, int(round(8 * float(session.get("window") or 1.0))))
-    percent = float(context or 0)
-    filled = (0 if percent <= 0 else gauge_width if percent >= 100
-              else max(1, min(gauge_width - 1, int(percent * gauge_width / 100 + .5))))
-    put(bx + 2, by + 2, "━" * filled, _percent_key(percent))
-    put(bx + 2 + filled, by + 2, "─" * (gauge_width - filled), "dim")
-    if context is not None:
+    if context is not None:                      # an unknown context draws nothing, as OVERVIEW does
+        gauge_width = max(1, int(round(8 * float(session.get("window") or 1.0))))
+        percent = float(context)
+        filled = (0 if percent <= 0 else gauge_width if percent >= 100
+                  else max(1, min(gauge_width - 1, int(percent * gauge_width / 100 + .5))))
+        put(bx + 2, by + 2, "━" * filled, _percent_key(percent))
+        put(bx + 2 + filled, by + 2, "─" * (gauge_width - filled), "dim")
         put(bx + 11, by + 2, f"{int(context):3d}%", _percent_key(percent) if percent >= 50 else "dim")
     yy = by + 3
     for text, key in extra:

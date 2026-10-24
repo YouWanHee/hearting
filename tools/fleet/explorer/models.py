@@ -78,7 +78,7 @@ def _draw_context(grid, data, state, x, y, width):
     units = _dict(data.get("token_units"))
     context = _dict(data.get("context"))
     source = _dict(data.get("context_source"))
-    tidy = tuple(data.get("tidy") or (None, None))
+    tidy = tuple(data.get("tidy") or (500000, 700000))        # the configured points when the view carries none
     chosen1 = state.fold_map().get("ui:tidy1")
     chosen2 = state.fold_map().get("ui:tidy2")
     t1 = units.get(chosen1, tidy[0] if tidy else None)
@@ -211,12 +211,14 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
         y += 1
     main_only = data.get("main_only")
     if isinstance(main_only, Mapping):
-        main_items = tuple(sorted(main_only.items(), key=lambda item: str(item[0])))
+        pairs = tuple(sorted(main_only.items(), key=lambda item: str(item[0])))
     elif isinstance(main_only, (list, tuple)):
-        main_items = tuple((item.get("harness", "·"), item.get("model", "·"))
-                           if isinstance(item, Mapping) else ("·", item) for item in main_only)
+        pairs = tuple((item.get("harness", "·"), item.get("model", "·"))
+                      if isinstance(item, Mapping) else ("·", item) for item in main_only)
     else:
-        main_items = ()
+        pairs = ()
+    main_items = tuple((harness_name, model_id) for harness_name, models in pairs         # one entry per model
+                       for model_id in ((models,) if isinstance(models, str) else tuple(models or ())))
     if main_items:
         label = "main session only, never dispatched:"
         grid.put(x + 3, y, label, "dim", limit=right + 1)

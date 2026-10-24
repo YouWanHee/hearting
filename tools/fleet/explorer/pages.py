@@ -114,9 +114,9 @@ def _session_page(grid, vm, tag, x, right, bottom, state=None):
                   ("  %d%%" % pct, gauge_key if pct >= 50 else "dim")]
     parts += [("      generation ", "label"),
               (str(generation) if generation else "·", "soft" if generation else "dim")]
-    if generation and session.get("last_clear"):
-        parts.append((" · last clear " + str(session["last_clear"]), "dim"))
-    _segs(grid, x + 16, y, parts, right)
+    if any(str(item[0]) == tag for item in vm.seats or ()) or (generation and session.get("last_clear")):
+        parts.append((" · last clear " + str(session.get("last_clear") or "·"), "dim"))
+    _segs(grid, x + 16, y, parts, grid.cols)                # a field line runs to the screen edge and is cut there
     y += 1
     now = session.get("now")
     grid.put(x + 3, y, "now:", "label", limit=right)

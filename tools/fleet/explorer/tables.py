@@ -27,6 +27,15 @@ def repo_rule_label(value, limit=None):
     return _clip(text, limit) if limit else text
 
 
+def gauge_cells(cells, pct):
+    """Filled cells of a ``cells``-wide gauge: none at 0, all at 100, otherwise at least one and never all."""
+    if pct <= 0:
+        return 0
+    if pct >= 100:
+        return cells
+    return max(1, min(cells - 1, int(pct * cells / 100 + 0.5)))
+
+
 def _cell(value, missing="·"):
     return missing if value is None or value == "" else str(value)
 
@@ -125,7 +134,7 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
             context = session.get("context")
             if not c["narrow"] and context is not None:
                 gauge_width = max(1, round(8 * float(session.get("window") or 1)))
-                filled = round(gauge_width * max(0, min(100, int(context))) / 100)
+                filled = gauge_cells(gauge_width, int(context))
                 gauge_key = ("g_blocked" if int(context) >= 80 else
                              "g_idle" if int(context) >= 50 else "done")
                 grid.put(x + c["ctx"], y, "━" * filled, gauge_key)
@@ -169,7 +178,7 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
     from .chrome import count_word
     summary = (f"{count_word(sessions_total, 'session')} · {working_sessions} working · "
                f"{questions} needs answer · {count_word(sum(1 for repo in repos if repo_label(repo.get('name', '·'))), 'project')}")
-    grid.put(x + 1, y, _clip(summary, max(0, right - x - 2)), "dim", limit=right)
+    grid.put(x + 1, y, summary, "dim")                # the summary runs to the screen edge and is cut there
     y += 2
     route_rows = [route for route in vm.routes if route.get("session_tag")]
     open_routes = sum(1 for route in route_rows if route.get("state") != "done")
@@ -303,13 +312,9 @@ def _harness_mix(routes):
         owner = str(route.get("harness") or "")
         if owner in counts:
             counts[owner] += 1
-        worker = route.get("worker") or ()
-        ended = len(worker) > 2 and any("ended" in str(part[0]) for part in worker[2])
-        if len(worker) > 1 and not ended:
-            for text, key in worker[1]:
-                if str(key).startswith("hb_") and str(text) in counts:
-                    counts[str(text)] += 1
-                    break
+        subworker = route.get("subworker")        # only the depth-2 workers the tree draws
+        if subworker and len(subworker) > 1 and str(subworker[1]) in counts:
+            counts[str(subworker[1])] += 1
     return [(" owner·worker ", "dim"),
             ("claude", "hb_claude" if counts["claude"] else "dim"),
             (f" {counts['claude']}", "soft" if counts["claude"] else "dim"), (" · ", "dim"),
@@ -480,6 +485,12 @@ def _leg_items(legs):
     return result
 
 
+def _stage_hue(route, step):
+    """The stage hue of a worker step: its index in the route's stages (five hues), green when it is not one of them."""
+    names = [stage.get("n") or stage.get("name") for stage in route.get("stages") or ()]
+    return "lcgym"[names.index(step) % 5] if step in names else "g"
+
+
 def _stage_items(stages):
     bright_hues = ("hb_opencode", "hb_claude", "grp_live", "g_idle", "hb_codex")
     dim_hues = ("version_release", "h_claude", "g_work_off", "lvl_y_dim", "h_codex")
@@ -487,7 +498,7 @@ def _stage_items(stages):
     for index, stage in enumerate(stages):
         status = stage.get("st")
         if status == "active":
-            name_key = {2: "g_work", 3: "stg3_on", 4: "eff_xhigh"}.get(index % len(bright_hues), "unknown")
+            name_key = {0: "hb_opencode", 1: "hb_claude", 2: "g_work", 3: "stg3_on", 4: "eff_xhigh"}[index % len(bright_hues)]
         elif status == "failed":
             name_key = bright_hues[index % len(bright_hues)]
         else:
@@ -655,7 +666,7 @@ def draw_routes(grid, vm, state, x=34, y=3):
                     tokens, window = context
                     pct = round(100 * tokens / max(1, window))
                     gauge_width = max(1, round(8 * window / 1_000_000))
-                    filled = round(gauge_width * pct / 100)
+                    filled = gauge_cells(gauge_width, pct)
                     grid.put(x + cols["ctx"], y, "━" * filled, "g_blocked" if pct >= 80 else "g_idle" if pct >= 50 else "done")
                     grid.put(x + cols["ctx"] + filled, y, "─" * (gauge_width - filled), "dim")
                     percent_key = "g_blocked" if pct >= 80 else "g_idle" if pct >= 50 else "dim"
@@ -681,8 +692,9 @@ def draw_routes(grid, vm, state, x=34, y=3):
             worker_running = route.get("activity") == "running" and any(
                 "running" in str(text) for text, _style in (worker[2] if len(worker) > 2 else ()))
             worker_stage = str(route.get("worker_stage") or "·")
+            hue = _stage_hue(route, worker_stage)
             stage_key = (route.get("worker_step_key") if worker_running else
-                         route.get("worker_stage_key")) or "g_work_off"
+                         route.get("worker_stage_key")) or ((hue, 0, 0) if worker_running else (hue, 0, 1))
             if not worker_running and isinstance(stage_key, (tuple, list)) and len(stage_key) == 3:
                 stage_key = (stage_key[0], 0, 1)
             stage_room = max(0, cols["own"] - GAP - cols["kind"])
@@ -694,7 +706,7 @@ def draw_routes(grid, vm, state, x=34, y=3):
                 harness = next((str(text) for text, style in segments
                                 if isinstance(style, str) and style.startswith("hb_")), "·")
                 effort = next((str(text) for text, _style in segments
-                               if str(text) in ("low", "medium", "high", "xhigh")), "")
+                               if str(text) in ("low", "medium", "high", "xhigh", "max")), "")
                 effort_key = next((style for text, style in segments
                                    if str(text) == effort), "dim")
                 segments = ((harness, "hb_" + harness),) + (("·" + effort, effort_key),) if effort else ((harness, "hb_" + harness),)
@@ -711,8 +723,8 @@ def draw_routes(grid, vm, state, x=34, y=3):
                 cursor += sum(cell_width(char) for char in str(text))
             cursor = x + cols["prog"]
             for text, style in (worker[2] if len(worker) > 2 else ()):
-                if "running" in str(text) and route.get("worker_stage_key"):
-                    style = route["worker_stage_key"]
+                if "running" in str(text):
+                    style = route.get("worker_stage_key") or (hue, 1, 0)
                 grid.put(cursor, y, text, style, limit=x + use - (9 if link else 0))
                 from .grid import cell_width
                 cursor += sum(cell_width(char) for char in str(text))
@@ -818,11 +830,11 @@ def draw_questions(grid, vm, state, x=34, y=3):
     answered = tuple(vm.answered or ())
     grid.put(x, y, "── ", "line")
     cursor = grid.put(x + 3, y, "ANSWERED TODAY", "sect")
-    answered_count = sum(len(rows) for _, rows in answered)
+    answered_count = len(answered[0][1]) if answered else 0     # the first repo's own rows, as its name before it
     first_repo = repo_label(answered[0][0]) if answered else "·"
     total = (vm.system or {}).get("answered_total") if hasattr(vm.system, "get") else None
-    total_text = str(total) if total is not None else str(answered_count)
-    cursor = grid.put(cursor, y, f"  {first_repo + ' ' if first_repo else ''}{answered_count} · {total_text} decision records in all projects", "dim", limit=right)
+    total_text = str(total) if total is not None else str(sum(len(rows) for _, rows in answered))
+    cursor = grid.put(cursor, y, f"  {first_repo + ' ' if first_repo else ''}{answered_count} · {total_text} decision records in all projects", "dim", limit=grid.cols)
     grid.put(cursor, y, " ", "branch_s")
     for xx in range(cursor + 1, right):
         grid.put(xx, y, "─", "line")

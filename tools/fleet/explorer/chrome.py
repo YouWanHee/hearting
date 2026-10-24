@@ -1,6 +1,6 @@
 """Header, navigation rail, feed, key legend and status rows."""
 from collections.abc import Mapping
-from .grid import CellGrid
+from .grid import CellGrid, cell_width, clip_cells
 from .tables import repo_label
 
 NAV_WIDTH = 32
@@ -19,8 +19,6 @@ def _clip(text, width):
 def draw_chrome(grid: CellGrid, vm, state, beat=1):
     width, height = grid.cols, grid.rows
     hosts = tuple(vm.hosts or ())
-    x = 1
-    x = grid.put(x, 0, "hosts ", "label")
     census_x = width - 1
     census_parts = []
     census = vm.census or {}
@@ -46,21 +44,27 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
         census_parts.append(("  " + str(freshness), "dim"))
     census_width = sum(len(part[0]) for part in census_parts)
     census_x = max(1, width - 1 - census_width)
-    for index, host in enumerate(hosts):
+    parts = [("hosts ", "label")]
+    for host in hosts:
         if isinstance(host, Mapping):
             mark, name = host.get("mark", "◇"), host.get("name", "·")
             key = host.get("key", "base_host")
         else:
             mark, name, key = (tuple(host) + ("base_host",))[:3]
-        mark_key = "dim" if mark == "◇" else "work"
-        x = grid.put(x, 0, f"{mark} ", mark_key, limit=max(x, census_x - 2))
-        x = grid.put(x, 0, name, mark_key if mark != "◇" else "soft",
-                     limit=max(x, census_x - 2))
-        separator = " " if index == len(hosts) - 1 else "  "
-        x = grid.put(x, 0, separator, "dim" if len(separator) == 1 else "branch_s",
-                     limit=max(x, census_x - 2))
-    if hosts and x + 4 < census_x:
-        x = grid.put(x, 0, f"{len(hosts)}/{len(hosts)}", "dim", limit=census_x - 1)
+        parts += [(f"{mark} ", "dim" if mark == "◇" else "work"),
+                  (str(name), "soft" if mark == "◇" else "work"), ("  ", "branch_s")]
+    if hosts:
+        parts[-1] = (f" {len(hosts)}/{len(hosts)}", "dim")
+    if 1 + sum(len(text) for text, _key in parts) > census_x - 2 and hosts:
+        first = hosts[0]
+        mark, name = ((first.get("mark", "◇"), first.get("name", "·")) if isinstance(first, Mapping)
+                      else (tuple(first) + ("◇", "·"))[:2])
+        parts = [("hosts ", "label"), (f"{mark} ", "dim" if mark == "◇" else "work"),
+                 (str(name), "soft" if mark == "◇" else "work"),
+                 (f" +{len(hosts) - 1} · {len(hosts)}/{len(hosts)}", "dim")]
+    x = 1
+    for text, key in parts:
+        x = grid.put(x, 0, text, key, limit=census_x - 2)
     cx = max(x + 1, width - 1 - census_width)
     for text, key in census_parts:
         if cx >= width - 1:
@@ -90,10 +94,12 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
             if x + fragment_width >= width - 12:
                 continue
             x = grid.put(x, 1, str(text) + " ", key, limit=width - 12)
-            filled = max(1, min(10, round(10 * int(percent) / 100))) if int(percent) else 0
-            x = grid.put(x, 1, "━" * filled, "done", limit=width - 12)
+            percent = int(percent)
+            filled = max(1, min(10, round(10 * percent / 100))) if percent else 0
+            gauge_key = "lvl_r_flat" if percent >= 80 else "lvl_y" if percent >= 50 else "lvl_g"
+            x = grid.put(x, 1, "━" * filled, gauge_key, limit=width - 12)
             x = grid.put(x, 1, "─" * (10 - filled), "dim", limit=width - 12)
-            x = grid.put(x, 1, f" {int(percent):3d}%", "done", limit=width - 12)
+            x = grid.put(x, 1, f" {percent:3d}%", gauge_key, limit=width - 12)
             x = grid.put(x, 1, " ↻ " + str(reset), "dim", limit=width - 12)
             if extras:
                 x = grid.put(x, 1, "  ", "dim", limit=width - 12)
@@ -106,33 +112,28 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
     else:
         for index, item in enumerate(usage[:3]):
             y = 1 + index
-            grid.put(1, y, str(item.get("text", "")), item.get("key", "dim"))
+            usage_limit = width - 9 if y == 1 else width - 1
+            grid.put(1, y, str(item.get("text", "")), item.get("key", "dim"), limit=usage_limit)
             windows = list(item.get("windows", ()))
 
             def window_end(slot, window):
                 return 14 + slot * 40 + 5 + 1 + 1 + 12 + 5 + 1 + (
                     2 + len(str(window[2])) + 1 if window[2] else 0)
-            if any(window and window_end(slot, window) > width - 10 for slot, window in enumerate(windows)):
-                # A narrow screen shows the windows it has room for, the week first.
-                present = sorted((window for window in windows if window),
-                                 key=lambda window: {"week": 0, "5h": 1}.get(str(window[0]), 2))
-                windows = [window for slot, window in enumerate(present)
-                           if window_end(slot, window) <= width - 10]
             for win_index, window in enumerate(windows):
                 if not window:
                     continue
                 name, percent, reset = window
                 x = 14 + win_index * 40
-                x = grid.put(x, y, str(name).rjust(5), "label")
-                x = grid.put(x + 1, y, "[", "dim")
+                x = grid.put(x, y, str(name).rjust(5), "label", limit=usage_limit)
+                x = grid.put(x + 1, y, "[", "dim", limit=usage_limit)
                 filled = max(1, min(12, round(12 * int(percent) / 100))) if int(percent) else 0
-                gauge_key = "g_blocked" if int(percent) >= 80 else "lvl_y" if int(percent) >= 50 else "lvl_g"
-                x = grid.put(x, y, "━" * filled, gauge_key)
-                x = grid.put(x, y, "─" * (12 - filled), "dim")
-                x = grid.put(x, y, f"{int(percent):4d}%", gauge_key)
-                x = grid.put(x, y, "]", "dim")
+                gauge_key = "lvl_r_flat" if int(percent) >= 80 else "lvl_y" if int(percent) >= 50 else "lvl_g"
+                x = grid.put(x, y, "━" * filled, gauge_key, limit=usage_limit)
+                x = grid.put(x, y, "─" * (12 - filled), "dim", limit=usage_limit)
+                x = grid.put(x, y, f"{int(percent):4d}%", gauge_key, limit=usage_limit)
+                x = grid.put(x, y, "]", "dim", limit=usage_limit)
                 if reset:
-                    grid.put(x + 1, y, "↻ " + str(reset), "dim")
+                    grid.put(x + 1, y, "↻ " + str(reset), "dim", limit=usage_limit)
         grid.put(width - 9, 1, "u", "hearting", limit=width - 1)
         grid.put(width - 8, 1, " less ▾", "dim", limit=width - 1)
     if height >= 3:
@@ -144,7 +145,7 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
         grid.put(NAV_WIDTH, title_y, "┌", "line")
         grid.put(NAV_WIDTH + 1, title_y, "─", "line")
         grid.put(NAV_WIDTH + 2, title_y, " { ", "dim")
-        title_text = _clip(str(state.title or state.view), max(1, width - 1 - (NAV_WIDTH + 6) - 3))
+        title_text = str(state.title or state.view)
         grid.put(NAV_WIDTH + 5, title_y, title_text, "head", limit=width - 1)
         from .grid import cell_width
         title_end = NAV_WIDTH + 5 + cell_width(title_text)
@@ -249,11 +250,6 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
     x = 1
     legend = [("↑↓", "move"), ("←→", "focus"), ("⏎", "go to pane"), ("Tab", "next view"),
               ("/", "filter"), ("u", "usage"), ("F", "feed"), ("q", "quit")]
-    # A narrow screen drops the hint-only keys first, then the rest from the right, never a half word.
-    for drop in ("F", "/", "⏎", "←→", "Tab"):
-        if sum(len(k) + 1 + len(l) for k, l in legend) + 3 * (len(legend) - 1) + 1 <= width:
-            break
-        legend = [item for item in legend if item[0] != drop]
     for key, label in legend:
         if x > 1:
             x = grid.put(x, height - 2, " · ", "line")
@@ -312,10 +308,11 @@ def draw_explorer(grid: CellGrid, vm, state):
                 grid.cells[y][xx] = (glyph, key, 236)
         y += 1
     x = 1
+    page_open = getattr(state, "scope", "-") != "-"
     for view in ("MEMORY", "MODELS", "SYSTEM"):
         left, right = x - 1, x + len(view) + 1
         grid.add_hit(y, left, right, ("tab", view))
-        selected = state.view == view
+        selected = not page_open and state.view == view
         if selected:
             grid.fill(left, right, y, " ", tint=236)
         grid.put(x, y, view, "head" if selected else "soft", tint=236 if selected else None,
@@ -455,17 +452,23 @@ def draw_explorer(grid: CellGrid, vm, state):
                     grid.put(4, y, "┃  ", "line")
                     grid.put(7, y, "  ", None)
                     branch_x = 9
-                grid.put(branch_x, y, "┗━ ", "line")
+                grid.put(branch_x, y, "┗━ " if route_index == len(session_routes) - 1 else "┣━ ", "line")
                 label = route.get("tree_label") or route.get("title") or "·"
                 rh = route.get("harness") or "·"
                 label_x = branch_x + 3
-                route_label = str(label) + ": "
-                grid.put(label_x, y, route_label, "dim", limit=width - 1)
-                grid.put(label_x + len(route_label), y, str(rh), "h_" + str(rh), limit=width - 1)
                 mark, mark_key = {"running": ("⠏", "g_spin_dim"), "working": ("⠏", "g_spin_dim"),
                                   "blocked": ("●", "lvl_r_dim")}.get(
                     route.get("activity", route.get("state")), ("●", "idle"))
-                grid.put(label_x + len(route_label) + len(str(rh)) + 1, y, mark, mark_key)
+                route_suffix = ": " + str(rh) + " " + mark
+                name_room = max(1, width - 1 - label_x - cell_width(route_suffix))
+                route_name = clip_cells(str(label), name_room)
+                route_label = route_name + ": "
+                grid.put(label_x, y, route_name, "dim", limit=width - 1)
+                grid.put(label_x + cell_width(route_name), y, ": ", "dim", limit=width - 1)
+                harness_x = label_x + cell_width(route_label)
+                grid.put(harness_x, y, str(rh), "h_" + str(rh), limit=width - 1)
+                grid.put(harness_x + cell_width(str(rh)) + 1, y, mark, mark_key,
+                         limit=width - 1)
                 if scope_kind == "route" and str(route.get("id")) == scope_id:
                     for col in range(width):
                         glyph, key, _tint = grid.cells[y][col]
@@ -501,7 +504,8 @@ def draw_explorer(grid: CellGrid, vm, state):
         for hit_y in range(compute_y + 1, grid.rows - 4):
             grid.add_hit(hit_y, 0, width, ("root", "COMPUTE"))
         grid.fill(0, width, compute_y, " ", "dim", tint=234)
-        grid.put(1, compute_y, "COMPUTE ", "head" if state.view == "COMPUTE" else "title_dim",
+        grid.put(1, compute_y, "COMPUTE ",
+                 "head" if state.view == "COMPUTE" and getattr(state, "scope", "-") == "-" else "title_dim",
                  tint=234)
         compute_count = f"{len(hosts)}/{len(hosts)}"
         grid.put(width - 1 - len(compute_count), compute_y, compute_count, "dim", tint=234,
@@ -536,7 +540,7 @@ def draw_explorer(grid: CellGrid, vm, state):
                     grid.put(gx, row_y, "  ·", "dim")
                 else:
                     pct = round(100 * float(used) / max(1, float(total)))
-                    key = ("dim" if pct == 0 else "g_blocked" if pct >= 80
+                    key = ("dim" if pct == 0 else "lvl_r" if pct >= 80
                            else "g_idle" if pct >= 50 else "grp_live")
                     grid.put(gx, row_y, f" {pct:2d}%", key)
                 if gpu_index == 0:

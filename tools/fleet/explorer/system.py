@@ -158,10 +158,10 @@ def usage_gauges(snapshot):
 
 
 def usage_text(snapshot, spaced=False):
-    """'CL 5h29% · CX 주8% · OC 5h0%' (spaced: 'CL 5h 29%'); '사용량 ?' when nothing is known."""
+    """'CL 5h29% · CX 주8% · OC 5h0%' (spaced: 'CL 5h 29%'); '·' when nothing is known."""
     gauges = usage_gauges(snapshot)
     if not gauges:
-        return "사용량 ?"
+        return "·"
     parts = []
     for abbr, label, value in gauges:
         if label is None:
