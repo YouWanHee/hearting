@@ -2,8 +2,9 @@
 
 This opt-in operator tool records installation, a focused first task, and
 available usage evidence for `claude-only` and `all` profiles. It does not
-change release CI. The `all` profile has separate demo repositories for Claude,
-Codex, and OpenCode.
+change release CI. `claude-only` runs the task with Claude; `all` installs all
+three runtimes and runs the task once with Codex and once with OpenCode, each in
+its own demo repository.
 
 ## Commands
 
@@ -44,4 +45,12 @@ The demo starts with `Helo` and a test expecting `Hello`. The runner records the
 failing baseline and judges local refs, worktrees, and commits against the
 original focused test bytes. Each harness starts one session; only that session
 can resume after the structured confirmation card, up to three times. Other
-questions, refusals, and incomplete work stop without retry.
+questions, refusals, and incomplete work stop without retry. Sessions the
+installed product starts on its own count toward the same task: tokens are summed
+over every transcript in the world. A task is `completed` only when a candidate
+passes the original focused test and the product left a route record
+(`.runtime/routes/*.json`) in the world; a fix without one is reported as
+`fixed-without-route-evidence`.
+
+Inside the sandbox the world keeps its host path, while the real HOME and
+`/home/nas` are empty tmpfs mounts; the report's isolation checks show this.

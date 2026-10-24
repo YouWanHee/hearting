@@ -122,8 +122,10 @@ def sandbox(argv: list[str], world: Path, env: dict[str, str], cwd: Path | None 
     for directory in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/ssl", "/etc/ca-certificates"):
         if Path(directory).exists(): args += ["--ro-bind", directory, directory]
     real_home = str(Path.home())
+    # The world keeps its host path inside the namespace, so paths the product
+    # records (symlinks, worktrees, configs) also resolve for host-side checks.
     args += ["--dir", "/home", "--tmpfs", "/home", "--dir", real_home, "--dir", "/home/nas",
-             "--tmpfs", "/home/nas", "--bind", str(world), "/journey"]
+             "--tmpfs", "/home/nas", "--bind", str(world), str(world)]
     if cli: args += ["--dir", "/opt", "--dir", "/opt/journey-cli"]
     made_dirs = {"/opt", "/opt/journey-cli"}
     for source, destination in cli or []:
@@ -134,8 +136,8 @@ def sandbox(argv: list[str], world: Path, env: dict[str, str], cwd: Path | None 
                 args += ["--dir", parent]; made_dirs.add(parent)
         args += ["--ro-bind", str(source), destination]
     for key, value in env.items():
-        args += ["--setenv", key, value.replace(str(world), "/journey")]
-    args += ["--chdir", str(Path("/journey") / cwd.relative_to(world)) if cwd else "/journey/home"]
+        args += ["--setenv", key, value]
+    args += ["--chdir", str(cwd if cwd else world / "home")]
     if probes:
         args += ["--setenv", "JOURNEY_PROBE_HOME", real_home,
                  "--setenv", "JOURNEY_PROBE_NAS", "/home/nas",
@@ -172,77 +174,109 @@ def published_installer(world: Path, tag: str, timeout: int) -> tuple[Path, str,
     return target, resolved, actual
 
 
-def detect_card(text: str) -> bool:
-    labels = ["task", "why", "route", "scope", "done"]
-    lower = text.lower()
-    header = "[실행 확인]" in text or "[execution confirmation]" in lower or "[execution check]" in lower
-    positions = [lower.find(label) for label in labels]
-    option = any(line.strip() in {"진행 / 수정 / 중단", "proceed / revise / stop"} for line in lower.splitlines())
-    return header and all(p >= 0 for p in positions) and positions == sorted(positions) and option
+# §0.4 confirmation card: five labelled fields in order, then the option line.
+CARD_LABELS = ((("작업",), ("이유",), ("경로",), ("범위",), ("완료",)),
+               (("task", "work"), ("why", "reason"), ("route", "path"), ("scope",), ("done", "completion", "complete")))
+CARD_OPTIONS = (("진행", "중단"), ("proceed", "stop"))
+MAX_CANNED = 3
 
 
-def canned_proceed(text: str) -> str:
-    return "진행" if "진행 / 수정 / 중단" in text else "Proceed"
+def card_answer(text: str) -> str | None:
+    """Return the card's proceed word when the reply is a confirmation card, else None."""
+    lines = [re.sub(r"^[\s>`•\-]+", "", line).replace("*", "").strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    for labels, (proceed, stop) in zip(CARD_LABELS, CARD_OPTIONS):
+        cursor = 0
+        for names in labels:
+            found = next((i for i in range(cursor, len(lines))
+                          if any(lines[i].lower().startswith(name) and lines[i][len(name):len(name) + 1] in (":", "：", " ")
+                                 for name in names)), None)
+            if found is None:
+                break
+            cursor = found + 1
+        else:
+            for line in lines[cursor:]:
+                lower = line.lower()
+                if "/" in line and proceed in lower and stop in lower:
+                    return "진행" if proceed == "진행" else "Proceed"
+    return None
+
+
+def _number(value) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
 def telemetry(world: Path, harness: str) -> dict:
-    # Keep unknown distinct from zero; every reader is restricted to the disposable world.
+    """Sum token usage of every session in the disposable world; unknown stays None, never 0."""
+    home = world / "home"
     if harness == "claude":
-        totals = {k: 0 for k in ("input", "output", "cache_creation", "cache_read")}
-        seen = {}; sessions = set()
-        project_dirs = [p for p in (world / "home").rglob("projects") if p.is_dir()]
-        files = [f for p in project_dirs for f in p.rglob("*.jsonl")]
-        for file in files:
-            for line in file.read_text(errors="replace").splitlines():
-                try: row = json.loads(line)
-                except json.JSONDecodeError: continue
-                msg = row.get("message", {}); usage = msg.get("usage", {})
-                mid = msg.get("id")
-                if not mid or not usage or row.get("type") != "assistant": continue
-                sessions.add(row.get("sessionId", file.stem)); seen[mid] = usage
-        for usage in seen.values():
-            for key, field in (("input", "input_tokens"), ("output", "output_tokens"),
-                               ("cache_creation", "cache_creation_input_tokens"), ("cache_read", "cache_read_input_tokens")):
-                value = usage.get(field)
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0: totals[key] += value
-        return {"status": "measured" if seen else "unknown", **(totals if seen else {k: None for k in totals}),
-                "sessions": len(sessions), "reason": None if seen else "no-claude-usage-records"}
-    if harness == "opencode":
-        db = world / "home/.local/share/opencode/opencode.db"
-        if not db.exists(): return {"status": "unknown", "total": None, "reason": "opencode-db-missing"}
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            tables = {row[0] for row in con.execute("select name from sqlite_master where type='table'")}
-            if "message" not in tables: raise ValueError("schema")
-            columns = {row[1] for row in con.execute("pragma table_info(message)")}
-            names = [x for x in ("input_tokens", "output_tokens", "cache_read", "cache_creation") if x in columns]
-            if not {"input_tokens", "output_tokens"}.issubset(names): raise ValueError("schema")
-            rows = list(con.execute("select " + ",".join(names) + " from message"))
-            return {"status": "measured", "total": sum(sum(v or 0 for v in row) for row in rows), "reason": None}
-        except (sqlite3.Error, ValueError): return {"status": "unknown", "total": None, "reason": "unsupported-opencode-schema"}
-    rollouts = list((world / "home").rglob("rollout-*.jsonl"))
-    if rollouts:
-        try:
-            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fleet"))
-            from token_budget import parse_codex_token_count
-            latest = {}; last_events = {}
-            for file in rollouts:
+        seen: dict[str, dict] = {}; sessions = set()
+        for project in (p for p in home.rglob("projects") if p.is_dir() and not p.is_symlink()):
+            for file in project.rglob("*.jsonl"):
                 for line in file.read_text(errors="replace").splitlines():
                     try: row = json.loads(line)
                     except json.JSONDecodeError: continue
-                    if row.get("type") == "event_msg" and row.get("payload", {}).get("type") == "token_count":
-                        latest[file] = parse_codex_token_count(line, session_id=file.stem)
-                        last_events[file] = row.get("payload", {})
-            vals = [x for x in latest.values() if x.session_total_tokens is not None]
-            if vals:
-                final = vals[-1]
-                return {"status": "measured", "total": final.session_total_tokens,
-                        "input": final.session_input_tokens, "output": final.session_output_tokens,
-                        "cached_input": final.session_cached_input_tokens,
-                        "reasoning_output": final.session_reasoning_output_tokens,
-                        "sessions": len(vals), "rate_limits": last_events.get(list(latest)[-1], {}).get("rate_limits"), "reason": None}
-        except (ImportError, ValueError, TypeError): pass
-    return {"status": "unknown", "total": None, "reason": "no-supported-codex-token-count"}
+                    msg = row.get("message") if isinstance(row, dict) else None
+                    if row.get("type") != "assistant" or not isinstance(msg, dict): continue
+                    if msg.get("id") and isinstance(msg.get("usage"), dict):
+                        seen[msg["id"]] = msg["usage"]; sessions.add(row.get("sessionId") or file.stem)
+        if not seen:
+            return {"status": "unknown", "total": None, "sessions": 0, "reason": "no-claude-usage-records"}
+        fields = {"input": "input_tokens", "output": "output_tokens",
+                  "cache_creation": "cache_creation_input_tokens", "cache_read": "cache_read_input_tokens"}
+        totals = {key: sum(_number(u.get(field)) or 0 for u in seen.values()) for key, field in fields.items()}
+        return {"status": "measured", **totals, "total": sum(totals.values()),
+                "total_formula": "input+output+cache_creation+cache_read",
+                "sessions": len(sessions), "messages": len(seen), "reason": None}
+    if harness == "opencode":
+        databases = [db for db in home.rglob("opencode.db") if db.is_file()]
+        if not databases:
+            return {"status": "unknown", "total": None, "sessions": 0, "reason": "opencode-db-missing"}
+        totals = {"input": 0, "output": 0, "reasoning": 0}; sessions = 0
+        try:
+            for db in databases:
+                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                try:
+                    columns = {row[1] for row in con.execute("pragma table_info(session)")}
+                    if not {"tokens_input", "tokens_output", "tokens_reasoning"} <= columns:
+                        raise ValueError("schema")
+                    for row in con.execute("select tokens_input, tokens_output, tokens_reasoning from session"):
+                        sessions += 1
+                        for key, value in zip(totals, row): totals[key] += _number(value) or 0
+                finally:
+                    con.close()
+        except (sqlite3.Error, ValueError):
+            return {"status": "unknown", "total": None, "sessions": 0, "reason": "unsupported-opencode-schema"}
+        return {"status": "measured" if sessions else "unknown", **totals,
+                "total": sum(totals.values()) if sessions else None,
+                "total_formula": "input+output+reasoning (session table)", "sessions": sessions,
+                "reason": None if sessions else "no-opencode-sessions"}
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fleet"))
+    from token_budget import parse_codex_token_count
+    per_session = []; rate_limits = None
+    for file in sorted(home.rglob("rollout-*.jsonl"), key=lambda p: p.stat().st_mtime):
+        last = None
+        for line in file.read_text(errors="replace").splitlines():
+            if '"token_count"' not in line: continue
+            try: row = json.loads(line)
+            except json.JSONDecodeError: continue
+            payload = row.get("payload") if isinstance(row, dict) else None
+            if row.get("type") == "event_msg" and isinstance(payload, dict) and payload.get("type") == "token_count":
+                last = line; rate_limits = payload.get("rate_limits") or rate_limits
+        if last:  # cumulative per session: take the last event, never sum events
+            per_session.append(parse_codex_token_count(last))
+    known = [t for t in per_session if t.session_total_tokens is not None]
+    if not known:
+        return {"status": "unknown", "total": None, "sessions": 0, "reason": "no-supported-codex-token-count"}
+    def total(attr):
+        values = [getattr(t, attr) for t in known]
+        return None if any(v is None for v in values) else sum(values)
+    return {"status": "measured" if len(known) == len(per_session) else "partial",
+            "input": total("session_input_tokens"), "cached_input": total("session_cached_input_tokens"),
+            "output": total("session_output_tokens"), "reasoning_output": total("session_reasoning_output_tokens"),
+            "total": total("session_total_tokens"),
+            "total_formula": "codex total_token_usage.total_tokens (cached/reasoning are subsets)",
+            "sessions": len(per_session), "rate_limits": rate_limits, "reason": None}
 
 
 def claude_account_snapshot(config: Path) -> dict | None:
@@ -260,92 +294,131 @@ def claude_account_snapshot(config: Path) -> dict | None:
     return {key: data.get(key) for key in ("rl_5h", "rl_7d", "rs_5h", "rs_7d")}
 
 
-def event_text(output: str, harness: str) -> tuple[str, str | None]:
-    text = output; sid = None
+def event_text(output: str, harness: str) -> tuple[str, str | None, int]:
+    """Final assistant text, session id, and permission denials from one turn's JSON events."""
+    text = ""; sid = None; denials = 0
     for line in output.splitlines():
         try: row = json.loads(line)
         except json.JSONDecodeError: continue
+        if not isinstance(row, dict): continue
         sid = sid or row.get("session_id") or row.get("thread_id") or row.get("sessionID")
         if harness == "claude":
-            msg = row.get("message", {})
+            msg = row.get("message")
             if isinstance(msg, dict) and msg.get("role") == "assistant":
-                content = msg.get("content", text)
-                text = "\n".join(str(x.get("text", "")) for x in content if isinstance(x, dict)) if isinstance(content, list) else str(content)
-            if row.get("type") == "result": text = str(row.get("result", text))
+                content = msg.get("content")
+                parts = [str(x.get("text", "")) for x in content if isinstance(x, dict) and x.get("type", "text") == "text"] if isinstance(content, list) else [str(content or "")]
+                text = "\n".join(p for p in parts if p) or text
+            if row.get("type") == "result":
+                text = str(row.get("result") or text)
+                denials = len(row.get("permission_denials") or [])
         elif harness == "codex":
-            if row.get("type") == "thread.started": sid = row.get("thread_id", sid)
-            if row.get("type") == "item.completed" and row.get("item", {}).get("type") == "agent_message": text = str(row["item"].get("text", text))
+            if row.get("type") == "thread.started": sid = row.get("thread_id") or sid
+            item = row.get("item")
+            if row.get("type") == "item.completed" and isinstance(item, dict) and item.get("type") == "agent_message":
+                text = str(item.get("text") or text)
         else:
-            if row.get("type") in {"text", "assistant"}: text = str(row.get("text", row.get("content", text)))
-    return text, sid
+            part = row.get("part")
+            if row.get("type") == "text":
+                text = str((part or {}).get("text") if isinstance(part, dict) else row.get("text") or text)
+    return text, sid, denials
 
 
-def judge_repo(repo: Path, baseline_test: bytes) -> dict:
-    git = lambda *a: subprocess.run(["git", *a], cwd=repo, capture_output=True, text=True).stdout
-    baseline_sha = hashlib.sha256(baseline_test).hexdigest()
-    worktrees = [Path(line[9:]) for line in git("worktree", "list", "--porcelain").splitlines() if line.startswith("worktree ")]
-    refs = git("for-each-ref", "--format=%(refname)", "refs/heads").splitlines()
-    candidates: list[tuple[str, Path, bool]] = [("working-tree", repo, True)]
-    for path in worktrees:
-        if path != repo and path.is_dir(): candidates.append((f"worktree:{path.name}", path, True))
-    commits = git("log", "--all", "--format=%H").splitlines()
-    for commit in commits:
-        candidates.append((f"commit:{commit[:12]}", repo, False))
-    checked = []
-    for label, base, working in candidates:
-        if working:
-            source = base / "greet.py"; test = base / "test_greet.py"; cwd = base
-        else:
-            source_data = subprocess.run(["git", "show", f"{label[7:]}:greet.py"], cwd=repo, capture_output=True).stdout
-            test_data = subprocess.run(["git", "show", f"{label[7:]}:test_greet.py"], cwd=repo, capture_output=True).stdout
-            source = repo / ".journey-candidate-greet.py"; test = repo / ".journey-candidate-test.py"
-            if not source_data or not test_data: continue
-            source.write_bytes(source_data); test.write_bytes(test_data); cwd = repo
-        if not source.is_file() or not test.is_file(): continue
-        if hashlib.sha256(test.read_bytes()).hexdigest() != baseline_sha: checked.append({"candidate":label,"passed":False,"reason":"baseline-test-edited"}); continue
+JUDGE_SCRIPT = r'''
+import hashlib, json, subprocess, sys, tempfile
+from pathlib import Path
+expected, repo = sys.argv[1], Path.cwd().resolve()
+git = lambda *a: subprocess.run(["git", *a], cwd=repo, capture_output=True, text=True).stdout
+def check(label, greet, test):
+    row = {"candidate": label, "greet_ok": False, "passed": False}
+    if hashlib.sha256(test).hexdigest() != expected:
+        return {**row, "reason": "baseline-test-edited"}
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "greet.py").write_bytes(greet); Path(tmp, "test_greet.py").write_bytes(test)
         try:
-            output = subprocess.run([sys.executable, str(source)], cwd=cwd, capture_output=True, text=True, timeout=5)
-            result = subprocess.run([sys.executable, "-m", "unittest", "-q", "test_greet"], cwd=cwd, capture_output=True, text=True, timeout=10)
-            passed = output.returncode == 0 and output.stdout.strip() == "Hello" and result.returncode == 0
-        except (OSError, subprocess.TimeoutExpired): passed = False
-        checked.append({"candidate": label, "passed": passed, "reason": None if passed else "greet-or-focused-test-failed"})
-        if not working:
-            source.unlink(missing_ok=True); test.unlink(missing_ok=True)
-    routes = list((repo / ".agent_reports/.runtime/routes").glob("*")) if (repo / ".agent_reports/.runtime/routes").exists() else []
-    passed = next((item["candidate"] for item in checked if item["passed"]), None)
-    return {"code_fixed": passed is not None, "focused_test_passed": passed is not None,
-            "route_evidence_observed": bool(routes), "candidate": passed, "candidates": checked,
-            "worktrees": [str(p) for p in worktrees], "local_refs": refs}
+            out = subprocess.run([sys.executable, "greet.py"], cwd=tmp, capture_output=True, text=True, timeout=10)
+            unit = subprocess.run([sys.executable, "-m", "unittest", "-q", "test_greet"], cwd=tmp, capture_output=True, text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            return {**row, "reason": "timeout"}
+    row["greet_ok"] = out.returncode == 0 and out.stdout.strip() == "Hello"
+    row["passed"] = row["greet_ok"] and unit.returncode == 0
+    return {**row, "reason": None if row["passed"] else "greet-or-focused-test-failed"}
+rows = []
+trees = [Path(l[9:]) for l in git("worktree", "list", "--porcelain").splitlines() if l.startswith("worktree ")] or [repo]
+for tree in trees:
+    label = "worktree:" + ("main" if tree.resolve() == repo else tree.name)
+    try: rows.append(check(label, (tree / "greet.py").read_bytes(), (tree / "test_greet.py").read_bytes()))
+    except OSError: rows.append({"candidate": label, "greet_ok": False, "passed": False, "reason": "files-missing"})
+for commit in git("log", "--all", "--format=%H").splitlines():
+    show = lambda name: subprocess.run(["git", "show", commit + ":" + name], cwd=repo, capture_output=True).stdout
+    greet, test = show("greet.py"), show("test_greet.py")
+    if greet and test: rows.append(check("commit:" + commit[:12], greet, test))
+print(json.dumps({"candidates": rows, "worktrees": len(trees),
+                  "local_refs": git("for-each-ref", "--format=%(refname)", "refs/heads").splitlines()}))
+'''
 
 
-def headless_turn(harness: str, executable: str, prompt: str, cwd: Path, world: Path,
-                  env: dict[str, str], timeout: int, mounts: list[tuple[Path, str]]) -> dict:
-    virtual_cwd = "/journey/" + str(cwd.relative_to(world))
-    if harness == "claude": argv = [executable, "-p", "--output-format", "stream-json", "--verbose", prompt]
-    elif harness == "codex": argv = [executable, "exec", "--json", "--cd", virtual_cwd, prompt]
-    else: argv = [executable, "run", "--format", "json", prompt]
-    turns = []; answers = 0; sid = None; answer = "Proceed"; result = {"status": "task-incomplete", "turns": turns, "canned_answers": 0}; texts=[]
+def judge_repo(repo: Path, baseline_test: bytes, wrap=None, env: dict[str, str] | None = None) -> dict:
+    """Judge every worktree and commit of the demo repo; `wrap` runs it inside the sandbox."""
+    argv = ["python3", "-c", JUDGE_SCRIPT, hashlib.sha256(baseline_test).hexdigest()]
+    result = run(wrap(argv) if wrap else argv, env=env if env is not None else dict(os.environ), timeout=180, cwd=repo)
+    try:
+        data = json.loads(result["output"].strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"code_fixed": False, "focused_test_passed": False, "candidate": None, "candidates": [],
+                "local_refs": [], "worktrees": 0, "reason": "judge-failed", "seconds": result["seconds"]}
+    passed = next((row["candidate"] for row in data["candidates"] if row["passed"]), None)
+    return {"code_fixed": any(row["greet_ok"] for row in data["candidates"]),
+            "focused_test_passed": passed is not None, "candidate": passed, "reason": None,
+            "seconds": result["seconds"], **data}
+
+
+def route_evidence(world: Path) -> int:
+    """Route files the installed product wrote anywhere in the world (`.runtime/routes/*.json`)."""
+    return sum(1 for routes in world.rglob("routes") if routes.is_dir() and routes.parent.name == ".runtime"
+               for _ in routes.glob("*.json"))
+
+
+def turn_argv(harness: str, command: str, cwd: Path, sid: str | None, message: str) -> list[str]:
+    if harness == "claude":
+        return [command, "-p", "--output-format", "stream-json", "--verbose", *(["--resume", sid] if sid else []), message]
+    if harness == "codex":
+        return [command, "exec", "resume", "--json", sid, message] if sid else [command, "exec", "--json", "--cd", str(cwd), message]
+    return [command, "run", "--format", "json", *(["--session", sid] if sid else []), message]
+
+
+def headless_turn(harness: str, command: str, prompt: str, cwd: Path, world: Path,
+                  env: dict[str, str], timeout: int, mounts: list[tuple[Path, str]], judge=None) -> dict:
+    """Drive one task session: answer only the confirmation card, stop on anything else."""
     deadline = time.monotonic() + timeout
-    for index in range(1, 5):
-        if index > 1:
-            if harness == "claude": argv = [executable, "-p", "--output-format", "stream-json", "--verbose", "--resume", sid, answer]
-            elif harness == "codex": argv = [executable, "exec", "resume", "--json", sid, answer]
-            else: argv = [executable, "run", "--format", "json", "--session", sid, answer]
-        remaining = max(1, int(deadline - time.monotonic()))
-        step = run(sandbox(argv, world, env, cwd, mounts), env=env, timeout=remaining, cwd=cwd)
-        text, found = event_text(step["output"], harness); sid = found or sid
+    turns: list[dict] = []; texts: list[str] = []; answers = 0; sid = None; message = prompt
+    status = "task-incomplete"
+    while True:
+        remaining = int(deadline - time.monotonic())
+        if remaining < 5:
+            status = "task-timeout"; break
+        step = run(sandbox(turn_argv(harness, command, cwd, sid, message), world, env, cwd, mounts),
+                   env=env, timeout=remaining, cwd=cwd)
+        text, found, denials = event_text(step["output"], harness)
+        sid = sid or found
         texts.append(text)
-        turns.append({"index": index, "exit": step["exit"], "seconds": step["seconds"], "session_id": sid})
-        if step["exit"] != 0: result["status"] = "task-failed"; break
-        if text and ("permission" in text.lower() or "refus" in text.lower()): result["status"] = "unexpected-question"; result["turn_index"] = index; break
-        if text and ("Hello" in text or "test_greet" in text) and not detect_card(text): result["status"] = "candidate-complete"; break
-        if detect_card(text) and answers < 3 and sid:
-            answer = canned_proceed(text)
-            answers += 1; continue
-        result["status"] = "unexpected-question" if "?" in text else "task-incomplete"; result["turn_index"] = index; break
-    result.update({"turns": turns, "canned_answers": answers, "session_id": sid, "output": "\n".join(texts)})
-    if answers >= 3 and result["status"] != "candidate-complete": result["status"] = "confirmation-cap"
-    return result
+        turns.append({"index": len(turns) + 1, "exit": step["exit"], "seconds": step["seconds"],
+                      "session_id": sid, "permission_denials": denials})
+        if step["exit"] == 124: status = "task-timeout"; break
+        if step["exit"] != 0: status = "task-failed"; break
+        if judge and judge():
+            status = "candidate-complete"; break
+        reply = card_answer(text)
+        if reply and sid and answers < MAX_CANNED:
+            answers += 1; message = reply; continue
+        if reply:
+            status = "confirmation-cap" if answers >= MAX_CANNED else "card-without-session"
+        elif denials:
+            status = "tool-permission-denied"
+        else:
+            status = "unexpected-question" if text.rstrip().endswith(("?", "？")) else "task-incomplete"
+        break
+    return {"status": status, "turns": turns, "canned_answers": answers, "session_id": sid,
+            "turn_index": len(turns), "output": "\n".join(texts)}
 
 
 def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
@@ -404,7 +477,8 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                 binaries[harness] = (resolved, executable)
         install_bin = home / ".local/bin"
         install_bin.mkdir(parents=True)
-        pathlist = [cli_bin, install_bin, sysbin]
+        # Installed launchers first, like a user's ~/.local/bin; then the profile CLIs.
+        pathlist = [install_bin, cli_bin, sysbin]
         env = clean_env(home, pathlist, {"CLAUDE_CONFIG_DIR": str(home / ".claude"),
                                         "CODEX_HOME": str(home / ".codex")})
         for key in ("home", "tmp", "repos", "logs"):
@@ -420,7 +494,7 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
             if p.returncode == 0:
                 index = {"tag_name": "v0.0.0-journey.1", "assets": []}
                 for name in ("hearting.tar.gz", "hearting.tar.gz.sha256"):
-                    index["assets"].append({"name": name, "browser_download_url": "file:///journey/release-assets/" + name})
+                    index["assets"].append({"name": name, "browser_download_url": f"file://{builddir}/{name}"})
                 (builddir / "release-index.json").write_text(json.dumps(index), encoding="utf-8")
                 shutil.copy2(builddir / "install.sh", builddir / "checkout-install.sh")
         else:
@@ -428,11 +502,12 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
         record["steps"].append(step)
         # Install through the regular distribution installer; model-free checks never use auth.
         runtime_args = [part for harness in PROFILES[profile] for part in ("--runtime", harness)]
-        install_args = ["sh", "/journey/release-assets/checkout-install.sh", *runtime_args, "--no-auto-update"] if args.source == "checkout" else ["sh", "/journey/release-assets/install.sh", *runtime_args, "--no-auto-update"]
+        assets = world / "release-assets"
+        install_args = ["sh", str(assets / ("checkout-install.sh" if args.source == "checkout" else "install.sh")), *runtime_args, "--no-auto-update"]
         install_extras = {}
         if args.source == "checkout":
             install_extras = {"HARNESS_ALLOW_FILE_RELEASES": "1",
-                              "HARNESS_RELEASE_INDEX_URL": "file:///journey/release-assets/release-index.json"}
+                              "HARNESS_RELEASE_INDEX_URL": f"file://{assets}/release-index.json"}
         resolved_tag, installer_sha = "checkout", None
         if args.source == "published":
             try:
@@ -443,7 +518,7 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
             if installer_path is None:
                 installed = {"exit": 1, "seconds": 0, "output": "published installer unavailable"}
             else:
-                install_args[1] = "/journey/release-assets/install.sh"
+                install_args[1] = str(installer_path)
                 installed = run(sandbox(install_args, world, env, cli=cli_mounts), env=env, timeout=args.step_timeout)
         else:
             installed = run(sandbox(install_args, world, {**env, **install_extras}, cli=cli_mounts), env={**env, **install_extras}, timeout=args.step_timeout)
@@ -465,7 +540,10 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                     versions[name] = version["output"][-120:].strip().replace(str(world), "<world>") if version["exit"] == 0 else "unknown"
             expected_visible = ["claude"] if profile == "claude-only" else ["claude", "codex", "opencode"]
             record["environment"] = {"visible_cli_names": visible, "cli_versions": versions,
-                                      "transport_flags": {"claude": "-p --output-format stream-json --verbose", "codex": "exec --json", "opencode": "run --format json"},
+                                      "transport_flags": {"claude": "-p --output-format stream-json --verbose [--resume <id>]",
+                                                          "codex": "exec --json --cd <repo> | exec resume --json <id>",
+                                                          "opencode": "run --format json [--session <id>]"},
+                                      "env_hygiene": ["DISABLE_AUTOUPDATER=1", "no permission flags"],
                                       "allowlist_names": sorted(env)}
             if visible != expected_visible: record["failures"].append({"reason": "cli-visibility-mismatch"})
             if platform.system() == "Linux":
@@ -502,17 +580,13 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                     cfg = json.loads(settings.read_text())
                     commands = [hook.get("command", "") for entries in cfg.get("hooks", {}).values()
                                 for entry in entries for hook in entry.get("hooks", []) if isinstance(hook, dict)]
-                    paths = [p for command in commands for p in re.findall(r"\$HOME/([^\"\s]+)", command)]
-                    def exists_in_world(relative):
-                        candidate = home / relative
-                        if candidate.is_file(): return True
-                        if candidate.is_symlink():
-                            target_path = os.readlink(candidate)
-                            if target_path.startswith("/journey/"):
-                                return (world / target_path[len("/journey/"):]).is_file()
-                        return False
-                    missing = [p for p in paths if not exists_in_world(p)]
-                    if missing: record["failures"].append({"reason": "claude-hook-command-missing", "count": len(missing)})
+                    # Same rule as post-publish-smoke.sh: every $HOME/<file> a hook names must exist.
+                    paths = [p for command in commands for p in re.findall(r"\$HOME/([^\s\"']+)", command)]
+                    missing = sorted({p for p in paths if Path(p).suffix and not (home / p).exists()})
+                    record["steps"].append({"name": "hook-files", "exit": 1 if missing else 0, "seconds": 0,
+                                            "checked": len(set(paths)), "missing": len(missing)})
+                    if missing: record["failures"].append({"reason": "claude-hook-command-missing", "count": len(missing),
+                                                           "detail": ", ".join(missing[:3])})
                 except (ValueError, OSError): record["failures"].append({"reason": "claude-settings-invalid"})
         # Demo test is explicitly observed before and after; baseline failure is expected.
         for harness in TASK_HARNESSES[profile]:
@@ -575,52 +649,57 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                         if harness == "claude": env["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
                         elif harness == "codex": env["CODEX_HOME"] = str(home / ".codex")
                         else: env["XDG_DATA_HOME"] = str(home / ".local/share")
-                        started = time.monotonic()
                         usage_started = time.monotonic()
                         account_before = claude_account_snapshot(home / ".claude") if harness == "claude" else None
                         if harness == "claude": record["steps"].append({"name":"usage-before:claude","exit":0 if account_before else 1,"seconds":round(time.monotonic()-usage_started,3),"status":"measured" if account_before else "unknown"})
-                        outcome = headless_turn(harness, binaries[harness][1], args.prompt, repo_dir, world,
-                                                env, args.task_timeout, cli_mounts)
+                        started = time.monotonic()
+                        baseline_test = (fixture / "test_greet.py").read_bytes()
+                        judge = lambda: judge_repo(repo_dir, baseline_test, lambda argv: sandbox(argv, world, baseline_env, repo_dir),
+                                                   baseline_env)["focused_test_passed"]
+                        # Invoke the CLI by name so an installed launcher in ~/.local/bin is used, as for a user.
+                        outcome = headless_turn(harness, harness, args.prompt, repo_dir, world,
+                                                env, args.task_timeout, cli_mounts, judge)
+                        record["steps"].append({"name": f"task:{harness}", "exit": outcome["turns"][-1]["exit"] if outcome["turns"] else 1,
+                                                "seconds": round(time.monotonic() - started, 3), "turns": len(outcome["turns"])})
+                        for turn in outcome["turns"]:
+                            record["steps"].append({"name": f"turn:{harness}:{turn['index']}", "exit": turn["exit"], "seconds": turn["seconds"]})
                         usage_started = time.monotonic()
                         account_after = claude_account_snapshot(home / ".claude") if harness == "claude" else None
                         if harness == "claude": record["steps"].append({"name":"usage-after:claude","exit":0 if account_after else 1,"seconds":round(time.monotonic()-usage_started,3),"status":"measured" if account_after else "unknown"})
-                        if harness == "claude":
-                            same_5h = account_before and account_after and account_before.get("rs_5h") == account_after.get("rs_5h")
-                            same_7d = account_before and account_after and account_before.get("rs_7d") == account_after.get("rs_7d")
-                            model["account_usage"] = {"before": account_before, "after": account_after,
-                                "delta_pp": {"5h": account_after["rl_5h"]-account_before["rl_5h"] if same_5h and account_before.get("rl_5h") is not None and account_after.get("rl_5h") is not None else None,
-                                             "7d": account_after["rl_7d"]-account_before["rl_7d"] if same_7d and account_before.get("rl_7d") is not None and account_after.get("rl_7d") is not None else None},
-                                "attribution": "uncertain", "note": "may include other work"}
-                        (world / "logs" / f"{harness}.output-tail.txt").write_text(outcome["output"], encoding="utf-8")
-                        record["steps"].append({"name": f"task:{harness}", "exit": next((t["exit"] for t in reversed(outcome["turns"])), 1),
-                                                "seconds": round(time.monotonic()-started, 3)})
-                        after = target.read_bytes() if target.exists() and not target.is_symlink() else before
-                        if after != before:
-                            temp_auth = store.with_name(store.name + ".tmp")
-                            temp_auth.write_bytes(after); os.chmod(temp_auth, 0o600); os.replace(temp_auth, store)
-                        _ACTIVE_AUTH = None
-                        model["status"] = outcome["status"]
-                        model["turns"] = len(outcome["turns"])
-                        model["canned_answers"] = outcome["canned_answers"]
-                        # A task is complete only when the focused test passes after the initial failing baseline.
-                        focused = run(sandbox(["python3", "-m", "unittest", "-v", "test_greet"], world,
-                                              baseline_env, repo_dir), env=baseline_env, timeout=args.step_timeout)
-                        record["steps"].append({"name": f"focused-test:{harness}", "exit": focused["exit"],
-                                                "seconds": focused["seconds"]})
-                        if outcome["status"] == "candidate-complete" and focused["exit"] != 0:
-                            model["status"] = "task-incomplete-test-failed"
-                        diff = run(sandbox(["git", "diff", "--", "greet.py"], world, baseline_env, repo_dir),
-                                   env=baseline_env, timeout=args.step_timeout)
-                        model["changed_demo"] = bool(diff["output"].strip())
-                        if model["status"] == "candidate-complete" and not model["changed_demo"]:
-                            model["status"] = "task-completed-without-demo-change"
+                        persist_active_auth(); _ACTIVE_AUTH = None
+                        (world / "logs" / f"{harness}.assistant-text.txt").write_text(outcome["output"], encoding="utf-8")
+                        model.update({"status": outcome["status"], "turns": len(outcome["turns"]),
+                                      "canned_answers": outcome["canned_answers"], "turn_index": outcome["turn_index"],
+                                      "permission_denials": sum(t["permission_denials"] for t in outcome["turns"])})
                         model["session_tokens"] = telemetry(world, harness)
-                        if harness == "claude": record["account_usage"] = model["account_usage"]
-                        model["verification"] = judge_repo(repo_dir, (fixture / "test_greet.py").read_bytes())
-                        if model["verification"]["candidate"] and model["verification"]["route_evidence_observed"]:
-                            model["status"] = "completed"
+                        if harness == "claude":
+                            def delta(key, reset):
+                                if not (account_before and account_after) or account_before.get(reset) != account_after.get(reset): return None
+                                a, b = account_before.get(key), account_after.get(key)
+                                return b - a if isinstance(a, (int, float)) and isinstance(b, (int, float)) else None
+                            model["account_usage"] = {"before": account_before, "after": account_after,
+                                                      "delta_pp": {"5h": delta("rl_5h", "rs_5h"), "7d": delta("rl_7d", "rs_7d")},
+                                                      "attribution": "uncertain", "note": "may include other work",
+                                                      "reason": None if account_before and account_after else "usage-endpoint-unavailable"}
+                            record["account_usage"] = model["account_usage"]
+                        elif harness == "codex":
+                            model["account_usage"] = {"before": None, "after": model["session_tokens"].get("rate_limits"), "delta_pp": None,
+                                                      "attribution": "uncertain", "note": "may include other work", "reason": "no-before-sample"}
+                        else:
+                            model["account_usage"] = {"before": None, "after": None, "delta_pp": None, "attribution": "uncertain",
+                                                      "note": "may include other work", "reason": "unsupported-provider-account-usage"}
+                        verify_started = time.monotonic()
+                        verification = judge_repo(repo_dir, baseline_test, lambda argv: sandbox(argv, world, baseline_env, repo_dir), baseline_env)
+                        verification["route_evidence_count"] = route_evidence(world)
+                        verification["route_evidence_observed"] = verification["route_evidence_count"] > 0
+                        record["steps"].append({"name": f"verify:{harness}", "exit": 0 if verification["focused_test_passed"] else 1,
+                                                "seconds": round(time.monotonic() - verify_started, 3)})
+                        model["verification"] = verification
+                        # The repo judgment decides success, not the reply text or the exit code.
+                        if verification["focused_test_passed"]:
+                            model["status"] = "completed" if verification["route_evidence_observed"] else "fixed-without-route-evidence"
                         elif model["status"] == "candidate-complete":
-                            model["status"] = "route-evidence-missing"
+                            model["status"] = "task-incomplete"
                 except Exception as exc:
                     model["status"] = "task-error"
                     model["detail"] = type(exc).__name__
@@ -643,25 +722,59 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
     return record
 
 
+def _tokens_line(tokens) -> str:
+    if not isinstance(tokens, dict) or tokens.get("total") is None:
+        reason = tokens.get("reason") if isinstance(tokens, dict) else tokens
+        return f"unknown ({reason})"
+    parts = [f"{k}={tokens[k]}" for k in ("input", "output", "cache_creation", "cache_read", "cached_input",
+                                          "reasoning", "reasoning_output") if tokens.get(k) is not None]
+    return f"total={tokens['total']} ({', '.join(parts)}; sessions={tokens.get('sessions')})"
+
+
 def write_report(record: dict, output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
-    raw = json.dumps(record, indent=2, sort_keys=True) + "\n"
-    (output / "journey.json").write_text(raw, encoding="utf-8")
-    source_kind = record["source"].get("kind") if isinstance(record["source"], dict) else record["source"]
-    lines = [f"# First journey: {record['profile']}", "", f"- Source: {source_kind}",
-             f"- Resolved tag: {record.get('source_detail', {}).get('resolved_tag', 'unknown')}",
-             f"- Installer SHA-256: {record.get('source_detail', {}).get('installer_sha256', 'unknown')}",
-             f"- Isolation: {record['isolation']['level']} (d3={record['isolation']['d3']})",
-             f"- Elapsed: {record['elapsed_seconds']} seconds", "", "## Steps", ""]
-    lines += [f"- {s['name']}: exit {s['exit']} ({s['seconds']}s)" for s in record["steps"]]
-    lines += ["", "## Harnesses", ""]
-    lines += [f"- {h['name']}: {h['model']['status']}; turns={h['model']['turns']}; canned answers={h['model'].get('canned_answers', 0)}; session tokens={h['model']['session_tokens']}" for h in record["harnesses"]]
-    lines += ["", "## Account usage", "", f"Before: {record['account_usage'].get('before')}; after: {record['account_usage'].get('after')}; delta_pp: {record['account_usage'].get('delta_pp')}; attribution uncertain ({record['account_usage'].get('note')}).", "", "## Headless uncovered", ""]
+    (output / "journey.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    source = record["source"] if isinstance(record["source"], dict) else {"kind": record["source"]}
+    detail = record.get("source_detail", {})
+    isolation = record["isolation"]
+    lines = [f"# First journey: {record['profile']} ({record.get('mode', 'unknown')})", "",
+             f"- Source: {source.get('kind')}; tag {detail.get('resolved_tag', source.get('tag'))}; "
+             f"installer sha256 {detail.get('installer_sha256') or 'n/a'}",
+             f"- Started: {record.get('started_at')}; finished: {record.get('finished_at')}; "
+             f"elapsed {record['elapsed_seconds']} s",
+             f"- Isolation: {isolation['level']}; d3={isolation['d3']}", "",
+             "## Steps", "", "| step | exit | seconds |", "| --- | ---: | ---: |"]
+    lines += [f"| {s['name']} | {s['exit']} | {s['seconds']} |" for s in record["steps"]]
+    lines += ["", "## Tasks", ""]
+    for h in record["harnesses"]:
+        m = h["model"]; usage = m.get("account_usage") or {}
+        lines.append(f"- {h['name']}: {m['status']}; turns={m['turns']}; canned answers={m.get('canned_answers', 0)}; "
+                     f"session tokens {_tokens_line(m.get('session_tokens'))}")
+        if usage:
+            lines.append(f"  - account usage before={usage.get('before')} after={usage.get('after')} "
+                         f"delta_pp={usage.get('delta_pp')}; attribution {usage.get('attribution')} ({usage.get('note')})")
+        verification = m.get("verification")
+        if verification:
+            lines.append(f"  - verification: code_fixed={verification.get('code_fixed')} focused_test_passed="
+                         f"{verification.get('focused_test_passed')} route_evidence={verification.get('route_evidence_count')} "
+                         f"candidate={verification.get('candidate')}")
+    account = record.get("account_usage") or {}
+    lines += ["", "## Account usage", "",
+              f"Before: {account.get('before')}; after: {account.get('after')}; delta_pp: {account.get('delta_pp')}; "
+              f"attribution uncertain ({account.get('note')}); reason: {account.get('reason')}.",
+              "", "## Headless uncovered", ""]
     lines += [f"- {x}" for x in record.get("headless_uncovered", [])]
-    lines += ["", "## Isolation checks", ""]
-    lines += [f"- {x['check']}: {'PASS' if x['passed'] else 'FAIL'}" for x in record["isolation"].get("checks", [])] or ["- not-proven"]
-    lines += ["", "## Failures", ""]
-    lines += [f"- {f.get('harness', 'runner')}: {f['reason']}" for f in record["failures"]] or ["- None"]
+    env = record.get("environment", {})
+    lines += ["", "## Environment", "", f"- Visible CLIs: {env.get('visible_cli_names')}",
+              f"- CLI versions: {env.get('cli_versions')}", f"- Transport: {env.get('transport_flags')}",
+              f"- Env hygiene: {env.get('env_hygiene')}", f"- Env names: {env.get('allowlist_names')}",
+              "", "## Isolation checks", ""]
+    lines += [f"- {x['check']}: {'PASS' if x['passed'] else 'FAIL'}" for x in isolation.get("checks", [])] or ["- not-proven"]
+    lines += [f"- host I/O exceptions: {isolation.get('host_io_exceptions')}", "", "## Failures", ""]
+    lines += [f"- {f.get('harness', 'runner')}: {f['reason']}" + (f" — {f['detail']}" if f.get("detail") else "")
+              for f in record["failures"]] or ["- None"]
+    if record.get("world"):
+        lines += ["", f"World kept for inspection (local only): {record['world']}"]
     (output / "journey.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

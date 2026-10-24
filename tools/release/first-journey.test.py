@@ -34,32 +34,53 @@ class JourneyTests(unittest.TestCase):
         self.assertEqual(fj.auth_file(Path("/tmp/auth"), "opencode"), Path("/tmp/auth/opencode/auth.json"))
 
     def test_confirmation_card_gets_one_answer_then_completion(self):
-        card = "[실행 확인]\nTask: fix\nWhy: typo\nRoute: direct\nScope: greet\nDone: test\n진행 / 수정 / 중단"
+        card = "[실행 확인]\n작업: fix\n이유: typo\n경로: direct\n범위: greet\n완료: test\n\n→ 진행 / 수정: <틀린 부분> / 중단"
         outputs = [json.dumps({"session_id": "s1", "type": "assistant", "message": {"role": "assistant", "content": card}}),
-                   json.dumps({"session_id": "s1", "type": "assistant", "message": {"role": "assistant", "content": "Hello; test_greet passed"}})]
+                   json.dumps({"session_id": "s1", "type": "assistant", "message": {"role": "assistant", "content": "Done."}})]
+        calls = []
+        judged = iter([False, True])
         old = fj.run
         try:
-            fj.run = lambda *a, **k: {"exit": 0, "seconds": 0.1, "output": outputs.pop(0)}
-            result = fj.headless_turn("claude", "claude", "task", Path("/tmp/world/repos/demo"), Path("/tmp/world"), {}, 5, [])
+            fj.run = lambda argv, **k: calls.append(argv) or {"exit": 0, "seconds": 0.1, "output": outputs.pop(0)}
+            result = fj.headless_turn("claude", "claude", "task", Path("/tmp/world/repos/demo"), Path("/tmp/world"), {}, 30, [],
+                                      judge=lambda: next(judged))
         finally: fj.run = old
         self.assertEqual(result["status"], "candidate-complete")
         self.assertEqual(result["canned_answers"], 1)
+        self.assertEqual(calls[1][-3:], ["--resume", "s1", "진행"])
+
+    def test_card_detection_matches_canonical_cards_only(self):
+        korean = ("[실행 확인]\n\n작업: 오타 수정\n이유: 출력 오타\n경로: autopilot-code · direct — 작은 수정\n"
+                  "범위: greet.py\n완료: 집중 시험 통과\n\n→ 진행 / 수정: <틀린 부분> / 중단")
+        english = ("**[Run confirmation]**\n\n**Task:** Fix the typo\n**Why:** wrong output\n**Route:** autopilot-code · direct\n"
+                   "**Scope:** greet.py\n**Done:** focused test passes\n\n→ Proceed / Revise: <what is wrong> / Stop")
+        self.assertEqual(fj.card_answer(korean), "진행")
+        self.assertEqual(fj.card_answer(english), "Proceed")
+        self.assertIsNone(fj.card_answer("Should I proceed with the fix?"))
+        self.assertIsNone(fj.card_answer("Task: fix\nScope: greet\n→ Proceed / Stop"))
+
+    def test_codex_turns_resume_the_exact_thread(self):
+        first = fj.turn_argv("codex", "codex", Path("/tmp/w/repos/codex"), None, "task")
+        later = fj.turn_argv("codex", "codex", Path("/tmp/w/repos/codex"), "t-1", "Proceed")
+        self.assertEqual(first, ["codex", "exec", "--json", "--cd", "/tmp/w/repos/codex", "task"])
+        self.assertEqual(later, ["codex", "exec", "resume", "--json", "t-1", "Proceed"])
+        self.assertNotIn("--sandbox", first + later)
 
     def test_unexpected_question_stops_without_answer(self):
         old = fj.run
         try:
             fj.run = lambda *a, **k: {"exit": 0, "seconds": 0, "output": json.dumps({"session_id":"s", "type":"assistant", "message":{"role":"assistant", "content":"Which file?"}})}
-            result = fj.headless_turn("claude", "claude", "task", Path("/tmp/world/repos/demo"), Path("/tmp/world"), {}, 5, [])
+            result = fj.headless_turn("claude", "claude", "task", Path("/tmp/world/repos/demo"), Path("/tmp/world"), {}, 30, [])
         finally: fj.run = old
         self.assertEqual(result["status"], "unexpected-question")
         self.assertEqual(result["canned_answers"], 0)
 
     def test_confirmation_answers_are_capped_at_three(self):
-        card = "[실행 확인]\nTask: fix\nWhy: typo\nRoute: direct\nScope: greet\nDone: test\n진행 / 수정 / 중단"
+        card = "[Run confirmation]\nTask: fix\nWhy: typo\nRoute: direct\nScope: greet\nDone: test\n→ Proceed / Revise: <x> / Stop"
         old = fj.run
         try:
             fj.run = lambda *a, **k: {"exit": 0, "seconds": 0, "output": json.dumps({"session_id":"s", "type":"assistant", "message":{"role":"assistant", "content":card}})}
-            result = fj.headless_turn("claude", "claude", "task", Path("/tmp/world/repos/demo"), Path("/tmp/world"), {}, 5, [])
+            result = fj.headless_turn("claude", "claude", "task", Path("/tmp/world/repos/demo"), Path("/tmp/world"), {}, 30, [])
         finally: fj.run = old
         self.assertEqual(result["canned_answers"], 3)
         self.assertEqual(result["status"], "confirmation-cap")
@@ -76,6 +97,23 @@ class JourneyTests(unittest.TestCase):
             path.write_text("\n".join(json.dumps({"type":"event_msg", "payload":{"type":"token_count", "info":{"total_token_usage":{"input_tokens":n,"output_tokens":0,"total_tokens":n}}}}) for n in (10,20)))
             result = fj.telemetry(Path(tmp), "codex")
         self.assertEqual(result["total"], 20)
+
+    def test_codex_telemetry_sums_sessions_not_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, counts in (("rollout-a.jsonl", (10, 20)), ("rollout-b.jsonl", (7,))):
+                path = Path(tmp) / "home/.codex/sessions" / name; path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("\n".join(json.dumps({"type":"event_msg", "payload":{"type":"token_count", "info":{"total_token_usage":{"input_tokens":n,"output_tokens":0,"total_tokens":n}}}}) for n in counts))
+            result = fj.telemetry(Path(tmp), "codex")
+        self.assertEqual((result["total"], result["sessions"]), (27, 2))
+
+    def test_opencode_telemetry_reads_session_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "home/.local/share/opencode/opencode.db"; db.parent.mkdir(parents=True)
+            con = fj.sqlite3.connect(db)
+            con.execute("create table session (id text, tokens_input integer, tokens_output integer, tokens_reasoning integer)")
+            con.execute("insert into session values ('s', 100, 20, 5)"); con.commit(); con.close()
+            result = fj.telemetry(Path(tmp), "opencode")
+        self.assertEqual((result["status"], result["total"], result["sessions"]), ("measured", 125, 1))
 
     def test_claude_usage_deduplicates_message_id(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -100,7 +138,7 @@ class JourneyTests(unittest.TestCase):
             value = json.loads((Path(tmp) / "journey.json").read_text())
             markdown = (Path(tmp) / "journey.md").read_text()
         self.assertEqual(value["account_usage"]["before"], "unknown")
-        self.assertIn("session tokens=unknown", markdown)
+        self.assertIn("session tokens unknown", markdown)
         self.assertIn("attribution uncertain", markdown)
         self.assertIn("Headless uncovered", markdown)
         self.assertIn("Isolation checks", markdown)
@@ -150,6 +188,17 @@ class JourneyTests(unittest.TestCase):
                 fj.sandbox(["true"], Path("/tmp"), {})
         finally:
             fj.shutil.which = old
+
+    def test_sandbox_keeps_world_path_and_hides_home_and_nas(self):
+        if fj.platform.system() != "Linux" or not fj.shutil.which("bwrap"):
+            self.skipTest("Linux bwrap check")
+        world = Path("/tmp/first-journey-unit")
+        joined = " ".join(fj.sandbox(["true"], world, {"HOME": str(world / "home")}))
+        self.assertIn(f"--bind {world} {world}", joined)
+        self.assertIn("--tmpfs /home/nas", joined)
+        self.assertIn("--tmpfs /home ", joined)
+        self.assertNotIn("/journey ", joined)
+        self.assertIn(f"--setenv HOME {world}/home", joined)
 
 
 if __name__ == "__main__":
