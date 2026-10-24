@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+from collections import deque
 from pathlib import Path
 import re
 import stat
@@ -17,6 +18,7 @@ import time
 _ID_RE = re.compile(r"batch-[0-9a-f]{32}\Z")
 _MAX_BYTES = 128 * 1024
 _PENDING = {"observing", "delivery-pending", "unknown"}
+_SETTLED_DEPENDENCY_CHECKS_PER_PASS = 64
 
 
 class BatchObligationError(ValueError):
@@ -651,6 +653,8 @@ class OwnerSettlementReadContext:
         self._cursors = {}
         self._invalidated_owners = set()
         self._pass_file_generations = {}
+        self._dependency_queues = {}
+        self._dependency_queued = set()
         self._metrics = {"historical_checks": 0, "settled_cache_hits": 0,
                          "dependency_checks": 0, "dependency_invalidations": 0}
 
@@ -717,12 +721,43 @@ class OwnerSettlementReadContext:
         self.forget_owner(jobs, metadata.get("attempt_id", ""))
         self._settled[key] = ((status, raw), self._fingerprint_rows(related_rows),
                               paths, generations, aliases)
+        self._queue_settled_dependency_check(key)
         for alias in aliases:
             self._route_owners.setdefault((key[0], alias), set()).add(key[1])
         if len(self._settled) > 4096:
             oldest = next(iter(self._settled))
             self.forget_owner(Path(oldest[0]), oldest[1])
         return True
+
+    def _queue_settled_dependency_check(self, key):
+        if key in self._dependency_queued:
+            return
+        self._dependency_queues.setdefault(key[0], deque()).append(key)
+        self._dependency_queued.add(key)
+
+    def _validate_settled_dependency_batch(self, jobs: Path) -> bool:
+        """Rotate a fixed-size dependency check batch through settled owners."""
+        root = str(jobs.resolve(strict=False))
+        queue = self._dependency_queues.get(root)
+        if not queue:
+            return any(item_root == root for item_root, _attempt in self._invalidated_owners)
+        checked = 0
+        invalidated = False
+        while queue and checked < _SETTLED_DEPENDENCY_CHECKS_PER_PASS:
+            key = queue.popleft()
+            self._dependency_queued.discard(key)
+            entry = self._settled.get(key)
+            if entry is None:
+                continue
+            checked += 1
+            if not self._dependencies_current(entry):
+                self._metrics["dependency_invalidations"] += 1
+                self._invalidated_owners.add(key)
+                self.forget_owner(jobs, key[1])
+                invalidated = True
+                continue
+            self._queue_settled_dependency_check(key)
+        return bool(queue) or invalidated
 
     def forget_owner(self, jobs: Path, attempt_id: str):
         key = (str(jobs.resolve(strict=False)), attempt_id)
@@ -805,14 +840,10 @@ class OwnerSettlementReadContext:
                     return True
             except Exception:
                 return True
-        pass_generations = {}
-        for (jobs_key, attempt), entry in tuple(self._settled.items()):
-            if jobs_key == key and not self._dependencies_current(entry, pass_generations):
-                self._metrics["dependency_invalidations"] += 1
-                self._invalidated_owners.add((jobs_key, attempt))
-                self.forget_owner(jobs, attempt)
-                return True
-        return False
+        # Registry changes select only their related owner rows. Check a
+        # bounded rotating dependency batch on unchanged passes so settled
+        # history does not add work behind unrelated appends.
+        return self._validate_settled_dependency_batch(jobs)
 
     def cached_signatures(self, jobs: Path):
         prior = self._seen.get(str(jobs.resolve(strict=False)))
