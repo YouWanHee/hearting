@@ -251,8 +251,10 @@ class NoticeWatcher:
 
     def _candidate_paths(self, _directory: Path | None = None) -> list[tuple[Path, str]]:
         """Rotate a bounded set of open records currently addressed to this session."""
+        recipient_kind = (CODEX_QUEUE_PARENT_DELIVERY if getattr(self.args, "queue_socket", None)
+                          else MANAGED_SESSION_PARENT_DELIVERY)
         records, _count = dispatch_session_sweep.addressed_records(
-            self.root, "codex-native-queue", self.recipient)
+            self.root, recipient_kind, self.recipient)
         eligible = []
         for record in records:
             storage_key = record.get(dispatch_session_sweep.STORAGE_KEY)
@@ -300,6 +302,9 @@ class NoticeWatcher:
             else:
                 storage_epoch = (self.epoch if storage_key == self.recipient
                                  else int(record.get("session_generation") or 0))
+                # Validation may raise supervision-resolved. Its cleanup path
+                # must claim the same storage row with this exact generation.
+                claim_epoch = storage_epoch
                 expected_attempts = set(record.get("attempt_ids") or ())
                 if not expected_attempts and storage_key == self.recipient:
                     expected_attempts = self.attempts
@@ -310,7 +315,8 @@ class NoticeWatcher:
                     expected_attempts=expected_attempts,
                     expected_sealed_batch_id=str(receipt.get("sealed_batch_id") or ""),
                 )
-            claim_epoch = storage_epoch if receipt.get("kind") != "notice" else self.epoch
+            if receipt.get("kind") == "notice":
+                claim_epoch = self.epoch
             target = (queue_target(self.args.jobs, self.attempts, self.recipient,
                                    record=record, storage_key=storage_key)
                       if queue_socket else "")
@@ -972,7 +978,8 @@ def queue_target(jobs: Path, attempts: set[str], registered: str, *,
             return ""
         try:
             import dispatch_seat_handover as handover
-            recipient = handover.record_recipient(record, storage_key, harness="codex")
+            recipient = handover.record_recipient(
+                record, storage_key, harness="codex", jobs=jobs)
             if not recipient:
                 return ""
             receipt = record.get("receipt") if isinstance(record, dict) else None

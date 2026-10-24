@@ -585,7 +585,8 @@ class M4LeaseRecovery(GatewayFixture):
         self.one(untyped)
         self.assertEqual(self.transport_calls, 1)
         self.assertEqual(self.record()["state"], "claimed")
-        self.assertIn(self.path, self.watcher._candidate_paths(self.path.parent))
+        self.assertIn((self.path, self.f.thread_id),
+                      self.watcher._candidate_paths(self.path.parent))
         self.assertIn("gateway-rejection-untyped", self.watcher.errors[-1])
 
     def test_m3d2_unconfirmed_rejection_is_not_terminal(self):

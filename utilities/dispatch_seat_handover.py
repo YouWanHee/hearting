@@ -1154,7 +1154,7 @@ def effective_parent_harness(meta: dict, jobs=None, *, read_context=None) -> str
 
 
 def record_recipient(record: dict, storage_key: str, *, harness: str,
-                     read_context=None) -> Optional[str]:
+                     jobs=None, read_context=None) -> Optional[str]:
     """Resolve one stored record through its immutable identity and current lineage.
 
     Route-free notices use their validated receipt and the storage SID's chain.
@@ -1178,7 +1178,7 @@ def record_recipient(record: dict, storage_key: str, *, harness: str,
     _end, lineage_state = chain_end(harness, storage_key, read_context=read_context)
     if lineage_state == "unresolved":
         return None
-    jobs = _default_jobs()
+    jobs = Path(jobs) if jobs is not None else _default_jobs()
     if jobs is None:
         return None
     latest = latest_rows(jobs)

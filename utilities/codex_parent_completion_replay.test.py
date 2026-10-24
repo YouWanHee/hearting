@@ -1653,6 +1653,7 @@ class NativeAcceptanceFixtureTests(unittest.TestCase):
                 pending, "ack", side_effect=ack_after_exact_consumption))
             watcher._one(late_path)
 
+        self.assertFalse(watcher.errors, list(watcher.errors))
         late_send.assert_called_once()
         self.assertEqual(late_send.call_args.kwargs["message"], notice_text)
         self.assertTrue(late_send.call_args.kwargs["require_message_match"])

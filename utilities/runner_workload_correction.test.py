@@ -635,13 +635,18 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                 counts["batch_activation_calls"] += 1
             return None
 
-        def checked_reconcile(store, duties=None, *, read_context=None):
+        def checked_reconcile(store, duties=None, *, read_context=None,
+                              notice_selection=None, runner_incarnation=None):
             if monitoring[0] and phase[0] == "runner":
                 counts["passes"] += 1
                 counts["passes_after_input" if event else "passes_before_input"] += 1
             cpu_started = time.process_time()
             try:
-                return original_reconcile(store, duties, read_context=read_context)
+                return original_reconcile(
+                    store, duties, read_context=read_context,
+                    notice_selection=notice_selection,
+                    runner_incarnation=runner_incarnation,
+                )
             finally:
                 if monitoring[0] and phase[0] == "runner":
                     counts["reconcile_cpu_seconds"] += time.process_time() - cpu_started

@@ -97,8 +97,10 @@ class HistoryTests(unittest.TestCase):
             {"event": "start", "harness": "claude", "sid": "A", "ts": 1, "first_seen": 1},
             {"event": "start", "harness": "claude", "sid": "C", "ts": 2, "first_seen": 2},
             {"event": "start", "harness": "claude", "sid": "B", "ts": 3, "first_seen": 3},
-            {"event": "handover", "harness": "claude", "sid": "B", "from": "A"},
-            {"event": "succession", "harness": "claude", "sid": "B", "from": "C"},
+            {"event": "handover", "harness": "claude", "sid": "B", "from": "A",
+             "source": "clear"},
+            {"event": "succession", "harness": "claude", "sid": "B", "from": "C",
+             "source": "tidy-clear"},
         ]
         lineage = viewer.session_tidy._project_seat_lineage(rows, {}, {}, sid="B")
         self.assertEqual(lineage[0]["relation"], "unknown")
