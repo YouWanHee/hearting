@@ -2921,211 +2921,213 @@ def recall(query, tier=None, scope=None, cwd=None, sessions=False, limit=20,
 
     con = get_con() if touch else _migration_read_connection()
     try:
-        encc = project_key(Path.cwd()) if cwd else None
+        try:
+            encc = project_key(Path.cwd()) if cwd else None
 
-        # Build the WHERE clause.
-        def build_where(base_cond=None):
-            conds, p = [], []
-            if base_cond:
-                conds.append(base_cond[0]); p.extend(base_cond[1])
-            if tier:
-                conds.append("r.tier=?"); p.append(tier)
-            if scope:
-                conds.append("r.scope=?"); p.append(scope)
-            if encc:
-                conds.append("(r.scope='global' OR r.cwd_origin=?)"); p.append(encc)
-            if not include_superseded:
-                conds.append("r.status='active'")
-                conds.append(_unexpired_sql("r")); p.append(today())
-            if topic:
-                conds.append("EXISTS (SELECT 1 FROM record_topics rt "
-                             "WHERE rt.record_id=r.id AND rt.topic=?)")
-                p.append(topic.casefold())
-            # Exclude injection-flagged records across every retrieval path.
-            conds.append("(r.injection_flag=0 OR r.injection_flag IS NULL)")
-            return (" AND ".join(conds) if conds else "1"), p
+            # Build the WHERE clause.
+            def build_where(base_cond=None):
+                conds, p = [], []
+                if base_cond:
+                    conds.append(base_cond[0]); p.extend(base_cond[1])
+                if tier:
+                    conds.append("r.tier=?"); p.append(tier)
+                if scope:
+                    conds.append("r.scope=?"); p.append(scope)
+                if encc:
+                    conds.append("(r.scope='global' OR r.cwd_origin=?)"); p.append(encc)
+                if not include_superseded:
+                    conds.append("r.status='active'")
+                    conds.append(_unexpired_sql("r")); p.append(today())
+                if topic:
+                    conds.append("EXISTS (SELECT 1 FROM record_topics rt "
+                                 "WHERE rt.record_id=r.id AND rt.topic=?)")
+                    p.append(topic.casefold())
+                # Exclude injection-flagged records across every retrieval path.
+                conds.append("(r.injection_flag=0 OR r.injection_flag IS NULL)")
+                return (" AND ".join(conds) if conds else "1"), p
 
-        has_fts = con.execute(
-            "SELECT name FROM sqlite_master WHERE name='records_fts'").fetchone()
+            has_fts = con.execute(
+                "SELECT name FROM sqlite_master WHERE name='records_fts'").fetchone()
 
-        def _fts_literal(q):
-            """Treat FTS5 operators in the query as a literal phrase."""
-            return '"' + q.replace('"', '""') + '"'
+            def _fts_literal(q):
+                """Treat FTS5 operators in the query as a literal phrase."""
+                return '"' + q.replace('"', '""') + '"'
 
-        # -------------------------------------------------------
-        # Normalize all retrieval paths to one nine-field tuple and rank by
-        # retrieval bucket, score, then descending strength.
-        # -------------------------------------------------------
-        tagged = []  # (bucket, score, -strength, row_9tuple)
-        seen_ids: set = set()
+            # -------------------------------------------------------
+            # Normalize all retrieval paths to one nine-field tuple and rank by
+            # retrieval bucket, score, then descending strength.
+            # -------------------------------------------------------
+            tagged = []  # (bucket, score, -strength, row_9tuple)
+            seen_ids: set = set()
 
-        # Bucket 0: compact retrieval capsule (headline/aliases/entities/topics/
-        # artifact pointers/canonical id). Body search remains a compatibility
-        # fallback and is intentionally ranked after capsule evidence.
-        has_capsule = con.execute(
-            "SELECT name FROM sqlite_master WHERE name='records_capsule_fts'").fetchone()
-        if has_capsule:
-            tokens = _tokenize_query(query)
-            capsule_expr = " OR ".join(tokens) if tokens else _fts_literal(query)
-            try:
-                where_c, params_c = build_where(("records_capsule_fts MATCH ?", [capsule_expr]))
-                sql_c = (f"SELECT r.id,r.tier,r.scope,r.type,r.cwd_origin,"
-                         f"COALESCE(NULLIF(r.headline,''),substr(r.body,1,160)),"
-                         f"r.strength,bm25(records_capsule_fts) AS score,r.delivery_state "
-                         f"FROM records_capsule_fts c JOIN records r ON r.id=c.id "
-                         f"WHERE {where_c} ORDER BY bm25(records_capsule_fts) LIMIT ?")
-                for row in con.execute(sql_c, params_c + [limit * 3]).fetchall():
-                    if row[0] not in seen_ids:
-                        seen_ids.add(row[0])
-                        tagged.append((0, row[7], -(row[6] or 1), row))
-            except sqlite3.OperationalError:
-                pass
+            # Bucket 0: compact retrieval capsule (headline/aliases/entities/topics/
+            # artifact pointers/canonical id). Body search remains a compatibility
+            # fallback and is intentionally ranked after capsule evidence.
+            has_capsule = con.execute(
+                "SELECT name FROM sqlite_master WHERE name='records_capsule_fts'").fetchone()
+            if has_capsule:
+                tokens = _tokenize_query(query)
+                capsule_expr = " OR ".join(tokens) if tokens else _fts_literal(query)
+                try:
+                    where_c, params_c = build_where(("records_capsule_fts MATCH ?", [capsule_expr]))
+                    sql_c = (f"SELECT r.id,r.tier,r.scope,r.type,r.cwd_origin,"
+                             f"COALESCE(NULLIF(r.headline,''),substr(r.body,1,160)),"
+                             f"r.strength,bm25(records_capsule_fts) AS score,r.delivery_state "
+                             f"FROM records_capsule_fts c JOIN records r ON r.id=c.id "
+                             f"WHERE {where_c} ORDER BY bm25(records_capsule_fts) LIMIT ?")
+                    for row in con.execute(sql_c, params_c + [limit * 3]).fetchall():
+                        if row[0] not in seen_ids:
+                            seen_ids.add(row[0])
+                            tagged.append((0, row[7], -(row[6] or 1), row))
+                except sqlite3.OperationalError:
+                    pass
 
-        if has_fts:
-            # Bucket 1: unicode61 body MATCH with literal fallback.
-            tokens = _tokenize_query(query)
-            match_expr = " OR ".join(tokens) if tokens else _fts_literal(query)
-            try:
-                where, params = build_where(("records_fts MATCH ?", [match_expr]))
-                sql = (f"SELECT r.id, r.tier, r.scope, r.type, r.cwd_origin, "
-                       f"snippet(records_fts,1,'»','«','…',12), "
-                       f"r.strength, bm25(records_fts) AS score, r.delivery_state "
-                       f"FROM records_fts f JOIN records r ON r.id=f.id "
-                       f"WHERE {where} ORDER BY bm25(records_fts) LIMIT ?")
-                fts_rows = con.execute(sql, params + [limit * 3]).fetchall()
-                for row in fts_rows:
-                    rid8 = row[0]
-                    if rid8 not in seen_ids:
-                        seen_ids.add(rid8)
-                        tagged.append((1, row[7], -(row[6] or 1), row))
+            if has_fts:
+                # Bucket 1: unicode61 body MATCH with literal fallback.
+                tokens = _tokenize_query(query)
+                match_expr = " OR ".join(tokens) if tokens else _fts_literal(query)
+                try:
+                    where, params = build_where(("records_fts MATCH ?", [match_expr]))
+                    sql = (f"SELECT r.id, r.tier, r.scope, r.type, r.cwd_origin, "
+                           f"snippet(records_fts,1,'»','«','…',12), "
+                           f"r.strength, bm25(records_fts) AS score, r.delivery_state "
+                           f"FROM records_fts f JOIN records r ON r.id=f.id "
+                           f"WHERE {where} ORDER BY bm25(records_fts) LIMIT ?")
+                    fts_rows = con.execute(sql, params + [limit * 3]).fetchall()
+                    for row in fts_rows:
+                        rid8 = row[0]
+                        if rid8 not in seen_ids:
+                            seen_ids.add(rid8)
+                            tagged.append((1, row[7], -(row[6] or 1), row))
 
-                # Bucket 2: CJK bigram shadow — ranked substring matching (W4).
-                # The query is re-expressed as bigram phrases; snippets come
-                # from the original body, never the shadow transform.
-                if _has_cjk(query) and _CJK_OK:
-                    has_cjk_tbl = con.execute(
-                        "SELECT name FROM sqlite_master WHERE name='records_cjk'").fetchone()
-                    cjk_expr = _cjk_query_expr(query)
-                    if has_cjk_tbl and cjk_expr:
-                        try:
-                            where2, params2 = build_where(("records_cjk MATCH ?", [cjk_expr]))
-                            sql2 = (f"SELECT r.id, r.tier, r.scope, r.type, r.cwd_origin, "
-                                    f"substr(r.body,1,160), "
-                                    f"r.strength, bm25(records_cjk) AS score, r.delivery_state "
-                                    f"FROM records_cjk t JOIN records r ON r.id=t.id "
-                                    f"WHERE {where2} ORDER BY bm25(records_cjk) LIMIT ?")
-                            cjk_rows = con.execute(sql2, params2 + [limit * 3]).fetchall()
-                            for tr in cjk_rows:
-                                if tr[0] not in seen_ids:
-                                    seen_ids.add(tr[0])
-                                    tagged.append((2, tr[7], -(tr[6] or 1), tr))
-                        except sqlite3.OperationalError:
-                            pass
-                elif _has_cjk(query) and not _CJK_OK:
-                    # Bucket 2: unranked LIKE only when the shadow index is unavailable.
+                    # Bucket 2: CJK bigram shadow — ranked substring matching (W4).
+                    # The query is re-expressed as bigram phrases; snippets come
+                    # from the original body, never the shadow transform.
+                    if _has_cjk(query) and _CJK_OK:
+                        has_cjk_tbl = con.execute(
+                            "SELECT name FROM sqlite_master WHERE name='records_cjk'").fetchone()
+                        cjk_expr = _cjk_query_expr(query)
+                        if has_cjk_tbl and cjk_expr:
+                            try:
+                                where2, params2 = build_where(("records_cjk MATCH ?", [cjk_expr]))
+                                sql2 = (f"SELECT r.id, r.tier, r.scope, r.type, r.cwd_origin, "
+                                        f"substr(r.body,1,160), "
+                                        f"r.strength, bm25(records_cjk) AS score, r.delivery_state "
+                                        f"FROM records_cjk t JOIN records r ON r.id=t.id "
+                                        f"WHERE {where2} ORDER BY bm25(records_cjk) LIMIT ?")
+                                cjk_rows = con.execute(sql2, params2 + [limit * 3]).fetchall()
+                                for tr in cjk_rows:
+                                    if tr[0] not in seen_ids:
+                                        seen_ids.add(tr[0])
+                                        tagged.append((2, tr[7], -(tr[6] or 1), tr))
+                            except sqlite3.OperationalError:
+                                pass
+                    elif _has_cjk(query) and not _CJK_OK:
+                        # Bucket 2: unranked LIKE only when the shadow index is unavailable.
+                        where_l, params_l = build_where()
+                        where_l = (where_l + " AND r.body LIKE ?") if where_l != "1" else "r.body LIKE ?"
+                        sql_l = (f"SELECT r.id, r.tier, r.scope, r.type, r.cwd_origin, "
+                                 f"substr(r.body,1,160), r.strength, 0.0 AS score, r.delivery_state "
+                                 f"FROM records r WHERE {where_l} LIMIT ?")
+                        like_rows = con.execute(sql_l, params_l + [f"%{query}%", limit * 3]).fetchall()
+                        for lr in like_rows:
+                            if lr[0] not in seen_ids:
+                                seen_ids.add(lr[0])
+                                tagged.append((3, lr[7], -(lr[6] or 1), lr))
+                except sqlite3.OperationalError:
+                    # Fall back to LIKE when FTS MATCH fails.
                     where_l, params_l = build_where()
                     where_l = (where_l + " AND r.body LIKE ?") if where_l != "1" else "r.body LIKE ?"
                     sql_l = (f"SELECT r.id, r.tier, r.scope, r.type, r.cwd_origin, "
                              f"substr(r.body,1,160), r.strength, 0.0 AS score, r.delivery_state "
                              f"FROM records r WHERE {where_l} LIMIT ?")
-                    like_rows = con.execute(sql_l, params_l + [f"%{query}%", limit * 3]).fetchall()
-                    for lr in like_rows:
-                        if lr[0] not in seen_ids:
-                            seen_ids.add(lr[0])
-                            tagged.append((3, lr[7], -(lr[6] or 1), lr))
-            except sqlite3.OperationalError:
-                # Fall back to LIKE when FTS MATCH fails.
+                    err_rows = con.execute(sql_l, params_l + [f"%{query}%", limit * 3]).fetchall()
+                    for er in err_rows:
+                        if er[0] not in seen_ids:
+                            seen_ids.add(er[0])
+                            tagged.append((3, er[7], -(er[6] or 1), er))
+            else:
+                # No FTS: use LIKE.
                 where_l, params_l = build_where()
                 where_l = (where_l + " AND r.body LIKE ?") if where_l != "1" else "r.body LIKE ?"
                 sql_l = (f"SELECT r.id, r.tier, r.scope, r.type, r.cwd_origin, "
                          f"substr(r.body,1,160), r.strength, 0.0 AS score, r.delivery_state "
                          f"FROM records r WHERE {where_l} LIMIT ?")
-                err_rows = con.execute(sql_l, params_l + [f"%{query}%", limit * 3]).fetchall()
-                for er in err_rows:
-                    if er[0] not in seen_ids:
-                        seen_ids.add(er[0])
-                        tagged.append((3, er[7], -(er[6] or 1), er))
-        else:
-            # No FTS: use LIKE.
-            where_l, params_l = build_where()
-            where_l = (where_l + " AND r.body LIKE ?") if where_l != "1" else "r.body LIKE ?"
-            sql_l = (f"SELECT r.id, r.tier, r.scope, r.type, r.cwd_origin, "
-                     f"substr(r.body,1,160), r.strength, 0.0 AS score, r.delivery_state "
-                     f"FROM records r WHERE {where_l} LIMIT ?")
-            nofts_rows = con.execute(sql_l, params_l + [f"%{query}%", limit * 3]).fetchall()
-            for nr in nofts_rows:
-                if nr[0] not in seen_ids:
-                    seen_ids.add(nr[0])
-                    tagged.append((3, nr[7], -(nr[6] or 1), nr))
-    finally:
-        if touch:
-            con.close()
-
-    # Lexicographic rank: bucket, ascending score, then descending strength.
-    ranked = sorted(tagged, key=lambda e: (e[0], e[1], e[2]))
-    rows_final = [e[3] for e in ranked]
-
-    full_bodies = {}
-    if full and rows_final:
-        con_body = get_con() if touch else con
-        try:
-            ids = [row[0] for row in rows_final[:limit]]
-            ph = ",".join("?" for _ in ids)
-            fence, fence_params = _visibility_clause(
-                "", all_projects=not bool(cwd), include_superseded=include_superseded)
-            full_bodies = dict(con_body.execute(
-                f"SELECT id, body FROM records WHERE id IN ({ph}) AND {fence}",
-                [*ids, *fence_params]).fetchall())
+                nofts_rows = con.execute(sql_l, params_l + [f"%{query}%", limit * 3]).fetchall()
+                for nr in nofts_rows:
+                    if nr[0] not in seen_ids:
+                        seen_ids.add(nr[0])
+                        tagged.append((3, nr[7], -(nr[6] or 1), nr))
         finally:
             if touch:
-                con_body.close()
+                con.close()
 
-    # Preserve the legacy five-field return while retaining auxiliary output fields.
-    hit_ids = []
-    hit_states = {}
-    for rid, rt, rs, rtype, cwd_orig, snip, _strength, _score, state in rows_final[:limit]:
-        rendered = full_bodies.get(rid, snip) if full else snip.replace("\n", " ")
-        hits.append((rt, rs, rtype, rid, rendered))
-        hit_ids.append(rid)
-        hit_states[rid] = state or "ordinary"
+        # Lexicographic rank: bucket, ascending score, then descending strength.
+        ranked = sorted(tagged, key=lambda e: (e[0], e[1], e[2]))
+        rows_final = [e[3] for e in ranked]
 
-    # Recall updates last_accessed as a cold-decay signal, but remains fail-open.
-    if touch:
-        _touch_records(hit_ids)
-    else:
-        con.close()
-    if touch:
-        _append_recall_event({
-            "at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "event": "explicit-recall",
-            "runtime": os.environ.get("MEM_RECALL_RUNTIME", "unknown"),
-            "result_count": len(hit_ids),
-            "accessed_ids": hit_ids,
-            "full": bool(full),
-            "sessions": bool(sessions),
-            "topic": topic or "",
-            "include_superseded": bool(include_superseded),
-            "gate_id": gate_id or "",
-        })
+        full_bodies = {}
+        if full and rows_final:
+            con_body = get_con() if touch else con
+            try:
+                ids = [row[0] for row in rows_final[:limit]]
+                ph = ",".join("?" for _ in ids)
+                fence, fence_params = _visibility_clause(
+                    "", all_projects=not bool(cwd), include_superseded=include_superseded)
+                full_bodies = dict(con_body.execute(
+                    f"SELECT id, body FROM records WHERE id IN ({ph}) AND {fence}",
+                    [*ids, *fence_params]).fetchall())
+            finally:
+                if touch:
+                    con_body.close()
 
-    if json_output:
-        print(json.dumps({"results": [
-            {"tier": rt, "scope": rs, "type": rtype, "id": rid,
-             "delivery_state": hit_states.get(rid, "ordinary"), "body": snip}
-            for rt, rs, rtype, rid, snip in hits]}, sort_keys=True, ensure_ascii=False))
-    else:
-        if not hits:
-            print("(no store matches)")
-        for rt, rs, rtype, rid, snip in hits:
-            identifier = f"[pending:{rid}]" if hit_states.get(rid) == "pending" else rid
-            if full:
-                print(f"  [{rt}/{rs}/{rtype}] {identifier}:\n{snip}")
-            else:
-                print(f"  [{rt}/{rs}/{rtype}] {identifier}: {snip}")
-    if sessions:
-        print(f"\n# raw session transcript: \"{query}\"  (unrefined)")
-        _recall_sessions(query, cwd)
-    return hits
+        # Preserve the legacy five-field return while retaining auxiliary output fields.
+        hit_ids = []
+        hit_states = {}
+        for rid, rt, rs, rtype, cwd_orig, snip, _strength, _score, state in rows_final[:limit]:
+            rendered = full_bodies.get(rid, snip) if full else snip.replace("\n", " ")
+            hits.append((rt, rs, rtype, rid, rendered))
+            hit_ids.append(rid)
+            hit_states[rid] = state or "ordinary"
+
+        # Recall updates last_accessed as a cold-decay signal, but remains fail-open.
+        if touch:
+            _touch_records(hit_ids)
+        if touch:
+            _append_recall_event({
+                "at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "event": "explicit-recall",
+                "runtime": os.environ.get("MEM_RECALL_RUNTIME", "unknown"),
+                "result_count": len(hit_ids),
+                "accessed_ids": hit_ids,
+                "full": bool(full),
+                "sessions": bool(sessions),
+                "topic": topic or "",
+                "include_superseded": bool(include_superseded),
+                "gate_id": gate_id or "",
+            })
+
+        if json_output:
+            print(json.dumps({"results": [
+                {"tier": rt, "scope": rs, "type": rtype, "id": rid,
+                 "delivery_state": hit_states.get(rid, "ordinary"), "body": snip}
+                for rt, rs, rtype, rid, snip in hits]}, sort_keys=True, ensure_ascii=False))
+        else:
+            if not hits:
+                print("(no store matches)")
+            for rt, rs, rtype, rid, snip in hits:
+                identifier = f"[pending:{rid}]" if hit_states.get(rid) == "pending" else rid
+                if full:
+                    print(f"  [{rt}/{rs}/{rtype}] {identifier}:\n{snip}")
+                else:
+                    print(f"  [{rt}/{rs}/{rtype}] {identifier}: {snip}")
+        if sessions:
+            print(f"\n# raw session transcript: \"{query}\"  (unrefined)")
+            _recall_sessions(query, cwd)
+        return hits
+    finally:
+        if not touch:
+            con.close()
 
 
 def recall_gate(decision=None, reason="", query=None, *, outcome=None, gate_id=None,

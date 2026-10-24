@@ -100,6 +100,50 @@ class NoTouchCliTest(unittest.TestCase):
         self.assertEqual(self.snapshot(self.paths), before)
         self.assertEqual(set(Path("/tmp").glob("hearting-migration-ro-*")), clones_before)
 
+    def _assert_no_touch_recall_exception_cleans_wal_clone(self, failure_stage):
+        writer = sqlite3.connect(self.store / "memory.db")
+        self.addCleanup(writer.close)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("UPDATE records SET body='no-touch fixture body with WAL' WHERE id=?",
+                       (self.rid,))
+        writer.commit()
+        before = self.snapshot(self.paths)
+        code = '''
+import os
+from pathlib import Path
+import mem
+
+clones_before = set(Path("/tmp").glob("hearting-migration-ro-*"))
+if os.environ["FAIL_STAGE"] == "search":
+    def fail_search(_query):
+        raise RuntimeError("forced search failure")
+    mem._tokenize_query = fail_search
+else:
+    def fail_full_body(*args, **kwargs):
+        raise RuntimeError("forced full-body failure")
+    mem._visibility_clause = fail_full_body
+try:
+    mem.recall("no-touch fixture", full=True, touch=False)
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("the requested failure was not raised")
+assert set(Path("/tmp").glob("hearting-migration-ro-*")) == clones_before
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", code], cwd=MEM.parent,
+            env=self._environment(FAIL_STAGE=failure_stage), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.snapshot(self.paths), before)
+
+    def test_no_touch_recall_search_exception_removes_wal_clone(self):
+        self._assert_no_touch_recall_exception_cleans_wal_clone("search")
+
+    def test_no_touch_recall_full_body_exception_removes_wal_clone(self):
+        self._assert_no_touch_recall_exception_cleans_wal_clone("full-body")
+
     def test_concurrent_wal_appends_return_one_complete_read_snapshot(self):
         ready = threading.Event()
         finished = threading.Event()
