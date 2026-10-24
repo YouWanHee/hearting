@@ -644,26 +644,20 @@ def _spawn_carrier(source, jobs, attempt, state_root, data_root, case_root):
 
 
 def _carrier_ready(consumers, candidate, state_root):
-    if candidate:
-        records = []
-        for path in (Path(state_root) / "peer-steward" / "obligations").glob("*.json"):
-            record = _read_json(path) or {}
-            intent = record.get("intent") or {}
-            observation = record.get("observation") or {}
-            if intent.get("kind") == "readiness-observation":
-                records.append(observation)
-        pending = [row for row in records
-                   if row.get("readiness_state") == "pending"
-                   and isinstance(row.get("shared_readiness"), dict)]
-        return len(pending) >= len(consumers)
-    for consumer in consumers:
-        events = _read_jsonl(consumer["helper_log"])
-        if not events or (events[-1].get("result") or {}).get("state") != "pending":
-            return False
-        stat = _proc_stat(consumer["process"].pid)
-        if stat is None or stat["cutime"] + stat["cstime"] <= 0:
-            return False
-    return True
+    # Both the measured baseline and candidate use the shared runner. Observe
+    # the same pending projection boundary on each side; the baseline carrier
+    # no longer launches a standalone readiness helper subprocess.
+    records = []
+    for path in (Path(state_root) / "peer-steward" / "obligations").glob("*.json"):
+        record = _read_json(path) or {}
+        intent = record.get("intent") or {}
+        observation = record.get("observation") or {}
+        if intent.get("kind") == "readiness-observation":
+            records.append(observation)
+    pending = [row for row in records
+               if row.get("readiness_state") == "pending"
+               and isinstance(row.get("shared_readiness"), dict)]
+    return len(pending) >= len(consumers)
 
 
 def _wait_processes(processes, timeout):
