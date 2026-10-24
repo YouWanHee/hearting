@@ -6,6 +6,8 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 
@@ -14,7 +16,149 @@ sys.path.insert(0, str(ROOT / "utilities"))
 import opencode_runtime as runtime
 
 
+def write_detached_version_cli(script: Path, pid_file: Path, *, hang: bool = False) -> None:
+    detached = (
+        "import os,pathlib,time\n"
+        "if os.fork(): os._exit(0)\n"
+        "os.setsid()\n"
+        "if os.fork(): os._exit(0)\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+    )
+    source = (
+        "#!/usr/bin/env python3\nimport pathlib,subprocess,sys,time\n"
+        f"subprocess.Popen([sys.executable,'-c',{detached!r}],env={{}})\n"
+        f"pid_file=pathlib.Path({str(pid_file)!r})\n"
+        "deadline=time.monotonic()+2\n"
+        "while not pid_file.exists() and time.monotonic()<deadline: time.sleep(.001)\n"
+        "print('opencode 2.0.32',flush=True)\n"
+        + ("time.sleep(30)\n" if hang else "")
+    )
+    script.write_text(source, encoding="utf-8")
+    script.chmod(0o700)
+
+
 class OpenCodeRunCodecTest(unittest.TestCase):
+    def test_launch_version_probe_uses_private_store_and_rejects_bad_versions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            script.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, pathlib, sys\n"
+                "assert pathlib.Path(os.environ['HOME']).is_relative_to(pathlib.Path(os.environ['TMPDIR']))\n"
+                "assert os.environ['XDG_DATA_HOME'] != '/user/data'\n"
+                "assert 'secret' not in os.environ\n"
+                "print('opencode 2.0.32')\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            version = runtime.probe_launch_version(
+                binary=str(script), cwd=temp, state_root=root,
+                environ={"PATH": os.environ.get("PATH", ""), "HOME": "/user",
+                         "XDG_DATA_HOME": "/user/data", "OPENAI_API_KEY": "secret"},
+            )
+            self.assertEqual(version, (2, 0, 32))
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_launch_version_probe_fails_closed_for_nonzero_or_malformed_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            for body in ("print('not a version')\n", "print('opencode 2.0.32')\nsys.exit(1)\n"):
+                script.write_text("#!/usr/bin/env python3\nimport sys\n" + body, encoding="utf-8")
+                script.chmod(0o700)
+                with self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                            "opencode-runtime-version-unavailable"):
+                    runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+
+    def test_launch_version_probe_rejects_truncation_and_caps_capture_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            script.write_text(
+                "#!/usr/bin/env python3\nimport os, pathlib, sys, time\n"
+                "target = pathlib.Path(os.environ['TMPDIR']) / 'version.out'\n"
+                "sys.stdout.write('opencode 2.0.32\\n'); sys.stdout.flush()\n"
+                "deadline = time.monotonic() + 1\n"
+                "while target.stat().st_size < 16 and time.monotonic() < deadline: time.sleep(.001)\n"
+                "sys.stdout.write('x' * (512 * 1024)); sys.stdout.flush()\n"
+                "deadline = time.monotonic() + 1\n"
+                "while target.stat().st_size < 32 and time.monotonic() < deadline: time.sleep(.001)\n"
+                "time.sleep(.02)\n"
+                "pathlib.Path.cwd().joinpath('capture-size.txt').write_text(str(target.stat().st_size))\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            with unittest.mock.patch.object(runtime, "VERSION_PROBE_OUTPUT_LIMIT", 32), \
+                    self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                           "opencode-runtime-version-unavailable"):
+                runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+            self.assertEqual(int((Path(temp) / "capture-size.txt").read_text()), 32)
+            script.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                "sys.stdout.write('x' * 64 + '\\nopencode 2.0.32\\n')\n",
+                encoding="utf-8",
+            )
+            with unittest.mock.patch.object(runtime, "VERSION_PROBE_OUTPUT_LIMIT", 32), \
+                    self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                           "opencode-runtime-version-unavailable"):
+                runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_launch_version_probe_reaps_double_fork_setsid_descendant_after_normal_exit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            pid_file = Path(temp) / "detached-pid"
+            script = Path(temp) / "opencode"
+            write_detached_version_cli(script, pid_file)
+            self.assertEqual(runtime.probe_launch_version(
+                binary=str(script), cwd=temp, state_root=root), (2, 0, 32))
+            pid = int(pid_file.read_text())
+            self.assertFalse(Path(f"/proc/{pid}").exists())
+            self.assertFalse(any(thread.name == "opencode-version-probe-output" and thread.is_alive()
+                                 for thread in threading.enumerate()))
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_launch_version_probe_timeout_reaps_double_fork_setsid_descendant(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            pid_file = Path(temp) / "timeout-detached-pid"
+            script = Path(temp) / "opencode"
+            write_detached_version_cli(script, pid_file, hang=True)
+            with self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                        "opencode-runtime-version-unavailable"):
+                runtime.probe_launch_version(binary=str(script), cwd=temp,
+                                             state_root=root, timeout=0.1)
+            pid = int(pid_file.read_text())
+            self.assertFalse(Path(f"/proc/{pid}").exists())
+            self.assertFalse(any(thread.name == "opencode-version-probe-output" and thread.is_alive()
+                                 for thread in threading.enumerate()))
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_launch_version_probe_rejects_valid_output_from_a_stopped_lease(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            script.write_text(
+                "#!/usr/bin/env python3\nimport os,signal,time\n"
+                "print('opencode 2.0.32',flush=True)\n"
+                "os.kill(os.getppid(),signal.SIGTERM)\n"
+                "time.sleep(30)\n")
+            script.chmod(0o700)
+            with self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                        "opencode-runtime-version-unavailable"):
+                runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertFalse(any(thread.name == "opencode-version-probe-output" and thread.is_alive()
+                                 for thread in threading.enumerate()))
+
     def test_v1_flags_and_v2_provider_variant_are_separate(self):
         v1 = runtime.run_argv(binary="opencode", cwd="/work", agent="build",
                               model="opencode-go/model", variant="high", pure=True,
