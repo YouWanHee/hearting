@@ -68,6 +68,13 @@ class LeasesTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        # The outer verification environment pins CUDA_VISIBLE_DEVICES empty.
+        # This suite exercises admission with synthetic OBS and mocked observer
+        # boundaries, so remove that explicit CPU choice for its auto-select fixtures.
+        self._cuda_env = mock.patch.dict(os.environ)
+        self._cuda_env.start()
+        self.addCleanup(self._cuda_env.stop)
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         self.state = self.root / "dispatch" / "gpu-leases.json"
         self.no_tmux_bin = self.root / "no-tmux-bin"
         self.no_tmux_bin.mkdir()

@@ -206,7 +206,7 @@ class ComputeRunLauncherIdentityTest(unittest.TestCase):
             args = SimpleNamespace(host="here", command=["python", "-c", "pass"],
                 name="resource-child", cwd=None, env=None, gpus=None, share=True,
                 dry_run=False, json=True)
-            receipt = {"gpus": [], "gpu_lease": None,
+            receipt = {"gpus": "", "gpu_lease": None,
                        "tmux_transport": {"kind": "nohup-v1"}}
             remote = mock.Mock(return_value=SimpleNamespace(
                 returncode=0, stdout=json.dumps(receipt) + "\n", stderr=""))
