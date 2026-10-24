@@ -2671,6 +2671,42 @@ def _wake_watch_observer(arm):
         return False
 
 
+def _wake_current_watch_observer(watch_root, watch_id, identity, *, transition=None,
+                                 readiness_root=None):
+    """Wake only the observer still named by this watch's current arm."""
+    if not isinstance(identity, dict):
+        return False
+    paths = _watch_paths(watch_id, watch_root)
+    if paths.receipt.exists():
+        return False
+    arm = _read_json(paths.arm)
+    if (not isinstance(arm, dict) or arm.get("watch_id") != watch_id
+            or not _watch_readiness_identity_matches_arm(
+                identity, arm, identity.get("native_state"))):
+        return False
+    watcher = arm.get("watcher") or {}
+    if not _pid_identity_ok(watcher.get("pid"), watcher.get("pid_start")):
+        return False
+    if transition is not None:
+        if readiness_root is None:
+            return False
+        observation = _read_json(paths.observation) or {}
+        current = observation.get("readiness_transition")
+        consumer = transition.get("consumer") if isinstance(transition, dict) else None
+        token = transition.get("token") if isinstance(transition, dict) else None
+        if (not isinstance(current, dict) or not isinstance(consumer, dict)
+                or transition.get("identity") != identity
+                or current.get("token") != token
+                or current.get("identity") != identity
+                or current.get("consumer") != consumer
+                or consumer != watcher
+                or not shared_readiness.consumer_is_current({"consumer": consumer})
+                or shared_readiness.watch_transition_result(
+                    readiness_root, watch_id, identity, token) is None):
+            return False
+    return _wake_watch_observer(arm)
+
+
 def _watch_root():
     """`peer-watches/` beside `peer-messages/`, under the one resolved state root.
 
@@ -7583,20 +7619,22 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
                 producer_pid=os.getpid(), producer_start=producer_start,
                 incarnation=incarnation, generation=generation, lineage=lineage)
             if changed:
-                for _watch_id, watch_arm, _transition in consumers:
-                    _wake_watch_observer(watch_arm)
+                for _watch_id, _watch_arm, _transition in consumers:
+                    _wake_current_watch_observer(
+                        root, _watch_id, watch_identity)
             for watch_id, watch_arm, transition in transition_consumers:
                 if (not isinstance(transition, dict)
                         or transition.get("identity") != watch_identity):
                     continue
-                transition_changed = shared_readiness.publish_watch_transition(
+                shared_readiness.publish_watch_transition(
                     store.root, watch_id, watch_identity, transition.get("token"),
                     {"state": transition_state, "reason": transition_reason},
                     producer_pid=os.getpid(), producer_start=producer_start,
                     incarnation=incarnation, generation=transition_generation, lineage=lineage,
                     authority=transition_authority)
-                if transition_changed:
-                    _wake_watch_observer(watch_arm)
+                _wake_current_watch_observer(
+                    root, watch_id, watch_identity, transition=transition,
+                    readiness_root=store.root)
     return True
 
 
