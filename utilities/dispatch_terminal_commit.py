@@ -2091,10 +2091,12 @@ def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | No
         if not gate_choice.allowed:
             result = TerminalCommitResult(gate_choice.next_action, "terminal-marker-not-current", json.dumps(gate_choice.census, sort_keys=True))
         else:
+            from dispatch_resource_wait import supervisor
+            compute_observations = supervisor().resource_failure_observations(ledger)
             with ledger.lock():
-                from dispatch_resource_wait import supervisor
                 supervisor().reconcile_resource_artifacts(route, ledger, request.owner_attempt_id, request.jobs,
-                                                         terminal_gates=gates)
+                                                         terminal_gates=gates,
+                                                         compute_observations=compute_observations)
                 ledger.completion_paths(workflow.route_terminal_nodes(route), gates)
             result = settle_terminal_commit(request)
         if result.result == "completed":

@@ -14,28 +14,29 @@ import resource_run_registry as registry
 
 
 class ResourceRegistryTest(unittest.TestCase):
-    def test_compute_identity_uses_fresh_observation_without_local_pid_probe(self):
-        row = {"execution": {"kind": "compute-hosts", "run_id": "compute-1"},
+    def test_compute_identity_uses_recorded_receipt_without_remote_or_local_probe(self):
+        row = {"execution": {"kind": "compute-hosts", "run_id": "compute-1",
+                             "receipt_state": "finished"},
                "pid": None, "starttime": None, "command_hash": None,
-               "resource_policy": "supervised-owner"}
+               "resource_policy": "supervised-owner", "status": "succeeded"}
         identity_reader = mock.Mock(side_effect=AssertionError("local PID probe"))
         with mock.patch.object(registry, "compute_execution_observation",
-                               return_value={"state": "quiescent", "reason": "fresh-empty"}):
+                               side_effect=AssertionError("remote observation")):
             self.assertEqual(registry.classify_identity(row, identity_reader),
-                             ("exited", None, "fresh-empty"))
-        with mock.patch.object(registry, "compute_execution_observation",
-                               return_value={"state": "unknown", "reason": "evidence-unavailable"}):
-            self.assertEqual(registry.classify_identity(row, identity_reader),
-                             ("stale", None, "evidence-unavailable"))
-        with mock.patch.object(registry, "compute_execution_observation",
-                               return_value={"state": "not-quiescent",
-                                             "reason": "compute-run-process-group-populated"}):
-            self.assertEqual(registry.classify_identity(row, identity_reader),
-                             ("working", None, "compute-run-process-group-populated"))
+                             ("stale", None, "compute-hosts-recorded-state-non-authoritative"))
+            self.assertFalse(registry.is_alive(row, identity_reader))
+            running = {**row, "status": "running", "execution": {**row["execution"],
+                                                                       "receipt_state": "running"}}
+            self.assertEqual(registry.classify_identity(running, identity_reader),
+                             ("working", None, "compute-hosts-recorded-running"))
+            self.assertTrue(registry.is_alive(running, identity_reader))
+            self.assertEqual(registry.normalize_run("resource-1", row, Path("/fixture/registry.json"))["liveness"],
+                             "exited")
         identity_reader.assert_not_called()
         with mock.patch.object(registry, "compute_execution_observation",
-                               return_value={"state": "populated"}):
+                               return_value={"state": "populated"}) as observer:
             self.assertFalse(registry.resource_process_group_quiescent(row))
+            observer.assert_called_once_with(row)
         with mock.patch.object(registry, "compute_execution_observation",
                                return_value={"state": "quiescent"}):
             self.assertTrue(registry.resource_process_group_quiescent(row))

@@ -1764,12 +1764,21 @@ def resource_predecessor_finished(row):
                  or resource_process_group_quiescent(row)))
 
 
-def require_resource_predecessors(rows, candidate):
+def require_resource_predecessors(rows, candidate, *, observations=None):
     """Recheck execution and evidence-address protection within the existing reservation lock."""
     from dispatch_resource_wait import resource_evidence_paths_conflict
-    if any(not resource_predecessor_finished(row) or resource_evidence_paths_conflict(row, candidate)
-           for row in rows):
-        raise ValueError("resource-route-body-conflict")
+    observations = observations or {}
+    for row in rows:
+        execution = row.get("execution") if isinstance(row, dict) else None
+        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+            captured = observations.get(row.get("run_id"))
+            if (not captured or captured.get("row") != row
+                    or captured.get("state") != "quiescent"):
+                raise ValueError("resource-route-body-conflict")
+        elif not resource_predecessor_finished(row):
+            raise ValueError("resource-route-body-conflict")
+        if resource_evidence_paths_conflict(row, candidate):
+            raise ValueError("resource-route-body-conflict")
 
 
 # Same work, another launcher. Never-started work may be taken over by a launcher that runs

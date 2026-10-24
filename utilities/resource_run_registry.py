@@ -284,15 +284,14 @@ def classify_identity(run: dict, identity_reader=proc_identity) -> tuple[str, di
         return "stale", None, "recorded-identity-incomplete"
     execution = run.get("execution")
     if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
-        # Remote identities never fall through to local /proc. Use the shared
-        # fresh host observation so admission, status, and settlement agree.
-        observed = compute_execution_observation(run)
-        if observed.get("state") == "quiescent":
-            return "exited", None, observed.get("reason", "compute-hosts-quiescent")
-        if (observed.get("state") == "not-quiescent"
-                and observed.get("reason") == "compute-run-process-group-populated"):
-            return "working", None, observed["reason"]
-        return "stale", None, observed.get("reason", "compute-hosts-observation-unavailable")
+        # Shared classification is used by surveys and writer-lock callbacks:
+        # it may consume only the recorded receipt and must never probe SSH.
+        # A recorded finished receipt is deliberately stale here; terminal
+        # authority requires the explicit fresh observer at its decision point.
+        receipt_state = execution.get("receipt_state")
+        if receipt_state == "running" and run.get("status") == "running":
+            return "working", None, "compute-hosts-recorded-running"
+        return "stale", None, "compute-hosts-recorded-state-non-authoritative"
     if (not any(run.get(key) is not None for key in IDENTITY_KEYS)
             and resource_never_started(run)):
         return "exited", None, "launcher-recorded-not-started"

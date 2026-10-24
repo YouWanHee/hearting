@@ -143,7 +143,6 @@ def context(args, control):
     import owner_route_binding as OWNER
     from resource_run_registry import (
         compute_execution_identity, resource_never_started,
-        resource_process_group_quiescent,
     )
     route_file = getattr(args, "route_file", "")
     if not route_file or not Path(route_file).is_file():
@@ -175,7 +174,9 @@ def context(args, control):
         expected = {"parent_attempt_id": args.parent_attempt_id, "session_id": control.thread_id,
             "route_id": args.route_id, "route_hash": args.route_hash, "jobs": str(jobs)}
         remote_identity = compute_execution_identity(row)
-        identity_valid = (bool(remote_identity) and resource_process_group_quiescent(row)
+        execution = row.get("execution") if isinstance(row, dict) else None
+        identity_valid = (bool(remote_identity) and isinstance(execution, dict)
+                          and execution.get("receipt_state") in {"running", "finished"}
                           if remote_identity else
                           (controller_intent(row) or resource_never_started(row)
                            or (type(row.get("pid")) is int and row["pid"] > 0

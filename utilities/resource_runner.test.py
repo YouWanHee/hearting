@@ -109,19 +109,29 @@ class ComputeRunAdoptionTest(unittest.TestCase):
 
     def _run_adoption(self, *, cwd="/lab", owner_status="open", target="target",
                       route_closed=False, binding_conflict=False, replay=False,
-                      interrupt_before_arm=False):
+                      interrupt_before_arm=False, late_conflict=None):
         import contextlib
         import resource_run_registry as RR
         import dispatch_resource_wait as OWNER_RESOURCE
         fake_ledger = SimpleNamespace(lock=contextlib.nullcontext,
                                       root=self.root / "workflow",
-                                      state=lambda: {"workflow_state": "RUNNING",
-                                          "nodes": {"full-run": {"state": "RUNNING"}}},
+                                      state=lambda: ({"workflow_state": "CANCELLED",
+                                          "nodes": {"full-run": {"state": "READY"}}}
+                                          if late_conflict == "stage-state" else
+                                          {"workflow_state": "RUNNING",
+                                           "nodes": {"full-run": {"state": "RUNNING"}}}),
                                       claims=lambda: {}, journal=lambda: [])
         fake_ledger.root.mkdir(exist_ok=True)
+        armed_reads = 0
+        def read_armed(_ledger):
+            nonlocal armed_reads
+            armed_reads += 1
+            if late_conflict == "armed-row" and armed_reads > 1:
+                return {"full-run": {**self.armed, "route_hash": "changed-route-hash"}}
+            return {"full-run": self.armed}
         fake_sup = SimpleNamespace(
             ledger_for=lambda *_args: fake_ledger,
-            read_armed=lambda _ledger: {"full-run": self.armed},
+            read_armed=read_armed,
             resource_predecessors=lambda *_args: [(self.armed, self.original)],
             resource_continuation_cancelled=lambda *_args: route_closed,
         )
@@ -129,7 +139,14 @@ class ComputeRunAdoptionTest(unittest.TestCase):
         fake_compute.execution_record = lambda *_args: {
             "state": "quiescent", "execution": {**self.execution,
                 "contract": {**self.contract, "cwd": cwd}}, "run_dir": str(self.compute_run)}
-        fake_compute.run_snapshot_current = lambda *_args: True
+        def run_snapshot_current(*_args):
+            if late_conflict == "publication":
+                current = json.loads(self.registry.read_text())
+                current["runs"]["full-run"]["exit_code"] = 7
+                self.registry.write_text(json.dumps(current))
+                self.raced_registry = self.registry.read_bytes()
+            return True
+        fake_compute.run_snapshot_current = run_snapshot_current
         loader = SimpleNamespace(exec_module=lambda _module: None)
         fake_inputs = SimpleNamespace(_locked=lambda *_args: contextlib.nullcontext(),
                                       _target=lambda *_args: (SimpleNamespace(status=owner_status), target))
@@ -141,7 +158,8 @@ class ComputeRunAdoptionTest(unittest.TestCase):
             mock.patch.object(OWNER_RESOURCE, "start_binding", return_value=self.owner_wait),
             mock.patch.object(OWNER_RESOURCE, "supervisor", return_value=fake_sup),
             mock.patch.object(OWNER_RESOURCE, "resource_body_digest", return_value="body"),
-            mock.patch.object(OWNER_RESOURCE, "resource_evidence_paths_conflict", return_value=False),
+            mock.patch.object(OWNER_RESOURCE, "resource_evidence_paths_conflict",
+                              return_value=late_conflict == "evidence-path"),
             mock.patch.object(RR, "classify_identity", return_value=("exited", None, "process-absent")),
             mock.patch.object(RR, "resource_process_group_quiescent", return_value=True),
             mock.patch("dispatch_owner_input._locked", side_effect=fake_inputs._locked),
@@ -258,6 +276,34 @@ class ComputeRunAdoptionTest(unittest.TestCase):
                 self.assertEqual({path.relative_to(workflow).as_posix(): path.read_bytes()
                                   for path in workflow.rglob("*") if path.is_file()}, before_workflow)
                 self.assertNotIn("full-run__a1", json.loads(self.registry.read_bytes())["runs"])
+
+    def test_late_binding_conflicts_include_field_differences_before_mutation(self):
+        for case in ("armed-row", "stage-state", "evidence-path", "publication"):
+            with self.subTest(case=case):
+                self.setUp()
+                before_registry = self.registry.read_bytes()
+                before_sentinel = self.sentinel.read_bytes()
+                before_jobs = self.jobs.read_bytes()
+                before_workflow = self.root / "workflow"
+                before_workflow.mkdir()
+                before_journal = {path.relative_to(before_workflow).as_posix(): path.read_bytes()
+                                  for path in before_workflow.rglob("*") if path.is_file()}
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        self._run_adoption(late_conflict=case)
+                self.assertEqual(caught.exception.code, 65)
+                refusal = json.loads(caught.exception.resource_message)
+                self.assertEqual(refusal["reason"], "resource-compute-binding-conflict")
+                self.assertTrue(refusal["differences"])
+                self.assertTrue(all({"field", "expected", "actual"} <= set(item)
+                                    for item in refusal["differences"]))
+                self.assertTrue(refusal["next_action"])
+                expected_registry = (self.raced_registry if case == "publication" else before_registry)
+                self.assertEqual(self.registry.read_bytes(), expected_registry)
+                self.assertEqual(self.sentinel.read_bytes(), before_sentinel)
+                self.assertEqual(self.jobs.read_bytes(), before_jobs)
+                self.assertEqual({path.relative_to(before_workflow).as_posix(): path.read_bytes()
+                                  for path in before_workflow.rglob("*") if path.is_file()}, before_journal)
 
 
 class TestProgressLaunch(unittest.TestCase):

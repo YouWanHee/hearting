@@ -2,6 +2,7 @@
 """Sequential supervised resources retain one stage and its output requirement."""
 import contextlib
 import copy
+import fcntl
 import importlib.util
 import io
 import json
@@ -130,16 +131,29 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                     parent_sandbox='workspace-write', subsession_id=None,
                 )
                 marker = jobs.parent / 'completion' / route['route_id'] / 'full-run.json'
+                observer_calls = []
+                def observe_outside_writer_locks(_row):
+                    observer_calls.append(True)
+                    for lock_path in (ledger.lock_path, Path(str(registry) + '.lock')):
+                        with lock_path.open('a+') as lock_file:
+                            try:
+                                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                self.fail(f'compute observation ran while writer lock held: {lock_path}')
+                            finally:
+                                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    return {'state': 'quiescent', 'reason': 'fixture-remote-empty'}
                 with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
                      mock.patch('subprocess.check_output', return_value=str(self.base)), \
-                     mock.patch.object(SUP.RR, 'compute_execution_observation', return_value={
-                         'state': 'quiescent', 'reason': 'fixture-remote-empty'}):
+                     mock.patch.object(SUP.RR, 'compute_execution_observation',
+                                       side_effect=observe_outside_writer_locks):
                     self.assertIsNone(RA.completion_gate(
                         args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
                     ))
                     self.assertIsNone(RA.completion_gate(
                         args, 'start', ROOT, jobs, gate=DC.completion_marker_gate,
                     ))
+                self.assertEqual(len(observer_calls), 2)
                 self.assertTrue(marker.is_file())
                 self.assertEqual(json.loads(marker.read_bytes())['resource_execution_identity'],
                                  compute_identity)

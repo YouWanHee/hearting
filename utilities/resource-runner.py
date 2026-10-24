@@ -219,8 +219,28 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             "config_ref", "config_sha256", "source_commit", "source_dirty", "source_git_state", "config_layout",
             "resource_policy", "owner_wait", "launch_request", "share")
     import dispatch_resource_wait as OWNER_RESOURCE
+    import resource_run_registry as RR
     sup = OWNER_RESOURCE.supervisor()
     ledger = sup.ledger_for(route, jobs) if route.get("route_id") else None
+    # Capture compute predecessor evidence before taking the ledger or registry
+    # writer lock. The callback below rechecks each captured row byte identity.
+    try:
+        initial_registry = json.loads(Path(registry).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        initial_registry = {"runs": {}}
+    initial_matches = [row for row in (initial_registry.get("runs") or {}).values()
+                       if row.get("route") == str(route_file) and row.get("node") == args.node]
+    initial_history_pairs = sup.resource_predecessors(ledger, args.node) if ledger else []
+    initial_history = [row for _, row in initial_history_pairs]
+    captured_compute = {}
+    for row in [*initial_matches, *initial_history]:
+        execution = row.get("execution") if isinstance(row, dict) else None
+        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+            captured_compute[row.get("run_id")] = {
+                "row": row, "state": RR.compute_execution_observation(row).get("state")}
+    for armed_row, row in initial_history_pairs:
+        if row.get("run_id") in captured_compute:
+            captured_compute[row["run_id"]]["armed"] = armed_row
     def reserve(data):
         if controller is not None:
             current = data["runs"].get(args.run_id)
@@ -232,6 +252,12 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             return True, claimed
         matches = [row for row in data["runs"].values() if row.get("route") == str(route_file)
                    and row.get("node") == args.node]
+        for row in matches:
+            execution = row.get("execution") if isinstance(row, dict) else None
+            if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+                captured = captured_compute.get(row.get("run_id"))
+                if not captured or captured["row"] != row:
+                    raise ValueError("resource-reservation-changed")
         current = data["runs"].get(args.run_id)
         if current is not None:
             if any(current.get(k) != placeholder.get(k) for k in keys):
@@ -241,13 +267,22 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             if reboot_evidence(previous):
                 settle(registry, previous['run_id'], previous, data=data)
         from route_authority import require_resource_predecessors
-        require_resource_predecessors([*matches, *history], placeholder)
+        require_resource_predecessors([*matches, *history], placeholder,
+                                      observations=captured_compute)
         data["runs"][args.run_id] = placeholder
         return True, placeholder
     with ledger.lock() if ledger else contextlib.nullcontext():
         if ledger and sup.resource_continuation_cancelled(route, ledger):
             raise ValueError("resource-parent-close-requested")
-        history = [row for _, row in sup.resource_predecessors(ledger, args.node)] if ledger else []
+        history_pairs = sup.resource_predecessors(ledger, args.node) if ledger else []
+        history = [row for _, row in history_pairs]
+        for armed_row, row in history_pairs:
+            execution = row.get("execution") if isinstance(row, dict) else None
+            if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+                captured = captured_compute.get(row.get("run_id"))
+                if (not captured or captured["row"] != row
+                        or captured.get("armed") != armed_row):
+                    raise ValueError("resource-reservation-changed")
         with controller.guard() if controller else contextlib.nullcontext():
             created, row = locked_update(registry, reserve)
     if not created:
@@ -637,11 +672,20 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
                 continue
             if original.get("status") != "failed" or original.get("exit_code") in (None, 0):
                 continue
-            from resource_run_registry import classify_identity, resource_process_group_quiescent
-            liveness, _identity, _reason = classify_identity(original)
+            from resource_run_registry import (classify_identity, compute_execution_observation,
+                                               resource_process_group_quiescent)
+            original_execution = original.get("execution") if isinstance(original, dict) else None
+            if isinstance(original_execution, dict) and original_execution.get("kind") == "compute-hosts":
+                original_observation = compute_execution_observation(original)
+                liveness = ("exited" if original_observation.get("state") == "quiescent" else "stale")
+                original_quiescent = original_observation.get("state") == "quiescent"
+            else:
+                liveness, _identity, _reason = classify_identity(original)
+                original_quiescent = (liveness == "exited"
+                                       and resource_process_group_quiescent(original))
             if (liveness != "exited"
                     or read_sentinel(original.get("sentinel")) != original.get("exit_code")
-                    or not resource_process_group_quiescent(original)):
+                    or not original_quiescent):
                 continue
         except (OSError, ValueError, KeyError, TypeError):
             continue
@@ -734,7 +778,9 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
                 and (row.get("execution") or {}).get("identity_key") == identity
                 and row.get("node") == node_id]
     if len(existing) > 1:
-        fail_compute("resource-compute-binding-conflict")
+        fail_compute("resource-compute-binding-conflict", differences=[
+            {"field": "compute_execution_identity.matches", "expected": 1, "actual": len(existing)}],
+            next_action="resolve duplicate adopted rows through the existing resource owner")
     def arm_adopted(adopted_row):
         current_armed = sup.read_armed(ledger).get(node_id)
         if current_armed and current_armed.get("predecessor_id") == adopted_row.get("run_id"):
@@ -758,7 +804,10 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
     if existing:
         adopted = existing[0]
         if adopted.get("parent_attempt_id") != owner_wait["parent_attempt_id"]:
-            fail_compute("resource-compute-binding-conflict")
+            fail_compute("resource-compute-binding-conflict", differences=[
+                {"field": "parent_attempt_id", "expected": owner_wait["parent_attempt_id"],
+                 "actual": adopted.get("parent_attempt_id")}],
+                next_action="resume through the owner route bound to this compute run")
         arm_adopted(adopted)
         return {**adopted, "replayed": True, "payload_spawned": False,
                 "compute_run_id": compute_run_id, "next_action": "start run-verify through its existing owner route"}
@@ -785,40 +834,83 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
     })
     adopted["resource_binding"] = OWNER_RESOURCE.resource_body_digest(adopted)
     if OWNER_RESOURCE.resource_evidence_paths_conflict(original, adopted):
-        fail_compute("resource-compute-binding-conflict")
+        fail_compute("resource-compute-binding-conflict", differences=[
+            {"field": "resource.evidence_paths", "expected": "no shared evidence path or inode",
+             "actual": {"existing_run": original.get("run_id"), "adopted_run": adopted_id,
+                        "existing": [original.get(key) for key in ("log", "sentinel", "progress_file")],
+                        "candidate": [adopted.get(key) for key in ("log", "sentinel", "progress_file")]}}],
+            next_action="repair the conflicting resource evidence paths before retrying")
     with ledger.lock():
         if sup.resource_continuation_cancelled(route, ledger):
             fail_compute("resource-compute-route-closed", differences=[
                 {"field": "route.state", "expected": "open", "actual": "closed or cancelled"}],
                 next_action="continue only after the route owner opens a new authorized route")
-        if sup.read_armed(ledger).get(node_id) != armed:
-            fail_compute("resource-compute-binding-conflict")
+        current_armed = sup.read_armed(ledger).get(node_id)
+        if current_armed != armed:
+            fail_compute("resource-compute-binding-conflict", differences=[
+                {"field": "armed_row", "expected": hashlib.sha256(json.dumps(
+                    armed, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                 "actual": hashlib.sha256(json.dumps(current_armed, sort_keys=True,
+                    separators=(",", ":")).encode()).hexdigest() if current_armed is not None else None}],
+                next_action="re-read the current owner route state before retrying the same compute run")
         state = ledger.state()
         stage = state.get("nodes", {}).get(node_id, {})
         failure_states = WS.vocabulary()["failure_states"]
-        if (stage.get("state") not in {"RUNNING", "FAILED_RETRYABLE"}
-                or state.get("workflow_state") not in {
-                    "RUNNING", "STAGE_SUCCEEDED", "NEXT_REGISTERED", "NEXT_RUNNING", "FAILED_RETRYABLE"}
-                or any(row.get("state") in failure_states
-                       for node, row in state.get("nodes", {}).items() if node != node_id)
-                or any(claim.get("predecessor") == node_id for claim in ledger.claims().values())):
-            fail_compute("resource-compute-binding-conflict")
+        invalid_states = []
+        if stage.get("state") not in {"RUNNING", "FAILED_RETRYABLE"}:
+            invalid_states.append({"field": f"nodes.{node_id}.state",
+                                   "expected": ["RUNNING", "FAILED_RETRYABLE"],
+                                   "actual": stage.get("state")})
+        if state.get("workflow_state") not in {
+                "RUNNING", "STAGE_SUCCEEDED", "NEXT_REGISTERED", "NEXT_RUNNING", "FAILED_RETRYABLE"}:
+            invalid_states.append({"field": "workflow_state",
+                                   "expected": ["RUNNING", "STAGE_SUCCEEDED", "NEXT_REGISTERED",
+                                                "NEXT_RUNNING", "FAILED_RETRYABLE"],
+                                   "actual": state.get("workflow_state")})
+        failed_nodes = [name for name, value in state.get("nodes", {}).items()
+                        if name != node_id and value.get("state") in failure_states]
+        if failed_nodes:
+            invalid_states.append({"field": "other_failed_nodes", "expected": [], "actual": failed_nodes})
+        claims = [claim for claim in ledger.claims().values() if claim.get("predecessor") == node_id]
+        if claims:
+            invalid_states.append({"field": "successor_claims", "expected": [],
+                                   "actual": [claim.get("successor") for claim in claims]})
+        if invalid_states:
+            fail_compute("resource-compute-binding-conflict", differences=invalid_states,
+                         next_action="resume only after the current route stage state is consistent")
         if stage.get("state") == "FAILED_RETRYABLE":
             previous = stage.get("evidence") or {}
             if (previous.get("resource_sha256") != RESOURCE_RESUME.row_digest(original)
                     or previous.get("succeeded") is not False
                     or previous.get("exit_code") != original.get("exit_code")):
-                fail_compute("resource-compute-binding-conflict")
+                fail_compute("resource-compute-binding-conflict", differences=[
+                    {"field": "stage.evidence.resource_sha256",
+                     "expected": RESOURCE_RESUME.row_digest(original),
+                     "actual": previous.get("resource_sha256")},
+                    {"field": "stage.evidence.succeeded", "expected": False,
+                     "actual": previous.get("succeeded")},
+                    {"field": "stage.evidence.exit_code", "expected": original.get("exit_code"),
+                     "actual": previous.get("exit_code")}],
+                    next_action="restore the existing failed-resource evidence before retrying")
         if state.get("workflow_state") == "FAILED_RETRYABLE":
             workflow_failure = next((entry for entry in reversed(ledger.journal())
                                      if entry.get("workflow_state")), {})
             if (state.get("nodes", {}).get(node_id, {}).get("state") != "FAILED_RETRYABLE"
                     and (workflow_failure.get("evidence") or {}).get("node") != node_id):
-                fail_compute("resource-compute-binding-conflict")
+                fail_compute("resource-compute-binding-conflict", differences=[
+                    {"field": "workflow_failure.evidence.node", "expected": node_id,
+                     "actual": (workflow_failure.get("evidence") or {}).get("node")}],
+                    next_action="resume the route from its recorded failed stage")
         for _other_armed, other_row in sup.resource_predecessors(ledger, node_id):
             if (other_row.get("run_id") != original.get("run_id")
                     and OWNER_RESOURCE.resource_evidence_paths_conflict(other_row, adopted)):
-                fail_compute("resource-compute-binding-conflict")
+                fail_compute("resource-compute-binding-conflict", differences=[
+                    {"field": "resource.evidence_paths", "expected": "no shared evidence path or inode",
+                     "actual": {"conflicting_run": other_row.get("run_id"),
+                                "candidate_run": adopted_id,
+                                "candidate_paths": [adopted.get(key) for key in
+                                                    ("log", "sentinel", "progress_file")]}}],
+                    next_action="repair the conflicting resource evidence paths before retrying")
         with owner_input_lock(jobs, owner_wait["parent_attempt_id"]):
             parent_row, target = owner_input_target(jobs, owner_wait["parent_attempt_id"])
             if parent_row.status not in {"open", "running"} or not target:
@@ -837,12 +929,28 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
             def publish(document):
                 current = document["runs"].get(original["run_id"])
                 if current != original or adopted_id in document["runs"]:
-                    raise ValueError("resource-compute-binding-conflict")
+                    raise ValueError(json.dumps({"field": "resource_registry.publication",
+                        "expected": {"original_row_sha256": hashlib.sha256(json.dumps(
+                            original, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                            "adopted_id_absent": True},
+                        "actual": {"original_row_sha256": hashlib.sha256(json.dumps(
+                            current, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                            if current is not None else None,
+                            "adopted_id_sha256": hashlib.sha256(json.dumps(
+                                document["runs"][adopted_id], sort_keys=True,
+                                separators=(",", ":")).encode()).hexdigest()
+                                if adopted_id in document["runs"] else None}}))
                 document["runs"][adopted_id] = adopted
             try:
                 locked_update(registry, publish)
-            except ValueError:
-                fail_compute("resource-compute-binding-conflict")
+            except ValueError as error:
+                try:
+                    detail = json.loads(str(error))
+                except ValueError:
+                    detail = {"field": "resource_registry.publication", "expected": "unchanged row and unused id",
+                              "actual": str(error)}
+                fail_compute("resource-compute-binding-conflict", differences=[detail],
+                             next_action="re-read the resource registry and retry only if the original binding remains current")
     arm_adopted(adopted)
     print(json.dumps({**adopted, "replayed": False, "payload_spawned": False,
                       "compute_run_id": compute_run_id,
