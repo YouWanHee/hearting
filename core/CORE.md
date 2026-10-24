@@ -323,9 +323,9 @@ a whole. `max_scanned_files` controls the count of eligible checkpoint
 candidates considered, after hidden, binary, oversize, invalid-locator,
 symlink, and other exclusions. It does not count physical filesystem entries.
 The internal `max_walk_entries` setting remains an accepted alias. An explicit
-checkpoint limits object takes precedence over this user configuration. These
-interim limits do not alter final manifests: finalization still declares and
-digests valid payload files under the sealed-manifest contract.
+checkpoint limits object takes precedence over this user configuration.
+Finalization retains the sealed-manifest rules for declaring and digesting
+valid payload files.
 
 **Cycle payload buckets.** The top-level table above closes only the names
 directly under the artifact root. Inside a cycle, the first segment below
