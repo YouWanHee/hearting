@@ -55,11 +55,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 if __package__:
+    from .model import current_attempt_rank
     from .work_titles import readable
 else:  # Existing file-path consumers load this module without a package.
     tools_dir = str(Path(__file__).resolve().parents[1])
     if tools_dir not in sys.path:
         sys.path.insert(0, tools_dir)
+    from fleet.model import current_attempt_rank
     from fleet.work_titles import readable
 
 _CACHE = {}          # {abspath: (mtime, size, record|None)}
@@ -1197,12 +1199,7 @@ def _node_state(node_id, route_jobs, ev_by_node, now, completion_marked=False, d
     proof that the node is done, including marker-only inline fallback legs that never had a
     jobs.log row. `active` still wins: a live re-run outranks a past marker."""
     def _best(rows):
-        return max(rows, key=lambda row: (
-            -(getattr(row, "registry_priority", None)
-              if getattr(row, "registry_priority", None) is not None else 0),
-            getattr(row, "registry_order", None) if getattr(row, "registry_order", None) is not None else -1,
-            -(getattr(row, "elapsed_min", None) if getattr(row, "elapsed_min", None) is not None else 10**9),
-        ))
+        return max(rows, key=current_attempt_rank)
 
     live = [j for j in route_jobs if getattr(j, "route_node", None) == node_id]
     active = [j for j in live if j.liveness == "working"]
