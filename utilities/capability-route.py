@@ -3544,8 +3544,8 @@ def _compose_readiness(cwd, jobs, parent_harness, children, *, gpu_route=None,
             worktree=Path(cwd), jobs=Path(jobs),
             owner_harnesses=list(owner_harnesses) if owner_harnesses is not None else [parent_harness],
             child_harnesses=list(children),
-            **({"codex_execution_selection": GPU_SANDBOX.select(gpu_route)}
-               if gpu_route and GPU_SANDBOX.gpu_resource_nodes(gpu_route) else {}),
+            **({"codex_execution_selection": GPU_SANDBOX.select_fresh(gpu_route)}
+               if gpu_route and GPU_SANDBOX.fresh_gpu_resource_nodes(gpu_route) else {}),
         )
     except module.ReadinessError as exc:
         raise ValueError(f"compose-readiness-unavailable:{exc}") from exc
@@ -4166,14 +4166,20 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             if node.get("model_profile") and node["id"] not in explicit_profiles:
                 explicit_profiles[node["id"]] = node["model_profile"]
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
-    gpu_route = {"capability": capability, "nodes": selected_recipe["standard_plus"]["nodes"],
+    gpu_intensity = max(("standard" if requested == "auto" else requested,
+                        "standard" if signals else "quick"), key=ORDER.get)
+    gpu_nodes = _expand_parallel_groups(
+        json.loads(json.dumps(selected_recipe["standard_plus"]["nodes"])),
+        selected_recipe["standard_plus"].get("parallel_groups"), gpu_intensity, capability,
+        auxiliary_check_units=registry.get("auxiliary_check_units"))
+    gpu_route = {"capability": capability, "nodes": gpu_nodes,
                  "selection": {"promotion_signals": [{"signal": s} for s in signals]}}
     if (shape == "staged" and not owner_only and dispatch_evidence is not None
-            and GPU_SANDBOX.gpu_resource_nodes(gpu_route)):
+            and GPU_SANDBOX.fresh_gpu_resource_nodes(gpu_route)):
         dispatch_evidence = _validate_dispatch_evidence(
             dispatch_evidence, DISPATCH_CONTRACT_VERSION,
             expected_worktree=cwd, require_scope=True)
-        choice = GPU_SANDBOX.select(gpu_route)
+        choice = GPU_SANDBOX.select_fresh(gpu_route)
         codex_rows = [row for row in dispatch_evidence.get("tuples", [])
                       if row.get("parent_harness") == "codex"]
         if any(row.get("parent_sandbox") != choice["sandbox"] for row in codex_rows):
@@ -5332,8 +5338,8 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                          "terminal_commit_contract":RUNTIME_SUPPORT.TERMINAL_COMMIT_CONTRACT,
                          "terminal_handoff_contract":RUNTIME_SUPPORT.TERMINAL_HANDOFF_CONTRACT,
                          "producer_binding_contract":RUNTIME_SUPPORT.PRODUCER_BINDING_CONTRACT}}
-    if GPU_SANDBOX.gpu_resource_nodes(payload):
-        payload["codex_execution_sandbox"] = GPU_SANDBOX.select(payload)
+    if GPU_SANDBOX.fresh_gpu_resource_nodes(payload):
+        payload["codex_execution_sandbox"] = GPU_SANDBOX.select_fresh(payload)
     payload.update(slug_fields)
     for key, value in (("campaign_key", campaign_key), ("parent_cycle_id", parent_cycle_id)):
         if value is not None:
