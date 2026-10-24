@@ -15,11 +15,13 @@ were populated. Each class below pins one of them against the real on-disk shape
 """
 import json
 import os
+from pathlib import Path
 import sqlite3
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _TOOLS_DIR not in sys.path:
@@ -28,7 +30,7 @@ if _TOOLS_DIR not in sys.path:
 from fleet import refresh_title as rt                       # noqa: E402
 from fleet.collectors import dispatch                       # noqa: E402
 from fleet.collectors import opencode                       # noqa: E402
-from fleet.model import DispatchJob                         # noqa: E402
+from fleet.model import DispatchJob, Session                # noqa: E402
 from fleet.context_policy import SCHEMA, policy_path       # noqa: E402
 
 
@@ -290,75 +292,199 @@ class DispatchTelemetryTest(unittest.TestCase):
         self.assertIsNotNone(dispatch._owned_attempt_log_path(job))
 
 
-class SessionBindingTest(unittest.TestCase):
-    """pid↔session binding when several opencode processes share one directory, and when
-    one process opens more than one session (measured 2026-09-29: three panes on the
-    primary checkout; one BC_ResNet pane that opened four sessions, whose live
-    OPENCODE_SESSION_ID was the fourth)."""
-
-    _DIR = "/repo"
+class CurrentSessionBindingTest(unittest.TestCase):
+    """Conversation enrichment requires the current PID/start TUI selection."""
 
     def setUp(self):
-        self.con = sqlite3.connect(":memory:")
-        self.con.execute(
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.env = mock.patch.dict(os.environ, {
+            "FLEET_TITLE_STATE_DIR": str(self.root / "titles"),
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.db = self.root / "opencode.db"
+        self.con = sqlite3.connect(self.db)
+        self.addCleanup(self.con.close)
+        self.con.executescript(
             "CREATE TABLE session (id TEXT, slug TEXT, agent TEXT, model TEXT, cost REAL, "
             "tokens_input INT, tokens_output INT, tokens_reasoning INT, time_updated INT, "
-            "parent_id TEXT, directory TEXT, time_created INT)")
+            "parent_id TEXT, directory TEXT);"
+            "CREATE TABLE message (id TEXT, session_id TEXT, data TEXT, time_updated INT);")
 
-    def _add(self, sid, created, updated, parent=None, directory=_DIR):
-        self.con.execute(
-            "INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (sid, sid, None, None, None, None, None, None, updated, parent, directory, created))
+    def _add(self, sid, *, updated, context, slug=None, model=None):
+        self.con.execute("INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
+            sid, slug or sid, None, model, 1.0, context, 2, 3, updated, None, "/repo"))
+        self.con.execute("INSERT INTO message VALUES (?,?,?,?)", (
+            "m-" + sid, sid, json.dumps({"tokens": {"total": context}}), updated))
+        self.con.commit()
 
-    def _bound(self, start, until=None):
-        row = opencode._query(self.con.cursor(), self._DIR, start, until)
-        return row[0] if row else None
+    def _session(self, *, prior=None, attempt=None):
+        sess = Session(harness="opencode", pid=4242, proc_start="123", cwd="/repo")
+        sess.session_id = prior
+        sess.title = "STALE TITLE"
+        sess.summary = "STALE SUMMARY"
+        sess.active_context_tokens = 999
+        sess.mtime = 999.0
+        sess._refresh_source = {"session_id": "stale"}
+        if attempt:
+            sess.attempt_id = attempt
+        return sess
 
-    def test_same_directory_processes_bind_their_own_sessions(self):
-        self._add("a", created=110, updated=900)
-        self._add("b", created=210, updated=950)
-        self._add("c", created=310, updated=990)
-        self.assertEqual(self._bound(100, 200), "a")
-        self.assertEqual(self._bound(200, 300), "b")
-        self.assertEqual(self._bound(300), "c")
+    def _title_patches(self):
+        title_map = {"ses_a": "Title A", "ses_b": "Title B",
+                     "attempt-exact": "Attempt title"}
+        summary_map = {"ses_a": "Summary A", "ses_b": "Summary B",
+                       "attempt-exact": "Attempt summary"}
+        return (
+            mock.patch.object(opencode.titles, "attempt_sid",
+                              side_effect=lambda attempt: "attempt-exact" if attempt else None),
+            mock.patch.object(opencode.titles, "last_title",
+                              side_effect=lambda sid, harness=None: title_map.get(sid)),
+            mock.patch.object(opencode.titles, "fresh_summary_with_ts",
+                              side_effect=lambda sid, harness=None:
+                              (summary_map.get(sid), 10.0 if sid in summary_map else None)),
+        )
 
-    def test_a_process_follows_the_session_it_opened_last(self):
-        for sid, created, updated in (("first", 110, 120), ("second", 130, 140),
-                                      ("current", 150, 999)):
-            self._add(sid, created, updated)
-        self.assertEqual(self._bound(100), "current")
+    def _run_v1(self, sess, claim):
+        with mock.patch.object(opencode, "session_of_process", return_value=claim), \
+                mock.patch.object(opencode, "_proc_start_ticks", return_value="123"), \
+                mock.patch.object(opencode, "_db", return_value=str(self.db)), \
+                mock.patch.object(opencode, "_enrich_v2", return_value=False) as v2_mock, \
+                mock.patch("fleet.context_policy.read_policy", return_value=None), \
+                self._title_patches()[0], self._title_patches()[1], self._title_patches()[2]:
+            opencode.enrich(sess)
+        return sess, v2_mock
 
-    def test_child_sessions_never_bind(self):
-        self._add("top", created=110, updated=500)
-        self._add("sub", created=120, updated=999, parent="top")
-        self.assertEqual(self._bound(100), "top")
+    def test_no_selection_or_argv_only_does_not_bind_the_single_same_cwd_candidate(self):
+        self._add("ses_a", updated=999999, context=41)
+        for claim in ((None, ""), ("ses_a", "opencode-argv")):
+            with self.subTest(claim=claim):
+                sess = self._session(prior="ses_a", attempt="att-exact")
+                sess, enrich_v2 = self._run_v1(sess, claim)
+                enrich_v2.assert_not_called()
+                self.assertIsNone(sess.session_id)
+                self.assertEqual(sess.session_identity_evidence["verdict"], "unobserved")
+                self.assertIsNone(sess.session_identity_evidence["claims"].get("opencode-argv"))
+                if claim[1] == "opencode-argv":
+                    self.assertEqual(sess.session_identity_evidence["started_on"], "ses_a")
+                self.assertEqual((sess.title, sess.summary),
+                                 ("Attempt title", "Attempt summary"))
+                self.assertIsNone(sess.active_context_tokens)
+                self.assertIsNone(sess._refresh_source)
+                self.assertIsNone(sess.mtime)
 
-    def test_attached_process_keeps_the_directory_fallback(self):
-        self._add("old", created=10, updated=999)
-        self.assertEqual(self._bound(100), "old")
+    def test_exact_selection_beats_stale_projected_identity_and_newer_neighbor(self):
+        self._add("ses_a", updated=999999, context=99)
+        self._add("ses_b", updated=1000, context=22)
+        sess, _v2 = self._run_v1(self._session(prior="ses_a"),
+                                 ("ses_b", "opencode-tui-selection"))
+        self.assertEqual(sess.session_id, "ses_b")
+        self.assertEqual(sess.session_identity_evidence["verdict"], "resolved")
+        self.assertEqual(sess.session_identity_evidence["current_source"],
+                         "opencode-tui-selection")
+        self.assertEqual(sess.session_identity_evidence["prior_projection"], "ses_a")
+        self.assertEqual(sess.session_identity_evidence["claims"],
+                         {"opencode-tui-selection": "ses_b"})
+        self.assertEqual((sess.title, sess.summary), ("Title B", "Summary B"))
+        self.assertEqual(sess.active_context_tokens, 22)
+        self.assertEqual(sess._refresh_source["session_id"], "ses_b")
+        self.assertEqual(sess.mtime, 1.0)
 
-    def test_prepare_tick_bounds_each_process_by_the_next_same_directory_start(self):
-        class _S:
-            def __init__(self, pid, cwd, harness="opencode"):
-                self.pid, self.cwd, self.harness = pid, cwd, harness
-        starts = {1: 300, 2: 100, 3: 200, 4: 50, 5: 60}
-        sessions = [_S(1, "/r"), _S(2, "/r"), _S(3, "/r"), _S(4, "/other"),
-                    _S(5, "/r", harness="codex")]
-        orig = opencode._process_started_ms
-        opencode._process_started_ms = lambda sess: starts[sess.pid]
-        try:
-            until = opencode.prepare_tick(sessions)
-        finally:
-            opencode._process_started_ms = orig
-        self.assertEqual(until, {2: 200, 3: 300, 1: None, 4: None})
+    def test_missing_exact_selection_row_never_borrows_the_only_neighbor(self):
+        self._add("ses_a", updated=999999, context=99)
+        sess, _v2 = self._run_v1(self._session(),
+                                 ("ses_b", "opencode-tui-selection"))
+        self.assertEqual(sess.session_id, "ses_b")
+        self.assertIsNone(sess.title)
+        self.assertIsNone(sess.summary)
+        self.assertIsNone(sess.active_context_tokens)
+        self.assertIsNone(sess._refresh_source)
+        self.assertIsNone(sess.mtime)
+
+    def test_pid_reuse_since_process_scan_rejects_the_new_process_selection(self):
+        sess = self._session()
+        with mock.patch.object(opencode, "_proc_start_ticks", return_value="124"), \
+                mock.patch.object(opencode, "session_of_process",
+                                  return_value=("ses_b", "opencode-tui-selection")) as identity, \
+                mock.patch.object(opencode, "_db") as db_path:
+            opencode.enrich(sess)
+        identity.assert_not_called()
+        db_path.assert_not_called()
+        self.assertIsNone(sess.session_id)
+        self.assertEqual(sess.session_identity_evidence["verdict"], "unobserved")
+        self.assertIsNone(sess.title)
+        self.assertIsNone(sess._refresh_source)
+
+    def _run_v2(self, sess, claim, observed):
+        runtime = mock.Mock()
+        runtime.credential_store_present.return_value = True
+        runtime.read_session_observation.return_value = observed
+        runtime.list_session_candidates.return_value = [{"id": "ses_a", "generation": "v2"}]
+        with mock.patch.object(opencode, "session_of_process", return_value=claim), \
+                mock.patch.object(opencode, "_proc_start_ticks", return_value="123"), \
+                mock.patch.object(opencode, "_db", return_value=str(self.db)), \
+                mock.patch.object(opencode, "_opencode_v2_runtime", return_value=runtime), \
+                mock.patch.object(opencode, "_attach_v2_shell_tasks"), \
+                mock.patch("fleet.context_policy.read_policy", return_value=None), \
+                self._title_patches()[0], self._title_patches()[1], self._title_patches()[2]:
+            opencode.enrich(sess)
+        return sess, runtime
+
+    def test_v2_exact_selection_reads_only_its_title_summary_context_and_refresh_source(self):
+        observed = {"state": "observed", "generation": "v2", "cursor": 8,
+                    "cursor_kind": "session-message-rowid-v1",
+                    "session": {"directory": "/repo", "slug": "slug-b",
+                                "model": {"id": "model-b", "providerID": "provider"},
+                                "time_updated": 1000, "tokens_input": 3},
+                    "messages": [{"type": "assistant", "tokens": {"total": 123}}]}
+        sess, runtime = self._run_v2(self._session(prior="ses_a"),
+                                     ("ses_b", "opencode-tui-selection"), observed)
+        self.assertEqual(runtime.read_session_observation.call_args.args[0], "ses_b")
+        runtime.list_session_candidates.assert_not_called()
+        self.assertEqual(sess.session_id, "ses_b")
+        self.assertEqual((sess.title, sess.summary), ("Title B", "Summary B"))
+        self.assertEqual(sess.active_context_tokens, 123)
+        self.assertEqual(sess._refresh_source["session_id"], "ses_b")
+
+    def test_v2_does_not_enumerate_a_unique_candidate_without_current_selection(self):
+        self._add("ses_a", updated=999999, context=41)
+        sess = self._session(prior="ses_a")
+        runtime = mock.Mock()
+        runtime.list_session_candidates.return_value = [{"id": "ses_a", "generation": "v2"}]
+        with mock.patch.object(opencode, "session_of_process",
+                               return_value=("ses_a", "opencode-argv")), \
+                mock.patch.object(opencode, "_proc_start_ticks", return_value="123"), \
+                mock.patch.object(opencode, "_db") as db_path, \
+                mock.patch.object(opencode, "_opencode_v2_runtime", return_value=runtime):
+            opencode.enrich(sess)
+        db_path.assert_not_called()
+        runtime.credential_store_present.assert_not_called()
+        runtime.list_session_candidates.assert_not_called()
+        self.assertIsNone(sess.session_id)
+        self.assertEqual(sess.session_identity_evidence["verdict"], "unobserved")
+        self.assertIsNone(sess.title)
+        self.assertIsNone(sess.summary)
+        self.assertIsNone(sess.active_context_tokens)
+        self.assertIsNone(sess._refresh_source)
+
+    def test_v2_missing_exact_selection_keeps_identity_and_does_not_query_neighbors(self):
+        sess, runtime = self._run_v2(
+            self._session(), ("ses_b", "opencode-tui-selection"),
+            {"state": "unobserved", "reason": "selected-session-row-missing"})
+        runtime.read_session_observation.assert_called_once()
+        runtime.list_session_candidates.assert_not_called()
+        self.assertEqual(sess.session_id, "ses_b")
+        self.assertIsNone(sess.title)
+        self.assertIsNone(sess.summary)
+        self.assertIsNone(sess.active_context_tokens)
+        self.assertIsNone(sess._refresh_source)
+        self.assertIsNone(sess.mtime)
 
 
 class DuplicateSidCollapseTest(unittest.TestCase):
-    """Issue #158 — a session leader plus its arg-less helper child bound the
-    same sid through the directory fallback and rendered as two identical
-    working rows. One session id must keep exactly one row; the loser returns
-    to anonymous-process state but its row stays (existence is the backbone's
-    decision, PRD §1)."""
+    """Duplicate exact bindings collapse while process rows and attempt data remain."""
 
     def _row(self, pid, sid, kind=None, started=None, harness="opencode",
              cwd="/repo", title="T", tag="[83]"):
@@ -376,9 +502,9 @@ class DuplicateSidCollapseTest(unittest.TestCase):
             _context_evidence="e", _refresh_source={"session_id": sid},
             mtime=999.0)
 
-    def test_leader_keeps_sid_and_helper_is_unbound(self):
-        leader = self._row(100, "ses_1", kind="window", started=1000)
-        helper = self._row(200, "ses_1", kind="fallback", started=2000)
+    def test_exact_selection_keeps_sid_and_helper_is_unbound(self):
+        leader = self._row(100, "ses_1", kind="process", started=1000)
+        helper = self._row(200, "ses_1", kind=None, started=2000)
         opencode.collapse_duplicate_sids([leader, helper])
         self.assertEqual(leader.session_id, "ses_1")
         self.assertEqual(leader.title, "T")
@@ -395,32 +521,43 @@ class DuplicateSidCollapseTest(unittest.TestCase):
         self.assertEqual(helper.slug, "repo")
         self.assertEqual(helper.mtime, 999.0)
 
-    def test_window_beats_fallback_despite_pid_order(self):
-        # The fallback row enriches first (lower pid) but must not steal the
-        # session from the process that created it through its window.
-        fallback = self._row(50, "ses_1", kind="fallback", started=1000)
-        owner = self._row(200, "ses_1", kind="window", started=2000)
-        opencode.collapse_duplicate_sids([fallback, owner])
+    def test_exact_selection_beats_unproven_binding_despite_pid_order(self):
+        unproven = self._row(50, "ses_1", kind=None, started=1000)
+        owner = self._row(200, "ses_1", kind="process", started=2000)
+        opencode.collapse_duplicate_sids([unproven, owner])
         self.assertEqual(owner.session_id, "ses_1")
-        self.assertIsNone(fallback.session_id)
+        self.assertIsNone(unproven.session_id)
 
-    def test_two_fallbacks_keep_the_earliest_start(self):
-        old = self._row(300, "ses_1", kind="fallback", started=1000)
-        new = self._row(100, "ses_1", kind="fallback", started=2000)
+    def test_duplicate_bindings_keep_the_earliest_start_if_neither_proves_selection(self):
+        old = self._row(300, "ses_1", kind=None, started=1000)
+        new = self._row(100, "ses_1", kind=None, started=2000)
         opencode.collapse_duplicate_sids([old, new])
         self.assertEqual(old.session_id, "ses_1")
         self.assertIsNone(new.session_id)
 
     def test_distinct_sids_and_other_harnesses_untouched(self):
-        a = self._row(100, "ses_1", kind="window", started=1000)
-        b = self._row(200, "ses_2", kind="fallback", started=2000)
-        c = self._row(300, "ses_1", kind="fallback", started=3000,
+        a = self._row(100, "ses_1", kind="process", started=1000)
+        b = self._row(200, "ses_2", kind=None, started=2000)
+        c = self._row(300, "ses_1", kind=None, started=3000,
                       harness="codex")
-        d = self._row(400, None, kind="fallback", started=4000)
+        d = self._row(400, None, kind=None, started=4000)
         opencode.collapse_duplicate_sids([a, b, c, d])
         self.assertEqual((a.session_id, b.session_id, c.session_id, d.session_id),
                          ("ses_1", "ses_2", "ses_1", None))
         self.assertEqual(c.title, "T")
+
+    def test_anonymous_duplicate_row_keeps_exact_attempt_sidecar(self):
+        selected = self._row(100, "ses_1", kind="process", started=1000)
+        anonymous = self._row(200, "ses_1", kind=None, started=2000)
+        anonymous.attempt_id = "att-exact"
+        with mock.patch.object(opencode.titles, "attempt_sid", return_value="attempt-exact"), \
+                mock.patch.object(opencode.titles, "last_title", return_value="Attempt title"), \
+                mock.patch.object(opencode.titles, "fresh_summary_with_ts",
+                                  return_value=("Attempt summary", 12.0)):
+            opencode.collapse_duplicate_sids([selected, anonymous])
+        self.assertIsNone(anonymous.session_id)
+        self.assertEqual((anonymous.title, anonymous.summary),
+                         ("Attempt title", "Attempt summary"))
 
 
 if __name__ == "__main__":
