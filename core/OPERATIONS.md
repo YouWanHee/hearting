@@ -765,10 +765,13 @@ OpenCode V1 remains isolated under its worker home.
 Before model selection, each OpenCode launch probes its runtime version once
 with a private temporary HOME and XDG roots separate from the user stores. The
 combined stdout/stderr capture is limited to 64 KiB; overflow, timeout, or an
-unreadable version fails closed. On POSIX, the probe process group is
-terminated on both normal exit and timeout before its private directory is
-removed. The resulting `OPENCODE_RUNTIME_VERSION` binding is shared by model
-selection, context lookup, worker-home construction, and execution.
+unreadable version fails closed. The probe runs inside
+`verification-background-lease.py`, which requires child-subreaper and scope
+observation, then reaps detached descendants on normal exit and timeout before
+the private directory is removed. Missing containment or incomplete cleanup
+leaves the version unknown. The resulting `OPENCODE_RUNTIME_VERSION` binding
+is shared by model selection, context lookup, worker-home construction, and
+execution.
 
 **Dispatch responsibility:** execution, semantic outcome, and notification are
 separate facts.

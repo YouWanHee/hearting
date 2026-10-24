@@ -11740,20 +11740,52 @@ class RefusedChainClose:
     unclosed_delivery: tuple[str, ...]
 
 
+_NO_START_PROCESS_IDENTITY_KEYS = (
+    "pid",
+    "pid_start",
+    "pid_scope",
+    "pid_host",
+    "pid_host_start",
+    "pid_host_ns",
+    "pid_host_proof",
+    "pid_ns",
+    "pid_observer_ns",
+    "pgid",
+    "pgid_host",
+    "launch_cgroup_b64",
+    "launch_cgroup_ns",
+    "group_reap_proof",
+    "group_reap_pgid",
+    "attempt_descendant_proof",
+    "attempt_descendant_observer_ns",
+    "attempt_descendant_residue",
+    "attempt_descendant_residue_count",
+    "attempt_descendant_residue_basis",
+    "attempt_descendant_residue_at",
+    "reap_watch",
+    "reap_watch_pid",
+    "post_exit_receipt_substitute",
+)
+
+
+def _has_persisted_process_identity(metadata: Mapping[str, str]) -> bool:
+    """Any child identity or descendant/reap evidence contradicts no-start."""
+    return any(metadata.get(key) for key in _NO_START_PROCESS_IDENTITY_KEYS)
+
+
 def attempt_row_never_started(fields: list[str]) -> bool:
     """Prove that a row has never crossed the durable launch fence."""
 
     if len(fields) != 6:
         return False
     metadata = parse_registry_metadata(fields[5])
-    # A claimed row, a row carrying a PID, and a reaped-before-publish row all
-    # remain supervisor-reconciliation evidence. Only an untouched open row or
-    # an explicitly adapter-closed never-launched row with no claim/identity
-    # can be proven never started here.
+    # A claimed row, any persisted child identity, and a reaped-before-publish
+    # row remain supervisor-reconciliation evidence. Parent lineage and
+    # registration metadata are deliberately not execution identity.
     return (
         metadata.get("launch_started") != "1"
         and metadata.get("launch_claimed") == "0"
-        and not metadata.get("pid")
+        and not _has_persisted_process_identity(metadata)
         and metadata.get("launch_outcome", "") in {"", "never-launched"}
     )
 
@@ -11772,7 +11804,7 @@ def terminal_attempt_never_started(status: str, metadata: Mapping[str, str]) -> 
     if metadata.get("launch_outcome") != "never-launched":
         return False
     if (metadata.get("launch_started") == "1" or metadata.get("launch_claimed") != "0"
-            or metadata.get("pid")):
+            or _has_persisted_process_identity(metadata)):
         return False
     # A committed work result contradicts a never-launched disposition.
     if (metadata.get("note") in SUCCESS_NOTES

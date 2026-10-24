@@ -129,18 +129,42 @@ runtime_version.cache_clear = _runtime_version_probe.cache_clear
 
 
 VERSION_PROBE_OUTPUT_LIMIT = 64 * 1024
+VERSION_PROBE_CLEANUP_SECONDS = 24.0
 
 
-def _kill_probe_process_group(process: subprocess.Popen) -> None:
-    """Stop the isolated version probe and descendants that inherited its pipe."""
+def _signal_probe_lease(process: subprocess.Popen, signum: int) -> bool:
+    """Signal only the isolated lease wrapper; it owns descendant cleanup."""
+    if process.poll() is not None:
+        return True
     if os.name == "posix":
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, signum)
         except ProcessLookupError:
-            pass
-        return
-    if process.poll() is None:
-        process.kill()
+            return True
+        except OSError:
+            return False
+    else:
+        try:
+            process.send_signal(signum)
+        except OSError:
+            return False
+    return True
+
+
+def _stop_probe_lease(process: subprocess.Popen) -> bool:
+    """Give the lease its bounded cleanup, then force-stop its wrapper."""
+    if process.poll() is not None:
+        return True
+    signaled = _signal_probe_lease(process, signal.SIGTERM)
+    try:
+        process.wait(timeout=VERSION_PROBE_CLEANUP_SECONDS)
+    except subprocess.TimeoutExpired:
+        signaled = _signal_probe_lease(process, signal.SIGKILL) and signaled
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            return False
+    return signaled and process.poll() is not None
 
 
 def probe_launch_version(*, binary: str = "opencode", cwd: str,
@@ -182,8 +206,11 @@ def probe_launch_version(*, binary: str = "opencode", cwd: str,
             # without bound during the timeout, and accepting its first line
             # would mistake a truncated result for a complete version.
             output = private / "version.out"
+            lease_script = Path(__file__).with_name("verification-background-lease.py")
             process = subprocess.Popen(
-                [executable, "--version"], cwd=cwd, env=env,
+                [sys.executable, str(lease_script), "--timeout", str(timeout),
+                 "--require-subreaper", "--", executable, "--version"],
+                cwd=cwd, env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 start_new_session=(os.name == "posix"), bufsize=0,
             )
@@ -212,22 +239,18 @@ def probe_launch_version(*, binary: str = "opencode", cwd: str,
             reader.start()
             timed_out = False
             cleanup_error = None
+            stop_attempted = False
             try:
-                process.wait(timeout=timeout)
+                process.wait(timeout=max(timeout, 0) + VERSION_PROBE_CLEANUP_SECONDS)
             except subprocess.TimeoutExpired:
                 timed_out = True
+                stop_attempted = True
+                if not _stop_probe_lease(process):
+                    cleanup_error = RuntimeError("verification-lease-cleanup-incomplete")
             finally:
-                try:
-                    _kill_probe_process_group(process)
-                except OSError as exc:
-                    cleanup_error = exc
-                    if process.poll() is None:
-                        process.kill()
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=1)
+                if process.poll() is None and not stop_attempted:
+                    if not _stop_probe_lease(process):
+                        cleanup_error = RuntimeError("verification-lease-cleanup-incomplete")
                 reader.join(timeout=1)
                 if reader.is_alive():
                     if process.stdout is not None:

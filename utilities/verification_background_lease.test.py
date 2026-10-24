@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """A verification lease ends everything its command started, and caps its memory."""
 import importlib.util
+import io
 import os
 from pathlib import Path
 import signal
@@ -87,6 +88,14 @@ class LeaseScopeTest(unittest.TestCase):
         done = self.run_lease([sys.executable, "-c", "print('ok')"])
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "ok"))
         self.assertNotIn("verification-scope-ended", done.stderr)
+
+    def test_required_subreaper_failure_does_not_start_the_command(self):
+        with mock.patch.object(L, "become_subreaper", return_value=False), \
+                mock.patch.object(L.subprocess, "Popen") as spawn, \
+                mock.patch.object(L.sys, "stderr", new=io.StringIO()):
+            status = L.main(["--timeout", "1", "--require-subreaper", "--", "fixture"])
+        self.assertEqual(status, L.SUBREAPER_UNAVAILABLE_EXIT)
+        spawn.assert_not_called()
 
     def test_the_scope_past_its_memory_budget_is_refused(self):
         process = subprocess.Popen(["sleep", self.marker], start_new_session=True)

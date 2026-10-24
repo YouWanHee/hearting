@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -13,6 +14,28 @@ import unittest.mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 import opencode_runtime as runtime
+
+
+def write_detached_version_cli(script: Path, pid_file: Path, *, hang: bool = False) -> None:
+    detached = (
+        "import os,pathlib,time\n"
+        "if os.fork(): os._exit(0)\n"
+        "os.setsid()\n"
+        "if os.fork(): os._exit(0)\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+    )
+    source = (
+        "#!/usr/bin/env python3\nimport pathlib,subprocess,sys,time\n"
+        f"subprocess.Popen([sys.executable,'-c',{detached!r}],env={{}})\n"
+        f"pid_file=pathlib.Path({str(pid_file)!r})\n"
+        "deadline=time.monotonic()+2\n"
+        "while not pid_file.exists() and time.monotonic()<deadline: time.sleep(.001)\n"
+        "print('opencode 2.0.32',flush=True)\n"
+        + ("time.sleep(30)\n" if hang else "")
+    )
+    script.write_text(source, encoding="utf-8")
+    script.chmod(0o700)
 
 
 class OpenCodeRunCodecTest(unittest.TestCase):
@@ -86,48 +109,36 @@ class OpenCodeRunCodecTest(unittest.TestCase):
                 runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
             self.assertEqual(list(root.iterdir()), [])
 
-    def test_launch_version_probe_kills_descendant_after_normal_exit(self):
+    def test_launch_version_probe_reaps_double_fork_setsid_descendant_after_normal_exit(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "dispatch"
             root.mkdir()
-            marker = Path(temp) / "descendant-survived"
+            pid_file = Path(temp) / "detached-pid"
             script = Path(temp) / "opencode"
-            script.write_text(
-                "#!/usr/bin/env python3\nimport pathlib, subprocess, sys\n"
-                "subprocess.Popen([sys.executable, '-c', "
-                "'import pathlib,sys,time; time.sleep(.35); pathlib.Path(sys.argv[1]).write_text(\"alive\")', "
-                f"{str(marker)!r}])\n"
-                "print('opencode 2.0.32')\n",
-                encoding="utf-8",
-            )
-            script.chmod(0o700)
+            write_detached_version_cli(script, pid_file)
             self.assertEqual(runtime.probe_launch_version(
                 binary=str(script), cwd=temp, state_root=root), (2, 0, 32))
-            time.sleep(0.45)
-            self.assertFalse(marker.exists())
+            pid = int(pid_file.read_text())
+            self.assertFalse(Path(f"/proc/{pid}").exists())
+            self.assertFalse(any(thread.name == "opencode-version-probe-output" and thread.is_alive()
+                                 for thread in threading.enumerate()))
             self.assertEqual(list(root.iterdir()), [])
 
-    def test_launch_version_probe_timeout_kills_process_group(self):
+    def test_launch_version_probe_timeout_reaps_double_fork_setsid_descendant(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "dispatch"
             root.mkdir()
+            pid_file = Path(temp) / "timeout-detached-pid"
             script = Path(temp) / "opencode"
-            script.write_text(
-                "#!/usr/bin/env python3\nimport pathlib, subprocess, sys, time\n"
-                "subprocess.Popen([sys.executable, '-c', "
-                "'import pathlib,sys,time; time.sleep(.35); pathlib.Path(sys.argv[1]).write_text(\"alive\")', "
-                f"{str(Path(temp) / 'timeout-descendant-survived')!r}])\n"
-                "print('opencode 2.0.32', flush=True)\n"
-                "time.sleep(30)\n",
-                encoding="utf-8",
-            )
-            script.chmod(0o700)
+            write_detached_version_cli(script, pid_file, hang=True)
             with self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
                                         "opencode-runtime-version-unavailable"):
                 runtime.probe_launch_version(binary=str(script), cwd=temp,
                                              state_root=root, timeout=0.1)
-            time.sleep(0.45)
-            self.assertFalse((Path(temp) / "timeout-descendant-survived").exists())
+            pid = int(pid_file.read_text())
+            self.assertFalse(Path(f"/proc/{pid}").exists())
+            self.assertFalse(any(thread.name == "opencode-version-probe-output" and thread.is_alive()
+                                 for thread in threading.enumerate()))
             self.assertEqual(list(root.iterdir()), [])
 
     def test_v1_flags_and_v2_provider_variant_are_separate(self):
