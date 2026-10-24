@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -498,10 +499,25 @@ def released_task_prompt(args) -> str:
     )
 
 
-def runtime_progress_prompt() -> str:
-    return ("The runtime observes tool progress and publishes completion. "
+def runtime_progress_prompt(args=None, *, now=None) -> str:
+    text = ("The runtime observes tool progress and publishes completion. "
             "No per-tool heartbeat command is required. Complete the assigned work "
-            "and return its final artifact and verdict.\n\n")
+            "and return its final artifact and verdict.")
+    if args is not None and getattr(args, "worker_type", None) == "stage":
+        try:
+            seconds = float(args.foreground_timeout)
+            if seconds > 0 and seconds < float("inf"):
+                origin = now or datetime.now(timezone.utc)
+                if origin.tzinfo is None:
+                    origin = origin.replace(tzinfo=timezone.utc)
+                deadline = origin.astimezone(timezone.utc) + timedelta(seconds=seconds)
+                text += (f"\nThis attempt's execution budget is {seconds:g} seconds "
+                         f"({seconds / 60:g} minutes); approximate deadline: "
+                         f"{deadline.strftime('%Y-%m-%d %H:%M:%S UTC')}. "
+                         "Long waits, including waiting with sleep, use this budget.")
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            text += "\nThe attempt budget/deadline is unavailable in this prompt."
+    return text + "\n\n"
 
 
 def owner_gate_prompt(args) -> str:

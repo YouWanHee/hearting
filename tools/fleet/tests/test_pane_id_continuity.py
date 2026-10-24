@@ -315,6 +315,21 @@ class PaneContinuityTest(unittest.TestCase):
                 self.assertEqual(kwargs["session_start_source"], source)
                 self.assertNotIn("resume_argv", kwargs)
 
+    def test_codex_projection_rekeys_only_when_current_native_launch_is_proven(self):
+        from fleet import process_identity
+        argv = ["/opt/codex", "resume", "old-session", "--model", "fixture"]
+        with mock.patch.object(herdr_projection.shutil, "which", return_value="/fixture/herdr"), \
+                mock.patch.object(herdr_projection, "may_report", return_value=True), \
+                mock.patch.object(process_identity, "current_launch_context", return_value={"argv": argv}), \
+                mock.patch.object(herdr_projection, "_formatter_overrides", return_value=(None, None)), \
+                mock.patch.object(herdr_projection, "compose", return_value=("codex", "")), \
+                mock.patch.object(herdr_projection.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+            herdr_projection.project("codex", "current-session", pane_id="w:p", session_seq=100,
+                                     session_start_source="clear")
+        command = run.call_args_list[0].args[0]
+        self.assertEqual(command[-8:], ["--session-start-source", "clear", "--", "codex",
+                                       "resume", "current-session", "--model", "fixture"])
+
     def test_proven_embedded_sessionstart_keeps_reporting_with_the_v10_state_hook(self):
         path = ROOT / "adapters/codex/hooks/herdr_session_projection.py"
         spec = importlib.util.spec_from_file_location("codex_embedded_projection_test", path)

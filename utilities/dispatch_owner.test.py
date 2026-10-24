@@ -62,10 +62,10 @@ class FrameAlternativeSelectionTest(unittest.TestCase):
             {"claude": 80, "codex": 80, "opencode": 80},
             list(policy["primary"]), lambda rows: rows, lambda h: states[h] == "ok")
 
-    def test_frame_keeps_capacity_selection_in_both_directions(self):
+    def test_frame_alternative_excludes_the_first_harness_in_both_directions(self):
         for first, other in (("claude", "codex"), ("codex", "claude")):
             with self.subTest(first=first):
-                self.assertEqual(self.choose(first, first)[0], first)
+                self.assertEqual(self.choose(first, first)[0], other)
 
     def test_single_supported_harness_keeps_selection(self):
         self.assertEqual(self.choose("codex", "codex", policy={
@@ -82,7 +82,7 @@ class FrameAlternativeSelectionTest(unittest.TestCase):
             {}, {}, {}, {}, {}, [], lambda rows: rows, lambda h: True)
         self.assertEqual(selected, "claude")
 
-    def test_selector_preserves_capacity_selection_in_both_directions(self):
+    def test_selector_places_frame_alternative_on_the_other_eligible_harness(self):
         import artifact_producer
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -138,7 +138,68 @@ class FrameAlternativeSelectionTest(unittest.TestCase):
                          mock.patch("dispatch_degradation.record_degradation") as record:
                         self.assertEqual(OWNER.main([]), 0)
                         record.assert_not_called()
-                self.assertEqual(Path(launch.call_args.args[0][0]).parts[-3], first)
+                self.assertEqual(Path(launch.call_args.args[0][0]).parts[-3], other)
+
+    def test_unusable_configured_alternate_records_reason_only_after_successful_start(self):
+        import artifact_producer
+        for mode, launch_result, should_record in (
+            ("start-success", 0, True), ("dry-run", 0, False), ("start-failure", 1, False),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                jobs = base / "jobs.log"
+                route_file = base / "route.json"
+                route = {"route_id": "rt-frame-unusable", "route_hash": "sha256:frame-unusable",
+                         "effective_intensity": "standard",
+                         "dispatch_evidence": {"tuples": [
+                             {"status": "supported", "child_harness": h}
+                             for h in ("claude", "codex")]},
+                         "nodes": [{"id": n, "model_profile": "deep"}
+                                   for n in ("frame", "frame-alternative")]}
+                route_file.write_text(json.dumps(route))
+                jobs.write_text("2026-09-26\trunning\t/r\t/w\tframe\t"
+                    f"route_id={route['route_id']},route_hash={route['route_hash']},"
+                    "route_node=frame,worker_type=frame,harness=codex,attempt_id=att-first\n")
+                policy = {"primary": ["claude", "codex"], "relief": [],
+                          "last_resort": [], "promote_relief_below": 0}
+                allocation = {"strategy": "capacity-aware", "window": 30,
+                              "harness_order": ["claude", "codex", "opencode"]}
+                values = {"--model-profile": "deep", "--worker-type": "frame",
+                          "--route-node": "frame-alternative", "--worktree": str(base),
+                          "--capability": "autopilot-code", "--capability-mode": "dev",
+                          "--intensity": "standard"}
+                binding = SimpleNamespace(route_file=str(route_file), route_id=route["route_id"],
+                    route_hash=route["route_hash"], route_node="frame-alternative",
+                    registry_digest="sha256:test", write_scope=str(base), completion_gate="test")
+                forwarded = ["--dry-run"] if mode == "dry-run" else ["--start"]
+                out = io.StringIO()
+                with mock.patch.object(OWNER, "_parse", return_value=(None, values, forwarded, str(route_file), [])), \
+                     mock.patch.object(OWNER, "_authoritative_jobs", return_value=str(jobs)), \
+                     mock.patch.object(OWNER, "_sealed_owner_context", return_value={
+                         "harnesses": {"claude", "codex"}, "policy": None, "allocation": allocation}), \
+                     mock.patch.object(OWNER, "_load_defaults", return_value={"schema_version": 3}), \
+                     mock.patch.object(OWNER._defaults, "query_profile_policy", return_value=policy), \
+                     mock.patch.object(OWNER, "_usage", return_value={
+                         "claude": "limited(usage-gate)", "codex": "ok", "opencode": "ok"}), \
+                     mock.patch.object(OWNER._allocation, "attempt_counts", return_value={
+                         "claude": 0, "codex": 0, "opencode": 0}), \
+                     mock.patch.object(OWNER._capacity, "capacity_report", return_value={
+                         "scores": {"claude": 80, "codex": 70, "opencode": 0}, "sources": {}}), \
+                     mock.patch.object(OWNER, "derive_frame_route_binding", return_value=binding), \
+                     mock.patch.object(artifact_producer, "prepare_route_artifact_env", return_value={}), \
+                     mock.patch.object(OWNER.os, "access", return_value=True), \
+                     mock.patch.object(OWNER, "select_launch_lifecycle", return_value="detached"), \
+                     mock.patch.object(OWNER, "run_owner_wrapper", return_value=launch_result) as launch, \
+                     mock.patch.object(OWNER, "record_frame_launch_degradation") as record, \
+                     contextlib.redirect_stdout(out):
+                    self.assertEqual(OWNER.main([]), launch_result)
+                self.assertIn("reason=frame-other-harness-unusable", out.getvalue())
+                self.assertEqual(Path(launch.call_args.args[0][0]).parts[-3], "codex")
+                self.assertEqual(record.called, should_record)
+                if should_record:
+                    record.assert_called_once()
+                    self.assertEqual(record.call_args.kwargs["reason"], "frame-other-harness-unusable")
+                    self.assertIn("limited(usage-gate)", record.call_args.kwargs["detail"])
 
 class FrameTopDeclarationTest(unittest.TestCase):
     """Automatic frame-leg assignment chooses only harnesses whose runtime config declares `top`."""

@@ -110,7 +110,13 @@ class FrameLaunchGateTest(unittest.TestCase):
    records=[json.loads(line) for line in (base/"degradations"/"rt-launch-ledger.jsonl").read_text().splitlines()]
    self.assertEqual(len(records),1)
    self.assertEqual(records[0]["writer"],"dispatch_contract.py")
+   self.assertEqual(records[0]["reason"],"frame-single-available-harness")
    self.assertEqual(records[0]["prior_attempt_ids"],["att-capacity"])
+   D.record_frame_launch_degradation(route,jobs,[],"att-first","codex",
+       reason="frame-other-harness-unusable",detail='{"codex":"limited"}')
+   records=[json.loads(line) for line in (base/"degradations"/"rt-launch-ledger.jsonl").read_text().splitlines()]
+   self.assertEqual(records[-1]["reason"],"frame-other-harness-unusable")
+   self.assertEqual(records[-1]["detail"],"[detail omitted]")
    with mock.patch("dispatch_degradation.record_degradation",return_value=None):
     self.assertIsNone(D.record_frame_launch_degradation(route,jobs,["att-capacity"],"att-first","codex"))
 
@@ -260,6 +266,20 @@ class FrameLaunchGateTest(unittest.TestCase):
 
 
 class DispatchContractTest(unittest.TestCase):
+ def test_repository_diagnosis_keeps_git_non_git_and_broken_git_distinct(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td);repo=root/"repo";repo.mkdir()
+   subprocess.run(["git","init","-q",str(repo)],check=True)
+   child=repo/"nested";child.mkdir()
+   self.assertEqual(D.diagnose_repository_start(child)["state"],"git")
+   self.assertEqual(D.work_root_identity(child),str(repo.resolve()))
+   plain=root/"plain";plain.mkdir()
+   self.assertEqual(D.diagnose_repository_start(plain)["state"],"non-git")
+   with self.assertRaisesRegex(D.DispatchContractError,"non-git-route-identity-unbound"):
+    D.work_root_identity(plain)
+   broken=root/"broken";broken.mkdir();(broken/".git").mkdir()
+   self.assertEqual(D.diagnose_repository_start(broken)["state"],"error")
+
  def test_access_observation_exempts_exiting_and_vanished_processes_only(self):
   entry=Path("/proc/4242")
   stat_tail=lambda state,flags: "4242 (fixture) %s 1 2 3 4 5 %d 7 8 9 10 11 12 13 14 15 16 17 18 99" % (state,flags)

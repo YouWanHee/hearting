@@ -1219,9 +1219,8 @@ def parent_runtime_failure(args, route: dict, row: dict, parent_identity) -> str
     if args.action != "dry-run" or not args.inherited_jobs:
         return ""
     try:
-        repo = subprocess.check_output(
-            ["git", "-C", str(route["cwd"]), "rev-parse", "--show-toplevel"], text=True
-        ).strip()
+        from dispatch_contract import work_root_identity
+        repo = work_root_identity(route["cwd"], route=route)
         resolve_live_parent_attempt(
             args.jobs,
             parent_slug=args.parent,
