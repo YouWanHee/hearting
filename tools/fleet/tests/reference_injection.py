@@ -12,6 +12,43 @@ def extract_view_model(renderer, *, scrub=False):
         from tools.fleet.tests.freeze_explorer import sanitize_reference
         sanitize_reference(renderer)
         values = copy.deepcopy(_fixture_values(renderer))
+    else:
+        # Parity evidence needs the hand VM's original values. _fixture_values also serves the
+        # public scrubbed fixture, so restore its width-redacted source records only in this
+        # private in-memory extraction path.
+        values.update({
+            "attempts": {**copy.deepcopy(getattr(renderer, "_RAW", {})), "route": "f5"},
+            "nodes": _jsonable(copy.deepcopy(getattr(renderer, "ROUTE_NODES", {}))),
+            "cards": copy.deepcopy(getattr(renderer, "HDATA", {})),
+            "dialogue": {"logs": copy.deepcopy(getattr(renderer, "LOGS", {})),
+                         "generation_text": copy.deepcopy(getattr(renderer, "GEN_TEXT_0C", {}))},
+            "peer_nodes": copy.deepcopy(getattr(renderer, "PEER_PROJECTS", ())),
+            "peer_edges": {"links": copy.deepcopy(renderer.mock6.LINKS),
+                           "cross": copy.deepcopy(getattr(renderer, "PEER_CROSS", ())),
+                           "side_lanes": copy.deepcopy(getattr(renderer, "PEER_SIDE_LANES", ()))},
+            "compute": copy.deepcopy(renderer.mock3.COMPUTE),
+            "memory": copy.deepcopy(getattr(renderer.mock4, "MEMORY", ())),
+            "questions": copy.deepcopy(renderer.mock4.QUESTIONS),
+            "answered": copy.deepcopy(renderer.mock4.ANSWERED),
+            "events": copy.deepcopy(renderer.mock3.FEED),
+        })
+        seats = [list(row) for row in renderer.seats_by_repo()]
+        generations = {}
+        for seat in seats:
+            while len(seat) < 5:
+                seat.append(False)
+            chain = renderer.chain(seat[0])
+            cards = [item for item in chain if item.get("card")]
+            seat.append(str(renderer.card_title(cards[-1]) or "") if cards else "")
+            seat.append(copy.deepcopy(renderer.LINEAGE.get(seat[0], ())))
+            generations[seat[0]] = [{
+                "harness": item.get("h"), "sid": str(item.get("sid") or ""),
+                "at": item.get("at"), "kind": item.get("kind"),
+                "connection": item.get("conn"), "note": item.get("note"),
+                "card": bool(item.get("card")), "detail": True,
+                "title": str(renderer.card_title(item) or ""),
+            } for item in chain]
+        values["seats"], values["generations"] = seats, generations
     # Keep the reference's independent data tables available for an exact in-memory round trip.
     # This private token is never serialized into public fixtures.
     modules = {}
@@ -23,7 +60,7 @@ def extract_view_model(renderer, *, scrub=False):
     globals_copy = {key: copy.deepcopy(value) for key, value in vars(renderer).items()
                     if key.isupper() and _jsonish(value)}
     values["_reference_snapshot"] = {"globals": globals_copy, "modules": modules}
-    return values
+    return _jsonable(values)
 
 
 def _jsonish(value):
@@ -34,6 +71,20 @@ def _jsonish(value):
     if isinstance(value, (list, tuple, set)):
         return all(_jsonish(item) for item in value)
     return False
+
+
+def _jsonable(value):
+    """Copy evidence values without retaining renderer callbacks or live objects."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items() if not callable(item)}
+    if isinstance(value, set):
+        return sorted((_jsonable(item) for item in value), key=repr)
+    if isinstance(value, (list, tuple)):
+        items = [_jsonable(item) for item in value if not callable(item)]
+        return items
+    return None
 
 
 def inject_model_catalog(renderer, catalog):

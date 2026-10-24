@@ -141,6 +141,22 @@ def _tag_for(session, used):
     if tag is None:
         sid = _text(_get(session, "session_id", "sid", "id"))
         if sid is None:
+            # Keep a first-observed process row visible until the harness publishes its sid.
+            # The collector's explicit session_tag remains authoritative once identity resolves.
+            pid = _get(session, "pid")
+            start = _get(session, "proc_start", "started_at")
+            managed = _text(_get(session, "managed_dir"))
+            if pid is None or start is None:
+                return None
+            sid = f"process:{pid}:{start}:{managed or ''}"
+            seed = f"{_get(session, 'harness', default='')}:{sid}"
+            tag = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:2]
+            for offset in range(1, 40):
+                if tag not in used:
+                    break
+                tag = hashlib.sha1(seed.encode("utf-8")).hexdigest()[offset:offset + 2]
+            return tag
+        if sid is None:
             return None
         seed = f"{_get(session, 'harness', default='')}:{sid}"
         digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
@@ -659,14 +675,22 @@ def _question_records(session_rows, session_index, now):
     return questions
 
 
-def _peer_records(session_rows, session_index, now):
+def _peer_records(session_rows, session_index, now, snapshot=None):
     tag_by_sid = {known: tag for tag, info in session_index.items() for known in info["ids"]}
+    observations = _get(snapshot, "observations", default={}) or {}
+    joined = _get(observations, "replay_sources", default={}) or {}
+    tag_by_sid.update(_get(joined, "historical_tags", default={}) or {})
     harness_of = {row["tag"]: row["harness"] for row in session_rows}
-    links, linked = [], set()
+    candidates, linked = [], set()
+
+    def add(link, stamp=None):
+        candidates.append((float(stamp or 0), link))
 
     def endpoint(sid, harness):
         tag = tag_by_sid.get(sid)
-        return [tag, harness_of.get(tag) or harness] if tag else None
+        if tag:
+            return [tag, harness_of.get(tag) or harness]
+        return [str(sid), harness] if _text(sid) and _text(harness) else None
 
     for row in session_rows:
         session = session_index[row["tag"]]["session"]
@@ -676,24 +700,64 @@ def _peer_records(session_rows, session_index, now):
             other = endpoint(received.get("from_session_id"), received.get("from_harness"))
             if other and _text(received.get("kind")):
                 age = _dur(received.get("age_min"))
-                links.append([other, me, received["kind"], f"{age} ago" if age else None, ""])
+                add([other, me, received["kind"], f"{age} ago" if age else None, ""],
+                    _epoch_of(received.get("ts", received.get("at"))) or
+                    -float(_num(received.get("age_min")) or 0))
         sent = _get(session, "peer_last_sent")
         if isinstance(sent, Mapping):
             other = endpoint(sent.get("to_session_id"), sent.get("to_harness"))
             if other and _text(sent.get("kind")):
                 age = _dur(sent.get("age_min"))
-                links.append([me, other, sent["kind"], f"{age} ago" if age else None, ""])
-        for target in _get(session, "steward_targets") or ():
-            other = endpoint(_get(target, "session_id"), _get(target, "harness"))
-            links.append([me, other if other else (_text(_get(target, "name")) or "·"), "watch ⚑",
-                          _iso_age(_get(target, "ts"), now), ""])
-    unique, seen = [], set()
-    for link in links:
-        key = repr(link[:3])
-        if key in seen:
+                add([me, other, sent["kind"], f"{age} ago" if age else None, ""],
+                    _epoch_of(sent.get("ts", sent.get("at"))) or
+                    -float(_num(sent.get("age_min")) or 0))
+        targets = list(_get(session, "steward_targets") or ())
+        if targets:
+            resolved, ended = [], False
+            for target in targets:
+                other = endpoint(_get(target, "session_id"), _get(target, "harness"))
+                if other:
+                    resolved.append(other)
+                    if _get(target, "session_id") not in tag_by_sid:
+                        ended = True
+                else:
+                    ended = ended or _get(target, "state", "liveness") in ("ended", "dead", "stale")
+                    resolved.append(_text(_get(target, "name")) or "·")
+            for target in resolved:
+                if isinstance(target, list) and target:
+                    linked.add(target[0])
+            label = " ".join(f"[{target[0]}]" if isinstance(target, list) and target
+                             else str(target) for target in resolved)
+            add([me, label or "·", "watch ⚑" + (" · ended" if ended else ""), None, ""], 0)
+    peer_messages = _get(joined, "peer_messages", default={}) or {}
+    for message in _get(peer_messages, "records", default=()) or ():
+        if not isinstance(message, Mapping):
             continue
-        seen.add(key)
-        unique.append(link)
+        source, target = message.get("from") or {}, message.get("to") or {}
+        src = endpoint(_get(source, "session_id"), _get(source, "harness"))
+        dst = endpoint(_get(target, "session_id"), _get(target, "harness"))
+        if src and dst:
+            add([src, dst, _text(message.get("kind")) or "notice",
+                 _iso_age(message.get("ts"), now), _text(message.get("summary")) or ""],
+                _epoch_of(message.get("ts")))
+    for handover in _get(joined, "history_handovers", default=()) or ():
+        if not isinstance(handover, Mapping):
+            continue
+        src = endpoint(_get(handover, "frm"), _get(handover, "frm_h"))
+        dst = endpoint(_get(handover, "to"), _get(handover, "to_h"))
+        if src and dst:
+            add([src, dst, "handover", _iso_age(handover.get("ts", handover.get("at")), now), ""],
+                _epoch_of(handover.get("ts", handover.get("at"))))
+    # Keep the newest observation for each directed endpoint pair and kind.
+    newest_by_pair = {}
+    for stamp, link in candidates:
+        key = (repr(link[0]), repr(link[1]))
+        if key not in newest_by_pair or stamp > newest_by_pair[key][0]:
+            newest_by_pair[key] = (stamp, link)
+    unique = [pair[1] for pair in newest_by_pair.values()]
+    unique.sort(key=lambda link: next((stamp for stamp, candidate in candidates if candidate is link), 0),
+                reverse=True)
+    for link in unique:
         for end in link[:2]:
             if isinstance(end, list) and end:
                 linked.add(end[0])
@@ -704,17 +768,6 @@ def _peer_records(session_rows, session_index, now):
             by_repo.setdefault(row["repo"], []).append([row["tag"]])
     for repo, columns in by_repo.items():
         nodes.append([repo, columns])
-    # The collector exposes one newest send and receive per session. Put those
-    # observations in temporal order while retaining stable row order for ties.
-    def newest(link):
-        value = link[3]
-        if isinstance(value, str):
-            match = re.match(r"(\d+)(m|h|d) ago$", value)
-            if match:
-                scale = {"m": 1, "h": 60, "d": 1440}[match.group(2)]
-                return int(match.group(1)) * scale
-        return float("inf")
-    unique.sort(key=newest)
     if not unique:
         return [], None                       # no peer record: the section is omitted
     return nodes, {"links": unique, "cross": [], "side_lanes": []}
@@ -751,10 +804,19 @@ def _host_records(snapshot, session_index):
         if host.get("reachable") is False:
             compute.append([name, base, None, None, None, []])
             continue
-        cpu_pct, cpu_n = _num(host.get("cpu_utilization_pct")), _num(host.get("cpu_count"))
-        cpu = [round(cpu_n * cpu_pct / 100, 1), cpu_n] if cpu_pct is not None and cpu_n else None
+        thread_pct = host.get("cpu_thread_utilization_pct")
+        if isinstance(thread_pct, (list, tuple)) and thread_pct:
+            samples = [_num(value) for value in thread_pct]
+            samples = [value for value in samples if value is not None]
+            cpu = [round(sum(samples) / 100, 1), len(samples)] if samples else None
+        else:
+            cpu_pct, cpu_n = _num(host.get("cpu_utilization_pct")), _num(host.get("cpu_count"))
+            cpu = [round(cpu_n * cpu_pct / 100, 1), cpu_n] if cpu_pct is not None and cpu_n else None
         mem_total, mem_used = _gib(host.get("memory_total_mib")), _gib(host.get("memory_used_mib"))
         mem = [mem_used, mem_total] if mem_total and mem_used is not None else None
+        swap_total = _gib(host.get("swap_total_mib"))
+        swap_used = _gib(host.get("swap_used_mib"))
+        swap = [swap_used, swap_total] if swap_total and swap_used is not None else None
         gpus = []
         for gpu in host.get("gpus") or ():
             if not isinstance(gpu, Mapping):
@@ -771,7 +833,7 @@ def _host_records(snapshot, session_index):
             gpus.append([_num(gpu.get("index")), "working" if processes else "idle",
                          _text(gpu.get("name")), None,
                          None if util is None else int(util), used, total, users])
-        compute.append([name, base, cpu, mem, None, gpus])
+        compute.append([name, base, cpu, mem, swap, gpus])
     return labels, compute
 
 
@@ -842,18 +904,33 @@ def _memory_records(snapshot, accepted_detail):
     by_repo = memory.get("by_repo")
     if not isinstance(by_repo, Mapping):
         return None
-    records = []
+    grouped = {}
+    seen = set()
     for repo, events in by_repo.items():
-        rows = []
         for event in events or ():
             if not isinstance(event, Mapping):
                 continue
-            action = "saved" if event.get("action") in ("add", "note") else "changed"
-            rows.append([_parse_clock(event.get("ts")), action, _text(event.get("type")),
-                         _text(event.get("snippet"))])
-        if rows:
-            records.append([_shown_repo(repo), rows])
-    return records
+            action_name = event.get("action")
+            if action_name == "lifecycle-expire":
+                continue
+            identity = _text(event.get("id"))
+            if identity and identity in seen:
+                continue
+            if identity:
+                seen.add(identity)
+            action = "saved" if action_name in ("add", "note", "tidy-add") else "changed"
+            snippet = _text(event.get("snippet"))
+            if snippet:
+                snippet = re.sub(r"^\d{4}-\d\d-\d\d\s+\[[^]]+\]\([^)]*\):\s*", "", snippet)
+            project_source = _text(event.get("project"))
+            if project_source and "/" in project_source:
+                project = _gpu_repo(project_source)
+            else:
+                project = project_source or _gpu_repo(_get(event, "cwd")) or _shown_repo(repo)
+            grouped.setdefault(project, []).append((_epoch_of(event.get("ts")) or 0.0,
+                [_parse_clock(event.get("ts")), action, _text(event.get("type")), snippet]))
+    return [[repo, [row for _stamp, row in sorted(rows, key=lambda item: -item[0])]]
+            for repo, rows in sorted(grouped.items()) if rows]
 
 
 def _system_record(snapshot, session_rows, compute, accepted_detail, usage, now=None):
@@ -861,9 +938,11 @@ def _system_record(snapshot, session_rows, compute, accepted_detail, usage, now=
     governor = _get(snapshot, "governor")
     jobs = _records(_get(snapshot, "jobs", default=()))
     resources = _records(_get(snapshot, "resources", default=()))
-    dispatch = {"jobs": len(jobs),
+    snapshot_summary = _get(snapshot, "summary", default={}) or {}
+    dispatch = {"jobs": sum(1 for job in jobs if _get(job, "status") in ("open", "running")),
                 "resource_running": sum(1 for r in resources if _get(r, "liveness") == "working"),
-                "resource_exited": sum(1 for r in resources if _get(r, "liveness") == "exited")}
+                "resource_exited": int(_num(_get(snapshot_summary, "resource_exited")) or
+                                        sum(1 for r in resources if _get(r, "liveness") == "exited"))}
     if isinstance(governor, Mapping):
         active, cap = _num(governor.get("active")), _num(governor.get("cap"))
         if active is not None:
@@ -871,29 +950,47 @@ def _system_record(snapshot, session_rows, compute, accepted_detail, usage, now=
         if cap is not None:
             dispatch["governor_cap"] = int(cap)
     system["dispatch"] = dispatch
-    system["dispatch_count"] = sum(1 for job in jobs if _get(job, "depth") == 1)
+    system["dispatch_count"] = sum(1 for job in jobs if _get(job, "liveness") == "working")
     delivery = _get(snapshot, "pending_delivery")
     if isinstance(delivery, Mapping):
         pending = _num(delivery.get("pending", delivery.get("total")))
         if pending is not None:
             system["peer_delivery"] = {"pending": int(pending)}
     memory = _get(snapshot, "memory")
-    if isinstance(memory, Mapping) and isinstance(memory.get("today"), Mapping):
-        today = memory["today"]
-        summary = {"added_today": _num(today.get("added")), "expired": _num(today.get("expired")),
-                   "latest": len(memory.get("recent") or ())}
-        if isinstance(memory.get("by_repo"), Mapping):
-            summary["projects"] = len(memory["by_repo"])
-        system["memory_summary"] = {k: v for k, v in summary.items() if v is not None}
+    if isinstance(memory, Mapping):
+        today = memory.get("today") if isinstance(memory.get("today"), Mapping) else {}
+        all_events = [(repo, event) for repo, events in (memory.get("by_repo") or {}).items()
+                      for event in (events or ()) if isinstance(event, Mapping)]
+        local_day = datetime.datetime.fromtimestamp(now).date() if _num(now) is not None else None
+        added = sum(1 for _repo, event in all_events
+                    if event.get("action") == "add" and local_day is not None
+                    and (_epoch_of(event.get("ts")) is not None)
+                    and datetime.datetime.fromtimestamp(_epoch_of(event.get("ts"))).date() == local_day)
+        expired = sum(1 for _repo, event in all_events if event.get("action") == "lifecycle-expire")
+        summary = {"added_today": _num(today.get("added")) if today.get("added") is not None else added,
+                   "expired": _num(today.get("expired")) if today.get("expired") is not None else expired,
+                   "projects": len(memory.get("by_repo") or {})}
+        system["memory_summary"] = summary
+    gpu_processes, unregistered_gpu, gpu_summary = _gpu_process_records(snapshot)
+    if gpu_processes:
+        system["gpu_processes"] = gpu_processes
+        system["gpu_process_summary"] = gpu_summary
+    if unregistered_gpu:
+        system["unregistered_gpu_processes"] = unregistered_gpu
+        system["unregistered_gpu_summary"] = {"count": gpu_summary["unregistered"],
+            "remaining": gpu_summary["remaining"], "owner": gpu_summary.get("owner")}
     install = _install_record(snapshot)
     if install is not None:
         system["install"] = install
     if usage:
         observed = [_num(snap.get("observed_at")) for snap in (_get(snapshot, "usage_snapshots", default={}) or {}).values()
                     if isinstance(snap, Mapping)]
-        stamp = _clock(max((v for v in observed if v is not None), default=now))
+        source_usage = _get(snapshot, "usage", default={}) or {}
+        source_observed = _num(_get(source_usage, "observed_at"))
+        stamp = _clock(max((v for v in observed if v is not None), default=source_observed or now))
         if stamp:
-            system["usage_api"] = {"state": "on", "freshness": stamp}
+            system["usage_api"] = {"state": "off" if source_usage.get("api_disabled") else "on",
+                                    "freshness": stamp}
     return system
 
 
@@ -931,6 +1028,83 @@ def _memory_events(snapshot, tag_of_sid, tag_of_cwd, limit=24):
     return events[:limit]
 
 
+def _gpu_repo(cwd):
+    parts = [part for part in str(cwd or "").split("/") if part]
+    for index, part in enumerate(parts):
+        if part.endswith("-wt"):
+            return part[:-3]
+    return parts[-1] if parts else None
+
+
+def _short_gpu_command(command):
+    if not isinstance(command, str) or not command.strip():
+        return None
+    parts = [part.rsplit("/", 1)[-1] for part in command.split()]
+    first_script = next((i for i, part in enumerate(parts) if part.endswith(".py")), 0)
+    shown = []
+    for part in parts[first_script:]:
+        if re.fullmatch(r"[0-9a-fA-F]{12,}", part.split("=")[-1]):
+            if shown and shown[-1].startswith("-") and "=" not in shown[-1]:
+                shown.pop()
+            continue
+        shown.append(part)
+    return " ".join(shown) or None
+
+
+def _gpu_process_records(snapshot):
+    hosts = _host_blocks(snapshot) or ()
+    unregistered = _records(_get(snapshot, "unregistered_gpu", default=()))
+    unregistered_keys = {(str(item.get("host") or ""), str(item.get("pid") or ""))
+                         for item in unregistered if isinstance(item, Mapping)}
+    session_tags = {}
+    for session in _records(_get(snapshot, "sessions", default=())):
+        sid = _text(_get(session, "session_id", "sid"))
+        tag = _text(_get(session, "session_tag", "tag"))
+        harness = _text(_get(session, "harness"))
+        if sid and tag and harness:
+            session_tags[(harness, sid)] = tag
+    processes = []
+    for host in hosts:
+        if not isinstance(host, Mapping):
+            continue
+        for gpu in host.get("gpus") or ():
+            if not isinstance(gpu, Mapping):
+                continue
+            for process in gpu.get("processes") or ():
+                if not isinstance(process, Mapping):
+                    continue
+                owner = process.get("session_owner") or {}
+                owner_sid = _text(_get(owner, "session_id", "id"))
+                owner_harness = _text(_get(owner, "harness"))
+                elapsed = _num(process.get("elapsed_s"))
+                gib = _gib(process.get("used_memory_mib"))
+                processes.append({"host": host.get("host"), "gpu": gpu.get("index"),
+                    "session_id": session_tags.get((owner_harness, owner_sid), owner_sid),
+                    "cwd": _gpu_repo(process.get("cwd")),
+                    "command": _short_gpu_command(process.get("command")),
+                    "vram": (f"{gib:g} GB" if gib is not None else None),
+                    "age": _dur(elapsed / 60) if elapsed is not None else None,
+                    "registered": (str(host.get("host") or ""), str(process.get("pid") or ""))
+                                  not in unregistered_keys})
+    unregistered_rows = []
+    for item in unregistered:
+        if not isinstance(item, Mapping):
+            continue
+        elapsed = _num(item.get("elapsed_s"))
+        unregistered_rows.append([item.get("host"), item.get("gpu_indexes", [item.get("gpu_name")])[0],
+            _short_gpu_command(item.get("command")), _gib(item.get("used_memory_mib")),
+            _dur(elapsed / 60) if elapsed is not None else None])
+    owner_sid = next((_text(_get(item.get("session_owner"), "session_id", "id"))
+                      for item in unregistered if isinstance(item, Mapping)
+                      and item.get("session_owner")), None)
+    owner = next((session_tags.get((_text(_get(session, "harness")), owner_sid))
+                  for session in _records(_get(snapshot, "sessions", default=())) if owner_sid
+                  and _text(_get(session, "session_id", "sid")) == owner_sid), None)
+    count = len(unregistered_rows)
+    return processes, unregistered_rows[:4], {"count": len(processes), "unregistered": count,
+        "remaining": max(0, count - 4), "owner": owner}
+
+
 def _registry_events(focus, tag):
     """The focused session's newest registry lines as feed records."""
     events = []
@@ -951,23 +1125,44 @@ def _registry_events(focus, tag):
     return events
 
 
+def _peer_events(snapshot, session_index):
+    observations = _get(snapshot, "observations", default={}) or {}
+    sources = _get(observations, "replay_sources", default={}) or {}
+    messages = _get(_get(sources, "peer_messages", default={}) or {}, "records", default=()) or ()
+    tag_by_sid = {sid: tag for tag, info in session_index.items() for sid in info["ids"]}
+    result = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        sender = message.get("from") or {}
+        stamp = _epoch_of(message.get("ts"))
+        if stamp is None:
+            continue
+        tag = tag_by_sid.get(_text(_get(sender, "session_id"))) or "·"
+        text = _text(message.get("summary")) or _text(message.get("kind")) or "notice"
+        result.append((stamp, [_clock(stamp), tag, "peer", _text(message.get("kind")) or "notice",
+                                   "dim", text]))
+    return sorted(result, key=lambda item: -item[0])[:5]
+
+
 def _answered_records(snapshot):
     """Decision records the user answered, per repo, newest first: ``[repo, [[HH:MM, text], ...]]``."""
     memory = _get(snapshot, "memory")
     by_repo = memory.get("by_repo") if isinstance(memory, Mapping) else None
     if not isinstance(by_repo, Mapping):
         return []
-    answered = []
+    grouped = {}
     for repo, events in by_repo.items():
-        rows = []
         for event in events or ():
             if isinstance(event, Mapping) and event.get("type") == "decision" and _text(event.get("snippet")):
-                rows.append((_epoch_of(event.get("ts")) or 0.0,
-                             [_parse_clock(event.get("ts")), event["snippet"]]))
-        rows.sort(key=lambda item: -item[0])
-        if rows:
-            answered.append([_shown_repo(repo), [row for _epoch, row in rows]])
-    return answered
+                project = _text(event.get("project"))
+                if project and "/" in project:
+                    project = _gpu_repo(project)
+                project = project or _gpu_repo(_get(event, "cwd")) or _shown_repo(repo)
+                grouped.setdefault(project, []).append((_epoch_of(event.get("ts")) or 0.0,
+                    [_parse_clock(event.get("ts")), event["snippet"]]))
+    return [[repo, [row for _epoch, row in sorted(rows, key=lambda item: -item[0])]]
+            for repo, rows in sorted(grouped.items()) if rows]
 
 
 # -- detail (the selection pump's reads) ----------------------------------------------------------
@@ -983,6 +1178,8 @@ def _detail_parts(detail):
 
 def _stamp(epoch, now):
     value = _num(epoch)
+    if value is None:
+        value = _epoch_of(epoch)
     if value is None:
         return None
     try:
@@ -1130,8 +1327,19 @@ def build_view_model(snapshot, accepted_detail=None, cached_config=None, now=Non
         session_rows.sort(key=lambda row: position.get(str(sid_of.get(row["tag"])), len(position)))
     routes, nodes = _route_records(snapshot, session_rows, session_index, resolver, clock)
     repos = _repo_records(session_rows, routes, _repo_results(snapshot, resolver, clock), clock)
+    if not order:
+        latest_by_repo, mtime_by_tag = {}, {}
+        for row in session_rows:
+            info = session_index[row["tag"]]
+            stamp = _num(_get(info["session"], "mtime")) or 0
+            latest_by_repo[row["repo_id"]] = max(latest_by_repo.get(row["repo_id"], 0), stamp)
+            mtime_by_tag[row["tag"]] = stamp
+        repos.sort(key=lambda row: (-latest_by_repo.get(row["id"], 0), row["id"]))
+        repo_rank = {row["id"]: index for index, row in enumerate(repos)}
+        session_rows.sort(key=lambda row: (repo_rank.get(row["repo_id"], len(repo_rank)),
+                                           -mtime_by_tag.get(row["tag"], 0), row["tag"]))
     questions = _question_records(session_rows, session_index, clock)
-    peer_nodes, peer_edges = _peer_records(session_rows, session_index, clock)
+    peer_nodes, peer_edges = _peer_records(session_rows, session_index, clock, snapshot)
     hosts, compute = _host_records(snapshot, session_index)
     usage = _usage_records(snapshot, session_rows, clock)
     by_repo = {}
@@ -1169,8 +1377,10 @@ def build_view_model(snapshot, accepted_detail=None, cached_config=None, now=Non
     focus_key = _get(focus, "key")
     if focus_key is not None:
         focus_tag = tag_of_sid.get(_get(focus_key, "sid"))
-    feed = _memory_events(snapshot, tag_of_sid, tag_of_cwd) + _registry_events(focus, focus_tag)
+    feed = (_memory_events(snapshot, tag_of_sid, tag_of_cwd) +
+            _registry_events(focus, focus_tag) + _peer_events(snapshot, session_index))
     feed.sort(key=lambda item: -item[0])
+    feed = feed[:5]
     explicit = _get(focus, "source_records")
     answered = _answered_records(snapshot)
     system = _system_record(snapshot, session_rows, compute, accepted_detail, usage, clock)

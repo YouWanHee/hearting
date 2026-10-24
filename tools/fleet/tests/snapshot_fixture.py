@@ -96,7 +96,9 @@ def replay_snapshot(payload, *, detail_bundle=None, now=None):
     detail_data = detail_bundle or payload.get("detail") or {}
     focus_data = detail_data.get("focus") if isinstance(detail_data, dict) else None
     focus = None
-    if isinstance(focus_data, dict):
+    if isinstance(focus_data, FocusResult):
+        focus = focus_data
+    elif isinstance(focus_data, dict):
         key_data = focus_data.get("key", {})
         key = FocusKey(**{name: key_data[name] for name in ("harness", "sid", "generation")
                           if name in key_data})
@@ -111,6 +113,182 @@ def replay_snapshot(payload, *, detail_bundle=None, now=None):
     if now is not None:
         snapshot.observations = dict(snapshot.observations or {}, replay_now=now)
     return snapshot, detail
+
+
+def _document(value):
+    if isinstance(value, (str, Path)):
+        return json.loads(Path(value).read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise TypeError("replay source must be a mapping or JSON path")
+    return value
+
+
+def _source_epoch(value, now=None):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            import datetime
+            stamp = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+            return stamp.timestamp()
+        except ValueError:
+            try:
+                import datetime
+                stamp = datetime.datetime.strptime(value, "%m-%d %H:%M")
+                year = datetime.datetime.fromtimestamp(now).year if isinstance(now, (int, float)) else datetime.datetime.now().year
+                return stamp.replace(year=year).timestamp()
+            except (ValueError, OSError, OverflowError):
+                return None
+    return None
+
+
+def replay_source_bundle(state, history_data, logs_hist, raw_f5, *, now=None):
+    """Join the four original capture records and rebuild typed production inputs.
+
+    ``source_records`` retains JSON-pointer provenance for each attached detail value.
+    The joined private bundle is evidence-only; checked fixtures stay scrubbed.
+    """
+    state_doc = _document(state)
+    history_doc = _document(history_data)
+    logs_doc = _document(logs_hist)
+    raw_doc = _document(raw_f5)
+    normalized = dict(state_doc)
+    normalized["resources"] = state_doc.get("resource_jobs", ())
+    route_rows = state_doc.get("route") or ()
+    normalized["node_evidence"] = {
+        str(row.get("route_id")): row for row in route_rows
+        if isinstance(row, dict) and row.get("route_id")
+    }
+    handovers = history_doc.get("_recent_handovers", ())
+    historical_tags = {}
+    for history_tag, history in history_doc.items():
+        if str(history_tag).startswith("_") or not isinstance(history, dict):
+            continue
+        for card in list(history.get("prior_cards") or ()) + list(history.get("cards") or ()):
+            if isinstance(card, dict) and card.get("sid"):
+                historical_tags[str(card["sid"])] = str(history_tag)
+    normalized["observations"] = dict(state_doc.get("observations") or {},
+        replay_sources={"peer_messages": state_doc.get("peer_messages"),
+                        "history_handovers": handovers,
+                        "historical_tags": historical_tags,
+                        "unregistered_gpu": state_doc.get("unregistered_gpu"),
+                        "source_records": {"peer_messages": "/state.json/peer_messages",
+                                           "history_handovers": "/history_data.json/_recent_handovers",
+                                           "historical_tags": "/history_data.json/*/cards",
+                                           "unregistered_gpu": "/state.json/unregistered_gpu"}})
+    detail = {"seats": {}, "panes": {}, "source_records": {}}
+    focus_target = None
+    for index, session in enumerate(state_doc.get("sessions") or ()):
+        if not isinstance(session, dict):
+            continue
+        sid = session.get("session_id")
+        harness = session.get("harness")
+        tag = session.get("session_tag")
+        if tag == "f5" or (focus_target is None and sid and raw_doc.get("sid") == sid):
+            focus_target = (session, index)
+        aliases = [tag, sid, *(session.get("session_aliases") or ())]
+        history_key = next((str(alias) for alias in aliases
+                            if alias and isinstance(history_doc.get(str(alias)), dict)), None)
+        source = history_doc.get(history_key) if history_key is not None else None
+        if source is not None:
+            for field_name in ("seat", "cards", "handovers", "prior_cards"):
+                if field_name in source:
+                    pointer = f"/history_data.json/{history_key}/{field_name}"
+                    detail["source_records"][f"{tag or sid}.{field_name}"] = pointer
+            if harness and sid and source.get("seat") is not None:
+                entries = []
+                for card in list(source.get("prior_cards") or ()) + list(source.get("cards") or ()):
+                    card_sid = card.get("sid") if isinstance(card, dict) else None
+                    card_harness = card.get("harness") if isinstance(card, dict) else None
+                    lines = list(card.get("lines") or ()) if isinstance(card, dict) else []
+                    title = next((str(line).strip() for line in lines
+                                  if str(line).strip() and not str(line).strip().startswith("<")), "")
+                    recorded = dict(card) if isinstance(card, dict) else {}
+                    recorded.update({"generation": recorded.get("gen", recorded.get("generation")),
+                                     "status": "available" if lines else "unavailable",
+                                     "at": _source_epoch(recorded.get("at"), now), "title": title[:48],
+                                     "lines": lines})
+                    entries.append({"harness": card_harness or harness, "sid": card_sid or sid,
+                                    "started_at": _source_epoch(recorded.get("at"), now),
+                                    "cards": [recorded], "handovers": source.get("handovers") or (),
+                                    "source": "history", "relation": "recorded generation",
+                                    "transcript": {}, "current": False})
+                entries.append({"harness": harness, "sid": sid, "cards": [],
+                                "handovers": source.get("handovers") or (),
+                                "source": "history", "relation": "current session",
+                                "started_at": _source_epoch(session.get("started_at"), now),
+                                "transcript": {}, "current": True})
+                detail["seats"][f"{harness}:{sid}"] = entries
+        if tag and sid:
+            detail["source_records"][f"session.{tag}"] = f"/state.json/sessions/{index}"
+    detail["handovers"] = handovers
+    detail["logs"] = logs_doc
+    detail["raw"] = raw_doc
+    detail["source_records"]["handovers"] = "/history_data.json/_recent_handovers"
+    detail["source_records"]["logs"] = "/logs_hist.json"
+    detail["source_records"]["raw"] = "/raw_f5.json/lines"
+    for key, entry in logs_doc.items():
+        if isinstance(entry, dict):
+            detail["source_records"][f"logs.{key}"] = f"/logs_hist.json/{key}/lines"
+    if raw_doc.get("lines"):
+        detail["source_records"]["raw.lines"] = "/raw_f5.json/lines"
+    if focus_target is not None:
+        session, index = focus_target
+        sid, harness = session.get("session_id"), session.get("harness")
+        tag = session.get("session_tag") or "f5"
+        seat_entries = detail["seats"].get(f"{harness}:{sid}")
+        dialogue = next((entry for entry in logs_doc.values()
+                         if isinstance(entry, dict) and entry.get("sid") == sid), None)
+        source_records = {"raw": raw_doc}
+        if seat_entries is not None:
+            source_records["seat"] = seat_entries
+        if dialogue is not None:
+            source_records["dialogue"] = {"index": 0, "harness": dialogue.get("harness"),
+                                           "sid": dialogue.get("sid"), "lines": dialogue.get("lines")}
+        from tools.fleet.explorer.types import FocusKey, FocusResult, Health
+        focus = FocusResult(key=FocusKey(str(harness), str(sid)), epoch=0,
+            snapshot_generation=0, output=tuple(raw_doc.get("lines") or ()),
+            health=Health("success"), events=tuple(), source_records=source_records)
+        detail["focus"] = focus
+        detail["source_records"][f"focus.{tag}"] = f"/state.json/sessions/{index}"
+    normalized["observations"]["replay_source_records"] = {
+        "state": "/state.json", "history": "/history_data.json",
+        "logs": "/logs_hist.json", "raw": "/raw_f5.json"}
+    snapshot, explorer_detail = replay_snapshot(normalized, detail_bundle=detail, now=now)
+    snapshot.compute_hosts = state_doc.get("compute_hosts")
+    snapshot.unregistered_gpu = state_doc.get("unregistered_gpu", ())
+    snapshot.peer_messages = state_doc.get("peer_messages")
+    snapshot.usage = state_doc.get("usage")
+    snapshot.route = route_rows
+    snapshot.summary = state_doc.get("summary")
+    from dataclasses import replace
+    from types import SimpleNamespace
+    try:
+        from tools.fleet.model import WorkProjection
+    except ModuleNotFoundError:
+        from fleet.model import WorkProjection
+    routes_by_id = {str(row["route_id"]): row for row in route_rows
+                    if isinstance(row, dict) and row.get("route_id")}
+    for entity in (*snapshot.sessions, *snapshot.jobs):
+        work = getattr(entity, "work_projection", None)
+        route = routes_by_id.get(str(getattr(work, "route_id", ""))) if work is not None else None
+        if route is not None:
+            view = dict(route)
+            setattr(entity, "work_projection", replace(work, _route_view={"record": route, "view": view}))
+    snapshot.route_entities = [SimpleNamespace(
+        work_projection=WorkProjection(source="replay-route", route_id=rid, route_hash=row.get("route_hash"),
+            _route_view={"record": row, "view": row}, result=row.get("result")))
+        for rid, row in routes_by_id.items()]
+    snapshot.observations = dict(snapshot.observations or {}, replay_sources=normalized["observations"]["replay_sources"],
+                                 replay_source_records=normalized["observations"]["replay_source_records"])
+    from tools.fleet.explorer.types import ExplorerDetail
+    explorer_detail = ExplorerDetail(
+        focus=explorer_detail.focus, seats=explorer_detail.seats,
+        config=explorer_detail.config, panes=explorer_detail.panes,
+        catalogs=explorer_detail.catalogs, source_records=detail["source_records"])
+    return snapshot, explorer_detail
 
 
 def observed_fixture(sessions, jobs, resources=None, node_evidence=None):

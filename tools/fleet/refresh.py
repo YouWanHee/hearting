@@ -130,6 +130,7 @@ class RefreshPump:
         self._latest = None
         self._last_error = None
         self._started_at = None
+        self._last_duration = 0.0
         self._last_success_at = None
         self._failure_streak = 0
         self._stall_after = (
@@ -279,6 +280,9 @@ class RefreshPump:
             error = exc
 
         with self._lock:
+            finished_at = self._clock()
+            if self._started_at is not None:
+                self._last_duration = max(0.0, finished_at - self._started_at)
             if error is None:
                 self._latest = value
                 self._generation += 1
@@ -293,7 +297,11 @@ class RefreshPump:
             # exponentially, bounded at eight intervals; success restores the
             # normal cadence and never changes explicit force-refresh behavior.
             cooldown = self._interval * (2 ** self._failure_streak)
-            self._next_due = self._clock() + cooldown
+            # Start the next periodic observation only after an idle interval
+            # at least as long as the last collection. This bounds duty cycle
+            # at 50% for a collection slower than the requested interval.
+            adaptive_delay = max(self._interval, self._last_duration)
+            self._next_due = finished_at + max(cooldown, adaptive_delay)
             if self._pending and not self._stopped:
                 self._pending = False
                 self._running = True

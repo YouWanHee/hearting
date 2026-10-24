@@ -63,8 +63,9 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
         x = grid.put(x, 0, f"{len(hosts)}/{len(hosts)}", "dim", limit=census_x - 1)
     cx = max(x + 1, width - 1 - census_width)
     for text, key in census_parts:
-        grid.put(cx, 0, text, key)
-        cx += len(text)
+        if cx >= width - 1:
+            break
+        cx = grid.put(cx, 0, text, key, limit=width - 1)
     usage = tuple(vm.usage or ())
     if not state.usage_open:
         more_x = width - 9
@@ -135,27 +136,27 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
         grid.put(width - 9, 1, "u", "hearting", limit=width - 1)
         grid.put(width - 8, 1, " less ▾", "dim", limit=width - 1)
     if height >= 3:
-        title_y = 4 if state.usage_open else 2
-        grid.fill(0, width, title_y, "─", "line")
-        grid.put(0, title_y, "─", "line")
-        grid.put(1, title_y, " EXPLORER ", "title_dim")
-        grid.put(NAV_WIDTH, title_y, "┬", "line")
+        title_y = 5 if state.usage_open else 3
+        grid.fill(0, NAV_WIDTH, title_y, " ", "dim", tint=234)
+        grid.put(0, title_y, " ", "dim", tint=234)
+        grid.put(1, title_y, "VIEWS    ", "title_dim", tint=234)
+        grid.put(NAV_WIDTH - 1, title_y, " ", None, tint=234)
+        grid.put(NAV_WIDTH, title_y, "┌", "line")
         grid.put(NAV_WIDTH + 1, title_y, "─", "line")
-        grid.put(NAV_WIDTH + 2, title_y, " ", "dim")
-        grid.put(NAV_WIDTH + 3, title_y, "{ ", "dim")
-        title_text = _clip(str(state.title or state.view), max(1, width - 1 - (NAV_WIDTH + 5) - 3))
+        grid.put(NAV_WIDTH + 2, title_y, " { ", "dim")
+        title_text = _clip(str(state.title or state.view), max(1, width - 1 - (NAV_WIDTH + 6) - 3))
         grid.put(NAV_WIDTH + 5, title_y, title_text, "head", limit=width - 1)
         from .grid import cell_width
         title_end = NAV_WIDTH + 5 + cell_width(title_text)
         grid.put(title_end, title_y, " ", "dim", limit=width - 1)
         grid.put(title_end + 1, title_y, "} ", "dim", limit=width - 1)
-        grid.put(title_end + 3, title_y, "─" * max(0, width - title_end - 4), "line", limit=width - 1)
+        grid.put(title_end + 3, title_y, "─" * max(0, width - title_end - 3), "line", limit=width)
         for row in range(title_y + 1, max(title_y + 1, height - 4)):
             grid.put(NAV_WIDTH, row, "│", "line")
         if height > 9:
-            grid.put(NAV_WIDTH, 11 if state.usage_open else 9, "┫", "line")
+            grid.put(NAV_WIDTH, 12 if state.usage_open else 10, "│", "line")
         if height > 34:
-            grid.put(NAV_WIDTH, 34, "┫", "line")
+            grid.put(NAV_WIDTH, 34, "│", "line")
         grid.fill(0, width, height - 4, "─", "line")
         grid.put(NAV_WIDTH, height - 4, "┴", "line")
     if height >= 1:
@@ -289,7 +290,7 @@ def draw_explorer(grid: CellGrid, vm, state):
               "ROUTES": sum(1 for route in vm.routes if route.get("state") != "done"),
               "QUESTIONS": len(vm.questions or ()), "HISTORY": len(vm.seats or ())}
     views = ("OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "COMPUTE")
-    y = 5 if getattr(state, "usage_open", False) else 3
+    y = 6 if getattr(state, "usage_open", False) else 4
     for view in views:
         page_scope = getattr(state, "scope", "-") != "-"
         selected = not page_scope and getattr(state, "view", "OVERVIEW") == view
@@ -302,15 +303,14 @@ def draw_explorer(grid: CellGrid, vm, state):
         count = counts.get(view, len(vm.compute or ()) if view == "COMPUTE" else 0)
         if view != "OVERVIEW" and count:
             count_key = "blocked" if view == "QUESTIONS" else "dim"
-            grid.put(width - len(str(count)) - 1, y, str(count), count_key,
+            shown_count = f"{count}/{count}" if view == "COMPUTE" else str(count)
+            grid.put(width - len(shown_count) - 1, y, shown_count, count_key,
                      limit=width - 1)
         if selected:
             for xx in range(width):
                 glyph, key, _tint = grid.cells[y][xx]
                 grid.cells[y][xx] = (glyph, key, 236)
         y += 1
-    # Keep a deliberate blank row between the compact view list and its section band.
-    y += 1
     x = 1
     for view in ("MEMORY", "MODELS", "SYSTEM"):
         left, right = x - 1, x + len(view) + 1
@@ -326,14 +326,23 @@ def draw_explorer(grid: CellGrid, vm, state):
                 grid.cells[y][xx] = (glyph, key, 236)
         x += len(view) + 3
     y += 1
+    # r14 separates the utility tabs from the SESSIONS band with a blank row.
+    y += 1
     sessions = tuple(vm.sessions or ())
     working = sum(1 for item in sessions if item.get("state") == "working")
     idle = sum(1 for item in sessions if item.get("state") == "idle")
     blocked = sum(1 for item in sessions if item.get("state") == "blocked")
-    grid.fill(0, width, y, " ", tint=234)
-    grid.put(1, y, " SESSIONS ", "title_dim", tint=234)
-    grid.put(12, y, f"⠏{working}  ●{idle}  ●{blocked}", "dim", tint=234,
-             limit=max(12, width - 1))
+    grid.fill(0, width, y, " ", "dim", tint=234)
+    grid.put(1, y, "SESSIONS ", "title_dim", tint=234)
+    count_x = max(1, width - 12)
+    grid.put(count_x, y, " ", "branch_s", tint=234)
+    grid.put(count_x + 1, y, "  ", None, tint=234)
+    grid.put(count_x + 3, y, f"⠏{working}", "g_spin", tint=234)
+    grid.put(count_x + 5, y, " ", "g_work_off", tint=234)
+    grid.put(count_x + 6, y, f"●{idle}", "g_work_off", tint=234)
+    grid.put(count_x + 8, y, " ", "g_blocked", tint=234)
+    grid.put(count_x + 9, y, f"●{blocked}", "g_blocked", tint=234)
+    grid.put(width - 1, y, " ", None, tint=234)
     y += 1
     tree_bottom = min(height - 1, 34)
     tree_total = _tree_row_count(vm, sessions)
@@ -469,16 +478,17 @@ def draw_explorer(grid: CellGrid, vm, state):
     compute_y = 34
     if compute_y < height:
         hosts = tuple(vm.compute or ())
-        grid.add_hit(compute_y, 0, width, ("tab", "COMPUTE"))
+        grid.add_hit(compute_y, 0, width, ("root", "COMPUTE"))
         for hit_y in range(compute_y + 1, grid.rows - 4):
             grid.add_hit(hit_y, 0, width, ("root", "COMPUTE"))
-        grid.fill(0, 27, compute_y, "─", "line")
-        grid.put(0, compute_y, "─", "line")
-        grid.put(1, compute_y, " COMPUTE ", "head" if state.view == "COMPUTE" else "title_dim")
-        grid.put(27, compute_y, " ", "dim")
-        grid.put(28, compute_y, f"{len(hosts)}/{len(hosts)}", "dim")
-        grid.put(31, compute_y, " ", "dim")
-        grid.put(32, compute_y, "┤", "line")
+        grid.fill(0, width, compute_y, " ", "dim", tint=234)
+        grid.put(1, compute_y, "COMPUTE ", "head" if state.view == "COMPUTE" else "title_dim",
+                 tint=234)
+        compute_count = f"{len(hosts)}/{len(hosts)}"
+        grid.put(width - 1 - len(compute_count), compute_y, compute_count, "dim", tint=234,
+                 limit=width - 1)
+        grid.put(width - 5, compute_y, " ", None, tint=234)
+        grid.put(width - 1, compute_y, " ", None, tint=234)
         grid.put(14, compute_y + 1, "cpu", "dim")
         grid.put(20, compute_y + 1, "gpu0", "dim")
         grid.put(27, compute_y + 1, "gpu1", "dim")

@@ -113,3 +113,4 @@ class ExplorerDetail:
     config: Optional[Mapping[str, Any]] = field(default=None, compare=False)
     panes: Mapping[str, str] = field(default_factory=dict, compare=False)
     catalogs: Mapping[str, ModelCatalog] = field(default_factory=dict, compare=False)
+    source_records: Mapping[str, Any] = field(default_factory=dict, compare=False)

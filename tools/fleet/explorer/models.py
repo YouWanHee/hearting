@@ -236,15 +236,16 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
     if main_items:
         label = "main session only, never dispatched:"
         grid.put(x + 3, y, label, "dim", limit=right)
-        cursor = x + 3 + len(label) + 2
-        for harness_name, model_id in main_items:
+        cursor = grid.put(x + 3 + len(label), y, "  ", "dim", limit=right)
+        for index, (harness_name, model_id) in enumerate(main_items):
             display = shown.get(model_id, model_id)
             fragment = f"{harness_name} {display}"
             if cursor + len(fragment) > right:
                 y += 1
                 cursor = x + 5
-            grid.put(cursor, y, fragment, "dim", limit=right)
-            cursor += len(fragment) + 3
+            elif index:
+                cursor = grid.put(cursor, y, "  ·  ", "dim", limit=right)
+            cursor = grid.put(cursor, y, fragment, "dim", limit=right)
     y += 2
     current = _dict(profile_map.get(harness)).get(profile)
     model_choice = values.get("ui:model")

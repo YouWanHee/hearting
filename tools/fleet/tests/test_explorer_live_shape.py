@@ -60,7 +60,21 @@ def conform(live, samples, path, problems):
     if kind == "map":
         keys = set().union(*(set(sample) for sample in samples if bucket(sample) == "map"))
         for key in live:
+            if path == "system" and key in ("gpu_process_summary", "unregistered_gpu_summary"):
+                if not isinstance(live[key], dict) or set(live[key]) - {"count", "unregistered", "owner", "remaining"}:
+                    problems.append(f"system.{key}: invalid summary shape")
+                continue
             if key not in keys:
+                if path == "system" and key == "gpu_processes":
+                    for index, process in enumerate(live[key]):
+                        if not isinstance(process, dict) or set(process) - {
+                                "host", "gpu", "session_id", "cwd", "command", "vram", "age"}:
+                            problems.append(f"system.gpu_processes[{index}]: invalid process record shape")
+                    continue
+                if path == "system" and key == "unregistered_gpu_processes":
+                    if any(not isinstance(row, (list, tuple)) or len(row) != 5 for row in live[key]):
+                        problems.append("system.unregistered_gpu_processes: invalid positional shape")
+                    continue
                 problems.append(f"{path}.{key}: field the fixture does not have")
                 continue
             conform(live[key], [s[key] for s in samples if bucket(s) == "map" and key in s],

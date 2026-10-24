@@ -76,6 +76,47 @@ class ConfigFields(unittest.TestCase):
         self.assertIsNone(missing.memory)
         self.assertIsInstance(ExplorerViewModel.from_mapping(missing), ExplorerViewModel)
 
+    def test_memory_lifecycle_is_summary_only_and_records_are_deduplicated(self):
+        memory = {"recent": [], "by_repo": {"memory-store": [
+            {"id": "a", "ts": "2026-10-24T08:00:00+09:00", "action": "tidy-add",
+             "type": "note", "project": "actual-project", "snippet": "2026-10-24 [aa](claude sid): useful"},
+            {"id": "a", "ts": "2026-10-24T08:00:00+09:00", "action": "tidy-add",
+             "type": "note", "project": "actual-project", "snippet": "duplicate"},
+            {"id": "e", "ts": "2026-10-24T07:00:00+09:00", "action": "lifecycle-expire",
+             "type": "note", "project": "actual-project", "snippet": "expired row"},
+        ]}}
+        vm = build_view_model({"sessions": [], "resources": [], "memory": memory}, now=1792800000)
+        rows = vm.memory[0][1]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(tuple(rows[0]), ("08:00", "saved", "note", "useful"))
+        self.assertEqual(vm.system["memory_summary"]["expired"], 1)
+
+    def test_first_tick_process_row_is_kept_and_gpu_processes_use_renderer_record_shape(self):
+        snapshot = {"sessions": [{"harness": "codex", "pid": 44, "proc_start": 100,
+                                  "cwd": "/work/SR_CorrNet-wt/branch", "liveness": "working"}],
+                    "resources": [], "compute_hosts": {"hosts": [{"host": "host-a", "gpus": [
+                        {"index": 0, "processes": [{"command": "python -B /tmp/resume.py --request-sha256 0123456789abcdef",
+                            "used_memory_mib": 2560, "elapsed_s": 3600,
+                            "cwd": "/work/SR_CorrNet-wt/branch",
+                            "session_owner": {"harness": "codex", "session_id": "sid-exact"}}]}]}]},
+                    "unregistered_gpu": []}
+        vm = build_view_model(snapshot, now=2_000_000_000)
+        self.assertEqual(len(vm.sessions), 1)
+        self.assertEqual(vm.system["gpu_processes"][0]["session_id"], "sid-exact")
+        self.assertEqual(vm.system["gpu_processes"][0]["command"], "resume.py")
+        self.assertEqual(vm.system["gpu_processes"][0]["vram"], "2.5 GB")
+        self.assertEqual(vm.system["gpu_processes"][0]["age"], "1h 00m")
+
+    def test_compute_host_uses_per_thread_cpu_and_swap_telemetry(self):
+        host = {"host": "host-a", "self": True, "reachable": True, "cpu_count": 4,
+                "cpu_utilization_pct": 10, "cpu_thread_utilization_pct": [50, 25, 0, 25],
+                "memory_total_mib": 8192, "memory_used_mib": 4096,
+                "swap_total_mib": 4096, "swap_used_mib": 1024, "gpus": []}
+        vm = build_view_model({"sessions": [], "resources": [],
+                               "compute_hosts": {"hosts": [host]}}, now=10)
+        self.assertEqual(tuple(vm.compute[0][2]), (1.0, 4))
+        self.assertEqual(tuple(vm.compute[0][4]), (1.0, 4.0))
+
 
 class RealDataFidelity(unittest.TestCase):
     """What the default board decides about a row, the explorer's records say the same."""
@@ -166,7 +207,7 @@ class RealDataFidelity(unittest.TestCase):
         _nodes, edges = _peer_records(sessions, index, 100)
         self.assertEqual(edges["links"][0][1], ["new", "claude"])
         self.assertEqual(edges["links"][0][2], "handoff")
-        self.assertEqual(edges["links"][1][2], "steer")
+        self.assertEqual(len(edges["links"]), 1)
 
     def test_decision_records_become_the_answered_list_and_the_feed_line(self):
         memory = {"recent": [{"ts": "2026-10-23T12:00:00+00:00", "action": "decision-record", "type": "decision",

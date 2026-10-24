@@ -11,12 +11,16 @@ from fleet.collectors import dispatch
 
 class ParsedRegistryRowsTest(unittest.TestCase):
     def test_reuses_immutable_rows_until_file_generation_changes(self):
+        dispatch._parse_pipe_meta_cached.cache_clear()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "jobs.log"
             path.write_text("open\tslug\t/repo\t/work\t2026-01-01\tcapability=code\n")
-            first = dispatch.parsed_registry_rows(path)
-            second = dispatch.parsed_registry_rows(path)
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                first = dispatch.parsed_registry_rows(path)
+                first_misses = dispatch._parse_pipe_meta_cached.cache_info().misses
+                second = dispatch.parsed_registry_rows(path)
             self.assertIs(first, second)
+            self.assertEqual(dispatch._parse_pipe_meta_cached.cache_info().misses, first_misses)
             self.assertEqual(first[0][0], 1)
             self.assertEqual(len(first[0][1]), 6)
             with self.assertRaises(TypeError):
@@ -24,9 +28,16 @@ class ParsedRegistryRowsTest(unittest.TestCase):
 
             with path.open("a") as stream:
                 stream.write("bad\trow\n")
-            third = dispatch.parsed_registry_rows(path)
+            with path.open("a") as stream:
+                stream.write("open\tslug2\t/repo\t/work\t2026-01-02\tmode=dev\n")
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                third = dispatch.parsed_registry_rows(path)
             self.assertIsNot(first, third)
-            self.assertEqual(len(third), 1)
+            self.assertEqual(
+                dispatch._parse_pipe_meta_cached.cache_info().misses, first_misses + 1)
+            self.assertEqual(len(third), 2)
+            self.assertEqual(third[-1][0], 3)
+            self.assertEqual(third[0], first[0])
 
     def test_missing_registry_is_empty(self):
         with tempfile.TemporaryDirectory() as directory:

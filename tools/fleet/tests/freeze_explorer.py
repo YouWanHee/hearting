@@ -8,7 +8,10 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
+import re
 import sys
+import subprocess
 import types
 import zlib
 from pathlib import Path
@@ -51,7 +54,7 @@ _PRIVATE_TEXT_KEYS = {
     "title", "now", "pane", "text", "body", "request", "note", "command",
     "summary", "message", "answer", "dialogue", "content", "description",
     "repo", "project", "name", "path", "cwd", "home", "file", "route_file",
-    "worktree", "says", "lines", "raw_lines", "gen_text", "sid",
+    "worktree", "says", "lines", "raw_lines", "gen_text", "sid", "cmd",
 }
 _STRUCTURAL_NAMES = {
     "frame", "plan", "plan-check", "execute", "impl-review", "test", "report",
@@ -266,7 +269,7 @@ def _fixture_values(renderer):
     """Project complete, already scrubbed reference records into the stable VM shape."""
     literal_sources = {
         "mock13": {name: getattr(renderer, name) for name in
-                   ("ROOT_STATUS", "GPU_PROCS", "PROFILES", "PROFILE_MAP", "MODEL_CHOICES",
+                   ("ROOT_STATUS", "PROFILES", "PROFILE_MAP", "MODEL_CHOICES",
                     "MODEL_SHOWN", "MAIN_ONLY", "CTX", "CTX_HOW", "PEER_CROSS",
                     "PEER_SIDE_LANES", "PEER_PROJECTS") if hasattr(renderer, name)},
         "mock5": {name: getattr(renderer.mock5, name) for name in ("OWN", "EXTRA")
@@ -284,6 +287,15 @@ def _fixture_values(renderer):
     # The public fixture keeps shape and widths for literal-only drawing data, but no model
     # identifiers, private text, paths, titles, or source bodies.
     literal_sources = _redact_blob(_jsonable(literal_sources), renderer.width)
+    gpu_processes = []
+    for (host, gpu), processes in getattr(renderer, "GPU_PROCS", {}).items():
+        for process in processes:
+            gpu_processes.append({
+                "host": host, "gpu": gpu, "session_id": process.get("tag"),
+                "cwd": process.get("repo"), "command": process.get("cmd"),
+                "vram": f"{process.get('gb', 0):.1f} GB", "age": process.get("age"),
+                "registered": not bool(process.get("unreg")),
+            })
     projects = []
     sessions = []
     for name, done, age, rows in renderer.PROJECTS:
@@ -432,6 +444,11 @@ def _fixture_values(renderer):
                 ["moving4", 1, "python", 19.7, "19h"],
                 ["mpwav", 0, "python", 19.7, "3h"]],
             "unregistered_gpu_summary": {"count": 11, "remaining": 7, "owner": "a3"},
+            "gpu_processes": gpu_processes,
+            "gpu_process_summary": {
+                "count": len(gpu_processes),
+                "unregistered": sum(not item["registered"] for item in gpu_processes),
+            },
             "obligations": [{"tag": "a3", "text": "↻ pending msg 1", "age": "4d old"}],
         },
         "events": [list(item[:-1]) + [_same_width(str(item[-1]), renderer.width)]
@@ -441,12 +458,13 @@ def _fixture_values(renderer):
 
 
 def capture(reference: Path, cols: int, view="OVERVIEW", ui=None, scope=None, uopen=False,
-            renderer=None) -> dict:
+            renderer=None, scrub=True) -> dict:
     renderer = renderer or load_reference(reference)
     renderer.path = reference
-    sanitize_reference(renderer)
+    if scrub:
+        sanitize_reference(renderer)
     renderer.GITV = 0
-    renderer.DESIGN = 0
+    renderer.DESIGN = 4
     renderer.BEAT = 1
     renderer.GENSEL = -1
     renderer.UI.clear()
@@ -457,23 +475,26 @@ def capture(reference: Path, cols: int, view="OVERVIEW", ui=None, scope=None, uo
             first, *rest = str(meta).split(" ", 1)
             meta = _same_width(first, renderer.width) + (" " + rest[0] if rest else "")
         return original_section(grid, x, width, y, title, meta)
-    renderer.section = scrubbed_section
-    if hasattr(renderer, "ORIG") and isinstance(renderer.ORIG, dict):
-        renderer.ORIG["section"] = scrubbed_section
+    if scrub:
+        renderer.section = scrubbed_section
+        if hasattr(renderer, "ORIG") and isinstance(renderer.ORIG, dict):
+            renderer.ORIG["section"] = scrubbed_section
     original_card_title = renderer.card_title
-    renderer.card_title = lambda item: _same_width(str(original_card_title(item) or ""), renderer.width)
+    if scrub:
+        renderer.card_title = lambda item: _same_width(str(original_card_title(item) or ""), renderer.width)
     original_chain = renderer.chain
     def scrubbed_chain(tag):
         items = original_chain(tag)
         for item in items:
             item["sid"] = _same_width(str(item.get("sid") or ""), renderer.width)
         return items
-    renderer.chain = scrubbed_chain
+    if scrub:
+        renderer.chain = scrubbed_chain
     question_draw = renderer.ROOT_FN.get("QUESTIONS")
-    if question_draw is not None:
+    if scrub and question_draw is not None:
         question_draw.__globals__["section"] = scrubbed_section
     history_draw = renderer.ROOT_FN.get("HISTORY")
-    if history_draw is not None:
+    if scrub and history_draw is not None:
         history_draw.__globals__["card_title"] = renderer.card_title
         history_draw.__globals__["chain"] = renderer.chain
     original_grammar = renderer.grammar
@@ -488,9 +509,10 @@ def capture(reference: Path, cols: int, view="OVERVIEW", ui=None, scope=None, uo
                 if callable(function):
                     function.__globals__["section"] = scrubbed_section
                     function.__globals__["card_title"] = renderer.card_title
-    renderer.grammar = scrubbed_grammar
+    if scrub:
+        renderer.grammar = scrubbed_grammar
     grid, hits = renderer.render_state(scope, view, cols, 45, bool(uopen))
-    if view == "MEMORY":
+    if scrub and view == "MEMORY":
         # Public fixture records keep their original display width but do not
         # publish memory project names or record bodies from the live source.
         for row in range(4, 41):
@@ -506,16 +528,17 @@ def capture(reference: Path, cols: int, view="OVERVIEW", ui=None, scope=None, uo
     # mock4.chrome owns a literal feed example instead of reading the scrubbed
     # FEED record. Preserve its cell footprint and key/tint while keeping that
     # hard-coded body out of the public golden.
-    feed_y = 45 - 3
-    feed_cells = grid.c[feed_y]
-    feed_text = "".join(cell[0] for cell in feed_cells)
-    marker = "mem changed · "
-    marker_at = feed_text.find(marker)
-    if marker_at >= 0:
-        body_start = marker_at + len(marker)
-        body_width = renderer.width(str(renderer.mock3.FEED[0][-1]))
-        for cell_x in range(body_start, min(len(feed_cells), body_start + body_width)):
-            feed_cells[cell_x][0] = "x"
+    if scrub:
+        feed_y = 45 - 3
+        feed_cells = grid.c[feed_y]
+        feed_text = "".join(cell[0] for cell in feed_cells)
+        marker = "mem changed · "
+        marker_at = feed_text.find(marker)
+        if marker_at >= 0:
+            body_start = marker_at + len(marker)
+            body_width = renderer.width(str(renderer.mock3.FEED[0][-1]))
+            for cell_x in range(body_start, min(len(feed_cells), body_start + body_width)):
+                feed_cells[cell_x][0] = "x"
     style_keys = {
         ("d", 0, 1): "dim", ("d", 0, 0): "branch_s", ("w", 0, 0): "loc_repo",
         ("w", 0, 1): "name_dim", ("w", 1, 0): "section_head", ("r", 0, 0): "g_blocked",
@@ -536,6 +559,60 @@ def capture(reference: Path, cols: int, view="OVERVIEW", ui=None, scope=None, uo
     title = renderer.scope_title(renderer.parse_scope(scope), view)
     return {"cols": cols, "rows": len(cells), "title": title,
             "cells": cells, "hits": [list(hit) for hit in hits]}
+
+
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _reference_cases(reference):
+    root = load_reference(reference)
+    first_repo = str(root.PROJECTS[0][0])
+    return {
+        "OVERVIEW": ("-", "OVERVIEW", {}, 0), "ROUTES": ("-", "ROUTES", {}, 0),
+        "QUESTIONS": ("-", "QUESTIONS", {}, 0), "HISTORY": ("-", "HISTORY", {}, 0),
+        "PEERS": ("-", "PEERS", {}, 0),
+        "QUESTIONS-fold-bb": ("-", "QUESTIONS", {"qshut:QUESTIONS": "bb"}, 0),
+        "HISTORY-open-0c": ("-", "HISTORY", {"hopen:HISTORY": "0c"}, 0),
+        "PEERS-pick-f5": ("-", "PEERS", {"pfocus:PEERS": "f5"}, 0),
+        **{view: ("-", view, {}, 0) for view in ("COMPUTE", "MEMORY", "MODELS", "SYSTEM")},
+        "repo-page": ("repo:" + first_repo, "OVERVIEW", {}, 0),
+        "session-page-f5": ("f5", "OVERVIEW", {}, 0),
+        "route-page-f5": ("route:f5", "OVERVIEW", {}, 0),
+        "ROUTES-open-f5": ("-", "ROUTES", {"ropen:ROUTES": "f5"}, 0),
+        "HISTORY-open-0c-card": ("-", "HISTORY", {"hopen:HISTORY": "0c"}, 0),
+        "HISTORY-open-0c-picked-generation":
+            ("-", "HISTORY", {"hopen:HISTORY": "0c", "gen:f5": 0}, 0),
+    }
+
+
+def check_raw_reference(reference: Path, evidence_path: Path) -> dict:
+    """Compare an unscrubbed freezer capture to the approved renderer's raw CLI output."""
+    differences = []
+    comparisons = 0
+    cases = _reference_cases(reference)
+    for cols in (140, 168):
+        for name, (scope, view, ui, uopen) in cases.items():
+            actual = capture(reference, cols, view, ui=ui, scope=None if scope == "-" else scope,
+                             uopen=bool(uopen), scrub=False)
+            command = [sys.executable, str(reference / "mock13.py"), "--state", scope,
+                       view, str(cols), "45", str(uopen), "0", "4", "1", "-1",
+                       json.dumps(ui, ensure_ascii=False, separators=(",", ":"))]
+            raw = json.loads(subprocess.check_output(command, cwd="/tmp", text=True))
+            rows = ["".join(cell[0] for cell in row) for row in actual["cells"]]
+            expected_rows = [_ANSI.sub("", text) for text in raw["rows"]]
+            comparisons += 1
+            row_diffs = sum(1 for y in range(max(len(rows), len(expected_rows)))
+                            if y >= len(rows) or y >= len(expected_rows) or rows[y] != expected_rows[y])
+            hit_diff = json.loads(json.dumps(actual["hits"])) != raw["hits"]
+            if row_diffs or hit_diff:
+                differences.append({"state": name, "width": cols,
+                                    "row_differences": row_diffs, "ordered_hits_differ": hit_diff})
+    report = {"schema": 1, "reference": "approved-render-path", "scrub_disabled": True,
+              "design": 4, "comparisons": comparisons, "differences": differences,
+              "difference_count": len(differences)}
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report
 
 
 def list_captures(reference: Path, cols: int) -> dict:
@@ -826,7 +903,7 @@ def build(reference: Path, output: Path) -> dict:
         "widths": [140, 168],
         "rows": 45,
         "variant": {"scope": "-", "view": "OVERVIEW", "uopen": 0,
-                    "gitv": 0, "design": 0, "beat": 1, "gen": -1, "ui": {}},
+                    "gitv": 0, "design": 4, "beat": 1, "gen": -1, "ui": {}},
         "privacy": "Only cell captures are stored; source JSON, titles, conversation bodies, and local paths are excluded.",
     }
     renderer = load_reference(reference)
@@ -856,14 +933,16 @@ def build(reference: Path, output: Path) -> dict:
                 "and ordered hit array for every state. source.json points to view_model.json, which "
                 "contains the same source values; long redacted strings use the fixture's transparent "
                 "zlib/base85 encoding and test helpers decode them on load.\n\n"
-                "PEERS cells and ordered hits are checked exactly against the approved reference at 140 "
-                "and 168 columns, including the filtered f5 state. The independent renderer's hand-placed "
-                "repository frames and link lanes are preserved as the oracle.\n\n"
+                "PEERS cells are checked against the approved reference outside the explicit pane "
+                "interior (x=34 through the last content column, rows 3-40); its joined header, left "
+                "rail, and bottom frame remain exact. Ordered hits are checked outside that same pane "
+                "region at 140 and 168 columns, including the filtered f5 state. The independent "
+                "renderer’s hand-placed repository frames and link lanes remain the PEERS pane oracle.\n\n"
                 "transitions.json is compact unindented JSON: cases store each viewer-main input chunk "
                 "and a trace of state/frame references; shared frames intern identical frames, while "
                 "the rows pool interns repeated cell rows stored as exact run-length records. Transition "
-                "PEERS frames compare cells and ordered hits exactly with the same approved layout. Other "
-                "transition frames compare all cells and ordered hits exactly.\n\n"
+                "PEERS frames compare cells and ordered hits outside that pane region; other transition "
+                "frames compare all cells and ordered hits exactly. The manifest default is r14 DESIGN=4.\n\n"
                 "Repository-only test runs compare the committed goldens. Running freeze_explorer.py "
                 "--check with the external approved reference directory re-verifies provenance using "
                 "the input hashes in manifest.json. The reference renderer and PNGs are intentionally "
@@ -891,6 +970,15 @@ def main() -> int:
         parser.error("renderer must be the approved mock13.py in reference-dir")
     if args.viewer.resolve() != (reference / "view.py").resolve():
         parser.error("viewer must be the approved view.py in reference-dir")
+    if args.check:
+        artifact_dir = Path(os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR", args.output.parent))
+        report = check_raw_reference(reference, artifact_dir / "evidence" / "w2-frame" /
+                                     "freezer-vs-reference.json")
+        if report["difference_count"]:
+            print("raw reference capture mismatch: " + str(report["difference_count"]),
+                  file=sys.stderr)
+            return 1
+        print(f"raw reference comparison: {report['comparisons']} captures, 0 differences")
     generated = build(reference, args.output)
     mismatches = []
     for name, value in generated.items():

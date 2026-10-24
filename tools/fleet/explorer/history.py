@@ -6,7 +6,7 @@ from .tables import _clip, _tint_row, repo_label, repo_rule_label
 
 def draw_history(grid, vm, state, x=34, y=3):
     use = max(0, grid.cols - x - 2)
-    right, bottom = x + use + 1, grid.rows - 5
+    right, bottom = x + use + 1, grid.rows - 6
     if use < 75:
         return _draw_history_compact(grid, vm, state, x, y, use, right, bottom)
     grid.fill(x, right, y, " ", tint=234)

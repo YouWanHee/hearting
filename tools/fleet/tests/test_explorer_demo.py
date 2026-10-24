@@ -149,7 +149,7 @@ class TreeOverflow(unittest.TestCase):
                                          for s in vm.sessions if s.get("repo_id") == repo["id"])
                                  for repo in many.repos
                                  if any(s.get("repo_id") == repo["id"] for s in vm.sessions))   # no session, no row
-                    self.assertEqual(hidden, 10 + needed - limit + 1)
+                    self.assertEqual(hidden, 13 + needed - limit + 1)
                     for hit in frame.hits:
                         if hit.action[0] in ("scope", "route") and hit.x0 < 32:
                             self.assertLess(hit.y, limit - 1, hit)

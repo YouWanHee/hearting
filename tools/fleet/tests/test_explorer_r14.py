@@ -19,12 +19,14 @@ class R14Renderer(unittest.TestCase):
         frame = draw(self.vm, NavState(), cols=100, rows=45)
         tabs = [hit.action[1] for hit in frame.hits
                 if hit.action and hit.action[0] == "tab"]
-        self.assertEqual(tabs.count("COMPUTE"), 2)  # VIEWS row and persistent section
+        self.assertEqual(tabs.count("COMPUTE"), 1)  # the persistent band opens the same pane via root
+        self.assertTrue(any(hit.action == ("root", "COMPUTE") for hit in frame.hits))
         rows = frame.text_rows()
         views_y = next(i for i, row in enumerate(rows) if row.lstrip().startswith("OVERVIEW"))
         sessions_y = next(i for i, row in enumerate(rows) if "SESSIONS" in row)
         self.assertGreater(sessions_y - views_y, 6)
-        self.assertIn("┬", rows[2])
+        self.assertIn("┌", rows[3])
+        self.assertEqual(rows[2].strip(), "")
         self.assertIn("┴", rows[-4])
 
     def test_peers_and_all_renderer_views_stay_inside_four_viewports(self):
@@ -68,7 +70,7 @@ class R14Renderer(unittest.TestCase):
         from tools.fleet.explorer.view_model import ExplorerViewModel
         data = self.vm.to_mapping()
         data["system"] = {**data["system"],
-                           "gpu_processes": ({"host": "host", "gpu": 0,
+                           "gpu_processes": ({"host": self.vm.hosts[0]["name"], "gpu": 0,
                                               "session_id": "full-session-id",
                                               "cwd": "/work/project-x",
                                               "command": "python3 -u /opt/run_eval.py --secret arg",

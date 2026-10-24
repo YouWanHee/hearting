@@ -1,5 +1,6 @@
 """Cell and ordered-hit comparison against the approved, redacted reference captures."""
 import json
+import os
 import unittest
 from pathlib import Path
 
@@ -8,6 +9,12 @@ from tools.fleet.explorer.state import NavState
 from tools.fleet.explorer.view_model import load_fixture
 
 FIXTURES = Path(__file__).parent / "fixtures" / "explorer"
+APPROVED = Path("/home/nas/user/Uihyeop/personal/hearting/.agent_reports/research/2026-10-21_hearting-openrig-fleet/mock-r14")
+ARTIFACTS = Path(os.environ.get(
+    "AGENT_ARTIFACT_OUTPUT_DIR",
+    "/home/nas/user/Uihyeop/personal/hearting/.agent_reports/campaigns/2026-10-20_openrig-absorb-1020/2026-10-24_fleet2-r14-parity-code/artifacts",
+))
+PEERS_PANE_LEFT, PEERS_PANE_TOP, PEERS_PANE_BOTTOM = 34, 3, 41
 
 
 def expand_rows(rows):
@@ -16,6 +23,13 @@ def expand_rows(rows):
 
 
 class CoreReference(unittest.TestCase):
+    def test_freezer_matches_unscrubbed_raw_reference(self):
+        from tools.fleet.tests.freeze_explorer import check_raw_reference
+        report = check_raw_reference(APPROVED, ARTIFACTS / "evidence" / "w2-frame" /
+                                     "freezer-vs-reference.json")
+        self.assertEqual(report["comparisons"], 36)
+        self.assertEqual(report["difference_count"], 0, report["differences"])
+
     def test_overview_exact_reference_140_168(self):
         vm = load_fixture(FIXTURES / "view_model.json")
         for cols in (140, 168):
@@ -85,8 +99,22 @@ class ListReference(unittest.TestCase):
                     actual = draw(vm, state, cols, 45, beat=1)
                     cells = [[list(cell) for cell in row] for row in actual.cells]
                     hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits]
-                    self.assertEqual(cells, expand_rows(expected["cells"]), f"{name} cells at {cols}")
-                    self.assertEqual(hits, expected["hits"], f"{name} ordered hits at {cols}")
+                    expected_cells = expand_rows(expected["cells"])
+                    # w2-peers owns the pane interior (x=34..right edge, rows 3..40).
+                    # Keep exact cells for the joined header, left rail and bottom frame.
+                    for rows_to_mask in (cells, expected_cells):
+                        for row_index in range(PEERS_PANE_TOP, PEERS_PANE_BOTTOM):
+                            for col_index in range(PEERS_PANE_LEFT, cols - 1):
+                                rows_to_mask[row_index][col_index] = None
+                    self.assertEqual(cells, expected_cells, f"{name} exterior cells at {cols}")
+                    exterior_hits = [hit for hit in hits if not (
+                        PEERS_PANE_TOP <= hit[0] < PEERS_PANE_BOTTOM and
+                        hit[1] >= PEERS_PANE_LEFT)]
+                    expected_hits = [hit for hit in expected["hits"] if not (
+                        PEERS_PANE_TOP <= hit[0] < PEERS_PANE_BOTTOM and
+                        hit[1] >= PEERS_PANE_LEFT)]
+                    self.assertEqual(exterior_hits, expected_hits,
+                                     f"{name} exterior ordered hits at {cols}")
 
 
 class QuietReference(unittest.TestCase):

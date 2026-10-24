@@ -105,8 +105,29 @@ class RefreshPumpTest(unittest.TestCase):
         release.set()
         self._wait(lambda: pump.generation == 1 and not pump.running)
         self.assertEqual(calls, 1)
-        self.assertFalse(pump.request_due(now=21.9))
-        self.assertTrue(pump.request_due(now=22.0))
+        self.assertFalse(pump.request_due(now=39.9))
+        self.assertTrue(pump.request_due(now=40.0))
+        self._wait(lambda: pump.generation == 2 and not pump.running)
+        pump.stop()
+
+    def test_slow_collection_gets_an_idle_period_equal_to_its_duration(self):
+        clock = [0.0]
+        entered = threading.Event()
+        release = threading.Event()
+
+        def producer():
+            entered.set()
+            release.wait()
+            clock[0] = 10.0
+            return "done"
+
+        pump = RefreshPump(producer, 2.0, clock=lambda: clock[0])
+        self.assertTrue(pump.start())
+        self.assertTrue(entered.wait(1.0))
+        release.set()
+        self._wait(lambda: pump.generation == 1 and not pump.running)
+        self.assertFalse(pump.request_due(now=19.9))
+        self.assertTrue(pump.request_due(now=20.0))
         self._wait(lambda: pump.generation == 2 and not pump.running)
         pump.stop()
 

@@ -152,15 +152,15 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
             y += 1
             gpu_count = sum(1 for host in (vm.compute or ()) for gpu in host[5]
                             if tag in (gpu[7] or ()))
-            if gpu_count > 1 and y < grid.rows - 4:
+            if gpu_count > 1 and y < grid.rows - 5:
                 grid.put(x + c["h"], y, "●", "work")
                 grid.put(x + c["h"] + 2, y, f"GPU ×{gpu_count}", "dim")
                 y += 1
             if state.opened == tag:
                 _tint_row(grid, row_y, x - 1, right, 236)
                 y = _session_unfold(grid, vm, x, use, y, session, c)
-            if y >= grid.rows - 4:
-                grid.put(right - 18, grid.rows - 4, "↓ more below", "dim", limit=right)
+            if y >= grid.rows - 5:
+                grid.put(right - 18, grid.rows - 5, "↓ more below", "dim", limit=right)
                 return
     sessions_total = len(sessions)
     working_sessions = sum(1 for item in sessions if item.get("state") == "working")
@@ -209,14 +209,15 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
         y += len(live_routes) * 2 + 2
         y += 1
         grid.put(x, y, "── ", "line")
-        recent_end = grid.put(x + 3, y, "RECENT", "head", limit=x + 15)
-        recent_end = grid.put(x + 18, y, "completed results", "dim", limit=right)
+        recent_end = grid.put(x + 3, y, "RECENT", "head", limit=right)
+        grid.put(recent_end, y, "  ", "dim", limit=right)
+        recent_end = grid.put(recent_end + 2, y, "completed results", "dim", limit=right)
         grid.put(recent_end, y, " ", "branch_s", limit=right)
         for xx in range(recent_end + 1, right):
             grid.put(xx, y, "─", "line")
         y += 1
         for repo in repos:
-            if not repo.get("done") or not repo_label(repo.get("name")) or y >= grid.rows - 4:
+            if not repo.get("done") or not repo_label(repo.get("name")) or y >= grid.rows - 5:
                 continue
             grid.add_hit(y, x, right, ("scope", "repo:" + str(repo.get("id", repo.get("name", "")))))
             grid.put(x + 1, y, "✓", "done")
@@ -244,7 +245,7 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
         gen_width = min(24, max(8, use - c_gen - 3 - 3 - 14 - 3 - 16))
         c_last = c_gen + 3 + gen_width + 3
         for seat in scoped_seats:
-            if y >= grid.rows - 4:
+            if y >= grid.rows - 5:
                 break
             tag = str(seat[0])
             session = next((item for item in sessions if str(item.get("tag")) == tag), {})
@@ -292,14 +293,15 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
         y += 1
     y += 1
     grid.put(x, y, "── ", "line")
-    recent_title_end = grid.put(x + 3, y, "RECENT", "head", limit=x + 15)
-    recent_title_end = grid.put(x + 18, y, "completed results", "dim", limit=right)
+    recent_title_end = grid.put(x + 3, y, "RECENT", "head", limit=right)
+    grid.put(recent_title_end, y, "  ", "dim", limit=right)
+    recent_title_end = grid.put(recent_title_end + 2, y, "completed results", "dim", limit=right)
     grid.put(recent_title_end, y, " ", "branch_s")
     for cell_x in range(recent_title_end + 1, right):
         grid.put(cell_x, y, "─", "line")
     y += 1
     for repo in repos:
-        if not repo.get("done") or not repo_label(repo.get("name")) or y >= grid.rows - 4:
+        if not repo.get("done") or not repo_label(repo.get("name")) or y >= grid.rows - 5:
             continue
         grid.put(x + 1, y, "✓", "done")
         grid.put(x + 3, y, str(repo.get("name", "")) + "/", "soft")
@@ -590,7 +592,7 @@ def _tint_row(grid, y, x0, x1, tint):
 def draw_routes(grid, vm, state, x=34, y=3):
     routes = tuple(vm.routes or ())
     use = max(0, grid.cols - x - 2)
-    right, bottom = x + use + 1, grid.rows - 4
+    right, bottom = x + use + 1, grid.rows - 5
     if use < 75:
         return _draw_routes_compact(grid, vm, state, routes, x, y, use, right, bottom)
     cols = _route_columns(use)
@@ -730,10 +732,8 @@ def draw_routes(grid, vm, state, x=34, y=3):
             y += 1
             if is_open and y < bottom:
                 from .pages import draw_route_detail
-                if getattr(state, "no_repo_group", False):
-                    y = draw_route_detail(grid, vm, route, x, use, y + 1, state)
-                else:
-                    height = max(16, min(30, grid.rows - 5 - y))
+                if not getattr(state, "no_repo_group", False):
+                    height = max(16, min(30, grid.rows - 6 - y))
                     draw_route_detail(grid, vm, route, x, use, y, state, bottom=y + height)
                     y += height + 1
     return y
@@ -800,7 +800,7 @@ def _draw_routes_compact(grid, vm, state, routes, x, y, use, right, bottom):
 
 def draw_questions(grid, vm, state, x=34, y=3):
     use = max(0, grid.cols - x - 2)
-    right, bottom = x + use + 1, grid.rows - 4
+    right, bottom = x + use + 1, grid.rows - 5
     if use < 75:
         return _draw_questions_compact(grid, vm, state, x, y, use, right, bottom)
     questions = tuple(vm.questions or ())

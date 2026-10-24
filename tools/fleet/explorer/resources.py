@@ -38,7 +38,11 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
     """Display collected host/GPU facts; absent measurements stay visibly unknown."""
     use = max(0, grid.cols - x - 2)
     hosts = tuple(vm.compute or ())
-    users_col = x + 64 + len("USED BY") <= grid.cols - 1
+    data = vm.system if isinstance(vm.system, Mapping) else {}
+    processes = tuple(data.get("gpu_processes") or ())
+    # The r14 reference carries session identity on each GPU process row and has
+    # no USED BY table column.
+    users_col = False
     y = _table_head(grid, x, use, y, ((1, "HOST"), (11, "GPU"), (16, "MODEL"),
                                       (31, "UTIL"), (38, "VRAM")) + (((64, "USED BY"),) if users_col else ()))
     labels = tuple(vm.hosts or ())
@@ -86,6 +90,41 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
                 cursor = grid.put(cursor, y, user, "soft")
                 cursor = grid.put(cursor, y, "]", "dim") + 1
             y += 1
+            for process in processes:
+                if not isinstance(process, Mapping):
+                    continue
+                if str(process.get("host") or "") != str(host) or \
+                        str(process.get("gpu") if process.get("gpu") is not None else "") != str(idx):
+                    continue
+                sid = str(process.get("session_id") or process.get("session") or "")
+                cwd = str(process.get("cwd") or "")
+                repo = cwd.rstrip("/").rsplit("/", 1)[-1] if cwd else "·"
+                command = str(process.get("command") or "·")
+                tokens = command.split()
+                if len(tokens) > 1 and tokens[0].rsplit("/", 1)[-1] in (
+                        "python", "python3", "node", "bash", "sh"):
+                    command = " ".join(tokens[1:])
+                command = command.split(" --", 1)[0].rsplit("/", 1)[-1] or "·"
+                age = str(process.get("age") or process.get("time") or "")
+                vram = str(process.get("vram") or "·")
+                tail = vram.rjust(8) + (("  " + age.rjust(6)) if grid.cols - x - 2 >= 120 else "")
+                grid.put(x + 13, y, "└", "dim")
+                if sid:
+                    session = next((item for item in vm.sessions if str(item.get("tag")) == sid), {})
+                    grid.put(x + 16, y, "[", "dim")
+                    tag_key = "steward" if session.get("steward") else "soft"
+                    grid.put(x + 17, y, sid, tag_key)
+                    grid.put(x + 17 + len(sid), y, "]", "dim")
+                else:
+                    grid.put(x + 17, y, "·", "dim")
+                repo_x = max(x + 21, x + 17 + len(sid) + 2)
+                grid.put(repo_x, y, clip(repo + "/", 14), "title_dim")
+                command_x = repo_x + len(clip(repo + "/", 14)) + 2
+                right = x + use
+                grid.put(command_x, y, clip(command, max(0, right - command_x - len(tail) - 2)),
+                         "soft", limit=right - len(tail))
+                grid.put(right - len(tail), y, tail, "dim", limit=right)
+                y += 1
         if cpu or mem or swap:
             for label, values, width, unit in (("CPU", cpu, 10, "thr"), ("MEM", mem, 8, "GB"),
                                                ("SWP", swap, 8, "GB")):
@@ -111,67 +150,13 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
     total = sum(len(host[5]) for host in hosts if len(host) > 5)
     idle_hosts = sum(1 for host in hosts if len(host) > 5 and host[5]
                      and all(len(gpu) > 1 and gpu[1] == "idle" for gpu in host[5]))
-    grid.put(x + 1, y, f"{len(hosts)}/{len(hosts)} hosts · GPU {busy}/{total} working · {idle_hosts} host idle", "dim")
-    y += 2
-    data = vm.system if isinstance(vm.system, Mapping) else {}
-    processes = tuple(data.get("gpu_processes") or ())
-    if processes:
-        summary = data.get("gpu_process_summary") or {}
-        total_processes = summary.get("count", len(processes))
-        unregistered = summary.get("unregistered", 0)
-        grid.put(x, y, "── GPU processes", "head", limit=grid.cols - 1)
-        grid.put(x + 18, y, f"{total_processes} total · {unregistered} unregistered", "dim",
-                 limit=grid.cols - 1)
-        y += 1
-        for process in processes:
-            if not isinstance(process, Mapping):
-                continue
-            sid = process.get("session_id") or process.get("session")
-            cwd = str(process.get("cwd") or "")
-            repo = cwd.rstrip("/").rsplit("/", 1)[-1] if cwd else None
-            command = str(process.get("command") or "·")
-            # Process collectors provide the display command when available. Keep
-            # the script token and omit common interpreter/flag prefixes.
-            tokens = command.split()
-            if len(tokens) > 1 and tokens[0].rsplit("/", 1)[-1] in (
-                    "python", "python3", "node", "bash", "sh"):
-                command = " ".join(tokens[1:])
-            command = command.split(" --", 1)[0].rsplit("/", 1)[-1] or "·"
-            vram = process.get("vram")
-            age = process.get("age") or process.get("time")
-            line = (f"└ [{sid or '·'}] {repo + '/' if repo else '·'}  {command}  "
-                    f"{vram if vram is not None else '·'} VRAM {age or '·'}")
-            grid.put(x + 1, y, line, "soft", limit=grid.cols - 1)
-            y += 1
-    extras = tuple(data.get("unregistered_gpu_processes") or ())
-    known_processes = {(str(item.get("host") or ""), str(item.get("gpu") or ""),
-                        str(item.get("command") or ""))
-                       for item in processes if isinstance(item, Mapping)}
-    extras = tuple(entry for entry in extras
-                   if (str((tuple(entry) + (None,) * 5)[0] or ""),
-                       str((tuple(entry) + (None,) * 5)[1] or ""),
-                       str((tuple(entry) + (None,) * 5)[2] or "")) not in known_processes)
-    if extras:
-        summary = data.get("unregistered_gpu_summary") or {}
-        cursor = grid.put(x, y, "── ", "line")
-        cursor = grid.put(cursor, y, "unregistered GPU processes", "head")
-        owner = summary.get("owner")
-        cursor = grid.put(cursor, y, "  " + str(summary.get("count", len(extras))) +
-                          (f" · owner [{owner}]" if owner else ""), "dim")
-        grid.put(cursor, y, " ", "branch_s")
-        for col in range(cursor + 1, grid.cols - 1):
-            grid.put(col, y, "─", "line")
-        y += 1
-        for entry in extras:
-            host, gpu, command, memory, age = (tuple(entry) + (None,) * 5)[:5]
-            grid.put(x + 3, y, f"{host}:{gpu}", "soft")
-            grid.put(x + 16, y, command or "·", "soft")
-            grid.put(x + 26, y, "·" if memory is None else f"{memory:g} GB", "dim")
-            grid.put(x + 38, y, age or "·", "dim")
-            y += 1
-        remaining = summary.get("remaining")
-        if remaining:
-            grid.put(x + 3, y, f"… {remaining} more", "dim")
+    process_summary = data.get("gpu_process_summary") or {}
+    process_count = process_summary.get("count", len(processes))
+    unregistered = process_summary.get("unregistered", 0)
+    grid.put(x + 1, y,
+             f"{len(hosts)}/{len(hosts)} hosts · GPU {busy}/{total} working · {idle_hosts} host idle · "
+             f"{process_count} processes, {unregistered} not registered with hearting",
+             "dim", limit=grid.cols - 1)
 
 
 def draw_memory(grid: CellGrid, vm, state=None, x=34, y=3):

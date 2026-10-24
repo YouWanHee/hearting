@@ -10,7 +10,7 @@ from .tables import _clip, _tint_row, draw_overview, draw_routes
 def draw_scope(grid, vm, state):
     scope = str(state.scope or "-")
     kind, _, ident = scope.partition(":")
-    x, right, bottom = 34, max(34, grid.cols - 1), max(0, grid.rows - 4)
+    x, right, bottom = 34, max(34, grid.cols - 1), max(0, grid.rows - 5)
     if kind == "repo":
         _repo_page(grid, vm, ident, x, right, bottom)
     elif kind == "session":
@@ -185,7 +185,7 @@ def _session_page(grid, vm, tag, x, right, bottom, state=None):
             y += 1
     y += 1
     seat = next((item for item in vm.seats if str(item[0]) == tag), None)
-    history_bottom = grid.rows - 5
+    history_bottom = grid.rows - 6
     if seat and history_bottom - y > 4:
         generations = tuple((vm.generations or {}).get(tag, ()))
         detail = any(isinstance(item, Mapping) and item.get("detail") for item in generations)
@@ -223,8 +223,10 @@ def _route_page(grid, vm, ident, x, right, bottom, state):
     route = next((item for item in vm.routes if str(item.get("id")) == ident), None)
     if route is None:
         return
-    _draw_route_subset(grid, vm, (route,), x, 3, bottom, opened=ident, no_repo_group=True,
-                       view_key="route:" + ident, state=state)
+    y = _draw_route_subset(grid, vm, (route,), x, 3, bottom, opened=ident, no_repo_group=True,
+                           view_key="route:" + ident, state=state)
+    draw_route_detail(grid, vm, route, x, grid.cols - x - 2, y + 1, state,
+                      bottom=min(bottom, grid.rows - 6))
 
 
 class _SubsetState:
@@ -276,9 +278,10 @@ def _lab(name):
     return (str(name).ljust(_LW), "dim")
 
 
-def _outline(grid, x, y, w, h, style):
+def _outline(grid, x, y, w, h, style, top_holes=()):
     for xx in range(x + 1, x + w - 1):
-        grid.put(xx, y, "─", style)
+        if not any(start <= xx < end for start, end in top_holes):
+            grid.put(xx, y, "─", style)
         grid.put(xx, y + h - 1, "─", style)
     for yy in range(y + 1, y + h - 1):
         grid.put(x, yy, "│", style)
@@ -340,7 +343,6 @@ def _stage_box(grid, x, y, w, h, index, stage):
         line = ("r", 0, 0)
     else:
         line = ("d", 0, 1)
-    _outline(grid, x, y, w, h, line)
     narrow = w < 34
     if status == "active":
         right = [(" ", None), ("●", "work"), (" " if narrow else " " + verdict_text + " ", "soft")]
@@ -357,6 +359,8 @@ def _stage_box(grid, x, y, w, h, index, stage):
     else:
         title = [(" ", None), (clip(name, w - 6 - rw), (hue, 1, 0) if status != "todo" else (hue, 0, 1)),
                  (" ", None)]
+    _outline(grid, x, y, w, h, line)
+    grid.mark_moved()
     _segs(grid, x + 2, y, title)
     _segs(grid, x + w - 1 - rw, y, right)
     room = w - 4 - _LW
@@ -444,7 +448,10 @@ def _stage_grid(grid, x0, y, stages, room, bottom, loops=()):
             for my in sorted(set(mids(stages[index], by)) | set(mids(stages[index + 1], by))):
                 grid.put(gx, my, _ARROWS[0] if nx > bx else _ARROWS[1], style)
         else:
-            grid.put(bx + w // 2, by + h, _ARROWS[2], style)
+            arrow_y, arrow_x = by + h, bx + w // 2
+            if 0 <= arrow_y < grid.rows and 0 <= arrow_x < grid.cols and \
+                    grid.cells[arrow_y][arrow_x][0] in (" ", "─"):
+                grid.put(arrow_x, arrow_y, _ARROWS[2], style)
     if lanes:
         _loop_lanes(grid, pos, w, y, h, stages, loops)
         return y + h + lanes
@@ -531,14 +538,16 @@ def _current_leg(grid, x, y, stages, room):
     stage = stages[cur]
     hue = _STAGE_HUE[cur % 5]
     name_style = ("r", 1, 0) if stage.get("st") == "failed" else (hue, 1, 0)
-    x = grid.put(x, y, str(stage.get("n") or stage.get("name")), name_style)
+    limit = x0 + max(0, room)
+    x = grid.put(x, y, clip(str(stage.get("n") or stage.get("name")), max(0, room)),
+                 name_style, limit=limit)
     if stage.get("st") != "active":
         mark, key = _STATE_MARK.get(stage.get("st"), ("·", "dim"))
-        x = grid.put(x + 1, y, mark, key)
+        x = grid.put(x + 1, y, mark, key, limit=limit)
     x += 2
     done = sum(1 for item in stages if item.get("st") == "done")
-    x = grid.put(x, y, "%d/%d" % (done, len(stages)), "soft") + 1
-    cells = max(0, min(12, x0 + room - x))
+    x = grid.put(x, y, "%d/%d" % (done, len(stages)), "soft", limit=limit) + 1
+    cells = max(0, min(12, limit - x))
     fill = round(cells * done / len(stages))
     for i in range(cells):
         x = grid.put(x, y, "━" if i < fill else "─", (hue, 0, 0) if i < fill else ("d", 0, 1))
@@ -563,9 +572,9 @@ def _scroll_strip(grid, state, x0, x1, y, head, layout, rows, key, tail=True):
         grid.put(x1, yy, "│", "line")
     for (xx, yy), glyph in (((x0, y), "┌"), ((x1, y), "┐"), ((x0, y1), "└"), ((x1, y1), "┘")):
         grid.put(xx, yy, glyph, "line")
-    _segs(grid, x0 + 2, y, [(" ", None)] + list(head) + [(" ", None)])
+    _segs(grid, x0 + 2, y, [(" ", None)] + list(head) + [(" ", None)], x1 - 1)
     _segs(grid, x0 + 2, y1, [(" ", None), (where, "dim")] +
-          ([("  ·  drag·wheel ↕", "dim")] if n > rows else []) + [(" ", None)])
+          ([("  ·  drag·wheel ↕", "dim")] if n > rows else []) + [(" ", None)], x1 - 1)
     for yy in range(y, y + rows + 2):
         grid.add_hit(yy, x0, x1 + 1, ("scroll", key, top) + (() if tail else (-1,)))
     for k, (segments, tint) in enumerate(shown):
@@ -598,7 +607,6 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
     nodes = tuple((vm.nodes or {}).get(ident, ()))
     frame_key = ("c", 0, 1)
     for xx in range(x + 1, right):
-        grid.put(xx, y, "═", frame_key)
         grid.put(xx, bottom, "═", frame_key)
     for yy in range(y + 1, bottom):
         grid.put(x, yy, "║", frame_key)
@@ -606,8 +614,11 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
     for (xx, yy), glyph in (((x, y), "╔"), ((right, y), "╗"), ((x, bottom), "╚"), ((right, bottom), "╝")):
         grid.put(xx, yy, glyph, frame_key)
     if not nodes:
+        for xx in range(x + 1, right):
+            grid.put(xx, y, "═", frame_key)
         grid.put(x + 3, y + 2, clip("이 route의 stage 기록을 읽지 못했습니다 (route 기록 없음)", max(0, use - 6)),
                  "dim", limit=right)
+        grid.mark_moved()
         return bottom + 1
     tag = route.get("session_tag")
     repo_text = repo_rule_label(route.get("repo"))
@@ -623,7 +634,13 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
     head += [(str(route.get("title") or "·"), "head"), (trailer, "dim")]
     if route.get("shape"):
         head.append((" · " + str(route["shape"]), "dim"))
-    _segs(grid, x + 2, y, head + [(" ", None)], right - 1)
+    title_start = x + 2
+    title_parts = head + [(" ", None)]
+    title_end = min(right - 1, title_start + _width(title_parts))
+    for xx in range(x + 1, right):
+        if xx < title_start or xx >= title_end:
+            grid.put(xx, y, "═", frame_key)
+    _segs(grid, title_start, y, title_parts, right - 1)
 
     got = ""
     if state is not None and hasattr(state, "opened_for"):
@@ -649,9 +666,6 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
             line = ("y", 0, 1)
         else:
             line = ("d", 0, 1)
-        _outline(grid, bx, band_y, width, _BAND_H, line)
-        for hit_y in range(band_y, band_y + _BAND_H):
-            grid.add_hit(hit_y, bx, bx + width, ("ui", "node", f"{ident}:{index}"))
         name_key = ("p", 1, 0) if gate else ("w", 1, 0) if status != "todo" else ("d", 0, 1)
         if status == "active":
             tail = [(" ", None), ("●", "work"), (" running ", "soft")]
@@ -659,17 +673,26 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
             mark, key = _STATE_MARK.get(status, ("·", "dim"))
             tail = [(" %s " % mark, key), (str(node.get("verdict") or status) + " ", "soft")]
         name_room = width - 6 - (3 if gate else 1) - _width(tail)
-        _segs(grid, bx + 2, band_y, ([(" ◑ ", "steward")] if gate else [(" ", None)]) +
-              [(clip(str(node.get("n")), max(4, name_room)), name_key), (" ", None)])
-        _segs(grid, bx + width - 1 - _width(tail), band_y, tail)
+        tail_x = bx + width - 1 - _width(tail)
+        _outline(grid, bx, band_y, width, _BAND_H, line)
+        grid.mark_moved()
+        for hit_y in range(band_y, band_y + _BAND_H):
+            grid.add_hit(hit_y, bx, bx + width, ("ui", "node", f"{ident}:{index}"))
+        _segs(grid, bx + 2, band_y, ([ (" ◑ ", "steward")] if gate else [(" ", None)]) +
+              [(clip(str(node.get("n")), max(4, name_room)), name_key), (" ", None)], tail_x)
+        _segs(grid, tail_x, band_y, tail)
         node_lines = [list(item) for item in (node.get("lines") or ())]
         detail = [dict(item) if hasattr(item, "keys") else item for item in (node.get("detail") or ())]
         band_lines = ([None] if node.get("kind") == "leg" and detail else []) + node_lines
         for k, parts in enumerate(band_lines[:_BAND_H - 2]):
             if parts is None:
                 end = bx + width - 2
-                label_end = grid.put(bx + 2, band_y + 1 + k, "stage".ljust(_LW), "dim")
-                _current_leg(grid, label_end, band_y + 1 + k, detail, end - (bx + 2) - _LW)
+                label_x = bx + 2
+                label_room = max(0, end - label_x)
+                label_text = "stage".ljust(_LW) if label_room >= _LW else clip("stage", label_room)
+                label_end = grid.put(label_x, band_y + 1 + k,
+                                     label_text, "dim", limit=end)
+                _current_leg(grid, label_end, band_y + 1 + k, detail, max(0, end - label_end))
             else:
                 _segs(grid, bx + 2, band_y + 1 + k, parts, bx + width - 1)
         if index:
@@ -682,13 +705,13 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
     band_end = x + 3 + len(nodes) * (width + _BAND_GAP) - _BAND_GAP
     after = _route_after(route, nodes)
     if after:
-        grid.put(band_end + 3, y + 2, after, "dim")
+        start = band_end + 3
+        grid.put(start, y + 2, clip(after, max(0, right - start)), "dim", limit=right)
 
     node = nodes[selected]
-    panel_left, panel_right, panel_y = x + 2, right - 2, y + _BAND_H + 2
+    panel_left, panel_right = x + 2, right - 2
+    panel_y = y + _BAND_H + (3 if use < 50 else 2)
     style = ("d", 0, 0)
-    for xx in range(panel_left + 1, panel_right):
-        grid.put(xx, panel_y, "─", style)
     for yy in range(panel_y + 1, bottom):
         grid.put(panel_left, yy, "│", style)
         grid.put(panel_right, yy, "│", style)
@@ -699,6 +722,10 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
     title = [(" ", None)] + [tuple(item) for item in (node.get("title") or ())] + [(" ", None)]
     tw = _width(title)
     tx = panel_left + 2 if panel_left + 2 + tw < centre - 1 else centre + 2
+    title_end = min(panel_right - 1, tx + tw)
+    for xx in range(panel_left + 1, panel_right):
+        if xx != centre and (xx < tx or xx >= title_end):
+            grid.put(xx, panel_y, "─", style)
     _segs(grid, tx, panel_y, title, panel_right - 1)
     grid.put(centre, panel_y, "┴", ("v", 0, 0))
     stages = [dict(item) if hasattr(item, "keys") else item for item in (node.get("detail") or ())]
@@ -724,6 +751,7 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
     if stages:
         _stage_grid(grid, panel_left + 2, panel_y + 1, stages, stage_room, stage_bottom,
                     tuple(tuple(item) for item in (node.get("loops") or ())))
+    grid.mark_moved()
     return bottom + 1
 
 

@@ -220,13 +220,16 @@ def _parse_pipe_meta_uncached(pipe):
 _parse_pipe_meta_cached = functools.lru_cache(maxsize=8192)(_parse_pipe_meta_uncached)
 
 _PARSED_REGISTRY_ROWS = OrderedDict()
+_PARSED_REGISTRY_LINE_COUNTS = {}
+_PARSED_REGISTRY_SEGMENTS = {}
 _PARSED_REGISTRY_ROWS_LIMIT = 32
 
 
-def _parse_registry_lines(path, lines, generation):
-    """Parse registry rows once per observed file generation."""
+def _parse_registry_lines(path, lines, generation, *, first_line=1,
+                          complete_line_count=None, segments=None):
+    """Parse registry rows once, retaining physical line positions."""
     rows = []
-    for line_number, line in enumerate(lines, 1):
+    for line_number, line in enumerate(lines, first_line):
         fields = tuple(line.split("\t"))
         if len(fields) != 6:
             continue
@@ -235,9 +238,16 @@ def _parse_registry_lines(path, lines, generation):
     result = tuple(rows)
     key = (os.path.abspath(os.fspath(path)), generation)
     _PARSED_REGISTRY_ROWS[key] = result
+    _PARSED_REGISTRY_LINE_COUNTS[key] = (
+        first_line + len(lines) - 1 if complete_line_count is None
+        else complete_line_count
+    )
+    _PARSED_REGISTRY_SEGMENTS[key] = tuple(segments) if segments is not None else None
     _PARSED_REGISTRY_ROWS.move_to_end(key)
     while len(_PARSED_REGISTRY_ROWS) > _PARSED_REGISTRY_ROWS_LIMIT:
-        _PARSED_REGISTRY_ROWS.popitem(last=False)
+        evicted, _value = _PARSED_REGISTRY_ROWS.popitem(last=False)
+        _PARSED_REGISTRY_LINE_COUNTS.pop(evicted, None)
+        _PARSED_REGISTRY_SEGMENTS.pop(evicted, None)
     return result
 
 
@@ -250,6 +260,7 @@ def parsed_registry_rows(path):
     """
     lines = _pinned_registry_lines(path)
     generation = None
+    view = None
     if lines is None:
         try:
             source = Path(path)
@@ -274,6 +285,48 @@ def parsed_registry_rows(path):
     if cached is not None:
         _PARSED_REGISTRY_ROWS.move_to_end(key)
         return cached
+    # The shared registry cache already retains append-only byte segments. Reuse
+    # the parsed prefix too, so a generation append parses only newly added rows.
+    prefix_key = None
+    prefix_rows = ()
+    prefix_lines = 0
+    if view is not None and generation is not None and len(generation) >= 3:
+        identity = (generation[0], generation[1])
+        for candidate in reversed(_PARSED_REGISTRY_ROWS):
+            candidate_path, candidate_generation = candidate
+            if (candidate_path != key[0] or not isinstance(candidate_generation, tuple)
+                    or len(candidate_generation) < 3):
+                continue
+            if ((candidate_generation[0], candidate_generation[1]) == identity
+                    and candidate_generation[2] < generation[2]):
+                old_segments = _PARSED_REGISTRY_SEGMENTS.get(candidate)
+                new_segments = tuple(view._segments)
+                if (old_segments is not None and len(old_segments) <= len(new_segments)
+                        and all(old is new for old, new in zip(old_segments, new_segments))):
+                    prefix_key = candidate
+                    prefix_lines = _PARSED_REGISTRY_LINE_COUNTS.get(candidate, 0)
+                    prefix_rows = tuple(row for row in _PARSED_REGISTRY_ROWS[candidate]
+                                        if row[0] <= prefix_lines)
+                    break
+    if prefix_key is not None and prefix_lines <= len(lines):
+        suffix = _parse_registry_lines(
+            path, lines[prefix_lines:], generation, first_line=prefix_lines + 1,
+            complete_line_count=view.line_count - int(view.has_partial_tail),
+            segments=view._segments)
+        result = tuple(prefix_rows) + tuple(suffix)
+        _PARSED_REGISTRY_ROWS[key] = result
+        _PARSED_REGISTRY_LINE_COUNTS[key] = view.line_count - int(view.has_partial_tail)
+        _PARSED_REGISTRY_SEGMENTS[key] = tuple(view._segments)
+        while len(_PARSED_REGISTRY_ROWS) > _PARSED_REGISTRY_ROWS_LIMIT:
+            evicted, _value = _PARSED_REGISTRY_ROWS.popitem(last=False)
+            _PARSED_REGISTRY_LINE_COUNTS.pop(evicted, None)
+            _PARSED_REGISTRY_SEGMENTS.pop(evicted, None)
+        return result
+    if view is not None:
+        return _parse_registry_lines(
+            path, lines, generation,
+            complete_line_count=view.line_count - int(view.has_partial_tail),
+            segments=view._segments)
     return _parse_registry_lines(path, lines, generation)
 
 
@@ -2869,7 +2922,6 @@ def _scan_registry_evidence(paths):
         rows = parsed_registry_rows(path)
         for registry_order, fields, meta in rows:
             ts, status, _repo, _worktree, slug, pipe = fields
-            meta = dict(meta)
             attempt_contract = _attempt_contract(meta)
             route_id = meta.get("route_id")
             route_node = meta.get("route_node")

@@ -7,13 +7,33 @@ from tools.fleet.explorer.view_model import load_fixture
 from tools.fleet.tests.parity_compare import diff_frames, diff_view_models, validate_ledger
 from tools.fleet.tests.parity_states import enumerate_states
 from tools.fleet.tests.reference_injection import inject_model_catalog
-from tools.fleet.tests.snapshot_fixture import replay_snapshot
+from tools.fleet.tests.snapshot_fixture import replay_snapshot, replay_source_bundle
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "explorer"
 
 
 class ReplayContract(unittest.TestCase):
+    def test_source_bundle_join_rebuilds_typed_rows_and_pointer_provenance(self):
+        state = {"sessions": [{"harness": "claude", "session_id": "sid-a", "session_tag": "aa",
+                               "cwd": "/repo", "pid": 1}],
+                 "jobs": [], "resource_jobs": [{"run_id": "resource-a", "cwd": "/repo"}],
+                 "route": [{"route_id": "route-a", "nodes": []}],
+                 "compute_hosts": {"hosts": []}, "peer_messages": {"records": []}}
+        history = {"aa": {"seat": "seat-data", "cards": [], "handovers": []},
+                   "_recent_handovers": [{"ts": "2026-10-20T01:00:00Z"}]}
+        logs = {"sid-a:0": {"h": "claude", "sid": "sid-a", "lines": ["log row"]}}
+        raw = {"lines": ["raw row"]}
+        snapshot, detail = replay_source_bundle(state, history, logs, raw, now=10)
+        from tools.fleet.model import ResourceJob, Session
+        self.assertIsInstance(snapshot.sessions[0], Session)
+        self.assertIsInstance(snapshot.resources[0], ResourceJob)
+        self.assertEqual(snapshot.compute_hosts, {"hosts": []})
+        self.assertEqual(detail.seats["claude:sid-a"][-1]["sid"], "sid-a")
+        self.assertEqual(detail.source_records["aa.cards"], "/history_data.json/aa/cards")
+        self.assertEqual(detail.source_records["logs.sid-a:0"], "/logs_hist.json/sid-a:0/lines")
+        self.assertEqual(snapshot.observations["replay_sources"]["history_handovers"], history["_recent_handovers"])
+
     def test_snapshot_replay_preserves_allowlisted_values_and_unknown_provenance(self):
         snapshot, detail = replay_snapshot({"malformed": 2, "observations": {"ready": True},
                                             "extra_capture": {"sha256": "abc"}}, now=123)

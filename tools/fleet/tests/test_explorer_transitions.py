@@ -9,6 +9,7 @@ from tools.fleet.explorer.state import NavState, reduce
 from tools.fleet.explorer.view_model import load_fixture
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "explorer"
+PEERS_PANE_LEFT, PEERS_PANE_TOP, PEERS_PANE_BOTTOM = 34, 3, 41
 
 
 def _expected_nav(st):
@@ -122,11 +123,23 @@ def _first_hit_difference(expected, actual):
 
 
 def _assert_peer_capture(test, expected, row_pool, vm, state, cols, case):
-    # PEERS uses hand-placed graph lanes in the approved screen, so transitions
-    # compare graph meaning and selection state while retaining exact chrome rows.
-    expected_text = ["".join(cell[0] for cell in row)
-                     for row in _expand([row_pool[index] for index in expected["cells"]])]
+    # w2-peers owns the pane interior. Keep every cell and hit outside that
+    # explicit rectangle exact, including the joined header and left rail.
+    expected_cells = _expand([row_pool[index] for index in expected["cells"]])
     actual = draw(vm, state, cols, 45, beat=1)
+    actual_cells, actual_hits = _frame_json(actual)
+    for rows_to_mask in (expected_cells, actual_cells):
+        for row_index in range(PEERS_PANE_TOP, PEERS_PANE_BOTTOM):
+            for col_index in range(PEERS_PANE_LEFT, cols - 1):
+                rows_to_mask[row_index][col_index] = None
+    test.assertEqual(actual_cells, expected_cells, f"{case}: PEERS exterior cells")
+    expected_hits = [hit for hit in expected["hits"] if not (
+        PEERS_PANE_TOP <= hit[0] < PEERS_PANE_BOTTOM and hit[1] >= PEERS_PANE_LEFT)]
+    actual_hits = [hit for hit in actual_hits if not (
+        PEERS_PANE_TOP <= hit[0] < PEERS_PANE_BOTTOM and hit[1] >= PEERS_PANE_LEFT)]
+    test.assertEqual(actual_hits, expected_hits, f"{case}: PEERS exterior ordered hits")
+    expected_text = ["".join(cell[0] for cell in row) for row in _expand(
+        [row_pool[index] for index in expected["cells"]])]
     actual_text = actual.text_rows()
     for _repo, columns in vm.peer_nodes:
         for column in columns:

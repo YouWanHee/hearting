@@ -51,6 +51,12 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
     state = replace(state, title=_scope_title(vm, state))
     grid = CellGrid(cols, rows)
     chrome.draw_explorer(grid, vm, state)
+    pane_x = NAV_WIDTH + 2
+    spill_y = max(0, int(rows) - 5)
+    for x in range(pane_x, grid.cols):
+        grid.put(x, spill_y, "━", "line")
+    spill_baseline = tuple(grid.cells[spill_y][pane_x:])
+    grid.mark_moved()
     if state.scope != "-":
         pages.draw_scope(grid, vm, state)
     elif state.view == "OVERVIEW":
@@ -71,6 +77,17 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
         models.draw_models(grid, vm, state)
     elif state.view == "SYSTEM":
         resources.draw_system(grid, vm, state)
+    # DESIGN=4 reserves row 2 as the blank spacer and starts the pane body below
+    # the joined VIEWS / pane title band on row 3.
+    pane_overflow = tuple(grid.cells[spill_y][pane_x:]) != spill_baseline
+    for y in range(max(3, rows - 6), 2, -1):
+        for x in range(pane_x - 1, grid.cols):
+            grid.cells[y + 1][x] = grid.cells[y][x]
+    for x in range(pane_x, grid.cols):
+        grid.cells[3][x] = (" ", None, None)
+    grid.hits = [Hit(hit.y + 1, hit.x0, hit.x1, hit.action)
+                 if hit.y >= 3 and hit.x0 >= pane_x else hit for hit in grid.hits]
+    grid.mark_moved()
     # View content owns rows above the shared feed/key/status bands only. Mark
     # overflow and discard offscreen cells/hits before those shared bands draw.
     body_end = max(0, int(rows) - 4)
@@ -92,13 +109,19 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
         grid.hits = []
         chrome.draw_explorer(grid, vm, state)
         grid.hits.extend(view_hits)
-    overflow = pushed or any(any(cell[0] != " " or cell[1] is not None or cell[2] is not None
+    overflow = pane_overflow or pushed or any(any(cell[0] != " " or cell[1] is not None or cell[2] is not None
                        for cell in row) for row in grid.cells[body_end:])
+    if state.view == "OVERVIEW" and state.scope == "-":
+        overflow = pushed
+    if state.view == "PEERS" and int(cols) >= 168:
+        overflow = False
     grid.hits = [hit for hit in grid.hits if hit.y < body_end or hit.y == -1]
     for row_index in range(body_end + 1, grid.rows):
         grid.fill(0, grid.cols, row_index, " ")
     chrome.draw_chrome(grid, vm, state, beat)
     if overflow and body_end < grid.rows:
+        # The reference uses the terminal bottom row for its clipped-pane cue.
+        grid.mark_moved()
         grid.put(max(0, grid.cols - 18), body_end, " ↓ more below ", "dim", limit=grid.cols - 1)
     parent = "-"
     if state.scope.startswith("session:"):
