@@ -274,10 +274,10 @@ function targetFiles(ctx, tool, args) {
   return []
 }
 
-function appendSpecSyncNudge(ctx, input, output, harnessRoot) {
+function specSyncNudgeText(ctx, input, output, harnessRoot) {
   const args = input.args || output.args || {}
   const toolName = typeof input.tool === "string" ? input.tool : input.tool?.name || ""
-  if ((toolName !== "edit" && toolName !== "apply_patch") || typeof output?.output !== "string") return Promise.resolve()
+  if ((toolName !== "edit" && toolName !== "apply_patch") || typeof output?.output !== "string") return Promise.resolve("")
   return new Promise((resolve) => {
     let settled = false
     let stdout = ""
@@ -287,8 +287,7 @@ function appendSpecSyncNudge(ctx, input, output, harnessRoot) {
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
-      if (code === 0 && stdout.trim()) output.output += "\n" + stdout.trim()
-      resolve()
+      resolve(code === 0 ? stdout.trim() : "")
     }
     const cwd = typeof args.workdir === "string" ? path.resolve(baseDir(ctx), args.workdir) : baseDir(ctx)
     try {
@@ -307,6 +306,12 @@ function appendSpecSyncNudge(ctx, input, output, harnessRoot) {
     } catch {
       finish(null)
     }
+  })
+}
+
+function appendSpecSyncNudge(ctx, input, output, harnessRoot) {
+  return specSyncNudgeText(ctx, input, output, harnessRoot).then((text) => {
+    if (text && typeof output?.output === "string") output.output += "\n" + text
   })
 }
 
@@ -2594,7 +2599,11 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
     }
   },
   "tool.execute.after": async (input, output) => {
-    await appendSpecSyncNudge(ctx, input, output, root)
+    const workerSession = isWorkerSession()
+    // Start the general-session helper before the existing synchronous post-tool work.
+    // Its text is appended once at the end, after all other output additions.
+    const specSyncNudge = workerSession ? null : specSyncNudgeText(ctx, input, output, root)
+    if (workerSession) await appendSpecSyncNudge(ctx, input, output, root)
     observePaneCallback(ctx, "tool.execute.after", input.sessionID || "")
     const args = input.args || output.args || {}
     const toolName = typeof input.tool === "string" ? input.tool : input.tool?.name || ""
@@ -2660,6 +2669,10 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
                                 answers: output?.metadata?.answers || [] }),
         encoding: "utf8",
       })
+    }
+    if (specSyncNudge && typeof output?.output === "string") {
+      const text = await specSyncNudge
+      if (text) output.output += "\n" + text
     }
   },
   })

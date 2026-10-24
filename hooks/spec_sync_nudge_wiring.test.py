@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "hooks" / "spec-sync-nudge.sh"
@@ -94,6 +95,7 @@ class SpecSyncNudgeWiringTest(unittest.TestCase):
             env = clean_env(base / "home")
             inputs = [
                 ("Claude Edit", {"file_path": "source.py", "old_string": "epoch = 30", "new_string": "epoch = 50"}),
+                ("Claude MultiEdit", {"edits": [{"file_path": "source.py", "old_string": "epoch = 30", "new_string": "epoch = 50"}]}),
                 ("Codex command patch", {"command": ["apply_patch", PATCH]}),
                 ("Codex input patch", {"input": PATCH}),
                 ("OpenCode edit", {"filePath": "source.py", "oldString": "epoch = 30", "newString": "epoch = 50"}),
@@ -156,14 +158,16 @@ for (const [tool, args] of [["edit", { filePath: "source.py", oldString: "epoch 
   assert.ok(output.output.includes("CANONICAL_ONLY"));
   assert.ok(output.output.includes("epoch = 30"));
   assert.ok(!output.output.includes("SHADOW_ONLY"));
+  assert.equal(output.output.split("Spec synchronization nudge").length - 1, 1);
 }
 hooks.dispose?.({ silent: true });
 '''
-            env = clean_env(base / "home", PLUGIN_PATH=ROOT / "adapters/opencode/plugins/hearting-guards.js",
-                            FIXTURE_CWD=linked, PATCH_TEXT=PATCH, AGENT_SESSION_ROLE="worker",
-                            AGENT_DISPATCH_CHILD="1", AGENT_DISPATCH_DEPTH="2")
-            result = run([NODE, "--input-type=module", "-e", script], cwd=ROOT, env=env, timeout=45)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for worker_env in ({}, {"AGENT_SESSION_ROLE": "worker", "AGENT_DISPATCH_CHILD": "1",
+                                  "AGENT_DISPATCH_DEPTH": "2"}):
+                env = clean_env(base / "home", PLUGIN_PATH=ROOT / "adapters/opencode/plugins/hearting-guards.js",
+                                FIXTURE_CWD=linked, PATCH_TEXT=PATCH, **worker_env)
+                result = run([NODE, "--input-type=module", "-e", script], cwd=ROOT, env=env, timeout=45)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_noise_filter_caps_fail_open_and_reader_priority(self):
         with tempfile.TemporaryDirectory(prefix="spec-sync-noise-") as raw:
@@ -270,6 +274,74 @@ hooks.dispose?.({ silent: true });
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
             self.assertLess(elapsed, 1.0, f"deadline did not bound resolver: {elapsed:.3f}s")
             self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["resolver"])
+
+    def test_slow_reader_with_multiple_files_and_candidates_obeys_aggregate_deadline(self):
+        with tempfile.TemporaryDirectory(prefix="spec-sync-reader-deadline-") as raw:
+            base = Path(raw)
+            root = base / "root"
+            spec = root / "spec"
+            spec.mkdir(parents=True)
+            (spec / "prd.md").write_text("# Spec\n- epoch = 30 and a_postedit_spec_sync\n", encoding="utf-8")
+            source_a = base / "source-a.py"
+            source_b = base / "source-b.py"
+            source_a.write_text("epoch = 50\n", encoding="utf-8")
+            source_b.write_text("value = True\n", encoding="utf-8")
+            calls = base / "calls"
+            resolver = "#!/bin/sh\nprintf '%s\\n' \"$FIXTURE_ARTIFACT_ROOT\"\n"
+            reader = ("import json, os, time\nfrom pathlib import Path\n"
+                      "with Path(os.environ['FIXTURE_CALLS']).open('a', encoding='utf-8') as f: f.write('reader\\n')\n"
+                      "time.sleep(2)\nprint(json.dumps({'path': os.path.join(os.environ['FIXTURE_ARTIFACT_ROOT'], 'spec')}))\n")
+            hook = instrumented_hook(base, root, resolver=resolver, reader=reader)
+            env = clean_env(base / "home", FIXTURE_ARTIFACT_ROOT=root, FIXTURE_CALLS=calls,
+                            SPEC_SYNC_DEADLINE_MS="120")
+            started = time.monotonic()
+            result = run(["bash", str(hook), "--format", "text"], cwd=base, env=env,
+                         input=payload({"edits": [
+                             {"file_path": str(source_a), "old_string": "epoch = 30", "new_string": "epoch = 50"},
+                             {"file_path": str(source_b), "old_string": "a_postedit_spec_sync", "new_string": "removed_identifier"},
+                         ]}, cwd=base), timeout=3)
+            elapsed = time.monotonic() - started
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+            self.assertLess(elapsed, 1.0, f"slow reader escaped aggregate deadline: {elapsed:.3f}s")
+            self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["reader"])
+
+    def test_deadline_override_is_clamped_without_waiting_for_timeout(self):
+        source = HOOK.read_text(encoding="utf-8")
+        embedded = source.split("NUDGE_PY=$(cat <<'PY'\n", 1)[1].split("\nPY\n)", 1)[0]
+        namespace = {"__name__": "spec_sync_deadline_contract"}
+        exec(embedded.split("def main():", 1)[0], namespace)
+        with mock.patch.dict(os.environ, {"SPEC_SYNC_DEADLINE_MS": "9000"}):
+            self.assertEqual(namespace["deadline_ms"](), 6000)
+
+    def test_patch_move_destination_and_add_delete_blocks(self):
+        with tempfile.TemporaryDirectory(prefix="spec-sync-patch-blocks-") as raw:
+            base = Path(raw)
+            primary, linked = make_linked_fixture(base)
+            canonical_spec = primary / ".agent_reports/spec/prd.md"
+            canonical_spec.write_text(canonical_spec.read_text(encoding="utf-8") +
+                                     "\n- ADD_ONLY = True\n- DELETE_ONLY = True\n", encoding="utf-8")
+            (linked / "destination.py").write_text("epoch = 30\n", encoding="utf-8")
+            patch = ("*** Begin Patch\n"
+                     "*** Update File: old-name.py\n*** Move to: destination.py\n"
+                     "@@\n-epoch = 30\n+epoch = 50\n"
+                     "*** Add File: added.py\n@@\n+ADD_ONLY = True\n"
+                     "*** Delete File: deleted.py\n@@\n-DELETE_ONLY = True\n"
+                     "*** End Patch\n")
+            result = run(["bash", str(HOOK), "--format", "text"], cwd=linked,
+                         env=clean_env(base / "home"),
+                         input=payload({"patchText": patch}, cwd=linked, tool_name="apply_patch"))
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+
+    def test_old_payload_removing_postedit_spec_identifier_is_detected(self):
+        with tempfile.TemporaryDirectory(prefix="spec-sync-postedit-signal-") as raw:
+            base = Path(raw)
+            _, linked = make_linked_fixture(base)
+            result = run(["bash", str(HOOK), "--format", "text"], cwd=linked,
+                         env=clean_env(base / "home"),
+                         input=payload({"file_path": "source.py", "old_string": "a_postedit_spec_sync",
+                                        "new_string": "removed_identifier"}, cwd=linked))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("a_postedit_spec_sync", result.stdout)
 
     def test_codex_posttooluse_array_preserves_original_five_entries(self):
         baseline = json.loads(subprocess.run(["git", "show", f"{BASELINE}:adapters/codex/hooks/hooks.json"],

@@ -27,10 +27,10 @@ def safe_cap(name, default):
         return default
 
 def deadline_ms():
-    # Parent ceilings: Claude 10s; Codex 10s > bridge 8s; OpenCode 8s.
-    # Keep this shared hook at 6s by default, with an optional local override.
+    # Parent ceilings: Claude 10s; Codex hook 10s > bridge 8s; OpenCode 8s.
+    # Overrides may lower, never raise, the shared 6s ceiling.
     try:
-        return max(0, min(int(os.environ.get("SPEC_SYNC_DEADLINE_MS", "6000")), 60000))
+        return max(0, min(int(os.environ.get("SPEC_SYNC_DEADLINE_MS", "6000")), 6000))
     except Exception:
         return 6000
 
