@@ -815,7 +815,7 @@ def apply_gpu_execution_sandbox(args: argparse.Namespace) -> None:
                 raise DispatchContractError("dispatch-evidence-parent-runtime-mismatch",
                                             "selected GPU owner sandbox differs from its checked tuple")
     args.gpu_execution_selection = selection
-    args.gpu_execution_scope = True
+    args.gpu_execution_scope = bool(selection["gpu_scope"])
     args.sandbox = selection["sandbox"]
 
 
