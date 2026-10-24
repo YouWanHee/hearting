@@ -2098,8 +2098,11 @@ execution permission or data protection.
 On a non-self managed-release launch, the payload receives a validated code
 copy under the shared run root; the launcher's `agent_home` remains the pinned
 local release path, while `payload_agent_home` records the copy. Self hosts keep
-the pinned path. A failed copy clears the payload value but does not block the
-run. Cache cleanup removes only unused copies older than 14 days and stale
+the pinned path. Reuse repeats the immutable identity and contained-symlink
+checks; a marker alone does not verify the cached contents. An invalid existing
+entry is preserved and uses the existing failed-copy fallback. A failed copy
+clears the payload value but does not block the run. Cache cleanup removes only
+unused copies older than 14 days and stale
 staging directories older than 24 hours, protects referenced copies for live
 runs, and scans run metadata at most daily. An orphaned run without `exit_code`
 keeps a referenced copy until it receives an exit code.

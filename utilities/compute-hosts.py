@@ -633,7 +633,9 @@ def _release_entry_valid(entry, key, identity):
                 return False
         data = json.loads(release_marker.read_text(encoding="utf-8"))
         return (isinstance(data, dict) and data.get("schema") == identity.get("schema") == 1
-                and data.get("version") == identity.get("version"))
+                and data.get("version") == identity.get("version")
+                and _release_tree_safe(source)
+                and _verified_release_identity(source, fresh=True) == identity)
     except (OSError, RuntimeError, ValueError):
         return False
 
@@ -791,6 +793,8 @@ def _publish_managed_agent_home(source, run_root, *, now=None):
                 _atomic_json(entry / RELEASE_MARKER_NAME, marker)
                 status = "present"
             else:
+                if entry.exists() or entry.is_symlink():
+                    raise OSError("cache entry exists but is not reusable")
                 stamp = f"{os.getpid()}-{time.time_ns()}"
                 stage = cache / f".stage-{key}-{stamp}"
                 stage.mkdir(mode=0o700)
@@ -849,6 +853,8 @@ def _select_payload_agent_home(provenance, host, run_root, *, dry_run=False):
                 return "", "publish-failed", "unsafe release cache path"
             if _release_entry_valid(entry, key, identity):
                 return str((entry / "source").resolve()), "present", "verified cached release is present"
+            if entry.exists() or entry.is_symlink():
+                return "", "publish-failed", "cache entry exists but is not reusable"
             return str(entry / "source"), "would-publish", "validated release would be copied under run_root"
         payload, status, note = _publish_managed_agent_home(source, run_root)
         if status == "publish-failed":

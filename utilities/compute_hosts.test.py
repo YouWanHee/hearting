@@ -1644,6 +1644,30 @@ class LauncherProvenanceTest(unittest.TestCase):
         self.assertEqual((reused, reuse_status), (payload_home, "present"))
         self.assertEqual(module._select_payload_agent_home(
             provenance, non_self, self.run_root, dry_run=True)[:2], (payload_home, "present"))
+        # Ownership/version markers survive a content change. Warm identity caches
+        # must not let either real reuse or its dry-run trust that changed copy.
+        core = copied / "core/CORE.md"
+        original_core = core.read_bytes()
+        marker_path = copied.parent / module.RELEASE_MARKER_NAME
+        marker_before = marker_path.read_bytes()
+        try:
+            core.write_bytes(original_core + b"# changed cached content\n")
+            key = module._release_key(identity)
+            self.assertFalse(module._release_entry_valid(copied.parent, key, identity))
+            dry_home, dry_status, dry_reason = module._select_payload_agent_home(
+                provenance, non_self, self.run_root, dry_run=True)
+            self.assertEqual((dry_home, dry_status), ("", "publish-failed"), dry_reason)
+            self.assertEqual(marker_path.read_bytes(), marker_before)
+            failed_home, failed_status, failed_reason = module._publish_managed_agent_home(
+                source, self.run_root)
+            self.assertEqual((failed_home, failed_status), ("", "publish-failed"), failed_reason)
+            self.assertIn("cache entry exists but is not reusable", failed_reason)
+            self.assertEqual(core.read_bytes(), original_core + b"# changed cached content\n")
+            self.assertEqual(marker_path.read_bytes(), marker_before)
+        finally:
+            core.write_bytes(original_core)
+        self.assertEqual(module._publish_managed_agent_home(source, self.run_root)[:2],
+                         (payload_home, "present"))
         hidden = source.with_name(source.name + ".hidden-for-test")
         source.rename(hidden)
         self.addCleanup(lambda: hidden.rename(source) if hidden.exists() else None)
