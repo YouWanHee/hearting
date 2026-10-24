@@ -4965,7 +4965,7 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     ids = [node["id"] for node in route["nodes"]]
     framed = shape == "framed"
-    graph = "→".join(ids) if route.get("composed") or framed else (ids[0] if ids else "-")
+    graph = "→".join(ids) if ids else "-"
     gates = ",".join(sorted({row["gate"] for row in route.get("human_gate_bindings") or []})) or "없음"
     card = (
         f"[경로] {route['capability']} · {shape}({route['effective_intensity']}) {graph}"
@@ -4978,7 +4978,7 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
     if include_decisions:
         card += "\n" + "\n".join(compose_decision_lines(route, non_git_decision))
     if non_git_decision and non_git_decision.get("kind") == "direct":
-        card += "\n  git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작"
+        card += "\n  git 아닌 폴더 — 이 세션이 직접 진행. 작업자가 필요하면 --shape 없이 다시 시작(원본 수정은 git init 필요)"
         if non_git_decision.get("capability_unresolved"):
             card += "\n  작업 종류 미정 — `--capability`로 지정"
     card += f"\n  확인 방식 {observed['confirmation']['method']} · 출처 {observed['confirmation']['origin']}"
@@ -10635,7 +10635,8 @@ def _decide_non_git_compose(cwd_diagnosis, requested_shape,
     """The single compose-start decision for Git, non-Git direct, and non-Git refusal.
 
     `requested_shape` is the shape the start will run: a readable route-plan leg's own
-    shape, else `--shape`. Only a direct (or omitted) shape runs without a worker."""
+    shape, else `--shape`. Only an explicit direct shape runs without a worker; an omitted
+    shape follows the Git default (framed), so the frame decides as in a Git folder."""
     common = {"cwd": str(cwd_diagnosis.get("cwd") or ""),
               "capability_hint": capability_hint}
     state = cwd_diagnosis.get("state")
@@ -10645,7 +10646,7 @@ def _decide_non_git_compose(cwd_diagnosis, requested_shape,
         detail = cwd_diagnosis.get("detail") or "git diagnosis unavailable"
         return {**common, "kind": "error", "detail": f"{common['cwd']}: {detail}"}
     cause = f"git 저장소 아님: {common['cwd']}"
-    if requested_shape not in (None, "direct"):
+    if requested_shape != "direct":
         return {**common, "kind": "worker-candidate", "cause": cause,
                 "next": "git init 후 다시 시작하거나, 이 세션에서 --shape direct로 진행"}
     if dispatch_depth > 0 or registered_attempt:

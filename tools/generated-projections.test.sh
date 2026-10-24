@@ -81,6 +81,89 @@ fi
 grep -q '^name: session-tidy$' "$ROOT/adapters/codex/skills/session-tidy/SKILL.md"
 grep -q '^name: session-tidy$' "$ROOT/adapters/opencode/skills/session-tidy/SKILL.md"
 
+# The shared recovery contract and the renamed canonical procedure must both
+# reach each native Skill projection.
+RECOVERY_CONTRACT="$ROOT/capabilities/code-execute.md"
+RECOVERY_PROCEDURE="$ROOT/capabilities/code-execute/references/procedure.md"
+cp "$RECOVERY_CONTRACT" "$TMP/code-execute-contract.md"
+python3 - "$RECOVERY_CONTRACT" "$RECOVERY_PROCEDURE" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+contract = Path(sys.argv[1])
+procedure = Path(sys.argv[2])
+procedure_text = procedure.read_text(encoding="utf-8")
+required = (
+    "## Failure Recovery",
+    "clearly attributable edits in reverse order",
+    "same file",
+    "staged content",
+    "untracked files",
+    "never replay a failed command automatically",
+    "route closure to the runtime",
+    "direct/inline and legacy recovery paths",
+)
+missing = [item for item in required if item not in procedure_text]
+if missing:
+    raise SystemExit(f"not ok - renamed canonical recovery procedure is incomplete: {missing}")
+
+text = contract.read_text(encoding="utf-8")
+heading = "## Portable Procedure\n"
+if heading not in text:
+    raise SystemExit("not ok - code-execute Portable Procedure is missing")
+sentinel = "\nProjection fixture: PORTABLE_RECOVERY_PROCEDURE_SENTINEL.\n"
+start = text.index(heading) + len(heading)
+next_heading = re.search(r"^## ", text[start:], re.MULTILINE)
+end = start + next_heading.start() if next_heading else len(text)
+contract.write_text(text[:end].rstrip() + sentinel + text[end:], encoding="utf-8")
+PY
+python3 "$ROOT/tools/generate.py" >/dev/null
+python3 - \
+  "$RECOVERY_CONTRACT" \
+  "$ROOT/adapters/codex/skills/code-execute/SKILL.md" \
+  "$ROOT/adapters/codex/plugins/hearting-codex/skills/code-execute/SKILL.md" \
+  "$ROOT/adapters/opencode/skills/code-execute/SKILL.md" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+def portable_section(path):
+    text = Path(path).read_text(encoding="utf-8")
+    match = re.search(r"(?ms)^## Portable Procedure\n(.*?)(?=^## |\Z)", text)
+    if not match:
+        raise SystemExit(f"not ok - Portable Procedure missing from {path}")
+    return match.group(1).strip()
+
+expected = portable_section(sys.argv[1])
+if "PORTABLE_RECOVERY_PROCEDURE_SENTINEL" not in expected:
+    raise SystemExit("not ok - recovery projection fixture was not inserted")
+for path in sys.argv[2:]:
+    if portable_section(path) != expected:
+        raise SystemExit(f"not ok - Portable Procedure differs in {path}")
+PY
+grep -Fq 'capabilities/code-execute.md#portable-procedure' "$RECOVERY_PROCEDURE" || {
+  echo "not ok - renamed canonical procedure omits the shared recovery contract" >&2
+  exit 1
+}
+for skill_copy in \
+  "$ROOT/skills/code-execute/SKILL.md" \
+  "$ROOT/adapters/claude/skills/code-execute/SKILL.md" \
+  "$ROOT/adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/code-execute/SKILL.md" \
+  "$ROOT/adapters/codex/skills/code-execute/SKILL.md" \
+  "$ROOT/adapters/codex/plugins/hearting-codex/skills/code-execute/SKILL.md" \
+  "$ROOT/adapters/opencode/skills/code-execute/SKILL.md"; do
+  grep -Fq 'capabilities/code-execute/references/procedure.md' "$skill_copy" || {
+    echo "not ok - renamed canonical procedure reference missing from $skill_copy" >&2
+    exit 1
+  }
+done
+cmp -s "$ROOT/skills/code-execute/SKILL.md" "$ROOT/adapters/claude/skills/code-execute/SKILL.md"
+cmp -s "$ROOT/skills/code-execute/SKILL.md" \
+  "$ROOT/adapters/claude/plugin-marketplace/plugins/hearting-claude/skills/code-execute/SKILL.md"
+cp "$TMP/code-execute-contract.md" "$RECOVERY_CONTRACT"
+python3 "$ROOT/tools/generate.py" >/dev/null
+
 python3 - "$MANIFEST" <<'PY'
 import json, sys
 path=sys.argv[1]

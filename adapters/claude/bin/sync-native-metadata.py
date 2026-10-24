@@ -62,6 +62,7 @@ def project_body(path: Path, identifier: str, spec: dict) -> str:
             f"Portable source: `capabilities/{identifier}.md`.\n\n"
             f"{references}"
         )
+        body = body.rstrip("\n") + "\n"
     return generated_frontmatter(identifier, spec) + body
 
 

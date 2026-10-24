@@ -15,4 +15,3 @@ metadata:
 # session-tidy
 
 Portable source: `capabilities/session-tidy.md`.
-

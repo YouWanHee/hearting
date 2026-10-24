@@ -47,6 +47,18 @@ Use the checklist as the sole orchestration tracker. Keep plan files immutable d
 - After a successful step, mark it `[x]`.
 - Continue until every processable step has a terminal checklist mark.
 
+Record each edit in the existing step log with its file path, old and new content, edit order, enough location or surrounding context to distinguish it, and a `Decision:` entry.
+
+## Failure Recovery
+
+For phase failure, total failure, cascading errors, failed debug verification, or an exhausted test retry, use the shared content-ownership recovery procedure in `capabilities/code-execute.md#portable-procedure`. Recovery covers only logged edits the failed work actually made within its assigned source scope. Compare the current file and context with the existing logs, then reverse only clearly attributable edits in reverse order. A matching string or changed path alone does not prove ownership.
+
+Preserve unrelated edits in the same file, earlier successful work, staged content, untracked files, and any ambiguous edit. Do not fall back to whole-file or whole-tree restore, `checkout`, `reset`, `stash`, `clean`, commit revert, or index rewrite. Reverse a created, deleted, or renamed path only when every affected path and surviving content is clearly attributable to the failed work.
+
+Keep the original command result and partial state; never replay a failed command automatically. Record what was recovered and what remains, why any edit was ambiguous, the observed index/worktree state, and checks skipped because they depend on unresolved edits. Do not claim complete recovery. Continue only with independent work; otherwise stop through the existing failure handoff.
+
+Registered owners and workers leave route closure to the runtime. Only the explicit direct/inline and legacy recovery paths in `core/WORKFLOW.md §0.5` are exceptions; they do not authorize a general manual close/finalize procedure.
+
 ## Assurance
 
 Use the intensity and selected stage graph as the assurance authority. A plan's

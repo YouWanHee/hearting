@@ -15,4 +15,3 @@ metadata:
 # artifact-projection-read
 
 Portable source: `capabilities/artifact-projection-read.md`.
-
