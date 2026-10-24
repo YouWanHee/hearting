@@ -90,5 +90,47 @@ class ReplayContract(unittest.TestCase):
         self.assertEqual(result["model_counts"], {"opencode": 1})
 
 
+class KeyedLedger(unittest.TestCase):
+    def test_a_pure_reorder_is_one_entry_and_no_field_cascade(self):
+        from tools.fleet.tests.parity_compare import diff_view_models_keyed
+        left = {"sessions": [{"tag": "a", "age": "1m"}, {"tag": "b", "age": "2m"}]}
+        right = {"sessions": [{"tag": "b", "age": "2m"}, {"tag": "a", "age": "1m"}]}
+        differences, _ = diff_view_models_keyed(left, right)
+        self.assertEqual([path for path, _l, _r in differences], ["/sessions/·order"])
+
+    def test_numbers_and_unknown_spellings_compare_equal(self):
+        from tools.fleet.tests.parity_compare import diff_view_models_keyed
+        left = {"sessions": [{"tag": "a", "n": 8, "pane": "·", "now": ""}]}
+        right = {"sessions": [{"tag": "a", "n": 8.0, "pane": None, "now": None}]}
+        self.assertEqual(diff_view_models_keyed(left, right)[0], [])
+
+    def test_route_aliases_resolve_through_the_stage_crosswalk(self):
+        from tools.fleet.tests.parity_compare import diff_view_models_keyed
+        stages = [{"name": "plan"}, {"name": "execute"}]
+        left = {"routes": [{"id": "row1", "session_tag": "09", "stages": stages, "age": "1m"}]}
+        right = {"routes": [{"id": "rt-1", "session_tag": "09", "stages": stages, "age": "2m"}]}
+        differences, crosswalk = diff_view_models_keyed(left, right)
+        self.assertEqual(crosswalk["row1"]["route_id"], "rt-1")
+        self.assertEqual([path for path, _l, _r in differences], ["/routes/row1/id", "/routes/row1/age"])
+
+    def test_class_two_is_refused_when_the_reference_text_has_a_source(self):
+        from tools.fleet.tests.parity_compare import build_live_ledger
+        rules = [{"id": "no-source", "match": "^/sessions/a/title$", "classification": 2, "reason": "none"}]
+        expected = {"sessions": [{"tag": "a", "title": "a distinctive reference title"}]}
+        actual = {"sessions": [{"tag": "a", "title": "other"}]}
+        sourced = build_live_ledger(expected, actual, capture={}, rules=rules,
+                                    texts={"state.json": "x a distinctive reference title y"})
+        self.assertEqual((sourced["differences"][0]["classification"], sourced["summary"]["class1_residue"]), (1, 1))
+        unsourced = build_live_ledger(expected, actual, capture={}, rules=rules, texts={"state.json": "nothing"})
+        self.assertEqual(unsourced["differences"][0]["classification"], 2)
+        self.assertEqual(unsourced["differences"][0]["production_value"], "·")
+        self.assertEqual(unsourced["summary"]["class1_residue"], 0)
+
+    def test_overlay_keeps_live_values_only_where_the_sides_are_equivalent(self):
+        from tools.fleet.tests.parity_compare import overlay_view_model
+        merged = overlay_view_model({"a": 8, "b": "hand", "c": ""}, {"a": 8.0, "b": "live", "c": None})
+        self.assertEqual((merged["a"], merged["b"], merged["c"]), (8.0, "hand", None))
+
+
 if __name__ == "__main__":
     unittest.main()

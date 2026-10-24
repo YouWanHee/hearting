@@ -17,7 +17,7 @@ from tools.fleet.tests import explorer_fixture as ef
 
 FIXTURE = Path(__file__).parent / "fixtures" / "explorer" / "view_model.json"
 HARNESSES = ("claude", "codex", "opencode")
-FREE_KEYED = frozenset(("dialogue.logs", "models.shown", "models.profile_map", "models.model_choices",
+FREE_KEYED = frozenset(("peer_edges.cards", "dialogue.logs", "models.shown", "models.profile_map", "models.model_choices",
                         "models.main_only", "models.pools", "models.context", "models.context_source",
                         "models.token_units", "models.effort_keys"))
 # Sections only the selection pump's reads can fill: without them they are omitted (empty), never invented.
@@ -65,6 +65,17 @@ def conform(live, samples, path, problems):
                     problems.append(f"system.{key}: invalid summary shape")
                 continue
             if key not in keys:
+                if path == "peer_edges" and key == "cards":          # PEERS field contract: owner-stage rows per card
+                    if not all(isinstance(card, dict) and all(
+                            isinstance(owner, dict) and set(owner) == {"state", "label", "stages"} and all(
+                                set(stage) == {"name", "state"} for stage in owner["stages"])
+                            for owner in card.get("owners", ())) for card in live[key].values()):
+                        problems.append("peer_edges.cards: invalid owner shape")
+                    continue
+                if path == "peer_edges" and key == "watches":        # PEERS field contract: steward watch footers
+                    if not all(isinstance(item, dict) and set(item) == {"repo", "text"} for item in live[key]):
+                        problems.append("peer_edges.watches: invalid shape")
+                    continue
                 if path == "system" and key == "gpu_processes":
                     for index, process in enumerate(live[key]):
                         if not isinstance(process, dict) or set(process) - {
@@ -118,12 +129,24 @@ class SectionShapes(unittest.TestCase):
         self.assertEqual(problems, [], section)
 
     def test_every_section_the_builder_fills_has_the_fixture_shape(self):
-        for section in ("hosts", "usage", "repos", "sessions", "routes", "nodes", "questions", "answered",
+        for section in ("hosts", "usage", "repos", "sessions", "routes", "nodes", "questions",
                         "seats", "generations", "cards", "dialogue", "attempts", "models",
                         "peer_nodes", "peer_edges", "compute", "memory", "events", "system"):
             with self.subTest(section=section):
                 self.assertTrue(self.live[section], f"live {section} is empty — the sample has no source")
                 self.check(section)
+
+    def test_answered_records_are_the_recorded_user_answers_and_have_the_fixture_shape(self):
+        from tools.fleet.refresh import LiveSnapshot
+        snapshot = LiveSnapshot(memory={"by_repo": {"demo-app": [
+            {"ts": "2026-10-23T12:00:00", "action": "decision-record", "type": "decision",
+             "snippet": "[결정] 이대로 시작할까요?"},
+            {"ts": "2026-10-23T11:00:00", "action": "add", "type": "decision", "snippet": "not an answer"}]}})
+        live = build_view_model(snapshot, now=time.time()).to_mapping()
+        self.assertEqual(live["answered"], [["demo-app", [["12:00", "이대로 시작할까요?"]]]])
+        problems = []
+        conform(live["answered"], [self.fixture["answered"]], "answered", problems)
+        self.assertEqual(problems, [])
 
     def test_sections_without_a_source_are_omitted_not_invented(self):
         for section in OMITTED:

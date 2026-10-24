@@ -126,8 +126,56 @@ def _reduce(state, event, frame=None):
             button = int(event.get("button", 0))
             offsets = dict(state.scroll)
             if phase == "release":
+                if state.drag and state.drag[0] == "tree":
+                    drag = state.drag
+                    if x >= 32 or y < 0 or y >= int(getattr(frame, "rows", 0)):
+                        return replace(state, drag=()), ()
+                    if drag[7] and drag[8]:
+                        ordering = event.get("ordering") or {}
+                        source = (drag[2] if drag[1] == "repo" else
+                                  getattr(ordering.get("tag_keys", {}), "get", lambda _key: None)(drag[2]))
+                        target = drag[6]
+                        if drag[1] == "session":
+                            target = (getattr(ordering.get("tag_keys", {}), "get", lambda _key: None)(target)
+                                      if target != "end" else None)
+                        repo = (drag[2] if drag[1] == "repo" else
+                                getattr(ordering.get("repo_by_tag", {}), "get", lambda _key: None)(drag[2]))
+                        if source and repo is not None:
+                            return replace(state, drag=()), (("reorder", drag[1], repo, source, target),)
+                    if not drag[8]:
+                        return reduce(replace(state, drag=()),
+                                      {"type": "click", "action": ("scope", drag[3])}, frame)
+                    return replace(state, drag=()), ()
                 return replace(state, drag=()), ()
             if event.get("motion") and state.drag:
+                if state.drag[0] == "tree":
+                    drag = state.drag
+                    moved = drag[8] or abs(y - drag[5]) >= 1 or abs(x - drag[4]) >= 2
+                    if not moved:
+                        return state, ()
+                    hit = next((item for item in getattr(frame, "hits", ())
+                                if item.y == y and item.x0 <= x < item.x1), None)
+                    action = hit.action if hit is not None else ()
+                    target_kind, target = None, None
+                    valid = False
+                    if action[:1] == ("scope",) and len(action) > 1:
+                        value = str(action[1])
+                        if value.startswith("repo:"):
+                            target_kind, target = "repo", value[5:]
+                        elif ":" not in value:
+                            target_kind, target = "session", value
+                    elif action[:1] == ("order-end",):
+                        target, valid = "end", True
+                    if target_kind == drag[1]:
+                        if target_kind == "repo":
+                            valid = target != drag[2]
+                        else:
+                            ordering = event.get("ordering") or {}
+                            repo_by_tag = ordering.get("repo_by_tag", {})
+                            source_repo = repo_by_tag.get(drag[2])
+                            valid = target != drag[2] and repo_by_tag.get(target) == source_repo
+                    return replace(state, drag=("tree", drag[1], drag[2], drag[3], drag[4],
+                                                 drag[5], target if valid else None, valid, moved)), ()
                 slot, maximum, origin_y, origin_offset, sign = state.drag
                 offsets[slot] = max(0, min(int(maximum), int(origin_offset) +
                                            (y - int(origin_y)) * int(sign)))
@@ -138,6 +186,17 @@ def _reduce(state, event, frame=None):
                         if item.y == y and item.x0 <= x < item.x1), None)
             if hit is None:
                 return state, ()
+            if hit.action[:1] == ("scope",) and len(hit.action) > 1:
+                scope = str(hit.action[1])
+                if scope.startswith("repo:"):
+                    return replace(state, drag=("tree", "repo", scope[5:], scope, x, y,
+                                                None, False, False)), ()
+                if ":" not in scope:
+                    ordering = event.get("ordering") or {}
+                    repo = ordering.get("repo_by_tag", {}).get(scope)
+                    if repo is not None:
+                        return replace(state, drag=("tree", "session", scope, scope, x, y,
+                                                    None, False, False)), ()
             if hit.action[:1] == ("scroll",):
                 _name, slot, maximum, *sign = hit.action
                 return replace(state, drag=(slot, int(maximum), y,
@@ -156,6 +215,8 @@ def _reduce(state, event, frame=None):
         view = tabs[(index + step) % len(tabs)]
         return replace(state, view=view, scope="-", opened="", title=view), ()
     if key in ("escape", "esc"):
+        if state.drag:
+            return replace(state, drag=()), ()
         if state.scope != "-":
             parent = event.get("parent")
             if parent is None:

@@ -52,7 +52,7 @@ def _dur(minutes):
         return f"{value}m"
     hours, minute = divmod(value, 60)
     if hours < 24:
-        return f"{hours}h {minute:02d}m"
+        return f"{hours}h {minute}m"
     days, hour = divmod(hours, 24)
     return f"{days}d {hour}h"
 
@@ -277,27 +277,53 @@ def _context_gauge(session):
 
 
 def _running(session):
+    """The ``running:`` line: the tool or child process the session is executing, with how long."""
     parts = []
     tool = _get(session, "exec_tool")
     if isinstance(tool, Mapping) and _text(tool.get("name")):
-        parts.append([tool["name"], "soft"])
+        parts.append(["⚙ " + tool["name"], "soft"])
+        etime = _num(tool.get("etime_s"))
+        if etime is not None:
+            parts.append([" · " + (_dur(etime / 60) or ""), _SEG_DIM])
     child = _get(session, "exec_child")
-    if isinstance(child, Mapping) and _text(child.get("comm")):
-        parts.append([child["comm"], _SEG_DIM])
+    if not parts and isinstance(child, Mapping) and _text(child.get("comm")):
+        parts.append(["⚙ " + child["comm"], "soft"])
+        etime = _num(child.get("leaf_etime_s", child.get("etime_s")))
+        if etime is not None:
+            parts.append([" · " + (_dur(etime / 60) or ""), _SEG_DIM])
     subagents = _get(session, "subagents")
     if subagents:
         parts.append([f"{len(subagents)} subagent", _SEG_DIM])
     return parts or None
 
 
+_ASK_WORDS = {"decision": "answer needed", "question": "answer needed", "answer": "answer needed",
+              "permission": "approval needed", "approval": "approval needed"}
+
+
 def _ask_kind(session):
+    """The words the row shows for a session waiting on a person (any kind of wait reads as a wait)."""
     state = _get(session, "interaction_state")
     kind = _text(_get(state, "kind")) if state is not None else None
-    return kind
+    return _ASK_WORDS.get(kind, kind)
+
+
+def _delivery_panes(snapshot):
+    """``{session id: pane}`` from the panes peer messages were delivered to (newest message wins)."""
+    records = _get(_get(snapshot, "peer_messages"), "records", default=()) or ()
+    found = {}
+    for message in sorted((m for m in records if isinstance(m, Mapping)),
+                          key=lambda m: _epoch_of(m.get("ts")) or 0.0):
+        target = message.get("to") or {}
+        sid, pane = _text(_get(target, "session_id")), _text(_get(target, "pane"))
+        if sid and pane:
+            found[sid] = pane
+    return found
 
 
 def _session_records(snapshot, now, resolver):
     used, rows, by_key = set(), [], {}
+    delivery_panes = _delivery_panes(snapshot)
     for session in _records(_get(snapshot, "sessions", default=())):
         if not _is_main(session):
             continue
@@ -323,7 +349,9 @@ def _session_records(snapshot, now, resolver):
             "ask": _ask_kind(session) if state == "blocked" else None,
             "age": age, "repo": repo, "repo_id": repo,
             "branch": _text(_get(session, "branch")),
-            "pane": _text(_get(session, "herdr_pane", "pane", "pane_id")),
+            "pane": _text(_get(session, "herdr_pane", "pane", "pane_id")) or
+                    _text(_get(_get(session, "session_identity_evidence"), "pane")) or
+                    delivery_panes.get(_text(_get(session, "session_id", "sid", "id")) or ""),
             "generation": None, "last_clear": None,
             "running": _running(session), "gpu": None, "pane_meta": None, "pane_lines": [],
         }
@@ -382,23 +410,48 @@ def _stage_state(node):
     return _NODE_STAGE.get(node.get("state"), "todo")
 
 
+def _stage_model(model):
+    """A stage's model as the route record names it (``opus`` stays ``opus``): ``[name, colour key]``."""
+    name = _text(model)
+    if name is None:
+        return None
+    try:
+        from .. import render
+        return [name, render._model_key(name)]
+    except Exception:
+        return [name, "fam_other"]
+
+
 def _stage_record(node):
     harness = _text(node.get("harness"))
     stage = {
         "name": _text(node.get("id")) or "·", "st": _stage_state(node),
         "el": _dur(node.get("elapsed_min")), "h": harness,
-        "m": _model_pair(node.get("model")), "e": _effort(node.get("effort")),
+        "m": _stage_model(node.get("model")), "e": _effort(node.get("effort")),
         "gate": bool(node.get("gate_passed")),
     }
     rounds = _num(node.get("route_attempt_round")) or _num(node.get("attempt_round"))
-    if rounds:
+    if rounds and rounds > 1:
         stage["r"] = int(rounds)
     if stage["st"] == "active" and node.get("unit") == "_kernel/resource":
         stage["host"] = None
     return stage
 
 
-def _worker_segments(node, resources):
+def _resource_run_label(run):
+    """``host:gpu · launcher`` of a resource run: where it runs and what it was launched with."""
+    placement = _get(run, "local_placement")
+    host = _text(_get(placement, "hostname")) if placement is not None else None
+    host = host.split(".", 1)[0] if host else None
+    devices = [d for d in (_get(placement, "requested_devices", default=()) or ()) if isinstance(d, str)]
+    gpu = next((d for d in devices if d.isdigit()), None)
+    command = _get(run, "command", default=()) or ()
+    script = os.path.basename(str(command[-1])) if command and isinstance(command[-1], str) else None
+    where = f"{host}:{gpu}" if host and gpu is not None else host
+    return " · ".join(part for part in (where, script) if part) or None
+
+
+def _worker_segments(node, resources, state_text=None):
     """``[label, harness segments, state segments]`` of the route's worker, or None."""
     if node is None:
         return None
@@ -408,7 +461,8 @@ def _worker_segments(node, resources):
     running = node.get("state") == "active"
     if unit == "_kernel/resource" and resources:
         run = resources[0]
-        name = _text(_get(run, "display_title")) or _text(_get(run, "route_node", "node", "run_id"))
+        name = _resource_run_label(run) or _text(_get(run, "display_title")) or \
+            _text(_get(run, "route_node", "node", "run_id"))
         host = [[name, "now_sub"]] if name else [["resource", _SEG_DIM]]
         state = [(f"running {elapsed}" if running and elapsed else "resource", _SEG_DIM)]
         return ["resource", host, [list(s) for s in state]]
@@ -423,7 +477,9 @@ def _worker_segments(node, resources):
             segs += [["·", _SEG_DIM], [effort, "eff_" + effort if effort in ("medium", "xhigh") else _SEG_DIM]]
         segs.append([")", _SEG_DIM])
     state = []
-    if elapsed:
+    if state_text:
+        state.append([state_text, _SEG_DIM])
+    elif elapsed:
         state.append([(f"running {elapsed}" if running else f"{elapsed} · worker ended"), _SEG_DIM])
     return ["worker", segs, state]
 
@@ -433,6 +489,128 @@ def _owner_job(jobs):
         if (_get(job, "depth") == 1 or _get(job, "dispatch_depth") == 1) and not _get(job, "route_node"):
             return job
     return jobs[0] if jobs else None
+
+
+def _route_stem(path):
+    text = _text(path)
+    return os.path.splitext(os.path.basename(text))[0] if text else None
+
+
+def _chain_nodes(session_index, rid):
+    """The owner session's route chain (oldest first) that holds route ``rid``."""
+    for info in session_index.values():
+        chain = _get(info["session"], "route_chain")
+        nodes = [n for n in (_get(chain, "nodes", default=()) or ()) if isinstance(n, Mapping)] \
+            if chain is not None else []
+        if any(_text(n.get("route_id")) == rid for n in nodes):
+            return nodes
+    return []
+
+
+def _chain_position(nodes, rid):
+    return next((i for i, n in enumerate(nodes) if _text(n.get("route_id")) == rid), None)
+
+
+def _chain_title(nodes, rid):
+    """The route's name: its own recorded outcome name, else that of the frame that opened it
+    (the nearest earlier ``route-frame`` node), else the nearest earlier named node."""
+    index = _chain_position(nodes, rid)
+    if index is None:
+        return None
+    own = _text(_get(nodes[index].get("result"), "name"))
+    if own:
+        return own
+    before = nodes[:index]
+    for node in reversed(before):
+        if node.get("capability") == "route-frame" and _text(_get(node.get("result"), "name")):
+            return node["result"]["name"]
+    for node in reversed(before):
+        if _text(_get(node.get("result"), "name")):
+            return node["result"]["name"]
+    return None
+
+
+def _chain_leg_name(node):
+    capability = _text(node.get("capability")) or ""
+    return "frame" if capability == "route-frame" else _short_capability(capability) or "·"
+
+
+def _chain_legs(nodes, rid, own, status, progress):
+    """``[[leg, status, progress], ...]``: the frame that opened the route, the latest finished leg
+    of every other capability since it, and the route's own leg."""
+    index = _chain_position(nodes, rid)
+    if index is None:
+        return [[own, status, progress]] if own else []
+    before = nodes[:index]
+    frame = next((i for i in range(len(before) - 1, -1, -1)
+                  if before[i].get("capability") == "route-frame"), None)
+    legs = []
+    if frame is not None:
+        legs.append(["frame", "done" if before[frame].get("state") == "done" else "active", None])
+    latest = {}
+    for node in before[(frame + 1 if frame is not None else 0):]:
+        name = _chain_leg_name(node)
+        if name in ("frame", own):
+            continue
+        latest.pop(name, None)
+        latest[name] = node
+    for name, node in latest.items():
+        legs.append([name, "done" if node.get("state") == "done" else "active", None])
+    if own:
+        legs.append([own, status, progress])
+    return legs
+
+
+def _clock_ago(now, minutes):
+    """The clock time ``minutes`` before ``now`` (a route record counts minutes since the event)."""
+    value = _num(minutes)
+    if value is None or now is None:
+        return None
+    return _clock(now - value * 60)
+
+
+def _route_title_line(rid, owner, resume):
+    harness = _text(owner.get("harness"))
+    parts = [[f"  {rid[:11]} · owner ", _SEG_DIM]]
+    if harness:
+        parts.append([harness, "hb_" + harness])
+        model, effort = owner.get("model"), owner.get("effort")
+        if model:
+            parts += [[" (", _SEG_DIM], [model[0], model[1]], ["·", _SEG_DIM],
+                      [effort or "", "eff_" + effort if effort in ("medium", "xhigh") else _SEG_DIM],
+                      [")", _SEG_DIM]]
+    if resume:
+        parts += [["  resumes from ", _SEG_DIM], [resume, "lvl_y"]]
+    return parts
+
+
+def _node_detail(node, now):
+    """One stage row of the route page, from the route record's node."""
+    state = _stage_state(node)
+    harness = _text(node.get("harness"))
+    model = _text(node.get("model"))
+    effort = _effort(node.get("effort"))
+    who = [harness, "·".join(part for part in (model, effort) if part)] if harness else None
+    if state == "done":
+        verdict = "PASS" if node.get("gate_passed") else "done"
+    else:
+        verdict = "worker ended" if node.get("note") == "dead-worker-blocked" else \
+            {"failed": "failed", "active": "running", "todo": "pending"}[state]
+    deps = [str(d) for d in (node.get("depends_on") or ())]
+    clock = _clock_ago(now, node.get("elapsed_min")) if state != "todo" else None
+    if clock:
+        when = {"done": "done ", "failed": "ended ", "active": "since "}[state] + clock
+    else:
+        when = "after " + ", ".join(deps) if deps and state == "todo" else "·"
+    rounds = _num(node.get("route_attempt_round")) or _num(node.get("attempt_round"))
+    return {
+        "n": _text(node.get("id")) or "·", "st": state, "verdict": verdict, "who": who,
+        "when": when, "rounds": [],
+        "rounds_note": f"R{int(rounds)} · 앞 {int(rounds) - 1}회는 이 기록 밖" if rounds and rounds > 1 else "",
+        "unit": " · ".join(p for p in (_text(node.get("unit")), _text(node.get("model_profile"))) if p) or "·",
+        "gate": _text(node.get("gate")),
+        "out": " · ".join(str(p) for p in (node.get("write_scope") or ())) or "·", "says": "",
+    }
 
 
 def _route_records(snapshot, session_rows, session_index, resolver, now):
@@ -478,7 +656,10 @@ def _route_records(snapshot, session_rows, session_index, resolver, now):
         cwd = _text(view.get("cwd")) or _text(record.get("cwd")) or _text(_get(owner, "cwd"))
         repo = (session_row or {}).get("repo") or _repo_of(resolver, cwd)
         owner_state = (session_row or {}).get("state")
-        if active is not None:
+        owner_live = _text(_get(owner, "liveness")) if owner is not None else None
+        if owner_live in ("working", "idle", "blocked", "dead", "done"):
+            state = owner_live                    # the route is as alive as the attempt that owns it
+        elif active is not None:
             state = "working"
         elif total and done == total:
             state = "done"
@@ -490,97 +671,106 @@ def _route_records(snapshot, session_rows, session_index, resolver, now):
             state = "idle"
         shown_node = active or next((n for n in view_nodes if n.get("state") != "done"), None) \
             or (view_nodes[-1] if view_nodes else None)
-        run_children = [r for r in resources if _text(_get(r, "route_id")) == rid
+        run_children = [r for r in resources if rid in (_text(_get(r, "route_id")), _route_stem(_get(r, "route")))
                         and _get(r, "liveness") == "working"]
-        resource_node = shown_node is not None and shown_node.get("unit") == "_kernel/resource"
         elapsed_values = [v for v in (_num(_get(job, "elapsed_min")) for job in jobs) if v is not None]
         age = _dur(max(elapsed_values)) if elapsed_values else None
         topology = _text(view.get("execution_topology")) or _text(record.get("execution_topology"))
+        resource_node = shown_node is not None and shown_node.get("unit") == "_kernel/resource"
         shape = topology
         if topology == "staged" and resource_node:
             shape = "staged+resource"
-        leg_status = "failed" if failed and active is None else "done" if state == "done" else "active"
+        leg_status = "failed" if (failed and active is None) or state == "dead" else \
+            "done" if state == "done" or (total and done == total) else "active"
         progress = f"{done}/{total}" if total else None
-        worker = _worker_segments(shown_node, run_children)
-        owner_model = _model_pair(_get(owner, "model") if owner is not None else None) or \
+        worker_node, state_text = shown_node, None
+        if state == "dead" and shown_node is not None and _stage_state(shown_node) == "todo":
+            earlier = [n for n in view_nodes if _stage_state(n) in ("done", "failed")]
+            if earlier:                            # the owner ended between stages: its last worker
+                worker_node = earlier[-1]
+                state_text = f"{_dur(worker_node.get('elapsed_min')) or ''} ⊸ · next " \
+                             f"{shown_node.get('id')} · owner ended".strip()
+        worker = _worker_segments(worker_node, run_children, state_text)
+        dead = state in ("dead", "stale")
+        owner_model = None if dead else (
+            _model_pair(_get(owner, "resolved_model", "model")) if owner is not None else None) or \
             (session_row or {}).get("model")
-        owner_harness = _text(_get(owner, "harness")) if owner is not None else None
-        owner_harness = (session_row or {}).get("harness") or owner_harness
+        owner_harness = (_text(_get(owner, "harness")) if owner is not None else None) or \
+            (session_row or {}).get("harness")
+        owner_effort = None if dead else (
+            _effort(_get(owner, "effort")) if owner is not None else None) or (session_row or {}).get("effort")
         worktree = None
         if cwd and ("-wt" in cwd or "/.worktrees/" in cwd):
             worktree = os.path.basename(cwd.rstrip("/")) or None
         result = _get(_get(owner, "work_projection"), "result") if owner is not None else None
         if result is None:
             result = _get(record, "result")
+        chain_nodes = _chain_nodes(session_index, rid)
         if result is None:
-            for session in slot["sessions"]:
-                chain = _get(session, "route_chain")
-                chain_nodes = _get(chain, "nodes", default=()) if chain is not None else ()
-                match = next((node for node in chain_nodes if _get(node, "route_id") == rid), None)
-                if match is not None and _get(match, "result") is not None:
-                    result = _get(match, "result")
-                    break
-        title = _text(_get(result, "name")) or _text(view.get("slug")) or _text(record.get("slug")) or \
+            match = next((node for node in chain_nodes if _get(node, "route_id") == rid), None)
+            if match is not None and _get(match, "result") is not None:
+                result = _get(match, "result")
+        title = _text(_get(result, "name")) or _chain_title(chain_nodes, rid) or \
+            _text(view.get("slug")) or _text(record.get("slug")) or \
             (_text(_get(owner, "slug")) if owner is not None else None)
         if (owner is None or not jobs) and (session_row or {}).get("title"):
             title = title or session_row["title"]
-        worker_stage = _text(shown_node.get("id")) if shown_node else None
-        worker_unit = _text(shown_node.get("unit")) if shown_node else None
+        worker_stage = _text(worker_node.get("id")) if worker_node else None
+        worker_unit = _text(worker_node.get("unit")) if worker_node else None
         context = None
         if owner is not None:
             tokens = _num(_get(owner, "active_context_tokens"))
             window = _num(_get(owner, "context_window_tokens"))
+            if window is None and session_row is not None and session_row.get("window") and \
+                    _text(_get(owner, "harness")) == session_row.get("harness"):
+                window = int(session_row["window"] * 1_000_000)
             if tokens is not None and window:
                 context = [int(tokens), int(window)]
-        routes.append({
+        resume = None
+        if state == "dead":
+            resume = next((n.get("id") for n in view_nodes if _stage_state(n) == "failed"), None) or \
+                next((n.get("id") for n in view_nodes if _stage_state(n) == "todo"), None)
+        legs = _chain_legs(chain_nodes, rid, short, leg_status, progress) if chain_nodes else \
+            ([[short or "·", leg_status, progress]] if short else [])
+        mode = _text(view.get("capability_mode")) or _text(record.get("capability_mode"))
+        route = {
             "id": rid, "repo": repo, "session_tag": owner_tag, "title": title, "state": state,
-            "worker": worker, "age": age,
-            "legs": [[short or "·", leg_status, progress]] if short else [],
-            "stages": stages, "resume": None, "activity": "running" if active is not None else "ended",
+            "worker": worker, "age": age, "legs": legs,
+            "stages": stages, "resume": resume, "activity": "running" if active is not None or state == "working" else "ended",
             "loops": None, "worktree": worktree, "tree_label": short,
-            "harness": owner_harness, "model": owner_model,
-            "effort": (session_row or {}).get("effort") or (_effort(_get(owner, "effort")) if owner is not None else None),
-            "mode": _text(view.get("capability_mode")) or _text(record.get("capability_mode")),
+            "harness": owner_harness, "model": owner_model, "effort": owner_effort,
+            "mode": mode,
             "intensity": _text(view.get("effective_intensity")) or _text(record.get("effective_intensity")),
-            "profile": _text(_get(owner, "profile")) if owner is not None else None,
+            "profile": _text(_get(owner, "model_profile", "profile")) if owner is not None else None,
             "capability": short, "shape": shape, "past_from": None,
             "worker_stage": worker_stage or "·", "worker_unit": worker_unit,
             "worker_stage_key": None, "worker_step_key": None,
             "owner_context": context, "subworker": None,
-        })
-        nodes[rid] = _node_groups(view_nodes, short, leg_status, progress)
+        }
+        routes.append(route)
+        nodes[rid] = _node_groups(view_nodes, route, rid, legs, now, done, leg_status)
     return routes, nodes
 
 
-def _node_groups(view_nodes, short, leg_status, progress):
+def _node_groups(view_nodes, route, rid, legs, now, done, leg_status):
     """One leg group holding the route's stages: the detail the route page prints per stage."""
     if not view_nodes:
         return []
-    detail = []
-    for node in view_nodes:
-        state = _stage_state(node)
-        harness = _text(node.get("harness"))
-        model = _model_pair(node.get("model"))
-        effort = _effort(node.get("effort"))
-        who = None
-        if harness:
-            who = [harness, (model[0] if model else "") + (("·" + effort) if effort and model else "")]
-        rounds = []
-        if state != "todo":
-            rounds.append(["✓" if state == "done" else "✕" if state == "failed" else "●",
-                           _dur(node.get("elapsed_min")) or "", ""])
-        detail.append({
-            "n": _text(node.get("id")) or "·", "st": state,
-            "verdict": "PASS" if node.get("gate_passed") else state if state != "todo" else "pending",
-            "unit": _text(node.get("unit")) or "·",
-            "who": who, "when": _dur(node.get("elapsed_min")) or "·",
-            "rounds": rounds, "gate": _text(node.get("gate")), "out": "·", "says": "",
-        })
-    label = f"leg 1 · {short}" if short else "leg 1"
+    detail = [_node_detail(node, now) for node in view_nodes]
+    short, mode = route.get("capability"), route.get("mode")
+    name = f"leg {len(legs) or 1} · {short or '·'}{' ' + mode if mode else ''}"
+    owner_line = [["owner  ", "dim"]]
+    if route.get("harness"):
+        owner_line.append([route["harness"], "hb_" + route["harness"]])
+    model = route.get("model")
+    if model:
+        owner_line.append([f" {model[0]}·{route['effort']}" if route.get("effort") else f" {model[0]}", "soft"])
+    if route.get("age"):
+        owner_line.append([" · " + route["age"], "dim"])
     return [{
-        "kind": "leg", "n": label, "st": leg_status, "verdict": progress or leg_status,
-        "lines": [[[label, "dim"]]], "detail": detail,
-        "title": [[label, "head"]], "loops": [],
+        "kind": "leg", "n": name, "st": leg_status, "verdict": f"{done}/{len(view_nodes)}",
+        "lines": [owner_line], "detail": detail,
+        "title": [[name, "head"]] + _route_title_line(rid, route, route.get("resume")), "loops": [],
     }]
 
 
@@ -675,6 +865,152 @@ def _question_records(session_rows, session_index, now):
     return questions
 
 
+_RECEIPTS = frozenset({"herdr steer received", "Claude native context received"})
+_HANDOVER_RECEIPT = re.compile(r"old_session=([0-9a-f-]+).*?new_session=([0-9a-f-]+)")
+
+
+def _handover_links(snapshot, session_index, seat_rows, now):
+    """``gen N → [tag]`` handover links: a clear that continued the work in a live session."""
+    observations = _get(snapshot, "observations", default={}) or {}
+    joined = _get(observations, "replay_sources", default={}) or {}
+    records = _get(_get(joined, "peer_messages", default={}) or {}, "records", default=()) or ()
+    tag_by_sid = {known: tag for tag, info in session_index.items() for known in info["ids"]}
+    generation = {seat[0]: seat[2] for seat in seat_rows}
+    links = []
+    for message in records:
+        if not isinstance(message, Mapping) or not (_text(message.get("summary")) or "").startswith(
+                "[notice] action=continue"):
+            continue
+        receipt = _text(_get(message.get("delivery"), "receipt")) or ""
+        found = _HANDOVER_RECEIPT.search(receipt)
+        tag = tag_by_sid.get(found.group(2)) if found else None
+        if not tag:
+            continue
+        count = generation.get(tag)
+        source = f"gen {count - 1}" if count else found.group(1)[:8]
+        words = (_text(message.get("summary")) or "").split(" true ", 1)[-1].strip()
+        links.append((_epoch_of(message.get("ts")) or 0.0, [
+            source, [tag, _text(_get(session_index[tag]["session"], "harness")) or "claude"], "handover",
+            _iso_age(message.get("ts"), now),
+            f"clear → {words} ({found.group(1)[:8]} → {found.group(2)[:8]})".replace("  ", " ")]))
+    newest = {}
+    for stamp, link in links:
+        key = link[1][0]
+        if key not in newest or stamp > newest[key][0]:
+            newest[key] = (stamp, link)
+    return list(newest.values())
+
+
+_JOB_STATE = {"done": "done", "working": "working", "idle": "idle", "dead": "dead", "blocked": "blocked"}
+
+
+def _routeless_jobs(snapshot, session_index):
+    """Dispatch jobs outside any route (a session-tidy run) with the live session that called them."""
+    tag_by_sid = {known: tag for tag, info in session_index.items() for known in info["ids"]}
+    found = []
+    for job in _records(_get(snapshot, "jobs", default=())):
+        if _text(_get(_get(job, "work_projection"), "route_id")) or _text(_get(job, "route_id", "owner_route_id")):
+            continue
+        tag = tag_by_sid.get(_text(_get(job, "caller_sid", "parent_sid")))
+        label = _text(_get(job, "capability_owner", "key"))
+        if tag and label and _get(job, "afterglow", "liveness") is not None:
+            found.append((tag, label, job))
+    return found
+
+
+def _job_events(snapshot, session_index, session_rows, now):
+    """Feed records for finished route-less jobs: ``[time, tag, repo, 'label ✓', 'done', summary]``."""
+    repo_of = {row["tag"]: row["repo"] for row in session_rows}
+    events = []
+    for tag, label, job in _routeless_jobs(snapshot, session_index):
+        elapsed = _num(_get(job, "elapsed_min"))
+        if _get(job, "liveness") == "done" and elapsed is not None:
+            stamp = now - elapsed * 60
+            events.append((stamp, [_clock(stamp), tag, repo_of.get(tag), f"{label} ✓", "done",
+                                   _text(_get(job, "summary")) or _text(_get(job, "title")) or ""]))
+    return events
+
+
+def _age_minutes(text):
+    """Minutes in a duration text such as ``1h 51m`` or ``1d 1h``; unknown ages sort last."""
+    if not isinstance(text, str):
+        return float("inf")
+    parts = {unit: int(value) for value, unit in re.findall(r"(\d+)([dhm])", text)}
+    return parts.get("d", 0) * 1440 + parts.get("h", 0) * 60 + parts.get("m", 0) if parts else float("inf")
+
+
+def _clear_times(snapshot, session_index):
+    """``{tag: epoch}`` of the newest clear that started each session, from handover records and the
+    clear/continue notices peers exchanged (for sessions whose seat has no card history)."""
+    observations = _get(snapshot, "observations", default={}) or {}
+    joined = _get(observations, "replay_sources", default={}) or {}
+    tag_by_sid8 = {str(known)[:8]: tag for tag, info in session_index.items() for known in info["ids"]}
+    found = {}
+
+    def note(sid, stamp):
+        tag = tag_by_sid8.get(str(sid)[:8]) if sid else None
+        if tag and stamp and stamp > found.get(tag, 0):
+            found[tag] = stamp
+    for handover in _get(joined, "history_handovers", default=()) or ():
+        if isinstance(handover, Mapping):
+            note(handover.get("to"), _num(handover.get("ts")) or _epoch_of(handover.get("ts")))
+    records = _get(_get(joined, "peer_messages", default={}) or {}, "records", default=()) or ()
+    for message in records:
+        if isinstance(message, Mapping) and (_text(message.get("summary")) or "").startswith("[notice] action=continue"):
+            match = _HANDOVER_RECEIPT.search(_text(_get(message.get("delivery"), "receipt")) or "")
+            if match:
+                note(match.group(2), _epoch_of(message.get("ts")))
+    return found
+
+
+def _finish_peers(nodes, edges, session_rows, session_index, routes, handovers, jobs=()):
+    """Add what needs the seats and routes: handover links, owner-stage rows per card, steward watches."""
+    links = list(edges["links"]) if edges else []
+    links += [link for _stamp, link in handovers]
+    if not links:
+        return nodes, edges
+    edges = dict(edges or {"cross": [], "side_lanes": []}, links=links)
+    repo_of = {row["tag"]: row["repo"] for row in session_rows}
+    linked = {end[0] for link in links for end in link[:2] if isinstance(end, list) and end}
+    present = {tag for _repo, columns in nodes for column in columns for tag in column}
+    nodes = [[repo, [list(column) for column in columns]] for repo, columns in nodes]
+    for row in session_rows:
+        if row["tag"] in linked and row["tag"] not in present:
+            match = next((entry for entry in nodes if entry[0] == row["repo"]), None)
+            if match is None:
+                match = [row["repo"], []]
+                nodes.append(match)
+            match[1].append([row["tag"]])
+    rank = {row["repo"]: index for index, row in enumerate(session_rows)}
+    nodes.sort(key=lambda entry: rank.get(entry[0], len(rank)))
+    cards = {}
+    for route in sorted(routes, key=lambda item: _age_minutes(item.get("age"))):      # youngest route first
+        tag = route.get("session_tag")
+        if tag in linked:
+            cards.setdefault(tag, {"owners": []})["owners"].append({
+                "state": route.get("state"), "label": route.get("tree_label") or route.get("capability") or "·",
+                "stages": [{"name": stage["name"], "state": stage["st"]} for stage in route.get("stages") or ()]})
+    for tag, label, job in jobs:
+        if tag in linked:
+            state = _JOB_STATE.get(_get(job, "liveness"), "idle")
+            cards.setdefault(tag, {"owners": []})["owners"].append({
+                "state": state, "label": label,
+                "stages": [{"name": _text(_get(job, "key")) or label,
+                            "state": "done" if state == "done" else "active" if state == "working" else "todo"}]})
+    if cards:
+        edges["cards"] = cards
+    watches = []
+    for link in links:
+        if link[2].startswith("watch") and isinstance(link[0], list):
+            count = re.match(r"(\d+) sessions", str(link[1]))
+            watches.append({"repo": repo_of.get(link[0][0]),
+                            "text": f"watch {int(count.group(1)) if count else 1}" +
+                                    (" · ended" if str(link[4]).endswith("ended)") or link[4] == "ended" else "")})
+    if watches:
+        edges["watches"] = watches
+    return nodes, edges
+
+
 def _peer_records(session_rows, session_index, now, snapshot=None):
     tag_by_sid = {known: tag for tag, info in session_index.items() for known in info["ids"]}
     observations = _get(snapshot, "observations", default={}) or {}
@@ -690,7 +1026,7 @@ def _peer_records(session_rows, session_index, now, snapshot=None):
         tag = tag_by_sid.get(sid)
         if tag:
             return [tag, harness_of.get(tag) or harness]
-        return [str(sid), harness] if _text(sid) and _text(harness) else None
+        return str(sid)[:8] if _text(sid) and _text(harness) else None      # an ended session: its short id
 
     for row in session_rows:
         session = session_index[row["tag"]]["session"]
@@ -711,29 +1047,32 @@ def _peer_records(session_rows, session_index, now, snapshot=None):
                 add([me, other, sent["kind"], f"{age} ago" if age else None, ""],
                     _epoch_of(sent.get("ts", sent.get("at"))) or
                     -float(_num(sent.get("age_min")) or 0))
-        targets = list(_get(session, "steward_targets") or ())
+        targets = [t for t in (_get(session, "steward_targets") or ()) if isinstance(t, Mapping) or hasattr(t, "get")]
         if targets:
-            resolved, ended = [], False
+            names, ended, stamps = [], True, []
             for target in targets:
-                other = endpoint(_get(target, "session_id"), _get(target, "harness"))
-                if other:
-                    resolved.append(other)
-                    if _get(target, "session_id") not in tag_by_sid:
-                        ended = True
-                else:
-                    ended = ended or _get(target, "state", "liveness") in ("ended", "dead", "stale")
-                    resolved.append(_text(_get(target, "name")) or "·")
-            for target in resolved:
-                if isinstance(target, list) and target:
-                    linked.add(target[0])
-            label = " ".join(f"[{target[0]}]" if isinstance(target, list) and target
-                             else str(target) for target in resolved)
-            add([me, label or "·", "watch ⚑" + (" · ended" if ended else ""), None, ""], 0)
+                sid = _text(_get(target, "session_id"))
+                names.append(_text(_get(target, "name")) or (sid[:8] if sid else "·"))
+                if sid in tag_by_sid:
+                    ended = False
+                    linked.add(tag_by_sid[sid])
+                stamp = _epoch_of(_get(target, "start_ts", "ts"))
+                if stamp:
+                    stamps.append(stamp)
+            if len(names) > 1:
+                note = " · ".join(names[:2]) + (" · …" if len(names) > 2 else "") + (" (ended)" if ended else "")
+            else:
+                note = "ended" if ended else ""
+            when = datetime.datetime.fromtimestamp(min(stamps)).strftime("%m-%d") if stamps else None
+            add([me, f"{len(names)} sessions" if len(names) > 1 else names[0], "watch ⚑", when, note], 0)
     peer_messages = _get(joined, "peer_messages", default={}) or {}
     for message in _get(peer_messages, "records", default=()) or ():
         if not isinstance(message, Mapping):
             continue
         source, target = message.get("from") or {}, message.get("to") or {}
+        summary = _text(message.get("summary")) or ""
+        if summary in _RECEIPTS or summary.startswith("[notice] action="):
+            continue                          # delivery receipts and clear/continue notices are not conversations
         src = endpoint(_get(source, "session_id"), _get(source, "harness"))
         dst = endpoint(_get(target, "session_id"), _get(target, "harness"))
         if src and dst:
@@ -748,29 +1087,53 @@ def _peer_records(session_rows, session_index, now, snapshot=None):
         if src and dst:
             add([src, dst, "handover", _iso_age(handover.get("ts", handover.get("at")), now), ""],
                 _epoch_of(handover.get("ts", handover.get("at"))))
-    # Keep the newest observation for each directed endpoint pair and kind.
+    # Keep the newest observation for each directed endpoint pair and kind; a link needs a live
+    # session at one end (two ended sessions talking is history, not the fleet) and two different ends.
+    def live_end(end):
+        return end[0] if isinstance(end, list) and end and end[0] in harness_of else None
     newest_by_pair = {}
     for stamp, link in candidates:
+        if not (live_end(link[0]) or live_end(link[1])) or link[0] == link[1]:
+            continue
         key = (repr(link[0]), repr(link[1]))
         if key not in newest_by_pair or stamp > newest_by_pair[key][0]:
             newest_by_pair[key] = (stamp, link)
-    unique = [pair[1] for pair in newest_by_pair.values()]
-    unique.sort(key=lambda link: next((stamp for stamp, candidate in candidates if candidate is link), 0),
-                reverse=True)
+    ranked = sorted(newest_by_pair.values(), key=lambda item: -item[0])
+    unique = [pair[1] for pair in ranked]
+    stamp_of = {id(pair[1]): pair[0] for pair in ranked}
     for link in unique:
         for end in link[:2]:
-            if isinstance(end, list) and end:
+            if live_end(end):
                 linked.add(end[0])
-    nodes = []
-    by_repo = {}
-    for row in session_rows:
-        if row["tag"] in linked:
-            by_repo.setdefault(row["repo"], []).append([row["tag"]])
-    for repo, columns in by_repo.items():
-        nodes.append([repo, columns])
     if not unique:
         return [], None                       # no peer record: the section is omitted
-    return nodes, {"links": unique, "cross": [], "side_lanes": []}
+    repo_of = {row["tag"]: row["repo"] for row in session_rows}
+    sent = {}                                  # (from, to) -> newest steer, live ends only
+    for link in unique:
+        if link[2] == "steer" and live_end(link[0]) and live_end(link[1]):
+            sent.setdefault((link[0][0], link[1][0]), link)
+    side_lanes, paired = [], set()
+    for (a, b) in sent:
+        if (b, a) in sent and repo_of.get(a) == repo_of.get(b) and a not in paired and b not in paired:
+            side_lanes.append(sorted((a, b)))             # the lower tag sits below the higher one
+            paired.update((a, b))
+    cross = next(([a, b, re.sub(r" ago$", "", link[3] or "")] for (a, b), link in sent.items()
+                  if repo_of.get(a) != repo_of.get(b) and link[3]), None)
+    by_repo = {}
+    for row in session_rows:
+        by_repo.setdefault(row["repo"], []).append(row["tag"])
+    nodes = []
+    for repo, tags in by_repo.items():
+        columns, used = [], set()
+        for tag in tags:
+            if tag in used:
+                continue
+            pair = next((lane for lane in side_lanes if tag in lane), None)
+            column = list(pair) if pair else [tag]
+            used.update(column)
+            columns.append(column)
+        nodes.append([repo, columns])
+    return nodes, {"links": unique, "cross": [cross] if cross else [], "side_lanes": side_lanes}
 
 
 # -- hosts / compute / usage / memory / system / events ------------------------------------
@@ -784,6 +1147,27 @@ def _host_blocks(snapshot):
 def _gib(mib):
     value = _num(mib)
     return None if value is None else round(value / 1024, 1)
+
+
+def _gpu_label(name):
+    """The short card name the explorer draws: no vendor, product-line or edition words."""
+    text = _text(name)
+    if text is None:
+        return None
+    for word in ("NVIDIA ", "GeForce ", " Generation"):
+        text = text.replace(word, "")
+    return text.strip() or None
+
+
+def _gpu_key(name):
+    """The colour class of a card name (``gpu_ada``, ``gpu_5090``...); None for a card with none."""
+    text = (_text(name) or "").lower()
+    if "ada" in text.split():
+        return "gpu_ada"
+    found = re.search(r"\b(5090|4090)\b", text)
+    if found:
+        return "gpu_" + found.group(1)
+    return "gpu_legacy" if re.search(r"\b(gtx|titan)\b", text) else None
 
 
 def _host_records(snapshot, session_index):
@@ -825,16 +1209,77 @@ def _host_records(snapshot, session_index):
             users = []
             for process in processes:
                 owner = process.get("session_owner")
-                tag = owner_tag.get((_get(owner, "harness"), _get(owner, "session_id"))) if owner else None
+                tag = owner_tag.get((_get(owner, "harness"),
+                                     _get(owner, "session_id", "id"))) if owner else None
                 if tag and tag not in users:
                     users.append(tag)
             used, total = _gib(gpu.get("memory_used_mib")), _gib(gpu.get("memory_total_mib"))
             util = _num(gpu.get("utilization_gpu_pct"))
             gpus.append([_num(gpu.get("index")), "working" if processes else "idle",
-                         _text(gpu.get("name")), None,
+                         _gpu_label(gpu.get("name")), _gpu_key(gpu.get("name")),
                          None if util is None else int(util), used, total, users])
         compute.append([name, base, cpu, mem, swap, gpus])
     return labels, compute
+
+
+def _dur_coarse(minutes):
+    """A process age at the grain the GPU rows use: ``42m``, ``19h``, ``1d 6h``."""
+    text = _dur(minutes)
+    if text and "h " in text and "d" not in text:
+        return text.split(" ", 1)[0]
+    return text
+
+
+def _session_gpu_lines(snapshot, session_index):
+    """``{tag: [segment rows]}``: one row per host:gpu the session's processes occupy.
+
+    A plain process row reads ``● host:gpu  card  used GB  process[ ×N]  · age``; a process owned
+    by a registered job reads ``● host:gpu  card  util%  process GB  job label``.
+    """
+    hosts = sorted((h for h in _host_blocks(snapshot) or [] if isinstance(h, Mapping)),
+                   key=lambda h: _text(h.get("host")) or "")
+    owner_tag = {}
+    for tag, info in session_index.items():
+        for known in info["ids"]:
+            owner_tag[(_get(info["session"], "harness"), known)] = tag
+    lines = {}
+    for host in hosts:
+        if not isinstance(host, Mapping) or host.get("reachable") is False:
+            continue
+        name = _text(host.get("host")) or "·"
+        for gpu in host.get("gpus") or ():
+            if not isinstance(gpu, Mapping):
+                continue
+            by_tag = {}
+            for process in gpu.get("processes") or ():
+                if not isinstance(process, Mapping):
+                    continue
+                owner = process.get("session_owner")
+                tag = owner_tag.get((_get(owner, "harness"), _get(owner, "session_id", "id"))) if owner else None
+                if tag:
+                    by_tag.setdefault(tag, []).append(process)
+            for tag, processes in by_tag.items():
+                head = [["●", "spin"], [f" {name}:{_num(gpu.get('index'))}", "host"],
+                        ["  " + (_gpu_label(gpu.get("name")) or "·"), "gpu_ada"]]
+                job = next((p for p in processes if _get(p.get("owner"), "kind") == "job"), None)
+                if job is not None:
+                    util = _num(gpu.get("utilization_gpu_pct"))
+                    used = sum(_num(p.get("used_memory_mib")) or 0 for p in processes)
+                    label = _text(_get(job.get("owner"), "label")) or "·"
+                    label = label.split(":", 1)[1] if label.startswith("job:") else label
+                    row = head + ([[f"  {int(util)}%", "soft"]] if util is not None else []) + \
+                        [[f"  {_gib(used)} GB", _SEG_DIM], ["  " + label, "now_sub"]]
+                else:
+                    used = _gib(sum(_num(p.get("used_memory_mib")) or 0 for p in processes))
+                    ages = [_dur_coarse((_num(p.get("elapsed_s")) or 0) / 60) for p in processes
+                            if _num(p.get("elapsed_s")) is not None]
+                    comm = _text(processes[0].get("process_name")) or "·"
+                    row = head + [[f"  {used} GB", "soft"],
+                                  ["  " + comm + (f" ×{len(processes)}" if len(processes) > 1 else ""), _SEG_DIM]]
+                    if ages:
+                        row.append(["  · " + " · ".join(ages), _SEG_DIM])
+                lines.setdefault(tag, []).append(row)
+    return lines
 
 
 _UNIT = {"5h": "5h", "7d": "week", "wk": "week", "mo": "month"}
@@ -868,7 +1313,7 @@ def _usage_records(snapshot, session_rows, now):
         _mt, r5, r7, rms, resets, windows = best[harness]
         raw = list(windows) if windows else [("5h", r5, resets[0]), ("week", r7, resets[1])]
         raw += [(label, value, None) for label, value in (rms or ())]
-        shown = []
+        shown = [None, None, None]            # slots: 5h, week, then the model or monthly window
         for item in raw:
             label, pct, reset = (tuple(item) + (None, None))[:3]
             if _num(pct) is None:
@@ -876,8 +1321,11 @@ def _usage_records(snapshot, session_rows, now):
             reset_text = None
             if _num(reset) is not None and now is not None:
                 reset_text = _dur(max(0, (reset - now) / 60))
-            shown.append([_UNIT.get(str(label), str(label)), int(pct), reset_text])
-        if shown:
+            unit = _UNIT.get(str(label), str(label))
+            slot = {"5h": 0, "week": 1}.get(unit, 2)
+            if shown[slot] is None:
+                shown[slot] = [unit, int(pct), reset_text]
+        if any(shown):
             usage.append({"text": harness, "key": "hb_" + harness, "windows": shown})
     return usage
 
@@ -892,6 +1340,20 @@ def _parse_clock(ts):
     if stamp.tzinfo is not None:
         stamp = stamp.astimezone()
     return stamp.strftime("%H:%M")
+
+
+_SAVED = frozenset({"add", "note", "tidy-add", "decision-record"})
+_BOOKKEEPING = frozenset({"supersede", "reinforce", "lifecycle-expire", "delete"})
+
+
+def _memory_text(snippet):
+    """A journal snippet without its ``2026-10-21 [0c](claude 442122b8):`` provenance header."""
+    text = _text(snippet)
+    if not text:
+        return text
+    text = re.sub(r"^\d{4}-\d\d-\d\d\s+(?:\S+\s+)?\[[^]]+\]\([^)]*\):\s*", "", text)
+    text = re.sub(r"^(?:\[[0-9a-f]{2}(?:/[0-9a-f]{2})?\]\s*)+", "", text)
+    return re.sub(r"^\d{4}-\d\d-\d\d(?:\s+\d\d:\d\d)?(?:\s*KST)?\s*[.:]?\s+", "", text) or text
 
 
 def _memory_records(snapshot, accepted_detail):
@@ -911,17 +1373,15 @@ def _memory_records(snapshot, accepted_detail):
             if not isinstance(event, Mapping):
                 continue
             action_name = event.get("action")
-            if action_name == "lifecycle-expire":
+            if action_name in _BOOKKEEPING:           # pointers and counters carry no sentence of their own
                 continue
             identity = _text(event.get("id"))
             if identity and identity in seen:
                 continue
             if identity:
                 seen.add(identity)
-            action = "saved" if action_name in ("add", "note", "tidy-add") else "changed"
-            snippet = _text(event.get("snippet"))
-            if snippet:
-                snippet = re.sub(r"^\d{4}-\d\d-\d\d\s+\[[^]]+\]\([^)]*\):\s*", "", snippet)
+            action = "saved" if action_name in _SAVED else "changed"
+            snippet = _memory_text(event.get("snippet"))
             project_source = _text(event.get("project"))
             if project_source and "/" in project_source:
                 project = _gpu_repo(project_source)
@@ -952,10 +1412,23 @@ def _system_record(snapshot, session_rows, compute, accepted_detail, usage, now=
     system["dispatch"] = dispatch
     system["dispatch_count"] = sum(1 for job in jobs if _get(job, "liveness") == "working")
     delivery = _get(snapshot, "pending_delivery")
+    peer_delivery = {}
     if isinstance(delivery, Mapping):
         pending = _num(delivery.get("pending", delivery.get("total")))
         if pending is not None:
-            system["peer_delivery"] = {"pending": int(pending)}
+            peer_delivery["pending"] = int(pending)
+    peer_messages = _get(snapshot, "peer_messages")
+    records = _get(peer_messages, "records") if peer_messages is not None else None
+    if isinstance(records, (list, tuple)):
+        peer_delivery["records"] = len(records)
+    if peer_delivery:
+        system["peer_delivery"] = peer_delivery
+    observations = _get(snapshot, "observations")
+    if isinstance(observations, Mapping):
+        collectors = [name for name, value in observations.items()
+                      if isinstance(value, Mapping) and "state" in value and not name.startswith("replay_")]
+        if collectors:
+            system["collectors"] = collectors
     memory = _get(snapshot, "memory")
     if isinstance(memory, Mapping):
         today = memory.get("today") if isinstance(memory.get("today"), Mapping) else {}
@@ -970,18 +1443,26 @@ def _system_record(snapshot, session_rows, compute, accepted_detail, usage, now=
         summary = {"added_today": _num(today.get("added")) if today.get("added") is not None else added,
                    "expired": _num(today.get("expired")) if today.get("expired") is not None else expired,
                    "projects": len(memory.get("by_repo") or {})}
+        expired_at = max((_epoch_of(event.get("ts")) or 0.0 for _repo, event in all_events
+                          if event.get("action") == "lifecycle-expire"), default=0.0)
+        if expired_at:
+            summary["expired_at"] = _clock(expired_at)
         system["memory_summary"] = summary
-    gpu_processes, unregistered_gpu, gpu_summary = _gpu_process_records(snapshot)
+    gpu_processes, unregistered_gpu, gpu_summary, gpu_owner = _gpu_process_records(snapshot)
     if gpu_processes:
         system["gpu_processes"] = gpu_processes
-        system["gpu_process_summary"] = gpu_summary
+        system["gpu_process_summary"] = {"count": gpu_summary["count"],
+                                         "unregistered": gpu_summary["unregistered"]}
     if unregistered_gpu:
         system["unregistered_gpu_processes"] = unregistered_gpu
         system["unregistered_gpu_summary"] = {"count": gpu_summary["unregistered"],
-            "remaining": gpu_summary["remaining"], "owner": gpu_summary.get("owner")}
+            "remaining": gpu_summary["remaining"], "owner": gpu_owner}
     install = _install_record(snapshot)
     if install is not None:
         system["install"] = install
+    runtimes = _get(_get(snapshot, "hearting"), "runtimes")
+    if isinstance(runtimes, (list, tuple)) and runtimes:
+        system["runtimes"] = [str(name) for name in runtimes]
     if usage:
         observed = [_num(snap.get("observed_at")) for snap in (_get(snapshot, "usage_snapshots", default={}) or {}).values()
                     if isinstance(snap, Mapping)]
@@ -1003,9 +1484,7 @@ def _epoch_of(value):
             stamp = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return None
-        if stamp.tzinfo is None:
-            stamp = stamp.replace(tzinfo=datetime.timezone.utc)
-        return stamp.timestamp()
+        return stamp.timestamp()          # a stamp without a zone is local time, as the journal writes it
     return None
 
 
@@ -1018,10 +1497,10 @@ def _memory_events(snapshot, tag_of_sid, tag_of_cwd, limit=24):
         if not isinstance(event, Mapping):
             continue
         epoch = _epoch_of(event.get("ts"))
-        text = _text(event.get("snippet"))
-        if epoch is None or text is None:
+        text = _memory_text(event.get("snippet"))
+        if epoch is None or text is None or event.get("action") in _BOOKKEEPING:
             continue
-        action = "saved" if event.get("action") in ("add", "note", "tidy-add") else "changed"
+        action = "saved" if event.get("action") in _SAVED else "changed"
         tag = tag_of_sid.get(_text(event.get("sid"))) or tag_of_cwd.get(_text(event.get("cwd"))) or "·"
         events.append((epoch, [_clock(epoch), tag, "hearting", f"mem {action}", "dim", text]))
     events.sort(key=lambda item: -item[0])
@@ -1082,7 +1561,7 @@ def _gpu_process_records(snapshot):
                     "session_id": session_tags.get((owner_harness, owner_sid), owner_sid),
                     "cwd": _gpu_repo(process.get("cwd")),
                     "command": _short_gpu_command(process.get("command")),
-                    "vram": (f"{gib:g} GB" if gib is not None else None),
+                    "vram": (f"{gib:.1f} GB" if gib is not None else None),
                     "age": _dur(elapsed / 60) if elapsed is not None else None,
                     "registered": (str(host.get("host") or ""), str(process.get("pid") or ""))
                                   not in unregistered_keys})
@@ -1092,8 +1571,10 @@ def _gpu_process_records(snapshot):
             continue
         elapsed = _num(item.get("elapsed_s"))
         unregistered_rows.append([item.get("host"), item.get("gpu_indexes", [item.get("gpu_name")])[0],
-            _short_gpu_command(item.get("command")), _gib(item.get("used_memory_mib")),
-            _dur(elapsed / 60) if elapsed is not None else None])
+            _text(item.get("process_name")) or _short_gpu_command(item.get("command")),
+            _gib(item.get("used_memory_mib")),
+            _dur_coarse(elapsed / 60) if elapsed is not None else None])
+    unregistered_rows.sort(key=lambda row: (-(row[3] or 0), str(row[0]), str(row[1])))
     owner_sid = next((_text(_get(item.get("session_owner"), "session_id", "id"))
                       for item in unregistered if isinstance(item, Mapping)
                       and item.get("session_owner")), None)
@@ -1102,7 +1583,7 @@ def _gpu_process_records(snapshot):
                   and _text(_get(session, "session_id", "sid")) == owner_sid), None)
     count = len(unregistered_rows)
     return processes, unregistered_rows[:4], {"count": len(processes), "unregistered": count,
-        "remaining": max(0, count - 4), "owner": owner}
+        "remaining": max(0, count - 4), "owner": owner}, owner
 
 
 def _registry_events(focus, tag):
@@ -1154,13 +1635,14 @@ def _answered_records(snapshot):
     grouped = {}
     for repo, events in by_repo.items():
         for event in events or ():
-            if isinstance(event, Mapping) and event.get("type") == "decision" and _text(event.get("snippet")):
+            if isinstance(event, Mapping) and event.get("action") == "decision-record" and \
+                    event.get("type") == "decision" and _text(event.get("snippet")):
                 project = _text(event.get("project"))
                 if project and "/" in project:
                     project = _gpu_repo(project)
                 project = project or _gpu_repo(_get(event, "cwd")) or _shown_repo(repo)
                 grouped.setdefault(project, []).append((_epoch_of(event.get("ts")) or 0.0,
-                    [_parse_clock(event.get("ts")), event["snippet"]]))
+                    [_parse_clock(event.get("ts")), re.sub(r"^\[결정\]\s*", "", event["snippet"])]))
     return [[repo, [row for _epoch, row in sorted(rows, key=lambda item: -item[0])]]
             for repo, rows in sorted(grouped.items()) if rows]
 
@@ -1206,17 +1688,17 @@ def _clear_text(entries, now):
     return when.strftime("%H:%M") + (f" · {minutes}m ago" if minutes < 60 else "")
 
 
-def _seat_view(tag, repo, harness, sid, entries, now):
+def _seat_view(tag, repo, harness, sid, entries, now, now_text=None):
     """``(seat record, generation records, cards or None)`` of one session's seat history."""
     from .nav import generation_chain
     chain = generation_chain(entries, harness, sid)
     full = any("lines" in card for entry in entries for card in (entry.get("cards") or ()))
-    generations, marks, card_rows = [], [], []
+    generations, marks, card_rows, prior_rows = [], [], [], []
     latest_title = ""
     for item in chain:
         card = item["card"] or {}
-        title = _text(card.get("title")) or ""
-        if title:
+        title = _text(card.get("title")) or (_text(now_text) if item["now"] and not item["card"] else "") or ""
+        if title and item["card"]:
             latest_title = title
         generations.append({
             "harness": _text(item["harness"]), "sid": str(item["sid"] or "")[:8],
@@ -1226,12 +1708,16 @@ def _seat_view(tag, repo, harness, sid, entries, now):
             "detail": full, "title": title})
         marks.append([_text(item["harness"]) or "·", item["kind"]])
         if full and item["card"] and "lines" in card:
-            card_rows.append({"gen": len(generations), "harness": _text(item["harness"]),
-                              "sid": str(item["sid"] or "")[:8], "at": _stamp(card.get("at"), now) or "",
-                              "chars": int(card.get("chars") or 0), "lines": list(card["lines"])})
+            row = {"gen": card.get("generation") or len(generations), "harness": _text(item["harness"]),
+                   "sid": str(item["sid"] or "")[:8], "at": _stamp(card.get("at"), now) or "",
+                   "chars": int(card.get("chars") or 0), "lines": list(card["lines"])}
+            (prior_rows if (item["entry"] or {}).get("prior") else card_rows).append(row)
     has_card = any(g["card"] for g in generations)
     seat = [tag, repo, len(chain), _clear_text(entries, now) or "·", has_card, latest_title, marks]
-    cards = {"seat": tag, "cards": card_rows, "prior_cards": []} if full else None
+    seat_id = next((_text(entry.get("seat")) for entry in entries if _text(entry.get("seat"))), tag)
+    handovers = next((list(entry["handovers"]) for entry in entries if entry.get("handovers")), [])
+    cards = {"seat": seat_id, "cards": card_rows, "handovers": handovers,
+             "prior_cards": prior_rows} if full else None
     return seat, generations, cards
 
 
@@ -1256,7 +1742,7 @@ def _detail_sections(rows, session_index, accepted_detail, now):
         if entries is None:
             continue
         seat, gens, card_block = _seat_view(row["tag"], row["repo"], row["harness"],
-                                            session_index[row["tag"]]["sid"], entries, now)
+                                            session_index[row["tag"]]["sid"], entries, now, row.get("now"))
         seat_rows.append(seat)
         generations[row["tag"]] = gens
         if card_block is not None:
@@ -1275,6 +1761,15 @@ def _detail_sections(rows, session_index, accepted_detail, now):
         dialogue = {"logs": {f"{tag}:{int(log['index'])}": {
             "h": _text(log.get("harness")), "sid": str(log.get("sid") or "")[:8],
             "lines": list(log.get("lines") or ())}}, "generation_text": {}}
+    recorded = sources.get("logs")                    # every generation's conversation the pump has read
+    if isinstance(recorded, Mapping) and recorded:
+        logs = dict(dialogue.get("logs", {})) if dialogue else {}
+        for key, entry in recorded.items():
+            if isinstance(entry, Mapping) and key not in logs:
+                logs[str(key)] = {"h": _text(entry.get("h", entry.get("harness"))),
+                                  "sid": str(entry.get("sid") or "")[:8],
+                                  "lines": list(entry.get("lines") or ())}
+        dialogue = {"logs": logs, "generation_text": dict((dialogue or {}).get("generation_text", {}))}
     return seat_rows, generations, cards, dialogue, pane_read, raw
 
 
@@ -1307,6 +1802,13 @@ def _install_record(snapshot):
     for key in ("managed", "pinned", "distribution"):
         if key in install:
             record[key] = install[key]
+    method = _text(install.get("install_method"))
+    if method:                                   # "managed/pinned" says both at once
+        parts = method.split("/")
+        record.setdefault("managed", "managed" in parts)
+        record.setdefault("pinned", "pinned" in parts)
+    if _text(install.get("source")):
+        record.setdefault("distribution", install["source"] == "distribution")
     return record
 
 
@@ -1341,6 +1843,9 @@ def build_view_model(snapshot, accepted_detail=None, cached_config=None, now=Non
     questions = _question_records(session_rows, session_index, clock)
     peer_nodes, peer_edges = _peer_records(session_rows, session_index, clock, snapshot)
     hosts, compute = _host_records(snapshot, session_index)
+    gpu_lines = _session_gpu_lines(snapshot, session_index)
+    for row in session_rows:
+        row["gpu"] = gpu_lines.get(row["tag"])
     usage = _usage_records(snapshot, session_rows, clock)
     by_repo = {}
     for row in session_rows:
@@ -1353,11 +1858,20 @@ def build_view_model(snapshot, accepted_detail=None, cached_config=None, now=Non
             row["pane"] = next((panes[i] for i in info["ids"] if i in panes), None)
     seat_rows, generations, cards, dialogue, pane_read, raw = _detail_sections(
         session_rows, session_index, accepted_detail, clock)
+    peer_nodes, peer_edges = _finish_peers(peer_nodes, peer_edges, session_rows, session_index, routes,
+                                           _handover_links(snapshot, session_index, seat_rows, clock),
+                                           _routeless_jobs(snapshot, session_index))
     by_tag = {row["tag"]: row for row in session_rows}
     for seat in seat_rows:
         row = by_tag[seat[0]]
         row["generation"] = seat[2]
         row["last_clear"] = None if seat[3] == "·" else seat[3].split(" · ")[0]
+    cleared = _clear_times(snapshot, session_index)
+    for row in session_rows:
+        if row["last_clear"] is None and row["tag"] in cleared and not any(seat[0] == row["tag"] for seat in seat_rows):
+            when = datetime.datetime.fromtimestamp(cleared[row["tag"]])
+            today = datetime.datetime.fromtimestamp(clock).date()
+            row["last_clear"] = when.strftime("%H:%M" if when.date() == today else "%m-%d %H:%M")
     if pane_read:
         tag, read = pane_read
         by_tag[tag]["pane"] = by_tag[tag]["pane"] or _text(read.get("pane"))
@@ -1378,7 +1892,8 @@ def build_view_model(snapshot, accepted_detail=None, cached_config=None, now=Non
     if focus_key is not None:
         focus_tag = tag_of_sid.get(_get(focus_key, "sid"))
     feed = (_memory_events(snapshot, tag_of_sid, tag_of_cwd) +
-            _registry_events(focus, focus_tag) + _peer_events(snapshot, session_index))
+            _registry_events(focus, focus_tag) + _peer_events(snapshot, session_index) +
+            _job_events(snapshot, session_index, session_rows, clock))
     feed.sort(key=lambda item: -item[0])
     feed = feed[:5]
     explicit = _get(focus, "source_records")

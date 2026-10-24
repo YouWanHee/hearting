@@ -355,6 +355,7 @@ def read_lineage(session, harness, sid):
 
 SEAT_SESSION_LIMIT = 12
 CARD_LINES_MAX = 600
+CARD_TITLE_MAX = 400
 DIALOGUE_LINES_MAX = 400
 PANE_ROWS = 14
 _ROLE_LINE = re.compile(r"\[([A-Za-z_ ]+)\] ")
@@ -364,11 +365,10 @@ _TAG_ONLY = re.compile(r"^</?[A-Za-z_][\w-]*>$")
 
 
 def _first_body_line(body):
-    """First line that says something: a bare ``<analysis>``-style tag line is not a title."""
-    for line in str(body or "").splitlines():
-        if line.strip() and not _TAG_ONLY.match(line.strip()):
-            return line.strip()[:48]
-    return ""
+    """What the card says first (see ``nav.card_title``); a bare ``<analysis>``-style tag line is not a title."""
+    from . import nav
+    lines = [line for line in str(body or "").splitlines() if not _TAG_ONLY.match(line.strip())]
+    return nav.card_title(lines)[:CARD_TITLE_MAX]
 
 
 def _read_card(module, card, *, full):

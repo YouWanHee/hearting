@@ -1,5 +1,6 @@
 """Small read-only session helpers shared by the live snapshot adapter."""
 
+import re
 from collections.abc import Mapping
 
 
@@ -24,12 +25,35 @@ def find_session(snapshot, sid):
     return None
 
 
+def card_title(lines):
+    """What a handover card says first: its ``# `` heading, else the first line that says something
+    (past bare labels like ``진행 중:`` and list marks)."""
+    lines = [str(line) for line in lines or ()]
+    head = next((line for line in lines if line.startswith("# ")), None)
+    if head:
+        if "세션 인계 카드" in head:         # every card opens with this heading; its first in-progress item says more
+            in_progress = False
+            for line in lines:
+                if line.startswith("#"):
+                    in_progress = "진행 중" in line
+                elif in_progress and re.match(r"^[-*]\s+\S", line):
+                    text = line.replace("**", "")[1:].strip()
+                    if len(text) > 8:
+                        return text
+        return head[2:].strip()
+    for line in lines:
+        text = re.sub(r"^[-*\s]*(진행 중\s*:?)?\s*", "", line.replace("**", "")).strip()
+        if len(text) > 8:
+            return text
+    return ""
+
+
 def generation_chain(entries, harness, sid):
     """Generations of a seat, oldest first: one per session-tidy card, then the running session (``now``).
 
     A generation follows the one before it as the same session (a compact: ``cont``) or a new session
     (``new``; a clear when its start source says so). A running session that took over by a retire
-    handover is not told apart in the seat records, so ``existing`` is never produced here.
+    handover is ``existing`` when the seat records say its start source was a retire.
     """
     entries = tuple(entries or ())
     items = []
@@ -44,12 +68,13 @@ def generation_chain(entries, harness, sid):
             item["kind"], item["connection"] = "new", None
             continue
         previous = items[index - 1]
-        if item["sid"] == previous["sid"]:
+        if str(item["sid"] or "")[:8] == str(previous["sid"] or "")[:8]:
             item["kind"], item["connection"] = "cont", "compact · same session went on"
         else:
             source = (item["entry"] or {}).get("source")
-            item["kind"] = "new"
-            item["connection"] = ("clear · new session took over" if source == "clear"
+            item["kind"] = "existing" if source == "retire" else "new"
+            item["connection"] = ("clear · new session took over" if source == "clear" else
+                                  "retire · a running session took over" if source == "retire"
                                   else "new session · no handover record")
         if item["harness"] != previous["harness"]:
             item["connection"] += f"  ·  {previous['harness']} → {item['harness']}"

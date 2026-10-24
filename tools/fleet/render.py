@@ -6932,6 +6932,16 @@ def _explorer_compose(snapshot, cols, rows, state=None, focus_result=None, last_
         snapshot, focus_result, vm=model, generation=_EXPLORER_GENERATION, now=now)
     _EXPLORER_READINESS = readiness
     _EXPLORER_MODEL = model
+    drag = tuple(getattr(state, "drag", ()) or ())
+    if len(drag) >= 3 and drag[0] == "tree":
+        ordering = getattr(model, "ordering", {}) or {}
+        identities = (set(ordering.get("repo_keys", ())) if drag[1] == "repo" else
+                      set(ordering.get("repo_by_tag", {})))
+        dragged = drag[2]
+        if dragged not in identities:
+            from dataclasses import replace
+            state = replace(state, drag=())
+            _EXPLORER_STATE = state
     from .explorer.runtime import tag_cycle
     cycle = tag_cycle(getattr(model, "ordering", None))
     if cycle:
@@ -7029,6 +7039,10 @@ def _draw_explorer(stdscr, snapshot, frame=None):
     if h <= 0 or w <= 0:
         return
     state = _explorer_state_for(_EXPLORER_STATE, w)
+    if _EXPLORER_SIZE is not None and _EXPLORER_SIZE != (h, w) and state.drag:
+        from dataclasses import replace
+        state = replace(state, drag=())
+        _EXPLORER_STATE = state
     _EXPLORER_SIZE = (h, w)
     if frame is None:
         frame = _explorer_compose(snapshot, w, h, state, _EXPLORER_RESULT)
@@ -10983,13 +10997,17 @@ def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
                          "x": mx, "y": my}
             else:
                 return
-            order = tuple("session:" + str(item) for item in _EXPLORER_ORDER)
-            _EXPLORER_STATE, _effects = reduce(state, {**event, "order": order}, _EXPLORER_FRAME)
+            from .explorer.runtime import tag_cycle
+            order = tag_cycle(getattr(_EXPLORER_MODEL, "ordering", None))
+            ordering = getattr(_EXPLORER_MODEL, "ordering", None) or {}
+            _EXPLORER_STATE, _effects = reduce(
+                state, {**event, "order": order, "ordering": ordering}, _EXPLORER_FRAME)
             _explorer_runtime().apply_effects(_effects, _EXPLORER_MODEL)
         return
     key = _explorer_key_name(ch)
     if key:
-        order = tuple("session:" + str(item) for item in _EXPLORER_ORDER)
+        from .explorer.runtime import tag_cycle
+        order = tag_cycle(getattr(_EXPLORER_MODEL, "ordering", None))
         _EXPLORER_STATE, _effects = reduce(state, {"type": "key", "key": key,
                                                     "order": order}, _EXPLORER_FRAME)
         _explorer_runtime().apply_effects(_effects, _EXPLORER_MODEL)
@@ -11119,6 +11137,11 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
           live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
           governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
+    if _EXPLORER_ENABLED:
+        try:
+            os.write(sys.stdout.fileno(), b"\x1b[?1002h\x1b[?1006h")
+        except (OSError, AttributeError):
+            pass
     try:
         while True:
             # Wake at the next 0.1s spinner frame while staying key-responsive. Collection
@@ -11278,6 +11301,11 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                   live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
                   governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
     finally:
+        if _EXPLORER_ENABLED:
+            try:
+                os.write(sys.stdout.fileno(), b"\x1b[?1006l\x1b[?1002l")
+            except (OSError, AttributeError):
+                pass
         if selection_feed is not None:
             selection_feed.stop()
         pump.stop(join_timeout=1.0)

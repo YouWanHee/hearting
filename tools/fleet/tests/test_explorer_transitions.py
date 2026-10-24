@@ -9,7 +9,6 @@ from tools.fleet.explorer.state import NavState, reduce
 from tools.fleet.explorer.view_model import load_fixture
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "explorer"
-PEERS_PANE_LEFT, PEERS_PANE_TOP, PEERS_PANE_BOTTOM = 34, 3, 41
 
 
 def _expected_nav(st):
@@ -71,16 +70,11 @@ class ViewerByteTrace(unittest.TestCase):
                         expected_frame = frames[expected["frame"]]
                         actual = draw(vm, state, case["cols"], 45, beat=1)
                         actual_cells, actual_hits = _frame_json(actual)
-                        if state.view == "PEERS" and state.scope == "-":
-                            _assert_peer_structure(self, vm, actual, state, case["name"])
-                            _assert_peer_capture(self, expected_frame, row_pool, vm, state,
-                                                 case["cols"], case["name"])
-                        else:
-                            expected_cells = _expand([row_pool[index] for index in expected_frame["cells"]])
-                            difference = _first_cell_difference(expected_cells, actual_cells)
-                            self.assertIsNone(difference, f"{context}: {difference or 'cell grids differ'}")
-                            if actual_hits != expected_frame["hits"]:
-                                self.fail(f"{context}: {_first_hit_difference(expected_frame['hits'], actual_hits)}")
+                        expected_cells = _expand([row_pool[index] for index in expected_frame["cells"]])
+                        difference = _first_cell_difference(expected_cells, actual_cells)
+                        self.assertIsNone(difference, f"{context}: {difference or 'cell grids differ'}")
+                        if actual_hits != expected_frame["hits"]:
+                            self.fail(f"{context}: {_first_hit_difference(expected_frame['hits'], actual_hits)}")
                         if event.get("type") == "key" and event.get("key") in ("/", "F"):
                             self.assertIn(("command", "filter" if event["key"] == "/" else "feed"), effects)
 
@@ -120,50 +114,6 @@ def _first_hit_difference(expected, actual):
         if ehit != ahit:
             return f"first hit difference index={index}: expected={ehit!r} actual={ahit!r}"
     return "ordered hit maps differ"
-
-
-def _assert_peer_capture(test, expected, row_pool, vm, state, cols, case):
-    # w2-peers owns the pane interior. Keep every cell and hit outside that
-    # explicit rectangle exact, including the joined header and left rail.
-    expected_cells = _expand([row_pool[index] for index in expected["cells"]])
-    actual = draw(vm, state, cols, 45, beat=1)
-    actual_cells, actual_hits = _frame_json(actual)
-    for rows_to_mask in (expected_cells, actual_cells):
-        for row_index in range(PEERS_PANE_TOP, PEERS_PANE_BOTTOM):
-            for col_index in range(PEERS_PANE_LEFT, cols - 1):
-                rows_to_mask[row_index][col_index] = None
-    test.assertEqual(actual_cells, expected_cells, f"{case}: PEERS exterior cells")
-    expected_hits = [hit for hit in expected["hits"] if not (
-        PEERS_PANE_TOP <= hit[0] < PEERS_PANE_BOTTOM and hit[1] >= PEERS_PANE_LEFT)]
-    actual_hits = [hit for hit in actual_hits if not (
-        PEERS_PANE_TOP <= hit[0] < PEERS_PANE_BOTTOM and hit[1] >= PEERS_PANE_LEFT)]
-    test.assertEqual(actual_hits, expected_hits, f"{case}: PEERS exterior ordered hits")
-    expected_text = ["".join(cell[0] for cell in row) for row in _expand(
-        [row_pool[index] for index in expected["cells"]])]
-    actual_text = actual.text_rows()
-    for _repo, columns in vm.peer_nodes:
-        for column in columns:
-            for tag in column:
-                test.assertTrue(any(f"[{tag}]" in row for row in actual_text), f"{case}: missing peer node {tag}")
-    for _frm, _to, kind, _when, _note in vm.peer_edges["links"]:
-        test.assertTrue(any(str(kind) in row for row in actual_text), f"{case}: missing edge kind {kind}")
-    test.assertTrue(any("LINKS" in row for row in actual_text), f"{case}: links section missing")
-    test.assertTrue(any("links" in row.lower() for row in expected_text), f"{case}: reference link count missing")
-
-
-def _assert_peer_structure(test, vm, frame, state, case):
-    rows = frame.text_rows()
-    test.assertTrue(any("links" in row.lower() for row in rows), f"{case}: peer link count missing")
-    test.assertGreater(len(frame.hits), 0, f"{case}: peer hits missing")
-    for _repo, columns in vm.peer_nodes:
-        for column in columns:
-            for tag in column:
-                test.assertTrue(any(f"[{tag}]" in row for row in rows), f"{case}: missing peer node {tag}")
-    for _frm, _to, kind, _when, _note in vm.peer_edges["links"]:
-        test.assertTrue(any(str(kind) in row for row in rows), f"{case}: missing edge kind {kind}")
-    focused = state.fold_map().get("pfocus:PEERS", "")
-    if focused:
-        test.assertTrue(any(f"[{focused}]" in row for row in rows), f"{case}: focused node missing")
 
 
 class CoreTransitions(unittest.TestCase):

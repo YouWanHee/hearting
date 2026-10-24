@@ -180,7 +180,7 @@ class SeatHistory(unittest.TestCase):
         self.assertEqual(health.state, "success")
         self.assertEqual((self.tidy.panes, pane), (["w1:p2"], "w1:p2"))
         self.assertEqual([(e["sid"], e["current"]) for e in entries], [("old-1", False), ("now-1", True)])
-        self.assertEqual(entries[0]["cards"][0]["title"], "# first line")     # the newest card is opened
+        self.assertEqual(entries[0]["cards"][0]["title"], "first line")     # the newest card is opened
 
     def test_cards_flag_reads_every_body_and_a_missing_seat_is_none_not_a_guess(self):
         entries, _pane, _health = self.focus.read_seat_history({"cwd": "/x"}, "claude", "now-1", cards=True)
@@ -210,7 +210,7 @@ class SeatHistory(unittest.TestCase):
         entries, _pane, _health = self.focus.read_seat_history({"cwd": "/x"}, "claude", "now-1")
         old = self.focus.lineage_from_seat(entries)
         self.assertEqual([item["sid"] for item in old], ["old-1"])
-        self.assertEqual(old[0]["title"], "# first line")
+        self.assertEqual(old[0]["title"], "first line")
 
 
 class AuxReads(unittest.TestCase):

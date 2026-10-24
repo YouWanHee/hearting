@@ -16,71 +16,6 @@ def _expand(rows):
              for cell in [[glyph, colour, tint]] * count] for row in rows]
 
 
-def _with_reference_additions(vm):
-    """Restore PEERS-only data represented by the scrubbed reference literals."""
-    values = vm.to_mapping()
-    literal = values.get("source_records", {}).get("reference_literals", {})
-    mock13 = literal.get("mock13", {})
-    mock5 = literal.get("mock5", {})
-    mock6 = literal.get("mock6", {})
-    edges = dict(values.get("peer_edges") or {})
-    cards = {}
-    owners = mock6.get("OWN", {})
-    extras = mock5.get("EXTRA", {})
-    routes_by_tag = {}
-    for route in values.get("routes", ()):
-        routes_by_tag.setdefault(str(route.get("session_tag") or ""), []).append(route)
-    for tag in set(owners) | set(extras):
-        card = {}
-        owner_rows = []
-        route_candidates = sorted(routes_by_tag.get(str(tag), ()),
-                                  key=lambda route: {"dead": 0, "working": 1, "idle": 2,
-                                                     "blocked": 3, "done": 4}.get(route.get("state"), 5))
-        for owner_index, record in enumerate(owners.get(tag, ())):
-            if isinstance(record, dict):
-                state, label, stages = record.get("state"), record.get("label"), record.get("stages", ())
-            else:
-                state, label, stages = record
-            if not state or set(str(state)) <= {"x"}:
-                state = (route_candidates[owner_index].get("state") if owner_index < len(route_candidates)
-                         else "done")
-            owner_rows.append({"state": state, "label": label,
-                               "stages": [{"name": stage.get("name"), "state": stage.get("st")}
-                                          if isinstance(stage, dict) else {"name": stage[0], "state": stage[1]}
-                                          for stage in stages]})
-        if owner_rows:
-            card["owners"] = owner_rows
-        extra = extras.get(tag, ())
-        if extra:
-            card["extra"] = [(text, style if style in ("dim", "blocked") else
-                               ("blocked" if len(str(style)) >= 7 else "dim")) for text, style in extra]
-        cards[tag] = card
-    edges["cards"] = cards
-    links = edges.get("links", ())
-    edges["lane_labels"] = [
-        {"from": str(link[0][0]), "to": str(link[1][0]), "kind": link[2],
-         "when": str(link[3]).removesuffix(" ago")}
-        for link in links if isinstance(link[0], (list, tuple)) and isinstance(link[1], (list, tuple))
-        and str(link[2]) == "steer"
-    ]
-    edges["generations"] = [
-        {"tag": str(link[1][0]), "harness": str(link[1][1]),
-         "text": f"◂ {link[0]} · {str(link[3]).removesuffix(' ago')}"}
-        for link in links if isinstance(link[1], (list, tuple)) and str(link[2]) == "handover"
-    ]
-    watch_sources = [str(link[0][0]) for link in links
-                     if isinstance(link[0], (list, tuple)) and str(link[2]).startswith("watch")]
-    if watch_sources:
-        repo_by_tag = {str(tag): str(repo) for repo, columns in mock13.get("PEER_PROJECTS", ())
-                       for col in columns for tag in col}
-        edges["watches"] = [{"repo": repo_by_tag.get(tag),
-                             "text": f"watch {len(watch_sources)} · ended"}
-                            for tag in dict.fromkeys(watch_sources) if repo_by_tag.get(tag)]
-    values["peer_edges"] = edges
-    from tools.fleet.explorer.view_model import ExplorerViewModel
-    return ExplorerViewModel.from_mapping(values)
-
-
 def _pane(frame):
     cells = [[list(cell) for cell in row[SEPARATOR:]] for row in frame.cells[5:]]
     hits = [[hit.y - 5, hit.x0 - SEPARATOR, hit.x1 - SEPARATOR, list(hit.action)]
@@ -90,7 +25,7 @@ def _pane(frame):
 
 class PeerPaneReference(unittest.TestCase):
     def test_peers_and_selected_links_match_reference_pane(self):
-        vm = _with_reference_additions(load_fixture(FIXTURES / "view_model.json"))
+        vm = load_fixture(FIXTURES / "view_model.json")
         for cols in (140, 168):
             capture = json.loads((FIXTURES / f"cells-{cols}.json").read_text())
             for name, folds in (("PEERS", ()), ("PEERS-pick-f5", (("pfocus:PEERS", "f5"),))):
@@ -112,7 +47,7 @@ class PeerPaneReference(unittest.TestCase):
                     self.assertEqual(actual_hits, expected_hits, f"{name} pane ordered hits at {cols}")
 
     def test_narrow_pane_has_bounded_hits_and_no_horizontal_overflow(self):
-        vm = _with_reference_additions(load_fixture(FIXTURES / "view_model.json"))
+        vm = load_fixture(FIXTURES / "view_model.json")
         frame = draw(vm, NavState(view="PEERS", title="PEERS"), 80, 100, beat=1)
         self.assertEqual(len(frame.cells), 100)
         self.assertTrue(all(len(row) == 80 for row in frame.cells))
@@ -138,6 +73,102 @@ class PeerPaneReference(unittest.TestCase):
         used = {cell[1] for row in frame.cells for cell in row if cell[1]}
         for harness in ("claude", "codex", "opencode"):
             self.assertIn("hb_" + harness, used)
+
+
+def _variant(**changes):
+    from tools.fleet.explorer.view_model import ExplorerViewModel
+    values = load_fixture(FIXTURES / "view_model.json").to_mapping()
+    values.update(changes)
+    return ExplorerViewModel.from_mapping(values)
+
+
+def _rows(vm, cols=140, folds=()):
+    return draw(vm, NavState(view="PEERS", title="PEERS", folds=folds), cols, 60, beat=1).text_rows()
+
+
+class PeerDerivedElements(unittest.TestCase):
+    def test_frames_start_directly_under_the_pane_title(self):
+        rows = _rows(load_fixture(FIXTURES / "view_model.json"))
+        self.assertIn("{ PEERS }", rows[3])
+        self.assertTrue(rows[4][SEPARATOR:].startswith("╔═ "), rows[4])
+
+    def test_gpu_and_question_lines_come_from_the_session_and_question_records(self):
+        base = load_fixture(FIXTURES / "view_model.json").to_mapping()
+        sessions = [dict(item) for item in base["sessions"]]
+        for item in sessions:
+            if item["tag"] == "f5":
+                item["gpu"] = list(item["gpu"]) * 3          # three held GPUs
+            if item["tag"] == "a3":
+                item["gpu"] = item["gpu"][:1]                # one is not worth a line
+        rows = _rows(_variant(sessions=sessions))
+        text = "\n".join(rows)
+        self.assertIn("GPU ×3", text)
+        self.assertNotIn("GPU ×8", text)
+        self.assertIn("answer needed · 3d 7h", text)
+
+    def test_watch_footer_and_lane_labels_follow_the_vm(self):
+        base = load_fixture(FIXTURES / "view_model.json").to_mapping()
+        edges = dict(base["peer_edges"])
+        edges["watches"] = [{"repo": base["peer_nodes"][0][0], "text": "watch 4 · ended"}]
+        edges["links"] = [list(link) for link in edges["links"]]
+        for link in edges["links"]:
+            if link[0] == ["a3", "codex"]:
+                link[3] = "9m ago"
+        text = "\n".join(_rows(_variant(peer_edges=edges)))
+        self.assertIn(" ⚑ watch 4 · ended ", text)
+        self.assertIn("[a3]→[f5] steer 9m", text)
+
+    def test_clear_marker_needs_a_recent_clear(self):
+        base = load_fixture(FIXTURES / "view_model.json").to_mapping()
+        seats = [list(seat) for seat in base["seats"]]
+        for seat in seats:
+            if seat[0] == "0c":
+                seat[3] = "22:47"
+        self.assertNotIn("◂ gen", "\n".join(_rows(_variant(seats=seats))))
+        self.assertIn("◂ gen 5 · 6m", "\n".join(_rows(load_fixture(FIXTURES / "view_model.json"))))
+
+    def test_selected_card_wears_the_bright_border(self):
+        vm = load_fixture(FIXTURES / "view_model.json")
+        plain = draw(vm, NavState(view="PEERS", title="PEERS"), 140, 45, beat=1)
+        picked = draw(vm, NavState(view="PEERS", title="PEERS", folds=(("pfocus:PEERS", "f5"),)),
+                      140, 45, beat=1)
+        self.assertEqual(plain.cells[22][SEPARATOR + 2][1], "h_claude")
+        self.assertEqual(picked.cells[22][SEPARATOR + 2][1], "hb_claude")
+
+    def test_narrow_widths_keep_lanes_and_labels_inside_the_pane(self):
+        vm = load_fixture(FIXTURES / "view_model.json")
+        for cols in (80, 100):
+            frame = draw(vm, NavState(view="PEERS", title="PEERS"), cols, 100, beat=1)
+            for row in frame.cells:
+                self.assertEqual(len(row), cols)
+            for row in frame.cells[4:80]:
+                self.assertEqual(row[cols - 1][0], " ", "pane writes into the last column")
+            text = "\n".join(frame.text_rows())
+            self.assertIn("[a3]→[f5] steer 3h 17m", text)
+            self.assertIn("→[f5] steer 3h 22m", text)
+
+    def test_cards_never_overlap_and_hits_stay_in_the_pane(self):
+        base = load_fixture(FIXTURES / "view_model.json").to_mapping()
+        edges = dict(base["peer_edges"])
+        cards = {tag: dict(card) for tag, card in edges["cards"].items()}
+        cards["33"] = {"owners": cards["f5"]["owners"] * 2}          # a tall card in a stacked column
+        edges["cards"] = cards
+        for vm in (load_fixture(FIXTURES / "view_model.json"), _variant(peer_edges=edges)):
+            for cols in (80, 100, 140, 168):
+                with self.subTest(cols=cols):
+                    frame = draw(vm, NavState(view="PEERS", title="PEERS"), cols, 100, beat=1)
+                    boxes = {}
+                    for hit in frame.hits:
+                        if hit.action[:2] == ("fold", "pfocus:PEERS") and hit.y < 90 and hit.x1 - hit.x0 > 20:
+                            boxes.setdefault(hit.action[2], []).append(hit)
+                    for tag, rows in boxes.items():
+                        self.assertTrue(all(h.x0 >= SEPARATOR and h.x1 <= cols - 1 for h in rows), tag)
+                        for other, other_rows in boxes.items():
+                            if other != tag:
+                                for a in rows:
+                                    for b in other_rows:
+                                        self.assertFalse(a.y == b.y and a.x0 < b.x1 and b.x0 < a.x1,
+                                                         f"{tag} and {other} overlap at row {a.y}")
 
 
 if __name__ == "__main__":

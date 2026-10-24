@@ -24,6 +24,7 @@ def extract_view_model(renderer, *, scrub=False):
                          "generation_text": copy.deepcopy(getattr(renderer, "GEN_TEXT_0C", {}))},
             "peer_nodes": copy.deepcopy(getattr(renderer, "PEER_PROJECTS", ())),
             "peer_edges": {"links": copy.deepcopy(renderer.mock6.LINKS),
+                           "cards": _peer_cards(renderer),
                            "cross": copy.deepcopy(getattr(renderer, "PEER_CROSS", ())),
                            "side_lanes": copy.deepcopy(getattr(renderer, "PEER_SIDE_LANES", ()))},
             "compute": copy.deepcopy(renderer.mock3.COMPUTE),
@@ -61,6 +62,17 @@ def extract_view_model(renderer, *, scrub=False):
                     if key.isupper() and _jsonish(value)}
     values["_reference_snapshot"] = {"globals": globals_copy, "modules": modules}
     return _jsonable(values)
+
+
+def _peer_cards(renderer):
+    """The owner-stage rows the reference hand-writes under each PEERS card (``cards[tag].owners``)."""
+    cards = {}
+    for tag, owners in getattr(getattr(renderer, "mock5", None), "OWN", {}).items():
+        cards[tag] = {"owners": [
+            {"state": state, "label": label,
+             "stages": [{"name": name, "state": stage_state} for name, stage_state in stages]}
+            for state, label, stages in owners]}
+    return cards
 
 
 def _jsonish(value):

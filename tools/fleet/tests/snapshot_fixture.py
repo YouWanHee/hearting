@@ -9,10 +9,12 @@ from typing import Union
 import time
 
 try:
+    from fleet.explorer.nav import card_title
     from fleet import projection, render
     from fleet.collectors import dispatch, resolve_parent_edges
     from fleet.refresh import LiveSnapshot
 except ModuleNotFoundError:
+    from tools.fleet.explorer.nav import card_title
     from tools.fleet import projection, render
     from tools.fleet.collectors import dispatch, resolve_parent_edges
     from tools.fleet.refresh import LiveSnapshot
@@ -86,6 +88,11 @@ def replay_snapshot(payload, *, detail_bundle=None, now=None):
             setattr(snapshot, key, [_typed(item, rows[key]) for item in value or ()])
         else:
             setattr(snapshot, key, _typed(value, snapshot_fields[key]))
+    for job in snapshot.jobs:                    # a job's resource children are resource jobs, not bare records
+        children = getattr(job, "resource_children", None)
+        if children:
+            job.resource_children = [_typed(child, ResourceJob) if isinstance(child, dict) else child
+                                     for child in children]
     if unknown:
         snapshot.observations = dict(snapshot.observations or {}, replay_unknown=unknown)
 
@@ -198,27 +205,37 @@ def replay_source_bundle(state, history_data, logs_hist, raw_f5, *, now=None):
                     pointer = f"/history_data.json/{history_key}/{field_name}"
                     detail["source_records"][f"{tag or sid}.{field_name}"] = pointer
             if harness and sid and source.get("seat") is not None:
-                entries = []
-                for card in list(source.get("prior_cards") or ()) + list(source.get("cards") or ()):
+                hand = {(str(h.get("frm")), str(h.get("to"))): h for h in source.get("handovers") or ()
+                        if isinstance(h, dict)}
+                entries, previous_sid = [], None
+                ordered = [(True, card) for card in source.get("prior_cards") or ()] + \
+                          [(False, card) for card in source.get("cards") or ()]
+                for prior, card in ordered:
                     card_sid = card.get("sid") if isinstance(card, dict) else None
                     card_harness = card.get("harness") if isinstance(card, dict) else None
                     lines = list(card.get("lines") or ()) if isinstance(card, dict) else []
-                    title = next((str(line).strip() for line in lines
-                                  if str(line).strip() and not str(line).strip().startswith("<")), "")
                     recorded = dict(card) if isinstance(card, dict) else {}
                     recorded.update({"generation": recorded.get("gen", recorded.get("generation")),
                                      "status": "available" if lines else "unavailable",
-                                     "at": _source_epoch(recorded.get("at"), now), "title": title[:48],
-                                     "lines": lines})
+                                     "at": _source_epoch(recorded.get("at"), now),
+                                     "title": card_title(lines), "lines": lines})
+                    into = hand.get((str(previous_sid), str(card_sid))) if previous_sid else None
                     entries.append({"harness": card_harness or harness, "sid": card_sid or sid,
-                                    "started_at": _source_epoch(recorded.get("at"), now),
-                                    "cards": [recorded], "handovers": source.get("handovers") or (),
-                                    "source": "history", "relation": "recorded generation",
+                                    "started_at": _source_epoch(into.get("at"), now) if into else None,
+                                    "source": into.get("source") if into else None,
+                                    "cards": [recorded], "prior": prior, "seat": source.get("seat"),
+                                    "handovers": source.get("handovers") or (), "relation": "recorded generation",
                                     "transcript": {}, "current": False})
-                entries.append({"harness": harness, "sid": sid, "cards": [],
-                                "handovers": source.get("handovers") or (),
-                                "source": "history", "relation": "current session",
-                                "started_at": _source_epoch(session.get("started_at"), now),
+                    previous_sid = card_sid
+                into = hand.get((str(previous_sid), str(sid)[:8])) if previous_sid else None
+                cleared_at = _source_epoch(into.get("at"), now) if into else None
+                if into is None and entries and str(entries[-1]["sid"]) != str(sid)[:8]:
+                    cleared_at = entries[-1]["cards"][0].get("at")      # the last card is written as the seat is cleared
+                entries.append({"harness": harness, "sid": sid, "cards": [], "prior": False,
+                                "seat": source.get("seat"), "handovers": source.get("handovers") or (),
+                                "source": (into or {}).get("source") or ("clear" if cleared_at else None),
+                                "relation": "current session",
+                                "started_at": cleared_at or _source_epoch(session.get("started_at"), now),
                                 "transcript": {}, "current": True})
                 detail["seats"][f"{harness}:{sid}"] = entries
         if tag and sid:
@@ -241,7 +258,7 @@ def replay_source_bundle(state, history_data, logs_hist, raw_f5, *, now=None):
         seat_entries = detail["seats"].get(f"{harness}:{sid}")
         dialogue = next((entry for entry in logs_doc.values()
                          if isinstance(entry, dict) and entry.get("sid") == sid), None)
-        source_records = {"raw": raw_doc}
+        source_records = {"raw": raw_doc, "logs": logs_doc}
         if seat_entries is not None:
             source_records["seat"] = seat_entries
         if dialogue is not None:

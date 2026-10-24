@@ -7,6 +7,7 @@ the live adapter without moving I/O into the drawing code.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 import time
 
 
@@ -16,6 +17,60 @@ class ExplorerRuntime:
     def prepare(self, snapshot, detail, *, vm, generation, now):
         """Return the already-built model and collection readiness for this generation."""
         model = vm
+        try:
+            from . import live, order
+            resolver = live._resolver(snapshot)
+            _rows, by_tag = live._session_records(snapshot, now or time.time(), resolver)
+            source_rows = tuple(live._records(live._get(snapshot, "sessions", default=())))
+            for source in source_rows:
+                explicit = live._text(live._get(source, "session_tag", "tag"))
+                sid = live._text(live._get(source, "session_id", "sid", "id"))
+                if explicit:
+                    by_tag.setdefault(explicit, {"session": source, "sid": sid})
+                if sid:
+                    by_tag.setdefault(sid, {"session": source, "sid": sid})
+            sessions = []
+            tag_keys, repo_by_tag, tags_by_key = {}, {}, {}
+            for row in model.sessions:
+                tag = str(row.get("tag", ""))
+                identity = by_tag.get(tag, {})
+                source = identity.get("session")
+                sid = identity.get("sid")
+                harness = str(row.get("harness") or "")
+                if sid:
+                    stable = "sid:" + harness + ":" + str(sid)
+                elif source is not None:
+                    stable = "process:" + ":".join(str(live._get(source, key, default=""))
+                                                       for key in ("harness", "pid", "proc_start", "managed_dir"))
+                else:
+                    # Unknown identity remains ephemeral for this generation and is never
+                    # persisted as a display-tag key.
+                    stable = "unidentified:" + harness + ":" + tag
+                session = dict(row)
+                session["order_key"] = stable
+                sessions.append(session)
+                tag_keys[tag] = stable
+                repo_by_tag[tag] = str(row.get("repo_id", row.get("repo", "")))
+                tags_by_key[stable] = tag
+            saved = order.load_order()
+            reconciled = order.reconcile_order(saved, model.repos, sessions)
+            ordered_sessions = reconciled["sessions"]
+            ordered_tags = [str(row.get("tag", "")) for row in ordered_sessions]
+            ordering = {
+                "saved": {"repos": list(reconciled["repo_order"]),
+                          "sessions": reconciled["session_order"]},
+                "repo_keys": list(reconciled["repo_order"]),
+                "session_keys": {key: list(value) for key, value in reconciled["session_order"].items()},
+                "tag_keys": tag_keys, "repo_by_tag": repo_by_tag,
+                "tags_by_key": tags_by_key,
+                "tag_cycle": ["session:" + tag for tag in ordered_tags],
+            }
+            model = replace(model, repos=tuple(reconciled["repos"]),
+                            sessions=tuple(ordered_sessions), ordering=ordering)
+        except (AttributeError, TypeError, ValueError):
+            # Preserve a valid frame if a third-party snapshot violates an optional
+            # ordering identity shape; malformed order files are handled by load_order.
+            pass
         readiness = getattr(model, "readiness", None)
         if readiness is None:
             observations = getattr(snapshot, "observations", None)
@@ -38,7 +93,23 @@ class ExplorerRuntime:
         return model, readiness
 
     def apply_effects(self, effects, vm):
-        """Apply runtime-owned effects after reduction; the initial seam is inert."""
+        """Apply persisted ordering effects after the pure reducer accepts a drop."""
+        from . import order
+        ordering = getattr(vm, "ordering", None)
+        if not isinstance(ordering, Mapping):
+            return None
+        saved = {"repos": list(ordering.get("repo_keys", ())),
+                 "sessions": {str(key): list(value) for key, value in
+                              ordering.get("session_keys", {}).items()}}
+        for effect in effects or ():
+            if not effect or effect[0] != "reorder" or len(effect) < 5:
+                continue
+            _name, kind, repo, source, target = effect[:5]
+            if kind == "repo":
+                saved = order.move_repo(saved, source, target)
+            elif kind == "session":
+                saved = order.move_session(saved, repo, source, target)
+            order.save_order(saved)
         return None
 
     def loading_frame(self, cols, rows):

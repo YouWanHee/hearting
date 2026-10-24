@@ -265,28 +265,25 @@ def sanitize_reference(renderer) -> None:
             feed[index] = (*item[:-1], _same_width(str(item[-1]), width))
 
 
+def _peer_cards(renderer):
+    """Owner-stage rows under each PEERS card, in the VM's general ``cards[tag].owners`` shape.
+
+    The reference hand-writes these rows per tag; the live adapter builds the same shape from
+    the session's routes (see the field contract). Stage names pass through the same scrub as
+    the route stages; labels and states are the reference's displayed words.
+    """
+    cards = {}
+    for tag, owners in renderer.mock5.OWN.items():
+        cards[tag] = {"owners": [
+            {"state": state, "label": label,
+             "stages": [_scrub({"name": name, "state": stage_state}, renderer.width)
+                        for name, stage_state in stages]}
+            for state, label, stages in owners]}
+    return cards
+
+
 def _fixture_values(renderer):
     """Project complete, already scrubbed reference records into the stable VM shape."""
-    literal_sources = {
-        "mock13": {name: getattr(renderer, name) for name in
-                   ("ROOT_STATUS", "PROFILES", "PROFILE_MAP", "MODEL_CHOICES",
-                    "MODEL_SHOWN", "MAIN_ONLY", "CTX", "CTX_HOW", "PEER_CROSS",
-                    "PEER_SIDE_LANES", "PEER_PROJECTS") if hasattr(renderer, name)},
-        "mock5": {name: getattr(renderer.mock5, name) for name in ("OWN", "EXTRA")
-                  if hasattr(renderer.mock5, name)},
-        "mock6": {name: getattr(renderer.mock6, name) for name in
-                  ("OWN", "EXTRA", "LINKS", "PEER_CROSS", "PEER_SIDE_LANES")
-                  if hasattr(renderer.mock6, name)},
-        "mock3": {name: getattr(renderer.mock3, name) for name in
-                  ("MEMORY", "COMPUTE", "FEED", "USAGE") if hasattr(renderer.mock3, name)},
-        "mock4": {name: getattr(renderer.mock4, name) for name in
-                  ("MEMORY", "QUESTIONS", "ANSWERED", "ROOT_STATUS") if hasattr(renderer.mock4, name)},
-        "opencode_palette": {name: renderer.mock2.K[name] for name in ("hb_opencode", "h_opencode")
-                              if name in renderer.mock2.K},
-    }
-    # The public fixture keeps shape and widths for literal-only drawing data, but no model
-    # identifiers, private text, paths, titles, or source bodies.
-    literal_sources = _redact_blob(_jsonable(literal_sources), renderer.width)
     gpu_processes = []
     for (host, gpu), processes in getattr(renderer, "GPU_PROCS", {}).items():
         for process in processes:
@@ -398,7 +395,8 @@ def _fixture_values(renderer):
         "peer_nodes": _safe_records(renderer.PEER_PROJECTS, renderer.width, 0),
         "peer_edges": {"links": _scrub(renderer.mock6.LINKS, renderer.width),
                        "cross": _scrub(renderer.PEER_CROSS, renderer.width),
-                       "side_lanes": _scrub(renderer.PEER_SIDE_LANES, renderer.width)},
+                       "side_lanes": _scrub(renderer.PEER_SIDE_LANES, renderer.width),
+                       "cards": _peer_cards(renderer)},
         "compute": _safe_records(renderer.mock3.COMPUTE, renderer.width, 0),
         "memory": _safe_memory(getattr(renderer.mock4, "MEMORY", []), renderer.width),
         "models": _jsonable({
@@ -453,7 +451,7 @@ def _fixture_values(renderer):
         },
         "events": [list(item[:-1]) + [_same_width(str(item[-1]), renderer.width)]
                    for item in renderer.mock3.FEED],
-        "source_records": {"reference_literals": literal_sources},
+        "source_records": {},
     }
 
 
@@ -933,16 +931,18 @@ def build(reference: Path, output: Path) -> dict:
                 "and ordered hit array for every state. source.json points to view_model.json, which "
                 "contains the same source values; long redacted strings use the fixture's transparent "
                 "zlib/base85 encoding and test helpers decode them on load.\n\n"
-                "PEERS cells are checked against the approved reference outside the explicit pane "
-                "interior (x=34 through the last content column, rows 3-40); its joined header, left "
-                "rail, and bottom frame remain exact. Ordered hits are checked outside that same pane "
-                "region at 140 and 168 columns, including the filtered f5 state. The independent "
-                "renderer’s hand-placed repository frames and link lanes remain the PEERS pane oracle.\n\n"
+                "PEERS is exact like every other state: all cells and ordered hits at 140 and 168 "
+                "columns, including the filtered f5 state. Its drawing data is general: "
+                "`peer_edges.cards[tag].owners` carries the owner-stage rows the reference hand-writes "
+                "per tag; the GPU and question lines, lane labels and the clear marker are derived from "
+                "the session, question, link and seat records. The reference draws the repository-frame "
+                "watch footer only for a repo named `hearting`; the scrubbed repo name differs, so the "
+                "golden carries none and `peer_edges.watches` is empty here.\n\n"
                 "transitions.json is compact unindented JSON: cases store each viewer-main input chunk "
                 "and a trace of state/frame references; shared frames intern identical frames, while "
                 "the rows pool interns repeated cell rows stored as exact run-length records. Transition "
-                "PEERS frames compare cells and ordered hits outside that pane region; other transition "
-                "frames compare all cells and ordered hits exactly. The manifest default is r14 DESIGN=4.\n\n"
+                "Every transition frame, PEERS included, compares all cells and ordered hits exactly. "
+                "The manifest default is r14 DESIGN=4.\n\n"
                 "Repository-only test runs compare the committed goldens. Running freeze_explorer.py "
                 "--check with the external approved reference directory re-verifies provenance using "
                 "the input hashes in manifest.json. The reference renderer and PNGs are intentionally "

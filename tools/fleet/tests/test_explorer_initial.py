@@ -17,7 +17,9 @@ class InitialReadinessTests(unittest.TestCase):
         pending = {"observations": {"usage": {"state": "pending"},
                                      "models": {"state": "unavailable"}}}
         prepared, readiness = runtime.prepare(pending, None, vm=vm, generation=0, now=1.0)
-        self.assertIs(prepared, vm)
+        # The model is the one already built (never rebuilt); prepare may only add its ordering record.
+        self.assertEqual({key: value for key, value in prepared.to_mapping().items() if key != "ordering"},
+                         {key: value for key, value in vm.to_mapping().items() if key != "ordering"})
         self.assertEqual(readiness["pending"], ("usage",))
         self.assertEqual(readiness["sources"]["models"]["state"], "unavailable")
         self.assertFalse(readiness["ready"])
