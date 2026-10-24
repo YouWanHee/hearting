@@ -2716,6 +2716,52 @@ class CompletedSpecPublicationTest(ProducerTestBase):
                                          "--cycle", cycle["cycle_id"]]), P.OK)
             self.assertNotIn("shared_publication", json.loads(output.getvalue()))
 
+    def test_unseeded_completed_code_cycle_stays_not_applicable_after_campaign_cleanup(self):
+        self.assertEqual(Path(P.__file__).resolve(), Path(__file__).with_name("artifact_producer.py").resolve())
+        self.activate()
+        route, path, cycle = self.begin("direct", "autopilot-code", "dev")
+        self.write_output(cycle, rel="plans/fixture/final_report.md", data=b"PASS\n")
+        self.close(route, path)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+
+        cycle_dir = Path(cycle["cycle_dir"])
+        campaign_dir = cycle_dir.parent
+        campaigns = self.root / "campaigns"
+        self.assertEqual(campaign_dir.parent, campaigns)
+        original_campaign_rel = campaign_dir.relative_to(campaigns)
+        moved_campaign = Path(self._tmp.name) / "removed-unseeded-campaign"
+        self.assertFalse((cycle_dir / "artifacts/spec").exists())
+        snapshot_dir = P.artifact_lifecycle.manifest_snapshot_dir(self.root, cycle["cycle_id"])
+        before_records = {
+            "route": path.read_bytes(),
+            "outcome": R.outcome_path(path).read_bytes(),
+            "cycle_record": P.cycle_record_path(self.root, cycle["cycle_id"]).read_bytes(),
+            "cycle_manifest": (cycle_dir / "manifest.json").read_bytes(),
+            "manifest_snapshots": {p.name: p.read_bytes() for p in snapshot_dir.glob("*.json")},
+        }
+        campaign_dir.rename(moved_campaign)
+
+        with mock.patch.object(P, "list_references",
+                               side_effect=AssertionError("unseeded cleanup must not scan shared refs")), \
+                mock.patch.object(P, "admit_shared",
+                                  side_effect=AssertionError("unseeded cleanup must not admit shared refs")):
+            self.assertEqual(self._publish(cycle), {"cycle_id": cycle["cycle_id"], "status": "not-applicable"})
+            self.assertEqual(P.completed_route_spec_publication(route, settle=False),
+                             {"status": "not-applicable"})
+            self.assertEqual(P.status(self.root)["shared_spec_publications"], [])
+
+        self.assertFalse((campaigns / original_campaign_rel).exists())
+        self.assertTrue(moved_campaign.is_dir())
+        self.assertFalse((campaigns / original_campaign_rel / cycle_dir.name / "artifacts/spec").exists())
+        after_records = {
+            "route": path.read_bytes(),
+            "outcome": R.outcome_path(path).read_bytes(),
+            "cycle_record": P.cycle_record_path(self.root, cycle["cycle_id"]).read_bytes(),
+            "cycle_manifest": (moved_campaign / cycle_dir.name / "manifest.json").read_bytes(),
+            "manifest_snapshots": {p.name: p.read_bytes() for p in snapshot_dir.glob("*.json")},
+        }
+        self.assertEqual(before_records, after_records)
+
     def test_code_seed_and_restored_version_history_without_authoring_delta_are_noop(self):
         self.activate()
         _, _base_path, base = self._completed({
@@ -2738,6 +2784,85 @@ class CompletedSpecPublicationTest(ProducerTestBase):
             self.assertEqual(publication["status"], "not-applicable", publication)
         self.assertFalse(any(row["cycle_id"] == cycle["cycle_id"]
                              for row in P.status(self.root)["shared_spec_publications"]))
+
+    def test_code_seed_only_cleanup_does_not_scan_references(self):
+        self.activate()
+        _, _, base = self._completed({"c/prd.md": b"# Component base\n"})
+        published = self._publish(base)
+        self.assertEqual(published["status"], "admitted", published)
+        route, path, cycle = self.begin("direct", "autopilot-code", "dev")
+        spec_root = Path(cycle["cycle_dir"]) / "artifacts/spec"
+        transaction_spec = importlib.util.spec_from_file_location(
+            "spec_transaction_seed_only_cleanup", Path(__file__).with_name("spec-transaction.py"))
+        transaction = importlib.util.module_from_spec(transaction_spec)
+        transaction_spec.loader.exec_module(transaction)
+        transaction.seed_cycle_spec(spec_root, self.root, spec_root / "c")
+        self.close(route, path)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+
+        with mock.patch.object(P, "list_references",
+                               side_effect=AssertionError("seed-only code cycle must not scan shared refs")), \
+                mock.patch.object(P, "admit_shared",
+                                  side_effect=AssertionError("seed-only code cycle must not publish")):
+            self.assertEqual(self._publish(cycle)["status"], "not-applicable")
+        publications = P.status(self.root)["shared_spec_publications"]
+        self.assertFalse(any(row["cycle_id"] == cycle["cycle_id"] for row in publications))
+
+    def test_code_missing_seed_remains_pending_when_manifest_records_transaction(self):
+        self.activate()
+        _, _, base = self._completed({"c/prd.md": b"# Component base\n"})
+        published = self._publish(base)
+        self.assertEqual(published["status"], "admitted", published)
+        route, path, cycle = self.begin("direct", "autopilot-code", "dev")
+        spec_root = Path(cycle["cycle_dir"]) / "artifacts/spec"
+        transaction_spec = importlib.util.spec_from_file_location(
+            "spec_transaction_missing_seed_cleanup", Path(__file__).with_name("spec-transaction.py"))
+        transaction = importlib.util.module_from_spec(transaction_spec)
+        transaction_spec.loader.exec_module(transaction)
+        transaction.seed_cycle_spec(spec_root, self.root, spec_root / "c")
+        prd = spec_root / "c/prd.md"
+        prd.write_bytes(b"# Component changed\n")
+        self.close(route, path)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+        (spec_root / P.SPEC_BASE_RECEIPT).unlink()
+
+        with mock.patch.object(P, "admit_shared",
+                               side_effect=AssertionError("corrupt seed must not admit")):
+            publication = self._publish(cycle)
+        self.assertEqual((publication["status"], publication["reason"]),
+                         ("pending", "shared-base-invalid"), publication)
+
+    def test_code_interrupted_publication_reuses_exact_revision(self):
+        self.activate()
+        _, _, base = self._completed({"c/prd.md": b"# Component base\n"})
+        initial = self._publish(base)
+        self.assertEqual(initial["status"], "admitted", initial)
+        route, path, cycle = self.begin("direct", "autopilot-code", "dev")
+        spec_root = Path(cycle["cycle_dir"]) / "artifacts/spec"
+        transaction_spec = importlib.util.spec_from_file_location(
+            "spec_transaction_code_recovery", Path(__file__).with_name("spec-transaction.py"))
+        transaction = importlib.util.module_from_spec(transaction_spec)
+        transaction_spec.loader.exec_module(transaction)
+        transaction.seed_cycle_spec(spec_root, self.root, spec_root / "c")
+        (spec_root / "c/prd.md").write_bytes(b"# Component changed\n")
+        self.close(route, path)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+        manifest = Path(cycle["cycle_dir"]) / "manifest.json"
+        manifest_bytes = manifest.read_bytes()
+        outcome_bytes = R.outcome_path(path).read_bytes()
+
+        with mock.patch.object(P, "_commit_shared",
+                               side_effect=P.ProducerError("shared-base-mismatch", "fixture interruption")):
+            pending = self._publish(cycle)
+        self.assertEqual(pending["status"], "pending", pending)
+        journal = next(P.shared_journal_path(self.root, "probe").parent.glob("*.json"))
+        revision_id = json.loads(journal.read_text())["revision_id"]
+        recovered = self._publish(cycle)
+        self.assertEqual(recovered["status"], "admitted", recovered)
+        self.assertEqual(recovered["shared_reference_revision_id"], revision_id)
+        self.assertFalse(journal.exists())
+        self.assertEqual(manifest.read_bytes(), manifest_bytes)
+        self.assertEqual(R.outcome_path(path).read_bytes(), outcome_bytes)
 
     def test_completed_missing_lineage_is_detected_and_normal_completion_admits_once(self):
         self.activate()

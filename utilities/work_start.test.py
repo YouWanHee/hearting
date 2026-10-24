@@ -2595,6 +2595,72 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
 GF = load("work_start_group_fixture", W.ROOT / "utilities/artifact_workflow_groups.test.py")
 
 
+class UnseededCodeCleanupWorkStartTest(GF.fixture.ProducerTestBase):
+    """A completed ordinary code route stays complete after owned payload cleanup."""
+
+    def test_campaign_cleanup_does_not_create_shared_publication_attention(self):
+        import artifact_producer
+
+        self.assertEqual(Path(artifact_producer.__file__).resolve(),
+                         Path(__file__).with_name("artifact_producer.py").resolve())
+        self.assertEqual(Path(W.__file__).resolve(), Path(__file__).with_name("work_start.py").resolve())
+        self.activate()
+        route = GF.fixture.R.compose_route(
+            capability="autopilot-code", capability_mode="dev", shape="direct", graph=None,
+            slug="unseeded-cleanup-start", cwd=W.ROOT, artifact_root=self.root,
+            campaign_key="unseeded-cleanup-start", parent_harness="codex", spec_read="fixture",
+            drift_verdict="within-spec",
+            work_request={"text": "Complete the isolated cleanup regression.", "owner_harness": "codex"})
+        binding = GF.fixture.L.admit_runtime_route(self.root, route)
+        path = Path(binding.route_file)
+        cycle = artifact_producer.begin(self.root, route_file=path,
+                                        capability="autopilot-code", intensity="direct")
+        self.write_output(cycle, rel="plans/fixture/final_report.md", data=b"PASS\n")
+        self.close(route, path)
+        artifact_producer.finalize(self.root, cycle_id=cycle["cycle_id"])
+
+        cycle_dir = Path(cycle["cycle_dir"])
+        campaign_dir = cycle_dir.parent
+        campaigns = self.root / "campaigns"
+        self.assertEqual(campaign_dir.parent, campaigns)
+        original_campaign_rel = campaign_dir.relative_to(campaigns)
+        moved_campaign = Path(self._tmp.name) / "removed-unseeded-campaign"
+        self.assertFalse((cycle_dir / "artifacts/spec").exists())
+        snapshot_dir = artifact_producer.artifact_lifecycle.manifest_snapshot_dir(
+            self.root, cycle["cycle_id"])
+        before_records = {
+            "route": path.read_bytes(),
+            "outcome": GF.fixture.R.outcome_path(path).read_bytes(),
+            "cycle_record": artifact_producer.cycle_record_path(self.root, cycle["cycle_id"]).read_bytes(),
+            "cycle_manifest": (cycle_dir / "manifest.json").read_bytes(),
+            "manifest_snapshots": {p.name: p.read_bytes() for p in snapshot_dir.glob("*.json")},
+        }
+        campaign_dir.rename(moved_campaign)
+
+        with mock.patch.object(artifact_producer, "list_references",
+                               side_effect=AssertionError("unseeded cleanup must not scan shared refs")), \
+                mock.patch.object(artifact_producer, "admit_shared",
+                                  side_effect=AssertionError("unseeded cleanup must not admit shared refs")), \
+                mock.patch.object(artifact_producer, "prepare_route_artifact_env",
+                                  side_effect=AssertionError("closed route must not be reopened")):
+            result = W.start_work(json.loads(path.read_text()), path, self.jobs)
+
+        self.assertEqual((result["state"], result["required_action"]),
+                         ("completed", "advance-completed"), result)
+        self.assertNotIn("shared_publication", result)
+        self.assertFalse((campaigns / original_campaign_rel).exists())
+        self.assertTrue(moved_campaign.is_dir())
+        self.assertFalse((campaigns / original_campaign_rel / cycle_dir.name / "artifacts/spec").exists())
+        after_records = {
+            "route": path.read_bytes(),
+            "outcome": GF.fixture.R.outcome_path(path).read_bytes(),
+            "cycle_record": artifact_producer.cycle_record_path(self.root, cycle["cycle_id"]).read_bytes(),
+            "cycle_manifest": (moved_campaign / cycle_dir.name / "manifest.json").read_bytes(),
+            "manifest_snapshots": {p.name: p.read_bytes() for p in snapshot_dir.glob("*.json")},
+        }
+        self.assertEqual(before_records, after_records)
+
+
 class GroupContextStartTest(GF.fixture.ProducerTestBase):
     """Actual compose/admit/start/producer seams with no live roots or workers."""
     _cycles = GF.WorkflowGroupsTest._cycles

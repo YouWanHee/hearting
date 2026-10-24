@@ -1828,7 +1828,7 @@ def status(root: Path) -> Dict[str, Any]:
     fallback = legacy_fallback_state(root, classification=klass)
     specs = [r for r in records if r.get("capability") == "autopilot-spec" and r.get("state") == "sealed"]
     code_specs = [r for r in records if r.get("capability") == "autopilot-code"
-                  and r.get("state") == "sealed" and _code_cycle_has_spec_source(root, r)]
+                  and r.get("state") == "sealed" and _code_cycle_has_publication_obligation(root, r)]
     publication_cycles = [*specs, *code_specs]
     references = list_references(root, "spec") if publication_cycles else []
     # Read shared revision metadata once per status call, not once per cycle.
@@ -9129,18 +9129,136 @@ def _spec_source_manifest_hints(root: Path, record: Mapping[str, Any], source_re
     return has_source, has_seed
 
 
-def _code_cycle_has_spec_source(root: Path, record: Mapping[str, Any]) -> bool:
-    """Cheap census guard: unseeded code cycles with no spec output are not candidates."""
+def _code_cycle_snapshot_spec_hints(root: Path, record: Mapping[str, Any],
+                                    source_rel: str) -> Optional[Tuple[bool, bool]]:
+    """Read source/seed evidence from the exact sealed manifest history.
+
+    The cycle payload may be ordinarily removed after completion. Its immutable
+    manifest snapshot still distinguishes an unseeded code cycle from a cycle
+    with a real spec transaction. Unknown or damaged evidence stays visible to
+    the existing publication classifier.
+    """
+    cycle_id = record.get("cycle_id")
+    campaign_id = record.get("campaign_id")
+    digest = record.get("manifest_digest")
+    if (not isinstance(cycle_id, str) or not isinstance(campaign_id, str)
+            or not isinstance(digest, str)):
+        return None
     try:
-        directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
-        source_rel = _placed_locator("artifacts/spec", _output_placements(root, record))
-        source_path = directory / source_rel
+        snapshots = artifact_lifecycle.read_manifest_snapshots(root, cycle_id)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    exact = [document for _raw, document in snapshots
+             if artifact_manifest.manifest_digest(document) == digest]
+    if len(exact) != 1:
+        return None
+    sealed = exact[0]
+    if not artifact_manifest.validate(sealed).ok:
+        return None
+    cycle = sealed.get("cycle")
+    producer = sealed.get("producer")
+    routes = sealed.get("routes")
+    if (not isinstance(cycle, Mapping) or cycle.get("cycle_id") != cycle_id
+            or cycle.get("campaign_id") != campaign_id
+            or cycle.get("state") != record.get("cycle_state")
+            or not isinstance(producer, Mapping)):
+        return None
+    revision = producer.get("source_revision")
+    parts = revision.split("/") if isinstance(revision, str) else []
+    if (len(parts) < 2 or parts[0] != record.get("capability")
+            or parts[1] != record.get("intensity") or not isinstance(routes, list)
+            or not any(isinstance(row, Mapping)
+                       and row.get("route_id") == record.get("route_id")
+                       and row.get("route_hash") == record.get("route_hash") for row in routes)):
+        return None
+
+    prefix = source_rel.rstrip("/") + "/"
+    has_source = has_seed = False
+    for _raw, document in snapshots:
+        if not artifact_manifest.validate(document).ok:
+            return None
+        snapshot_cycle = document.get("cycle")
+        snapshot_producer = document.get("producer")
+        snapshot_routes = document.get("routes")
+        if (not isinstance(snapshot_cycle, Mapping)
+                or snapshot_cycle.get("campaign_id") != campaign_id
+                or not isinstance(snapshot_producer, Mapping)
+                or snapshot_producer.get("source_revision") != revision
+                or not isinstance(snapshot_routes, list)
+                or not any(isinstance(row, Mapping)
+                           and row.get("route_id") == record.get("route_id")
+                           and row.get("route_hash") == record.get("route_hash") for row in snapshot_routes)):
+            return None
+        rows = document.get("artifact_revisions")
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            locator = row.get("locator") if isinstance(row, Mapping) else None
+            path = locator.get("path") if isinstance(locator, Mapping) else None
+            if not isinstance(path, str):
+                return None
+            if path == source_rel or path.startswith(prefix):
+                has_source = True
+                if path == prefix + SPEC_BASE_RECEIPT:
+                    has_seed = True
+    return has_source, has_seed
+
+
+def _code_cycle_has_publication_obligation(root: Path, record: Mapping[str, Any]) -> bool:
+    """Keep code cycles out of shared-spec work unless a seed may obligate it."""
+    source_rel = _placed_locator("artifacts/spec", _output_placements(root, record))
+    hints = _code_cycle_snapshot_spec_hints(root, record, source_rel)
+    if hints is not None and not hints[1]:
+        # The exact immutable cycle history proves no code spec transaction
+        # was ever seeded. Ordinary payload cleanup cannot add one later.
+        return False
+    try:
+        # This also keeps a present but corrupt manifest on the existing typed
+        # refusal path. Only the exact missing-campaign cleanup shape may use
+        # immutable snapshot evidence below.
+        _published_cycle_state(root, record)
+    except ProducerError as exc:
+        if (exc.code == "sealed-cycle-state-unknown"
+                and f"{record.get('cycle_id')}: campaign-locator=missing" in exc.detail):
+            if hints is not None:
+                return hints[1]
+        # A damaged or positively seeded cycle remains visible to the normal
+        # completion classifier; no broad exception becomes not-applicable.
+        return True
+
+    try:
+        manifest_path = _record_cycle_manifest_path(root, record)
+        source_path = manifest_path.parent / source_rel
         if _path_entry_present(source_path / SPEC_BASE_RECEIPT):
+            seed = _read_json(source_path / SPEC_BASE_RECEIPT)
+            if not isinstance(seed, Mapping):
+                return True
+            if _code_spec_tree_changed(root, record, source_rel, source_path, seed):
+                return True
+            reference_id = seed.get("reference_id")
+            if not isinstance(reference_id, str):
+                # Without the seed's exact reference identity, retain the
+                # existing classifier and its lineage/replay check.
+                return True
+            reference = _read_json(_reference_path(root, "spec", reference_id))
+            if not isinstance(reference, Mapping):
+                return True
+            _revision_id, finished = _finished_spec_publication(
+                root, reference, record["cycle_id"], source_rel, record, source_path, None)
+            return finished is not None
+        if source_path.is_symlink():
             return True
-        has_source, _has_seed = _spec_source_manifest_hints(root, record, source_rel)
-        return has_source
-    except (ProducerError, OSError, ValueError, KeyError, TypeError):
-        # Keep a damaged sealed code cycle visible to the normal classifier.
+        has_source, has_seed = _spec_source_manifest_hints(root, record, source_rel)
+        return has_seed
+    except ProducerError as exc:
+        if (exc.code == "sealed-cycle-state-unknown"
+                and f"{record.get('cycle_id')}: campaign-locator=missing" in exc.detail):
+            hints = _code_cycle_snapshot_spec_hints(root, record, source_rel)
+            if hints is not None:
+                return hints[1]
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        # Keep a damaged or unresolvable sealed code cycle visible.
         return True
 
 
@@ -9203,7 +9321,13 @@ def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = Fals
         capability = record.get("capability")
         if capability not in {"autopilot-spec", "autopilot-code"}:
             return result
-        if record.get("state") != "sealed" or _published_cycle_state(root, record) != "completed":
+        if record.get("state") != "sealed":
+            return {**result, "reason": "spec-work-not-completed"}
+        if (capability == "autopilot-code"
+                and not _code_cycle_has_publication_obligation(root, record)):
+            return result
+        published_state = _published_cycle_state(root, record)
+        if published_state != "completed":
             return {**result, "reason": "spec-work-not-completed"}
         directory = cycle_dir(root, record["campaign_id"], cycle_id, record)
         source_rel = _placed_locator("artifacts/spec", _output_placements(root, record))
