@@ -19,7 +19,8 @@ python3 tools/release/first-journey.py run --source published --model-free --out
 Login is performed in an isolated environment and retains only the selected
 harness credential under `/tmp/hearting-measure-auth-UID`. OpenCode V1 keeps
 using `opencode/auth.json`. OpenCode V2 stores the bounded
-`auth export --standalone` payload in `opencode/credentials-v2.json`; each
+`auth export --standalone` payload in the `credentials-v2.json` file in the
+`opencode` directory; each
 fresh run imports it with `auth import --standalone`, then exports it again
 under the same exclusive lock after the task. V2 commands include
 `--standalone`. The runner determines the generation once from the sandboxed
