@@ -274,6 +274,42 @@ function targetFiles(ctx, tool, args) {
   return []
 }
 
+function appendSpecSyncNudge(ctx, input, output, harnessRoot) {
+  const args = input.args || output.args || {}
+  const toolName = typeof input.tool === "string" ? input.tool : input.tool?.name || ""
+  if ((toolName !== "edit" && toolName !== "apply_patch") || typeof output?.output !== "string") return Promise.resolve()
+  return new Promise((resolve) => {
+    let settled = false
+    let stdout = ""
+    let child
+    let timer
+    const finish = (code) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      if (code === 0 && stdout.trim()) output.output += "\n" + stdout.trim()
+      resolve()
+    }
+    const cwd = typeof args.workdir === "string" ? path.resolve(baseDir(ctx), args.workdir) : baseDir(ctx)
+    try {
+      child = spawn("bash", [path.join(harnessRoot, "hooks", "spec-sync-nudge.sh"), "--format", "text"], {
+        cwd, env: { ...process.env, AGENT_HOME: harnessRoot }, stdio: ["pipe", "pipe", "ignore"],
+      })
+      child.stdout?.setEncoding("utf8")
+      child.stdout?.on("data", (chunk) => { stdout += chunk })
+      child.once("error", () => finish(null))
+      child.once("close", (code) => finish(code))
+      timer = setTimeout(() => {
+        try { child.kill("SIGKILL") } catch { /* fail-open timeout */ }
+        finish(null)
+      }, 8000)
+      child.stdin.end(JSON.stringify({ hook_event_name: "PostToolUse", cwd, tool_name: toolName, tool_input: args }))
+    } catch {
+      finish(null)
+    }
+  })
+}
+
 function isDesignHtml(file) {
   return /\.html?$/i.test(file) && designPattern.test(file.replaceAll(path.sep, "/"))
 }
@@ -938,11 +974,14 @@ async function setupOpenCodeV2(ctx) {
     await hooks["tool.execute.before"]?.(input, output)
   }))
   await ctx.tool.hook("execute.after", async (event) => withSession(event.sessionID, async () => {
-    if (v2WorkerSessions.has(event.sessionID)) return
     const content = event.status === "completed" ? event.result?.content : []
     const output = { output: Array.isArray(content)
       ? content.map((part) => part?.text || "").filter(Boolean).join("\n") : "",
       metadata: event.status === "error" ? { exit: 1 } : {} }
+    if (v2WorkerSessions.has(event.sessionID)) {
+      await appendSpecSyncNudge(ctx, { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output, root)
+      return
+    }
     await hooks["tool.execute.after"]?.(
       { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output)
   }))
@@ -2555,6 +2594,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
     }
   },
   "tool.execute.after": async (input, output) => {
+    await appendSpecSyncNudge(ctx, input, output, root)
     observePaneCallback(ctx, "tool.execute.after", input.sessionID || "")
     const args = input.args || output.args || {}
     const toolName = typeof input.tool === "string" ? input.tool : input.tool?.name || ""
