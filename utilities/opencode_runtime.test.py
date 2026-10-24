@@ -79,6 +79,19 @@ class OpenCodeRunCodecTest(unittest.TestCase):
                 self.assertFalse(runtime.is_v2(binary="injected-opencode", environ=env))
                 self.assertFalse(runtime.is_v2(environ=env, version=(1, 19, 0)))
 
+    def test_ambient_public_version_api_resolves_fixture_home_without_path_binary(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as empty_path:
+            binary = Path(home) / ".opencode" / "bin" / "opencode"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\nprintf '2.0.32\\n'\n")
+            binary.chmod(0o755)
+            runtime.runtime_version.cache_clear()
+            with unittest.mock.patch.dict(os.environ, {"HOME": home, "PATH": empty_path}, clear=True):
+                self.assertEqual(runtime.runtime_version(), (2, 0, 32))
+                runtime.runtime_version.cache_clear()
+                self.assertTrue(runtime.is_v2())
+            runtime.runtime_version.cache_clear()
+
     def test_explicit_argument_wins_over_opencode_bin(self):
         with tempfile.TemporaryDirectory() as temp:
             chosen = self._cli(Path(temp) / "chosen" / "opencode", "1.19.0")

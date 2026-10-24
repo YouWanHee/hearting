@@ -693,22 +693,25 @@ class LeasesTest(unittest.TestCase):
         tmux = shutil.which("tmux")
         if tmux is None:
             self.skipTest("tmux is not installed")
-        # This integration needs tmux's per-session environment transport. Probe
-        # that exact capability on a disposable server; old tmux versions may
-        # exit successfully while ignoring the unsupported -e option.
+        # Only skip when the platform cannot start an isolated disposable
+        # server. The launch itself exercises the supported shell transport,
+        # including tmux versions without new-session -e.
         server = "hearting-cap-%s-%x" % (os.getpid(), abs(hash(self.id())))
-        probe = subprocess.run(
-            [tmux, "-L", server, "new-session", "-d", "-e", "HEARTING_PROBE=1",
-             "-s", "hearting-probe", "true"],
-            capture_output=True, text=True, timeout=5)
-        subprocess.run([tmux, "-L", server, "kill-server"],
-                       capture_output=True, timeout=5)
-        if probe.returncode:
-            reason = probe.stderr.strip() or probe.stdout.strip() or "new-session -e rejected"
-            self.skipTest("installed tmux lacks new-session -e: " + reason)
+        probe = subprocess.run([tmux, "-L", server, "start-server"],
+                               capture_output=True, text=True, timeout=5)
+        try:
+            if probe.returncode:
+                reason = probe.stderr.strip() or probe.stdout.strip() or "disposable server unavailable"
+                self.skipTest("cannot start disposable tmux server: " + reason)
+        finally:
+            subprocess.run([tmux, "-L", server, "kill-server"],
+                           capture_output=True, timeout=5)
         spec = importlib.util.spec_from_file_location("_gpu_end_to_end_compute", Path(G.__file__).with_name("compute-hosts.py"))
         tool = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(tool)
+        launch_server = G.tmux_server_name(self.state)
+        self.addCleanup(subprocess.run, [tmux, "-L", launch_server, "kill-server"],
+                        capture_output=True, timeout=5)
         finish = self.root / "finish"
         code = ("import os,time; from pathlib import Path; print(os.environ['CUDA_VISIBLE_DEVICES'],flush=True); "
                 "end=time.monotonic()+10; p=Path(%r); "
@@ -718,7 +721,8 @@ class LeasesTest(unittest.TestCase):
         real_run = subprocess.run
         def local_remote(_host, script, **kwargs):
             return real_run(["bash", "-c", script], capture_output=True, text=True, timeout=10,
-                            env={**os.environ, "PATH": str(self.no_tmux_bin)})
+                            env={**os.environ, "PATH": str(self.no_tmux_bin) + os.pathsep +
+                                 str(Path(tmux).parent)})
         output, warning = io.StringIO(), io.StringIO()
         with mock.patch.object(tool, "load_config", return_value={"run_root": self.root / "managed-runs",
                          "hosts": {"fixture": {"ssh_host": "local"}}}), \
