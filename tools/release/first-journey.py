@@ -35,15 +35,27 @@ def persist_active_auth() -> None:
     try:
         if target.is_file() and not target.is_symlink():
             latest = target.read_bytes()
+            json.loads(latest)
             if latest != original:
                 temporary = store.with_name(store.name + ".tmp")
                 temporary.write_bytes(latest); os.chmod(temporary, 0o600); os.replace(temporary, store)
-    except OSError: pass
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError): pass
 
 
 def auth_signal(signum, _frame):
-    persist_active_auth()
     raise SystemExit(128 + signum)
+
+
+def _stop_process_group(process: subprocess.Popen) -> None:
+    """Stop and reap a started process and every child in its session."""
+    try: os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError: pass
+    try: process.wait(timeout=0.25)
+    except subprocess.TimeoutExpired: pass
+    try: os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError: pass
+    process.wait()
+    process.communicate()
 
 
 def safe_root(value: str, label: str, forbidden: list[Path]) -> Path:
@@ -90,13 +102,14 @@ def run(argv: list[str], *, env: dict[str, str], timeout: int, cwd: Path | None 
         return {"exit": process.returncode, "seconds": round(time.monotonic() - started, 3), "output": output[-12000:]}
     except subprocess.TimeoutExpired:
         if process:
-            try: os.killpg(process.pid, signal.SIGTERM); process.communicate(timeout=2)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                try: os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError: pass
+            _stop_process_group(process)
         return {"exit": 124, "seconds": round(time.monotonic() - started, 3), "output": "timeout"}
     except OSError as e:
         return {"exit": 127, "seconds": round(time.monotonic() - started, 3), "output": type(e).__name__}
+    except BaseException:
+        if process:
+            _stop_process_group(process)
+        raise
 
 
 def clean_env(home: Path, paths: list[Path], extras: dict[str, str] | None = None) -> dict[str, str]:
@@ -110,7 +123,8 @@ def clean_env(home: Path, paths: list[Path], extras: dict[str, str] | None = Non
 
 
 def sandbox(argv: list[str], world: Path, env: dict[str, str], cwd: Path | None = None,
-            cli: list[tuple[Path, str]] | None = None, probes: bool = False) -> list[str]:
+            cli: list[tuple[Path, str]] | None = None, probes: bool = False,
+            system_files: dict[str, Path] | None = None) -> list[str]:
     if platform.system() != "Linux":
         return argv
     bwrap = shutil.which("bwrap")
@@ -121,6 +135,13 @@ def sandbox(argv: list[str], world: Path, env: dict[str, str], cwd: Path | None 
             "--tmpfs", "/tmp", "--dir", "/run"]
     for directory in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/ssl", "/etc/ca-certificates"):
         if Path(directory).exists(): args += ["--ro-bind", directory, directory]
+    host_files = system_files if system_files is not None else {
+        name: Path("/etc") / name for name in ("resolv.conf", "hosts", "nsswitch.conf", "passwd", "group")}
+    for name, path in host_files.items():
+        if path.exists():
+            # Bind the resolved source to /etc/name so a resolver target under
+            # /run works even though /run is empty in the namespace.
+            args += ["--ro-bind", str(path.resolve()), f"/etc/{name}"]
     real_home = str(Path.home())
     # The world keeps its host path inside the namespace, so paths the product
     # records (symlinks, worktrees, configs) also resolve for host-side checks.
@@ -386,9 +407,34 @@ def turn_argv(harness: str, command: str, cwd: Path, sid: str | None, message: s
     return [command, "run", "--format", "json", *(["--session", sid] if sid else []), message]
 
 
+TRANSPORT_HELP = {
+    "claude": (["--help"], ("--resume", "--output-format")),
+    "codex": (["exec", "resume", "--help"], ("--json",)),
+    "opencode": (["run", "--help"], ("--session", "--format")),
+}
+
+
+def transport_result(harness: str, exit_code: int, output: str) -> dict:
+    required = TRANSPORT_HELP[harness][1]
+    missing = [flag for flag in required if flag not in output]
+    return {"supported": exit_code == 0 and not missing,
+            "exit": exit_code, "required_flags": list(required), "missing_flags": missing}
+
+
+def probe_transport(harness: str, executable: str, world: Path, env: dict[str, str],
+                    mounts: list[tuple[Path, str]], timeout: int) -> dict:
+    args, _required = TRANSPORT_HELP[harness]
+    result = run(sandbox([executable, *args], world, env, cli=mounts), env=env, timeout=timeout)
+    return transport_result(harness, result["exit"], result["output"])
+
+
 def headless_turn(harness: str, command: str, prompt: str, cwd: Path, world: Path,
-                  env: dict[str, str], timeout: int, mounts: list[tuple[Path, str]], judge=None) -> dict:
+                  env: dict[str, str], timeout: int, mounts: list[tuple[Path, str]], judge=None,
+                  transport_supported: bool = True) -> dict:
     """Drive one task session: answer only the confirmation card, stop on anything else."""
+    if not transport_supported:
+        return {"status": "unsupported-headless-transport", "turns": [], "canned_answers": 0,
+                "session_id": None, "turn_index": 0, "output": ""}
     deadline = time.monotonic() + timeout
     turns: list[dict] = []; texts: list[str] = []; answers = 0; sid = None; message = prompt
     status = "task-incomplete"
@@ -533,17 +579,21 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
             for name in ("claude", "codex", "opencode", "herdr"):
                 probe = run(sandbox(["sh", "-c", f"command -v {name}"], world, env, cli=cli_mounts), env=env, timeout=args.step_timeout)
                 if probe["exit"] == 0: visible.append(name)
-            versions = {}
+            versions = {}; transport_supported = {}
             for name in PROFILES[profile]:
                 if name in binaries:
                     version = run(sandbox([binaries[name][1], "--version"], world, env, cli=cli_mounts), env=env, timeout=args.step_timeout)
                     versions[name] = version["output"][-120:].strip().replace(str(world), "<world>") if version["exit"] == 0 else "unknown"
+                    if name in TASK_HARNESSES[profile]:
+                        transport_supported[name] = probe_transport(name, binaries[name][1], world, env,
+                                                                     cli_mounts, args.step_timeout)
             expected_visible = ["claude"] if profile == "claude-only" else ["claude", "codex", "opencode"]
             record["environment"] = {"visible_cli_names": visible, "cli_versions": versions,
                                       "transport_flags": {"claude": "-p --output-format stream-json --verbose [--resume <id>]",
                                                           "codex": "exec --json --cd <repo> | exec resume --json <id>",
                                                           "opencode": "run --format json [--session <id>]"},
                                       "env_hygiene": ["DISABLE_AUTOUPDATER=1", "no permission flags"],
+                                      "transport_supported": transport_supported,
                                       "allowlist_names": sorted(env)}
             if visible != expected_visible: record["failures"].append({"reason": "cli-visibility-mismatch"})
             if platform.system() == "Linux":
@@ -623,6 +673,9 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                          "session_tokens": {"status":"unknown","input":None,"output":None,"total":None,"reason":"model-free"}}
             elif any(step["name"] == "install" and step["exit"] != 0 for step in record["steps"]):
                 model = {"status": "install-failed", "turns": 0, "canned_answers": 0, "session_tokens": {"status":"unknown","input":None,"output":None,"reason":"installation-failed"}}
+            elif not transport_supported.get(harness, {}).get("supported", False):
+                model = {"status": "unsupported-headless-transport", "turns": 0, "canned_answers": 0,
+                         "session_tokens": "unknown", "transport": transport_supported.get(harness)}
             elif not auth_file(Path(args.auth_root), harness).is_file():
                 model = {"status": "measurement-login-missing", "turns": 0, "canned_answers": 0, "session_tokens": "unknown"}
             elif not cli_map[harness]:
@@ -767,6 +820,7 @@ def write_report(record: dict, output: Path) -> None:
     env = record.get("environment", {})
     lines += ["", "## Environment", "", f"- Visible CLIs: {env.get('visible_cli_names')}",
               f"- CLI versions: {env.get('cli_versions')}", f"- Transport: {env.get('transport_flags')}",
+              f"- Transport supported: {env.get('transport_supported')}",
               f"- Env hygiene: {env.get('env_hygiene')}", f"- Env names: {env.get('allowlist_names')}",
               "", "## Isolation checks", ""]
     lines += [f"- {x['check']}: {'PASS' if x['passed'] else 'FAIL'}" for x in isolation.get("checks", [])] or ["- not-proven"]

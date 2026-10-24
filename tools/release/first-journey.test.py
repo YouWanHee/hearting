@@ -1,9 +1,12 @@
 import importlib.util
 import json
 import os
+import signal
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -199,6 +202,72 @@ class JourneyTests(unittest.TestCase):
         self.assertIn("--tmpfs /home ", joined)
         self.assertNotIn("/journey ", joined)
         self.assertIn(f"--setenv HOME {world}/home", joined)
+
+    def test_sandbox_read_only_binds_resolver_target_to_etc_resolv_conf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "resolver-target"; target.write_text("nameserver 192.0.2.1\n")
+            resolver = root / "resolv.conf"; resolver.symlink_to(target)
+            old_system = fj.platform.system
+            old_which = fj.shutil.which
+            try:
+                fj.platform.system = lambda: "Linux"
+                fj.shutil.which = lambda command: "/usr/bin/bwrap" if command == "bwrap" else old_which(command)
+                args = fj.sandbox(["true"], root / "world", {}, system_files={"resolv.conf": resolver})
+            finally:
+                fj.platform.system = old_system
+                fj.shutil.which = old_which
+        pairs = [args[i + 1:i + 3] for i, arg in enumerate(args[:-2]) if arg == "--ro-bind"]
+        self.assertIn([str(target), "/etc/resolv.conf"], pairs)
+
+    def test_run_kills_and_reaps_child_after_keyboard_interrupt(self):
+        if fj.platform.system() != "Linux": self.skipTest("process groups are exercised on Linux")
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child.pid"
+            script = "import os,time; open(%r,'w').write(str(os.getpid())); time.sleep(60)" % str(pidfile)
+            previous = signal.getsignal(signal.SIGUSR1)
+            signal.signal(signal.SIGUSR1, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+            def interrupt_when_started():
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not pidfile.exists(): time.sleep(0.01)
+                os.kill(os.getpid(), signal.SIGUSR1)
+            timer = threading.Timer(0.05, interrupt_when_started)
+            timer.start()
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    fj.run(["python3", "-c", script], env=dict(os.environ), timeout=30)
+            finally:
+                timer.cancel(); signal.signal(signal.SIGUSR1, previous)
+            child_pid = int(pidfile.read_text())
+            with self.assertRaises(ProcessLookupError): os.kill(child_pid, 0)
+
+    def test_invalid_auth_json_is_not_persisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "store.json"; store.write_text('{"token":"original"}')
+            target = Path(tmp) / "world-auth.json"; target.write_text('{"token":"')
+            previous = fj._ACTIVE_AUTH
+            try:
+                fj._ACTIVE_AUTH = (store, target, store.read_bytes())
+                fj.persist_active_auth()
+            finally:
+                fj._ACTIVE_AUTH = previous
+            self.assertEqual(store.read_text(), '{"token":"original"}')
+
+    def test_unsupported_transport_does_not_execute_task_argv(self):
+        calls = []
+        previous = fj.run
+        try:
+            fj.run = lambda argv, **kwargs: calls.append(argv) or {
+                "exit": 0, "seconds": 0, "output": "Usage: opencode run [prompt]"}
+            transport = fj.probe_transport("opencode", "opencode", Path("/tmp/world"), {}, [], 5)
+            outcome = fj.headless_turn("opencode", "opencode", "Fix the task", Path("/tmp/repo"),
+                                       Path("/tmp/world"), {}, 5, [], transport_supported=transport["supported"])
+        finally:
+            fj.run = previous
+        self.assertFalse(transport["supported"])
+        self.assertEqual(outcome["status"], "unsupported-headless-transport")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][-2:], ["run", "--help"])
 
 
 if __name__ == "__main__":
