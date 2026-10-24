@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +69,21 @@ def make_linked_fixture(base: Path):
 def payload(tool_input, *, cwd, tool_name="edit"):
     return json.dumps({"hook_event_name": "PostToolUse", "tool_name": tool_name,
                        "tool_input": tool_input, "cwd": str(cwd)})
+
+
+def instrumented_hook(base: Path, root: Path, *, resolver: str, reader: str, agent_home: str = ""):
+    hook_dir = base / "instrumented" / "hooks"
+    utilities = base / "instrumented" / "utilities"
+    hook_dir.mkdir(parents=True)
+    utilities.mkdir(parents=True)
+    shutil.copy2(HOOK, hook_dir / HOOK.name)
+    (utilities / "artifact-root.sh").write_text(resolver, encoding="utf-8")
+    (utilities / "artifact_reader.py").write_text(reader, encoding="utf-8")
+    if agent_home:
+        (utilities / "agent-home.sh").write_text(agent_home, encoding="utf-8")
+        (utilities / "agent-home.sh").chmod(0o755)
+    (utilities / "artifact-root.sh").chmod(0o755)
+    return hook_dir / HOOK.name
 
 
 class SpecSyncNudgeWiringTest(unittest.TestCase):
@@ -197,6 +213,63 @@ hooks.dispose?.({ silent: true });
                             input=payload({"file_path": "source.py", "old_string": "epoch = 30", "new_string": "epoch = 50"}, cwd=linked))
             self.assertIn("CYCLE_ONLY", cycle_hit.stdout)
             self.assertNotIn("SHARED_ONLY", cycle_hit.stdout)
+
+    def test_failed_reader_never_falls_back_to_legacy_spec(self):
+        for reader_body in ("import sys\nsys.exit(7)\n", "print('{not-json')\n"):
+            with self.subTest(reader=reader_body), tempfile.TemporaryDirectory(prefix="spec-sync-reader-fail-") as raw:
+                base = Path(raw)
+                root = base / "legacy-root"
+                legacy = root / "spec"
+                legacy.mkdir(parents=True)
+                (legacy / "prd.md").write_text("# Legacy\n- epoch = 30\n", encoding="utf-8")
+                source = base / "source.py"
+                source.write_text("epoch = 50\n", encoding="utf-8")
+                resolver = "#!/bin/sh\nprintf '%s\\n' \"$FIXTURE_ARTIFACT_ROOT\"\n"
+                hook = instrumented_hook(base, root, resolver=resolver, reader=reader_body)
+                env = clean_env(base / "home", FIXTURE_ARTIFACT_ROOT=root)
+                result = run(["bash", str(hook), "--format", "text"], cwd=base, env=env,
+                             input=payload({"file_path": str(source), "old_string": "epoch = 30",
+                                            "new_string": "epoch = 50"}, cwd=base))
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+
+    def test_no_candidates_launch_no_helper_subprocesses(self):
+        with tempfile.TemporaryDirectory(prefix="spec-sync-no-subprocess-") as raw:
+            base = Path(raw)
+            root = base / "root"
+            calls = base / "calls"
+            source = base / "source.py"
+            source.write_text("noise_probe = True\n", encoding="utf-8")
+            resolver = "#!/bin/sh\necho resolver >> \"$FIXTURE_CALLS\"\nprintf '%s\\n' \"$FIXTURE_ARTIFACT_ROOT\"\n"
+            reader = "from pathlib import Path\nimport os\nPath(os.environ['FIXTURE_CALLS']).write_text('reader\\n', encoding='utf-8')\n"
+            agent_home = "#!/bin/sh\necho agent-home >> \"$FIXTURE_CALLS\"\n"
+            hook = instrumented_hook(base, root, resolver=resolver, reader=reader, agent_home=agent_home)
+            env = clean_env(base / "home", FIXTURE_ARTIFACT_ROOT=root, FIXTURE_CALLS=calls)
+            result = run(["bash", str(hook), "--format", "text"], cwd=base, env=env,
+                         input=payload({"file_path": str(source), "old_string": "noise_probe",
+                                        "new_string": "noise_probe"}, cwd=base))
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+            self.assertFalse(calls.exists())
+
+    def test_deadline_bounds_lookup_and_returns_silently(self):
+        with tempfile.TemporaryDirectory(prefix="spec-sync-deadline-") as raw:
+            base = Path(raw)
+            root = base / "root"
+            calls = base / "calls"
+            source = base / "source.py"
+            source.write_text("epoch = 50\n", encoding="utf-8")
+            resolver = "#!/bin/sh\necho resolver >> \"$FIXTURE_CALLS\"\nsleep 2\nprintf '%s\\n' \"$FIXTURE_ARTIFACT_ROOT\"\n"
+            reader = "from pathlib import Path\nimport os\nPath(os.environ['FIXTURE_CALLS']).write_text('reader\\n', encoding='utf-8')\n"
+            hook = instrumented_hook(base, root, resolver=resolver, reader=reader)
+            env = clean_env(base / "home", FIXTURE_ARTIFACT_ROOT=root, FIXTURE_CALLS=calls,
+                            SPEC_SYNC_DEADLINE_MS="100")
+            started = time.monotonic()
+            result = run(["bash", str(hook), "--format", "text"], cwd=base, env=env,
+                         input=payload({"file_path": str(source), "old_string": "epoch = 30",
+                                        "new_string": "epoch = 50"}, cwd=base), timeout=3)
+            elapsed = time.monotonic() - started
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+            self.assertLess(elapsed, 1.0, f"deadline did not bound resolver: {elapsed:.3f}s")
+            self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["resolver"])
 
     def test_codex_posttooluse_array_preserves_original_five_entries(self):
         baseline = json.loads(subprocess.run(["git", "show", f"{BASELINE}:adapters/codex/hooks/hooks.json"],

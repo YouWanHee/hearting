@@ -15,7 +15,7 @@ EOF
 [ "${SPEC_SYNC_NUDGE:-1}" = 0 ] && { cat >/dev/null 2>&1; exit 0; }
 
 NUDGE_PY=$(cat <<'PY'
-import glob, json, os, re, subprocess, sys
+import glob, json, os, re, subprocess, sys, time
 
 def quiet_exit():
     raise SystemExit(0)
@@ -25,6 +25,14 @@ def safe_cap(name, default):
         return max(0, min(int(os.environ.get(name, str(default))), 1000))
     except Exception:
         return default
+
+def deadline_ms():
+    # Parent ceilings: Claude 10s; Codex 10s > bridge 8s; OpenCode 8s.
+    # Keep this shared hook at 6s by default, with an optional local override.
+    try:
+        return max(0, min(int(os.environ.get("SPEC_SYNC_DEADLINE_MS", "6000")), 60000))
+    except Exception:
+        return 6000
 
 def records_from_patch(patch):
     records = []
@@ -97,6 +105,17 @@ def direct_records(tool_input):
     return result
 
 def main():
+    deadline = time.monotonic() + deadline_ms() / 1000
+    def run_bounded(command, cap):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            return subprocess.run(command, capture_output=True, text=True,
+                                  timeout=min(cap, remaining))
+        except Exception:
+            return None
+
     mode = os.environ.get("SSN_MODE", "stdin")
     fmt = os.environ.get("SSN_FORMAT", "claude-json")
     cwd = os.environ.get("SSN_CWD") or os.getcwd()
@@ -118,6 +137,40 @@ def main():
     if not records:
         quiet_exit()
 
+    # Resolve utilities only after cheap per-file filtering has produced candidates.
+    prose_ext = {".md", ".markdown", ".mdx", ".rst", ".txt", ".adoc", ".org"}
+    token_re = re.compile(r"(?<![A-Za-z0-9_])(?:[A-Z][A-Z0-9_]*-\d+|v\d+(?:\.\d+)*|\d+(?:\.\d+)?\s*(?:kHz|Hz|MHz|GHz|ms|s|GB|MB)|[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:[A-Za-z_][A-Za-z0-9_.-]*|\d+(?:\.\d+)?)|[A-Za-z_][A-Za-z0-9_]{2,})(?![A-Za-z0-9_])")
+    stop = {"def","for","pass","return","self","the","and","not","import","from","class","true","false","none","null","eof","this","that","with","print","range","function"}
+    old_by_file, new_by_file = {}, {}
+    for path, old, new in records:
+        if not path or not isinstance(old, str) or not isinstance(new, str): continue
+        absolute = os.path.abspath(path if os.path.isabs(path) else os.path.join(cwd, path))
+        if os.path.splitext(absolute)[1].lower() in prose_ext: continue
+        new_by_file.setdefault(absolute, set()).update(token_re.findall(new))
+        values = old_by_file.setdefault(absolute, [])
+        for token in token_re.findall(old):
+            if token in values or token.lower() in stop: continue
+            structured = "=" in token or "-" in token or re.fullmatch(r"v\d+(?:\.\d+)*", token) or re.fullmatch(r"\d+(?:\.\d+)?\s*(?:kHz|Hz|MHz|GHz|ms|s|GB|MB)", token)
+            if token[:1].isalpha() and len(token) < 3 and not structured: continue
+            if token[:1].isalpha() and not structured and token.islower() and "_" not in token and not any(c.isdigit() for c in token): continue
+            values.append(token)
+    removed_by_file = {
+        path: [token for token in values if token not in new_by_file.get(path, set())]
+        for path, values in old_by_file.items()
+    }
+    max_tokens, max_hits = safe_cap("SPEC_SYNC_TOKENS", 12), safe_cap("SPEC_SYNC_HITS", 8)
+    if not max_tokens or not max_hits: quiet_exit()
+    candidates = []
+    for path, values in removed_by_file.items():
+        try:
+            with open(path, encoding="utf-8") as stream: content = stream.read()
+            available = [v for v in values if not re.search(r"(?<![A-Za-z0-9_])" + re.escape(v) + r"(?![A-Za-z0-9_])", content)]
+        except Exception:
+            available = values
+        candidates.extend((path, token) for token in available)
+    candidates = candidates[:max_tokens]
+    if not candidates: quiet_exit()
+
     hook_dir = os.environ.get("SSN_HOOK_DIR", "")
     local_utils = os.path.normpath(os.path.join(hook_dir, "..", "utilities"))
     fallback_home = ""
@@ -125,8 +178,8 @@ def main():
         agent_home_script = os.path.join(local_utils, "agent-home.sh")
         if os.path.isfile(agent_home_script):
             try:
-                found = subprocess.run([agent_home_script], capture_output=True, text=True, timeout=3)
-                if found.returncode == 0: fallback_home = found.stdout.strip()
+                found = run_bounded([agent_home_script], 3)
+                if found and found.returncode == 0: fallback_home = found.stdout.strip()
             except Exception:
                 pass
         if not fallback_home:
@@ -146,19 +199,18 @@ def main():
             for probe in (start, cwd):
                 if not artifact_resolver: break
                 try:
-                    resolved = subprocess.run([artifact_resolver, probe], capture_output=True, text=True, timeout=5)
-                    if resolved.returncode == 0 and resolved.stdout.strip():
+                    resolved = run_bounded([artifact_resolver, probe], 5)
+                    if resolved and resolved.returncode == 0 and resolved.stdout.strip():
                         root = os.path.abspath(resolved.stdout.strip()); break
-                except Exception:
-                    pass
+                except Exception: pass
             root_cache[start] = root or ""
         if not root: return None, absolute, ""
         if root in spec_cache: return spec_cache[root], absolute, root
         found = None
         if reader:
             try:
-                result = subprocess.run([sys.executable, reader, "spec-dir", "--artifact-root", root], capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
+                result = run_bounded([sys.executable, reader, "spec-dir", "--artifact-root", root], 5)
+                if result and result.returncode == 0:
                     value = json.loads(result.stdout)
                     if isinstance(value, dict) and isinstance(value.get("path"), str): found = value["path"]
             except Exception:
@@ -170,48 +222,14 @@ def main():
         spec_cache[root] = found
         return found, absolute, root
 
-    prose_ext = {".md", ".markdown", ".mdx", ".rst", ".txt", ".adoc", ".org"}
-    token_re = re.compile(r"(?<![A-Za-z0-9_])(?:[A-Z][A-Z0-9_]*-\d+|v\d+(?:\.\d+)*|\d+(?:\.\d+)?\s*(?:kHz|Hz|MHz|GHz|ms|s|GB|MB)|[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:[A-Za-z_][A-Za-z0-9_.-]*|\d+(?:\.\d+)?)|[A-Za-z_][A-Za-z0-9_]{2,})(?![A-Za-z0-9_])")
-    stop = {"def","for","pass","return","self","the","and","not","import","from","class","true","false","none","null","eof","this","that","with","print","range","function"}
-    old_by_file, new_by_file = {}, {}
-    for path, old, new in records:
-        if not path or not isinstance(old, str) or not isinstance(new, str): continue
-        spec_dir, absolute, root = spec_for(path)
-        if not spec_dir or os.path.splitext(absolute)[1].lower() in prose_ext: continue
-        try:
-            if os.path.commonpath([absolute, os.path.abspath(spec_dir)]) == os.path.abspath(spec_dir): continue
-        except ValueError:
-            continue
-        new_by_file.setdefault(absolute, set()).update(token_re.findall(new))
-        values = old_by_file.setdefault(absolute, [])
-        for token in token_re.findall(old):
-            if token in values or token.lower() in stop: continue
-            structured = "=" in token or "-" in token or re.fullmatch(r"v\d+(?:\.\d+)*", token) or re.fullmatch(r"\d+(?:\.\d+)?\s*(?:kHz|Hz|MHz|GHz|ms|s|GB|MB)", token)
-            if token[:1].isalpha() and len(token) < 3 and not structured: continue
-            if token[:1].isalpha() and not structured and token.islower() and "_" not in token and not any(c.isdigit() for c in token): continue
-            values.append(token)
-
-    removed_by_file = {
-        path: [token for token in values if token not in new_by_file.get(path, set())]
-        for path, values in old_by_file.items()
-    }
-
-    max_tokens, max_hits = safe_cap("SPEC_SYNC_TOKENS", 12), safe_cap("SPEC_SYNC_HITS", 8)
-    if not max_tokens or not max_hits: quiet_exit()
-    candidates = []
-    for path, values in removed_by_file.items():
-        try:
-            with open(path, encoding="utf-8") as stream: content = stream.read()
-            available = [v for v in values if not re.search(r"(?<![A-Za-z0-9_])" + re.escape(v) + r"(?![A-Za-z0-9_])", content)]
-        except Exception:
-            available = values
-        candidates.extend((path, token) for token in available)
-    candidates = candidates[:max_tokens]
-    if not candidates: quiet_exit()
     hit_rows, seen = [], set()
     for path, token in candidates:
         spec_dir, _, root = spec_for(path)
         if not spec_dir: continue
+        try:
+            if os.path.commonpath([path, os.path.abspath(spec_dir)]) == os.path.abspath(spec_dir): continue
+        except ValueError:
+            continue
         base = root or os.path.dirname(spec_dir)
         try: files = sorted(f for f in glob.glob(os.path.join(spec_dir, "**", "*.md"), recursive=True) if "_internal" not in os.path.relpath(f, spec_dir).split(os.sep))
         except Exception: continue
@@ -228,7 +246,7 @@ def main():
             except Exception:
                 continue
         if len(hit_rows) >= max_hits: break
-    if not hit_rows: quiet_exit()
+    if not hit_rows or deadline - time.monotonic() <= 0: quiet_exit()
     rows = ["  {}:{}  «{}»  {}".format(rel, line, token, text if len(text) <= 120 else text[:117] + "...") for rel, line, token, text in hit_rows]
     body = ("# 🔗 Spec synchronization nudge — the edit may conflict with the spec lines below\n"
             "Values or identifiers removed by the edit still appear in the spec. Review the corresponding synchronization as part of this change:\n" + "\n".join(rows))
