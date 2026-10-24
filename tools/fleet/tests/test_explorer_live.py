@@ -1,6 +1,7 @@
 """VM mapping keeps unknowns explicit and freezes nested input."""
 import unittest
 import json
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -88,7 +89,8 @@ class ConfigFields(unittest.TestCase):
         vm = build_view_model({"sessions": [], "resources": [], "memory": memory}, now=1792800000)
         rows = vm.memory[0][1]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(tuple(rows[0]), ("08:00", "saved", "note", "useful"))
+        local = datetime.fromisoformat("2026-10-24T08:00:00+09:00").astimezone().strftime("%H:%M")
+        self.assertEqual(tuple(rows[0]), (local, "saved", "note", "useful"))
         self.assertEqual(vm.system["memory_summary"]["expired"], 1)
 
     def test_first_tick_process_row_is_kept_and_gpu_processes_use_renderer_record_shape(self):
