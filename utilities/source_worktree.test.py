@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -355,13 +356,13 @@ class FramedStartPolicyTest(SourceWorktreeFixture):
 
 
 class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
-    def test_non_git_start_without_shape_or_with_direct_starts_inline_without_git_or_worker(self):
+    def test_non_git_start_with_direct_starts_inline_without_git_or_worker(self):
         project = Path(self.tmp.name) / "non-git-project"
         project.mkdir()
         prompt = Path(self.tmp.name) / "non-git-task.md"
         prompt.write_text("기술 동향 조사 결과를 정리한다.\n", encoding="utf-8")
-        for shape_args in ([], ["--shape", "direct"]):
-            with self.subTest(shape=shape_args or "omitted"):
+        for shape_args in (["--shape", "direct"],):
+            with self.subTest(shape=shape_args):
                 argv = ["capability-route.py", "compose", "--start", "--slug", "non-git-start",
                         *shape_args, "--prompt-file", str(prompt), "--cwd", str(project),
                         "--artifact-root", str(self.artifact_root), "--unassigned", "--jobs", str(self.jobs)]
@@ -372,7 +373,7 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
                 self.assertEqual((route["capability"], route["effective_intensity"], route["source_commit"]),
                                  ("autopilot-research", "direct", "unversioned"))
                 self.assertEqual([node["id"] for node in route["nodes"]], ["inline"])
-                self.assertIn("git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작",
+                self.assertIn("git 아닌 폴더 — 이 세션이 직접 진행. 작업자가 필요하면 --shape 없이 다시 시작(원본 수정은 git init 필요)",
                               err.getvalue())
                 self.assertEqual(err.getvalue().count("git 아닌 폴더 — 이 세션이 직접 진행"), 1)
                 self.assertFalse((project / ".git").exists())
@@ -409,6 +410,16 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
         frame_route = self.start_calls[-1][0]
         self.assertEqual((frame_route["source_commit"], frame_route["selection"]["shape"],
                           frame_route["cwd"]), ("unversioned", "framed", str(project.resolve())))
+        omitted_argv = [arg for arg in framed_argv if arg not in ("--shape", "framed")]
+        omitted_argv[omitted_argv.index("framed-recordish")] = "omitted-shape"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.main(omitted_argv), 0)
+        omitted_route = self.start_calls[-1][0]
+        self.assertEqual((omitted_route["source_commit"], omitted_route["selection"]["shape"],
+                          omitted_route["cwd"]), ("unversioned", "framed", str(project.resolve())))
+        self.assertNotIn("이 세션이 직접 진행", err.getvalue())
+        self.assertFalse(project.with_name(project.name + "-wt").exists())
         from dispatch_contract import launch_repository_identity
         self.assertEqual(launch_repository_identity(
             project, self.start_calls[-1][1]), (str(project.resolve()), "non-git"))
@@ -422,11 +433,15 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
                 self.main(["capability-route.py", "compose", "--start", "--slug", "registered-refused",
                            "--shape", "direct", "--prompt-file", str(prompt), "--cwd", str(project),
                            "--artifact-root", str(self.artifact_root), "--unassigned", "--jobs", str(self.jobs)])
-        self.assertEqual(len(self.route_files()), 1)
-        self.assertEqual(len(self.start_calls), 1)
-        # Only the framed route's own frame legs launched; the refused routes wrote none.
-        frame_legs = [node for node in frame_route["nodes"] if node["id"] != "route-decision"]
+        self.assertEqual(len(self.route_files()), 2)
+        self.assertEqual(len(self.start_calls), 2)
+        # Only the two framed routes' own frame legs launched; the refused routes wrote none.
+        frame_legs = [node for route in (frame_route, omitted_route) for node in route["nodes"]
+                      if node["id"] != "route-decision"]
         self.assertEqual(len(self.owner_attempt_rows()), len(frame_legs))
+        launched = {re.search(r"(?:^|,)route_id=([^,\s]+)", row).group(1)
+                    for row in self.owner_attempt_rows()}
+        self.assertEqual(launched, {frame_route["route_id"], omitted_route["route_id"]})
         self.assertFalse(project.with_name(project.name + "-wt").exists())
 
     def test_non_git_direct_cleans_dispatch_hints_and_preserves_explicit_capability(self):
@@ -438,7 +453,7 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
         demands.write_text("{}\n", encoding="utf-8")
         profiles = Path(self.tmp.name) / "profiles.json"
         profiles.write_text("{}\n", encoding="utf-8")
-        argv = ["capability-route.py", "compose", "--start", "--slug", "non-git-selection",
+        argv = ["capability-route.py", "compose", "--start", "--slug", "non-git-selection", "--shape", "direct",
                 "--prompt-file", str(prompt), "--cwd", str(project), "--artifact-root", str(self.artifact_root),
                 "--unassigned", "--jobs", str(self.jobs), "--graph", "execute", "--intensity", "standard",
                 "--signal", "shared-contract", "--profile", "light", "--pin", "worker=codex",
@@ -456,7 +471,7 @@ class ComposeStartPreparationRetryTest(SourceWorktreeFixture):
         self.assertEqual(self.probe_cwds, [])
         self.assertEqual(self.owner_attempt_rows(), [])
         prompt.write_text("계속 진행\n", encoding="utf-8")
-        mode_only = ["capability-route.py", "compose", "--start", "--slug", "non-git-mode-only",
+        mode_only = ["capability-route.py", "compose", "--start", "--slug", "non-git-mode-only", "--shape", "direct",
                      "--prompt-file", str(prompt), "--cwd", str(project), "--artifact-root", str(self.artifact_root),
                      "--unassigned", "--jobs", str(self.jobs), "--capability-mode", "eval"]
         err = io.StringIO()
