@@ -2808,6 +2808,141 @@ class CompletedSpecPublicationTest(ProducerTestBase):
         publications = P.status(self.root)["shared_spec_publications"]
         self.assertFalse(any(row["cycle_id"] == cycle["cycle_id"] for row in publications))
 
+    def test_seed_only_completed_code_cycle_stays_not_applicable_after_campaign_cleanup(self):
+        self.assertEqual(Path(P.__file__).resolve(), Path(__file__).with_name("artifact_producer.py").resolve())
+        self.activate()
+        _, _, base = self._completed({"c/prd.md": b"# Component base\n"})
+        admitted = self._publish(base)
+        self.assertEqual(admitted["status"], "admitted", admitted)
+
+        route, route_path, cycle = self.begin("direct", "autopilot-code", "dev")
+        spec_root = Path(cycle["cycle_dir"]) / "artifacts/spec"
+        transaction_spec = importlib.util.spec_from_file_location(
+            "spec_transaction_seed_only_cleanup_after_move", Path(__file__).with_name("spec-transaction.py"))
+        transaction = importlib.util.module_from_spec(transaction_spec)
+        transaction_spec.loader.exec_module(transaction)
+        transaction.seed_cycle_spec(spec_root, self.root, spec_root / "c")
+        self.write_output(cycle, rel="plans/fixture/final_report.md", data=b"PASS\n")
+        self.close(route, route_path)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+        self.assertEqual(self._publish(cycle, settle=False),
+                         {"cycle_id": cycle["cycle_id"], "status": "not-applicable"})
+
+        cycle_dir = Path(cycle["cycle_dir"])
+        campaign_dir = cycle_dir.parent
+        campaigns = self.root / "campaigns"
+        self.assertEqual(campaign_dir.parent, campaigns)
+        campaign_rel = campaign_dir.relative_to(campaigns)
+        moved_campaign = Path(self._tmp.name) / "removed-seed-only-campaign"
+        snapshots = P.artifact_lifecycle.manifest_snapshot_dir(self.root, cycle["cycle_id"])
+        before = {
+            "route": route_path.read_bytes(),
+            "outcome": R.outcome_path(route_path).read_bytes(),
+            "cycle_record": P.cycle_record_path(self.root, cycle["cycle_id"]).read_bytes(),
+            "manifest": (cycle_dir / "manifest.json").read_bytes(),
+            "snapshots": {path.name: path.read_bytes() for path in snapshots.glob("*.json")},
+        }
+        campaign_dir.rename(moved_campaign)
+
+        with mock.patch.object(P, "admit_shared",
+                               side_effect=AssertionError("seed-only cleanup must not admit shared refs")):
+            self.assertEqual(self._publish(cycle, settle=False),
+                             {"cycle_id": cycle["cycle_id"], "status": "not-applicable"})
+            self.assertEqual(P.completed_route_spec_publication(route, settle=False),
+                             {"status": "not-applicable"})
+
+        self.assertFalse((campaigns / campaign_rel).exists())
+        self.assertTrue(moved_campaign.is_dir())
+        self.assertFalse((campaigns / campaign_rel / cycle_dir.name / "artifacts/spec").exists())
+        after = {
+            "route": route_path.read_bytes(),
+            "outcome": R.outcome_path(route_path).read_bytes(),
+            "cycle_record": P.cycle_record_path(self.root, cycle["cycle_id"]).read_bytes(),
+            "manifest": (moved_campaign / cycle_dir.name / "manifest.json").read_bytes(),
+            "snapshots": {path.name: path.read_bytes() for path in snapshots.glob("*.json")},
+        }
+        self.assertEqual(before, after)
+
+    def test_published_code_authoring_replays_after_campaign_cleanup(self):
+        self.activate()
+        _, _, base = self._completed({"c/prd.md": b"# Component base\n"})
+        self.assertEqual(self._publish(base)["status"], "admitted")
+        route, route_path, cycle = self.begin("direct", "autopilot-code", "dev")
+        spec_root = Path(cycle["cycle_dir"]) / "artifacts/spec"
+        transaction_spec = importlib.util.spec_from_file_location(
+            "spec_transaction_code_publication_cleanup_replay", Path(__file__).with_name("spec-transaction.py"))
+        transaction = importlib.util.module_from_spec(transaction_spec)
+        transaction_spec.loader.exec_module(transaction)
+        transaction.seed_cycle_spec(spec_root, self.root, spec_root / "c")
+        (spec_root / "c/prd.md").write_bytes(b"# Component changed\n")
+        self.write_output(cycle, rel="plans/fixture/final_report.md", data=b"PASS\n")
+        self.close(route, route_path)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+        publication = self._publish(cycle, settle=True)
+        self.assertEqual(publication["status"], "admitted", publication)
+        revision_id = publication["shared_reference_revision_id"]
+        reference_id = publication["shared_reference_id"]
+
+        cycle_dir = Path(cycle["cycle_dir"])
+        campaign_dir = cycle_dir.parent
+        moved_campaign = Path(self._tmp.name) / "removed-published-code-campaign"
+        snapshots = P.artifact_lifecycle.manifest_snapshot_dir(self.root, cycle["cycle_id"])
+        before = {
+            "route": route_path.read_bytes(),
+            "outcome": R.outcome_path(route_path).read_bytes(),
+            "cycle_record": P.cycle_record_path(self.root, cycle["cycle_id"]).read_bytes(),
+            "manifest": (cycle_dir / "manifest.json").read_bytes(),
+            "snapshots": {path.name: path.read_bytes() for path in snapshots.glob("*.json")},
+        }
+        campaign_dir.rename(moved_campaign)
+
+        replay = self._publish(cycle, settle=False)
+        self.assertEqual((replay["status"], replay["shared_reference_id"],
+                          replay["shared_reference_revision_id"]),
+                         ("admitted", reference_id, revision_id), replay)
+        self.assertTrue(moved_campaign.is_dir())
+        self.assertFalse(campaign_dir.exists())
+        self.assertFalse((campaign_dir / cycle_dir.name / "artifacts/spec").exists())
+        after = {
+            "route": route_path.read_bytes(),
+            "outcome": R.outcome_path(route_path).read_bytes(),
+            "cycle_record": P.cycle_record_path(self.root, cycle["cycle_id"]).read_bytes(),
+            "manifest": (moved_campaign / cycle_dir.name / "manifest.json").read_bytes(),
+            "snapshots": {path.name: path.read_bytes() for path in snapshots.glob("*.json")},
+        }
+        self.assertEqual(before, after)
+
+    def test_changed_code_authoring_does_not_become_not_applicable_after_cleanup(self):
+        self.activate()
+        _, _, base = self._completed({"c/prd.md": b"# Component base\n"})
+        self.assertEqual(self._publish(base)["status"], "admitted")
+        route, route_path, cycle = self.begin("direct", "autopilot-code", "dev")
+        spec_root = Path(cycle["cycle_dir"]) / "artifacts/spec"
+        transaction_spec = importlib.util.spec_from_file_location(
+            "spec_transaction_changed_code_cleanup", Path(__file__).with_name("spec-transaction.py"))
+        transaction = importlib.util.module_from_spec(transaction_spec)
+        transaction_spec.loader.exec_module(transaction)
+        transaction.seed_cycle_spec(spec_root, self.root, spec_root / "c")
+        (spec_root / "c/prd.md").write_bytes(b"# Component changed\n")
+        self.write_output(cycle, rel="plans/fixture/final_report.md", data=b"PASS\n")
+        self.close(route, route_path)
+        P.finalize(self.root, cycle_id=cycle["cycle_id"])
+        before = self._publish(cycle, settle=False)
+        self.assertEqual((before["status"], before["reason"]),
+                         ("pending", "shared-publication-required"), before)
+
+        cycle_dir = Path(cycle["cycle_dir"])
+        campaign_dir = cycle_dir.parent
+        moved_campaign = Path(self._tmp.name) / "removed-changed-code-campaign"
+        campaign_dir.rename(moved_campaign)
+        after = self._publish(cycle, settle=False)
+        self.assertEqual(after["status"], "pending", after)
+        self.assertNotEqual(after.get("status"), "not-applicable")
+        self.assertEqual(after.get("reason"), "sealed-cycle-state-unknown", after)
+        self.assertTrue(moved_campaign.is_dir())
+        self.assertFalse(campaign_dir.exists())
+        self.assertFalse((campaign_dir / cycle_dir.name / "artifacts/spec").exists())
+
     def test_code_missing_seed_remains_pending_when_manifest_records_transaction(self):
         self.activate()
         _, _, base = self._completed({"c/prd.md": b"# Component base\n"})

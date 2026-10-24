@@ -2661,6 +2661,97 @@ class UnseededCodeCleanupWorkStartTest(GF.fixture.ProducerTestBase):
         self.assertEqual(before_records, after_records)
 
 
+class SeedOnlyCodeCleanupWorkStartTest(GF.fixture.ProducerTestBase):
+    """A completed seed-only code route stays complete after payload cleanup."""
+
+    def test_campaign_cleanup_does_not_create_shared_publication_attention(self):
+        import artifact_producer
+
+        self.assertEqual(Path(artifact_producer.__file__).resolve(),
+                         Path(__file__).with_name("artifact_producer.py").resolve())
+        self.assertEqual(Path(W.__file__).resolve(), Path(__file__).with_name("work_start.py").resolve())
+        self.activate()
+
+        base_route = GF.fixture.R.compose_route(
+            capability="autopilot-spec", capability_mode="update", shape="direct", graph=None,
+            slug="seed-only-cleanup-base", cwd=W.ROOT, artifact_root=self.root,
+            campaign_key="seed-only-cleanup-start", parent_harness="codex", spec_read="fixture",
+            drift_verdict="within-spec",
+            work_request={"text": "Complete the isolated seed-only cleanup regression.",
+                          "owner_harness": "codex"})
+        base_binding = GF.fixture.L.admit_runtime_route(self.root, base_route)
+        base_path = Path(base_binding.route_file)
+        base_cycle = artifact_producer.begin(self.root, route_file=base_path,
+                                             capability="autopilot-spec", intensity="direct")
+        self.write_output(base_cycle, rel="spec/c/prd.md", data=b"# Component base\n")
+        self.close(base_route, base_path)
+        artifact_producer.finalize(self.root, cycle_id=base_cycle["cycle_id"])
+        base_publication = artifact_producer.completed_spec_publication(
+            self.root, cycle_id=base_cycle["cycle_id"], settle=True)
+        self.assertEqual(base_publication["status"], "admitted", base_publication)
+
+        route = GF.fixture.R.compose_route(
+            capability="autopilot-code", capability_mode="dev", shape="direct", graph=None,
+            slug="seed-only-cleanup-start", cwd=W.ROOT, artifact_root=self.root,
+            campaign_key="seed-only-cleanup-start", parent_harness="codex", spec_read="fixture",
+            drift_verdict="within-spec",
+            work_request={"text": "Complete the isolated seed-only cleanup regression.",
+                          "owner_harness": "codex"})
+        route_binding = GF.fixture.L.admit_runtime_route(self.root, route)
+        route_path = Path(route_binding.route_file)
+        cycle = artifact_producer.begin(self.root, route_file=route_path,
+                                        capability="autopilot-code", intensity="direct")
+        spec_root = Path(cycle["cycle_dir"]) / "artifacts/spec"
+        transaction_spec = importlib.util.spec_from_file_location(
+            "work_start_seed_only_transaction_cleanup", Path(__file__).with_name("spec-transaction.py"))
+        transaction = importlib.util.module_from_spec(transaction_spec)
+        transaction_spec.loader.exec_module(transaction)
+        transaction.seed_cycle_spec(spec_root, self.root, spec_root / "c")
+        self.write_output(cycle, rel="plans/fixture/final_report.md", data=b"PASS\n")
+        self.close(route, route_path)
+        artifact_producer.finalize(self.root, cycle_id=cycle["cycle_id"])
+        self.assertEqual(artifact_producer.completed_spec_publication(
+            self.root, cycle_id=cycle["cycle_id"], settle=False)["status"], "not-applicable")
+
+        cycle_dir = Path(cycle["cycle_dir"])
+        campaign_dir = cycle_dir.parent
+        campaigns = self.root / "campaigns"
+        self.assertEqual(campaign_dir.parent, campaigns)
+        campaign_rel = campaign_dir.relative_to(campaigns)
+        moved_campaign = Path(self._tmp.name) / "removed-seed-only-work-start-campaign"
+        snapshot_dir = artifact_producer.artifact_lifecycle.manifest_snapshot_dir(
+            self.root, cycle["cycle_id"])
+        before_records = {
+            "route": route_path.read_bytes(),
+            "outcome": GF.fixture.R.outcome_path(route_path).read_bytes(),
+            "cycle_record": artifact_producer.cycle_record_path(self.root, cycle["cycle_id"]).read_bytes(),
+            "cycle_manifest": (cycle_dir / "manifest.json").read_bytes(),
+            "manifest_snapshots": {path.name: path.read_bytes() for path in snapshot_dir.glob("*.json")},
+        }
+        campaign_dir.rename(moved_campaign)
+
+        with mock.patch.object(artifact_producer, "admit_shared",
+                               side_effect=AssertionError("seed-only cleanup must not publish shared refs")), \
+                mock.patch.object(artifact_producer, "prepare_route_artifact_env",
+                                  side_effect=AssertionError("closed route must not be reopened")):
+            result = W.start_work(json.loads(route_path.read_text()), route_path, self.jobs)
+
+        self.assertEqual((result["state"], result["required_action"]),
+                         ("completed", "advance-completed"), result)
+        self.assertNotIn("shared_publication", result)
+        self.assertFalse((campaigns / campaign_rel).exists())
+        self.assertTrue(moved_campaign.is_dir())
+        self.assertFalse((campaigns / campaign_rel / cycle_dir.name / "artifacts/spec").exists())
+        after_records = {
+            "route": route_path.read_bytes(),
+            "outcome": GF.fixture.R.outcome_path(route_path).read_bytes(),
+            "cycle_record": artifact_producer.cycle_record_path(self.root, cycle["cycle_id"]).read_bytes(),
+            "cycle_manifest": (moved_campaign / cycle_dir.name / "manifest.json").read_bytes(),
+            "manifest_snapshots": {path.name: path.read_bytes() for path in snapshot_dir.glob("*.json")},
+        }
+        self.assertEqual(before_records, after_records)
+
+
 class GroupContextStartTest(GF.fixture.ProducerTestBase):
     """Actual compose/admit/start/producer seams with no live roots or workers."""
     _cycles = GF.WorkflowGroupsTest._cycles

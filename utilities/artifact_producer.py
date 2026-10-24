@@ -1827,10 +1827,19 @@ def status(root: Path) -> Dict[str, Any]:
     klass = classify_root(root)
     fallback = legacy_fallback_state(root, classification=klass)
     specs = [r for r in records if r.get("capability") == "autopilot-spec" and r.get("state") == "sealed"]
-    code_specs = [r for r in records if r.get("capability") == "autopilot-code"
-                  and r.get("state") == "sealed" and _code_cycle_has_publication_obligation(root, r)]
+    code_specs = []
+    resolved_references = None
+    for record in records:
+        if record.get("capability") != "autopilot-code" or record.get("state") != "sealed":
+            continue
+        decision = _code_cycle_publication_decision(root, record, resolved_references)
+        if decision.get("references") is not None:
+            resolved_references = decision["references"]
+        if decision["obligation"]:
+            code_specs.append(record)
     publication_cycles = [*specs, *code_specs]
-    references = list_references(root, "spec") if publication_cycles else []
+    references = (resolved_references if resolved_references is not None else
+                  list_references(root, "spec") if publication_cycles else [])
     # Read shared revision metadata once per status call, not once per cycle.
     # This is an in-call projection, never a cache or publication authority.
     lineage: Dict[str, Any] = {}
@@ -9113,7 +9122,7 @@ def _spec_source_manifest_hints(root: Path, record: Mapping[str, Any], source_re
     except (OSError, ValueError, KeyError, TypeError):
         pass
     prefix = source_rel.rstrip("/") + "/"
-    has_source = has_seed = False
+    has_seed = False
     for document in documents:
         for row in document.get("artifact_revisions", []):
             if not isinstance(row, Mapping):
@@ -9130,7 +9139,7 @@ def _spec_source_manifest_hints(root: Path, record: Mapping[str, Any], source_re
 
 
 def _code_cycle_snapshot_spec_hints(root: Path, record: Mapping[str, Any],
-                                    source_rel: str) -> Optional[Tuple[bool, bool]]:
+                                    source_rel: str) -> Optional[Dict[str, Any]]:
     """Read source/seed evidence from the exact sealed manifest history.
 
     The cycle payload may be ordinarily removed after completion. Its immutable
@@ -9197,49 +9206,176 @@ def _code_cycle_snapshot_spec_hints(root: Path, record: Mapping[str, Any],
             path = locator.get("path") if isinstance(locator, Mapping) else None
             if not isinstance(path, str):
                 return None
-            if path == source_rel or path.startswith(prefix):
-                has_source = True
-                if path == prefix + SPEC_BASE_RECEIPT:
-                    has_seed = True
-    return has_source, has_seed
+            if path == prefix + SPEC_BASE_RECEIPT:
+                has_seed = True
+    return {"has_seed": has_seed, "sealed": sealed}
 
 
-def _code_cycle_has_publication_obligation(root: Path, record: Mapping[str, Any]) -> bool:
-    """Keep code cycles out of shared-spec work unless a seed may obligate it."""
+def _code_cycle_snapshot_spec_facts(document: Mapping[str, Any], source_rel: str
+                                    ) -> Optional[Dict[str, Tuple[str, int]]]:
+    """Project the sealed manifest's current file revisions for one spec tree."""
+    prefix = source_rel.rstrip("/") + "/"
+    artifacts = [row for row in document.get("artifacts", []) if isinstance(row, Mapping)]
+    active_ids = {row.get("artifact_id") for row in artifacts}
+    for artifact in artifacts:
+        if artifact.get("type") != "directory-bundle":
+            continue
+        title = artifact.get("title")
+        if not isinstance(title, str) or not title:
+            return None
+        tree_rel = "artifacts/" + title
+        if (tree_rel == source_rel or tree_rel.startswith(prefix)
+                or source_rel.startswith(tree_rel.rstrip("/") + "/")):
+            # The descriptor body is a payload, not part of immutable manifest
+            # history. Keep this case on the existing refusal path.
+            return None
+
+    latest: Dict[str, Mapping[str, Any]] = {}
+    for row in document.get("artifact_revisions", []):
+        if not isinstance(row, Mapping) or row.get("artifact_id") not in active_ids:
+            continue
+        artifact_id = row.get("artifact_id")
+        previous = latest.get(artifact_id)
+        if previous is None or row.get("revision_sequence", 0) > previous.get("revision_sequence", 0):
+            latest[artifact_id] = row
+
+    facts: Dict[str, Tuple[str, int]] = {}
+    for row in latest.values():
+        locator = row.get("locator")
+        path = locator.get("path") if isinstance(locator, Mapping) else None
+        if not isinstance(path, str):
+            return None
+        if path == source_rel:
+            return None
+        if not path.startswith(prefix):
+            continue
+        relative = path[len(prefix):]
+        digest = row.get("content_digest")
+        byte_size = row.get("byte_size")
+        if (not relative or not isinstance(digest, str) or not digest.startswith("sha256:")
+                or not isinstance(byte_size, int) or byte_size < 0 or relative in facts):
+            return None
+        facts[relative] = (digest, byte_size)
+    return facts
+
+
+def _code_cycle_snapshot_publication_obligation(
+    root: Path, record: Mapping[str, Any], source_rel: str,
+    hints: Mapping[str, Any], reference_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Resolve a removed code payload through its sealed seed digest and lineage."""
+    references = reference_rows if reference_rows is not None else list_references(root, "spec")
+    document = hints.get("sealed")
+    if not isinstance(document, Mapping):
+        return {"obligation": True, "references": references}
+    missing_source = root / ".runtime" / "missing-cycle-payload" / str(record.get("cycle_id")) / source_rel
+    for candidate_reference in references:
+        published_id, published = _finished_spec_publication(
+            root, candidate_reference, str(record.get("cycle_id")), source_rel,
+            record, missing_source, None)
+        if published is not None:
+            return {"obligation": True, "references": references,
+                    "finished": (candidate_reference, published_id, published)}
+    source_facts = _code_cycle_snapshot_spec_facts(document, source_rel)
+    if source_facts is None:
+        return {"obligation": True, "references": references}
+    receipt_fact = source_facts.get(SPEC_BASE_RECEIPT)
+    if receipt_fact is None:
+        # A seed in an earlier manifest but absent from the exact sealed
+        # revision is a missing-seed case, not proof of an unused transaction.
+        return {"obligation": True, "references": references}
+    receipt_digest, receipt_size = receipt_fact
+    source_components = tuple(sorted({path.split("/", 1)[0] for path in source_facts
+                                      if not path.startswith("_internal/")}))
+    candidates: List[Tuple[Optional[Mapping[str, Any]], Optional[str], Optional[str],
+                           Optional[Tuple[str, ...]]]] = []
+
+    def try_candidate(reference: Optional[Mapping[str, Any]], reference_id: Optional[str],
+                      revision_id: Optional[str], content_digest: Optional[str]) -> None:
+        option_rows: List[Optional[Tuple[str, ...]]] = [None]
+        if source_components:
+            option_rows.append(source_components)
+        for components in option_rows:
+            raw = _json_bytes({
+                "schema_version": 1, "reference_id": reference_id,
+                "revision_id": revision_id, "content_digest": content_digest,
+                **({"components": list(components),
+                   "component_seeds": {component: True for component in components}}
+                  if components is not None else {}),
+                "seed_complete": True,
+            })
+            if len(raw) == receipt_size and _digest(raw) == receipt_digest:
+                candidates.append((reference, reference_id, revision_id, components))
+
+    try_candidate(None, None, None, None)
+    for reference in references:
+        reference_id = reference.get("shared_reference_id")
+        if not isinstance(reference_id, str):
+            continue
+        revision_ids = reference.get("revisions")
+        if not isinstance(revision_ids, list):
+            continue
+        if not revision_ids:
+            try_candidate(reference, reference_id, None, None)
+        for revision_id in revision_ids:
+            if not isinstance(revision_id, str):
+                continue
+            revision_record = _read_json(
+                root / "shared/spec" / reference_id / "revisions" / revision_id / REVISION_RECORD_NAME)
+            if not isinstance(revision_record, Mapping):
+                continue
+            content_digest = revision_record.get("content_digest")
+            if not isinstance(content_digest, str):
+                continue
+            try_candidate(reference, reference_id, revision_id, content_digest)
+
+    if len(candidates) != 1:
+        return {"obligation": True, "references": references}
+    reference, reference_id, revision_id, components = candidates[0]
+    try:
+        base_tree = {}
+        if revision_id is not None:
+            if not isinstance(reference, Mapping) or revision_id not in reference.get("revisions", []):
+                return {"obligation": True, "references": references}
+            base_tree, _base_record = _verified_shared_spec(root, reference_id, revision_id)
+    except (ProducerError, OSError, ValueError, KeyError, TypeError):
+        return {"obligation": True, "references": references}
+
+    def authoring_facts(files: Mapping[str, Tuple[str, int]]) -> Optional[Dict[str, Tuple[str, int]]]:
+        selected: Dict[str, Tuple[str, int]] = {}
+        for path, facts in files.items():
+            if path == SPEC_BASE_RECEIPT or "/_internal/versions/" in "/" + path:
+                continue
+            if components is not None and path.split("/", 1)[0] not in components:
+                return None
+            selected[path] = facts
+        return selected
+
+    current_authoring = authoring_facts(source_facts)
+    base_facts = {path: (_digest(data), len(data)) for path, data in base_tree.items()}
+    base_authoring = authoring_facts(base_facts)
+    if current_authoring is None or base_authoring is None:
+        return {"obligation": True, "references": references}
+    return {"obligation": current_authoring != base_authoring, "references": references}
+
+
+def _code_cycle_publication_decision(root: Path, record: Mapping[str, Any],
+                                     reference_rows: Optional[List[Dict[str, Any]]] = None
+                                     ) -> Dict[str, Any]:
+    """Decide the shared-spec duty from the code cycle's actual transaction evidence."""
     source_rel = _placed_locator("artifacts/spec", _output_placements(root, record))
     hints = _code_cycle_snapshot_spec_hints(root, record, source_rel)
-    if hints is not None and not hints[1]:
-        # An extant payload that contradicts the immutable snapshot remains a
-        # corruption case. Only ordinary campaign cleanup can rely on the
-        # snapshot alone to prove there was no transaction.
-        try:
-            manifest_path = _record_cycle_manifest_path(root, record)
-        except ProducerError as exc:
-            if (exc.code == "sealed-cycle-state-unknown"
-                    and f"{record.get('cycle_id')}: campaign-locator=missing" in exc.detail):
-                return False
-            return True
-        source_path = manifest_path.parent / source_rel
-        if (_path_entry_present(source_path / SPEC_BASE_RECEIPT) or source_path.is_symlink()):
-            return True
-        try:
-            _published_cycle_state(root, record)
-        except ProducerError:
-            return True
-        return False
     try:
-        # This also keeps a present but corrupt manifest on the existing typed
-        # refusal path. Only the exact missing-campaign cleanup shape may use
-        # immutable snapshot evidence below.
         _published_cycle_state(root, record)
     except ProducerError as exc:
         if (exc.code == "sealed-cycle-state-unknown"
                 and f"{record.get('cycle_id')}: campaign-locator=missing" in exc.detail):
             if hints is not None:
-                return hints[1]
-        # A damaged or positively seeded cycle remains visible to the normal
-        # completion classifier; no broad exception becomes not-applicable.
-        return True
+                if not hints["has_seed"]:
+                    return {"obligation": False}
+                return _code_cycle_snapshot_publication_obligation(
+                    root, record, source_rel, hints, reference_rows)
+        return {"obligation": True}
 
     try:
         manifest_path = _record_cycle_manifest_path(root, record)
@@ -9247,34 +9383,36 @@ def _code_cycle_has_publication_obligation(root: Path, record: Mapping[str, Any]
         if _path_entry_present(source_path / SPEC_BASE_RECEIPT):
             seed = _read_json(source_path / SPEC_BASE_RECEIPT)
             if not isinstance(seed, Mapping):
-                return True
+                return {"obligation": True}
             if _code_spec_tree_changed(root, record, source_rel, source_path, seed):
-                return True
+                return {"obligation": True}
             reference_id = seed.get("reference_id")
             if not isinstance(reference_id, str):
-                # Without the seed's exact reference identity, retain the
-                # existing classifier and its lineage/replay check.
-                return True
+                return {"obligation": True}
             reference = _read_json(_reference_path(root, "spec", reference_id))
             if not isinstance(reference, Mapping):
-                return True
-            _revision_id, finished = _finished_spec_publication(
+                return {"obligation": True}
+            revision_id, finished = _finished_spec_publication(
                 root, reference, record["cycle_id"], source_rel, record, source_path, None)
-            return finished is not None
+            if finished is not None:
+                return {"obligation": True, "finished": (reference, revision_id, finished)}
+            return {"obligation": False}
         if source_path.is_symlink():
-            return True
+            return {"obligation": True}
         has_source, has_seed = _spec_source_manifest_hints(root, record, source_rel)
-        return has_seed
+        return {"obligation": has_seed}
     except ProducerError as exc:
         if (exc.code == "sealed-cycle-state-unknown"
                 and f"{record.get('cycle_id')}: campaign-locator=missing" in exc.detail):
             hints = _code_cycle_snapshot_spec_hints(root, record, source_rel)
             if hints is not None:
-                return hints[1]
-        return True
+                if not hints["has_seed"]:
+                    return {"obligation": False}
+                return _code_cycle_snapshot_publication_obligation(
+                    root, record, source_rel, hints, reference_rows)
+        return {"obligation": True}
     except (OSError, ValueError, KeyError, TypeError):
-        # Keep a damaged or unresolvable sealed code cycle visible.
-        return True
+        return {"obligation": True}
 
 
 def _code_spec_tree_changed(root: Path, record: Mapping[str, Any], source_rel: str,
@@ -9338,9 +9476,37 @@ def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = Fals
             return result
         if record.get("state") != "sealed":
             return {**result, "reason": "spec-work-not-completed"}
-        if (capability == "autopilot-code"
-                and not _code_cycle_has_publication_obligation(root, record)):
-            return result
+        code_decision = {"obligation": True}
+        if capability == "autopilot-code":
+            code_decision = _code_cycle_publication_decision(root, record, references)
+            if not code_decision["obligation"]:
+                return result
+            if code_decision.get("references") is not None and code_decision.get("finished") is not None:
+                reference, revision_id, revision = code_decision["finished"]
+                reference_id = reference["shared_reference_id"]
+                result.update(status="admitted", shared_reference_id=reference_id,
+                              shared_reference_revision_id=revision_id,
+                              content_digest=revision.get("content_digest"))
+                if settle:
+                    if "spec_merge" in revision:
+                        _verify_spec_publication(root, reference, revision, completed=True)
+                    else:
+                        _verify_exact_spec_publication(root, reference, revision, completed=True)
+                    admission = {
+                        "status": "reused", "kind": SHARED_KINDS["spec"],
+                        "shared_reference_id": reference_id,
+                        "shared_reference_revision_id": revision_id,
+                        "reference_created": False,
+                        "revision_dir": str(root / "shared/spec" / reference_id / "revisions" / revision_id),
+                        "content_digest": revision.get("content_digest"),
+                        "file_count": revision.get("file_count"),
+                        "promotion": revision.get("promotion"),
+                    }
+                    if "spec_merge" in revision:
+                        admission["spec_merge"] = revision["spec_merge"]
+                    result["admission"] = admission
+                    result["reason"] = None
+                return result
         published_state = _published_cycle_state(root, record)
         if published_state != "completed":
             return {**result, "reason": "spec-work-not-completed"}
