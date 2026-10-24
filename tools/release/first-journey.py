@@ -669,7 +669,7 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
             repo_dir.mkdir()
             fixture = repo / "tools/release/fixtures/first-journey"
             shutil.copy2(fixture / "greet.py", repo_dir / "greet.py")
-            shutil.copy2(fixture / "test_greet.py", repo_dir / "test_greet.py")
+            shutil.copy2(fixture / "focused_test.py.txt", repo_dir / "test_greet.py")
             baseline_env = clean_env(home, pathlist, {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
             git_steps = []
             git_started = time.monotonic()
@@ -731,7 +731,7 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                         account_before = claude_account_snapshot(home / ".claude") if harness == "claude" else None
                         if harness == "claude": record["steps"].append({"name":"usage-before:claude","exit":0 if account_before else 1,"seconds":round(time.monotonic()-usage_started,3),"status":"measured" if account_before else "unknown"})
                         started = time.monotonic()
-                        baseline_test = (fixture / "test_greet.py").read_bytes()
+                        baseline_test = (fixture / "focused_test.py.txt").read_bytes()
                         judge = lambda: judge_repo(repo_dir, baseline_test, lambda argv: sandbox(argv, world, baseline_env, repo_dir),
                                                    baseline_env)["focused_test_passed"]
                         # Invoke the CLI by name so an installed launcher in ~/.local/bin is used, as for a user.

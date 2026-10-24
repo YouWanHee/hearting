@@ -43,11 +43,13 @@ class JourneyTests(unittest.TestCase):
         calls = []
         judged = iter([False, True])
         old = fj.run
+        old_sandbox = fj.sandbox
         try:
             fj.run = lambda argv, **k: calls.append(argv) or {"exit": 0, "seconds": 0.1, "output": outputs.pop(0)}
+            fj.sandbox = lambda argv, *a, **k: argv
             result = fj.headless_turn("claude", "claude", "task", Path("/tmp/world/repos/demo"), Path("/tmp/world"), {}, 30, [],
                                       judge=lambda: next(judged))
-        finally: fj.run = old
+        finally: fj.run = old; fj.sandbox = old_sandbox
         self.assertEqual(result["status"], "candidate-complete")
         self.assertEqual(result["canned_answers"], 1)
         self.assertEqual(calls[1][-3:], ["--resume", "s1", "진행"])
@@ -71,20 +73,24 @@ class JourneyTests(unittest.TestCase):
 
     def test_unexpected_question_stops_without_answer(self):
         old = fj.run
+        old_sandbox = fj.sandbox
         try:
             fj.run = lambda *a, **k: {"exit": 0, "seconds": 0, "output": json.dumps({"session_id":"s", "type":"assistant", "message":{"role":"assistant", "content":"Which file?"}})}
+            fj.sandbox = lambda argv, *a, **k: argv
             result = fj.headless_turn("claude", "claude", "task", Path("/tmp/world/repos/demo"), Path("/tmp/world"), {}, 30, [])
-        finally: fj.run = old
+        finally: fj.run = old; fj.sandbox = old_sandbox
         self.assertEqual(result["status"], "unexpected-question")
         self.assertEqual(result["canned_answers"], 0)
 
     def test_confirmation_answers_are_capped_at_three(self):
         card = "[Run confirmation]\nTask: fix\nWhy: typo\nRoute: direct\nScope: greet\nDone: test\n→ Proceed / Revise: <x> / Stop"
         old = fj.run
+        old_sandbox = fj.sandbox
         try:
             fj.run = lambda *a, **k: {"exit": 0, "seconds": 0, "output": json.dumps({"session_id":"s", "type":"assistant", "message":{"role":"assistant", "content":card}})}
+            fj.sandbox = lambda argv, *a, **k: argv
             result = fj.headless_turn("claude", "claude", "task", Path("/tmp/world/repos/demo"), Path("/tmp/world"), {}, 30, [])
-        finally: fj.run = old
+        finally: fj.run = old; fj.sandbox = old_sandbox
         self.assertEqual(result["canned_answers"], 3)
         self.assertEqual(result["status"], "confirmation-cap")
 
@@ -150,14 +156,14 @@ class JourneyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo=Path(tmp)
             fixture=Path(__file__).parent/"fixtures/first-journey"
-            shutil.copy(fixture/"greet.py",repo/"greet.py"); shutil.copy(fixture/"test_greet.py",repo/"test_greet.py")
+            shutil.copy(fixture/"greet.py",repo/"greet.py"); shutil.copy(fixture/"focused_test.py.txt",repo/"test_greet.py")
             subprocess.run(["git","init","-q"],cwd=repo,check=True)
             subprocess.run(["git","config","user.name","Test"],cwd=repo,check=True)
             subprocess.run(["git","config","user.email","test@example.invalid"],cwd=repo,check=True)
             subprocess.run(["git","add","."],cwd=repo,check=True); subprocess.run(["git","commit","-qm","baseline"],cwd=repo,check=True)
             subprocess.run(["git","switch","-qc","feature"],cwd=repo,check=True)
             (repo/"greet.py").write_text('def greet(): return "Hello"\nif __name__ == "__main__": print(greet())\n')
-            result=fj.judge_repo(repo,(fixture/"test_greet.py").read_bytes())
+            result=fj.judge_repo(repo,(fixture/"focused_test.py.txt").read_bytes())
         self.assertTrue(result["code_fixed"])
         self.assertIn("refs/heads/feature",result["local_refs"])
 
@@ -177,7 +183,7 @@ class JourneyTests(unittest.TestCase):
     def test_baseline_fixture_expects_hello_but_greet_is_typo(self):
         fixture = Path(__file__).parent / "fixtures/first-journey"
         source = (fixture / "greet.py").read_text()
-        test = (fixture / "test_greet.py").read_text()
+        test = (fixture / "focused_test.py.txt").read_text()
         self.assertIn('return "Helo"', source)
         self.assertIn('self.assertEqual(greet(), "Hello")', test)
 
@@ -300,14 +306,16 @@ class JourneyTests(unittest.TestCase):
     def test_unsupported_transport_does_not_execute_task_argv(self):
         calls = []
         previous = fj.run
+        previous_sandbox = fj.sandbox
         try:
             fj.run = lambda argv, **kwargs: calls.append(argv) or {
                 "exit": 0, "seconds": 0, "output": "Usage: opencode run [prompt]"}
+            fj.sandbox = lambda argv, *a, **k: argv
             transport = fj.probe_transport("opencode", "opencode", Path("/tmp/world"), {}, [], 5)
             outcome = fj.headless_turn("opencode", "opencode", "Fix the task", Path("/tmp/repo"),
                                        Path("/tmp/world"), {}, 5, [], transport_supported=transport["supported"])
         finally:
-            fj.run = previous
+            fj.run = previous; fj.sandbox = previous_sandbox
         self.assertFalse(transport["supported"])
         self.assertEqual(outcome["status"], "unsupported-headless-transport")
         self.assertEqual(len(calls), 1)
