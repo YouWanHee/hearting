@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
-import os
+import csv
+import io
 import json
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -17,12 +19,86 @@ import workflow_state as WS
 import worker_bootstrap as WB
 
 ROOT = Path(__file__).resolve().parents[1]
-LIVE_TODO_COUNTS = {"first.txt": 1, "second.txt": 2, "third.txt": 0}
+LIVE_O1_VALUES = (1, 2)
+LIVE_O1_RESULT = sum(LIVE_O1_VALUES)
+LIVE_O1_COMMAND = "python3 -c 'print(sum([" + ",".join(map(str, LIVE_O1_VALUES)) + "]))'"
+LIVE_CSV_FIXTURE = (
+    "category,value\n"
+    "A,2\nB,5\nA,7\nC,4\nB,1\nC,8\n"
+)
 LIVE_TODO_FIXTURES = {
     "first.txt": "TODO: first item\nReviewed\n",
     "second.txt": "TODO: second item\nTODO: third item\n",
     "third.txt": "No marker found\n",
 }
+
+
+def _live_csv_expectations():
+    rows = [(row["category"], int(row["value"]))
+            for row in csv.DictReader(io.StringIO(LIVE_CSV_FIXTURE))]
+    groups = {}
+    for category, value in rows:
+        groups[category] = groups.get(category, 0) + value
+    return rows, {"count": len(rows), "total": sum(value for _, value in rows),
+                  "groups": groups}
+
+
+LIVE_CSV_ROWS, LIVE_CSV_TOTALS = _live_csv_expectations()
+LIVE_TODO_COUNTS = {
+    name: len(re.findall(r"\bTODO\b", body))
+    for name, body in LIVE_TODO_FIXTURES.items()
+}
+
+
+def _live_csv_records_from_output(output):
+    records = []
+    for line in str(output or "").splitlines():
+        try:
+            row = next(csv.reader([line], strict=True))
+        except csv.Error:
+            continue
+        if len(row) == 2:
+            records.append(tuple(cell.strip() for cell in row))
+    return records
+
+
+def _live_coverage_rows(coverage):
+    lines = str(coverage or "").splitlines()
+    header = None
+    header_line = None
+    for index, line in enumerate(lines):
+        if "|" not in line:
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        normalized = [cell.casefold() for cell in cells]
+        if "file" in normalized and "todo count" in normalized:
+            header = (normalized.index("file"), normalized.index("todo count"),
+                      normalized.index("evidence") if "evidence" in normalized else None)
+            header_line = index
+            break
+    if header is None:
+        return None, {}, []
+
+    file_column, count_column, evidence_column = header
+    file_rows = {}
+    total_rows = []
+    for line in lines[header_line + 1:]:
+        if "|" not in line:
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if all(not cell or re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+            continue
+        if max(file_column, count_column) >= len(cells):
+            continue
+        filename = cells[file_column]
+        raw_count = cells[count_column]
+        count = int(raw_count) if re.fullmatch(r"\d+", raw_count) else None
+        evidence = cells[evidence_column] if evidence_column is not None and evidence_column < len(cells) else ""
+        if filename.casefold() == "total":
+            total_rows.append(count)
+        elif filename:
+            file_rows.setdefault(filename, []).append((count, evidence))
+    return header, file_rows, total_rows
 
 
 def _clean_test_env():
@@ -68,10 +144,10 @@ def _live_solo_findings(workdir, final_text, events):
     successful = lambda row: row[3] == 0 or (row[3] is None and row[4] == "completed")
     o1 = [(i, cmd, out) for i, cmd, out, code, status in tools
           if successful((i, cmd, out, code, status))
-          and "python3" in cmd and "sum([1,2])" in cmd and "3" in out.split()]
+          and LIVE_O1_COMMAND in cmd and str(LIVE_O1_RESULT) in out.split()]
     if not o1:
-        findings.append("O1 command/result event for sum([1,2]) -> 3 is missing")
-    o1_index = o1[-1][0] if o1 else -1
+        findings.append(f"O1 command/result event for sum([1,2]) -> {LIVE_O1_RESULT} is missing")
+    o1_index = o1[-1][0] if o1 else len(events)
 
     csv_path = Path(workdir) / "rows.csv"
     later_csv = [(i, cmd, out) for i, cmd, out, code, status in tools
@@ -79,15 +155,21 @@ def _live_solo_findings(workdir, final_text, events):
                  and successful((i, cmd, out, code, status))]
     if not later_csv:
         findings.append("O2 CSV inspection event after O1 is missing")
+    else:
+        expected_csv_records = [("category", "value")]
+        expected_csv_records.extend((category, str(value)) for category, value in LIVE_CSV_ROWS)
+        if not any(_live_csv_records_from_output(out) == expected_csv_records
+                   for _, _, out in later_csv):
+            findings.append("O2 successful rows.csv output does not establish all six fixture records")
+
     totals_path = Path(workdir) / "totals.json"
     try:
         totals = json.loads(totals_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         totals = None
         findings.append(f"O2 totals.json is missing or invalid: {exc}")
-    expected_totals = {"count": 6, "total": 27, "groups": {"A": 9, "B": 6, "C": 12}}
-    if totals is not None and totals != expected_totals:
-        findings.append(f"O2 totals.json differs from {expected_totals!r}: {totals!r}")
+    if totals is not None and totals != LIVE_CSV_TOTALS:
+        findings.append(f"O2 totals.json differs from fixture-derived {LIVE_CSV_TOTALS!r}: {totals!r}")
 
     coverage_path = Path(workdir) / "coverage.md"
     try:
@@ -95,16 +177,42 @@ def _live_solo_findings(workdir, final_text, events):
     except OSError as exc:
         coverage = ""
         findings.append(f"O3 coverage.md is missing: {exc}")
+    coverage_header, coverage_rows, total_rows = _live_coverage_rows(coverage)
+    if coverage_header is None:
+        findings.append("O3 coverage.md exact File/TODO count table header is missing")
     counts = LIVE_TODO_COUNTS
     for filename, count in counts.items():
-        after_o1 = [cmd + "\n" + out for i, cmd, out, code, status in tools
-                    if i > o1_index and successful((i, cmd, out, code, status))]
-        if not any(filename in evidence for evidence in after_o1):
-            findings.append(f"O3 tool evidence for {filename} after O1 is missing")
-        if not any(filename in line and str(count) in line for line in coverage.splitlines()):
-            findings.append(f"O3 per-file result {filename}={count} is missing from coverage.md")
-    if not re.search(r"\btotal\b\s*[:=|]?\s*3\b|\b3\s+total\b", coverage, re.I):
-        findings.append("O3 total TODO count 3 is missing from coverage.md")
+        observations = []
+        for i, command, output, code, status in tools:
+            if i <= o1_index or filename not in command or not successful((i, command, output, code, status)):
+                continue
+            for line in output.splitlines():
+                match = re.fullmatch(rf"\s*{re.escape(filename)}\s*:\s*(\d+)\s*", line)
+                if match:
+                    observations.append(int(match.group(1)))
+        if not observations:
+            findings.append(f"O3 successful TODO count observation for {filename} after O1 is missing")
+        elif set(observations) != {count}:
+            findings.append(f"O3 observed TODO count for {filename} differs from fixture-derived {count}: {observations!r}")
+
+        reported = coverage_rows.get(filename, [])
+        if not reported:
+            findings.append(f"O3 exact coverage table row for {filename} is missing")
+        else:
+            if len(reported) != 1:
+                findings.append(f"O3 coverage table must contain exactly one row for {filename}")
+            for reported_count, evidence in reported:
+                if reported_count is None:
+                    findings.append(f"O3 coverage table count cell for {filename} is not an exact integer")
+                elif reported_count != count or (observations and reported_count not in observations):
+                    findings.append(
+                        f"O3 coverage count for {filename}={reported_count} does not match "
+                        f"its observation and fixture-derived count {count}")
+                if coverage_header is not None and not evidence:
+                    findings.append(f"O3 coverage evidence cell for {filename} is empty")
+    expected_todo_total = sum(LIVE_TODO_COUNTS.values())
+    if total_rows != [expected_todo_total]:
+        findings.append(f"O3 exact Total table cell must report {expected_todo_total}; got {total_rows!r}")
     if not re.search(r"\b(command|evidence)\b|```|`(?:grep|python3|cat|sed|rg)\b", coverage, re.I):
         findings.append("O3 command/evidence reference is missing from coverage.md")
 
@@ -112,11 +220,13 @@ def _live_solo_findings(workdir, final_text, events):
     for marker in ("O1", "O2", "O3"):
         if marker not in final:
             findings.append(f"Final status omits {marker}")
-        elif not re.search(rf"\b{marker}\b[^\n]*\b(complete|completed|done|met|passed|blocked|incomplete|pending)\b",
+        elif not re.search(rf"\b{marker}\b[^\n]*\b(complete|completed|done|met|passed)\b",
                            final, re.I):
-            findings.append(f"Final status does not state {marker}'s outcome")
-    for marker in ("3", "6", "27", "9", "12"):
-        if not re.search(rf"(?<!\d){marker}(?!\d)", final):
+            findings.append(f"Final status does not report {marker} complete")
+    expected_values = {LIVE_O1_RESULT, LIVE_CSV_TOTALS["count"], LIVE_CSV_TOTALS["total"],
+                       *LIVE_CSV_TOTALS["groups"].values(), expected_todo_total}
+    for marker in map(str, expected_values):
+        if not re.search(rf"(?<!\d){re.escape(marker)}(?!\d)", final):
             findings.append(f"Final status omits expected value {marker}")
     if not re.search(r"\b(complete|completed|done|finished)\b", final, re.I):
         findings.append("Final status does not report O1–O3 complete")
@@ -624,55 +734,101 @@ class UnitBootstrapPromptTest(unittest.TestCase):
 
 
 class LiveSoloResultComparatorFixtureTest(unittest.TestCase):
-    """A local fixture proves the live result comparator rejects a missing duty."""
+    """Synthetic events and artifacts exercise live-result acceptance and rejection."""
 
-    def test_fixture_rejects_deleted_expected_result(self):
+    def test_fixture_requires_observed_and_reported_results_for_each_duty(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "rows.csv").write_text("category,value\nA,2\n", encoding="utf-8")
+            self.assertEqual(len(LIVE_CSV_ROWS), 6)
+            self.assertEqual(LIVE_CSV_TOTALS,
+                             {"count": 6, "total": 27, "groups": {"A": 9, "B": 6, "C": 12}})
             self.assertEqual(
                 {name: len(re.findall(r"\bTODO\b", body))
                  for name, body in LIVE_TODO_FIXTURES.items()},
-                LIVE_TODO_COUNTS,
+                {"first.txt": 1, "second.txt": 2, "third.txt": 0},
             )
             self.assertNotIn("TODO", LIVE_TODO_FIXTURES["third.txt"])
+            (root / "rows.csv").write_text(LIVE_CSV_FIXTURE, encoding="utf-8")
             for name, body in LIVE_TODO_FIXTURES.items():
                 (root / name).write_text(body, encoding="utf-8")
-            totals = {"count": 6, "total": 27, "groups": {"A": 9, "B": 6, "C": 12}}
-            (root / "totals.json").write_text(json.dumps(totals), encoding="utf-8")
-            (root / "coverage.md").write_text(
+            (root / "totals.json").write_text(json.dumps(LIVE_CSV_TOTALS), encoding="utf-8")
+            coverage = (
                 "| File | TODO count | Evidence |\n"
-                "| first.txt | 1 | `grep -n TODO first.txt` |\n"
-                "| second.txt | 2 | `grep -n TODO second.txt` |\n"
-                "| third.txt | 0 | `grep -n TODO third.txt` |\n"
-                "| Total | 3 | command results above |\n",
-                encoding="utf-8",
+                "| --- | ---: | --- |\n"
+                "| first.txt | 1 | `python count first.txt`, fixture count 1 |\n"
+                "| second.txt | 2 | `python count second.txt` |\n"
+                "| third.txt | 0 | `python count third.txt` |\n"
+                "| Total | 3 | command results above |\n"
             )
+            (root / "coverage.md").write_text(coverage, encoding="utf-8")
+
+            def command_event(command, output, exit_code=0, status="completed"):
+                return {"type": "item.completed", "item": {"type": "command_execution",
+                        "command": command, "aggregated_output": output,
+                        "exit_code": exit_code, "status": status}}
+
             events = [
-                {"type": "item.completed", "item": {"type": "command_execution",
-                 "command": "python3 -c 'print(sum([1,2]))'", "aggregated_output": "3\n",
-                 "exit_code": 0, "status": "completed"}},
-                {"type": "item.completed", "item": {"type": "command_execution",
-                 "command": "cat rows.csv", "aggregated_output": "A,2\nB,5\nA,7\nC,4\nB,1\nC,8\n",
-                 "exit_code": 0, "status": "completed"}},
-                *[{"type": "item.completed", "item": {"type": "command_execution",
-                   "command": f"grep -n TODO {name}", "aggregated_output": "TODO result\n",
-                   "exit_code": 0, "status": "completed"}}
-                  for name in ("first.txt", "second.txt", "third.txt")],
+                command_event(LIVE_O1_COMMAND, f"{LIVE_O1_RESULT}\n"),
+                command_event("cat rows.csv", LIVE_CSV_FIXTURE),
+                *[command_event(f"python3 count-todos {name}", f"{name}: {count}\n")
+                  for name, count in LIVE_TODO_COUNTS.items()],
             ]
-            final = "O1 complete: 3. O2 complete: count 6, total 27, A=9 B=6 C=12. O3 complete: 3. All complete."
+            groups_text = ", ".join(f"{name}={value}"
+                                     for name, value in LIVE_CSV_TOTALS["groups"].items())
+            final = (f"O1 complete: {LIVE_O1_RESULT}. O2 complete: count {LIVE_CSV_TOTALS['count']}, "
+                     f"total {LIVE_CSV_TOTALS['total']}, {groups_text}. "
+                     f"O3 complete: {sum(LIVE_TODO_COUNTS.values())}. All complete.")
             self.assertEqual(_live_solo_findings(root, final, events), [])
             self.assertEqual(_live_solo_judgment(0, [], events), "PASS")
 
-            failed_command_events = [
-                {**event, "item": dict(event["item"])}
-                if isinstance(event.get("item"), dict) else event
-                for event in events
-            ]
-            failed_command_events[0]["item"].update(exit_code=1, status="failed")
-            findings = _live_solo_findings(root, final, failed_command_events)
-            self.assertTrue(any("O1 command/result event" in item for item in findings), findings)
-            self.assertEqual(_live_solo_judgment(0, findings, failed_command_events), "FAIL")
+            def assert_rejected(candidate_events, expected_finding, label):
+                findings = _live_solo_findings(root, final, candidate_events)
+                self.assertTrue(any(expected_finding in item for item in findings),
+                                f"{label}: {findings}")
+                self.assertEqual(_live_solo_judgment(0, findings, candidate_events), "FAIL", label)
+
+            # Correct prefilled artifacts cannot substitute for observable O2/O3 results.
+            assert_rejected(events[:1], "O2 CSV inspection event", "absent observations")
+
+            partial_csv = "\n".join(LIVE_CSV_FIXTURE.splitlines()[:4]) + "\n"
+            partial_events = [dict(event, item=dict(event["item"])) for event in events]
+            partial_events[1]["item"]["aggregated_output"] = partial_csv
+            assert_rejected(partial_events, "does not establish all six", "partial O2 rows")
+
+            inconsistent_events = [dict(event, item=dict(event["item"])) for event in events]
+            inconsistent_events[1]["item"]["aggregated_output"] = LIVE_CSV_FIXTURE.replace("B,5\n", "B,50\n")
+            assert_rejected(inconsistent_events, "does not establish all six", "inconsistent O2 rows")
+
+            out_of_order_events = events[1:] + events[:1]
+            assert_rejected(out_of_order_events, "O2 CSV inspection event after O1 is missing",
+                            "O2/O3 before O1")
+
+            missing_file_events = events[:4]
+            assert_rejected(missing_file_events, "observation for third.txt after O1 is missing",
+                            "missing per-file observation")
+
+            wrong_count_events = [dict(event, item=dict(event["item"])) for event in events]
+            wrong_count_events[3]["item"]["aggregated_output"] = "second.txt: 9\n"
+            assert_rejected(wrong_count_events, "observed TODO count for second.txt differs",
+                            "incorrect per-file observation")
+
+            failed_zero_events = [dict(event, item=dict(event["item"])) for event in events]
+            failed_zero_events[4]["item"].update(aggregated_output="third.txt: 0\n",
+                                                   exit_code=1, status="failed")
+            assert_rejected(failed_zero_events, "observation for third.txt after O1 is missing",
+                            "failed zero-count grep")
+
+            wrong_cell = coverage.replace("| first.txt | 1 |", "| first.txt | 10 |")
+            (root / "coverage.md").write_text(wrong_cell, encoding="utf-8")
+            assert_rejected(events, "coverage count for first.txt=10", "wrong exact table cell")
+            (root / "coverage.md").write_text(coverage.replace("| second.txt | 2 |", "| second.txt | 1 |"),
+                                               encoding="utf-8")
+            assert_rejected(events, "coverage count for second.txt=1", "reported/observed mismatch")
+            (root / "coverage.md").write_text(coverage, encoding="utf-8")
+
+            failed_o1_events = [dict(event, item=dict(event["item"])) for event in events]
+            failed_o1_events[0]["item"].update(exit_code=1, status="failed")
+            assert_rejected(failed_o1_events, "O1 command/result event", "failed O1")
 
             (root / "totals.json").unlink()
             findings = _live_solo_findings(root, final, events)
@@ -702,8 +858,7 @@ class LiveSoloContinuationTest(unittest.TestCase):
         evidence_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".hearting-solo-live-", dir=ROOT) as tmp:
             root = Path(tmp).resolve()
-            (root / "rows.csv").write_text(
-                "category,value\nA,2\nB,5\nA,7\nC,4\nB,1\nC,8\n", encoding="utf-8")
+            (root / "rows.csv").write_text(LIVE_CSV_FIXTURE, encoding="utf-8")
             for name, body in LIVE_TODO_FIXTURES.items():
                 (root / name).write_text(body, encoding="utf-8")
             self.assertNotIn("TODO", LIVE_TODO_FIXTURES["third.txt"])
@@ -712,14 +867,17 @@ class LiveSoloContinuationTest(unittest.TestCase):
                 "deployment, or merge work. Complete these three distinct duties and then "
                 "report the status of O1, O2, and O3. This request has no done_when field.\n\n"
                 "O1 (first, a small quick-like check): run exactly "
-                "python3 -c 'print(sum([1,2]))' and record its observed output.\n\n"
-                f"O2 (remaining calculation): read all six rows in {root / 'rows.csv'}, "
-                "compute the row count, sum of values, and per-category totals; write "
+                f"{LIVE_O1_COMMAND} and record its observed output.\n\n"
+                f"O2 (remaining calculation): read all {len(LIVE_CSV_ROWS)} rows in {root / 'rows.csv'}, "
+                f"print the header and all {len(LIVE_CSV_ROWS)} CSV data rows in a successful command output, "
+                "then compute the row count, sum of values, and per-category totals; write "
                 f"{root / 'totals.json'} as JSON with fields count, total, and groups.\n\n"
                 "O3 (remaining exhaustive inspection and report): inspect each of these "
                 f"three text files using commands that name the file: {root / 'first.txt'}, "
-                f"{root / 'second.txt'}, and {root / 'third.txt'}. Record the TODO count "
-                "found in each file, their summed total, and command/evidence references in "
+                f"{root / 'second.txt'}, and {root / 'third.txt'}. For each file, run a successful "
+                "count command whose output includes a line in the form '<filename>: <count>', "
+                "including for zero-count files; use a count method that exits successfully for zero. "
+                "Record each observed count, their summed total, and command/evidence references in "
                 f"{root / 'coverage.md'}. Use a table with file, TODO count, and evidence columns."
             )
             assignment = WB.assignment_prompt(SimpleNamespace(worker_type="owner"), request, {})
