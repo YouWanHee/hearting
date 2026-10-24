@@ -101,8 +101,11 @@ def logical_round_records(rows, *, jobs=None):
     declaration leaves both rows visible. The registry and failure history are
     never changed; only the admission/marker census uses this projection.
     """
+    from dispatch_contract import terminal_attempt_never_started
+    rows = [(fields, meta) for fields, meta in rows
+            if not terminal_attempt_never_started(fields[1], meta)]
     if jobs is None:
-        return rows  # No registry binding grants no census-reduction authority.
+        return rows  # No registry binding grants no SD-157 projection authority.
     from route_authority import replacement_parent_matches
     by_id = {}
     for fields, meta in rows:

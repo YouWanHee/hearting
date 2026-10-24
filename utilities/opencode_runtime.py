@@ -16,10 +16,14 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
+import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from types import MappingProxyType
 from urllib.parse import quote
@@ -97,11 +101,7 @@ def parse_version(value: str | None) -> tuple[int, int, int] | None:
 
 
 @lru_cache(maxsize=16)
-def runtime_version(binary: str = "opencode") -> tuple[int, int, int] | None:
-    """Read the executable version once per process; never start a session."""
-    configured = os.environ.get("OPENCODE_RUNTIME_VERSION")
-    if configured:
-        return parse_version(configured)
+def _runtime_version_probe(binary: str) -> tuple[int, int, int] | None:
     # Test/injected command overrides are often scripts with unrelated
     # ``--version`` semantics. Never execute an arbitrary command merely to
     # identify it as OpenCode; callers can pass a known version through the
@@ -115,6 +115,161 @@ def runtime_version(binary: str = "opencode") -> tuple[int, int, int] | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     return parse_version((result.stdout or "") + "\n" + (result.stderr or ""))
+
+
+def runtime_version(binary: str = "opencode") -> tuple[int, int, int] | None:
+    """Return the launch binding before consulting the ambient probe cache."""
+    configured = os.environ.get("OPENCODE_RUNTIME_VERSION")
+    if configured:
+        return parse_version(configured)
+    return _runtime_version_probe(binary)
+
+
+runtime_version.cache_clear = _runtime_version_probe.cache_clear
+
+
+VERSION_PROBE_OUTPUT_LIMIT = 64 * 1024
+VERSION_PROBE_CLEANUP_SECONDS = 24.0
+
+
+def _signal_probe_lease(process: subprocess.Popen, signum: int) -> bool:
+    """Signal only the isolated lease wrapper; it owns descendant cleanup."""
+    if process.poll() is not None:
+        return True
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+    else:
+        try:
+            process.send_signal(signum)
+        except OSError:
+            return False
+    return True
+
+
+def _stop_probe_lease(process: subprocess.Popen) -> bool:
+    """Give the lease its bounded cleanup, then force-stop its wrapper."""
+    if process.poll() is not None:
+        return True
+    signaled = _signal_probe_lease(process, signal.SIGTERM)
+    try:
+        process.wait(timeout=VERSION_PROBE_CLEANUP_SECONDS)
+    except subprocess.TimeoutExpired:
+        signaled = _signal_probe_lease(process, signal.SIGKILL) and signaled
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            return False
+    return signaled and process.poll() is not None
+
+
+def probe_launch_version(*, binary: str = "opencode", cwd: str,
+                         state_root: str | Path,
+                         environ: Mapping[str, str] | None = None,
+                         timeout: float = 5) -> tuple[int, int, int]:
+    """Identify this launch's binary without reading or writing a user store.
+
+    The probe uses a private HOME and all four XDG roots beneath a temporary
+    directory in canonical dispatch state. Only non-secret process settings
+    needed to locate and execute the binary are inherited.
+    """
+    source = os.environ if environ is None else environ
+    path_value = source.get("PATH", os.defpath)
+    executable = shutil.which(binary, path=path_value)
+    if not executable:
+        raise OpenCodeRuntimeError("opencode-runtime-version-unavailable")
+    root = Path(state_root).resolve(strict=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix="opencode-version-", dir=root) as temp:
+            private = Path(temp)
+            home = private / "home"
+            home.mkdir(mode=0o700)
+            env = {"PATH": path_value, "HOME": str(home)}
+            for name in ("DATA", "CACHE", "STATE", "CONFIG"):
+                directory = private / name.lower()
+                directory.mkdir(mode=0o700)
+                env[f"XDG_{name}_HOME"] = str(directory)
+            env["OPENCODE_CONFIG_DIR"] = str(private / "config" / "opencode")
+            env["TMPDIR"] = str(private)
+            for name in ("LANG", "LC_ALL", "LC_CTYPE", "TERM"):
+                if source.get(name):
+                    env[name] = str(source[name])
+            for name in ("OPENCODE_DB", "OPENCODE_AUTH", "OPENCODE_DATA_DIR",
+                         "OPENCODE_CONFIG_CONTENT", "OPENCODE_RUNTIME_VERSION"):
+                env.pop(name, None)
+            # Drain both output streams while retaining at most the protocol
+            # limit. A file redirected directly from the child can grow
+            # without bound during the timeout, and accepting its first line
+            # would mistake a truncated result for a complete version.
+            output = private / "version.out"
+            lease_script = Path(__file__).with_name("verification-background-lease.py")
+            process = subprocess.Popen(
+                [sys.executable, str(lease_script), "--timeout", str(timeout),
+                 "--require-subreaper", "--", executable, "--version"],
+                cwd=cwd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                start_new_session=(os.name == "posix"), bufsize=0,
+            )
+            capture = {"bytes": 0, "truncated": False, "error": None}
+
+            def drain_output() -> None:
+                try:
+                    assert process.stdout is not None
+                    with output.open("wb") as sink:
+                        while True:
+                            chunk = process.stdout.read(8192)
+                            if not chunk:
+                                break
+                            remaining = VERSION_PROBE_OUTPUT_LIMIT - capture["bytes"]
+                            if remaining > 0:
+                                kept = chunk[:remaining]
+                                sink.write(kept)
+                                sink.flush()
+                                capture["bytes"] += len(kept)
+                            if len(chunk) > max(remaining, 0):
+                                capture["truncated"] = True
+                except BaseException as exc:  # surfaced after the bounded join
+                    capture["error"] = exc
+
+            reader = threading.Thread(target=drain_output, name="opencode-version-probe-output", daemon=True)
+            reader.start()
+            timed_out = False
+            cleanup_error = None
+            stop_attempted = False
+            try:
+                process.wait(timeout=max(timeout, 0) + VERSION_PROBE_CLEANUP_SECONDS)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                stop_attempted = True
+                if not _stop_probe_lease(process):
+                    cleanup_error = RuntimeError("verification-lease-cleanup-incomplete")
+            finally:
+                if process.poll() is None and not stop_attempted:
+                    if not _stop_probe_lease(process):
+                        cleanup_error = RuntimeError("verification-lease-cleanup-incomplete")
+                reader.join(timeout=1)
+                if reader.is_alive():
+                    if process.stdout is not None:
+                        process.stdout.close()
+                    reader.join(timeout=0.25)
+                elif process.stdout is not None:
+                    process.stdout.close()
+            with output.open("rb") as handle:
+                head = handle.read(VERSION_PROBE_OUTPUT_LIMIT)
+            version = parse_version(head.decode("utf-8", errors="replace"))
+            if (timed_out or reader.is_alive() or capture["error"] is not None
+                    or capture["truncated"] or cleanup_error is not None
+                    or process.returncode != 0 or version is None):
+                raise OpenCodeRuntimeError("opencode-runtime-version-unavailable")
+            return version
+    except OpenCodeRuntimeError:
+        raise
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+        raise OpenCodeRuntimeError("opencode-runtime-version-unavailable") from exc
 
 
 def is_v2(binary: str = "opencode", version: tuple[int, int, int] | None = None,
