@@ -2540,10 +2540,8 @@ def bind_launch_access(args, *, runtime: str, default_roots, network_available: 
             # Prospective probes without an access request need no live owner.
             # A requested grant, including in dry-run, uses start's exact lookup.
             try:
-                repo = subprocess.check_output(
-                    ["git", "-C", str(args.worktree), "rev-parse", "--show-toplevel"],
-                    text=True, stderr=subprocess.DEVNULL,
-                ).strip()
+                from dispatch_contract import work_root_identity
+                repo = work_root_identity(args.worktree, route=route)
                 args.parent_binding = resolve_live_parent_attempt(
                     args.jobs_path, parent_slug=getattr(args, "parent_slug", None) or "",
                     repo=repo,
@@ -2652,13 +2650,12 @@ def _admit_supervised_owner_resource_start(args, agent_home, jobs):
         raise _contract_error("resource-owner-start-requires-live-parent", str(route_node))
     from dispatch_contract import (
         DispatchContractError, parent_lookup_worktree, resolve_live_parent_attempt,
+        work_root_identity,
     )
     import dispatch_owner_input as INPUT
     import subprocess
     try:
-        repo = subprocess.check_output(
-            ["git", "-C", args.worktree, "rev-parse", "--show-toplevel"], text=True,
-        ).strip()
+        repo = work_root_identity(args.worktree, route=route)
         owner = resolve_live_parent_attempt(
             Path(jobs),
             parent_slug=getattr(args, "parent_slug", None) or "",

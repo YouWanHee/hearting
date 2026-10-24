@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+from types import SimpleNamespace
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,10 @@ class CoreWriteGuardTest(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {"HOME": str(self.home)}, clear=False)
         self.env.start()
         os.environ.pop("XDG_DATA_HOME", None)
+        for key in ("AGENT_ROUTE_FILE", "AGENT_ROUTE_ID", "AGENT_ROUTE_HASH",
+                    "AGENT_OWNER_ROUTE_FILE", "AGENT_OWNER_ROUTE_ID", "AGENT_OWNER_ROUTE_HASH",
+                    "AGENT_DISPATCH_REGISTERED_WORKER"):
+            os.environ.pop(key, None)
         self.primary = self.tmp / "repo"
         (self.primary / ".git/worktrees/feat").mkdir(parents=True)
         self.worktree = self.tmp / "repo-wt/feat"
@@ -65,6 +70,96 @@ class CoreWriteGuardTest(unittest.TestCase):
                                      str(self.worktree)), "")
         with mock.patch.dict(os.environ, {"AGENT_RUNTIME_DIR": str(target.parent)}, clear=False):
             self.assertEqual(G.violation(str(target), str(self.worktree)), "")
+
+    def test_registered_unversioned_worker_scopes_to_sealed_route_cwd(self):
+        route_cwd = self.tmp / "recordish"
+        route_cwd.mkdir()
+        nested_cwd = route_cwd / "sub"
+        nested_cwd.mkdir()
+        artifact_inside = route_cwd / ".agent_reports"
+        artifact_inside.mkdir()
+        artifact_outside = self.tmp / "external-artifacts"
+        artifact_outside.mkdir()
+        unrelated = self.tmp / "unrelated"
+        unrelated.mkdir()
+        route_file = self.tmp / "route.json"
+        route_file.write_text(json.dumps({"cwd": str(route_cwd)}), encoding="utf-8")
+        user_file = route_cwd / "user.txt"
+        user_file.write_text("keep\n")
+        inside_output = artifact_inside / "result.md"
+        inside_output.write_text("result\n")
+        outside_output = artifact_outside / "result.md"
+        outside_output.write_text("result\n")
+        outside_link = route_cwd / "artifact-link.md"
+        outside_link.symlink_to(inside_output)
+        artifact_escape = artifact_inside / "escape.md"
+        artifact_escape.symlink_to(unrelated / "outside.md")
+        (unrelated / "outside.md").write_text("outside\n")
+
+        def check(artifact):
+            route = {"cwd": str(route_cwd), "artifact_root": str(artifact),
+                     "source_commit": "unversioned"}
+            module = SimpleNamespace(validated_unversioned_route=lambda path: (
+                route if Path(path).resolve() == route_cwd.resolve() else None))
+            env = {
+                "AGENT_HOME": str(Path(__file__).resolve().parents[1]),
+                "AGENT_ROUTE_FILE": str(route_file),
+                "AGENT_DISPATCH_REGISTERED_WORKER": "1",
+                "AGENT_ROUTE_ID": "rt-fixture",
+                "AGENT_ROUTE_HASH": "sha256:fixture",
+            }
+            return mock.patch.dict(sys.modules, {"dispatch_contract": module}), \
+                mock.patch.dict(os.environ, env)
+
+        with check(artifact_inside)[0], check(artifact_inside)[1]:
+            self.assertIn("이번 cycle 출력", G.violation(str(user_file), str(artifact_inside)))
+            self.assertIn("이번 cycle 출력", G.violation(str(user_file), str(nested_cwd)))
+            self.assertIn("이번 cycle 출력", G.violation("../user.txt", str(nested_cwd)))
+            self.assertIn("이번 cycle 출력", G.violation(str(outside_link), str(artifact_inside)))
+            self.assertIn("이번 cycle 출력", G.violation(str(artifact_escape), str(route_cwd)))
+            self.assertEqual(G.violation(str(inside_output), str(artifact_inside)), "")
+        with check(artifact_outside)[0], check(artifact_outside)[1]:
+            self.assertIn("이번 cycle 출력", G.violation(str(user_file), str(artifact_outside)))
+            self.assertEqual(G.violation(str(outside_output), str(artifact_outside)), "")
+            self.assertEqual(G.violation(str(unrelated / "outside.md"), str(unrelated)), "")
+
+    def test_registered_unversioned_worker_outside_route_and_artifact_is_unrelated(self):
+        route_cwd = self.tmp / "recordish"
+        route_cwd.mkdir()
+        artifact = self.tmp / "artifacts"
+        artifact.mkdir()
+        unrelated = self.tmp / "elsewhere"
+        unrelated.mkdir()
+        route_file = self.tmp / "route.json"
+        route_file.write_text(json.dumps({"cwd": str(route_cwd)}), encoding="utf-8")
+        route = {"cwd": str(route_cwd), "artifact_root": str(artifact),
+                 "source_commit": "unversioned"}
+        module = SimpleNamespace(validated_unversioned_route=lambda path: route)
+        with mock.patch.dict(sys.modules, {"dispatch_contract": module}), \
+             mock.patch.dict(os.environ, {
+                 "AGENT_HOME": str(Path(__file__).resolve().parents[1]),
+                 "AGENT_ROUTE_FILE": str(route_file),
+                 "AGENT_DISPATCH_REGISTERED_WORKER": "1",
+                 "AGENT_ROUTE_ID": "rt-fixture",
+             }):
+            self.assertEqual(G.violation(str(unrelated / "note.md"), str(unrelated)), "")
+
+    def test_invalid_bound_unversioned_route_fails_closed(self):
+        cwd = self.tmp / "recordish"
+        cwd.mkdir()
+        route_file = self.tmp / "route.json"
+        route_file.write_text(json.dumps({"cwd": str(cwd), "source_commit": "unversioned"}),
+                              encoding="utf-8")
+        module = SimpleNamespace(validated_unversioned_route=lambda _path: None)
+        with mock.patch.dict(sys.modules, {"dispatch_contract": module}), \
+             mock.patch.dict(os.environ, {
+                 "AGENT_HOME": str(Path(__file__).resolve().parents[1]),
+                 "AGENT_ROUTE_FILE": str(route_file),
+                 "AGENT_DISPATCH_REGISTERED_WORKER": "1",
+                 "AGENT_ROUTE_ID": "rt-fixture",
+             }):
+            reason = G.violation(str(cwd / "source.txt"), str(self.tmp))
+            self.assertIn("route를 검증할 수 없어", reason)
 
     def test_hook_modes(self):
         payload = {"tool_name": "Edit", "cwd": str(self.worktree),
