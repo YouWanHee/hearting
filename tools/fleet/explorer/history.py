@@ -1,7 +1,20 @@
 """Seat and generation list for the HISTORY view."""
 
 from collections.abc import Mapping
+from .grid import cell_width
 from .tables import _clip, _tint_row, repo_rule_label
+
+
+def _hard_cut(text, room):
+    """Cut at a display-cell boundary without adding a marker."""
+    out, used = [], 0
+    for char in str(text):
+        width = cell_width(char)
+        if used + width > max(0, int(room)):
+            break
+        out.append(char)
+        used += width
+    return "".join(out)
 
 
 def draw_history(grid, vm, state, x=34, y=3):
@@ -36,19 +49,21 @@ def draw_history(grid, vm, state, x=34, y=3):
             grid.fill(x - 1, right, y, " ", tint=236)
             grid.put(x, y, "▶", "soft")
         if repo != previous_repo:
-            grid.put(x + 2, y, repo_rule_label(repo, 13), "title_dim")
+            grid.put(x + 2, y, _hard_cut(repo_rule_label(repo, 13), right - x - 2),
+                     "title_dim", limit=right)
             previous_repo = repo
         session = next((item for item in vm.sessions if item.get("tag") == tag), {})
         harness = str(session.get("harness") or "·")
         tag_style = "steward" if session.get("steward") else "soft"
         grid.put(x + c_id, y, "[", "dim")
-        grid.put(x + c_id + 1, y, tag, tag_style)
-        grid.put(x + c_id + 1 + len(tag), y, "]", "dim")
-        grid.put(x + c_h, y, harness, "hb_" + harness)
+        shown_tag = _hard_cut(tag, right - x - c_id - 1)
+        grid.put(x + c_id + 1, y, shown_tag, tag_style, limit=right)
+        grid.put(x + c_id + 1 + cell_width(shown_tag), y, "]", "dim", limit=right)
+        grid.put(x + c_h, y, _hard_cut(harness, right - x - c_h), "hb_" + harness, limit=right)
         grid.put(x + c_gen, y, f"{generation_count:2d} ", "soft")
         root_marks = tuple(seat[6]) if len(seat) > 6 else tuple((vm.generations or {}).get(tag, ()))
         _gen_strip(grid, x + c_gen + 3, y, root_marks, gen_width, harness)
-        grid.put(x + c_last, y, last_clear, "dim", limit=right)
+        grid.put(x + c_last, y, _hard_cut(last_clear, right - x - c_last), "dim", limit=right)
         grid.put(x + c_card, y, _clip(title, use - c_card) if title != "·" else "·",
                  "soft" if title != "·" else "dim", limit=right)
         if is_open:
@@ -100,7 +115,9 @@ def draw_seat_expand(grid, vm, state, tag, x, use, y, bottom, seat, harness):
         usage = (vm.system or {}).get("usage_api") if isinstance(vm.system, Mapping) else None
         stamp = usage.get("freshness") if isinstance(usage, Mapping) else None
         note = f"{stamp} 전에 남은 카드 본문이 없습니다." if stamp else "읽은 카드 본문이 없습니다."
-        grid.put(cursor, y, f"  · last clear {last_clear}   {note}", "dim", limit=x + use + 1)
+        limit = x + use + 1
+        line = f"  · last clear {last_clear}   {note}"
+        grid.put(cursor, y, _hard_cut(line, limit - cursor), "dim", limit=limit)
         return y + 1
     right = x + use + 1
     selected_generation = state.opened_for("ui:gen:" + tag)
@@ -128,11 +145,11 @@ def draw_seat_expand(grid, vm, state, tag, x, use, y, bottom, seat, harness):
             title = ("from another seat" if isinstance(gen, Mapping) and gen.get("note") else
                      "no card" if at != "now" else "current generation · no card yet")
         grid.put(x0, y, "now" if at == "now" else f"{index + 1:3d}", "soft")
-        grid.put(x0 + 6, y, at if at != "now" else "", "dim")
+        grid.put(x0 + 6, y, _hard_cut(at if at != "now" else "", right - x0 - 6), "dim", limit=right)
         hue = {"claude": "c", "codex": "m", "opencode": "l"}.get(h, "d")
         grid.put(x0 + 20, y, {"new": "●", "cont": "○", "existing": "◆"}.get(kind, "●"), (hue, 1, 0))
         cursor = grid.put(x0 + 22, y, h, "hb_" + h)
-        grid.put(cursor + 1, y, sid, "dim")
+        grid.put(cursor + 1, y, _hard_cut(sid, right - cursor - 1), "dim", limit=right)
         grid.put(x0 + 42, y, _clip(connection, 30), "blocked" if kind == "existing" else "dim", limit=right)
         grid.put(x0 + 75, y, _clip(title, use - 75 - 6),
                  "soft" if isinstance(gen, Mapping) and gen.get("card") else "dim", limit=right)
