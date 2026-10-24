@@ -176,7 +176,7 @@ class WrapperCommonTest(unittest.TestCase):
                 owner_route_binding=None, route_node="frame-alternative", worker_type="frame",
                 action="start", artifact_root=str(base), agent_home=str(ROOT), jobs=str(jobs), model=None,
                 registered_worker=1, dispatch_depth=1, inherit_model_settings=False,
-                model_role="deep maker", effort=None, capacity_retry=0,
+                model_role="deep maker", effort=None, variant=None, capacity_retry=0,
             )
             with mock.patch("dispatch_capacity_evidence.usage_states", return_value={"claude": "ok"}):
                 context = C.prepare_pair_model_rotation(args, harness="claude")
@@ -191,8 +191,49 @@ class WrapperCommonTest(unittest.TestCase):
         self.assertEqual(args.model_profile, "top")
         self.assertEqual(receipt["model_diversity"], "rotated")
 
+    def test_opencode_frame_pair_skips_collapsed_profiles_and_receipts_balanced_rotation(self):
+        from model_config import resolve_config
+        from model_profile import resolve_profile_demand, resolve_profile_values, selection_receipt
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            config, _ = resolve_config("opencode", source_root=ROOT)
+            top_model = resolve_profile_values("opencode", config, "top")["model"]
+            route = {"route_id": "rt-opencode-frame", "route_hash": "sha256:opencode-frame",
+                     "profile_selection_contract_version": 1,
+                     "nodes": [{"id": name, "worker_type": "frame", "model_profile": "top",
+                                "profile_demand": None,
+                                "profile_selection": resolve_profile_demand(None, explicit_profile="top")}
+                               for name in ("frame", "frame-alternative")]}
+            route_path = base / "route.json"
+            route_path.write_text(json.dumps(route))
+            jobs = base / "jobs.log"
+            jobs.write_text("now\trunning\t/repo\t/tree\tframe\t"
+                f"route_id={route['route_id']},route_hash={route['route_hash']},route_node=frame,"
+                f"worker_type=frame,harness=opencode,model={top_model},attempt_id=att-first\n")
+            args = argparse.Namespace(
+                model_profile="top", pair_model_profile="balanced", route_file=str(route_path),
+                owner_route_binding=None, route_node="frame-alternative", worker_type="frame",
+                action="start", artifact_root=str(base), agent_home=str(ROOT), jobs=str(jobs), model=None,
+                registered_worker=1, dispatch_depth=1, inherit_model_settings=False,
+                model_role="deep maker", effort=None, variant=None, capacity_retry=0,
+            )
+            with mock.patch("dispatch_capacity_evidence.usage_states", return_value={"opencode": "ok"}):
+                context = C.prepare_pair_model_rotation(args, harness="opencode")
+                wrapper = load("opencode")
+                settings = wrapper.resolve_model_settings(args)
+                args.resolved_model_settings = settings
+                receipt = selection_receipt(args)
+        self.assertEqual(context["status"], "rotated")
+        self.assertEqual(context["profile"], "balanced")
+        self.assertEqual(args.model_profile, "top")
+        self.assertEqual(settings["profile"], "balanced")
+        self.assertNotEqual(settings["model"], top_model)
+        self.assertEqual(receipt["model_diversity"], "rotated")
+        self.assertEqual(receipt["model_source"], "profile+diversity")
+
     def test_missing_model_alternative_is_unavailable_and_target_limit_keeps_seal(self):
         from model_config import resolve_config
+        from model_profile import resolve_profile_values
         config, receipt = resolve_config("claude", source_root=ROOT)
         config = dict(config)
         for profile in ("balanced-deep", "balanced", "light"):
@@ -212,8 +253,17 @@ class WrapperCommonTest(unittest.TestCase):
              mock.patch("replica_batch_contract.verify_manifest", return_value=(manifest, "digest", {})):
             args = self._pair_args(td, hint=None)
             unavailable = C.prepare_pair_model_rotation(args, harness="claude")
+            wrapper = load("claude")
+            settings = wrapper.resolve_model_settings(args)
+            args.resolved_model_settings = settings
+            from model_profile import selection_receipt
+            receipt = selection_receipt(args)
         self.assertEqual(unavailable["status"], "unavailable")
         self.assertEqual(unavailable["profile"], "balanced-deep")
+        self.assertEqual(settings["profile"], "balanced-deep")
+        self.assertEqual(settings["model"], resolve_profile_values("claude", config, "balanced-deep")["model"])
+        self.assertEqual(receipt["model_diversity"], "unavailable")
+        self.assertEqual(settings["source"], "profile")
 
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.dict(os.environ, {"AGENT_MODEL_GOVERNOR_RESERVATION_TOKEN": "token-fixture"}), \

@@ -66,6 +66,80 @@ class PairModelProposalTest(unittest.TestCase):
         self.assertEqual(diagnostic["reason"], "proposed")
         self.assertEqual([row[0]["model_profile"] for row in nodes], ["deep", "balanced-deep"])
 
+    def test_batch_proposal_flows_through_shared_wrapper_to_realized_rotation_receipt(self):
+        from model_config import resolve_config
+        from model_profile import resolve_profile_demand, resolve_profile_values, selection_receipt
+        import dispatch_wrapper_common as COMMON
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            config, _ = resolve_config("claude", source_root=ROOT)
+            nodes = [
+                ({"id": "plan", "model_profile": "deep", "parallel_leg_index": 0}, "claude", "same", 1),
+                ({"id": "plan-alternative", "model_profile": "balanced-deep", "parallel_leg_index": 1}, "claude", "same", 1),
+            ]
+            proposals, diagnostic = BATCH._pair_model_proposals(nodes)
+            self.assertEqual(proposals, {"plan-alternative": "balanced"})
+            route = {"route_id": "rt-batch-wrapper", "route_hash": "sha256:batch-wrapper",
+                     "profile_selection_contract_version": 1,
+                     "nodes": [{"id": name, "parallel_group": "plan", "model_profile": profile,
+                                "profile_demand": None,
+                                "profile_selection": resolve_profile_demand(None, explicit_profile=profile)}
+                               for name, profile in (("plan", "deep"), ("plan-alternative", "balanced-deep"))]}
+            route_path = base / "route.json"
+            route_path.write_text(json.dumps(route))
+            manifest = {"members": [
+                {"route_node": "plan", "model_profile": "deep", "harness": "claude"},
+                {"route_node": "plan-alternative", "model_profile": "balanced-deep", "harness": "claude"},
+            ]}
+            jobs = base / "jobs.log"
+            jobs.write_text("")
+            args = SimpleNamespace(
+                model_profile="balanced-deep", pair_model_profile=proposals["plan-alternative"],
+                route_file=str(route_path), owner_route_binding=None, route_node="plan-alternative",
+                action="start", attempt_id="att-alternative", parent_attempt_id="att-parent",
+                fallback_hop="same-harness-headless", fallback_ordinal=1, artifact_root=str(base),
+                agent_home=str(ROOT), jobs=str(jobs), worker_type="stage", model=None,
+                registered_worker=1, dispatch_depth=2, inherit_model_settings=False,
+                model_role="deep maker", effort=None, capacity_retry=0,
+            )
+            with mock.patch.dict(os.environ, {"AGENT_MODEL_GOVERNOR_RESERVATION_TOKEN": "token-fixture"}), \
+                 mock.patch("dispatch_contract.replica_batch_expectation", return_value={}), \
+                 mock.patch("dispatch_contract.resolve_model_governor_root", return_value=base / "governor"), \
+                 mock.patch("dispatch_contract._governor_json", return_value={"state": "unclaimed", "batch_manifest": manifest}), \
+                 mock.patch("route_authority.require_batch_reservation"), \
+                 mock.patch("replica_batch_contract.verify_manifest", return_value=(manifest, "digest", {})), \
+                 mock.patch("dispatch_capacity_evidence.usage_states", return_value={"claude": "ok"}):
+                context = COMMON.prepare_pair_model_rotation(args, harness="claude")
+                wrapper = importlib.util.spec_from_file_location(
+                    "claude_pair_batch_wrapper", ROOT / "adapters/claude/bin/dispatch-headless.py")
+                module = importlib.util.module_from_spec(wrapper)
+                wrapper.loader.exec_module(module)
+                rotated = module.resolve_model_settings(args)
+                args.resolved_model_settings = rotated
+                receipt = selection_receipt(args)
+            baseline = resolve_profile_values("claude", config, "deep")
+            results = [
+                {"attempt_id": "att-anchor", "node": "plan", "launch_state": "started",
+                 "model_profile": "deep", "model": baseline["model"], "model_source": "profile",
+                 "model_diversity": "distinct"},
+                {"attempt_id": "att-alternative", "node": "plan-alternative", "launch_state": "started",
+                 "model_profile": rotated["profile"], "model": rotated["model"],
+                 "model_source": receipt.get("model_source", "profile"),
+                 "model_diversity": receipt["model_diversity"]},
+            ]
+            batch_receipt, _success = BATCH.batch_receipt(
+                args=SimpleNamespace(parallel_group="plan"), lifecycle="detached", independence="persona",
+                required_axes=["model"], realized_axes=[], degradation_reason="",
+                legs=[{"attempt_id": row["attempt_id"]} for row in results], results=results, admitted=2,
+                selection_diagnostics={"model_diversity_proposal": diagnostic})
+        self.assertEqual(context["status"], "rotated")
+        self.assertEqual(args.model_profile, "balanced-deep")
+        self.assertEqual(rotated["profile"], "balanced")
+        self.assertNotEqual(rotated["model"], baseline["model"])
+        realized = batch_receipt["selection_diagnostics"]["model_diversity_realized"]["plan-alternative"]
+        self.assertEqual(realized["model_diversity"], "rotated")
+        self.assertEqual(realized["model_source"], "profile+diversity")
+
     def test_distinct_harness_pair_is_outside_model_rotation(self):
         nodes = [
             ({"id": "plan-a", "model_profile": "deep"}, "claude", "same", 1),
