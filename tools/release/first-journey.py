@@ -181,6 +181,10 @@ def detect_card(text: str) -> bool:
     return header and all(p >= 0 for p in positions) and positions == sorted(positions) and option
 
 
+def canned_proceed(text: str) -> str:
+    return "진행" if "진행 / 수정 / 중단" in text else "Proceed"
+
+
 def telemetry(world: Path, harness: str) -> dict:
     # Keep unknown distinct from zero; every reader is restricted to the disposable world.
     if harness == "claude":
@@ -221,13 +225,14 @@ def telemetry(world: Path, harness: str) -> dict:
         try:
             sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fleet"))
             from token_budget import parse_codex_token_count
-            latest = {}
+            latest = {}; last_events = {}
             for file in rollouts:
                 for line in file.read_text(errors="replace").splitlines():
                     try: row = json.loads(line)
                     except json.JSONDecodeError: continue
                     if row.get("type") == "event_msg" and row.get("payload", {}).get("type") == "token_count":
                         latest[file] = parse_codex_token_count(line, session_id=file.stem)
+                        last_events[file] = row.get("payload", {})
             vals = [x for x in latest.values() if x.session_total_tokens is not None]
             if vals:
                 final = vals[-1]
@@ -235,7 +240,7 @@ def telemetry(world: Path, harness: str) -> dict:
                         "input": final.session_input_tokens, "output": final.session_output_tokens,
                         "cached_input": final.session_cached_input_tokens,
                         "reasoning_output": final.session_reasoning_output_tokens,
-                        "rate_limits": None, "reason": None}
+                        "sessions": len(vals), "rate_limits": last_events.get(list(latest)[-1], {}).get("rate_limits"), "reason": None}
         except (ImportError, ValueError, TypeError): pass
     return {"status": "unknown", "total": None, "reason": "no-supported-codex-token-count"}
 
@@ -319,13 +324,13 @@ def headless_turn(harness: str, executable: str, prompt: str, cwd: Path, world: 
     if harness == "claude": argv = [executable, "-p", "--output-format", "stream-json", "--verbose", prompt]
     elif harness == "codex": argv = [executable, "exec", "--json", "--cd", virtual_cwd, prompt]
     else: argv = [executable, "run", "--format", "json", prompt]
-    turns = []; answers = 0; sid = None; result = {"status": "task-incomplete", "turns": turns, "canned_answers": 0}; texts=[]
+    turns = []; answers = 0; sid = None; answer = "Proceed"; result = {"status": "task-incomplete", "turns": turns, "canned_answers": 0}; texts=[]
     deadline = time.monotonic() + timeout
     for index in range(1, 5):
         if index > 1:
-            if harness == "claude": argv = [executable, "-p", "--output-format", "stream-json", "--verbose", "--resume", sid, "진행"]
-            elif harness == "codex": argv = [executable, "exec", "resume", "--json", sid, "진행"]
-            else: argv = [executable, "run", "--format", "json", "--session", sid, "진행"]
+            if harness == "claude": argv = [executable, "-p", "--output-format", "stream-json", "--verbose", "--resume", sid, answer]
+            elif harness == "codex": argv = [executable, "exec", "resume", "--json", sid, answer]
+            else: argv = [executable, "run", "--format", "json", "--session", sid, answer]
         remaining = max(1, int(deadline - time.monotonic()))
         step = run(sandbox(argv, world, env, cwd, mounts), env=env, timeout=remaining, cwd=cwd)
         text, found = event_text(step["output"], harness); sid = found or sid
@@ -335,6 +340,7 @@ def headless_turn(harness: str, executable: str, prompt: str, cwd: Path, world: 
         if text and ("permission" in text.lower() or "refus" in text.lower()): result["status"] = "unexpected-question"; result["turn_index"] = index; break
         if text and ("Hello" in text or "test_greet" in text) and not detect_card(text): result["status"] = "candidate-complete"; break
         if detect_card(text) and answers < 3 and sid:
+            answer = canned_proceed(text)
             answers += 1; continue
         result["status"] = "unexpected-question" if "?" in text else "task-incomplete"; result["turn_index"] = index; break
     result.update({"turns": turns, "canned_answers": answers, "session_id": sid, "output": "\n".join(texts)})
