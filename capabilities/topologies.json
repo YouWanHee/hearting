@@ -822,7 +822,7 @@
         "topology": "one-shot-owner",
         "worker_kind": "capability-owner",
         "write_scope": [
-          "designs/<cycle>/**",
+          "designs/**",
           "spec/design/**"
         ],
         "owner_dispatch_depth": 1,
@@ -842,10 +842,10 @@
               "references"
             ],
             "outputs": [
-              "designs/<cycle>/01_refs/frame/direction-brief.md"
+              "designs/01_refs/frame/direction-brief.md"
             ],
             "write_scope": [
-              "designs/<cycle>/01_refs/frame/**",
+              "designs/01_refs/frame/**",
               "spec/design/01_refs/frame/**"
             ],
             "resource_class": "normal",
@@ -872,10 +872,10 @@
               "references"
             ],
             "outputs": [
-              "designs/<cycle>/01_refs/frame-alternative/direction-brief.md"
+              "designs/01_refs/frame-alternative/direction-brief.md"
             ],
             "write_scope": [
-              "designs/<cycle>/01_refs/frame-alternative/**",
+              "designs/01_refs/frame-alternative/**",
               "spec/design/01_refs/frame-alternative/**"
             ],
             "resource_class": "normal",
@@ -903,14 +903,14 @@
             "inputs": [
               "design-task",
               "references",
-              "designs/<cycle>/01_refs/frame/direction-brief.md",
-              "designs/<cycle>/01_refs/frame-alternative/direction-brief.md"
+              "designs/01_refs/frame/direction-brief.md",
+              "designs/01_refs/frame-alternative/direction-brief.md"
             ],
             "outputs": [
-              "designs/<cycle>/01_refs/reference-brief.json"
+              "designs/01_refs/reference-brief.json"
             ],
             "write_scope": [
-              "designs/<cycle>/01_refs/**",
+              "designs/01_refs/**",
               "spec/design/01_refs/**"
             ],
             "resource_class": "normal",
@@ -947,8 +947,8 @@
               "render"
             ],
             "write_scope": [
-              "designs/<cycle>/02_tokens/**",
-              "designs/<cycle>/03_components/**",
+              "designs/02_tokens/**",
+              "designs/03_components/**",
               "spec/design/02_tokens/**",
               "spec/design/03_components/**"
             ],
@@ -982,10 +982,10 @@
               "components"
             ],
             "outputs": [
-              "designs/<cycle>/04_review/verify/verdict.yaml"
+              "designs/04_review/verify/verdict.yaml"
             ],
             "write_scope": [
-              "designs/<cycle>/04_review/verify/**",
+              "designs/04_review/verify/**",
               "spec/design/04_review/verify/**"
             ],
             "resource_class": "normal",
@@ -1018,10 +1018,10 @@
               "components"
             ],
             "outputs": [
-              "designs/<cycle>/04_review/critic/verdict.json"
+              "designs/04_review/critic/verdict.json"
             ],
             "write_scope": [
-              "designs/<cycle>/04_review/critic/**",
+              "designs/04_review/critic/**",
               "spec/design/04_review/critic/**"
             ],
             "resource_class": "normal",
@@ -1049,16 +1049,16 @@
             ],
             "role": "deep editor",
             "inputs": [
-              "designs/<cycle>/04_review/verify/verdict.yaml",
-              "designs/<cycle>/04_review/critic/verdict.json",
+              "designs/04_review/verify/verdict.yaml",
+              "designs/04_review/critic/verdict.json",
               "tokens",
               "components"
             ],
             "outputs": [
-              "designs/<cycle>/05_handoff/**"
+              "designs/05_handoff/**"
             ],
             "write_scope": [
-              "designs/<cycle>/05_handoff/**",
+              "designs/05_handoff/**",
               "spec/design/05_handoff/**"
             ],
             "resource_class": "normal",
@@ -1203,7 +1203,7 @@
       ],
       "artifact_scope": {
         "cycle_anchors": [
-          "designs/<cycle>",
+          "designs",
           "spec/design"
         ],
         "map_anchor": "01_refs",
@@ -4651,7 +4651,7 @@
     "plans": "plans/<cycle>",
     "documents": "documents/<cycle>",
     "experiments": "experiments/<cycle>",
-    "designs": "designs/<cycle>",
+    "designs": "designs",
     "spec-component": "spec/<component>",
     "user_profile": "user_profile",
     "campaign-cycle": "campaigns/<campaign-locator>/<cycle-locator>/artifacts",
@@ -4752,8 +4752,8 @@
         "autopilot-design": {
           "consumer": "refs",
           "inputs": [
-            "designs/<cycle>/01_refs/frame/direction-brief.md",
-            "designs/<cycle>/01_refs/frame-alternative/direction-brief.md"
+            "designs/01_refs/frame/direction-brief.md",
+            "designs/01_refs/frame-alternative/direction-brief.md"
           ]
         },
         "autopilot-spec": {

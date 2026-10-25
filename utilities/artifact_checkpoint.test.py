@@ -64,6 +64,43 @@ class CheckpointTestBase(F.ProducerTestBase):
 
 
 class InterimManifestTest(CheckpointTestBase):
+    def test_literal_design_payload_keeps_locator_and_identity_through_checkpoint_seal_and_refresh(self):
+        relative = "designs/<cycle>/02_tokens/tokens.json"
+        target = Path(self.result["cycle_dir"]) / "artifacts" / relative
+        self.assertEqual(P.check_write(self.root, target)["verdict"], "allow")
+        self.write_output(self.result, relative, b'{"color":"blue"}\n')
+        first_checkpoint = P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual(first_checkpoint["status"], "emitted", first_checkpoint)
+        first_rows = _ids_by_path(self.interim())
+        locator = "artifacts/" + relative
+        self.assertIn(locator, first_rows)
+        artifact_id, revision_id, first_digest, _role = first_rows[locator]
+        self.assertEqual(first_digest, "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest())
+        unchanged = P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual(unchanged["status"], "unchanged", unchanged)
+        self.assertEqual(_ids_by_path(self.interim())[locator][0:2], (artifact_id, revision_id))
+
+        _sealed, document = self.seal()
+        sealed_rows = _ids_by_path(document)
+        self.assertEqual(sealed_rows[locator][0], artifact_id)
+        self.assertEqual(sealed_rows[locator][2], first_digest)
+        target.write_bytes(b'{"color":"green"}\n')
+        refreshed = P.refresh_cycle(self.root, self.cycle_id, trigger="explicit")
+        self.assertEqual(refreshed["status"], "emitted", refreshed)
+        rows = _ids_by_path(json.loads((Path(self.result["cycle_dir"]) / "manifest.json").read_text()))
+        self.assertEqual(rows[locator][0], artifact_id)
+        self.assertNotEqual(rows[locator][1], revision_id)
+        self.assertEqual(rows[locator][2], "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest())
+
+        target.write_bytes(b'{"color":"purple"}\n')
+        bounded = P.refresh_cycle(self.root, self.cycle_id, trigger="explicit",
+                                  budget=P.RefreshBudget(max_walk_entries=500,
+                                      max_hash_bytes=1024 * 1024, max_seconds=10.0))
+        self.assertEqual(bounded["status"], "emitted", bounded)
+        final_rows = _ids_by_path(json.loads((Path(self.result["cycle_dir"]) / "manifest.json").read_text()))
+        self.assertEqual(final_rows[locator][0], artifact_id)
+        self.assertEqual(final_rows[locator][2], "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest())
+
     def test_checkpoint_config_reload_fallback_alias_and_invalid_whole_file(self):
         xdg_config = P._checkpoint_limits_path()
         xdg_config.parent.mkdir(parents=True)

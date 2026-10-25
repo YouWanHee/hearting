@@ -99,6 +99,24 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(names, ["2026-08-26_cycle-plan", "2026-01-01_legacy-plan"])
         self.assertEqual(reader.glob_bucket(self.root, "plans", ".hidden"), [])
 
+    def test_flat_design_layout_is_one_cycle_and_literal_legacy_layout_stays_discoverable(self):
+        cycle = self.root / "campaigns" / CAMP / "cycles" / CYC
+        flat = cycle / "artifacts" / "designs"
+        (flat / "01_refs").mkdir(parents=True)
+        (flat / "02_tokens").mkdir()
+        (flat / "03_components").mkdir()
+        (flat / "04_review").mkdir()
+        (flat / "05_handoff").mkdir()
+        rows = [(path, meta) for path, meta in reader.iter_bucket_children(self.root, "designs")]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], flat)
+        self.assertEqual(rows[0][1]["design_layout"], "flat")
+        flat.rename(cycle / "artifacts" / "designs-flat")
+        old = cycle / "artifacts" / "designs"
+        (old / "<cycle>" / "02_tokens").mkdir(parents=True)
+        legacy = list(reader.iter_bucket_children(self.root, "designs"))
+        self.assertEqual([path for path, _meta in legacy], [old / "<cycle>"])
+
     def test_cycle_buckets_use_record_ids_across_readable_and_legacy_paths(self):
         campaign_id = "camp_" + "2" * 32
         cycle_id = "cyc_" + "3" * 32
