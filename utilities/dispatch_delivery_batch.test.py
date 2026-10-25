@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,39 @@ DRIVER = Path(__file__).with_name("dispatch_delivery_batch_fixture.py")
 
 
 class DeliveryBatchMeasurementTest(unittest.TestCase):
+    def test_measurement_stops_only_its_own_writer_before_temporary_cleanup(self):
+        import dispatch_delivery_batch_fixture as fixture
+        import peer_obligations
+
+        prior = mock.Mock()
+        runners = [prior]
+        writer = None
+        with mock.patch.object(peer_obligations, "_RUNNERS", runners):
+            with tempfile.TemporaryDirectory(prefix="delivery-runner-cleanup-") as temporary, \
+                    fixture._fixture_obligation_runners():
+                directory = Path(temporary)
+                script = (
+                    "from pathlib import Path; import sys,time\n"
+                    "root=Path(sys.argv[1])/'peer-steward'/'obligations'\n"
+                    "root.mkdir(parents=True)\n"
+                    "print('ready', flush=True)\n"
+                    "while True:\n"
+                    " (root/'record.json').write_text('{}')\n"
+                    " time.sleep(.01)\n"
+                )
+                writer = subprocess.Popen(
+                    [sys.executable, "-c", script, str(directory)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                runners.append(writer)
+                self.assertEqual(writer.stdout.readline().strip(), "ready")
+                self.assertIsNone(writer.poll())
+            self.assertIsNotNone(writer.poll())
+            self.assertFalse(directory.exists())
+        prior.poll.assert_not_called()
+        prior.terminate.assert_not_called()
+        writer.stdout.close()
+        writer.stderr.close()
+
     def test_candidate_carriers_coalesce_success_and_deliver_failures(self):
         with tempfile.TemporaryDirectory(prefix="delivery-batch-test-") as temporary:
             output = Path(temporary) / "candidate.json"
