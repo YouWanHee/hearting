@@ -24,7 +24,8 @@ VIEWS = ("OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "COMPUTE",
 # The narrow-width exceptions belong to this observed R14/v87 renderer. Runtime
 # put-tracing below emits the exact changed-cell mask; these source hashes prevent
 # a different reference tree from inheriting that mask accidentally.
-REFERENCE_MASK_VERSION = "r14-v87-explicit-cell-mask-v1"
+REFERENCE_MASK_VERSION = "r14-v87-explicit-cell-mask-v2"
+REFERENCE_MASK_COMPAT_VERSIONS = frozenset({REFERENCE_MASK_VERSION, "r14-v87-explicit-cell-mask-v1"})
 R14_REFERENCE_PROFILE = "mock-r14-v87"
 R14_REFERENCE_MODULE_SHA256 = {
     "mock2.py": "79f93bb6c0ceb7e1d17849e994bccde01e268178f123cf445eac50c51c7b6a4e",
@@ -53,6 +54,49 @@ R14_MODELS_HIT_MASKS = {
     },
 }
 R14_UNKNOWN_GPU_TRACK_LAST_COLUMN = {80: 78, 100: 81, 140: 81, 168: 81}
+R14_RESIDUAL_COORDINATES = {
+    ("OVERVIEW", 80, 4): (64, 65, 66, 67, 68),
+    ("MODELS", 80, 22): (77, 78, 79),
+    ("MODELS", 80, 26): (59, 79),
+    ("MODELS", 80, 32): (78, 79),
+    ("MODELS", 100, 22): (97, 98, 99),
+    ("MODELS", 100, 26): (59, 86, 99),
+}
+R14_MODELS_BLANK_KEY_CELLS = {80: (59,), 100: (59, 86)}
+R14_RESIDUAL_CELL_PAIRS = {
+    ("OVERVIEW", 80, 4): {
+        64: (("T", "section_head", 234), ("C", "section_head", 234)),
+        65: (("C", "section_head", 234), ("T", "section_head", 234)),
+        66: (("T", "section_head", 234), ("X", "section_head", 234)),
+        67: (("X", "section_head", 234), (" ", None, 234)),
+        68: (("E", "section_head", 234), (" ", None, 234)),
+    },
+    ("MODELS", 80, 22): {
+        77: (("s", "dim", None), (" ", "branch_s", None)),
+        78: ((" ", "dim", None), ("┘", "dim", None)),
+        79: (("a", "dim", None), (" ", None, None)),
+    },
+    ("MODELS", 80, 26): {
+        59: ((" ", "dim", None), (" ", "branch_s", None)),
+        79: (("p", "hb_opencode", None), (" ", None, None)),
+    },
+    ("MODELS", 80, 32): {
+        78: (("n", "dim", None), (" ", "branch_s", None)),
+        79: (("s", "dim", None), (" ", None, None)),
+    },
+    ("MODELS", 100, 22): {
+        97: (("·", "dim", None), (" ", "branch_s", None)),
+        98: ((" ", "dim", None), ("┘", "dim", None)),
+        99: (("s", "dim", None), (" ", None, None)),
+    },
+    ("MODELS", 100, 26): {
+        59: ((" ", "dim", None), (" ", "branch_s", None)),
+        86: ((" ", "dim", None), (" ", "branch_s", None)),
+        99: (("c", "hb_claude", None), (" ", None, None)),
+    },
+}
+R14_MODELS_FOOT_TEXT = "→ .bak backup · new sessions and launches only · sealed routes keep their choice"
+R14_MODELS_SECTION_META = "  input tokens · new sessions only"
 
 
 def _reference_profile(reference):
@@ -91,6 +135,10 @@ def _reference_trace_mask(reference, renderer, width, state, profile=None):
         start_x, start_y = x, y
         right = self.W if limit is None else min(self.W, int(limit))
         rendered = str(text)
+        trace_models_foot = (profile == R14_REFERENCE_PROFILE and state.view == "MODELS" and
+                             width in (80, 100) and y + 1 == 22 and rendered == R14_MODELS_FOOT_TEXT)
+        trace_models_section_edge = (profile == R14_REFERENCE_PROFILE and state.view == "MODELS" and
+                                     width == 80 and y + 1 == 32 and rendered == R14_MODELS_SECTION_META)
         if 0 <= y < len(self.c):
             for char in rendered:
                 cells = renderer.mock2.cw(char)
@@ -108,12 +156,19 @@ def _reference_trace_mask(reference, renderer, width, state, profile=None):
                     glyph = char if offset == 0 else ""
                     if previous and previous[0] != call and _overwrites(previous[1], glyph):
                         overlaps = True
+                    if (trace_models_foot and column == width - 3 and previous and
+                            previous[1] in "─━═┈┄┅┉╌╍"):
+                        add(y, column, "text-on-box-rule")
                 if overlaps and 2 <= y <= 39 and x + cells - 1 >= 33:
                     for column in range(max(33, x), min(self.W, x + cells)):
                         add(y, column, "text-overlap")
                 if 2 <= y <= 39 and x + cells > self.W - 1:
                     for column in range(max(33, x), min(self.W, x + cells)):
                         add(y, column, "text-beyond-pane")
+                    if trace_models_section_edge and x == width - 1:
+                        previous = owners.get((y, x - 1))
+                        if previous and previous[0] == call:
+                            add(y, x - 1, "text-edge-predecessor")
                 for offset in range(cells):
                     owners[(y, x + offset)] = (call, char if offset == 0 else "")
                 x += cells
@@ -412,11 +467,96 @@ def _system_pending_diff(record, band):
     return bool(ref_value and fleet_value and ref_value.group(1) != fleet_value.group(1))
 
 
+def _has_pinned_reference_trace(record, *, current=False):
+    trace = record.get("reference_overflow_mask") or {}
+    versions = {REFERENCE_MASK_VERSION} if current else REFERENCE_MASK_COMPAT_VERSIONS
+    return (record.get("reference_profile") == R14_REFERENCE_PROFILE and
+            trace.get("profile") == R14_REFERENCE_PROFILE and trace.get("version") in versions)
+
+
+def _r14_residual_key(record, band):
+    if band.get("pane") != "right" or len(band.get("rows") or ()) != 1:
+        return None
+    key = (record.get("state"), record.get("width"), band["rows"][0])
+    return key if key in R14_RESIDUAL_COORDINATES else None
+
+
+def _row_cell_diffs(record, row):
+    return sorted((diff for diff in record.get("differences", ())
+                   if diff.get("kind") == "cell" and diff.get("row") == row),
+                  key=lambda diff: diff.get("column", -1))
+
+
+def _trace_cells_for_row(record, row):
+    trace = record.get("reference_overflow_mask") or {}
+    return {item.get("column"): tuple(sorted(item.get("kinds") or ()))
+            for item in trace.get("cells", ()) if item.get("row") == row}
+
+
+def _row_matches_residual_pairs(record, key):
+    pairs = R14_RESIDUAL_CELL_PAIRS[key]
+    row = key[2]
+    diffs = _row_cell_diffs(record, row)
+    if [diff.get("column") for diff in diffs] != sorted(pairs):
+        return False
+    reference_cells = record.get("reference_cells") or ()
+    fleet2_cells = record.get("fleet2_cells") or ()
+    if row >= len(reference_cells) or row >= len(fleet2_cells):
+        return False
+    for diff in diffs:
+        column = diff["column"]
+        expected, actual = pairs[column]
+        if (tuple(diff.get("expected") or ()) != expected or tuple(diff.get("actual") or ()) != actual or
+                tuple(reference_cells[row][column]) != expected or tuple(fleet2_cells[row][column]) != actual):
+            return False
+    return all(tuple(reference_cells[row][column]) == tuple(fleet2_cells[row][column])
+               for column in range(record["width"]) if column not in pairs)
+
+
+def _r14_residual_reference_mask(record, band):
+    """Mask only the captured header collision and MODELS note overprint, with exact cells and traces."""
+    key = _r14_residual_key(record, band)
+    if key not in (("OVERVIEW", 80, 4), ("MODELS", 80, 22), ("MODELS", 100, 22)):
+        return []
+    if not _has_pinned_reference_trace(record, current=True) or not _row_matches_residual_pairs(record, key):
+        return []
+    row = key[2]
+    width = key[1]
+    if [diff.get("column") for diff in band.get("diffs") or ()] != list(R14_RESIDUAL_COORDINATES[key]):
+        return []
+    if key == ("OVERVIEW", 80, 4):
+        if _trace_cells_for_row(record, row) != {65: ("text-overlap",), 67: ("text-overlap",)}:
+            return []
+        if (band.get("reference") != ["      ID       HARNESS         TCTXE       AGE"] or
+                band.get("fleet2") != ["      ID       HARNESS         CTX         AGE"]):
+            return []
+        reference_cells = record["reference_cells"][row]
+        fleet2_cells = record["fleet2_cells"][row]
+        if any(tuple(reference_cells[column]) != tuple(fleet2_cells[column]) or
+               tuple(fleet2_cells[column]) != (glyph, "section_head", 234)
+               for column, glyph in zip((76, 77, 78), "AGE")):
+            return []
+    else:
+        expected_trace = {width - 3: ("text-on-box-rule",), width - 2: ("text-overlap",),
+                          width - 1: ("text-beyond-pane",)}
+        if _trace_cells_for_row(record, row) != expected_trace:
+            return []
+        reference_text = record["reference_rows"][row][33:width - 3]
+        fleet2_text = record["fleet2_rows"][row][33:width - 3]
+        if (reference_text != fleet2_text or
+                not reference_text.startswith("  └─ models.conf → .bak backup · new session")):
+            return []
+    return [{"row": row, "column": column, "kinds": list(_trace_cells_for_row(record, row).get(column, ())) or
+             ["exact-r14-residual-cell"]} for column in R14_RESIDUAL_COORDINATES[key]]
+
+
 def _reference_overflow_mask(record, band):
     """A narrow reference exception applies only when every changed cell is traced in the R14 mask."""
+    if _r14_residual_key(record, band):
+        # These cells need their row-specific candidate geometry checks below; a trace alone is insufficient.
+        return []
     trace = record.get("reference_overflow_mask") or {}
-    if (record.get("width") not in (80, 100) or record.get("reference_profile") != R14_REFERENCE_PROFILE or
-            trace.get("profile") != R14_REFERENCE_PROFILE or trace.get("version") != REFERENCE_MASK_VERSION):
+    if (record.get("width") not in (80, 100) or not _has_pinned_reference_trace(record)):
         return []
     masks = {(item.get("row"), item.get("column")): item.get("kinds", ())
              for item in trace.get("cells", ())}
@@ -439,6 +579,62 @@ def _reference_overflow_mask(record, band):
             return []
         accepted.append({"row": row, "column": column, "kinds": list(kinds)})
     return accepted
+
+
+def _split_r14_models_row26(record, bands):
+    """Separate the recorded row-26 blank-key cells from its independent clipped suffix."""
+    result = []
+    for band in bands:
+        key = _r14_residual_key(record, band)
+        if (key not in (("MODELS", 80, 26), ("MODELS", 100, 26)) or
+                not _has_pinned_reference_trace(record, current=True) or
+                not _row_matches_residual_pairs(record, key)):
+            result.append(band)
+            continue
+        row_diffs = _row_cell_diffs(record, key[2])
+        if [diff.get("column") for diff in row_diffs] != list(R14_RESIDUAL_COORDINATES[key]):
+            result.append(band)
+            continue
+        if _trace_cells_for_row(record, key[2]) != {key[1] - 1: ("text-beyond-pane",)}:
+            result.append(band)
+            continue
+        for diff in band.get("diffs") or ():
+            piece = dict(band)
+            piece["cells"] = 1
+            piece["diffs"] = [diff]
+            expected = diff.get("expected") or (None, None, None)
+            actual = diff.get("actual") or (None, None, None)
+            piece["text_equal"] = expected[0] == actual[0]
+            piece["blank_only"] = (piece["text_equal"] and expected[0] in (" ", "") and
+                                   actual[0] in (" ", ""))
+            piece["style_pairs"] = [(json.dumps(expected[1]), json.dumps(actual[1]))]
+            piece["samples"] = [{"row": diff["row"], "column": diff["column"],
+                                 "reference": diff.get("expected"), "fleet2": diff.get("actual")}]
+            result.append(piece)
+    return result
+
+
+def _r14_models_safe_edge_clip(record, band):
+    key = _r14_residual_key(record, band)
+    if key not in (("MODELS", 80, 26), ("MODELS", 100, 26), ("MODELS", 80, 32)):
+        return False
+    if not _has_pinned_reference_trace(record, current=True) or not _row_matches_residual_pairs(record, key):
+        return False
+    row, width = key[2], key[1]
+    row_diffs = _row_cell_diffs(record, row)
+    if [diff.get("column") for diff in row_diffs] != list(R14_RESIDUAL_COORDINATES[key]):
+        return False
+    trace = ({width - 1: ("text-beyond-pane",)} if row == 26 else
+             {78: ("text-edge-predecessor",), 79: ("text-beyond-pane",)})
+    if _trace_cells_for_row(record, row) != trace:
+        return False
+    band_columns = [diff.get("column") for diff in band.get("diffs") or ()]
+    if row == 26:
+        if band_columns != [width - 1]:
+            return False
+    elif band_columns != [78, 79]:
+        return False
+    return True
 
 
 def _reserved_terminal_column(record, band):
@@ -522,7 +718,7 @@ def _unknown_compute_track(record, band):
     if not (record["state"] == "COMPUTE" and record["width"] in R14_UNKNOWN_GPU_TRACK_LAST_COLUMN
             and band["pane"] == "right" and len(band["rows"]) == 1 and band["rows"][0] in (5, 6)
             and record.get("reference_profile") == R14_REFERENCE_PROFILE
-            and trace.get("profile") == R14_REFERENCE_PROFILE and trace.get("version") == REFERENCE_MASK_VERSION
+            and trace.get("profile") == R14_REFERENCE_PROFILE and trace.get("version") in REFERENCE_MASK_COMPAT_VERSIONS
             and limitations == {(0, unknown_cells), (1, unknown_cells)}
             and len(band["reference"]) == len(band["fleet2"]) == 1):
         return False
@@ -555,6 +751,16 @@ def _same_backgrounds(band):
 
 
 def _blank_cell_key(record, band):
+    key = _r14_residual_key(record, band)
+    if key in (("MODELS", 80, 26), ("MODELS", 100, 26)):
+        if (not _has_pinned_reference_trace(record, current=True) or
+                not _row_matches_residual_pairs(record, key) or len(band.get("diffs") or ()) != 1):
+            return False
+        diff = band["diffs"][0]
+        expected, actual = R14_RESIDUAL_CELL_PAIRS[key].get(diff.get("column"), ((), ()))
+        return (diff.get("column") in R14_MODELS_BLANK_KEY_CELLS[key[1]] and
+                tuple(diff.get("expected") or ()) == expected and tuple(diff.get("actual") or ()) == actual and
+                expected == (" ", "dim", None) and actual == (" ", "branch_s", None))
     return (band["blank_only"] and _same_backgrounds(band) and
             all((diff.get("expected") or [None])[0] in (" ", "") and
                 (diff.get("actual") or [None])[0] in (" ", "") for diff in band.get("diffs", ())))
@@ -661,6 +867,9 @@ RULES = [
     ("right-edge-safe-clip", "intended", None,
      "fleet2 reserves the final terminal column on the shared feed and SYSTEM collector row; the frozen reference writes into that cell",
      _reserved_terminal_column),
+    ("r14-models-safe-edge-clip", "intended", None,
+     "the pinned R14 MODELS row has an exact visible suffix at its pane edge; Fleet2 keeps the unchanged prefix and the recorded blank suffix",
+     _r14_models_safe_edge_clip),
     ("unknown-gpu-track", "copy-limitation", None,
      "moving4 GPU 0/1 UTIL and VRAM values are None: the reference copy can show · but cannot draw fleet2's empty 10-cell unknown track; no zero is synthesized",
      _unknown_compute_track),
@@ -769,7 +978,7 @@ def _hit_delta(expected, actual):
 def _r14_hit_mask_matches(record, expected_hits, actual_hits, missing, extra):
     trace = record.get("reference_overflow_mask") or {}
     if (record.get("state") != "MODELS" or record.get("reference_profile") != R14_REFERENCE_PROFILE or
-            trace.get("profile") != R14_REFERENCE_PROFILE or trace.get("version") != REFERENCE_MASK_VERSION):
+            trace.get("profile") != R14_REFERENCE_PROFILE or trace.get("version") not in REFERENCE_MASK_COMPAT_VERSIONS):
         return False
     expected = R14_MODELS_HIT_MASKS.get(record.get("width"))
     if expected is None:
@@ -803,14 +1012,19 @@ def classify(records):
     entries, counts = [], {}
     for record in records:
         bands, hits = _bands(record)
-        for band in bands:
+        for band in _split_r14_models_row26(record, bands):
             matched = []
             selected = None
-            masked_cells = _reference_overflow_mask(record, band)
+            residual_cells = _r14_residual_reference_mask(record, band)
+            masked_cells = residual_cells or _reference_overflow_mask(record, band)
             if masked_cells:
-                rule_id, cls, owner = "r14-reference-overflow-mask", "excluded", None
-                reason = ("every differing cell is inside the versioned R14 reference put-trace mask; "
-                          "cells and styles outside those exact coordinates remain compared")
+                rule_id = "r14-reference-residual-mask" if residual_cells else "r14-reference-overflow-mask"
+                cls, owner = "excluded", None
+                reason = (("the pinned R14 trace and exact row cells prove this header collision or MODELS box-note overprint; "
+                           "candidate glyphs, styles, prefixes and adjacent cells are checked against the residual contract")
+                          if residual_cells else
+                          ("every differing cell is inside the versioned R14 reference put-trace mask; "
+                           "cells and styles outside those exact coordinates remain compared"))
             else:
                 for rule in RULES:
                     try:

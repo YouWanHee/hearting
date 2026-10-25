@@ -6,8 +6,9 @@ from pathlib import Path
 from unittest import mock
 
 from tools.fleet.tests.parity_compare import diff_frames
-from tools.fleet.tests.parity_today import (_frame_from_reference, _jsonable, _unique_reference_copy_limitations,
-                                            build_live_vm, classify, main)
+from tools.fleet.tests.parity_today import (REFERENCE_MASK_VERSION, R14_REFERENCE_PROFILE,
+                                            R14_RESIDUAL_CELL_PAIRS, _frame_from_reference, _jsonable,
+                                            _unique_reference_copy_limitations, build_live_vm, classify, main)
 
 
 class TodayParityPlumbingTests(unittest.TestCase):
@@ -92,6 +93,79 @@ def _rows_record(width, state, rows, *, start=0, hits=None, profile=None, fleet_
     return record
 
 
+def _r14_residual_record(state, width, row, *, hits=None):
+    key = (state, width, row)
+    pairs = R14_RESIDUAL_CELL_PAIRS[key]
+    text = {
+        ("OVERVIEW", 80, 4): ("      ID       HARNESS         TCTXE       AGE",
+                               "      ID       HARNESS         CTX         AGE"),
+        ("MODELS", 80, 22): ("  └─ models.conf → .bak backup · new sessions a",
+                             "  └─ models.conf → .bak backup · new session ┘"),
+        ("MODELS", 80, 26): ("    weights:         codex ▮▮▮▮▮▮▮▮▮▮ 1.0    op",
+                             "    weights:         codex ▮▮▮▮▮▮▮▮▮▮ 1.0    o"),
+        ("MODELS", 80, 32): (" ── CONTEXT & TIDY  input tokens · new sessions",
+                             " ── CONTEXT & TIDY  input tokens · new sessio"),
+        ("MODELS", 100, 22): ("  └─ models.conf → .bak backup · new sessions and launches only · s",
+                              "  └─ models.conf → .bak backup · new sessions and launches only  ┘"),
+        ("MODELS", 100, 26): ("    weights:         codex ▮▮▮▮▮▮▮▮▮▮ 1.0    opencode ▮▮▮▮ 0.4    c",
+                              "    weights:         codex ▮▮▮▮▮▮▮▮▮▮ 1.0    opencode ▮▮▮▮ 0.4"),
+    }[key]
+    record = _record(width=width)
+    record["state"] = state
+    reference_text = (" " * 33 + text[0]).ljust(width)[:width]
+    fleet2_text = (" " * 33 + text[1]).ljust(width)[:width]
+    record["reference_rows"][row] = reference_text
+    record["fleet2_rows"][row] = fleet2_text
+    for column in range(width):
+        ref_glyph, live_glyph = reference_text[column], fleet2_text[column]
+        if key == ("OVERVIEW", 80, 4):
+            bg = 234 if 33 <= column < 79 else None
+            ref_style = "section_head" if ref_glyph != " " and 33 <= column < 79 else None
+            live_style = "section_head" if live_glyph != " " and 33 <= column < 79 else None
+        else:
+            bg = None
+            ref_style = "dim" if ref_glyph != " " else None
+            live_style = "dim" if live_glyph != " " else None
+        record["reference_cells"][row][column] = (ref_glyph, ref_style, bg)
+        record["fleet2_cells"][row][column] = (live_glyph, live_style, bg)
+    for column, (expected, actual) in pairs.items():
+        record["reference_cells"][row][column] = expected
+        record["fleet2_cells"][row][column] = actual
+        record["differences"].append({"kind": "cell", "row": row, "column": column,
+                                      "expected": list(expected), "actual": list(actual)})
+    record["reference_profile"] = R14_REFERENCE_PROFILE
+    if key == ("OVERVIEW", 80, 4):
+        trace_cells = [{"row": row, "column": 65, "kinds": ["text-overlap"]},
+                       {"row": row, "column": 67, "kinds": ["text-overlap"]}]
+    elif row == 22:
+        trace_cells = [{"row": row, "column": width - 3, "kinds": ["text-on-box-rule"]},
+                       {"row": row, "column": width - 2, "kinds": ["text-overlap"]},
+                       {"row": row, "column": width - 1, "kinds": ["text-beyond-pane"]}]
+    elif row == 26:
+        trace_cells = [{"row": row, "column": width - 1, "kinds": ["text-beyond-pane"]}]
+    else:
+        trace_cells = [{"row": row, "column": 78, "kinds": ["text-edge-predecessor"]},
+                       {"row": row, "column": 79, "kinds": ["text-beyond-pane"]}]
+    record["reference_overflow_mask"] = {"version": REFERENCE_MASK_VERSION,
+                                         "profile": R14_REFERENCE_PROFILE, "cells": trace_cells}
+    if hits:
+        record["differences"].append({"kind": "hits", "expected": hits, "actual": []})
+    return record
+
+
+def _change_candidate_cell(record, row, column, actual):
+    record["fleet2_cells"][row][column] = tuple(actual)
+    diff = next((item for item in record["differences"]
+                 if item.get("kind") == "cell" and item.get("row") == row and item.get("column") == column), None)
+    if diff is None:
+        diff = {"kind": "cell", "row": row, "column": column,
+                "expected": list(record["reference_cells"][row][column])}
+        record["differences"].append(diff)
+    diff["actual"] = list(actual)
+    row_text = record["fleet2_rows"][row]
+    record["fleet2_rows"][row] = row_text[:column] + (actual[0] or " ") + row_text[column + 1:]
+
+
 class ClassificationTests(unittest.TestCase):
     def test_narrow_reference_edge_flag_alone_never_excludes_interior_cell_differences(self):
         answered = _record(width=80, cells=[(10, 40, "x", "dim", "y", "dim")])
@@ -136,6 +210,83 @@ class ClassificationTests(unittest.TestCase):
         record["fleet2_rows"][10] = record["fleet2_rows"][10][:50] + "b" + record["fleet2_rows"][10][51:]
         rejected = classify([record])["entries"][0]
         self.assertEqual(rejected["class"], "unexplained")
+
+    def test_r14_overview_header_overlap_requires_exact_trace_and_candidate_geometry(self):
+        record = _r14_residual_record("OVERVIEW", 80, 4)
+        entry = classify([record])["entries"][0]
+        self.assertEqual((entry["class"], entry["rule"], entry["difference_cells"]),
+                         ("excluded", "r14-reference-residual-mask",
+                          [[4, 64], [4, 65], [4, 66], [4, 67], [4, 68]]))
+
+        cases = [
+            (64, ("Z", "section_head", 234)),       # wrong canonical CTX glyph
+            (65, ("Z", "section_head", 234)),       # wrong glyph at a traced overlap cell
+            (64, ("C", "branch_s", 234)),            # wrong header style
+            (76, ("X", "section_head", 234)),       # AGE geometry moved or corrupted
+        ]
+        for column, actual in cases:
+            with self.subTest(column=column, actual=actual):
+                rejected = _r14_residual_record("OVERVIEW", 80, 4)
+                _change_candidate_cell(rejected, 4, column, actual)
+                self.assertEqual(classify([rejected])["summary"]["unexplained"], 1)
+
+        untraced = _r14_residual_record("OVERVIEW", 80, 4)
+        untraced["reference_overflow_mask"]["cells"] = []
+        self.assertEqual(classify([untraced])["entries"][0]["class"], "unexplained")
+
+    def test_r14_models_box_note_mask_keeps_the_candidate_corner_and_prefix(self):
+        for width in (80, 100):
+            record = _r14_residual_record("MODELS", width, 22)
+            entry = classify([record])["entries"][0]
+            self.assertEqual((entry["class"], entry["rule"]),
+                             ("excluded", "r14-reference-residual-mask"))
+            for column, actual in ((width - 2, ("X", "dim", None)),
+                                   (width - 2, ("┘", "reverse", None)),
+                                   (width - 4, ("X", "dim", None))):
+                with self.subTest(width=width, column=column, actual=actual):
+                    rejected = _r14_residual_record("MODELS", width, 22)
+                    _change_candidate_cell(rejected, 22, column, actual)
+                    self.assertEqual(classify([rejected])["summary"]["unexplained"], 1)
+
+    def test_r14_models_row26_splits_invisible_blank_keys_from_edge_clips(self):
+        for width, expected_cells in ((80, [59, 79]), (100, [59, 86, 99])):
+            record = _r14_residual_record("MODELS", width, 26)
+            entries = classify([record])["entries"]
+            self.assertEqual([entry["difference_cells"][0][1] for entry in entries], expected_cells)
+            self.assertEqual([entry["class"] for entry in entries], ["intended"] * len(expected_cells))
+            self.assertEqual([entry["rule"] for entry in entries],
+                             ["blank-cell-key" if column in (59, 86) else "r14-models-safe-edge-clip"
+                              for column in expected_cells])
+
+        rejected_cases = [
+            (80, 59, (" ", "reverse", None)),             # foreground key is outside the approved pair
+            (80, 59, (" ", "branch_s", 234)),             # background change
+            (80, 79, ("X", "hb_opencode", None)),        # visible clipped glyph changed
+            (100, 99, (" ", "reverse", None)),            # edge suffix style changed
+        ]
+        for width, column, actual in rejected_cases:
+            with self.subTest(width=width, column=column, actual=actual):
+                rejected = _r14_residual_record("MODELS", width, 26)
+                _change_candidate_cell(rejected, 26, column, actual)
+                self.assertEqual(classify([rejected])["summary"]["unexplained"], 1)
+
+    def test_r14_models_row32_clip_checks_exact_suffix_and_leaves_hit_changes_unexplained(self):
+        record = _r14_residual_record("MODELS", 80, 32)
+        entry = classify([record])["entries"][0]
+        self.assertEqual((entry["class"], entry["rule"]), ("intended", "r14-models-safe-edge-clip"))
+
+        for column, actual in ((78, ("X", "branch_s", None)),
+                               (78, (" ", "reverse", None)),
+                               (77, ("X", "dim", None))):
+            with self.subTest(column=column, actual=actual):
+                rejected = _r14_residual_record("MODELS", 80, 32)
+                _change_candidate_cell(rejected, 32, column, actual)
+                self.assertEqual(classify([rejected])["summary"]["unexplained"], 1)
+
+        hit = [10, 40, 50, ["ui", "sel", "unmasked"]]
+        with_hit = _r14_residual_record("MODELS", 80, 32, hits=[hit])
+        entries = classify([with_hit])["entries"]
+        self.assertEqual([entry["class"] for entry in entries], ["intended", "unexplained"])
 
     def test_adjacent_rows_keep_independent_reference_masks(self):
         record = _record(width=80, cells=[(10, 78, "x", "dim", " ", None),
