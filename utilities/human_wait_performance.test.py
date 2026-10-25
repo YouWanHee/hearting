@@ -128,7 +128,14 @@ class HumanWaitPerformanceTests(unittest.TestCase):
             self.assertEqual(after_cold["full_metadata_parses"], 1)
             self.assertEqual(after_warm["full_metadata_parses"], after_cold["full_metadata_parses"],
                              (after_cold, after_warm))
-            self.assertGreater(after_append["delta_reads"], after_warm["delta_reads"])
+            # A scoped observation validates the complete generation before index
+            # reuse; suffix I/O is counted only by the trusted append-only API.
+            self.assertGreater(after_append["append_reuses"], after_warm["append_reuses"])
+            self.assertEqual(after_append["full_metadata_parses"], after_warm["full_metadata_parses"])
+            self.assertEqual(after_append["metadata_rows_parsed"], after_warm["metadata_rows_parsed"] + 1)
+            self.assertEqual(after_append["content_reads"], after_warm["content_reads"] + 1)
+            self.assertEqual(after_append["bytes_read"] - after_warm["bytes_read"], jobs.stat().st_size)
+            self.assertEqual(after_append["delta_reads"], after_warm["delta_reads"])
 
             # Exercise the actual cache consumer helper. The baseline removes
             # only the answer-wait lookup; title/formatter work is identical.
@@ -151,14 +158,18 @@ class HumanWaitPerformanceTests(unittest.TestCase):
                         if observed is not None:
                             with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(raw_state)}):
                                 wait_state.publish_cache(dict(result, observed_at=observed))
-                        started = time.perf_counter()
-                        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(raw_state)}):
-                            herdr_projection._metadata_command("herdr", "codex", "sid-parent", "pane")
-                        raw["pane"].append(time.perf_counter() - started)
+                        # As with start/prompt below, measure the common pipeline
+                        # first with waits disabled. Its one-time title/tag load
+                        # belongs to the baseline, not to answer-wait overhead;
+                        # the first real wait-cache lookup remains timed.
                         started = time.perf_counter()
                         with mock.patch.object(wait_state, "cached_view", return_value=None):
                             herdr_projection._metadata_command("herdr", "codex", "sid-parent", "pane")
                         baseline["pane"].append(time.perf_counter() - started)
+                        started = time.perf_counter()
+                        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(raw_state)}):
+                            herdr_projection._metadata_command("herdr", "codex", "sid-parent", "pane")
+                        raw["pane"].append(time.perf_counter() - started)
                         for event in ("start", "prompt"):
                             raw_hook_state = root / (case + "-raw-hook-%d-%s" % (_, event))
                             baseline_hook_state = root / (case + "-baseline-hook-%d-%s" % (_, event))
@@ -207,6 +218,8 @@ class HumanWaitPerformanceTests(unittest.TestCase):
                   f"warm_full_parses={after_warm['full_metadata_parses']}\t"
                   f"append_delta_reads={after_append['delta_reads'] - after_warm['delta_reads']}\t"
                   f"append_delta_bytes={after_append['delta_bytes_read'] - after_warm['delta_bytes_read']}\t"
+                  f"append_prefix_reuses={after_append['append_reuses'] - after_warm['append_reuses']}\t"
+                  f"append_scope_bytes={after_append['bytes_read'] - after_warm['bytes_read']}\t"
                   f"append_parsed_rows={after_append['metadata_rows_parsed'] - after_warm['metadata_rows_parsed']}")
             print("surface\tcase\tbaseline_p50_s\tbaseline_p95_s\tbaseline_max_s\traw_p50_s\traw_p95_s\traw_max_s\tdelta_p50_s\tdelta_p95_s\tdelta_max_s")
             deltas_all = []

@@ -302,7 +302,7 @@ class _RegistrySegment:
 class RegistryView:
     """Immutable segmented registry view with incremental append indexes."""
 
-    __slots__ = ("path_identity", "resolved_path", "signature", "_raw", "_fd", "_segments", "_tail",
+    __slots__ = ("path_identity", "resolved_path", "signature", "_fd", "_segments", "_tail",
                  "line_count", "record_count", "malformed_rows", "has_partial_tail",
                  "last_observed_at", "_has_duplicate_attempts", "_invalid_utf8_prefix",
                  "has_invalid_utf8", "_raw_digest", "_prefix_reuse_eligible",
@@ -313,7 +313,6 @@ class RegistryView:
         self.path_identity = path_identity
         self.resolved_path = resolved_path
         self.signature = signature
-        self._raw = raw if previous is None else previous._raw + raw
         self._fd = fd
         self._append_only_generation = previous is not None
         self.last_observed_at = time.monotonic()
@@ -857,7 +856,8 @@ def _observe_generation(path: Path) -> tuple[RegistryView, tuple[str, ...]]:
                 and cached.signature[:2] == signature[:2]
                 and signature[2] > cached.signature[2]
                 and len(raw) == signature[2]
-                and raw[:cached.signature[2]] == cached._raw
+                and hashlib.sha256(memoryview(raw)[:cached.signature[2]]).digest()
+                    == cached._raw_digest.digest()
                 and not any(separator in raw for separator in _NON_CANONICAL_LINE_SEPARATORS)
                 and not _utf8_status(raw)[0]
             )
@@ -1024,7 +1024,7 @@ def _drop(identity: str) -> "RegistryView | None":
     global _CACHE_BYTES
     removed = _CACHE.pop(identity, None)
     if removed is not None:
-        _CACHE_BYTES -= len(removed._raw)
+        _CACHE_BYTES -= removed.signature[2]
         _close_view_fd(removed)
     return removed
 
@@ -1032,14 +1032,14 @@ def _drop(identity: str) -> "RegistryView | None":
 def _remember(identity: str, view: RegistryView) -> None:
     """Cache one generation within the existing bounds; the caller holds ``_LOCK``."""
     global _CACHE_BYTES
-    if len(view._raw) <= _CACHE_MAX_BYTES:
+    if view.signature[2] <= _CACHE_MAX_BYTES:
         _CACHE[identity] = view
-        _CACHE_BYTES += len(view._raw)
+        _CACHE_BYTES += view.signature[2]
     else:
         _close_view_fd(view)
     while (len(_CACHE) > _CACHE_MAX_PATHS or _CACHE_BYTES > _CACHE_MAX_BYTES):
         _evicted_identity, evicted = _CACHE.popitem(last=False)
-        _CACHE_BYTES -= len(evicted._raw)
+        _CACHE_BYTES -= evicted.signature[2]
         _close_view_fd(evicted)
         _METRICS["cache_evictions"] += 1
 
