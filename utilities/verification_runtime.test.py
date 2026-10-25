@@ -40,7 +40,8 @@ class VerificationRuntimeTest(unittest.TestCase):
         sibling.update(id="independent-verify-alternative", outputs=["reviews-alternative/eval-verdict.json"],
                        write_scope=["reviews/eval-alternative/**"])
         self.route["nodes"].append(sibling)
-        self.env = {"AGENT_ARTIFACT_OUTPUT_DIR": str(self.artifact), "AGENT_RUNTIME_DIR": str(self.runtime)}
+        self.env = {"AGENT_ARTIFACT_OUTPUT_DIR": str(self.artifact), "AGENT_RUNTIME_DIR": str(self.runtime),
+                    "HARNESS_STATE_ROOT": str(self.base / "state")}
         import worker_bootstrap as W
         def scope(route, node_id, *a, **kw):
             node = next(n for n in route["nodes"] if n["id"] == node_id)
@@ -275,6 +276,45 @@ class VerificationRuntimeTest(unittest.TestCase):
              mock.patch.object(module, "verification_profile_config", return_value=None):
             with self.assertRaisesRegex(module.SupervisorError, "loopback-only-unsupported"):
                 module.configure_permission_profiles(args, ["codex", "app-server"])
+
+
+    def test_canonical_spec_marker_grant_survives_without_opening_state_parent(self):
+        from harness_state_roots import spec_grounding_dir
+        marker = spec_grounding_dir(None, self.env)
+        lookalike = self.base / "unrelated" / "spec-grounding"
+        scope = V.review_scope(self.route, "independent-verify", self.path, self.env)
+        supplied = [str(self.artifact), str(self.runtime), str(marker), str(lookalike)]
+        roots = V.scoped_write_roots(scope, supplied, self.env)
+        self.assertIn(str(marker), roots)
+        for denied in (marker.parent, lookalike, self.wt, self.artifact):
+            self.assertNotIn(str(denied), roots)
+        with mock.patch.object(P, "local_verification_available", return_value=True):
+            profile = P.verification_profile_config(str(self.wt), supplied, str(self.path),
+                "independent-verify", environ=self.env)
+        fs = profile["permissions"][P.LOCAL_VERIFICATION_PROFILE_NAME]["filesystem"]
+        self.assertEqual(fs[str(marker)], "write")
+        self.assertNotIn(str(marker.parent), fs)
+        self.assertNotIn(str(lookalike), fs)
+        self.assertNotIn(str(marker), V.scoped_write_roots(scope, [str(self.runtime)], self.env))
+
+    def test_registered_launch_defaults_declare_the_same_marker_for_three_harnesses(self):
+        from execution_access import adapter_default_roots
+        marker = self.base / "state" / "spec-grounding"
+        with mock.patch.dict(os.environ, self.env):
+            for harness in ("codex", "claude", "opencode"):
+                args = SimpleNamespace(harness=harness, route_id=self.route["route_id"],
+                                       worktree=str(self.wt), artifact_root=str(self.artifact))
+                roots = adapter_default_roots(args, [marker])
+                self.assertEqual(roots.count(marker), 1)
+                self.assertNotIn(marker.parent, roots)
+            self.assertNotIn(marker, adapter_default_roots(SimpleNamespace(worktree=str(self.wt))))
+
+    def test_marker_resolution_honors_passed_state_environment(self):
+        from harness_state_roots import spec_grounding_dir
+        with mock.patch.dict(os.environ, {"HARNESS_STATE_ROOT": str(self.base / "wrong")}):
+            self.assertEqual(spec_grounding_dir(None, self.env), self.base / "state/spec-grounding")
+            self.assertEqual(spec_grounding_dir(None, {"XDG_STATE_HOME": str(self.base / "xdg")}),
+                             self.base / "xdg/hearting/spec-grounding")
 
 
 if __name__ == "__main__":

@@ -2038,7 +2038,7 @@ def receipt_fragment(grant: ExecutionAccessGrant | None) -> str:
 
 
 def adapter_default_roots(args: object, *roots: Iterable[str | Path]) -> tuple[Path, ...]:
-    """Flatten adapter-computed defaults for absorption tests/builders."""
+    """Combine adapter scopes with the portable kernel's required read-marker state."""
 
     values: list[Path] = []
     worktree = getattr(args, "worktree", None)
@@ -2055,4 +2055,10 @@ def adapter_default_roots(args: object, *roots: Iterable[str | Path]) -> tuple[P
     runtime = getattr(args, "runtime_dir", None)
     if runtime:
         values.append(Path(runtime).resolve(strict=False))
+    # The portable kernel requires this witnessed read for every registered
+    # launch. Tool-permission runtimes also need it in the grant inventory
+    # when their bounded verification command uses the shared OS sandbox.
+    from harness_state_roots import spec_read_marker_required, spec_grounding_dir
+    if spec_read_marker_required(args):
+        values.append(spec_grounding_dir(args).resolve(strict=False))
     return tuple(_unique_paths(values))
