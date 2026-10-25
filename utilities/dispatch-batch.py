@@ -1888,11 +1888,9 @@ def bounded_process_output(proc: subprocess.Popen) -> tuple[str, str]:
 
 def collect_wrapper(
     item: tuple[dict[str, object], str, subprocess.Popen],
-    *, jobs: Path, log_dir: Path | None = None,
 ) -> tuple[dict[str, object], str, subprocess.Popen, str, str]:
     leg, token, proc = item
     stdout, stderr = bounded_process_output(proc)
-    save_wrapper_evidence(jobs, leg, proc.returncode, stdout, stderr, log_dir=log_dir)
     return leg, token, proc, stdout, stderr
 
 
@@ -3659,13 +3657,15 @@ def main(argv: list[str] | None = None) -> int:
         if processes:
             with ThreadPoolExecutor(max_workers=len(processes)) as executor:
                 futures = {
-                    executor.submit(collect_wrapper, item, jobs=jobs, log_dir=args.log_dir): item
+                    executor.submit(collect_wrapper, item): item
                     for item in processes
                 }
                 for future in as_completed(futures):
                     original_leg, token, proc = futures[future]
                     try:
                         leg, _, proc, stdout, stderr = future.result()
+                        save_wrapper_evidence(jobs, leg, proc.returncode, stdout, stderr,
+                                              log_dir=args.log_dir)
                         result = wrapper_result(leg, proc, stdout, stderr)
                         if result["launch_state"] == "existing":
                             checked = existing_leg_result(

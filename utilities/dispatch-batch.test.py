@@ -3704,27 +3704,65 @@ class DispatchBatchTest(unittest.TestCase):
             ],
         )
 
+    def _run_diagnostic_wrapper_batch(self, harness, script_for_leg):
+        # Exercise the public batch path with real subprocess pipes. Only the
+        # external model launch/admission is replaced by fixture-owned scripts.
+        import copy
+        route = copy.deepcopy(self.route)
+        jobs = Path(tempfile.mkdtemp(prefix="diagnostic-batch-", dir=self.base)) / "jobs.log"
+        log_dir = jobs.parent / "nested" / "logs"
+        for node in route["nodes"]:
+            node["fallback_hops"][1]["candidates"].append(
+                {"child_harness": "opencode", "status": "supported"})
+        peer = "codex" if harness == "claude" else "claude"
+        assignments = [(node, adapter,
+                        "same-harness-headless" if adapter == "codex" else "cross-harness-headless",
+                        1 if adapter == "codex" else 2)
+                       for node, adapter in zip(route["nodes"], (harness, peer))]
+        original_command = BATCH.node_launch_command
+        def fixture_command(**kwargs):
+            script = script_for_leg(kwargs["leg"], original_command(**kwargs))
+            return [sys.executable, "-c", script]
+        output, error = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(BATCH, "load_route", return_value=route))
+            stack.enter_context(mock.patch.object(BATCH, "assign_harnesses", return_value=(
+                assignments, "cross-harness", {"families_considered": [], "usable_families": [],
+                    "family_exclusions": {}, "capacity": {}, "degradation_cause": ""})))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_agent_home", return_value=self.base))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_global_registry",
+                                                  return_value=SimpleNamespace(path=jobs)))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_live_parent_attempt"))
+            stack.enter_context(mock.patch.object(BATCH, "completion_marker_gate"))
+            stack.enter_context(mock.patch.object(BATCH.subprocess, "check_output", return_value=str(self.base)))
+            stack.enter_context(mock.patch.object(BATCH, "reserve_batch", return_value=["a" * 32, "b" * 32]))
+            stack.enter_context(mock.patch.object(BATCH, "cancel_unclaimed"))
+            stack.enter_context(mock.patch.object(BATCH, "node_launch_command", side_effect=fixture_command))
+            stack.enter_context(mock.patch.dict(os.environ, {
+                "AGENT_DISPATCH_SELF_SLUG": "owner", "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture",
+                "AGENT_DISPATCH_CURRENT_HARNESS": "codex", "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
+                "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write",
+                "AGENT_DISPATCH_JOBS": str(jobs)}))
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+                argv = self.argv()
+                argv[argv.index("--jobs") + 1] = str(jobs)
+                rc = BATCH.main(argv + ["--log-dir", str(log_dir)])
+        self.assertFalse(jobs.exists())
+        return rc, output.getvalue(), error.getvalue(), log_dir
+
     def test_exit_one_wrapper_saves_bounded_traceback_for_each_harness(self):
-        log_dir = self.base / "nested" / "logs"
-        self.jobs.write_text("unchanged registry\n")
         for harness in ("claude", "codex", "opencode"):
             with self.subTest(harness=harness):
-                leg = {"slug": "failed-leg", "attempt_id": f"att-exit-one-{harness}",
-                       "adapter": harness}
-                proc = subprocess.Popen(
-                    [sys.executable, "-c",
-                     "import sys; print('한'*100000+'OUT'); "
-                     "print('앞'*100000, file=sys.stderr); "
-                     "raise RuntimeError('wrapper exit-one fixture')"],
-                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                with contextlib.redirect_stdout(io.StringIO()) as output, \
-                     contextlib.redirect_stderr(io.StringIO()) as error:
-                    collected = BATCH.collect_wrapper((leg, "token", proc),
-                                                       jobs=self.jobs, log_dir=log_dir)
-                self.assertEqual((output.getvalue(), error.getvalue()), ("", ""))
-                self.assertEqual(proc.returncode, 1)
+                rc, stdout, stderr, log_dir = self._run_diagnostic_wrapper_batch(harness, lambda *_args:
+                    "import sys; print('한'*100000+'OUT'); "
+                    "print('앞'*100000, file=sys.stderr); "
+                    "raise RuntimeError('wrapper exit-one fixture')")
+                self.assertEqual(rc, 70)
+                self.assertEqual(stderr, "")
+                receipt = json.loads(stdout)
+                leg = next(row for row in receipt["legs"] if row["adapter"] == harness)
                 record = json.loads((log_dir /
-                    f"failed-leg.{leg['attempt_id']}.{harness}.wrapper.json").read_text())
+                    f"{leg['slug']}.{leg['attempt_id']}.{harness}.wrapper.json").read_text())
                 self.assertEqual(record["returncode"], 1)
                 self.assertEqual(record["attempt_id"], leg["attempt_id"])
                 self.assertTrue(record["stdout_tail"].endswith("OUT\n"))
@@ -3734,29 +3772,22 @@ class DispatchBatchTest(unittest.TestCase):
                 for stream in ("stdout", "stderr"):
                     self.assertLessEqual(len(record[f"{stream}_tail"].encode()),
                                          BATCH.OUTPUT_TAIL_BYTES)
-                result = BATCH.wrapper_result(leg, proc, collected[3], collected[4])
-                self.assertEqual((result["exit_code"], result["reason"]),
-                                 (1, "invalid-wrapper-receipt"))
-        self.assertEqual(self.jobs.read_text(), "unchanged registry\n")
+                self.assertEqual((leg["exit_code"], leg["reason"]), (1, "invalid-wrapper-receipt"))
+        self.assertFalse(self.jobs.exists())
 
     def test_evidence_write_failure_preserves_collected_output_and_receipt(self):
         import dispatch_launch_evidence as evidence
-        leg = self.legs()[0]
-        command = BATCH.node_launch_command(
-            route_path=self.route_path, leg=leg, parent="owner", prompt_text="task",
-            reviewed_evidence=None, jobs=self.jobs, parent_attempt="att-parent-fixture",
-            log_dir=None, lifecycle="detached", qa=None)
-        stdout = success_receipt(command)
-        proc = SimpleNamespace(returncode=0, communicate=lambda: (stdout, ""))
-        expected = BATCH.wrapper_result(leg, proc, stdout, "")
-        with mock.patch.object(evidence, "_write", side_effect=PermissionError("read-only")), \
-             contextlib.redirect_stdout(io.StringIO()) as output, \
-             contextlib.redirect_stderr(io.StringIO()) as error:
-            collected = BATCH.collect_wrapper((leg, "token", proc), jobs=self.jobs)
-        self.assertEqual(collected[3:], (stdout, ""))
-        self.assertEqual(BATCH.wrapper_result(leg, proc, *collected[3:]), expected)
-        self.assertEqual(expected["launch_state"], "started")
-        self.assertEqual((output.getvalue(), error.getvalue()), ("", ""))
+        script = lambda _leg, command: f"print({success_receipt(command)!r}, end='')"
+        expected = self._run_diagnostic_wrapper_batch("codex", script)
+        with mock.patch.object(evidence, "_write", side_effect=PermissionError("read-only")):
+            observed = self._run_diagnostic_wrapper_batch("codex", script)
+        # Independent fixture registries differ only in their printed ledger root.
+        normalized = observed[1].replace(str(observed[3].parent.parent),
+                                          str(expected[3].parent.parent))
+        self.assertEqual((observed[0], normalized, observed[2]), expected[:3])
+        self.assertEqual(expected[0], 0)
+        self.assertEqual(expected[2], "")
+        self.assertEqual(json.loads(expected[1])["state"], "launched")
 
     def test_wrapper_output_tail_is_memory_bounded(self):
         proc = BATCH.subprocess.Popen(
