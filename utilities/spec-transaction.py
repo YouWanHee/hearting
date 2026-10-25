@@ -168,9 +168,9 @@ def seed_component_spec(spec_base, artifact, reference, receipt, components):
 
 
 
-def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = None,
-                    *, reference_id: str | None = None, key: str | None = None,
-                    components: tuple[str, ...] | None = None):
+def _seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = None,
+                     *, reference_id: str | None = None, key: str | None = None,
+                     components: tuple[str, ...] | None = None):
     """W7C cycle layout: a fresh cycle's `artifacts/spec` is empty, so the
     transaction would see no pre-image and write no `_internal/versions/vN`
     snapshot -- which is why operators copied the previous version by hand
@@ -313,6 +313,69 @@ def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = No
                 "kept_existing":kept,"kept_existing_paths":kept_paths,"source":str(revision),"spec_base":str(spec_base)}
     return {"status":"seeded","source":str(revision),"files":copied,"history_versions":history,"prd_present":has_prd,
             "preexisting_files":preexisting,"kept_existing":kept,"kept_existing_paths":kept_paths,"spec_base":str(spec_base)}
+
+
+def _record_code_seed_pin(artifact: Path, spec_base: Path) -> None:
+    """Retain the exact base already chosen by this normal seed operation."""
+    receipt = PRODUCER._read_json(Path(spec_base) / PRODUCER.SPEC_BASE_RECEIPT)
+    if not isinstance(receipt, dict) or receipt.get("seed_complete") is not True:
+        return
+    reference_id = receipt.get("reference_id")
+    revision_id = receipt.get("revision_id")
+    content_digest = receipt.get("content_digest")
+    if reference_id is None and revision_id is None:
+        if content_digest is not None:
+            raise PRODUCER.ProducerError("shared-base-invalid", "seed revision digest")
+        return
+    if revision_id is None:
+        if content_digest is not None:
+            raise PRODUCER.ProducerError("shared-base-invalid", "seed revision digest")
+        return
+    if (not isinstance(reference_id, str) or not isinstance(revision_id, str)
+            or not PRODUCER.artifact_identity.is_well_formed(reference_id, "shared_reference")
+            or not PRODUCER.artifact_identity.is_well_formed(revision_id, "shared_reference_revision")
+            or not isinstance(content_digest, str)):
+        raise PRODUCER.ProducerError("shared-base-invalid", "seed reference lineage")
+
+    cycle_dir = Path(spec_base).resolve().parent.parent
+    binding = PRODUCER.artifact_locator.read_cycle_binding(cycle_dir)
+    if binding is None:
+        return
+    record = PRODUCER.read_cycle_record(artifact, binding["cycle_id"])
+    if (not isinstance(record, dict) or record.get("capability") != "autopilot-code"
+            or record.get("state") != "open"):
+        return
+
+    pin = {"kind": "spec", "shared_reference_id": reference_id,
+           "shared_reference_revision_id": revision_id, "content_digest": content_digest}
+    PRODUCER._resolve_shared_pin(artifact, pin)
+    reference = PRODUCER._read_json(
+        Path(artifact) / "shared/spec" / reference_id / "reference.json")
+    if (not isinstance(reference, dict) or reference.get("shared_reference_id") != reference_id
+            or revision_id not in reference.get("revisions", [])):
+        raise PRODUCER.ProducerError("shared-base-invalid", revision_id)
+    pins = record.get("shared_reference_pins") or []
+    if not isinstance(pins, list):
+        raise PRODUCER.ProducerError("shared-reference-pin-invalid", "cycle pins")
+    for existing in pins:
+        if (isinstance(existing, dict) and existing.get("kind") == "spec"
+                and existing.get("shared_reference_id") == reference_id
+                and existing.get("shared_reference_revision_id") == revision_id):
+            if existing.get("content_digest") not in (None, content_digest):
+                raise PRODUCER.ProducerError("shared-reference-pin-digest-mismatch", revision_id)
+            return
+    record["shared_reference_pins"] = [*pins, pin]
+    PRODUCER._write_cycle_record(artifact, record, exclusive=False)
+
+
+def seed_cycle_spec(spec_base: Path, artifact: Path, spec_root: Path | None = None,
+                    *, reference_id: str | None = None, key: str | None = None,
+                    components: tuple[str, ...] | None = None):
+    """Seed the route's spec tree and retain its exact shared base when present."""
+    result = _seed_cycle_spec(spec_base, artifact, spec_root,
+                              reference_id=reference_id, key=key, components=components)
+    _record_code_seed_pin(artifact, spec_base)
+    return result
 
 
 def preseed_owner_cycle(artifact: Path, cycle_dir: Path, *, wait_timeout: float = 600, route=None):

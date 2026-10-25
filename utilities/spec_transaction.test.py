@@ -99,13 +99,20 @@ class SpecTransactionTest(unittest.TestCase):
    self.assertEqual(result.returncode,7,result.stdout+result.stderr)
    self.assertEqual((spec/"_internal/versions/v1/prd.md").read_text(),"before\n")
 
- def test_spec_touch_required(self):
+ def test_code_spec_touch_is_bound_to_execute_scope(self):
   with tempfile.TemporaryDirectory() as td:
-   root=Path(td); artifact=root/".agent_reports"; artifact.mkdir(); subprocess.run(["git","init","-q",str(root)],check=True)
+   root=Path(td); artifact,spec,_=self.fixture(root)
    gate={"spec_read":{"satisfied":True,"source":"fixture"},"drift_verdict":"within-spec","workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"fixture"}}
-   route=R.compile_route("autopilot-code","dev","direct",root,artifact,predicates=["atomic-outcome","known-scope","no-shared-contract","no-resource-run","no-artifact-handoff","no-independent-verifier","focused-verification"],inline_reason="atomic-direct",tracking="tracked",tracked_gate_evidence=gate)
-   path=root/"route.json"; path.write_text(json.dumps(route)); result=subprocess.run([sys.executable,str(ROOT/"utilities/spec-transaction.py"),"run","--artifact-root",str(artifact),"--worktree",str(root),"--route",str(path),"--node","inline","--",sys.executable,"-c","pass"],text=True,capture_output=True,env=HERMETIC_ENV)
-   self.assertEqual(result.returncode,65); self.assertIn("spec-touch-not-declared",result.stdout)
+   route=R.compile_route("autopilot-code","dev","standard",root,artifact,predicates=[],transport="headless",tracking="tracked",tracked_gate_evidence=gate,dispatch_evidence=dispatch(root))
+   execute=next(n for n in route["nodes"] if n["id"]=="execute")
+   plan=next(n for n in route["nodes"] if n["id"]=="plan")
+   self.assertTrue(route["spec_touch"])
+   self.assertIn("spec/**",execute["write_scope"])
+   self.assertNotIn("spec/**",plan["write_scope"])
+   path=root/"code-route.json"; path.write_text(json.dumps(route))
+   result=subprocess.run([sys.executable,str(ROOT/"utilities/spec-transaction.py"),"run","--artifact-root",str(artifact),"--worktree",str(root),"--route",str(path),"--node","plan","--",sys.executable,"-c","pass"],text=True,capture_output=True,env=HERMETIC_ENV)
+   self.assertEqual(result.returncode,65,result.stdout+result.stderr)
+   self.assertIn("route-node-scope-mismatch",result.stdout)
 
   # -- the v{N} chain is canonical, not per-tree ------------------------------
 

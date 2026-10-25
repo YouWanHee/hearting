@@ -87,7 +87,7 @@ from dispatch_contract import (
     stable_state_root,
     validate_attempt_metadata,
 )
-from stage_session_contract import load_manifest
+from stage_session_contract import load_manifest, report_path_from_brief
 from dispatch_degradation import record_degradation  # noqa: E402
 from dispatch_completion_join import materialize_after_terminal_close  # noqa: E402
 from codex_dispatch_terminal import (  # noqa: E402
@@ -10848,14 +10848,40 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
     # A lineage-clean commit moves its files out of `git status` and into
     # history, so the audit has to add them back or accepting the commit would
     # silently blind the very measurement it just passed.
+    declared_artifact_outputs = set()
+    artifact_output_dir = None
     if unversioned:
-        output_dir = (baseline or {}).get("artifact_output_dir") or os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR")
-        if not output_dir:
+        artifact_output_dir = (
+            (baseline or {}).get("artifact_output_dir")
+            or os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR")
+        )
+        if not artifact_output_dir:
             _refuse("subdivision-baseline-missing", "unversioned artifact output directory unavailable")
-        changed = _artifact_delta(baseline, output_dir)
+        output_root = Path(artifact_output_dir).resolve(strict=False)
+        for session in manifest["sessions"]:
+            report_identity = (
+                session.get("gap_retry_of") or session.get("continues")
+                or session["subsession_id"]
+            )
+            report_path = report_path_from_brief(
+                Path(session["phase_brief"]).read_text(encoding="utf-8"),
+                session_id=report_identity, route_node=node_id, node=node,
+            )
+            if not report_path:
+                continue
+            report = output_root / report_path
+            resolved_report = report.resolve(strict=False)
+            if resolved_report != report:
+                _refuse("subdivision-scope-violation", f"report path uses a symlink: {report_path}")
+            try:
+                resolved_report.relative_to(output_root)
+            except ValueError:
+                _refuse("subdivision-scope-violation", f"report path escaped cycle output: {report_path}")
+            declared_artifact_outputs.add(resolved_report)
+        changed = _artifact_delta(baseline, artifact_output_dir)
     else:
         changed = _git_changed_files(worktree, route=route) | committed
-    outside = changed - declared_union - preexisting
+    outside = changed - declared_union - declared_artifact_outputs - preexisting
     if outside:
         _refuse(
             "subdivision-scope-violation",
