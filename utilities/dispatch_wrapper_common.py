@@ -928,7 +928,7 @@ def attach_summary_owner(args, log_path: Path, prompt_path: Path, identity, *,
     )
 
 
-def validate_route_record(args: argparse.Namespace, *, marker_gate) -> int:
+def validate_route_record(args: argparse.Namespace, *, marker_gate, runtime_harness=None) -> int:
     """One admission check for every wrapper.
 
     The wrapper passes its own completion-marker gate, looked up in its own
@@ -950,7 +950,9 @@ def validate_route_record(args: argparse.Namespace, *, marker_gate) -> int:
     if route_record.get("schema_version") != 2 or "broker_contract_version" in route_record:
         return fail("legacy-broker-route-read-only", 65, route_file=args.route_file, child_spawned="0")
     try:
-        validate_runtime_requirements(route_record, args.route_node)
+        from verification_runtime import supported_requirements
+        validate_runtime_requirements(route_record, args.route_node, supported=
+            supported_requirements(route_record, args.route_node, runtime_harness))
     except OwnerRouteBindingError as exc:
         return fail(str(exc), 69, child_spawned="0", fallback="inline-or-main")
     try:

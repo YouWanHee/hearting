@@ -87,6 +87,7 @@ shared-utility-deferred	verification-background-lease.py
 shared-utility-deferred	work_start.py
 shared-utility-deferred	start_receipt.py
 shared-utility-deferred	recipient_lifetime.py
+shared-utility-deferred	verification_runtime.py
 utility-deferred	artifact-root.test.sh
 utility-deferred	artifact-sink.sh
 utility-deferred	artifact-sink.test.sh

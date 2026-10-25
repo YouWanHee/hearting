@@ -4253,6 +4253,38 @@ class TestComputePollObservationBoundary(WorkflowFixture):
         )
         return route, jobs, registry, ledger
 
+    def test_continuation_reuses_admitted_resource_without_model_sidecar(self):
+        route, jobs, registry, ledger = self.owner_terminal_settled_compute_fixture()
+        route_module = SUP.route_module()
+        node = WS.route_node(route, "run")
+        before = ledger.journal_path.read_bytes()
+        with mock.patch.object(route_module, "_continuation_source_jobs", return_value=jobs):
+            result, _ = route_module._continuation_reused_evidence(route, node)
+        self.assertIsNone(result["terminal_attempt_id"])
+        evidence = ledger.read_only_state()["nodes"]["run"]["evidence"]
+        self.assertEqual(result["resource_execution_identity"], evidence["identity"])
+        self.assertEqual(result["resource_sha256"], evidence["resource_sha256"])
+        self.assertEqual(ledger.journal_path.read_bytes(), before)
+        document = json.loads(registry.read_text())
+        document["runs"]["fixture-resource"]["execution"]["meta_sha256"] = "changed"
+        registry.write_text(json.dumps(document))
+        with mock.patch.object(route_module, "_continuation_source_jobs", return_value=jobs):
+            with self.assertRaises(ValueError):
+                route_module._continuation_reused_evidence(route, node)
+
+    def test_resource_reuse_rejects_missing_admitted_quiescence(self):
+        route, jobs, registry, ledger = self.owner_terminal_settled_compute_fixture()
+        node = WS.route_node(route, "run")
+        route_module = SUP.route_module()
+        marker_path = route_module.completion_dir(route["route_id"], jobs=jobs) / "run.json"
+        marker = json.loads(marker_path.read_text())
+        for field in ("terminal", "quiescent", "owner_terminal_settlement"):
+            state = ledger.read_only_state()
+            state["nodes"]["run"]["evidence"][field] = False
+            with mock.patch.object(WS.WorkflowLedger, "read_only_state", return_value=state):
+                with self.assertRaises(DC.DispatchContractError):
+                    DC.resource_completion_reuse_proof(route, node, marker_path, marker, jobs)
+
     def _assert_observer_outside_writer_locks(self, ledger, registry, calls):
         def observe(_row):
             held = []
