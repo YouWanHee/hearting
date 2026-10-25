@@ -43,7 +43,7 @@ def _get(value, key, default=None):
 
 
 class SourceCache:
-    """Bounded (path, mtime_ns, size)-keyed JSON reads; an unchanged file is not read twice."""
+    """Bounded content-generation JSON reads; unchanged files are not reparsed."""
 
     def __init__(self, limit=512):
         self._limit = limit
@@ -53,26 +53,31 @@ class SourceCache:
 
     def read_json(self, path):
         path = str(path)
+        observation = utility("runtime_observation")
         try:
-            info = os.stat(path)
+            generation = observation.file_generation(path)
         except OSError:
+            with self._lock:
+                self._items.pop(path, None)
             return None
-        if info.st_size > _MAX_RECORD_BYTES:
+        if generation.signature[2] > _MAX_RECORD_BYTES:
+            with self._lock:
+                self._items.pop(path, None)
             return None
-        key = (info.st_mtime_ns, info.st_size)
         with self._lock:
             hit = self._items.get(path)
-            if hit is not None and hit[0] == key:
+            if hit is not None and hit[0] == generation:
                 self._items.move_to_end(path)
                 return hit[1]
         try:
-            with open(path, encoding="utf-8") as handle:
-                record = json.load(handle)
+            record = json.loads(observation.stable_read_bytes(path).decode("utf-8"))
+            if observation.file_generation(path) != generation:
+                record = None
         except (OSError, ValueError, UnicodeError):
             record = None
         with self._lock:
             self.reads += 1
-            self._items[path] = (key, record)
+            self._items[path] = (generation, record)
             self._items.move_to_end(path)
             while len(self._items) > self._limit:
                 self._items.popitem(last=False)

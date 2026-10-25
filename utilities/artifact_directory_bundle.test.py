@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import artifact_directory_bundle as B
 
@@ -150,6 +151,32 @@ class DirectoryBundleTests(unittest.TestCase):
                 self.assertIn(caught.exception.code, {"output-changed-while-reading"})
             finally:
                 B._hash_fd = original
+
+    def test_final_tree_check_rehashes_content_even_when_all_stat_fields_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / "artifacts" / "raw-results"
+            raw.mkdir(parents=True)
+            target = raw / "mutable"
+            target.write_bytes(b"first")
+            original_hash = B._hash_fd
+            calls = 0
+            hashed_bytes = 0
+            def mutate_after_initial_hash(fd, rel):
+                nonlocal calls, hashed_bytes
+                result = original_hash(fd, rel)
+                calls += 1
+                hashed_bytes += result[1]
+                if calls == 1:
+                    target.write_bytes(b"other")
+                return result
+            with mock.patch.object(B, "_identity", return_value=(1, 2, 3, 4, 5)), \
+                 mock.patch.object(B, "_hash_fd", side_effect=mutate_after_initial_hash):
+                with self.assertRaises(B.DirectoryBundleError) as caught:
+                    B.scan_tree(root, "artifacts/raw-results")
+            self.assertEqual(caught.exception.code, "output-changed-while-reading")
+            self.assertEqual(calls, 2)
+            self.assertEqual(hashed_bytes, 2 * len(b"first"))
 
     def test_streaming_hash_and_copy_memory_bound(self):
         self.assertEqual(B.CHUNK_BYTES, 1024 * 1024)

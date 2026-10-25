@@ -5,6 +5,7 @@ session-existence" contract. Fixtures are a throwaway sqlite DB (OpenCode) and t
 jsonl transcripts (Claude) — no real opencode/claude state is ever touched.
 """
 import json
+import hashlib
 import os
 import sqlite3
 import sys
@@ -1001,16 +1002,26 @@ class ClaudeSidechainTest(unittest.TestCase):
             self.assertEqual(len(subs), 1)
             self.assertEqual(subs[0].agent_type, "explore")
 
-    def test_cache_keyed_on_mtime_and_size(self):
+    def test_cache_invalidates_same_stat_small_file_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "t.jsonl")
-            _write_transcript(path, [_tool_use_line("t1", "explore")])
-            first = claude._tail_subagents(path)
-            self.assertEqual(len(first), 1)
-            st = os.stat(path)
-            claude._SUBAGENT_CACHE[path] = (st.st_mtime, st.st_size, [])   # poison the cache
-            cached = claude._tail_subagents(path)
-            self.assertEqual(cached, [], "재읽기 없이 (mtime,size) 캐시를 그대로 반환해야 함")
+            first_line = _tool_use_line("t1", "explore")
+            second_line = _tool_use_line("t1", "general")
+            self.assertEqual(len(first_line), len(second_line))
+            _write_transcript(path, [first_line])
+            original_stat = os.stat(path)
+            def frozen_content_generation(source, info=None):
+                with open(source, "rb") as stream:
+                    data = stream.read()
+                return (1, 2, len(data), 3, 4, hashlib.sha256(data).hexdigest())
+            with mock.patch.object(claude, "_cache_stamp", side_effect=frozen_content_generation):
+                first = claude._tail_subagents(path)
+                self.assertEqual(first[0].agent_type, "explore")
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write(json.dumps(second_line) + "\n")
+                self.assertEqual(os.stat(path).st_size, original_stat.st_size)
+                second = claude._tail_subagents(path)
+            self.assertEqual(second[0].agent_type, "general")
 
 
 class NoRegressionTest(unittest.TestCase):

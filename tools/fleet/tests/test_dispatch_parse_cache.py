@@ -29,13 +29,27 @@ class ParseCacheTest(unittest.TestCase):
     def test_second_process_cache_does_not_read_source(self):
         cold = dispatch._parse_codex_attempt_tail(str(self.path))
         dispatch._CODEX_ATTEMPT_CACHE.clear()  # empty memory, as on next Fleet startup
-        original = builtins.open
-        def opened(path, *args, **kwargs):
-            if str(path) == str(self.path):
-                raise AssertionError("unchanged source read on disk-cache hit")
-            return original(path, *args, **kwargs)
-        with mock.patch.object(builtins, "open", side_effect=opened):
+        before = dispatch._ATTEMPT_VIEW_BYTES_READ
+        with mock.patch.object(dispatch, "_codex_attempt_thread_ids",
+                               side_effect=AssertionError("cache hit reparsed source")):
             self.assertEqual(dispatch._parse_codex_attempt_tail(str(self.path)), cold)
+        validated = dispatch._ATTEMPT_VIEW_BYTES_READ - before
+        self.assertGreater(validated, 0)
+        self.assertLessEqual(validated, dispatch._CLAUDE_SUPERVISOR_HEAD_BYTES
+                             + dispatch._CLAUDE_STREAM_TAIL_BYTES)
+
+    def test_large_append_log_cache_validates_only_bounded_head_and_tail_views(self):
+        row = json.dumps({"type": "thread.started", "thread_id": "thread-large"}) + "\n"
+        self.path.write_bytes(b"x" * (2 * 1024 * 1024) + b"\n" + row.encode())
+        cold = dispatch._parse_codex_attempt_tail(str(self.path))
+        self.assertEqual(cold["thread_id"], "thread-large")
+        dispatch._CODEX_ATTEMPT_CACHE.clear()
+        before = dispatch._ATTEMPT_VIEW_BYTES_READ
+        self.assertEqual(dispatch._parse_codex_attempt_tail(str(self.path)), cold)
+        validated = dispatch._ATTEMPT_VIEW_BYTES_READ - before
+        self.assertLess(validated, self.path.stat().st_size // 2)
+        self.assertLessEqual(validated, dispatch._CLAUDE_SUPERVISOR_HEAD_BYTES
+                             + dispatch._CLAUDE_STREAM_TAIL_BYTES)
 
     def test_append_truncate_replace_and_same_size_edit_invalidate(self):
         path = str(self.path)
@@ -57,6 +71,30 @@ class ParseCacheTest(unittest.TestCase):
         dispatch._CODEX_ATTEMPT_CACHE.clear()
         self.assertEqual(dispatch._parse_codex_attempt_tail(path)["thread_id"], "thread-e")
         self.assertEqual(len(list(parse_cache._directory().glob("*.json"))), 1)
+
+    def test_attempt_parser_invalidates_same_size_content_under_frozen_stat(self):
+        from types import SimpleNamespace
+        import stat
+        self.path.write_text('{"type":"thread.started","thread_id":"thread-a"}\n')
+        info = self.path.stat()
+        frozen = SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_size=info.st_size,
+                                 st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns,
+                                 st_mtime=info.st_mtime, st_mode=stat.S_IFREG | 0o600)
+        real_stat, real_fstat = os.stat, os.fstat
+        def fixed_path_stat(path, *args, **kwargs):
+            return frozen if os.fspath(path) == str(self.path) else real_stat(path, *args, **kwargs)
+        def fixed_fd_stat(fd):
+            actual = real_fstat(fd)
+            return frozen if actual.st_ino == info.st_ino else actual
+        with mock.patch.object(dispatch.os, "stat", side_effect=fixed_path_stat), \
+             mock.patch.object(dispatch.os, "fstat", side_effect=fixed_fd_stat), \
+             mock.patch.object(parse_cache, "load", return_value=None), \
+             mock.patch.object(parse_cache, "save"):
+            first = dispatch._parse_codex_attempt_tail(str(self.path))
+            self.path.write_text('{"type":"thread.started","thread_id":"thread-b"}\n')
+            second = dispatch._parse_codex_attempt_tail(str(self.path))
+        self.assertEqual(first["thread_id"], "thread-a")
+        self.assertEqual(second["thread_id"], "thread-b")
 
     def test_corrupt_or_unwritable_cache_falls_back_to_source(self):
         cold = dispatch._parse_codex_attempt_tail(str(self.path))

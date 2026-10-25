@@ -16,6 +16,7 @@ if str(ROOT / "utilities") not in sys.path:
 
 import frame_interview as FI
 import workflow_state as WS
+from runtime_observation import file_generation, stable_read_bytes
 
 _CACHE_LIMIT = 2048
 _JOURNAL_CACHE = OrderedDict()
@@ -37,10 +38,11 @@ _S1_LOG_CHUNK_BYTES = 64 * 1024
 
 
 def _stamp(path):
-    """Stable identity for an existing or missing input; never follows symlinks."""
+    """Content-sensitive generation for bounded mutable records."""
     try:
-        meta = Path(path).lstat()
-        return (meta.st_dev, meta.st_ino, meta.st_mtime_ns, meta.st_ctime_ns, meta.st_size)
+        generation = file_generation(path)
+        return (generation.path_identity, generation.resolved_path,
+                *generation.signature, generation.content_digest)
     except OSError:
         return None
 
@@ -150,7 +152,7 @@ def _stable_read(path, cache):
         cache.move_to_end(key)
         return cache[key]
     try:
-        value = Path(path).read_text(encoding="utf-8")
+        value = stable_read_bytes(path).decode("utf-8")
     except (OSError, UnicodeError):
         return None
     after = _stamp(path)

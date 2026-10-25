@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 import tempfile
 import threading
 import time
@@ -105,6 +106,27 @@ class SourceCacheContracts(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as stream:
                 json.dump({"value": 2}, stream)
             self.assertEqual(cache.read_json(path), {"value": 2})
+            self.assertEqual(cache.reads, 2)
+
+    def test_same_stat_tuple_content_change_invalidates_json_record(self):
+        from unittest import mock
+        import stat
+        from utilities import runtime_observation as observation
+        cache = SourceCache()
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "record.json"
+            path.write_text('{"value": 1}', encoding="utf-8")
+            original = path.stat()
+            frozen = type("FrozenStat", (), {
+                "st_dev": original.st_dev, "st_ino": original.st_ino,
+                "st_size": original.st_size, "st_mtime_ns": original.st_mtime_ns,
+                "st_ctime_ns": original.st_ctime_ns, "st_mode": stat.S_IFREG | 0o600,
+            })()
+            with mock.patch.object(observation.Path, "stat", return_value=frozen), \
+                 mock.patch.object(observation.os, "fstat", return_value=frozen):
+                self.assertEqual(cache.read_json(path), {"value": 1})
+                path.write_text('{"value": 2}', encoding="utf-8")
+                self.assertEqual(cache.read_json(path), {"value": 2})
             self.assertEqual(cache.reads, 2)
 
 

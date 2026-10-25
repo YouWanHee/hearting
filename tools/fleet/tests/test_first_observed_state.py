@@ -253,16 +253,19 @@ class CampaignLabelsTest(unittest.TestCase):
         for index in range(401):
             self.record('%03d.json' % index, 'rt-%d' % index, 'title-%d' % index)
         job = model.DispatchJob(key='code', route_id='rt-400', artifact_root=str(self.root))
-        original = dispatch._stat_stamp
+        original = dispatch._file_generation
         observed = []
-        def stamp(path):
+        def generation(path):
             observed.append(path)
             return original(path)
-        with mock.patch.object(dispatch, '_stat_stamp', side_effect=stamp):
+        with mock.patch.object(dispatch, '_file_generation', side_effect=generation):
             dispatch._campaign_labels([job])
         self.assertIsNone(job.campaign_label)
-        self.assertEqual(sum(Path(p).parent == self.cycles and not Path(p).name.startswith('.')
-                             for p in observed), 200)
+        record_checks = [p for p in observed if Path(p).parent == self.cycles
+                         and Path(p).name.endswith('.json')
+                         and not Path(p).name.startswith('.')]
+        self.assertEqual(len(set(record_checks)), 200)
+        self.assertEqual(len(record_checks), 400)  # stable generation before and after parse
         dispatch._campaign_labels([job])
         self.assertIsNone(job.campaign_label)
         dispatch._campaign_labels([job])

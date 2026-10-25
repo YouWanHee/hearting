@@ -3036,6 +3036,71 @@ class ResidueDisplayTest(unittest.TestCase):
 class TickReuseTest(unittest.TestCase):
     """Unchanged files reuse their parse across ticks; any stat change rereads."""
 
+    def _freeze_file_stats(self, path):
+        """Hide every stat-field change while leaving the file's bytes real."""
+        import runtime_observation as observation
+
+        info = path.stat()
+        frozen = type("FrozenStat", (), {
+            "st_dev": info.st_dev, "st_ino": info.st_ino,
+            "st_size": info.st_size, "st_mtime_ns": info.st_mtime_ns,
+            "st_ctime_ns": info.st_ctime_ns,
+            "st_mode": info.st_mode,
+        })()
+        real_fstat = observation.os.fstat
+        real_stat = dispatch.os.stat
+
+        def fstat(fd):
+            actual = real_fstat(fd)
+            return frozen if actual.st_ino == frozen.st_ino else actual
+
+        def stat(target, *args, **kwargs):
+            actual = real_stat(target, *args, **kwargs)
+            return frozen if actual.st_ino == frozen.st_ino else actual
+
+        return (mock.patch.object(observation.Path, "stat", return_value=frozen),
+                mock.patch.object(observation.os, "fstat", side_effect=fstat),
+                mock.patch.object(dispatch, "_stat_stamp", return_value=(
+                    info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)),
+                mock.patch.object(dispatch.os, "stat", side_effect=stat))
+
+    def _count_fdopen_reads(self, counts):
+        real_fdopen = dispatch.os.fdopen
+
+        class CountedFile:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                self.handle.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.handle.__exit__(*args)
+
+            def fileno(self):
+                return self.handle.fileno()
+
+            def read(self, size=-1):
+                result = self.handle.read(size)
+                counts.append(len(result))
+                return result
+
+            def readline(self, size=-1):
+                result = self.handle.readline(size)
+                counts.append(len(result))
+                return result
+
+            def seek(self, *args):
+                return self.handle.seek(*args)
+
+        return mock.patch.object(
+            dispatch.os, "fdopen",
+            side_effect=lambda fd, *args, **kwargs: CountedFile(
+                real_fdopen(fd, *args, **kwargs)
+            ),
+        )
+
     def test_stat_memo_reuses_unchanged_log_and_rereads_on_change(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "attempt.log")
@@ -3056,6 +3121,336 @@ class TickReuseTest(unittest.TestCase):
             os.unlink(path)
             self.assertFalse(dispatch._stat_memo(cache, path, read))
             self.assertNotIn(path, cache)
+
+    def test_transcript_cwd_refreshes_after_same_stat_content_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            path.write_text('{"payload":{"cwd":"/old/path"}}\n', encoding="utf-8")
+            frozen_stats = self._freeze_file_stats(path)
+            with frozen_stats[0], frozen_stats[1], frozen_stats[2], frozen_stats[3]:
+                with mock.patch.object(dispatch.json, "loads", wraps=json.loads) as parse:
+                    self.assertEqual(dispatch._codex_transcript_cwd(str(path)), "/old/path")
+                    self.assertEqual(dispatch._codex_transcript_cwd(str(path)), "/old/path")
+                    self.assertEqual(parse.call_count, 1)
+                path.write_text('{"payload":{"cwd":"/new/path"}}\n', encoding="utf-8")
+                self.assertEqual(dispatch._codex_transcript_cwd(str(path)), "/new/path")
+
+    def test_terminal_envelope_refreshes_after_same_stat_content_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "attempt.log"
+            path.write_text('{"type":"step_finish","part":{"reason":"noop"}}\n',
+                            encoding="utf-8")
+            frozen_stats = self._freeze_file_stats(path)
+            with frozen_stats[0], frozen_stats[1], frozen_stats[2], frozen_stats[3]:
+                self.assertFalse(dispatch._terminal_envelope_memo(str(path)))
+                self.assertFalse(dispatch._terminal_envelope_memo(str(path)))
+                path.write_text('{"type":"step_finish","part":{"reason":"stop"}}\n',
+                                encoding="utf-8")
+                self.assertTrue(dispatch._terminal_envelope_memo(str(path)))
+
+    def test_terminal_tail_read_and_parse_cost_stay_bounded_and_reuse_parse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "large-attempt.log"
+            path.write_bytes((b'{"type":"item.started"}\n' * 100000)
+                             + b'{"type":"step_finish","part":{"reason":"stop"}}\n')
+            read_sizes = []
+            original_read = dispatch._read_stable_terminal_tail
+            original_parse = dispatch.terminal_envelope_observed_view
+
+            def read(target):
+                result = original_read(target)
+                read_sizes.append(len(result[1]))
+                return result
+
+            with mock.patch.object(dispatch, "_read_stable_terminal_tail", side_effect=read), \
+                    mock.patch.object(dispatch, "terminal_envelope_observed_view",
+                                       wraps=original_parse) as parse:
+                self.assertTrue(dispatch._terminal_envelope_memo(str(path)))
+                self.assertTrue(dispatch._terminal_envelope_memo(str(path)))
+            self.assertLessEqual(max(read_sizes), 1024 * 1024)
+            self.assertEqual(len(read_sizes), 2)
+            self.assertEqual(parse.call_count, 1)
+
+    def test_cycle_record_refreshes_after_same_stat_content_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cycles = root / ".runtime/artifact-producer/v1/cycles"
+            cycles.mkdir(parents=True)
+            record = cycles / "cyc_fixture.json"
+            record.write_text('{"route_id":"rt-fixture","title":"old"}', encoding="utf-8")
+            job = DispatchJob(key="code", route_id="rt-fixture", artifact_root=str(root))
+            frozen_stats = self._freeze_file_stats(record)
+            dispatch._CYCLE_RECORD_CACHE.clear()
+            dispatch._CYCLE_LABEL_INVENTORIES.clear()
+            dispatch._CYCLE_ROUTE_PATHS.clear()
+            with frozen_stats[0], frozen_stats[1], frozen_stats[2], frozen_stats[3]:
+                dispatch._campaign_labels([job])
+                self.assertEqual(job.campaign_label, "old")
+                record.write_text('{"route_id":"rt-fixture","title":"new"}', encoding="utf-8")
+                dispatch._campaign_labels([job])
+                self.assertEqual(job.campaign_label, "new")
+
+    def test_cycle_label_retries_after_post_generation_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cycles = root / ".runtime/artifact-producer/v1/cycles"
+            cycles.mkdir(parents=True)
+            record = cycles / "cyc_fixture.json"
+            record.write_text('{"route_id":"rt-fixture","title":"old"}', encoding="utf-8")
+            job = DispatchJob(key="code", route_id="rt-fixture", artifact_root=str(root))
+            dispatch._CYCLE_RECORD_CACHE.clear()
+            dispatch._CYCLE_LABEL_INVENTORIES.clear()
+            dispatch._CYCLE_ROUTE_PATHS.clear()
+            real_generation = dispatch._file_generation
+            generation_calls = []
+            real_read = dispatch._read_cycle_record
+            read_calls = []
+
+            def mutate_after_load(path):
+                value = real_read(path)
+                read_calls.append(path)
+                if len(read_calls) == 1:
+                    record.write_text(
+                        '{"route_id":"rt-fixture","title":"fresh"}',
+                        encoding="utf-8",
+                    )
+                return value
+
+            def fail_post_check_once(path):
+                if os.fspath(path) == str(record):
+                    generation_calls.append(path)
+                    if len(generation_calls) == 2:
+                        raise OSError("injected-post-check-error")
+                return real_generation(path)
+
+            with mock.patch.object(dispatch, "_read_cycle_record", side_effect=mutate_after_load), \
+                    mock.patch.object(dispatch, "_file_generation", side_effect=fail_post_check_once):
+                dispatch._campaign_labels([job])
+            self.assertEqual(job.campaign_label, "fresh")
+            self.assertGreaterEqual(len(read_calls), 2)
+
+    def test_small_record_parse_is_not_published_across_loader_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "record.json"
+            path.write_text('{"value":"old"}', encoding="utf-8")
+            frozen_stats = self._freeze_file_stats(path)
+            cache, calls = {}, []
+
+            def read(target):
+                calls.append(target)
+                value = json.loads(Path(target).read_text(encoding="utf-8"))
+                if len(calls) == 1:
+                    path.write_text('{"value":"new"}', encoding="utf-8")
+                return value
+
+            with frozen_stats[0], frozen_stats[1], frozen_stats[2], frozen_stats[3]:
+                result = dispatch._stat_memo(cache, str(path), read)
+                self.assertEqual(dispatch._stat_memo(cache, str(path), read), result)
+            self.assertEqual(result, {"value": "new"})
+            self.assertEqual(len(calls), 2)
+
+    def test_small_record_cache_reloads_on_symlink_retarget_and_skips_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first, second = root / "first.json", root / "second.json"
+            link = root / "record.json"
+            first.write_text('{"value":1}', encoding="utf-8")
+            second.write_text('{"value":1}', encoding="utf-8")
+            link.symlink_to(first.name)
+            cache, calls = {}, []
+
+            def read(target):
+                calls.append(target)
+                return json.loads(Path(target).read_text(encoding="utf-8"))
+
+            self.assertEqual(dispatch._stat_memo(cache, str(link), read), {"value": 1})
+            link.unlink()
+            link.symlink_to(second.name)
+            self.assertEqual(dispatch._stat_memo(cache, str(link), read), {"value": 1})
+            self.assertEqual(len(calls), 2)
+
+            directory_calls = []
+            directory_cache = {}
+
+            def read_directory(target):
+                directory_calls.append(target)
+                return Path(target).is_dir()
+
+            self.assertTrue(dispatch._stat_memo(directory_cache, str(root), read_directory))
+            self.assertTrue(dispatch._stat_memo(directory_cache, str(root), read_directory))
+            self.assertEqual(len(directory_calls), 2)
+            self.assertNotIn(str(root), directory_cache)
+
+    def test_stat_memo_discards_loader_value_when_post_generation_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "record.json"
+            path.write_text('{"value":"stale"}', encoding="utf-8")
+            real_generation = dispatch._file_generation
+            calls = []
+
+            def fail_first_post_check(target):
+                calls.append(target)
+                if len(calls) == 2:
+                    path.write_text('{"value":"fresh"}', encoding="utf-8")
+                    raise OSError("injected-post-check-error")
+                return real_generation(target)
+
+            with mock.patch.object(dispatch, "_file_generation",
+                                   side_effect=fail_first_post_check):
+                result = dispatch._stat_memo(
+                    {}, str(path), dispatch._read_cycle_record
+                )
+            self.assertEqual(result, {"value": "fresh"})
+            self.assertEqual(len(calls), 4)
+
+    def test_stat_memo_returns_empty_after_persistent_post_generation_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "record.json"
+            path.write_text('{"value":"stale"}', encoding="utf-8")
+            real_generation = dispatch._file_generation
+            calls = []
+
+            def fail_post_checks(target):
+                calls.append(target)
+                if len(calls) % 2 == 0:
+                    if len(calls) == 2:
+                        path.write_text('{"value":"changed"}', encoding="utf-8")
+                    raise OSError("injected-post-check-error")
+                return real_generation(target)
+
+            with mock.patch.object(dispatch, "_file_generation",
+                                   side_effect=fail_post_checks):
+                result = dispatch._stat_memo(
+                    {}, str(path), dispatch._read_cycle_record
+                )
+            self.assertIsNone(result)
+            self.assertEqual(len(calls), 6)
+
+    def test_stat_memo_returns_empty_after_persistent_generation_mismatches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "record.json"
+            path.write_text('{"value":0}', encoding="utf-8")
+            reads = []
+
+            def mutate_each_load(target):
+                value = dispatch._read_cycle_record(target)
+                reads.append(value)
+                path.write_text('{"value":%d}' % len(reads), encoding="utf-8")
+                return value
+
+            cache = {}
+            result = dispatch._stat_memo(cache, str(path), mutate_each_load)
+            self.assertIsNone(result)
+            self.assertEqual(len(reads), 3)
+            self.assertNotIn(str(path), cache)
+
+    def test_stat_memo_recovers_on_later_stable_read_after_exhaustion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "record.json"
+            path.write_text('{"value":"fresh"}', encoding="utf-8")
+            real_generation = dispatch._file_generation
+            calls = []
+
+            def fail_post_checks_then_stabilize(target):
+                calls.append(target)
+                if len(calls) <= 6 and len(calls) % 2 == 0:
+                    raise OSError("injected-post-check-error")
+                return real_generation(target)
+
+            cache = {}
+            with mock.patch.object(dispatch, "_file_generation",
+                                   side_effect=fail_post_checks_then_stabilize):
+                failed = dispatch._stat_memo(
+                    cache, str(path), dispatch._read_cycle_record
+                )
+                recovered = dispatch._stat_memo(
+                    cache, str(path), dispatch._read_cycle_record
+                )
+            self.assertIsNone(failed)
+            self.assertEqual(recovered, {"value":"fresh"})
+
+    def test_large_transcript_cached_prefix_refresh_cost_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-large.jsonl"
+            prefix = b'{"payload":{"cwd":"/work/early"}}\n'
+            path.write_bytes(prefix + (b'{"type":"event"}\n' * 250000))
+            dispatch._TRANSCRIPT_CWD_CACHE.pop(str(path.absolute()), None)
+            hashed = []
+            read_bytes = []
+            original_sha256 = dispatch.hashlib.sha256
+
+            class MeasuredDigest:
+                def __init__(self, *args, **kwargs):
+                    self.digest = original_sha256(*args, **kwargs)
+                    if args and args[0]:
+                        hashed.append(len(args[0]))
+
+                def update(self, data):
+                    hashed.append(len(data))
+                    self.digest.update(data)
+
+                def hexdigest(self):
+                    return self.digest.hexdigest()
+
+            def measured_sha256(*args, **kwargs):
+                return MeasuredDigest(*args, **kwargs)
+
+            with self._count_fdopen_reads(read_bytes), \
+                    mock.patch.object(dispatch.hashlib, "sha256", side_effect=measured_sha256):
+                self.assertEqual(dispatch._codex_transcript_cwd(str(path)), "/work/early")
+                self.assertEqual(dispatch._codex_transcript_cwd(str(path)), "/work/early")
+            self.assertEqual(sum(hashed), 2 * len(prefix))
+            self.assertEqual(sum(read_bytes), 2 * len(prefix))
+
+    def test_large_transcript_late_and_absent_cwd_keep_semantics_and_bound_refresh_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, tail, expected in (
+                ("late", b'{"payload":{"cwd":"/work/late"}}\n', "/work/late"),
+                ("absent", b'{"type":"event"}\n', None),
+            ):
+                path = Path(tmp) / (name + ".jsonl")
+                path.write_bytes((b'{"type":"event"}\n' * 240000) + tail)
+                dispatch._TRANSCRIPT_CWD_CACHE.pop(str(path.absolute()), None)
+                hashed = []
+                read_bytes = []
+                original_sha256 = dispatch.hashlib.sha256
+
+                class MeasuredDigest:
+                    def __init__(self, *args, **kwargs):
+                        self.digest = original_sha256(*args, **kwargs)
+                        if args and args[0]:
+                            hashed.append(len(args[0]))
+
+                    def update(self, data):
+                        hashed.append(len(data))
+                        self.digest.update(data)
+
+                    def hexdigest(self):
+                        return self.digest.hexdigest()
+
+                def measured_sha256(*args, **kwargs):
+                    return MeasuredDigest(*args, **kwargs)
+
+                with self._count_fdopen_reads(read_bytes), \
+                        mock.patch.object(dispatch.hashlib, "sha256", side_effect=measured_sha256):
+                    self.assertEqual(dispatch._codex_transcript_cwd(str(path)), expected)
+                    self.assertEqual(sum(hashed), path.stat().st_size)
+                    self.assertEqual(sum(read_bytes), path.stat().st_size)
+                    entry = dispatch._TRANSCRIPT_CWD_CACHE[str(path.absolute())]
+                    hashed.clear()
+                    read_bytes.clear()
+                    with mock.patch.object(dispatch.time, "time_ns",
+                                           return_value=entry[0][4] + 999_999_999):
+                        self.assertEqual(dispatch._codex_transcript_cwd(str(path)), expected)
+                    self.assertEqual(sum(hashed), path.stat().st_size)
+                    self.assertEqual(sum(read_bytes), path.stat().st_size)
+                    hashed.clear()
+                    read_bytes.clear()
+                    with mock.patch.object(dispatch.time, "time_ns",
+                                           return_value=entry[0][4] + 1_000_000_000):
+                        self.assertEqual(dispatch._codex_transcript_cwd(str(path)), expected)
+                self.assertEqual(sum(hashed), 0)
+                self.assertEqual(sum(read_bytes), 0)
 
     def test_parse_pipe_meta_returns_independent_copies(self):
         pipe = "capability=autopilot-code,mode=dev"

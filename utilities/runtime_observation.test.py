@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from runtime_observation import (ObservationContext, file_generation,
                                 stable_read_bytes)  # noqa: E402
+import runtime_observation as RO  # noqa: E402
 
 
 class ObservationContextTest(unittest.TestCase):
@@ -40,6 +43,63 @@ class ObservationContextTest(unittest.TestCase):
         os.utime(self.path, ns=(old, old))
         self.assertNotEqual(first, file_generation(self.path))
         self.assertEqual(self.context.memoize(key, [self.path], lambda: "new"), "new")
+
+    def test_same_stat_tuple_with_changed_small_file_bytes_invalidates(self):
+        self.path.write_text('{"value": 1}', encoding="utf-8")
+        original = self.path.stat()
+        frozen = type("FrozenStat", (), {
+            "st_dev": original.st_dev, "st_ino": original.st_ino,
+            "st_size": original.st_size, "st_mtime_ns": original.st_mtime_ns,
+            "st_ctime_ns": original.st_ctime_ns, "st_mode": stat.S_IFREG | 0o600,
+        })()
+        first = RO.file_generation
+        with mock.patch.object(RO.Path, "stat", return_value=frozen), \
+             mock.patch.object(RO.os, "fstat", return_value=frozen):
+            self.assertEqual(self.context.memoize("frozen-stat", [self.path], lambda: "one"), "one")
+            before = first(self.path)
+            self.path.write_text('{"value": 2}', encoding="utf-8")
+            after = first(self.path)
+            self.assertEqual(self.context.memoize("frozen-stat", [self.path], lambda: "two"), "two")
+        self.assertEqual(before.signature, after.signature)
+        self.assertNotEqual(before.content_digest, after.content_digest)
+
+    def test_loader_same_tuple_mutation_is_not_published(self):
+        original = self.path.stat()
+        frozen = type("FrozenStat", (), {
+            "st_dev": original.st_dev, "st_ino": original.st_ino,
+            "st_size": original.st_size, "st_mtime_ns": original.st_mtime_ns,
+            "st_ctime_ns": original.st_ctime_ns, "st_mode": stat.S_IFREG | 0o600,
+        })()
+        def loader():
+            self.path.write_text('{"value": 2}', encoding="utf-8")
+            return "raced"
+        with mock.patch.object(RO.Path, "stat", return_value=frozen), \
+             mock.patch.object(RO.os, "fstat", return_value=frozen), \
+             self.assertRaisesRegex(OSError, "dependency-changed"):
+            self.context.memoize("frozen-loader-race", [self.path], loader)
+        self.assertEqual(self.context.memoize("frozen-loader-race", [self.path], lambda: "current"),
+                         "current")
+
+    def test_large_append_log_generation_does_not_hash_the_whole_file(self):
+        large = self.path.with_name("jobs.log")
+        payload = b"x" * (RO.SMALL_MUTABLE_FILE_BYTES + 1)
+        large.write_bytes(payload)
+        reads = []
+        real_read = RO.os.read
+        def counted(fd, size):
+            data = real_read(fd, size)
+            reads.append(len(data))
+            return data
+        with mock.patch.object(RO.os, "read", side_effect=counted):
+            generation = file_generation(large)
+        self.assertIsNone(generation.content_digest)
+        self.assertEqual(sum(reads), 0)
+
+    def test_directory_generation_remains_available_for_artifact_consumers(self):
+        generation = file_generation(self.path.parent)
+        self.assertEqual(generation.kind, "directory")
+        self.assertIsNone(generation.content_digest)
+        self.assertEqual(self.context.memoize("directory", [self.path.parent], lambda: "ok"), "ok")
 
     def test_missing_dependency_does_not_reuse_old_projection(self):
         key = "missing"

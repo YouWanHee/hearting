@@ -401,5 +401,29 @@ class SurfaceBoundaryTest(_QueueFixture):
         self.assertNotEqual(plugin_row.slug, registry_row.slug)
 
 
+class TelemetryGenerationTest(unittest.TestCase):
+    def test_companion_evidence_requires_the_same_token_count_view(self):
+        from types import SimpleNamespace
+        from fleet.collectors import codex
+        line = '{"type":"token_count","payload":{"info":{"last_token_usage":{}}}}'
+        original = (line, (100, 200), 100.0, "a" * 64)
+        changed = (line, (100, 200), 100.0, "b" * 64)
+        policy = {"state": "applied", "applied_trigger_tokens": 700}
+        tel = SimpleNamespace(context_window_tokens=1000, active_context_tokens=500,
+                              session_total_tokens=600)
+        with unittest.mock.patch.object(cc, "_rollout_for_thread", return_value="/fixture/rollout"), \
+             unittest.mock.patch.object(codex, "_tail_token_count_observation",
+                                        side_effect=[original, changed]), \
+             unittest.mock.patch.object(cc, "parse_codex_token_count", return_value=tel), \
+             unittest.mock.patch.object(codex, "_rollout_cli_version", return_value="v"), \
+             unittest.mock.patch.object(codex, "_rollout_model_effort", return_value=("gpt", None)), \
+             unittest.mock.patch.object(codex, "_rollout_home", return_value="/fixture"), \
+             unittest.mock.patch("fleet.context_policy.codex_applied_policy", return_value=policy), \
+             unittest.mock.patch("fleet.token_budget.context_policy_used_pct", return_value=50):
+            payload, evidence = cc._telemetry({"threadId": "thread-a"})
+        self.assertEqual(payload["context_used_pct"], 50)
+        self.assertIsNone(evidence)
+
+
 if __name__ == "__main__":
     unittest.main()

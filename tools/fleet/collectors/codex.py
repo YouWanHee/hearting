@@ -25,6 +25,7 @@ A per-tick cache (cwd → newest rollout path) is built from cheap line-1 reads 
 (≈200 files); the expensive last-token-count parse touches only a 64 KB tail of the matched file.
 """
 import glob
+import hashlib
 import json
 import os
 import re
@@ -1876,22 +1877,45 @@ def prepare_tick(sessions, *, wait_timeout=0.0):
 
 def _tail_token_count(path, chunk=65536):
     """Last '"token_count"' line within the file's trailing `chunk` bytes."""
+    observed = _tail_token_count_observation(path, chunk)
+    return observed[0] if observed else None
+
+
+def _tail_token_count_observation(path, chunk=65536):
+    """Token-count payload, source sequence, and bounded-view content digest."""
+    fd = None
     try:
-        sz = os.path.getsize(path)
-        start = max(0, sz - chunk)
-        with open(path, "rb") as f:
-            f.seek(start)
-            data = f.read().decode("utf-8", "replace")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            return None
+        start = max(0, before.st_size - chunk)
+        os.lseek(fd, start, os.SEEK_SET)
+        data = os.read(fd, chunk)
+        after = os.fstat(fd)
+        current = os.stat(path, follow_symlinks=False)
+        signature = (before.st_dev, before.st_ino, before.st_size,
+                     before.st_mtime_ns, before.st_ctime_ns)
+        if (signature != (after.st_dev, after.st_ino, after.st_size,
+                          after.st_mtime_ns, after.st_ctime_ns)
+                or signature != (current.st_dev, current.st_ino, current.st_size,
+                                 current.st_mtime_ns, current.st_ctime_ns)):
+            return None
     except OSError:
         return None
-    lines = data.splitlines()
+    finally:
+        if fd is not None:
+            os.close(fd)
+    text = data.decode("utf-8", "replace")
+    lines = text.splitlines()
     if start > 0 and lines:
         lines = lines[1:]                           # drop the partial first line
     last = None
     for ln in lines:
         if '"token_count"' in ln:
             last = ln
-    return last
+    return last, (before.st_mtime_ns, before.st_size), before.st_mtime, hashlib.sha256(data).hexdigest()
 
 
 def _latest_user_message_offset(path, chunk=_SUMMARY_BOUNDARY_SCAN):

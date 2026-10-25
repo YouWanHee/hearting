@@ -52,18 +52,33 @@ class PendingWaitTest(unittest.TestCase):
 
     def test_journal_parse_cache_invalidates_on_same_size_rewrite(self):
         import workflow_state as WS
+        from types import SimpleNamespace
+        import stat
+        from utilities import runtime_observation as RO
         ledger = WS.WorkflowLedger(self.route["route_id"], self.route["route_hash"], jobs=self.jobs)
-        first = H._journal(ledger)
-        with mock.patch.object(H.json, "loads", wraps=H.json.loads) as loads:
-            self.assertEqual(H._journal(ledger), first)
-            self.assertEqual(loads.call_count, 0)
-            raw = ledger.journal_path.read_text(encoding="utf-8")
-            changed = raw.replace("BLOCKED_HUMAN_GATE", "CANCELLED_________")
-            self.assertEqual(len(changed), len(raw))
-            ledger.journal_path.write_text(changed, encoding="utf-8")
-            parsed = H._journal(ledger)
-            self.assertEqual(loads.call_count, 1)
-            self.assertEqual(parsed[0]["workflow_state"], "CANCELLED_________")
+        info = ledger.journal_path.stat()
+        frozen = SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_size=info.st_size,
+                                 st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns,
+                                 st_mode=stat.S_IFREG | 0o600)
+        real_fstat = RO.os.fstat
+        def fstat(fd):
+            actual = real_fstat(fd)
+            return frozen if actual.st_ino == info.st_ino else actual
+        for cache in (H._JOURNAL_CACHE, H._OBSERVATION_CACHE):
+            cache.clear()
+        with mock.patch.object(RO.Path, "stat", return_value=frozen), \
+             mock.patch.object(RO.os, "fstat", side_effect=fstat):
+            first = H._journal(ledger)
+            with mock.patch.object(H.json, "loads", wraps=H.json.loads) as loads:
+                self.assertEqual(H._journal(ledger), first)
+                self.assertEqual(loads.call_count, 0)
+                raw = ledger.journal_path.read_text(encoding="utf-8")
+                changed = raw.replace("BLOCKED_HUMAN_GATE", "CANCELLED_________")
+                self.assertEqual(len(changed), len(raw))
+                ledger.journal_path.write_text(changed, encoding="utf-8")
+                parsed = H._journal(ledger)
+                self.assertEqual(loads.call_count, 1)
+                self.assertEqual(parsed[0]["workflow_state"], "CANCELLED_________")
 
     def _blocked_owner_fixture(self):
         route = {"artifact_root": str(self.artifacts), "nodes": []}

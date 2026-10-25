@@ -560,19 +560,21 @@ def read_generation(reader, entry, now=None) -> OutputView:
         plan = SourcePlan(f"generation:{harness}:{sid}", label, harness, abbr, "generation", direct=path)
         return reader.read(("generation", harness, sid), title, [plan], now=now)
     try:
-        info = os.stat(path)
-        stamp = (path, info.st_mtime_ns, info.st_size)
+        observation = utility("runtime_observation")
+        generation = observation.file_generation(path)
         cache = reader.scopes.setdefault(("generation-cache",), OrderedDict())
         hit = cache.get((harness, sid))
-        if hit is not None and hit[0] == stamp:
+        if hit is not None and hit[0] == generation:
             return hit[1]
         rows, error = _read_transcript(harness, path, sid, label, abbr)
+        if rows is not None and observation.file_generation(path) != generation:
+            rows, error = None, "source-changed-during-read"
     except OSError as exc:
         rows, error = None, type(exc).__name__
     if rows is None:
         return OutputView(title, (), (f"읽지 못함 · {error}",), Health("failed", None, error), False)
     view = OutputView(title, tuple(rows), (), Health("success", reader.clock()), False)
-    cache[(harness, sid)] = (stamp, view)
+    cache[(harness, sid)] = (generation, view)
     while len(cache) > 4:
         cache.popitem(last=False)
     return view

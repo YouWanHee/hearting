@@ -11,14 +11,17 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
+import stat
 import threading
 import time
 from typing import Callable, Hashable, Iterable, TypeVar
 
 
 T = TypeVar("T")
+SMALL_MUTABLE_FILE_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,8 @@ class FileGeneration:
     path_identity: str
     resolved_path: str
     signature: tuple[int, int, int, int, int]
+    content_digest: str | None = None
+    kind: str = "regular"
 
 
 @dataclass(frozen=True)
@@ -37,16 +42,69 @@ class _Entry:
 
 
 def file_generation(path: str | os.PathLike[str]) -> FileGeneration:
-    """Return a generation that detects replacement and same-size rewrites."""
+    """Return metadata plus a content generation for bounded mutable records."""
     candidate = Path(path).expanduser()
     identity = str(candidate.absolute())
-    resolved = str(candidate.resolve(strict=True))
-    info = candidate.stat()
-    return FileGeneration(
-        identity,
-        resolved,
-        (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns),
-    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    for _attempt in range(3):
+        fd = None
+        try:
+            before = candidate.stat()
+            resolved = str(candidate.resolve(strict=True))
+            if stat.S_ISDIR(before.st_mode):
+                signature = (before.st_dev, before.st_ino, before.st_size,
+                             before.st_mtime_ns, before.st_ctime_ns)
+                after_path = candidate.stat()
+                after_resolved = str(candidate.resolve(strict=True))
+                if (signature != (after_path.st_dev, after_path.st_ino, after_path.st_size,
+                                  after_path.st_mtime_ns, after_path.st_ctime_ns)
+                        or resolved != after_resolved):
+                    continue
+                return FileGeneration(identity, resolved, signature, None, "directory")
+            if not stat.S_ISREG(before.st_mode):
+                raise OSError("observation-file-not-regular")
+            fd = os.open(candidate, flags)
+            opened = os.fstat(fd)
+            signature = (opened.st_dev, opened.st_ino, opened.st_size,
+                         opened.st_mtime_ns, opened.st_ctime_ns)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OSError("observation-file-not-regular")
+            if signature != (before.st_dev, before.st_ino, before.st_size,
+                             before.st_mtime_ns, before.st_ctime_ns):
+                continue
+            digest = None
+            if opened.st_size <= SMALL_MUTABLE_FILE_BYTES:
+                hasher = hashlib.sha256()
+                while True:
+                    chunk = os.read(fd, min(64 * 1024, SMALL_MUTABLE_FILE_BYTES + 1))
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+                after_fd = os.fstat(fd)
+                after_path = candidate.stat()
+                final = (after_fd.st_dev, after_fd.st_ino, after_fd.st_size,
+                         after_fd.st_mtime_ns, after_fd.st_ctime_ns)
+                if (final != signature or final != (after_path.st_dev, after_path.st_ino,
+                        after_path.st_size, after_path.st_mtime_ns, after_path.st_ctime_ns)):
+                    continue
+                digest = hasher.hexdigest()
+            else:
+                after_path = candidate.stat()
+                if signature != (after_path.st_dev, after_path.st_ino, after_path.st_size,
+                                 after_path.st_mtime_ns, after_path.st_ctime_ns):
+                    continue
+            after_resolved = str(candidate.resolve(strict=True))
+            if resolved != after_resolved:
+                continue
+            return FileGeneration(identity, resolved, signature, digest, "regular")
+        except FileNotFoundError:
+            raise
+        except OSError:
+            raise
+        finally:
+            if fd is not None:
+                os.close(fd)
+    raise OSError("observation-file-changed-during-generation")
 
 
 def stable_read_bytes(path: str | os.PathLike[str], *, chunk_size: int = 1024 * 1024,

@@ -59,9 +59,16 @@ from dispatch_completion_join import read_supervisor_phase_state, read_join_obse
 from dispatch_subsession_advance import row_is_registered_only  # noqa: E402
 from dispatch_attempt_policy import decide_attempt, terminal_conflict_pending  # noqa: E402
 import dispatch_registry_cache as _dispatch_registry_cache  # noqa: E402
-from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
+from codex_dispatch_terminal import (  # noqa: E402
+    _MAX_TAIL_BYTES as _TERMINAL_TAIL_BYTES,
+    terminal_envelope_observed,
+    terminal_envelope_observed_view,
+)
 from claude_project_dir import encode_project_dir  # noqa: E402
 from attempt_view import owned_attempt_log_path as _shared_owned_attempt_log_path  # noqa: E402
+from runtime_observation import (  # noqa: E402
+    file_generation as _file_generation,
+)
 
 try:  # W7D read-side layout resolver; absent on a pre-cutover checkout.
     import artifact_reader  # noqa: E402
@@ -613,8 +620,8 @@ def _codex_home():
 
 
 _STAT_MEMO_LIMIT = 8192
-_TRANSCRIPT_CWD_CACHE = {}       # path -> (stat stamp, cwd)
-_TERMINAL_ENVELOPE_CACHE = {}    # path -> (stat stamp, observed)
+_TRANSCRIPT_CWD_CACHE = {}       # path -> (stable file stamp, consumed-prefix digest, cwd)
+_TERMINAL_ENVELOPE_CACHE = {}    # path -> (stable file stamp, tail digest, observed)
 
 
 def _stat_stamp(path):
@@ -623,42 +630,180 @@ def _stat_stamp(path):
 
 
 def _stat_memo(cache, path, read):
-    """Reuse ``read(path)`` while the file's stat stamp is unchanged; any change rereads."""
-    try:
-        stamp = _stat_stamp(path)
-    except (OSError, TypeError, ValueError):
+    """Reuse small parsed records only for the exact stable content generation."""
+    for _attempt in range(3):
+        try:
+            generation = _file_generation(path)
+        except (OSError, TypeError, ValueError):
+            cache.pop(path, None)
+            return read(path)
+        # These callers parse mutable records. A large file must not acquire a
+        # whole-file digest merely because it shares this compatibility helper.
+        if generation.kind != "regular" or generation.content_digest is None:
+            cache.pop(path, None)
+            return read(path)
+        cached = cache.get(path)
+        if cached is not None and cached[0] == generation:
+            return cached[1]
+        value = read(path)
+        try:
+            after = _file_generation(path)
+        except (OSError, TypeError, ValueError):
+            cache.pop(path, None)
+            # A failed post-read check invalidates this parse just like a
+            # generation mismatch. Retry within the same bounded budget.
+            continue
+        if after == generation:
+            cache[path] = (after, value)
+            if len(cache) > _STAT_MEMO_LIMIT:
+                cache.pop(next(iter(cache)))
+            return value
+        # Do not publish a parse that crossed an in-place write or retarget.
         cache.pop(path, None)
-        return read(path)
-    cached = cache.get(path)
-    if cached is not None and cached[0] == stamp:
-        return cached[1]
-    value = read(path)
-    cache[path] = (stamp, value)
-    if len(cache) > _STAT_MEMO_LIMIT:
-        cache.pop(next(iter(cache)))
-    return value
+    # Consumers interpret a miss as an empty/failed observation. Never perform
+    # an unchecked final load after the stability budget is exhausted.
+    return None
 
 
 def _codex_transcript_cwd(path):
-    return _stat_memo(_TRANSCRIPT_CWD_CACHE, path, _read_codex_transcript_cwd)
-
-
-def _read_codex_transcript_cwd(path):
+    """Read and memoize the exact prefix consumed by the first-valid-cwd parser."""
+    identity = os.path.abspath(os.fspath(path))
+    cached = _TRANSCRIPT_CWD_CACHE.get(identity)
+    fd = None
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if '"cwd"' not in line:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as handle:
+            fd = None
+            before = os.fstat(handle.fileno())
+            path_before = os.stat(path)
+            if (not stat.S_ISREG(before.st_mode)
+                    or _file_stat_tuple(path_before) != _file_stat_tuple(before)):
+                raise OSError("transcript-not-regular")
+            resolved = os.path.realpath(path)
+            stable_stamp = (before.st_dev, before.st_ino, before.st_size,
+                            before.st_mtime_ns, before.st_ctime_ns, resolved)
+            if cached is not None and cached[0] == stable_stamp:
+                consumed, prefix_digest = cached[1]
+                if consumed <= 256 * 1024:
+                    prefix = handle.read(consumed)
+                    prefix_valid = (len(prefix) == consumed
+                                    and hashlib.sha256(prefix).hexdigest() == prefix_digest)
+                else:
+                    # Large transcripts are append logs. Near a ctime boundary
+                    # metadata may describe a write in flight, so revalidate
+                    # the full consumed prefix there. Outside that conservative
+                    # one-second window, reuse the cached prefix without an
+                    # unbounded reread/hash on every refresh.
+                    age_ns = time.time_ns() - before.st_ctime_ns
+                    prefix_valid = age_ns >= 1_000_000_000
+                if prefix_valid:
+                    after = os.fstat(handle.fileno())
+                    path_after = os.stat(path)
+                    if (_file_stat_tuple(after) == _file_stat_tuple(before)
+                            and _file_stat_tuple(path_after) == _file_stat_tuple(before)
+                            and os.path.realpath(path) == resolved):
+                        return cached[2]
+                handle.seek(0)
+            else:
+                handle.seek(0)
+
+            hasher = hashlib.sha256()
+            consumed = 0
+            cwd = None
+            while True:
+                line = handle.readline()
+                if not line:
+                    break
+                consumed += len(line)
+                hasher.update(line)
+                if b'"cwd"' not in line:
                     continue
                 try:
-                    payload = (json.loads(line).get("payload") or {})
+                    payload = (json.loads(line.decode("utf-8", errors="replace")).get("payload") or {})
+                    candidate = payload.get("cwd")
                 except Exception:
                     continue
-                cwd = payload.get("cwd")
-                if isinstance(cwd, str) and cwd:
-                    return cwd
-    except OSError:
+                if isinstance(candidate, str) and candidate:
+                    cwd = candidate
+                    break
+            after = os.fstat(handle.fileno())
+            path_after = os.stat(path)
+            if (_file_stat_tuple(after) != _file_stat_tuple(before)
+                    or _file_stat_tuple(path_after) != _file_stat_tuple(before)
+                    or os.path.realpath(path) != resolved):
+                raise OSError("transcript-changed-during-read")
+    except (OSError, TypeError, ValueError):
+        _TRANSCRIPT_CWD_CACHE.pop(identity, None)
         return None
-    return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    prefix_stamp = (consumed, hasher.hexdigest())
+    _TRANSCRIPT_CWD_CACHE[identity] = (stable_stamp, prefix_stamp, cwd)
+    if len(_TRANSCRIPT_CWD_CACHE) > _STAT_MEMO_LIMIT:
+        _TRANSCRIPT_CWD_CACHE.pop(next(iter(_TRANSCRIPT_CWD_CACHE)))
+    return cwd
+
+
+def _file_stat_tuple(st):
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _read_stable_terminal_tail(path):
+    """Return the terminal parser's bounded tail and stable file identity."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = None
+    try:
+        before_path = os.stat(path)
+        if not stat.S_ISREG(before_path.st_mode):
+            raise OSError("terminal-log-not-regular")
+        resolved = os.path.realpath(path)
+        fd = os.open(path, flags)
+        before = os.fstat(fd)
+        if (_file_stat_tuple(before) != _file_stat_tuple(before_path)
+                or not stat.S_ISREG(before.st_mode)):
+            raise OSError("terminal-log-retargeted-before-read")
+        start = max(0, before.st_size - _TERMINAL_TAIL_BYTES)
+        os.lseek(fd, start, os.SEEK_SET)
+        chunks = []
+        remaining = min(_TERMINAL_TAIL_BYTES, before.st_size - start)
+        while remaining:
+            chunk = os.read(fd, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(fd)
+        path_after = os.stat(path)
+        if (remaining or _file_stat_tuple(after) != _file_stat_tuple(before)
+                or _file_stat_tuple(path_after) != _file_stat_tuple(before)
+                or os.path.realpath(path) != resolved):
+            raise OSError("terminal-log-changed-during-read")
+        stamp = (os.path.abspath(os.fspath(path)), resolved,
+                 _file_stat_tuple(before))
+        return stamp, data, bool(start)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _terminal_envelope_memo(path):
+    try:
+        stamp, data, truncated = _read_stable_terminal_tail(path)
+    except (OSError, TypeError, ValueError):
+        _TERMINAL_ENVELOPE_CACHE.pop(path, None)
+        return terminal_envelope_observed(path)
+    digest = hashlib.sha256(data).hexdigest()
+    cached = _TERMINAL_ENVELOPE_CACHE.get(path)
+    if cached is not None and cached[0] == stamp and cached[1] == digest:
+        return cached[2]
+    observed = terminal_envelope_observed_view(data, truncated=truncated)
+    _TERMINAL_ENVELOPE_CACHE[path] = (stamp, digest, observed)
+    if len(_TERMINAL_ENVELOPE_CACHE) > _STAT_MEMO_LIMIT:
+        _TERMINAL_ENVELOPE_CACHE.pop(next(iter(_TERMINAL_ENVELOPE_CACHE)))
+    return observed
 
 
 def _row_state_roots(job=None, agent_home=None):
@@ -1042,8 +1187,8 @@ def _dispatch_liveness(job, now, track=True, codex_index=None):
         and job.registered_worker is True
     ):
         log_file = getattr(job, "_log_file", None)
-        terminal_seen = bool(terminal_observation) or bool(log_file) and _stat_memo(
-            _TERMINAL_ENVELOPE_CACHE, log_file, terminal_envelope_observed
+        terminal_seen = bool(terminal_observation) or bool(log_file) and _terminal_envelope_memo(
+            log_file
         )
         registry_path = getattr(job, "_registry_path", None)
         phase = ""
@@ -1461,13 +1606,65 @@ def _supervised_claude_transcript(job, receipt_path):
     return (str(transcript), None) if transcript else (None, reason)
 
 
+_ATTEMPT_VIEW_BYTES_READ = 0
+
+
+def _attempt_file_view(path, head_bytes, tail_bytes, *, read_whole_below=None,
+                       tail_after_head=False, always_tail=False):
+    """Read and fingerprint exactly the bounded bytes used by an attempt parser."""
+    global _ATTEMPT_VIEW_BYTES_READ
+    flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError("attempt-log-not-regular")
+        head_limit = (before.st_size if read_whole_below is not None
+                      and before.st_size <= read_whole_below else head_bytes)
+        head = os.read(fd, head_limit)
+        tail = b""
+        if before.st_size > len(head) or always_tail:
+            start = max(len(head) if tail_after_head else 0,
+                        before.st_size - tail_bytes)
+            os.lseek(fd, start, os.SEEK_SET)
+            remaining = max(0, before.st_size - start)
+            chunks = []
+            while remaining:
+                chunk = os.read(fd, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            tail = b"".join(chunks)
+        after = os.fstat(fd)
+        path_after = os.stat(path, follow_symlinks=False)
+        signature = (before.st_dev, before.st_ino, before.st_size,
+                     before.st_mtime_ns, before.st_ctime_ns)
+        if (signature != (after.st_dev, after.st_ino, after.st_size,
+                          after.st_mtime_ns, after.st_ctime_ns)
+                or signature != (path_after.st_dev, path_after.st_ino, path_after.st_size,
+                                 path_after.st_mtime_ns, path_after.st_ctime_ns)):
+            raise OSError("attempt-log-changed-during-view")
+        fingerprint = hashlib.sha256()
+        fingerprint.update(len(head).to_bytes(8, "big"))
+        fingerprint.update(head)
+        fingerprint.update(len(tail).to_bytes(8, "big"))
+        fingerprint.update(tail)
+        _ATTEMPT_VIEW_BYTES_READ += len(head) + len(tail)
+        return before, head, tail, (*signature, fingerprint.hexdigest())
+    finally:
+        os.close(fd)
+
+
 def _parse_claude_stream_tail(path):
     """Read one bounded exact-attempt tail for identity, context, and open tool."""
     try:
-        st = os.stat(path)
+        st, head, tail, cache_key = _attempt_file_view(
+            path, _CLAUDE_STREAM_HEAD_BYTES, _CLAUDE_STREAM_TAIL_BYTES,
+            tail_after_head=True)
     except OSError:
         return None
-    cache_key = (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino)
     cached = _CLAUDE_STREAM_CACHE.get(path)
     if cached and cached[0] == cache_key:
         return cached[1]
@@ -1480,17 +1677,7 @@ def _parse_claude_stream_tail(path):
         if len(_CLAUDE_STREAM_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
             _CLAUDE_STREAM_CACHE.pop(next(iter(_CLAUDE_STREAM_CACHE)))
         return parsed
-    tail_start = st.st_size
-    try:
-        with open(path, "rb") as stream:
-            head = stream.read(_CLAUDE_STREAM_HEAD_BYTES)
-            tail = b""
-            if st.st_size > len(head):
-                tail_start = max(len(head), st.st_size - _CLAUDE_STREAM_TAIL_BYTES)
-                stream.seek(tail_start)
-                tail = stream.read(_CLAUDE_STREAM_TAIL_BYTES)
-    except OSError:
-        return None
+    tail_start = max(len(head), st.st_size - len(tail)) if tail else st.st_size
     head_lines = head.decode("utf-8", "replace").splitlines()
     if head and not head.endswith(b"\n") and head_lines:
         head_lines.pop()  # the last head item may be a partial JSON line
@@ -1587,7 +1774,10 @@ def _parse_claude_stream_tail(path):
         "exec_tool": next(reversed(open_tools.values())) if open_tools else None,
     }
     _CLAUDE_STREAM_CACHE[path] = (cache_key, parsed)
-    parse_cache.save(disk_key, parsed, path, cache_key)
+    parse_cache.save(disk_key, parsed, path, cache_key,
+                     source_is_current=lambda: _attempt_file_view(
+                         path, _CLAUDE_STREAM_HEAD_BYTES, _CLAUDE_STREAM_TAIL_BYTES,
+                         tail_after_head=True)[3] == cache_key)
     if len(_CLAUDE_STREAM_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _CLAUDE_STREAM_CACHE.pop(next(iter(_CLAUDE_STREAM_CACHE)))
     return parsed
@@ -1787,10 +1977,11 @@ def _parse_codex_attempt_tail(path):
     bytes read stay a constant independent of file size (F-51b/F-51d non-blocking tick).
     """
     try:
-        st = os.stat(path)
+        st, head_raw, tail_raw, cache_key = _attempt_file_view(
+            path, _CLAUDE_SUPERVISOR_HEAD_BYTES, _CLAUDE_STREAM_TAIL_BYTES,
+            read_whole_below=_CLAUDE_SUPERVISOR_HEAD_BYTES + _CLAUDE_STREAM_TAIL_BYTES)
     except OSError:
         return None
-    cache_key = (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino)
     cached = _CODEX_ATTEMPT_CACHE.get(path)
     if cached and cached[0] == cache_key:
         return cached[1]
@@ -1803,23 +1994,10 @@ def _parse_codex_attempt_tail(path):
             _CODEX_ATTEMPT_CACHE.pop(next(iter(_CODEX_ATTEMPT_CACHE)))
         return parsed
     head_bytes = _CLAUDE_SUPERVISOR_HEAD_BYTES
-    tail_bytes = _CLAUDE_STREAM_TAIL_BYTES
     head_thread_ids = set()
-    if st.st_size <= head_bytes + tail_bytes:
-        try:
-            with open(path, "rb") as stream:
-                raw = stream.read()
-        except OSError:
-            return None
-        lines = raw.decode("utf-8", "replace").splitlines()
+    if not tail_raw:
+        lines = head_raw.decode("utf-8", "replace").splitlines()
     else:
-        try:
-            with open(path, "rb") as stream:
-                head_raw = stream.read(head_bytes)
-                stream.seek(st.st_size - tail_bytes)
-                tail_raw = stream.read(tail_bytes)
-        except OSError:
-            return None
         head_lines = head_raw.decode("utf-8", "replace").splitlines()
         if head_lines:
             head_lines = head_lines[:-1]  # the last line may be truncated at the head boundary
@@ -1892,7 +2070,11 @@ def _parse_codex_attempt_tail(path):
               "activity": activity if len(thread_ids) == 1 else None,
               "exec_tool": next(reversed(open_commands.values())) if open_commands else None}
     _CODEX_ATTEMPT_CACHE[path] = (cache_key, parsed)
-    parse_cache.save(disk_key, parsed, path, cache_key)
+    parse_cache.save(disk_key, parsed, path, cache_key,
+                     source_is_current=lambda: _attempt_file_view(
+                         path, _CLAUDE_SUPERVISOR_HEAD_BYTES, _CLAUDE_STREAM_TAIL_BYTES,
+                         read_whole_below=_CLAUDE_SUPERVISOR_HEAD_BYTES + _CLAUDE_STREAM_TAIL_BYTES)[3]
+                     == cache_key)
     if len(_CODEX_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _CODEX_ATTEMPT_CACHE.pop(next(iter(_CODEX_ATTEMPT_CACHE)))
     return parsed
@@ -2082,10 +2264,11 @@ def _parse_opencode_attempt_tail(path):
     ``exec`` would assert it is still running, so the field stays absent instead.
     """
     try:
-        st = os.stat(path)
+        st, head, raw, cache_key = _attempt_file_view(
+            path, _CLAUDE_SUPERVISOR_HEAD_BYTES, _CLAUDE_STREAM_TAIL_BYTES,
+            always_tail=True)
     except OSError:
         return None
-    cache_key = (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino)
     cached = _OPENCODE_ATTEMPT_CACHE.get(path)
     if cached and cached[0] == cache_key:
         return cached[1]
@@ -2097,14 +2280,7 @@ def _parse_opencode_attempt_tail(path):
         if len(_OPENCODE_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
             _OPENCODE_ATTEMPT_CACHE.pop(next(iter(_OPENCODE_ATTEMPT_CACHE)))
         return parsed
-    start = max(0, st.st_size - _CLAUDE_STREAM_TAIL_BYTES)
-    try:
-        with open(path, "rb") as stream:
-            head = stream.read(_CLAUDE_SUPERVISOR_HEAD_BYTES)
-            stream.seek(start)
-            raw = stream.read(_CLAUDE_STREAM_TAIL_BYTES)
-    except OSError:
-        return None
+    start = max(0, st.st_size - len(raw))
     lines = raw.decode("utf-8", "replace").splitlines()
     if start > 0 and lines:
         lines = lines[1:]                       # a seek mid-file truncates the first line
@@ -2161,7 +2337,11 @@ def _parse_opencode_attempt_tail(path):
         "announced_cwds": sorted(announced_cwds),
     }
     _OPENCODE_ATTEMPT_CACHE[path] = (cache_key, parsed)
-    parse_cache.save(disk_key, parsed, path, cache_key)
+    parse_cache.save(disk_key, parsed, path, cache_key,
+                     source_is_current=lambda: _attempt_file_view(
+                         path, _CLAUDE_SUPERVISOR_HEAD_BYTES, _CLAUDE_STREAM_TAIL_BYTES,
+                         always_tail=True)[3]
+                     == cache_key)
     if len(_OPENCODE_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _OPENCODE_ATTEMPT_CACHE.pop(next(iter(_OPENCODE_ATTEMPT_CACHE)))
     return parsed

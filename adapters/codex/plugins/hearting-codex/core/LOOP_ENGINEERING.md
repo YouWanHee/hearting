@@ -182,6 +182,15 @@ discards the prior result instead of turning it into authority. Mutable writer
 documents stay separate from historical read projections. Reusing parsed
 segments avoids reparsing unchanged rows, while append reads incur only suffix
 I/O and scoped digest validation counts the bytes it reads.
+Small mutable records also bind their generation to a bounded content digest;
+matching device, inode, size, and timestamps alone cannot validate changed
+bytes. Stable reads use a regular-file descriptor and compare the path and
+content generation around parsing. Large append logs keep their descriptor,
+cursor, and bounded-view rules. Codex transcript cwd lookup hashes the consumed
+prefix for small views; a cached larger prefix is re-read and hashed within one
+second of its ctime boundary, then reused by stable metadata outside that
+boundary. The initial scan and that conservative boundary can therefore read
+an arbitrarily long prefix, while ordinary unchanged refreshes do not.
 Reusing derived decisions additionally requires unchanged dependencies, while
 live recipients, leases, claims, processes, and
 state transitions remain fresh observations.

@@ -179,7 +179,10 @@ def _telemetry(record, home=None):
     path = _rollout_for_thread(record.get("threadId"), home=home)
     if not path:
         return None, None
-    line = codex._tail_token_count(path)     # bounded 64 KB tail, same as session enrichment
+    observed = codex._tail_token_count_observation(path)  # bounded 64 KB payload and generation
+    if not observed:
+        return None, None
+    line, sequence, observed_at, content_digest = observed
     if not line:
         return None, None
     tel = parse_codex_token_count(line, session_id=record.get("threadId"))
@@ -207,15 +210,14 @@ def _telemetry(record, home=None):
     }
     evidence = None
     if used is not None:
-        try:
-            st = os.stat(path)
-        except OSError:
+        current = codex._tail_token_count_observation(path)
+        if (not current or current[0] != line or current[1] != sequence
+                or current[3] != content_digest):
             return payload, None
-        sequence = (st.st_mtime_ns, st.st_size)
         evidence = ContextEvidence(
             used_pct=used, source="codex-rollout",
             sequence=sequence, source_head_sequence=sequence,
-            observed_at=st.st_mtime, fresh_until=st.st_mtime + 900)
+            observed_at=observed_at, fresh_until=observed_at + 900)
     return payload, evidence
 
 

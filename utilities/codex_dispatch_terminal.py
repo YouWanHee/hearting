@@ -1140,6 +1140,23 @@ def terminal_envelope_observed(path: str | Path | None) -> bool:
         lines = _tail_lines(Path(path))
     except (OSError, UnicodeDecodeError):
         return False
+    return terminal_envelope_observed_lines(lines)
+
+
+def terminal_envelope_observed_view(data: bytes, *, truncated: bool = False) -> bool:
+    """Apply the terminal parser to one already-read bounded tail view."""
+    lines = data.splitlines()
+    if truncated and lines:
+        lines = lines[1:]
+    try:
+        decoded = [line.decode("utf-8", "strict") for line in lines]
+    except UnicodeDecodeError:
+        return False
+    return terminal_envelope_observed_lines(decoded)
+
+
+def terminal_envelope_observed_lines(lines: list[str]) -> bool:
+    """Recognize a terminal envelope from the parser's exact tail lines."""
     for line in reversed(lines):
         try:
             value = json.loads(line)

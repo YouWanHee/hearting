@@ -15,6 +15,7 @@ from unittest import mock
 from tools.fleet.explorer.output import (CLEANED, RESET_NOTE, SUPERVISOR_ONLY, TAIL_RECORDS, OutputLine,
                                          OutputReader, SourcePlan, attempt_view, fit_row, line_row,
                                          render_output)
+from tools.fleet.explorer import output as output_module
 from tools.fleet.explorer.types import FocusKey, Health
 from tools.fleet.tests import explorer_fixture as ef
 
@@ -181,6 +182,33 @@ class Harnesses(TempCase):
 
 
 class SourceHealth(TempCase):
+    def test_small_generation_view_invalidates_on_same_tuple_content_change(self):
+        from types import SimpleNamespace
+        import stat
+        from utilities import runtime_observation as observation
+        path = self.dir / "transcript.jsonl"
+        path.write_text("first", encoding="utf-8")
+        info = path.stat()
+        frozen = SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_size=info.st_size,
+                                 st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns,
+                                 st_mode=stat.S_IFREG | 0o600)
+        entry = {"harness": "codex", "sid": "session-a",
+                 "transcript": {"path": str(path), "status": "available"}}
+        calls = []
+        def read(_harness, source, _sid, label, abbr):
+            calls.append(1)
+            return [OutputLine(f"[{label}] {abbr} » {Path(source).read_text()}")], ""
+        reader = self.reader()
+        with mock.patch.object(observation.Path, "stat", return_value=frozen), \
+             mock.patch.object(observation.os, "fstat", return_value=frozen), \
+             mock.patch.object(output_module, "_read_transcript", side_effect=read):
+            first = output_module.read_generation(reader, entry)
+            path.write_text("other", encoding="utf-8")
+            second = output_module.read_generation(reader, entry)
+        self.assertIn("first", first.rows[0].text)
+        self.assertIn("other", second.rows[0].text)
+        self.assertEqual(len(calls), 2)
+
     def test_a_cleaned_claude_owner_is_a_supervisor_only_record_not_an_error(self):
         log = self.dir / "owner.att-x.claude.jsonl"
         write_jsonl(log, ef.supervisor_rows("att-x", "sid-1", str(self.dir)))

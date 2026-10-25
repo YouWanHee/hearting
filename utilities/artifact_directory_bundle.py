@@ -306,7 +306,7 @@ def scan_tree(cycle_root: Path, directory: str) -> Tree:
             if _identity(post) != fingerprint:
                 raise DirectoryBundleError("output-changed-while-reading", rel)
             leaves.append(Leaf(rel_inner, digest, size, fingerprint))
-            listing.append((rel_inner, "file", fingerprint))
+            listing.append((rel_inner, "file", fingerprint, digest))
     except BaseException:
       raise
     finally:
@@ -359,7 +359,23 @@ def scan_inventory(cycle_root: Path, directory: str):
                     opened_dirs.append(child)
                     stack.append((child, rel))
                 elif stat.S_ISREG(st.st_mode):
-                    rows.append((rel, "file", _identity(st)))
+                    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                             | getattr(os, "O_NONBLOCK", 0))
+                    try:
+                        fd = os.open(entry.name, flags, dir_fd=current_fd)
+                    except OSError as exc:
+                        raise DirectoryBundleError("tree-open-failed", f"{directory}/{rel}", str(exc)) from exc
+                    try:
+                        opened = os.fstat(fd)
+                        if _identity(opened) != _identity(st):
+                            raise DirectoryBundleError("output-changed-while-reading", f"{directory}/{rel}")
+                        digest, size, fingerprint = _hash_fd(fd, f"{directory}/{rel}")
+                        after = os.stat(entry.name, dir_fd=current_fd, follow_symlinks=False)
+                        if (_identity(after) != fingerprint or size != after.st_size):
+                            raise DirectoryBundleError("output-changed-while-reading", f"{directory}/{rel}")
+                    finally:
+                        os.close(fd)
+                    rows.append((rel, "file", fingerprint, digest))
                 else:
                     raise DirectoryBundleError("tree-unsafe-entry", f"{directory}/{rel}")
         return tuple(sorted(rows, key=lambda x: x[0].encode("utf-8")))

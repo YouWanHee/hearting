@@ -87,12 +87,15 @@ def load(cache_key):
         return None
 
 
-def save(cache_key, value, source, stamp):
+def save(cache_key, value, source, stamp, *, source_is_current=None):
     """Publish only if the source stayed unchanged while being parsed."""
     temp = None
     try:
         st = os.stat(source)
-        if (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino) != stamp:
+        current_stat = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        expected_stat = (stamp[:5] if len(stamp) >= 5 else
+                         (stamp[2], stamp[3], stamp[1], stamp[0], st.st_ctime_ns))
+        if current_stat != expected_stat or (source_is_current and not source_is_current()):
             return
         directory = _directory()
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -102,6 +105,8 @@ def save(cache_key, value, source, stamp):
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump({"signature": signature, "value": value}, stream,
                       ensure_ascii=False, separators=(",", ":"))
+        if source_is_current and not source_is_current():
+            return
         os.replace(temp, directory / (locator + ".json"))
     except (OSError, TypeError, ValueError):
         pass

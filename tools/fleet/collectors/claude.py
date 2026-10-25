@@ -30,6 +30,16 @@ if os.path.normpath(_UTILITIES) not in map(os.path.normpath, sys.path):
     sys.path.insert(0, os.path.normpath(_UTILITIES))
 from claude_project_dir import encode_project_dir  # noqa: E402
 from claude_process_identity import tap_sids_by_pid  # noqa: E402
+from runtime_observation import SMALL_MUTABLE_FILE_BYTES, file_generation  # noqa: E402
+
+
+def _cache_stamp(path, info=None):
+    """Content-bind only small mutable files; keep large transcript scans metadata-only."""
+    info = info or os.stat(path)
+    if info.st_size <= SMALL_MUTABLE_FILE_BYTES:
+        return file_generation(path)
+    return (info.st_dev, info.st_ino, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns, None)
 
 
 def _home():
@@ -108,7 +118,7 @@ def _newest_transcript_mtime(home, cwd, sid):
 _TITLE_JUNK_RE = re.compile(r"^(new session\b|\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2})", re.IGNORECASE)
 
 
-_TITLE_CACHE = {}   # path -> (mtime, size, title) — avoid rescanning an unchanged transcript every tick
+_TITLE_CACHE = {}   # path -> (content-aware generation, title)
 
 
 def _tail_ai_title(path, chunk=8192, max_scan=None):
@@ -121,14 +131,19 @@ def _tail_ai_title(path, chunk=8192, max_scan=None):
     over the session's life (renamed/refined) — the last one wins. tolerant:
     malformed json lines are skipped, a missing/empty/placeholder ("New session …",
     bare ISO timestamp) title → None so the caller falls back to slug. Results are
-    memoized per (mtime, size) so unchanged files are not re-read on every tick."""
+    memoized per bounded source generation so small rewrites invalidate safely."""
     try:
         st = os.stat(path)
     except OSError:
         return None
+    try:
+        stamp = _cache_stamp(path, st)
+    except OSError:
+        _TITLE_CACHE.pop(path, None)
+        return None
     cached = _TITLE_CACHE.get(path)
-    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
-        return cached[2]
+    if cached and cached[0] == stamp:
+        return cached[1]
     sz = st.st_size
     limit = sz if max_scan is None else min(sz, max_scan)
     window = chunk
@@ -162,12 +177,16 @@ def _tail_ai_title(path, chunk=8192, max_scan=None):
         window = min(window * 8, limit)
     if title and _TITLE_JUNK_RE.match(title):
         title = None
-    _TITLE_CACHE[path] = (st.st_mtime, st.st_size, title)
+    try:
+        if _cache_stamp(path) != stamp:
+            return None
+    except OSError:
+        return None
+    _TITLE_CACHE[path] = (stamp, title)
     return title
 
 
-_SUBAGENT_CACHE = {}   # path -> (mtime, size, [SubAgent,...]) — separate from _TITLE_CACHE;
-                        # same (mtime, size) key pattern, independent invalidation.
+_SUBAGENT_CACHE = {}   # path -> (content-aware generation, [SubAgent,...])
 
 # Async Agent lifecycle markers (see _tail_subagents docstring). The ack text and the
 # notification tag are harness-emitted fixed phrases; ids are compared verbatim.
@@ -213,9 +232,14 @@ def _tail_subagents(path, chunk=8192, max_scan=None):
         st = os.stat(path)
     except OSError:
         return None
+    try:
+        stamp = _cache_stamp(path, st)
+    except OSError:
+        _SUBAGENT_CACHE.pop(path, None)
+        return None
     cached = _SUBAGENT_CACHE.get(path)
-    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
-        return cached[2]
+    if cached and cached[0] == stamp:
+        return cached[1]
     sz = st.st_size
     limit = sz if max_scan is None else min(sz, max_scan)
     window = chunk
@@ -302,11 +326,16 @@ def _tail_subagents(path, chunk=8192, max_scan=None):
         out.append(sa)
     _join_subagent_budget(path, calls)
     out.sort(key=lambda sa: sa.started_at or 0, reverse=True)
-    _SUBAGENT_CACHE[path] = (st.st_mtime, st.st_size, out)
+    try:
+        if _cache_stamp(path) != stamp:
+            return None
+    except OSError:
+        return None
+    _SUBAGENT_CACHE[path] = (stamp, out)
     return out
 
 
-_SUBAGENT_BUDGET_CACHE = {}   # subagent jsonl path -> (mtime, size, (model, effort, last_ts))
+_SUBAGENT_BUDGET_CACHE = {}   # subagent jsonl path -> (content-aware generation, projection)
 
 
 def _subagent_budget(jsonl_path, chunk=65536):
@@ -323,9 +352,14 @@ def _subagent_budget(jsonl_path, chunk=65536):
         st = os.stat(jsonl_path)
     except OSError:
         return (None, None, None)
+    try:
+        stamp = _cache_stamp(jsonl_path, st)
+    except OSError:
+        _SUBAGENT_BUDGET_CACHE.pop(jsonl_path, None)
+        return (None, None, None)
     cached = _SUBAGENT_BUDGET_CACHE.get(jsonl_path)
-    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
-        return cached[2]
+    if cached and cached[0] == stamp:
+        return cached[1]
     detail = (None, None, st.st_mtime)
     try:
         with open(jsonl_path, "rb") as f:
@@ -348,7 +382,12 @@ def _subagent_budget(jsonl_path, chunk=65536):
             detail = (msg.get("model"), eff if isinstance(eff, str) else None,
                       st.st_mtime)
             break
-    _SUBAGENT_BUDGET_CACHE[jsonl_path] = (st.st_mtime, st.st_size, detail)
+    try:
+        if _cache_stamp(jsonl_path) != stamp:
+            return (None, None, None)
+    except OSError:
+        return (None, None, None)
+    _SUBAGENT_BUDGET_CACHE[jsonl_path] = (stamp, detail)
     return detail
 
 
