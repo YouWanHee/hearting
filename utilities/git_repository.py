@@ -9,7 +9,7 @@ import subprocess
 
 def git_environment() -> dict[str, str]:
     env = {key: value for key, value in os.environ.items()
-           if not key.startswith("GIT_")}
+           if not key.startswith("GIT_") and key != "LANGUAGE"}
     env.update({"LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
     return env

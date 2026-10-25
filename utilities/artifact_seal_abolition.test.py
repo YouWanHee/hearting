@@ -60,6 +60,10 @@ def _load_sibling(name, filename):
     return module
 
 
+def _init_git_worktree(path):
+    subprocess.run(["git", "init", "-q", str(path)], check=True, capture_output=True)
+
+
 TERM = _load_sibling("terminal_fixtures_for_seal_abolition", "dispatch_terminal_commit.test.py")
 INLINE = _load_sibling("inline_fixtures_for_seal_abolition", "inline_finish.test.py")
 
@@ -224,7 +228,6 @@ class A1PolicyWritesParentsTest(SealAbolitionBase):
         excluded = {
             ".pytest_cache/v/cache/lastfailed": b"{}",
             "plans/cycle/.hidden.md": b"hidden file",
-            "plans/cycle/checkout/.git/config": b"[core]",
             "plans/cycle/__pycache__/mod.cpython-312.pyc": b"\x00pyc",
             "plans/cycle/stray.pyc": b"\x00pyc",
             "plans/cycle/draft.md.swp": b"swap",
@@ -235,6 +238,7 @@ class A1PolicyWritesParentsTest(SealAbolitionBase):
         }
         for rel, data in excluded.items():
             self.write_output(result, rel, data)
+        _init_git_worktree(Path(result["cycle_dir"]) / "artifacts/plans/cycle/checkout")
         link = artifacts / "plans" / "cycle" / "outside-link.md"
         os.symlink(outside, link)
         dir_link = artifacts / "plans" / "cycle" / "linked-dir"
@@ -1252,7 +1256,7 @@ class B1RefreshTest(B1RefreshBase):
                 P._write_cycle_record(self.root, record, exclusive=False)
 
                 checkout = manifest_path.parent / "artifacts/dev_logs/runtime/checkout"
-                (checkout / ".git").mkdir()
+                _init_git_worktree(checkout)
                 if publication == "bounded":
                     first = self.refresh(result)
                     self.assertEqual(first["status"], "emitted", first)
@@ -1615,7 +1619,7 @@ class B1RefreshTest(B1RefreshBase):
         })
         cycle = Path(result["cycle_dir"])
         runtime_root = cycle / "artifacts/dev_logs/runtime/checkout"
-        (runtime_root / ".git").mkdir(parents=True)
+        _init_git_worktree(runtime_root)
         payload = runtime_root / "source.py"
         old = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
         old_row = next(row for row in old["artifact_revisions"]

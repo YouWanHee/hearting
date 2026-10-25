@@ -7660,8 +7660,14 @@ class ComposeRouteTest(TestRoute):
    self.assertEqual(diagnosis["state"],"non-git",diagnosis)
    (cwd/".git").mkdir()
    diagnosis=R._compose_git_diagnosis(cwd)
+   self.assertEqual(diagnosis["state"],"non-git",diagnosis)
    decision=R._decide_non_git_compose({**diagnosis,"cwd":str(cwd)},None,0,False,None)
-   self.assertEqual(decision["kind"],"error")
+   self.assertEqual(decision["kind"],"worker-candidate")
+   (cwd/".git").rmdir()
+   (cwd/".git").write_text("gitdir: /definitely-missing-hearting-gitdir\n")
+   diagnosis=R._compose_git_diagnosis(cwd)
+   decision=R._decide_non_git_compose({**diagnosis,"cwd":str(cwd)},None,0,False,None)
+   self.assertEqual(decision["kind"],"error",diagnosis)
    self.assertIn(str(cwd),decision["detail"])
 
  def test_compose_git_diagnosis_rejects_ancestor_gitfile_with_missing_gitdir(self):
@@ -7687,6 +7693,7 @@ class ComposeRouteTest(TestRoute):
  def test_compose_git_probe_uses_c_locale_without_changing_parent_environment(self):
   with tempfile.TemporaryDirectory(prefix="compose-locale-diagnosis-") as tmp, \
        mock.patch.dict(os.environ,{"LC_ALL":"ko_KR.UTF-8","LANGUAGE":"ko"}):
+   (Path(tmp)/".git").write_text("gitdir: /definitely-missing-hearting-gitdir\n")
    before=(os.environ.get("LC_ALL"),os.environ.get("LANGUAGE"))
    with mock.patch.object(R.subprocess,"run",return_value=subprocess.CompletedProcess(
        ["git"],128,"","fatal: not a git repository (or any of the parent directories): .git\n")) as run:
