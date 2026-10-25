@@ -216,6 +216,84 @@ class LaunchFenceTest(unittest.TestCase):
                 parse_registry_metadata(row)["launch_started"], "1"
             )
 
+    def test_failed_registry_launch_persists_original_error_without_worker_log(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                jobs = base / "jobs.log"
+                attempt = f"att-failed-fence-{harness}"
+                log = base / "nested" / "logs" / f"worker.{attempt}.{harness}.jsonl"
+                marker = base / "payload-ran"
+                gate_read, gate_write = os.pipe()
+                failure_read, failure_write = os.pipe()
+                proc = subprocess.Popen([
+                    sys.executable, str(FENCE), "--parent-pid", str(os.getpid()),
+                    "--gate-fd", str(gate_read), "--failure-fd", str(failure_write),
+                    "--jobs", str(jobs), "--attempt-id", attempt, "--",
+                    sys.executable, "-c",
+                    f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                ], pass_fds=(gate_read, failure_write), start_new_session=True,
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                os.close(gate_read)
+                os.close(failure_write)
+                self.addCleanup(lambda proc=proc: proc.poll() is None and proc.kill())
+                try:
+                    identity = process_launch_identity(proc.pid)
+                    metadata = (
+                        "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+                        "execution_surface=registered-headless,registered_worker=1,"
+                        "fallback_hop=same-harness-headless,"
+                        f"attempt_id={attempt},harness={harness},log_file={log},"
+                        "launch_claimed=1,launch_fence=registry-v1,"
+                        "model_source=profile+diversity,model_source=profile+diversity,"
+                        + ",".join(f"{key}={value}" for key, value in identity.items()))
+                    before = f"2026-10-25T00:00:00Z\topen\t/repo\t/wt\tworker\t{metadata}\n"
+                    jobs.write_text(before)
+                    os.write(gate_write, b"1")
+                    os.close(gate_write)
+                    gate_write = -1
+                    stdout, stderr = proc.communicate(timeout=10)
+                    failure = json.loads(os.read(failure_read, 16384))
+                    self.assertEqual(proc.returncode, 70)
+                    self.assertEqual(stdout, "")
+                    self.assertEqual(stderr, "launch-fence: model_source\n")
+                    self.assertEqual(failure["detail"], "model_source")
+                    saved = log.with_suffix(".launch-fence.txt").read_text()
+                    self.assertIn("reason=attempt-immutable-metadata-duplicate", saved)
+                    self.assertIn("Traceback (most recent call last)", saved)
+                    self.assertIn("dispatch_contract.DispatchContractError: model_source", saved)
+                    self.assertLessEqual(len(saved.encode()), 65536 + 168)
+                    self.assertFalse(log.exists())
+                    self.assertFalse(marker.exists())
+                    self.assertEqual(jobs.read_text(), before)
+                finally:
+                    if gate_write >= 0:
+                        os.close(gate_write)
+                    os.close(failure_read)
+
+    def test_unwritable_diagnostics_do_not_change_fence_failure_channel(self):
+        import dispatch_launch_evidence as evidence
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td, "jobs.log")
+            log = Path(td, "logs", "worker.att-fail.codex.jsonl")
+            jobs.write_text(f"now\topen\t/repo\t/wt\tworker\t"
+                            f"attempt_id=att-fail,harness=codex,log_file={log}\n")
+            failure_read, failure_write = os.pipe()
+            try:
+                with mock.patch.object(L, "main", side_effect=ValueError("original failure")), \
+                     mock.patch.object(evidence, "_write", side_effect=PermissionError("read-only")), \
+                     mock.patch("sys.stderr"):
+                    result = L.cli(["--jobs", str(jobs), "--attempt-id", "att-fail",
+                                    "--failure-fd", str(failure_write)])
+                failure_write = -1
+                self.assertEqual(result, 70)
+                self.assertEqual(json.loads(os.read(failure_read, 16384))["detail"],
+                                 "original failure")
+            finally:
+                os.close(failure_read)
+                if failure_write >= 0:
+                    os.close(failure_write)
+
     def test_foreground_release_retains_selected_parent_death_signal(self):
         with mock.patch.object(L, "set_parent_death_signal") as pdeath, \
              mock.patch.object(L.os, "getppid", return_value=123), \

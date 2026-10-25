@@ -56,6 +56,7 @@ from replica_batch_contract import (  # noqa: E402
     effective_independence_axes,
     verify_manifest,
 )
+from dispatch_launch_evidence import OUTPUT_TAIL_BYTES, save_wrapper_evidence  # noqa: E402
 from dispatch_degradation import record_degradation  # noqa: E402
 from dispatch_allocation_receipt import record_allocation_receipt  # noqa: E402
 from dispatch_quality_peer import quality_peer_families  # noqa: E402
@@ -104,7 +105,6 @@ NODE_SPEC.loader.exec_module(DISPATCH_NODE)
 SUPPORTED_BATCH_HARNESSES = ("codex", "claude", "opencode")
 SAFE_SLUG = re.compile(r"[^A-Za-z0-9._-]+")
 RESERVATION_TOKEN = re.compile(r"[0-9a-f]{32}")
-OUTPUT_TAIL_BYTES = 65536
 DEFAULT_PROMPT = "Execute the selected immutable parallel leg and emit its completion evidence."
 
 # Closed degradation vocabulary. An unconstrained free-text reason reproduces
@@ -1888,9 +1888,11 @@ def bounded_process_output(proc: subprocess.Popen) -> tuple[str, str]:
 
 def collect_wrapper(
     item: tuple[dict[str, object], str, subprocess.Popen],
+    *, jobs: Path, log_dir: Path | None = None,
 ) -> tuple[dict[str, object], str, subprocess.Popen, str, str]:
     leg, token, proc = item
     stdout, stderr = bounded_process_output(proc)
+    save_wrapper_evidence(jobs, leg, proc.returncode, stdout, stderr, log_dir=log_dir)
     return leg, token, proc, stdout, stderr
 
 
@@ -3657,7 +3659,7 @@ def main(argv: list[str] | None = None) -> int:
         if processes:
             with ThreadPoolExecutor(max_workers=len(processes)) as executor:
                 futures = {
-                    executor.submit(collect_wrapper, item): item
+                    executor.submit(collect_wrapper, item, jobs=jobs, log_dir=args.log_dir): item
                     for item in processes
                 }
                 for future in as_completed(futures):
