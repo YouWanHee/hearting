@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import importlib.util
 import json
 import os
 import select
@@ -15,12 +16,21 @@ sys.path.insert(0, str(HERE))
 import shared_readiness as READINESS  # noqa: E402
 from dispatch_contract import process_start_ticks  # noqa: E402
 
+_ACCEPTANCE_SPEC = importlib.util.spec_from_file_location(
+    "shared_readiness_acceptance_reader",
+    HERE / "shared_readiness_acceptance.test.py")
+if _ACCEPTANCE_SPEC is None or _ACCEPTANCE_SPEC.loader is None:
+    raise RuntimeError("cannot load the shared-readiness acceptance reader")
+ACCEPTANCE = importlib.util.module_from_spec(_ACCEPTANCE_SPEC)
+_ACCEPTANCE_SPEC.loader.exec_module(ACCEPTANCE)
+
 
 class SharedReadinessTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        (self.root / "peer-steward" / "obligations").mkdir(parents=True)
         self.start = str(process_start_ticks(os.getpid()))
         self.identity = READINESS.attempt_identity(
             self.root / "jobs.log", "att-one", parent="parent", slug="worker",
@@ -165,6 +175,19 @@ class SharedReadinessTest(unittest.TestCase):
         self.assertEqual(readable, [wake_fd])
         self.assertEqual(os.read(wake_fd, 4096), b"\0")
 
+    def test_readiness_recovery_does_not_recreate_a_removed_state_root(self):
+        state_root = self.root / "removed-state"
+        obligations = state_root / "peer-steward" / "obligations"
+        (obligations / "readiness-v1").mkdir(parents=True)
+        state_root.rename(state_root.with_name("removed-state-held"))
+
+        with self.assertRaises(OSError):
+            READINESS.publish_runner_incarnation(obligations, os.getpid(), self.start,
+                                                 "old-runner")
+        with self.assertRaises(OSError):
+            READINESS.open_runner_wake(obligations)
+        self.assertFalse(state_root.exists())
+
     def test_unverifiable_producer_and_oversized_result_never_publish_ready(self):
         bad = self.projection(producer_start="1")
         self.assertFalse(READINESS.projection_is_current(bad, self.identity))
@@ -245,6 +268,133 @@ class SharedReadinessTest(unittest.TestCase):
         self.assertEqual(result["state"], "unknown")
         self.assertEqual(result["reason"], "shared-readiness-authority-unbounded")
         self.assertNotIn("authority", result)
+
+
+class SharedReadinessAcceptanceReaderTest(unittest.TestCase):
+    @staticmethod
+    def valid_six_watch_fixture():
+        watch_ids = [f"watch-{index}" for index in range(6)]
+        return {
+            "case": ACCEPTANCE.SIX_WATCH_LIFECYCLE_CASE,
+            "watch_count": 6,
+            "same_target_count": 5,
+            "distinct_stewards": 6,
+            "runner_process_count": 1,
+            "runner_session_snapshot_calls": 4,
+            "native_result_counts": {"idle": 5, "done": 1},
+            "observation_groups": [
+                {"pane": "w1:p1", "session_id": "sid-a", "native_state": "done",
+                 "watch_count": 1, "watch_ids": [watch_ids[0]]},
+                {"pane": "w1:p1", "session_id": "sid-a", "native_state": "idle",
+                 "watch_count": 4, "watch_ids": watch_ids[1:5]},
+                {"pane": "w1:p2", "session_id": "sid-b", "native_state": "idle",
+                 "watch_count": 1, "watch_ids": [watch_ids[5]]},
+            ],
+            "receipt_records": {watch_id: True for watch_id in watch_ids},
+            "notice_records": {watch_id: 1 for watch_id in watch_ids},
+            "ack_records": {watch_id: True for watch_id in watch_ids},
+            "receipt_count": 6,
+            "ack_count": 6,
+            "first_ack_isolation": True,
+            "remaining_independent_receipts": 6,
+            "notice_transfer_refs_present": {watch_id: True for watch_id in watch_ids},
+            "acknowledged_watch": watch_ids[0],
+            "target_state_before_after": ["working", "idle"],
+            "jobs_sha256_before_after": ["unchanged-jobs", "unchanged-jobs"],
+        }
+
+    @classmethod
+    def lifecycle_evidence(cls, fixtures):
+        return {
+            "tests_run": 34,
+            "suite_exit_code": 0,
+            "failures": [],
+            "errors": [],
+            "fixtures": fixtures,
+            "selected_regressions": [
+                "SharedReadinessRunnerTest.test_runner_reads_once_for_five_stewards_and_separates_another_pane"
+            ],
+        }
+
+    @staticmethod
+    def lifecycle_cleanup():
+        return {
+            "status": "pass",
+            "results": [{
+                "runner_pid": 123,
+                "runner_reaped": True,
+                "runner_lock_fd_closed": True,
+                "watchers": [{"reaped": True} for _ in range(6)],
+            }],
+        }
+
+    def test_selects_six_watch_case_after_unrelated_fixture_and_reports_it(self):
+        target = self.valid_six_watch_fixture()
+        unrelated = {"case": "stale-runner-snapshot-wakes-current-detached-observer",
+                     "receipt_count": 1}
+        lifecycle = self.lifecycle_evidence([unrelated, target])
+
+        self.assertEqual(ACCEPTANCE._lifecycle_errors(lifecycle), [])
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            baseline = root / "baseline"
+            baseline.mkdir()
+            report, _acceptance_path, handoff_path = ACCEPTANCE._assemble_report(
+                root / "evidence", baseline, {"exit_code": 0}, {"exit_code": 0},
+                {}, {"status": "pass"}, lifecycle, self.lifecycle_cleanup(),
+                {"status": "pass", "readings": {}, "fixture": {}})
+
+            selected = report["d3_independent_delivery"]["fixture"]
+            self.assertEqual(selected["case"], ACCEPTANCE.SIX_WATCH_LIFECYCLE_CASE)
+            self.assertEqual(report["d3_independent_delivery"]["validation_errors"], [])
+            self.assertEqual(report["d2_shared_observation"]["runner_session_snapshot_calls"], 4)
+            self.assertEqual(report["d2_shared_observation"]["observation_groups"],
+                             target["observation_groups"])
+            handoff = handoff_path.read_text(encoding="utf-8")
+            self.assertIn("Lifecycle target groups:", handoff)
+            self.assertIn("It recorded 6 watches across 6 stewards.", handoff)
+
+    def test_missing_or_duplicate_six_watch_identity_is_rejected(self):
+        target = self.valid_six_watch_fixture()
+        unrelated = {"case": "unrelated-lifecycle-case"}
+        with self.subTest("missing target"):
+            errors = ACCEPTANCE._lifecycle_errors(
+                self.lifecycle_evidence([unrelated]))
+            self.assertIn("six-watch lifecycle fixture is missing", errors)
+        with self.subTest("duplicate target"):
+            errors = ACCEPTANCE._lifecycle_errors(
+                self.lifecycle_evidence([target, dict(target)]))
+            self.assertIn("six-watch lifecycle fixture identity is duplicated or ambiguous",
+                          errors)
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            baseline = root / "baseline"
+            baseline.mkdir()
+            for name, fixtures in (("missing", [unrelated]),
+                                   ("duplicate", [target, dict(target)])):
+                with self.subTest("report remains incomplete", selection=name):
+                    report, _acceptance_path, _handoff_path = ACCEPTANCE._assemble_report(
+                        root / name, baseline, {"exit_code": 0}, {"exit_code": 0},
+                        {}, {"status": "pass"}, self.lifecycle_evidence(fixtures),
+                        self.lifecycle_cleanup(),
+                        {"status": "pass", "readings": {}, "fixture": {}})
+                    self.assertEqual(report["d3_independent_delivery"]["status"],
+                                     "incomplete")
+                    self.assertEqual(report["d3_independent_delivery"]["fixture"], {})
+
+    def test_selected_target_still_has_strict_six_watch_field_checks(self):
+        target = self.valid_six_watch_fixture()
+        target["watch_count"] = 5
+        target["runner_process_count"] = 2
+        target["receipt_records"]["watch-0"] = False
+        errors = ACCEPTANCE._lifecycle_errors(
+            self.lifecycle_evidence([{"case": "unrelated"}, target]))
+
+        self.assertIn("lifecycle fixture did not exercise five shared watches and one control",
+                      errors)
+        self.assertIn("lifecycle fixture did not observe exactly one shared runner", errors)
+        self.assertIn("six independent receipt files were not verified", errors)
 
 
 if __name__ == "__main__":

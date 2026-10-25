@@ -243,8 +243,11 @@ class OffScreenPeerTest(unittest.TestCase):
 
     def test_shape_is_identical_under_group_order_reversal(self):
         a, b = self._fixture()
-        forward = [t for t in self._rows([a, b]) if "←" in t and "sidB" in t]
-        reversed_ = [t for t in self._rows([b, a]) if "←" in t and "sidB" in t]
+        # Both renders must observe the same animation frame. Working-session
+        # spinners are clock-driven, and these calls can otherwise straddle a tick.
+        with mock.patch.object(render.time, "time", return_value=1_800_000_000.0):
+            forward = [t for t in self._rows([a, b]) if "←" in t and "sidB" in t]
+            reversed_ = [t for t in self._rows([b, a]) if "←" in t and "sidB" in t]
         self.assertEqual(forward, reversed_)
         self.assertEqual(len(forward), 1)
 
@@ -359,8 +362,8 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     change in these four goldens; absent connection rows remain absent.
     Exception on record: 2026-10-19 provider status without an account observation
     reads `provider availability unknown`. The approved 2026-10-20 OpenCode header
-    cleanup now limits the default row to Go quota bars or `Go usage unavailable`;
-    provider/credential diagnostics remain in JSON. At each captured width only the
+    cleanup now limits the default row to Go quota bars or `Go usage unavailable` with
+    one approved failure reason; provider matrices remain in JSON. At each captured width only the
     OpenCode usage row changes; all other bytes are kept."""
 
     def _render(self, width):

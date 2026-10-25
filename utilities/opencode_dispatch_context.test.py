@@ -23,6 +23,10 @@ CONTEXT = DISPATCH.opencode_context
 
 class OpenCodeDispatchContextTest(unittest.TestCase):
     def setUp(self):
+        launch_version = mock.patch.object(
+            DISPATCH.opencode_runtime, "probe_launch_version", return_value=(2, 0, 32))
+        self.launch_version = launch_version.start()
+        self.addCleanup(launch_version.stop)
         self.temp = tempfile.TemporaryDirectory(prefix="opencode-dispatch-context-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -170,11 +174,13 @@ class OpenCodeDispatchContextTest(unittest.TestCase):
     def test_v2_cap_is_applied_to_worker_home_and_dispatch_reaches_spawn(self):
         result, receipt, calls, spawn, worker_commands = self._invoke()
         self.assertEqual(result, 0, receipt)
+        self.launch_version.assert_called_once()
         self.assertIn("child_spawned=1", receipt)
         self.assertEqual([call[0][1:] for call in calls], [
             ["api", "--standalone", "GET", "/api/model"],
             ["api", "--standalone", "GET", "/api/model"],
         ])
+        self.assertEqual(calls[0][2]["OPENCODE_RUNTIME_VERSION"], "2.0.32")
         before_config = json.loads(calls[0][2]["OPENCODE_CONFIG_CONTENT"])
         final_config = json.loads(calls[1][2]["OPENCODE_CONFIG_CONTENT"])
         self.assertFalse(before_config["snapshot"])
@@ -186,6 +192,7 @@ class OpenCodeDispatchContextTest(unittest.TestCase):
         self.assertEqual(len(launch_calls), 1)
         child_env = launch_calls[0].kwargs["env"]
         self.assertEqual(child_env["OPENCODE_CONFIG_CONTENT"], calls[1][2]["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(child_env["OPENCODE_RUNTIME_VERSION"], "2.0.32")
         self.assertNotIn("OPENCODE_DB", child_env)
         self.assertNotIn("OPENCODE_AUTH", child_env)
         self.assertEqual(len(worker_commands), 1)

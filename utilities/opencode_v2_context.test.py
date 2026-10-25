@@ -62,12 +62,14 @@ class OpenCodeV2ContextTest(unittest.TestCase):
             "permissions": [{"action": "*", "resource": "*", "effect": "deny"}],
         }
         responses = [self.model_response(selected), self.model_response(applied)]
-        with mock.patch.object(context, "_installed_version", return_value="v2.0.32"), \
+        with mock.patch.object(context, "_installed_version",
+                               side_effect=AssertionError("launch version was re-probed")), \
                 mock.patch.object(context, "_api_json", side_effect=responses) as api:
             launch = context.prepare_launch_context(
                 model="fixture/friendly#quality", variant="quality",
                 context_window="800000", config_content=json.dumps(config),
-                cwd=str(self.cwd), environ={}, command="opencode-fixture",
+                cwd=str(self.cwd), environ={"OPENCODE_RUNTIME_VERSION": "2.0.32"},
+                command="opencode-fixture",
             )
 
         self.assertEqual([call.args[0] for call in api.call_args_list], [

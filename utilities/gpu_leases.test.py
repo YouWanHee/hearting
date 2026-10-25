@@ -23,18 +23,70 @@ OBS = {"reachable": True, "gpus": [
     {"index": 1, "uuid": "GPU-one", "free_mib": 23000, "utilization_gpu_pct": 0, "processes": []}]}
 
 
+class ComputePayloadReceiptTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def payload_namespace(self):
+        namespace = {}
+        exec(compile(G.serialized_payload_source(), "serialized-payload", "exec"), namespace)
+        namespace["identity"] = lambda _pid: {
+            "pid": 123, "starttime": "456", "process_group": 123,
+            "pid_namespace": "pid:[fixture]", "boot_id": "boot-fixture", "state": "S"}
+        namespace["bind"] = lambda *_args: None
+        namespace["release"] = mock.Mock()
+        return namespace
+
+    def test_payload_keeps_running_and_records_receipt_even_when_receipt_io_fails(self):
+        namespace = self.payload_namespace()
+        namespace["write_receipt"] = mock.Mock(side_effect=OSError("receipt storage unavailable"))
+        with mock.patch.object(namespace["subprocess"], "call", return_value=0):
+            result = namespace["payload"]("/unused/state.json", None, "true",
+                                           str(self.root / "run" / "launch-receipt.json"), "run-1")
+        self.assertEqual(result, 0)
+        namespace["release"].assert_called_once_with("/unused/state.json", None)
+        self.assertEqual(namespace["write_receipt"].call_count, 2)
+
+    def test_payload_receipt_records_exact_wrapper_identity_and_terminal_exit(self):
+        namespace = self.payload_namespace()
+        receipt_path = self.root / "run" / "launch-receipt.json"
+        receipt_path.parent.mkdir()
+        with mock.patch.object(namespace["subprocess"], "call", return_value=0):
+            self.assertEqual(namespace["payload"]("/unused/state.json", None, "true",
+                                                   str(receipt_path), "run-2"), 0)
+        receipt = json.loads(receipt_path.read_text())
+        self.assertEqual(receipt["run_id"], "run-2")
+        self.assertEqual(receipt["identity"]["process_group"], 123)
+        self.assertEqual(receipt["identity"]["boot_id"], "boot-fixture")
+        self.assertEqual((receipt["state"], receipt["exit_code"]), ("finished", 0))
+
+
 class LeasesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        # The outer verification environment pins CUDA_VISIBLE_DEVICES empty.
+        # This suite exercises admission with synthetic OBS and mocked observer
+        # boundaries, so remove that explicit CPU choice for its auto-select fixtures.
+        self._cuda_env = mock.patch.dict(os.environ)
+        self._cuda_env.start()
+        self.addCleanup(self._cuda_env.stop)
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         self.state = self.root / "dispatch" / "gpu-leases.json"
         self.no_tmux_bin = self.root / "no-tmux-bin"
         self.no_tmux_bin.mkdir()
         for name, target in (("python3", sys.executable), ("bash", "/bin/bash"),
                              ("id", "/usr/bin/id"), ("sh", "/bin/sh"),
-                             ("tr", "/usr/bin/tr")):
+                             ("tr", "/usr/bin/tr"), ("env", "/usr/bin/env")):
             (self.no_tmux_bin / name).symlink_to(target)
+        tmux = next((Path(directory) / "tmux" for directory in os.get_exec_path()
+                     if (Path(directory) / "tmux").is_file()
+                     and os.access(Path(directory) / "tmux", os.X_OK)), None)
+        if tmux is not None:
+            (self.no_tmux_bin / "tmux").symlink_to(tmux)
 
     def acquire(self, **kwargs):
         return G.acquire(self.state, OBS, **kwargs)
@@ -117,8 +169,8 @@ class LeasesTest(unittest.TestCase):
                 "owner": {"label": name}, "task": "CPU fixture", "run_id": "gpu-lease-test-" + name,
                 "run_dir": str(run_dir), "inner": inner}
 
-    def launch(self, options, env=None):
-        payload_source = G.serialized_payload_source()
+    def launch(self, options, env=None, payload_source=None):
+        payload_source = payload_source or G.serialized_payload_source()
         code = SOURCE + '\nprint(json.dumps(launch_compute(%r, %r)))' % (options, payload_source)
         launch_env = {**os.environ, "PATH": str(self.no_tmux_bin)}
         if env:
@@ -128,7 +180,7 @@ class LeasesTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
-    def test_tmux_launch_uses_private_server_and_exact_session_environment(self):
+    def test_tmux_launch_uses_private_server_and_exact_wrapper_environment(self):
         fakebin = self.root / "tmux-bin"
         fakebin.mkdir()
         records = self.root / "tmux-records"
@@ -151,24 +203,18 @@ class LeasesTest(unittest.TestCase):
             "'HEARTING_GPU_LEASE_RELEASE')}})\n"
             "else:\n"
             "    tail = args[args.index('new-session') + 1:]\n"
-            "    session_env = {}; cwd = '/'; command = None; index = 0\n"
+            "    cwd = '/'; command = None; index = 0\n"
             "    while index < len(tail):\n"
             "        item = tail[index]\n"
             "        if item in ('-d',): index += 1\n"
-            "        elif item in ('-s','-c','-e'):\n"
+            "        elif item in ('-s','-c'):\n"
             "            value = tail[index + 1]; index += 2\n"
             "            if item == '-s': run_id = value\n"
             "            elif item == '-c': cwd = value\n"
-            "            else:\n"
-            "                key, _, value = value.partition('='); session_env[key] = value\n"
             "        else: command = item; break\n"
             "    record({'event':'session', 'server':server, 'cwd':cwd, "
-            "'session_env':session_env, 'run_id':run_id})\n"
-            "    child = dict(os.environ)\n"
-            "    child.update({'AGENT_HOME':'/stale/server-release', "
-            "'AGENT_DISPATCH_ATTEMPT_ID':'att-stale-server', 'CODEX_THREAD_ID':'stale-thread'})\n"
-            "    child.update(session_env)\n"
-            "    raise SystemExit(subprocess.run(['bash','-lc',command], cwd=cwd, env=child).returncode)\n",
+            "'command':command, 'run_id':run_id})\n"
+            "    raise SystemExit(subprocess.run(['/bin/sh','-c',command], cwd=cwd).returncode)\n",
             encoding="utf-8",
         )
         fake.chmod(0o755)
@@ -188,6 +234,7 @@ class LeasesTest(unittest.TestCase):
             "HEARTING_COMPUTE_HOST": "fixture-host",
             "HEARTING_RESOURCE_RUN_ID": "",
             "HEARTING_GPU_LEASE_RELEASE": "",
+            "FIXTURE_QUOTING": "space 'quote' \"double\"\n$HOME `tick`",
         }
         server_env = {
             "PATH": str(fakebin) + os.pathsep + str(self.no_tmux_bin),
@@ -202,7 +249,14 @@ class LeasesTest(unittest.TestCase):
             "HEARTING_RESOURCE_RUN_ID": "stale-resource-run",
             "HEARTING_GPU_LEASE_RELEASE": "echo stale-lease",
         }
-        receipt = self.launch(options, env=server_env)
+        wrapper_env_path = self.root / "wrapper-env.json"
+        payload_source = (G.serialized_payload_source() +
+                          ("\nopen(%r, 'w').write(json.dumps({key: os.environ.get(key) "
+                           "for key in ('AGENT_HOME', 'AGENT_DISPATCH_ATTEMPT_ID', "
+                           "'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID', "
+                           "'HEARTING_RESOURCE_RUN_ID', 'FIXTURE_QUOTING')}))\n") %
+                          str(wrapper_env_path))
+        receipt = self.launch(options, env=server_env, payload_source=payload_source)
         self.assertEqual(output.read_text(),
                          "/fixture/pinned-release|att-current-launch|current-thread")
         transport = receipt["tmux_transport"]
@@ -214,7 +268,87 @@ class LeasesTest(unittest.TestCase):
         self.assertEqual(start["cwd"], "/")
         self.assertEqual(set(start["pins"].values()), {None})
         self.assertEqual(session["cwd"], str(self.root))
-        self.assertEqual(session["session_env"], options["tmux_environment"])
+        self.assertTrue(session["command"].startswith("exec env "))
+        self.assertEqual(shlex.split(session["command"])[0:2], ["exec", "env"])
+        wrapper_env = json.loads(wrapper_env_path.read_text())
+        self.assertEqual(wrapper_env["AGENT_HOME"], "/fixture/pinned-release")
+        self.assertEqual(wrapper_env["AGENT_DISPATCH_ATTEMPT_ID"], "att-current-launch")
+        self.assertEqual(wrapper_env["CODEX_THREAD_ID"], "current-thread")
+        self.assertEqual(wrapper_env["CLAUDE_CODE_SESSION_ID"], "")
+        self.assertEqual(wrapper_env["HEARTING_RESOURCE_RUN_ID"], "")
+        self.assertEqual(wrapper_env["FIXTURE_QUOTING"], options["tmux_environment"]["FIXTURE_QUOTING"])
+
+    def test_tmux_21_and_30a_fakes_run_both_launch_paths_without_legacy_options(self):
+        fakebin = self.root / "old-tmux-bin"
+        fakebin.mkdir()
+        fake = fakebin / "tmux"
+        fake.write_text(
+            "#!%s\nimport os,sys,subprocess\n"
+            "args=sys.argv[1:]\n"
+            "if '-e' in args:\n print('tmux: unknown option -- e', file=sys.stderr); sys.exit(1)\n"
+            "if args[-1] == 'start-server': sys.exit(0)\n"
+            "if 'new-session' not in args: sys.exit(2)\n"
+            "tail=args[args.index('new-session')+1:]\n"
+            "cwd='/'\n"
+            "while tail:\n"
+            " item=tail.pop(0)\n"
+            " if item == '-d': continue\n"
+            " if item == '-s': tail.pop(0); continue\n"
+            " if item == '-c': cwd=tail.pop(0); continue\n"
+            " command=item; break\n"
+            "open(os.environ['TMUX_TEST_CWD'], 'w').write(cwd)\n"
+            "sys.exit(subprocess.run(['/bin/sh','-c',command], cwd=cwd).returncode)\n" % sys.executable,
+            encoding="utf-8")
+        fake.chmod(0o755)
+        for version in ("2.1", "3.0a"):
+            for namespaced in (False, True):
+                with self.subTest(version=version, namespaced=namespaced):
+                    tag = version.replace(".", "") + ("-ns" if namespaced else "-plain")
+                    options = self.options(tag, requested="")
+                    probe = self.root / (tag + "-wrapper.json")
+                    output = self.root / (tag + "-payload.txt")
+                    options["inner"] = ("__HEARTING_GPU_SETUP__ && printf '%s|%s' "
+                                        "\"$AGENT_HOME\" \"$HEARTING_RESOURCE_RUN_ID\" > "
+                                        + shlex.quote(str(output)))
+                    options["tmux_environment"] = {
+                        "AGENT_HOME": "/current/release", "AGENT_DISPATCH_ATTEMPT_ID": "att-current",
+                        "HEARTING_COMPUTE_RUN_ID": options["run_id"],
+                        "HEARTING_COMPUTE_HOST": "old-tmux", "HEARTING_RESOURCE_RUN_ID": "",
+                        "HEARTING_GPU_LEASE_RELEASE": "", "CODEX_THREAD_ID": "thread-current",
+                        "CLAUDE_CODE_SESSION_ID": "", "EMPTY_VALUE": "",
+                    }
+                    payload_source = (G.serialized_payload_source() +
+                                      ("\nopen(%r, 'w').write(json.dumps({k: os.environ.get(k) "
+                                       "for k in ('AGENT_HOME','AGENT_DISPATCH_ATTEMPT_ID', "
+                                       "'HEARTING_RESOURCE_RUN_ID','CLAUDE_CODE_SESSION_ID')}))\n") %
+                                      str(probe))
+                    launch_env = {"PATH": str(fakebin) + os.pathsep + os.environ.get("PATH", ""),
+                                  "AGENT_HOME": "stale", "AGENT_DISPATCH_ATTEMPT_ID": "stale",
+                                  "HEARTING_RESOURCE_RUN_ID": "stale", "TMUX": "stale",
+                                  "TMUX_TEST_CWD": str(self.root / (tag + "-cwd"))}
+                    if namespaced:
+                        options.update({"path_namespace": {"/target": "/source"},
+                                        "run_root": "/target/runs", "cwd": None})
+                        namespace_source = ("class _NamespaceRefusal(Exception): pass\n"
+                                            "def _ns_safe_run_fd(*args): return None\n"
+                                            "def _ns_enter(*args): return None, None\n")
+                        with mock.patch.object(G, "_ns_namespace_creation"), \
+                             mock.patch.object(G, "_PATH_NAMESPACE_SOURCE", namespace_source), \
+                             mock.patch.dict(os.environ, launch_env, clear=True):
+                            receipt = G.launch_compute_namespaced(options, payload_source)
+                    else:
+                        options["cwd"] = str(self.root)
+                        with mock.patch.dict(os.environ, launch_env, clear=True):
+                            receipt = G.launch_compute(options, payload_source)
+                    self.assertEqual(receipt["tmux_transport"]["kind"], "hearting-tmux-v1")
+                    expected_cwd = "/" if namespaced else str(self.root)
+                    self.assertEqual(Path(launch_env["TMUX_TEST_CWD"]).read_text(), expected_cwd)
+                    self.assertEqual(output.read_text(), "/current/release|")
+                    wrapper_env = json.loads(probe.read_text())
+                    self.assertEqual(wrapper_env["AGENT_HOME"], "/current/release")
+                    self.assertEqual(wrapper_env["AGENT_DISPATCH_ATTEMPT_ID"], "att-current")
+                    self.assertEqual(wrapper_env["HEARTING_RESOURCE_RUN_ID"], "")
+                    self.assertEqual(wrapper_env["CLAUDE_CODE_SESSION_ID"], "")
 
     def test_tmux_launch_failure_releases_lease_for_a_retry(self):
         fakebin = self.root / "failing-tmux-bin"
@@ -240,6 +374,63 @@ class LeasesTest(unittest.TestCase):
         retry = G.acquire(self.state, OBS, requested="0", run_id="tmux-retry")
         self.assertEqual(retry["gpus"], ["0"])
         G.release(self.state, retry)
+
+    def test_tmux_environment_command_round_trips_shell_sensitive_values(self):
+        values = {"EMPTY_PIN": "", "SPACE_PIN": "space value",
+                  "QUOTE_PIN": "single' double\" newline\n $HOME `tick`"}
+        environment = G._validated_tmux_launch_environment(values)
+        command = G._tmux_launch_command(
+            environment,
+            "python3 -c " + shlex.quote(
+                "import json,os; print(json.dumps({k:os.environ.get(k) for k in "
+                "('EMPTY_PIN','SPACE_PIN','QUOTE_PIN')}))"))
+        self.assertTrue(command.startswith("exec env "))
+        tokens = shlex.split(command)
+        executable_index = tokens.index("python3")
+        assignment_keys = [token.split("=", 1)[0] for token in tokens[2:executable_index]]
+        self.assertEqual(assignment_keys, sorted(environment))
+        result = subprocess.run(["/bin/sh", "-c", command], capture_output=True,
+                                text=True, check=True)
+        self.assertEqual(json.loads(result.stdout), values)
+        with self.assertRaises(G.GPUUnavailable):
+            G._validated_tmux_launch_environment({"BAD=KEY": "value"})
+        with self.assertRaises(G.GPUUnavailable):
+            G._validated_tmux_launch_environment({"BAD_VALUE": 1})
+        with self.assertRaises(G.GPUUnavailable):
+            G._validated_tmux_launch_environment({"BAD_VALUE": "nul\0value"})
+
+    def test_tmux_client_failure_has_bounded_structured_output_without_argv(self):
+        fake = self.root / "tmux-diagnostic"
+        fake.write_text("#!%s\nimport sys\nsys.stdout.write('o' * 5000)\n"
+                        "sys.stderr.write('stderr-marker\\n')\nsys.exit(7)\n" % sys.executable,
+                        encoding="utf-8")
+        fake.chmod(0o755)
+        for operation in ("start-server", "new-session"):
+            with self.subTest(operation=operation), self.assertRaises(G.GPUUnavailable) as caught:
+                G._run_tmux_launch(operation, [str(fake), "private-payload-secret"], {})
+            detail = json.loads(str(caught.exception))
+            self.assertEqual(detail["operation"], operation)
+            self.assertEqual(detail["exit_code"], 7)
+            self.assertIn("[truncated]", detail["stdout"])
+            self.assertIn("stderr-marker", detail["stderr"])
+            self.assertNotIn("private-payload-secret", str(caught.exception))
+
+    def test_tmux_client_does_not_wait_for_daemon_inherited_capture_fds(self):
+        finished = self.root / "daemon-finished"
+        fake = self.root / "tmux-daemon-child"
+        fake.write_text(
+            "#!%s\nimport os,time\npid=os.fork()\n"
+            "if pid == 0:\n time.sleep(0.5); open(%r,'w').write('done'); os._exit(0)\n"
+            "os._exit(0)\n" % (sys.executable, str(finished)), encoding="utf-8")
+        fake.chmod(0o755)
+        started = time.monotonic()
+        G._run_tmux_launch("new-session", [str(fake)], {})
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.4)
+        deadline = time.monotonic() + 2
+        while not finished.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(finished.exists())
 
     def test_two_concurrent_sessions_choose_distinct_gpus_and_release_on_exit(self):
         options = [self.options("one"), self.options("two")]
@@ -553,6 +744,13 @@ class LeasesTest(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("_gpu_end_to_end_compute", Path(G.__file__).with_name("compute-hosts.py"))
         tool = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(tool)
+        tmux = self.no_tmux_bin / "tmux"
+        if not tmux.is_file():
+            tmux = None
+        if tmux is not None:
+            launch_server = G.tmux_server_name(self.state)
+            self.addCleanup(subprocess.run, [str(tmux), "-L", launch_server, "kill-server"],
+                            capture_output=True, timeout=5)
         finish = self.root / "finish"
         code = ("import os,time; from pathlib import Path; print(os.environ['CUDA_VISIBLE_DEVICES'],flush=True); "
                 "end=time.monotonic()+10; p=Path(%r); "
@@ -561,7 +759,8 @@ class LeasesTest(unittest.TestCase):
                                cwd=None, env=None, gpus=None, share=False, dry_run=False, json=True)
         real_run = subprocess.run
         def local_remote(_host, script, **kwargs):
-            return real_run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+            return real_run(["bash", "-c", script], capture_output=True, text=True, timeout=10,
+                            env={**os.environ, "PATH": str(self.no_tmux_bin)})
         output, warning = io.StringIO(), io.StringIO()
         with mock.patch.object(tool, "load_config", return_value={"run_root": self.root / "managed-runs",
                          "hosts": {"fixture": {"ssh_host": "local"}}}), \
@@ -715,10 +914,10 @@ class PathNamespaceSerializationTest(unittest.TestCase):
             ])
             for mode in ("success", "refusal", "error"):
                 captured = {}
-                def check_call(argv, **_kwargs):
+                def run_tmux(_operation, argv, _environment):
                     if "new-session" in argv:
                         captured["argv"] = argv
-                        captured["runner"] = Path(shlex.split(argv[-1])[1])
+                        captured["runner"] = Path(shlex.split(argv[-1])[-1])
                 bound = mock.MagicMock()
                 bound.__enter__.return_value = {"leases": {}}
                 with mock.patch.object(G, "acquire", return_value=lease), \
@@ -726,7 +925,7 @@ class PathNamespaceSerializationTest(unittest.TestCase):
                      mock.patch.object(G, "_ns_namespace_creation"), \
                      mock.patch.object(G, "_PATH_NAMESPACE_SOURCE", ""), \
                      mock.patch.object(G.subprocess, "call", return_value=0), \
-                     mock.patch.object(G.subprocess, "check_call", side_effect=check_call), \
+                     mock.patch.object(G, "_run_tmux_launch", side_effect=run_tmux), \
                      mock.patch.object(G, "locked", return_value=bound), \
                      mock.patch.object(G.time, "monotonic", side_effect=[0, 0]):
                     G.launch_compute_namespaced(options, payload_source)
@@ -750,7 +949,9 @@ class PathNamespaceSerializationTest(unittest.TestCase):
                                                   "/target/runs/fixture-run")), events)
                     self.assertIn(("enter", ({"/target": "/lab"}, "/target/runs", "/work",
                                                "/target/runs/fixture-run")), events)
-                    self.assertIn(("payload", (str(state_path), lease, "echo inner")), events)
+                    self.assertIn(("payload", (str(state_path), lease, "echo inner",
+                                                 "/target/runs/fixture-run/launch-receipt.json",
+                                                 "fixture-run")), events)
                 else:
                     self.assertEqual(result.exception.code, 125)
                     self.assertEqual([event for event in events if event[0] == "payload"], [])
@@ -771,21 +972,22 @@ class PathNamespaceSerializationTest(unittest.TestCase):
                        "path_namespace": {"/mnt/lab": "/volume/lab"},
                        "run_root": "/mnt/lab/runs"}
             captured = {}
-            def check_call(argv, **_kwargs):
+            def run_tmux(_operation, argv, _environment):
                 if "new-session" in argv:
                     captured["argv"] = argv
+                    captured["runner"] = Path(shlex.split(argv[-1])[-1])
                     raise OSError("tmux launch failed")
             with mock.patch.object(G, "acquire", return_value=None), \
                  mock.patch.object(G, "_ns_namespace_creation"), \
                  mock.patch.object(G, "_PATH_NAMESPACE_SOURCE", "x" * 200000), \
                  mock.patch.object(G.subprocess, "call", return_value=0), \
-                 mock.patch.object(G.subprocess, "check_call", side_effect=check_call):
+                 mock.patch.object(G, "_run_tmux_launch", side_effect=run_tmux):
                 with self.assertRaisesRegex(OSError, "tmux launch failed"):
                     G.launch_compute_namespaced(options, "payload" * 10000)
             argv_text = "\0".join(captured["argv"])
             self.assertLess(len(argv_text), 2048)
             self.assertNotIn("x" * 100, argv_text)
-            runner_path = Path(shlex.split(captured["argv"][-1])[1])
+            runner_path = captured["runner"]
             self.assertFalse(runner_path.exists())
             self.assertFalse((root / "volume").exists())
 
@@ -797,7 +999,7 @@ class PathNamespaceSerializationTest(unittest.TestCase):
             with mock.patch.object(G, "acquire", return_value=None), \
                  mock.patch.object(G, "_ns_namespace_creation"), \
                  mock.patch.object(G.subprocess, "call", return_value=0), \
-                 mock.patch.object(G.subprocess, "check_call") as start:
+                 mock.patch.object(G, "_run_tmux_launch") as start:
                 with self.assertRaisesRegex(G.GPUUnavailable, "inside a path_namespace target"):
                     G.launch_compute_namespaced(inside, "payload")
             start.assert_not_called()
@@ -810,7 +1012,7 @@ class PathNamespaceSerializationTest(unittest.TestCase):
             with mock.patch.object(G, "acquire", return_value=None), \
                  mock.patch.object(G, "_ns_namespace_creation"), \
                  mock.patch.object(G.subprocess, "call", return_value=0), \
-                 mock.patch.object(G.subprocess, "check_call"):
+                 mock.patch.object(G, "_run_tmux_launch"):
                 with self.assertRaises(FileExistsError):
                     G.launch_compute_namespaced(options, "payload")
             self.assertEqual(collision.read_text(), "owned by another launch\n")

@@ -66,6 +66,89 @@ class F51UsageCacheTest(unittest.TestCase):
             "opencode", "opencode-go", "*", "account:two", now=1500)["state"], "unknown")
         self.assertEqual(usage_cache.provider_records("opencode")[0]["state"], "unavailable")
 
+    def test_error_marker_survives_without_refreshing_quota_age(self):
+        usage_cache._write("opencode", {"error": "missing-credential",
+                                         "reason": "credential-not-found"},
+                           0.0, 1000.0)
+        snapshot = usage_cache.read("opencode", now=1001.0)
+        self.assertIsNone(snapshot["payload"])
+        self.assertEqual(snapshot["freshness"], "unknown")
+        self.assertEqual(snapshot["error_observation"]["error"], "missing-credential")
+        expired = usage_cache.read("opencode", now=1000.0 + usage_cache.STALE_MAX + 1)
+        self.assertIsNone(expired["error_observation"])
+
+    def test_diagnostics_validate_schema_and_independent_bounded_time(self):
+        path = os.path.join(self.tmp.name, "opencode.json")
+        for observed_at in (True, float("inf"), float("nan"), 1001.0):
+            item = {"schema_version": 1, "harness": "opencode", "fetched_at": 0.0,
+                    "attempted_at": 1000.0, "payload": {},
+                    "error_observation": {"error": "missing-credential",
+                                           "reason": "credential-not-found",
+                                           "observed_at": observed_at}}
+            with open(path, "w") as fh:
+                json.dump(item, fh)
+            self.assertIsNone(usage_cache.read("opencode", now=1000.0)["error_observation"])
+        item["schema_version"] = 2
+        item["error_observation"]["observed_at"] = 999.0
+        with open(path, "w") as fh:
+            json.dump(item, fh)
+        self.assertIsNone(usage_cache.read("opencode", now=1000.0)["error_observation"])
+
+        self._write_cache("opencode", 1000.0, {"rl_5h": 7},
+                          error_observation={"error": "auth", "reason": "credential-expired",
+                                             "observed_at": 900.0})
+        snap = usage_cache.read("opencode", now=1100.0, stale_max=3600)
+        self.assertEqual(snap["payload"]["rl_5h"], 7)
+        self.assertEqual(snap["error_observation"]["observed_at"], 900.0)
+        self.assertIsNone(usage_cache.read("opencode", now=1100.0,
+                                           stale_max=100)["error_observation"])
+
+    def test_legacy_error_marker_keeps_original_time_through_none_and_attempt(self):
+        usage_cache._write("opencode", {"error": "missing-credential",
+                                         "reason": "credential-not-found"},
+                           0.0, 1000.0)
+        self.assertEqual(usage_cache.read("opencode", now=1010)["error_observation"]["observed_at"],
+                         1000.0)
+        usage_cache.FETCHERS["opencode"] = lambda: None
+        with mock.patch.object(usage_cache.time, "time", return_value=1100.0):
+            usage_cache._worker("opencode")
+        self.assertEqual(usage_cache.read("opencode", now=1100)["error_observation"]["observed_at"],
+                         1000.0)
+        usage_cache.record_attempt("opencode", now=1200.0)
+        self.assertEqual(usage_cache.read("opencode", now=1200)["error_observation"]["observed_at"],
+                         1000.0)
+        self.assertIsNone(usage_cache.read(
+            "opencode", now=1000.0 + usage_cache.STALE_MAX + 1)["error_observation"])
+
+    def test_rejection_does_not_merge_other_account_quota_or_store_raw_detail(self):
+        usage_cache._write("opencode", {"rl_5h": 23, "account_scope": "scope:A"},
+                           1000.0, 1000.0)
+        usage_cache.FETCHERS["opencode"] = lambda: {
+            "error": "auth", "reason": "credential-expired", "detail": "raw-secret",
+            "account_scope": "scope:B"}
+        with mock.patch.object(usage_cache.time, "time", return_value=1100.0):
+            usage_cache._worker("opencode")
+        path = os.path.join(self.tmp.name, "opencode.json")
+        with open(path, encoding="utf-8") as fh:
+            persisted = json.load(fh)
+        self.assertNotIn("rl_5h", persisted["payload"])
+        self.assertEqual(persisted["payload"]["account_scope"], "scope:B")
+        raw = json.dumps(persisted)
+        self.assertNotIn("raw-secret", raw)
+
+        usage_cache._write("opencode", {"rl_5h": 8, "account_scope": "scope:B"},
+                           1200.0, 1200.0)
+        usage_cache.FETCHERS["opencode"] = lambda: {
+            "error": "auth", "reason": "credential-expired", "detail": "raw-secret",
+            "account_scope": "scope:B"}
+        with mock.patch.object(usage_cache.time, "time", return_value=1300.0):
+            usage_cache._worker("opencode")
+        with open(path, encoding="utf-8") as fh:
+            same_account = json.load(fh)
+        self.assertEqual(same_account["payload"]["rl_5h"], 8)
+        self.assertEqual(same_account["fetched_at"], 1200.0)
+        self.assertNotIn("raw-secret", json.dumps(same_account))
+
     def test_new_same_account_success_clears_only_the_matching_scope(self):
         usage_cache.record_provider("opencode", "opencode-go", "*", "account:one",
                                     "unavailable", reason="credential-expired", now=1000)
@@ -299,6 +382,95 @@ class F51UsageCacheTest(unittest.TestCase):
             collectors.collect_all.last_usage_snapshots["claude"]["payload"],
         )
         self.assertIn("opencode", collectors.collect_all.last_usage_snapshots)
+
+    def test_collect_all_confirms_only_current_local_missing_credential(self):
+        from fleet import collectors
+        from fleet.collectors import procscan
+        import importlib
+        from types import SimpleNamespace
+        utilities = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                                                 "utilities"))
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        runtime = importlib.import_module("opencode_runtime")
+        jobs_path = os.path.join(self.tmp.name, "jobs.log")
+        open(jobs_path, "w").close()
+        unavailable = SimpleNamespace(state="unavailable", reason="credential-not-found",
+                                      provider_scope=None, opencode_scope=None,
+                                      entitlement_scope=None)
+        snapshot = {"payload": None, "freshness": "unknown", "observed_at": None,
+                    "error_observation": None}
+        with mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "2.0.32"}), \
+             mock.patch.object(procscan, "scan", return_value=[]), \
+             mock.patch("fleet.collectors.dispatch.collect", return_value=[]), \
+             mock.patch.object(usage_cache, "account_usage", return_value=snapshot), \
+             mock.patch.object(runtime, "is_v2", return_value=True), \
+             mock.patch.object(runtime, "selected_go_usage_observation", return_value=unavailable), \
+             mock.patch.object(runtime, "account_scope_observation",
+                               return_value=SimpleNamespace(scope=None)):
+            sessions, _jobs = collectors.collect_all(harness_filter={"opencode"},
+                                                      jobs_path=jobs_path)
+        self.assertEqual(sessions, [])
+        observed = collectors.collect_all.last_usage_snapshots["opencode"]["error_observation"]
+        self.assertEqual((observed["error"], observed["reason"]),
+                         ("missing-credential", "credential-not-found"))
+        self.assertNotIn("credential-not-found", json.dumps(snapshot.get("payload")))
+
+    def test_restored_go_credentials_discard_old_unscoped_denial(self):
+        from fleet import collectors
+        from fleet.collectors import procscan
+        import importlib
+        from types import SimpleNamespace
+        utilities = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                                                 "utilities"))
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        runtime = importlib.import_module("opencode_runtime")
+        jobs_path = os.path.join(self.tmp.name, "jobs.log")
+        open(jobs_path, "w").close()
+        selected = SimpleNamespace(state="usable", reason=None, provider_scope="scope:A",
+                                   opencode_scope="scope:A", entitlement_scope="scope:A")
+        snapshot = {"payload": None, "freshness": "unknown", "observed_at": None,
+                    "error_observation": {"error": "missing-credential",
+                                          "reason": "credential-not-found",
+                                          "observed_at": time.time()}}
+        with mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "2.0.32"}), \
+             mock.patch.object(procscan, "scan", return_value=[]), \
+             mock.patch("fleet.collectors.dispatch.collect", return_value=[]), \
+             mock.patch.object(usage_cache, "account_usage", return_value=snapshot), \
+             mock.patch.object(runtime, "is_v2", return_value=True), \
+             mock.patch.object(runtime, "selected_go_usage_observation", return_value=selected), \
+             mock.patch.object(runtime, "account_scope_observation",
+                               return_value=SimpleNamespace(scope="scope:A")):
+            collectors.collect_all(harness_filter={"opencode"}, jobs_path=jobs_path)
+        self.assertIsNone(collectors.collect_all.last_usage_snapshots["opencode"]
+                          ["error_observation"])
+
+    def test_no_installation_evidence_does_not_fabricate_local_error_row(self):
+        from fleet import collectors
+        from fleet.collectors import procscan
+        import importlib
+        from types import SimpleNamespace
+        utilities = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                                                 "utilities"))
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        runtime = importlib.import_module("opencode_runtime")
+        jobs_path = os.path.join(self.tmp.name, "jobs-no-install.log")
+        open(jobs_path, "w").close()
+        snapshot = {"payload": None, "freshness": "unknown", "observed_at": None,
+                    "error_observation": None}
+        with mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": ""}), \
+             mock.patch.object(procscan, "scan", return_value=[]), \
+             mock.patch("fleet.collectors.dispatch.collect", return_value=[]), \
+             mock.patch.object(usage_cache, "account_usage", return_value=snapshot), \
+             mock.patch.object(runtime, "is_v2", return_value=False), \
+             mock.patch.object(runtime, "selected_go_usage_observation",
+                               return_value=SimpleNamespace(state="unavailable",
+                                                            reason="credential-not-found")):
+            collectors.collect_all(harness_filter={"opencode"}, jobs_path=jobs_path)
+        self.assertIsNone(collectors.collect_all.last_usage_snapshots["opencode"]
+                          ["error_observation"])
 
     def test_collect_all_replaces_stale_codex_window_label_from_account_cache(self):
         from fleet import collectors

@@ -1,5 +1,6 @@
 """Fleet-owned, non-blocking last-good usage cache and per-harness lease."""
 import json
+import math
 import os
 import tempfile
 import threading
@@ -10,6 +11,10 @@ FRESH_WINDOWS = {"claude": 180.0, "codex": 60.0, "opencode": 180.0}
 STALE_MAX = 900.0
 RETRY_AFTER = 60.0
 LEASE_MAX = 60.0
+_ERRORS = {"auth", "subscription-missing", "missing-credential", "unknown"}
+_REASONS = {"credential-not-found", "credential-expired", "authentication-rejected",
+            "subscription-missing", "credential-store-unavailable",
+            "credential-store-read-failed", "credential-invalid"}
 
 FETCHERS = {}
 _LOCK = threading.RLock()
@@ -52,7 +57,39 @@ def _fetcher(harness):
 
 def _unknown(attempted_at=None):
     return {"payload": None, "freshness": "unknown", "observed_at": None,
-            "attempted_at": attempted_at}
+            "attempted_at": attempted_at, "error_observation": None}
+
+
+def _valid_time(value, now):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value <= now)
+
+
+def _error_observation(item, now, stale_max):
+    observation = item.get("error_observation") if isinstance(item, dict) else None
+    if isinstance(observation, dict):
+        observed_at = observation.get("observed_at")
+        error = observation.get("error")
+        reason = observation.get("reason")
+        account_scope = observation.get("account_scope")
+    else:
+        # Schema-1 caches written before error_observation used attempted_at for
+        # error-only payloads. Reuse that original attempt time; never renew it.
+        payload = item.get("payload") if isinstance(item, dict) else None
+        if not isinstance(payload, dict) or not payload.get("error"):
+            return None
+        observed_at = item.get("attempted_at")
+        error = payload.get("error")
+        reason = payload.get("reason")
+        account_scope = payload.get("account_scope")
+    if (not _valid_time(observed_at, now) or now - observed_at > stale_max):
+        return None
+    if not isinstance(error, str) or error not in _ERRORS:
+        return None
+    return {"error": error, "reason": reason if isinstance(reason, str)
+            and reason in _REASONS else None,
+            "observed_at": observed_at,
+            "account_scope": account_scope}
 
 
 def read(harness, now=None, stale_max=None):
@@ -68,21 +105,26 @@ def read(harness, now=None, stale_max=None):
         return _unknown()
     if not isinstance(item, dict) or item.get("schema_version") != SCHEMA_VERSION \
             or item.get("harness") != harness or not isinstance(item.get("payload"), dict):
-        return _unknown(item.get("attempted_at") if isinstance(item, dict) else None)
+        return _unknown()
+    error_observation = _error_observation(item, now, stale_max)
     fetched = item.get("fetched_at")
     attempted = item.get("attempted_at")
-    if not isinstance(fetched, (int, float)) or not isinstance(attempted, (int, float)) \
-            or fetched > now or attempted > now:
-        return _unknown(attempted)
+    if not _valid_time(fetched, now) or not _valid_time(attempted, now):
+        unknown = _unknown(attempted)
+        unknown["error_observation"] = error_observation
+        return unknown
     age = now - float(fetched)
     if age < 0 or age > stale_max:
-        return _unknown(attempted)
+        unknown = _unknown(attempted)
+        unknown["error_observation"] = error_observation
+        return unknown
     freshness = "fresh" if age <= FRESH_WINDOWS.get(harness, 180.0) else "stale"
     return {"payload": item["payload"], "freshness": freshness,
-            "observed_at": fetched, "attempted_at": attempted}
+            "observed_at": fetched, "attempted_at": attempted,
+            "error_observation": error_observation}
 
 
-def _write(harness, payload, fetched_at, attempted_at):
+def _write(harness, payload, fetched_at, attempted_at, error_observation=None):
     directory = state_dir()
     os.makedirs(directory, exist_ok=True)
     providers = {}
@@ -94,9 +136,27 @@ def _write(harness, payload, fetched_at, attempted_at):
             providers = existing["providers"]
     except (OSError, ValueError, TypeError):
         pass
+    if error_observation is None and isinstance(payload, dict) and payload.get("error"):
+        error_observation = {key: payload.get(key) for key in
+                             ("error", "reason", "account_scope")}
+        error_observation["observed_at"] = attempted_at
+    if isinstance(error_observation, dict):
+        error_observation = {
+            "error": error_observation.get("error")
+                     if isinstance(error_observation.get("error"), str)
+                     and error_observation.get("error") in _ERRORS
+                     else "unknown",
+            "reason": error_observation.get("reason")
+                      if isinstance(error_observation.get("reason"), str)
+                      and error_observation.get("reason") in _REASONS else None,
+            "account_scope": error_observation.get("account_scope"),
+            "observed_at": error_observation.get("observed_at"),
+        }
     item = {"schema_version": SCHEMA_VERSION, "harness": harness,
             "fetched_at": fetched_at, "attempted_at": attempted_at,
             "payload": payload if isinstance(payload, dict) else {}, "providers": providers}
+    if isinstance(error_observation, dict):
+        item["error_observation"] = error_observation
     fd, temp = tempfile.mkstemp(prefix=".%s." % harness, dir=directory, text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -130,7 +190,8 @@ def record_attempt(harness, now=None):
     now = time.time() if now is None else float(now)
     previous = read(harness, now=now, stale_max=float("inf"))
     try:
-        _write(harness, previous.get("payload") or {}, previous.get("observed_at") or 0.0, now)
+        _write(harness, previous.get("payload") or {}, previous.get("observed_at") or 0.0,
+               now, error_observation=previous.get("error_observation"))
         return True
     except OSError:
         return False
@@ -255,25 +316,46 @@ def _worker(harness):
         if isinstance(payload, dict) and payload.get("error") in ("auth", "subscription-missing"):
             previous = read(harness, now=now, stale_max=float("inf"))
             old_payload = previous.get("payload") or {}
-            quota = {key: value for key, value in old_payload.items()
-                     if key in {"rl_5h", "rl_7d", "rl_ms", "rs_5h", "rs_7d", "rl_windows"}}
-            _write(harness, {**quota, **payload}, previous.get("observed_at") or 0.0, now)
+            same_scope = (isinstance(payload.get("account_scope"), str)
+                          and payload.get("account_scope")
+                          and payload.get("account_scope") == old_payload.get("account_scope"))
+            quota = ({key: value for key, value in old_payload.items()
+                      if key in {"rl_5h", "rl_7d", "rl_ms", "rs_5h", "rs_7d", "rl_windows"}}
+                     if same_scope else {})
+            safe_error = {key: payload.get(key) for key in
+                          ("error", "reason", "account_scope") if payload.get(key) is not None}
+            _write(harness, {**quota, **safe_error},
+                   previous.get("observed_at") if quota else 0.0, now,
+                   error_observation={**safe_error, "observed_at": now})
         elif isinstance(payload, dict) and "error" not in payload:
             _write(harness, payload, now, now)
         elif isinstance(payload, dict):
             previous = read(harness, now=now)
             if previous.get("payload") is not None:
-                _write(harness, previous["payload"], previous.get("observed_at"), now)
+                diagnostic = {key: payload.get(key) for key in
+                              ("error", "reason", "account_scope")}
+                diagnostic["observed_at"] = now
+                _write(harness, previous["payload"], previous.get("observed_at"), now,
+                       error_observation=diagnostic)
             else:
-                _write(harness, payload, 0.0, now)
+                safe_error = {key: payload.get(key) for key in
+                              ("error", "reason", "account_scope") if payload.get(key) is not None}
+                _write(harness, safe_error, 0.0, now,
+                       error_observation={**safe_error, "observed_at": now})
         elif previous.get("payload") is not None:
-            _write(harness, previous["payload"], previous.get("observed_at"), now)
+            _write(harness, previous["payload"], previous.get("observed_at"), now,
+                   error_observation=previous.get("error_observation"))
+        elif previous.get("error_observation") is not None:
+            _write(harness, {}, 0.0, now,
+                   error_observation=previous.get("error_observation"))
         else:
             _write(harness, {}, 0.0, now)
     except Exception:
         try:
             now = time.time(); previous = read(harness, now=now)
-            _write(harness, previous.get("payload") or {}, previous.get("observed_at") or 0.0, now)
+            _write(harness, previous.get("payload") or {}, previous.get("observed_at") or 0.0,
+                   now, error_observation={"error": "unknown", "reason": "usage-unreadable",
+                                           "observed_at": now})
         except Exception:
             pass
     finally:
