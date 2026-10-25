@@ -1487,8 +1487,11 @@ def _chain_to(rows: list, session: str) -> list:
         if origin in seen:
             return []
         matches = reverse[cursor][origin]
-        if matches:
-            chain.append(dict(max(matches, key=lambda item: item[:3])[3]))
+        # Publications on one edge can carry disjoint exact binding scopes.
+        # Recency resolves a logical binding's holder in _lineage_holder, not
+        # which scopes discovery may see. Keep every row on this ancestry;
+        # candidate admission still rechecks each binding's current authority.
+        chain.extend(dict(match[3]) for match in matches)
         seen.add(origin)
         cursor = origin
         if len(reverse.get(cursor, {})) > 1:

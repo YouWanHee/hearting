@@ -54,6 +54,23 @@ import claude_process_identity  # noqa: E402
 terminal_surface = peer_steward.terminal_surface
 
 
+def _register_completion_fixture(jobs, attempt, metadata):
+    """Materialize a private registered completion through the ordinary row API."""
+    import dispatch_contract as contract
+    import dispatch_completion_join as join
+
+    route = jobs.with_name(attempt + "-route.json")
+    metadata = dict(attempt_schema_version="2", dispatch_depth="1", transport="headless",
+        execution_surface="registered-headless", registered_worker="1",
+        fallback_hop="same-harness-headless", worker_type="owner", harness="codex",
+        attempt_id=attempt, route_hash="sha256:" + "a" * 64, route_file=str(route), **metadata)
+    route.write_text(json.dumps({key: metadata[key] for key in ("route_id", "route_hash")}))
+    pipe = ",".join(key + "=" + value for key, value in metadata.items())
+    if not contract.claim_attempt_row(jobs, attempt, f"now\tdone\t{jobs.parent}\t-\tfixture\t{pipe}"):
+        raise AssertionError("private completion fixture was not registered")
+    return join.current_attempt_row(jobs, attempt)
+
+
 class _TmpRootMixin:
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -4764,7 +4781,8 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
 
     def _run_claude_prompt(self, *, state="idle", screen=None,
                            consume=False, readiness=None, foregrounds=None,
-                           send_result=(0, {}), producer_binding=None):
+                           send_result=(0, {}), producer_binding=None,
+                           body="[steer] exact private recipient ref", on_prepared=None):
         if screen is None:
             screen = CLAUDE_SUGGESTION
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
@@ -4811,13 +4829,14 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner",
                                return_value=False), \
              mock.patch("builtins.print") as printed:
-            prompt_args = ["prompt", "child", "[steer] exact private recipient ref"]
+            prompt_args = ["prompt", "child", body]
             if producer_binding is not None:
                 for value in (producer_binding["duty_id"], producer_binding["attempt_id"],
                               producer_binding["delivery_id"]):
                     prompt_args.extend(("--ref", value))
             args = peer_steward.build_parser().parse_args(prompt_args)
-            rc = peer_steward.cmd_prompt(args, producer_binding=producer_binding)
+            rc = peer_steward.cmd_prompt(args, producer_binding=producer_binding,
+                                        on_prepared=on_prepared)
             if state != "idle":
                 self.assertEqual(screen_reader.call_count, 0)
         record = self._all_records()[-1]
@@ -4825,20 +4844,51 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         return rc, printed.call_args[0][0], row, sent, schedule
 
     def test_registered_runtime_prompt_preserves_producer_through_sender_duty_and_receipt(self):
+        import dispatch_pending_delivery as pending
+        import dispatch_session_sweep as sweep
+
         producer = {
             "schema": peer_steward.peer_message._RUNTIME_PRODUCER_SCHEMA,
             "duty_id": "registered-batch-" + "a" * 32,
             "jobs": str(Path(self._tmp.name) / "jobs.log"),
             "attempt_id": "att-runtime-completion",
-            "carrier": "claude-async-rewake",
+            "carrier": "claude-parent-runtime",
             "delivery_id": "delivery-runtime-completion",
             "receipt_digest": "b" * 64,
             "recipient": {"harness": "claude", "session_id": "sid-child"},
             "route_id": "rt-runtime", "route_node": "execute",
         }
-        Path(producer["jobs"]).touch()
+        jobs = Path(producer["jobs"])
+        jobs.touch()
+        sid, attempt, did = "sid-child", producer["attempt_id"], producer["delivery_id"]
+        receipt = dict(schema_version=2, state="delivered", job_registry=str(jobs),
+            parent_attempt_id="att-runtime-parent", children=[dict(attempt_id=attempt,
+                status="done", readiness="ready", reason="terminal-failure-or-unclosed",
+                required_action="inspect-done-failure")])
+        stored = pending.create(jobs.parent, recipient_kind=producer["carrier"], recipient_key=sid,
+            delivery_id=did, session_generation="", session_generation_supported="0",
+            attempt_ids=[attempt], parent_attempt_id="att-runtime-parent",
+            route_id=producer["route_id"], route_node=producer["route_node"], receipt=receipt,
+            receipt_digest=pending._canonical_receipt_digest(receipt), row_revisions={attempt: "revision-runtime"})
+        producer["receipt_digest"] = stored["receipt_digest"]
+        _register_completion_fixture(jobs, attempt, dict(parent_sid=sid, parent_harness="claude",
+            parent_completion_delivery=producer["carrier"], delivery_intent="1", delivery_id=did,
+            delivery_receipt_digest=stored["receipt_digest"], delivery_row_revision="revision-runtime",
+            route_id=producer["route_id"], route_node=producer["route_node"]))
+        store = peer_steward.peer_obligations.ObligationStore(jobs.parent)
+        store.create(producer["duty_id"], "registered-batch", dict(jobs=str(jobs), attempt_id=attempt,
+            session_id=sid, harness="claude", server="default"), dict(carrier=producer["carrier"]))
+        owner = "retained-rewake:" + producer["duty_id"]
+        pending.claim(jobs.parent, sid, did, claim_owner=owner, lease_seconds=30,
+                      require_generation_proof=False, jobs=jobs)
+        binding = dict(duty_id=producer["duty_id"], jobs=str(jobs), attempt_id=attempt,
+            carrier=producer["carrier"], recipient_sid=sid, storage_recipient=sid, delivery_id=did,
+            receipt_digest=stored["receipt_digest"], claim_owner=owner)
+        body = "[steer] exact private recipient ref\n" + sweep.delivery_context([
+            (jobs.parent, [{**stored, sweep.STORAGE_KEY: sid}])])
         rc, line, row, sent, schedule = self._run_claude_prompt(
-            consume=True, producer_binding=producer)
+            consume=True, producer_binding=producer, body=body,
+            on_prepared=lambda ref: peer_steward.peer_message.bind_dispatch_notice(ref, binding))
         self.assertEqual(rc, 0, line)
         self.assertIn("verify=exact-peer-ref", line)
         self.assertIn("runtime-from:", sent[0][1])
@@ -13775,13 +13825,12 @@ class NativeDispatchReceiptTest(unittest.TestCase):
                         "delivery_id": did, "delivery_receipt_digest": stored["receipt_digest"],
                         "delivery_row_revision": "revision-projected",
                         "route_id": "route-projected", "route_node": "execute"}
-            row = SimpleNamespace(status="done", attempt_id=attempt, metadata=metadata)
+            row = _register_completion_fixture(jobs, attempt, metadata)
             store = peer_steward.peer_obligations.ObligationStore(root)
             identity = {"jobs": str(jobs), "attempt_id": attempt, "session_id": sid,
                         "harness": "claude", "server": "default"}
-            duty = store.create("registered-batch-projected-" + "b" * 20,
+            duty = store.create(peer_steward.peer_obligations.stable_duty_id("registered-batch", identity),
                                 "registered-batch", identity, {"carrier": carrier})
-            owner = "retained-rewake:" + duty["id"]
 
             def project(_root, _recipient, _delivery_id, record, _owner, jobs=None):
                 record["receipt"] = dict(record["receipt"], delivery_classification="success",
@@ -13791,27 +13840,22 @@ class NativeDispatchReceiptTest(unittest.TestCase):
                               for child in record["receipt"]["children"]])
                 return True
 
+            sent_bodies = []
+            def capture_prompt(args, **kwargs):
+                sent_bodies.append(Path(args.body_file).read_text())
+                return 0
+
             agents = {"result": {"agents": [{"agent": "claude", "pane_id": "w1:p9",
                       "agent_session": {"value": sid}}]}}
-            with mock.patch("dispatch_completion_join.current_attempt_row", return_value=row), \
-                 mock.patch("dispatch_completion_join.materialize_after_terminal_close"), \
-                 mock.patch("dispatch_seat_handover.effective_parent", return_value=sid), \
-                 mock.patch("dispatch_seat_handover.effective_parent_harness", return_value="claude"), \
-                 mock.patch.object(pending, "claim", return_value=dict(
-                     stored, state="claimed", claim_owner=owner, attempts=1)), \
-                 mock.patch.object(pending, "mark_sent_ambiguous"), \
-                 mock.patch.object(pending, "release_claim"), \
-                 mock.patch("dispatch_notice_state.keep_claim", side_effect=project), \
+            with mock.patch("dispatch_notice_state.keep_claim", side_effect=project), \
                  mock.patch("dispatch_supervision.continue_for_parent", return_value=None), \
                  mock.patch.object(peer_steward, "_settle_claude_native_dispatch_receipt",
                                    return_value=False) as received, \
-                 mock.patch.object(sweep, "delivery_context", return_value="body") as render, \
-                 mock.patch.object(peer_steward.peer_message, "_valid_runtime_producer_binding",
-                                   return_value=True), \
+                 mock.patch.object(sweep, "delivery_context", wraps=sweep.delivery_context) as render, \
                  mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
                      stdout=json.dumps(agents), returncode=0)), \
                  mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", sid)), \
-                 mock.patch.object(peer_steward, "cmd_prompt", return_value=0) as send:
+                 mock.patch.object(peer_steward, "cmd_prompt", side_effect=capture_prompt) as send:
                 peer_steward._resume_registered_obligation(store.get(duty["id"]), store)
             send.assert_called_once()
             # Receipt evidence is checked against the stored record before and after the claim.
@@ -13822,6 +13866,13 @@ class NativeDispatchReceiptTest(unittest.TestCase):
                              "advance-completed")
             self.assertEqual(rendered[sweep.IDENTITY_KEY],
                              pending.received_ack_identity(stored, sid, did))
+            current = pending.read(root, sid, did)
+            self.assertEqual(current["receipt"], receipt)
+            self.assertEqual(pending.received_ack_identity(current, sid, did),
+                             pending.received_ack_identity(stored, sid, did))
+            from dispatch_recipient_receipt import receipt_marker
+            self.assertIn(receipt_marker(stored, sid), sent_bodies[0])
+            self.assertIn("required_action=advance-completed", sent_bodies[0])
 
 
 class WatchReceiptLockBudgetTest(_TmpRootMixin, unittest.TestCase):

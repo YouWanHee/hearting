@@ -7452,6 +7452,9 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
             member_id = claimed["delivery_id"]
             stored_member = pending.read(jobs.parent, storage_recipient, member_id)
             expected_identity = pending.received_ack_identity(claimed, storage_recipient, member_id)
+            # keep_claim may project the outward receipt in memory. First-write
+            # guards and safe release still bind the original stored identity.
+            claimed[IDENTITY_KEY] = expected_identity
             if (stored_member is None or pending.received_ack_identity(
                     stored_member, storage_recipient, member_id) != expected_identity or not keep_claim(
                     jobs.parent, storage_recipient, member_id, claimed, claim_owner, jobs=jobs)):

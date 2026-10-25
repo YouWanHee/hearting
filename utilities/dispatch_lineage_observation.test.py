@@ -736,5 +736,152 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
         self.assertEqual(self.snapshot(path), before)
 
 
+class BindingScopeDiscoveryTest(peer._TmpRootMixin, unittest.TestCase):
+    """Enumeration keeps scopes; the existing per-binding reader grants authority."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["AGENT_HOME"] = str(ROOT)
+        handover._LINEAGE_GRAPH_CACHE.clear()
+
+    def seed(self, tag, *, reverse=False, jobs=None, legacy=False):
+        jobs = jobs or self.jobs_path
+        origin, holder = tag + "-A", tag + "-B"
+        metas = [dict(attempt_schema_version="2", dispatch_depth="1", worker_type="owner",
+            registered_worker="1", attempt_id=f"att-{tag}-{i}", parent_sid=origin,
+            parent_harness="claude", route_id=f"rt-{tag}-{i}", route_hash=f"sha256:{tag}-{i}",
+            route_node="" if i == 0 else "owner") for i in range(handover.MAX_BINDINGS + 1)]
+        jobs.write_text("".join("now\trunning\t/w\t/w\tfixture\t" +
+            ",".join(k + "=" + v for k, v in meta.items()) + "\n" for meta in metas))
+        bindings = [handover.binding_of(jobs, meta) for meta in metas]
+        scopes = [bindings[:12], bindings[12:], bindings[4:7], bindings[:12]]
+        if reverse:
+            scopes.reverse()
+        seats = []
+        for i, scope in enumerate(scopes):
+            seat = tidy.Seat("pane", f"{tag}-seat-{i}")
+            seats.append(seat)
+            with tidy.seat_lock(seat.key):
+                handover.publish_snapshot_locked(seat, "claude", origin, scope, jobs=jobs)
+                row = dict(event="handover", harness="codex", sid=holder,
+                    **{"from": origin}, ts=100 - i if reverse else i + 1, bindings=scope)
+                if not legacy:
+                    row["source"] = "retire"
+                tidy._append_ledger_entry(seat, row)
+        return jobs, origin, holder, metas, bindings, seats
+
+    def candidates(self, jobs, holder, harness="codex", context=None):
+        return handover._handover_candidates(harness, holder, jobs, read_context=context)
+
+    def test_disjoint_overlapping_duplicate_scopes_and_owner_keys_ignore_publication_order(self):
+        for reverse in (False, True):
+            for named in (False, True):
+                with self.subTest(reverse=reverse, named=named):
+                    tag = f"scopes-{reverse}-{named}"
+                    jobs = self.tmp_root / (tag + ".registry") if named else self.jobs_path
+                    jobs, origin, holder, metas, bindings, seats = self.seed(tag, reverse=reverse, jobs=jobs)
+                    before = jobs.read_bytes()
+                    expected = {handover._logical_key(b) for b in bindings}
+                    snapshots = handover._all_snapshots()
+                    with mock.patch.object(handover, "_all_snapshots", return_value=list(reversed(snapshots))):
+                        possible = self.candidates(jobs, holder, context=PeerReadContext())
+                    self.assertEqual(len(possible), 13)
+                    self.assertEqual({handover._logical_key(b) for b, _ in possible}, expected)
+                    self.assertIn((metas[0]["route_id"], metas[0]["route_hash"], ""),
+                                  handover._handover_binding_keys_for_session(jobs, holder))
+                    self.assertEqual(len(handover.current_bindings("codex", holder, jobs)), 12)
+                    with mock.patch.object(handover, "pane_seat", return_value=seats[0]):
+                        self.assertEqual(dict(handover.storage_recipients(holder, harness="codex"))[origin],
+                                         frozenset(meta["attempt_id"] for meta in metas))
+                    self.assertTrue(all(handover.effective_parent(meta, jobs) == holder for meta in metas))
+                    self.assertEqual(jobs.read_bytes(), before)
+
+    def test_legacy_scopes_follow_same_harness_hops_and_explicit_away_precedes_tidy(self):
+        jobs, origin, holder, metas, bindings, seats = self.seed("legacy-scopes", legacy=True)
+        context = PeerReadContext()
+        previous = holder
+        for index, current in enumerate((holder + "-C", holder + "-D")):
+            tidy._append_ledger_entry(tidy.Seat("pane", f"legacy-hop-{index}"), dict(event="succession",
+                source="tidy-clear", harness="codex", **{"from": previous}, sid=current, ts=200 + index))
+            self.assertEqual(len(self.candidates(jobs, current, context=context)), 13)
+            previous = current
+        away = dict(event="handover", source="retire", harness="opencode", sid="away-holder",
+                    **{"from": current}, ts=300, bindings=[bindings[0]])
+        tidy._append_ledger_entry(tidy.Seat("pane", "legacy-away"), away)
+        self.assertEqual(handover.effective_parent(metas[0], jobs, read_context=context), "away-holder")
+        self.assertEqual(handover.effective_parent_harness(metas[0], jobs), "opencode")
+        self.assertEqual(len(self.candidates(jobs, current, context=context)), 12)
+        self.assertEqual(self.candidates(jobs, holder), [])
+        # A source-less explicit row never becomes an unbound edge for another job.
+        unbound = dict(metas[0], attempt_id="unbound", route_id="unbound", route_node="owner")
+        self.assertEqual(handover.effective_parent(unbound, jobs), origin)
+        with mock.patch.object(handover, "pane_seat", return_value=seats[0]):
+            self.assertEqual(dict(handover.storage_recipients(current, harness="codex"))[origin],
+                             frozenset(meta["attempt_id"] for meta in metas[1:]))
+
+    def test_global_fork_merge_cycle_and_different_origins_never_use_local_scope_fallback(self):
+        for kind in ("fork", "merge", "cycle", "explicit-merge"):
+            with self.subTest(kind=kind):
+                jobs, origin, holder, _metas, bindings, seats = self.seed(kind)
+                target = holder + "-C"
+                tidy._append_ledger_entry(seats[0], dict(event="succession", source="tidy-clear",
+                    harness="codex", **{"from": holder}, sid=target, ts=200))
+                left, right = ((holder, "fork-D") if kind == "fork" else
+                               ("merge-X", target) if kind == "merge" else
+                               (target, holder) if kind == "cycle" else ("explicit-X", target))
+                row = dict(event="handover" if kind == "explicit-merge" else "succession",
+                    source="retire" if kind == "explicit-merge" else "tidy-clear", harness="codex",
+                    **{"from": left}, sid=right, ts=300,
+                    bindings=[bindings[0]] if kind == "explicit-merge" else [])
+                tidy._append_ledger_entry(tidy.Seat("pane", kind + "-hidden"), row)
+                self.assertEqual(handover._handover_binding_keys_for_session(jobs, target), ())
+                self.assertEqual(self.candidates(jobs, target), [])
+
+    def test_manual_clear_is_not_an_implicit_edge_and_global_incomplete_is_not_local_authority(self):
+        jobs, _origin, holder, metas, _bindings, seats = self.seed("unavailable")
+        local = handover.handover_rows(seats[0])
+        hidden = tidy.Seat("pane", "unavailable-hidden")
+        tidy._append_ledger_entry(hidden, dict(event="start", harness="codex", sid="manual-C", ts=200))
+        self.assertEqual(self.candidates(jobs, "manual-C"), [])
+        path = tidy._ledger_path(hidden)
+        original = path.read_bytes()
+        for failure in ("partial", "corrupt", "unreadable"):
+            with self.subTest(failure=failure), contextlib.ExitStack() as stack:
+                if failure in {"partial", "corrupt"}:
+                    path.write_bytes(original + (b'{"event":' if failure == "partial" else b'{bad}\n'))
+                else:
+                    real_open = os.open
+                    def open_file(candidate, *args, **kwargs):
+                        if Path(candidate) == path:
+                            raise PermissionError("fixture unavailable global ledger")
+                        return real_open(candidate, *args, **kwargs)
+                    stack.enter_context(mock.patch.object(tidy.os, "open", side_effect=open_file))
+                handover._LINEAGE_GRAPH_CACHE.clear()
+                self.assertTrue(local)
+                self.assertEqual(self.candidates(jobs, holder), [])
+                self.assertEqual(handover.effective_parent(metas[0], jobs), "")
+            path.write_bytes(original)
+        self.assertEqual(len(self.candidates(jobs, holder)), 13)
+
+    def test_candidate_admission_rechecks_explicit_authority_after_discovery(self):
+        import route_authority
+        jobs, _origin, holder, metas, bindings, _seats = self.seed("use-time")
+        decide = route_authority.decide_continuation
+        observed = []
+        def move_then_admit(**kwargs):
+            if not observed:
+                tidy._append_ledger_entry(tidy.Seat("pane", "use-time-away"),
+                    dict(event="handover", source="retire", harness="claude", sid="latest-holder",
+                         **{"from": holder}, ts=400, bindings=[bindings[0]]))
+            observed.append(kwargs["metadata"]["attempt_id"])
+            return decide(**kwargs)
+        with mock.patch.object(route_authority, "decide_continuation", side_effect=move_then_admit):
+            possible = self.candidates(jobs, holder)
+        self.assertEqual(len(observed), 13)
+        self.assertEqual(len(possible), 12)
+        self.assertNotIn(metas[0]["attempt_id"], {b["attempt"] for b, _ in possible})
+        self.assertEqual(handover.effective_parent(metas[0], jobs), "latest-holder")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
