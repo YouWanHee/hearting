@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 import importlib.util
+import hashlib
 import json
 import math
+import os
 import sqlite3
 from pathlib import Path
+import subprocess
 import tempfile
 import sys
+import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 P = Path(__file__).with_name("foreground_activity.py")
@@ -163,6 +168,139 @@ class ForegroundActivityTests(unittest.TestCase):
                 self.assertTrue(missing.uncertain, "lost access could incorrectly expire the no-progress window")
                 context.log_path.write_text(context.log_path.read_text() + "attempt-owned progress\n")
                 self.assertIn("attempt-file-change", monitor.sample().reasons)
+
+    def test_owner_observation_ignores_supervisor_logs_transcript_roots_and_aggregate_child_cpu(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            log = root / "attempt.jsonl"
+            broad = root / "other-session.jsonl"
+            exact = root / "exact-session.jsonl"
+            log.write_text("supervisor bookkeeping 1\n")
+            broad.write_text("other session 1\n")
+            exact.write_text("payload 1\n")
+            context = A.ForegroundActivityContext(
+                window_seconds=7200, harness="claude", log_path=log,
+                metadata={"attempt_id": "owner-1"},
+                transcript_roots=(root,), exact_files=(exact,), owner_turn=True,
+            )
+            monitor = A.ForegroundActivityMonitor(10, "1", context)
+            table = {
+                (10, "1"): {"self_cpu": 1, "children_cpu": 10},
+                (11, "2"): {"self_cpu": 3, "children_cpu": 100},
+            }
+            members = set(table)
+            with mock.patch.object(monitor, "_processes", return_value=table), \
+                 mock.patch.object(monitor, "_members", return_value=members), \
+                 mock.patch.object(monitor, "_runtime_lineage", return_value={(10, "1")}), \
+                 mock.patch.object(monitor, "_lease_active", return_value=False), \
+                 mock.patch.object(monitor, "_opencode_session_state", return_value=None):
+                baseline = monitor.sample()
+                self.assertEqual((baseline.active, baseline.uncertain), (False, False))
+                table[(10, "1")] = {"self_cpu": 1, "children_cpu": 99}
+                log.write_text("supervisor bookkeeping 2\n")
+                broad.write_text("other session 2\n")
+                quiet = monitor.sample()
+                self.assertEqual((quiet.active, quiet.uncertain), (False, False))
+                exact.write_text("payload 2\n")
+                changed = monitor.sample()
+                self.assertTrue(changed.active)
+                self.assertIn("attempt-file-change", changed.reasons)
+
+    def test_owner_process_members_exclude_process_group_siblings_and_attempt_tags(self):
+        context = A.ForegroundActivityContext(
+            window_seconds=7200, harness="codex", log_path=Path("/attempt.log"),
+            metadata={"attempt_id": "owner-1"}, owner_turn=True,
+        )
+        monitor = A.ForegroundActivityMonitor(10, "1", context)
+        table = {
+            (10, "1"): {"ppid": 1, "pgid": 10},
+            (11, "2"): {"ppid": 1, "pgid": 10},  # same group, not a descendant
+            (12, "3"): {"ppid": 10, "pgid": 12},  # exact runtime descendant
+        }
+        with mock.patch("dispatch_contract.attempt_tagged_descendants",
+                        side_effect=AssertionError("owner must not broaden by tag")):
+            self.assertEqual(monitor._members(table), {(10, "1"), (12, "3")})
+
+    def test_owner_pid_reuse_is_uncertain_and_never_becomes_activity(self):
+        context = A.ForegroundActivityContext(
+            window_seconds=7200, harness="codex", log_path=Path("/attempt.log"),
+            metadata={"attempt_id": "owner-1"}, owner_turn=True,
+        )
+        monitor = A.ForegroundActivityMonitor(10, "birth-1", context)
+        table = {(10, "birth-2"): {"ppid": 1, "pgid": 10}}
+        with self.assertRaisesRegex(RuntimeError, "identity changed or disappeared"):
+            monitor._members(table)
+
+    def test_owner_lease_requires_exact_process_route_and_live_deadline(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs.log"
+            jobs.touch()
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                start_new_session=True,
+            )
+            try:
+                proc = Path("/proc") / str(process.pid)
+                stat = A._stat(proc / "stat")
+                argv = (proc / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+                record = {
+                    "attempt_id": "owner-1", "schema_version": 1,
+                    "route_id": "route-1", "route_node": "owner",
+                    "pid": process.pid, "pid_start": stat["start"],
+                    "pgid": process.pid, "deadline": time.time() + 30,
+                    "command_digest": hashlib.sha256(b"\0".join(argv)).hexdigest(),
+                }
+                lease = root / "verification-leases" / "owner-1.json"
+                lease.parent.mkdir()
+                lease.write_text(json.dumps(record), encoding="utf-8")
+                context = A.ForegroundActivityContext(
+                    window_seconds=7200, harness="codex", log_path=root / "attempt.log",
+                    metadata={"attempt_id": "owner-1", "route_id": "route-1",
+                              "route_node": "owner"}, jobs=jobs, owner_turn=True,
+                )
+                monitor = A.ForegroundActivityMonitor(process.pid, stat["start"], context)
+                self.assertTrue(monitor._lease_active())
+                lease.write_text(json.dumps({**record, "pid_start": "reused"}), encoding="utf-8")
+                self.assertFalse(monitor._lease_active())
+                lease.write_text(json.dumps({**record, "route_id": "route-other"}), encoding="utf-8")
+                self.assertFalse(monitor._lease_active())
+                lease.write_text(json.dumps({**record, "deadline": time.time() - 1}), encoding="utf-8")
+                self.assertFalse(monitor._lease_active())
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
+    def test_owner_turn_factory_requires_the_exact_registered_owner_binding(self):
+        args = SimpleNamespace(parent_attempt_id="owner-1", jobs="/tmp/jobs.log",
+                               route_id="route-1", route_hash="sha256:route-1",
+                               worktree="/tmp/work")
+        process = SimpleNamespace(pid=4242)
+        row = SimpleNamespace(
+            attempt_id="owner-1", status="running",
+            metadata={"worker_type": "owner", "route_id": "route-1",
+                      "route_hash": "sha256:route-1", "route_node": "owner",
+                      "log_file": "/tmp/owner.log"},
+        )
+        monitor = mock.Mock()
+        with mock.patch("dispatch_completion_join.exact_attempt_row", return_value=row), \
+             mock.patch.object(A, "_stat", return_value={"start": "77"}), \
+             mock.patch.object(A, "ForegroundActivityMonitor", return_value=monitor) as create:
+            activity = A.owner_turn_activity(args, process, harness="codex", window_seconds=20)
+        context = create.call_args.args[2]
+        self.assertTrue(context.owner_turn)
+        self.assertEqual(context.metadata["runtime_pid"], "4242")
+        self.assertEqual(context.metadata["runtime_start"], "77")
+        self.assertEqual(context.metadata["route_node"], "owner")
+        activity.expired(now=0)
+        monitor.sample.assert_called_once()
+
+        row.metadata["worker_type"] = "stage"
+        with mock.patch("dispatch_completion_join.exact_attempt_row", return_value=row), \
+             mock.patch.object(A, "ForegroundActivityMonitor",
+                               side_effect=AssertionError("mismatched attempt must not be sampled")):
+            uncertain = A.owner_turn_activity(args, process, harness="codex", window_seconds=20)
+        self.assertFalse(uncertain.expired(now=0))
 
 
 if __name__ == "__main__":

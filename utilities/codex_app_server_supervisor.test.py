@@ -2119,6 +2119,77 @@ class ActiveTurnDeadlineParityTest(unittest.TestCase):
             self.assertEqual(trace.read_text().split().count("turn/start"), 1)
             self.assertNotIn("turn/interrupt", trace.read_text())
 
+    def test_silent_owner_turn_survives_when_exact_payload_activity_is_observed(self):
+        from foreground_activity import ActivityObservation
+        from session_supervisor_decisions import OwnerTurnActivity
+        module = load_supervisor_module()
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / "quiet_app.py"
+            script.write_text(textwrap.dedent("""\
+                import json, sys, time
+                def send(value): print(json.dumps(value), flush=True)
+                for line in sys.stdin:
+                    value = json.loads(line)
+                    if value.get('method') == 'turn/start':
+                        send({'jsonrpc':'2.0','id':value['id'],'result':{'turn':{'id':'turn-1'}}})
+                        time.sleep(0.8)
+                        send({'jsonrpc':'2.0','method':'item/completed','params':{
+                            'threadId':'thread-1','turnId':'turn-1','item':{
+                                'type':'agentMessage','id':'m1','text':'done'}}})
+                        send({'jsonrpc':'2.0','method':'turn/completed','params':{
+                            'threadId':'thread-1','turn':{'id':'turn-1','status':'completed'}}})
+            """))
+            server = module.AppServer([sys.executable, str(script)], temp, dict(os.environ))
+            self.addCleanup(server.close)
+            args = SimpleNamespace(worktree=temp, writable_root=[], sandbox="danger-full-access",
+                                   network_access=False, approval="inherit", model=None,
+                                   reasoning=None, owner_input=None)
+            activity = OwnerTurnActivity(
+                lambda: ActivityObservation(True, False, ("exact-tool-cpu",)),
+                window_seconds=0.3, sample_seconds=0.05,
+            )
+            started = time.monotonic()
+            with mock.patch.object(module, "emit"):
+                text, _item = module.run_turn(
+                    server, thread_id="thread-1", prompt="go", args=args, activity=activity)
+            self.assertGreater(time.monotonic() - started, 0.3)
+            self.assertEqual(text, "done")
+
+    def test_token_accounting_events_do_not_hide_confirmed_owner_inactivity(self):
+        from foreground_activity import ActivityObservation
+        from session_supervisor_decisions import OwnerTurnActivity
+        module = load_supervisor_module()
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / "bookkeeping_app.py"
+            script.write_text(textwrap.dedent("""\
+                import json, sys, time
+                def send(value): print(json.dumps(value), flush=True)
+                for line in sys.stdin:
+                    value = json.loads(line)
+                    if value.get('method') == 'turn/start':
+                        send({'jsonrpc':'2.0','id':value['id'],'result':{'turn':{'id':'turn-1'}}})
+                        deadline = time.monotonic() + 2
+                        while time.monotonic() < deadline:
+                            send({'jsonrpc':'2.0','method':'thread/tokenUsage/updated','params':{
+                                'threadId':'thread-1','turnId':'turn-1',
+                                'tokenUsage':{'last':{'totalTokens':1}}}})
+                            time.sleep(0.02)
+            """))
+            server = module.AppServer([sys.executable, str(script)], temp, dict(os.environ))
+            self.addCleanup(server.close)
+            args = SimpleNamespace(worktree=temp, writable_root=[], sandbox="danger-full-access",
+                                   network_access=False, approval="inherit", model=None,
+                                   reasoning=None, owner_input=None)
+            activity = OwnerTurnActivity(
+                lambda: ActivityObservation(False, False, ("quiet",)),
+                window_seconds=0.3, sample_seconds=0.05,
+            )
+            with mock.patch.object(module, "emit"):
+                with self.assertRaisesRegex(module.SupervisorError, "codex-turn-no-progress"):
+                    module.run_turn(server, thread_id="thread-1", prompt="go",
+                                    args=args, activity=activity)
+            self.assertIsNone(server.owner_turn_activity)
+
 
 class SharedReceiptlessRecoveryTest(unittest.TestCase):
     """The former Codex-only recovery now belongs to the shared join."""

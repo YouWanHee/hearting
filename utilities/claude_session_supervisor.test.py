@@ -2925,10 +2925,7 @@ class DurableHandoffTransportTest(unittest.TestCase):
 
 
 class ActiveTurnDeadlineTest(unittest.TestCase):
-    """`--turn-timeout` is a no-progress window for the live stream turn: any
-    output from the live process restarts it, silence for the whole window
-    still fails with the existing reason, and a sealed handoff keeps its fixed
-    deadline."""
+    """Owner activity extends only the supervised turn; bounded calls stay fixed."""
 
     WINDOW = 0.6
 
@@ -3004,6 +3001,103 @@ class ActiveTurnDeadlineTest(unittest.TestCase):
         stream = SimpleNamespace(submit=mock.Mock(return_value=({"type": "result"}, 0)))
         supervisor.run_turn(self.args, "sess", "hi", resume=False, stream_session=stream)
         self.assertIs(stream.idle_reset, True)
+
+    def test_silent_stream_survives_when_exact_tool_activity_is_observed(self):
+        from foreground_activity import ActivityObservation
+        from session_supervisor_decisions import OwnerTurnActivity
+        session = self.session(
+            "time.sleep(0.8)\n"
+            "emit(type='result', subtype='success', result='ok', user_message_uuids=[turn])\n"
+            "sys.stdin.read()\n"
+        )
+        session.idle_reset = False
+        session.owner_activity = OwnerTurnActivity(
+            lambda: ActivityObservation(True, False, ("exact-tool-cpu",)),
+            window_seconds=0.3, sample_seconds=0.05,
+        )
+        started = time.monotonic()
+        result, rc = session.run_turn("hi", 0.3)
+        self.assertGreater(time.monotonic() - started, 0.3)
+        self.assertEqual((result["result"], rc), ("ok", 0))
+
+    def test_silent_stream_expires_only_after_a_confirmed_quiet_window(self):
+        from foreground_activity import ActivityObservation
+        from session_supervisor_decisions import OwnerTurnActivity
+        session = self.session("sys.stdin.read()\n")
+        session.owner_activity = OwnerTurnActivity(
+            lambda: ActivityObservation(False, False, ("quiet",)),
+            window_seconds=0.3, sample_seconds=0.05,
+        )
+        started = time.monotonic()
+        with self.assertRaisesRegex(supervisor.SupervisorError, "claude-turn-process-failed"):
+            session.run_turn("hi", 0.3)
+        self.assertGreaterEqual(time.monotonic() - started, 0.3)
+
+    def test_stream_system_bookkeeping_does_not_hide_owner_inactivity(self):
+        from foreground_activity import ActivityObservation
+        from session_supervisor_decisions import OwnerTurnActivity
+        session = self.session(
+            "for _ in range(30):\n"
+            "    time.sleep(0.05)\n"
+            "    emit(type='system', subtype='status')\n"
+            "sys.stdin.read()\n"
+        )
+        session.owner_activity = OwnerTurnActivity(
+            lambda: ActivityObservation(False, False, ("quiet",)),
+            window_seconds=0.3, sample_seconds=0.05,
+        )
+        with self.assertRaisesRegex(supervisor.SupervisorError, "claude-turn-process-failed"):
+            session.run_turn("hi", 0.3)
+
+    def test_process_transport_drains_prompt_without_blocking_and_observes_silent_activity(self):
+        from foreground_activity import ActivityObservation
+        from session_supervisor_decisions import OwnerTurnActivity
+        script = self.root / "process.py"
+        script.write_text(
+            "import json,sys,time\n"
+            "prompt=sys.stdin.read()\n"
+            "time.sleep(0.8)\n"
+            "print(json.dumps({'type':'result','subtype':'success','result':str(len(prompt))}),flush=True)\n",
+            encoding="utf-8",
+        )
+        activity = OwnerTurnActivity(
+            lambda: ActivityObservation(True, False, ("exact-tool-cpu",)),
+            window_seconds=0.3, sample_seconds=0.05,
+        )
+        with mock.patch("foreground_activity.owner_turn_activity", return_value=activity), \
+             mock.patch.object(supervisor, "claude_command",
+                               return_value=[sys.executable, str(script)]):
+            started = time.monotonic()
+            result, rc = supervisor.run_turn(
+                self.args, "sess", "x" * 200_000, resume=False, ordinary_owner_turn=True)
+        self.assertGreater(time.monotonic() - started, 0.3)
+        self.assertEqual((result["result"], rc), ("200000", 0))
+
+    def test_process_transport_kills_and_reaps_only_after_confirmed_idle(self):
+        from foreground_activity import ActivityObservation
+        from session_supervisor_decisions import OwnerTurnActivity
+        pid_file = self.root / "pid"
+        script = self.root / "idle-process.py"
+        script.write_text(
+            "import os,sys,time\n"
+            f"open({str(pid_file)!r},'w').write(str(os.getpid()))\n"
+            "sys.stdin.read()\n"
+            "time.sleep(10)\n",
+            encoding="utf-8",
+        )
+        activity = OwnerTurnActivity(
+            lambda: ActivityObservation(False, False, ("quiet",)),
+            window_seconds=0.3, sample_seconds=0.05,
+        )
+        with mock.patch("foreground_activity.owner_turn_activity", return_value=activity), \
+             mock.patch.object(supervisor, "claude_command",
+                               return_value=[sys.executable, str(script)]):
+            with self.assertRaisesRegex(supervisor.SupervisorError, "turn-submission-unknown"):
+                supervisor.run_turn(
+                    self.args, "sess", "hi", resume=False, ordinary_owner_turn=True)
+        pid = int(pid_file.read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
 
 class TerminalCommitActivationTests(unittest.TestCase):

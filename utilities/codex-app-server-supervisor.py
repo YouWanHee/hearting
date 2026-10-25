@@ -620,6 +620,7 @@ class AppServer:
         self.next_id = 1
         self.pending: list[dict[str, Any]] = []
         self.input_control = None
+        self.owner_turn_activity = None
         self.git_failure_feedback = CodexGitFailureFeedback(self)
         self.messages = queue.Queue()
         def receive():
@@ -645,6 +646,9 @@ class AppServer:
                 line = self.messages.get(timeout=0.2)
                 break
             except queue.Empty:
+                activity = self.owner_turn_activity
+                if activity is not None and activity.expired():
+                    raise SupervisorError("codex-turn-no-progress")
                 continue
         if not line:
             raise SupervisorError("app-server-eof")
@@ -655,8 +659,14 @@ class AppServer:
         if not isinstance(value, dict):
             raise SupervisorError("app-server-protocol-shape-invalid")
         if self.input_control is not None and self.input_control.response(value):
+            activity = self.owner_turn_activity
+            if activity is not None and activity.expired():
+                raise SupervisorError("codex-turn-no-progress")
             return self.read()
         if self.git_failure_feedback.response(value):
+            activity = self.owner_turn_activity
+            if activity is not None and activity.expired():
+                raise SupervisorError("codex-turn-no-progress")
             return self.read()
         return value
 
@@ -861,6 +871,7 @@ def run_turn(
     thread_id: str,
     prompt: str,
     args: argparse.Namespace,
+    activity=None,
 ) -> tuple[str | None, dict[str, Any] | None]:
     apply_owner_runtime_permissions(args)
     params: dict[str, Any] = {
@@ -917,6 +928,7 @@ def run_turn(
     final_text: str | None = None
     final_item: dict[str, Any] | None = None
     turn_error: dict[str, Any] | None = None
+    server.owner_turn_activity = activity
     while True:
         event = server.next_event()
         if "id" in event and "method" in event:
@@ -924,6 +936,13 @@ def run_turn(
         method = event.get("method")
         raw_params = event.get("params")
         event_params = raw_params if isinstance(raw_params, dict) else {}
+        completed_turn = event_params.get("turn")
+        terminal_event = (method == "turn/completed" and isinstance(completed_turn, dict)
+                          and completed_turn.get("id") == turn_id)
+        if activity is not None and not terminal_event and activity.expired(
+                payload_progress=codex_payload_progress(event, thread_id, turn_id)):
+            server.owner_turn_activity = None
+            raise SupervisorError("codex-turn-no-progress")
         # The exact notification method that carries a same-turn TurnError
         # ahead of `turn/completed` is not confirmed from observed traffic
         # (plan.md item 4 sampling found zero structured-error rows); match
@@ -969,6 +988,7 @@ def run_turn(
             emit({"type": "dispatch.supervisor.turn.completed", "thread_id": thread_id,
                   "turn_id": turn_id, "status": completed.get("status")})
             if completed.get("status") != "completed":
+                server.owner_turn_activity = None
                 if feedback is not None:
                     feedback.finish_turn(turn_id)
                 raw_completed_error = completed.get("error")
@@ -984,6 +1004,7 @@ def run_turn(
                 control.completed(turn_id)
             if feedback is not None:
                 feedback.finish_turn(turn_id)
+            server.owner_turn_activity = None
             return final_text, final_item
 
 
@@ -1051,6 +1072,21 @@ def parser() -> argparse.ArgumentParser:
 def context_window_arguments(args: argparse.Namespace) -> list[str]:
     value = getattr(args, "model_context_window", None)
     return [] if value is None else ["-c", f"model_context_window={value}"]
+
+
+def codex_payload_progress(event: dict[str, Any], thread_id: str, turn_id: str) -> bool:
+    """Accept only work events bound to this native thread and turn."""
+    method = event.get("method")
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return False
+    if params.get("threadId") != thread_id or params.get("turnId") != turn_id:
+        return False
+    if method in {"turn/plan/updated", "turn/diff/updated"}:
+        return True
+    if method in {"item/started", "item/completed"}:
+        return isinstance(params.get("item"), dict)
+    return False
 
 
 def run_one_turn(args: argparse.Namespace) -> int:
@@ -1299,8 +1335,14 @@ def main(argv: list[str] | None = None) -> int:
                 receipt_id=active_outbox.receipt_id if active_outbox is not None else None,
             )
             next_prompt = control.prepare(next_prompt)
+            from foreground_activity import owner_turn_activity
+            activity = owner_turn_activity(
+                args, server.process, harness="codex",
+                window_seconds=DECISIONS.OWNER_TURN_IDLE_SECONDS,
+            )
             final_text, _final_item = run_turn(
-                server, thread_id=thread_id, prompt=next_prompt, args=args
+                server, thread_id=thread_id, prompt=next_prompt, args=args,
+                activity=activity,
             )
             pending_notice = ""
             DECISIONS.refresh_owner_route(args)
