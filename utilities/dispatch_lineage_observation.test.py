@@ -83,6 +83,7 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
         tidy._append_ledger_entry(other, dict(event="start", harness="claude", sid="other", ts=1))
         before = self.snapshot(path)
         context = PeerReadContext()
+        handover._LINEAGE_GRAPH_CACHE.clear()  # Cold observation after writer-side retention.
         with self.unreadable(path):
             for _ in range(2):
                 self.assertIsNone(handover.record_recipient(notice, "A", harness="claude",
@@ -127,6 +128,10 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
 
     def test_absent_and_empty_legacy_state_differ_from_failed_stat_and_enumeration(self):
         notice = self.notice()
+        self.assertEqual(handover.record_recipient(notice, "A", harness="claude"), "A")
+        empty = tidy._ledger_path(tidy.Seat("pane", "empty-legacy"))
+        empty.parent.mkdir(parents=True, exist_ok=True)
+        empty.write_bytes(b"")
         self.assertEqual(handover.record_recipient(notice, "A", harness="claude"), "A")
         path = tidy._ledger_path(self.edge("claude", "A", "B"))
         directory = path.parent
@@ -205,6 +210,22 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
             for sid in ("A", "B"):
                 self.assertEqual(sweep.sweep_deliver(self.tmp_root, "claude-parent-runtime", sid)[0], [])
         self.assertEqual(pending.read(self.tmp_root, "A", notice["delivery_id"])["state"], "pending")
+
+    def test_unbound_registered_parent_stays_unresolved_during_read_failure(self):
+        meta = dict(attempt_id="att-" + "a" * 32, parent_sid="A", parent_harness="claude",
+                    dispatch_depth="1", worker_type="frame", route_id="rt-" + "a" * 16,
+                    route_hash="sha256:" + "b" * 64, route_node="execute")
+        self.jobs_path.write_text("now\trunning\t/w\t/w\ttask\t" +
+                                 ",".join(k + "=" + v for k, v in meta.items()) + "\n")
+        record = {"attempt_ids": [meta["attempt_id"]]}
+        path = tidy._ledger_path(self.edge("claude", "A", "B"))
+        context = PeerReadContext()
+        with self.unreadable(path):
+            self.assertIsNone(handover.record_recipient(record, "A", harness="claude", read_context=context))
+            self.assertEqual(handover.effective_parent(meta, self.jobs_path, read_context=context), "")
+            for sid in ("A", "B"):
+                self.assertFalse(handover.owns(meta, sid, self.jobs_path, read_context=context))
+        self.assertEqual(handover.record_recipient(record, "A", harness="claude", read_context=context), "B")
 
     def test_real_preparation_and_last_native_guard_refuse_unavailable_lineage(self):
         for boundary in ("readiness", "last-guard"):
@@ -365,6 +386,27 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
                 self.assertIsNone(self.counts()["no_recipient"])
             self.assertEqual(self.counts()["no_recipient"], 1)
             self.assertEqual(self.snapshot(path), before)
+
+    def test_one_unavailable_pending_directory_keeps_other_legacy_counts(self):
+        paths = []
+        for sid in ("dead-A", "dead-B"):
+            notice = self.notice(sid=sid, key=sid)
+            tidy._append_ledger_entry(tidy.Seat("pane", sid), dict(event="start", harness="claude", sid=sid))
+            paths.append(pending.record_path(self.tmp_root, sid, notice["delivery_id"]))
+        real = Path.stat
+
+        def fail(path, *args, **kwargs):
+            if path == paths[0].parent:
+                raise PermissionError("fixture one recipient directory")
+            return real(path, *args, **kwargs)
+
+        before = [self.snapshot(path) for path in paths]
+        with mock.patch.object(Path, "stat", new=fail):
+            counts = self.counts()
+            self.assertEqual(counts["pending"], 1)
+            self.assertIsNone(counts["no_recipient"])
+        self.assertEqual(self.counts()["no_recipient"], 2)
+        self.assertEqual([self.snapshot(path) for path in paths], before)
 
     def test_invalid_duplicate_is_observed_before_deduplication(self):
         notice = self.notice(sid="dead-A")
