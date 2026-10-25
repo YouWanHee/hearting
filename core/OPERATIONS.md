@@ -1516,13 +1516,24 @@ same bytes through an independent PASS. The runtime records the run identity,
 consumed file hashes, stage-marker hashes and independent gate in the existing
 workflow journal as downstream consumption, preserving the original FAIL,
 exit, resource registry, artifacts and scientific result. Owner wording or
-downstream PASS alone is insufficient. Missing or
-different bindings retain failure and return an executable continuation using
-the existing compose surface: a new resource attempt with a distinct `__a<N>`
-identity and output directory, followed by revalidation of its downstream
-stages. Old PASS markers are provenance, not authority for the new bytes.
-The same judgment serves owner settlement and workflow completion on all three
-harnesses, without another flag, required input or approval.
+downstream PASS alone is insufficient.
+
+When bindings are missing or differ, retry guidance follows the exact route
+and current owner receipt. A live owner, or an unanswered BLOCKED/FAIL owner,
+gets its existing `correction_command` with a same-route instruction for a new
+`__a<N>` resource attempt, a separate output directory and downstream
+revalidation. For BLOCKED owners, check `owner_report` before sending the
+prepared answer. Other open or unobservable states, including retained answers,
+human gates, cancellation and waits, use the route's existing
+`resume_command`. Cancellation remains protected even when its exact route
+closure exists. An ordinarily closed route uses the existing compose surface to
+open a new route. The agreed exception is a rejected settlement from an owner
+whose PASS is proven by the shared verdict reader: it keeps the existing
+compose guidance until same-route PASS-settlement recovery is implemented.
+An observation failure counts as neither closure nor PASS. Old PASS markers are
+provenance, not authority for new bytes. These choices add no flag, required
+input, gate or approval, and the same resource judgment serves owner settlement
+and workflow completion on all three harnesses.
 
 **Advance evidence is four-part and fail-closed.** Before a supervisor may
 start a successor it proves, for the predecessor: exact process identity
