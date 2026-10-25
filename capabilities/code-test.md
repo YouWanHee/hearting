@@ -26,6 +26,11 @@ levels include the fail-closed figure semantic verifier against its manifest
 and report. Missing exact 48 kHz full-band metadata, range-compatible claims,
 shared-scale evidence, or a hash-current visual review is a failed level.
 
+When registered sub-sessions are aggregated into a source-bound test marker,
+the marker carries the exact effective children’s common subject digest and
+source epoch. Missing, mixed, or stale child bindings cannot produce a PASS,
+and replay of an already published marker retains its original result.
+
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 Put pytest basetemp and tool scratch data under the supplied `runtime_dir` or

@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -198,6 +200,106 @@ class SubdivisionContractTest(unittest.TestCase):
         ]
         jobs_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    def _source_test_fixture(self, td, *, mixed=False, missing=False, stale=False, epoch_stale=False):
+        worktree, _route, _node, manifest_path = self._fixture(td)
+        for index in (1, 2):
+            target = worktree / f"source/file-{index}.py"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"value = {index}\n", encoding="utf-8")
+        subprocess = __import__("subprocess")
+        subprocess.run(["git", "-C", str(worktree), "add", "source"], check=True)
+        subprocess.run(["git", "-C", str(worktree), "-c", "user.name=Fixture", "-c",
+                        "user.email=fixture@example.com", "commit", "-qm", "fixture"], check=True)
+        route_path = Path(td) / "route.json"
+        dispatch_rows = [
+            {
+                "parent_harness": harness,
+                "parent_transport": "headless",
+                "parent_sandbox": CR.WRAPPER_PARENT_SANDBOXES[harness][0],
+                "child_harness": harness,
+                "launch_authority": "conductor",
+                "status": "supported",
+                "probe_source": f"{harness}-fixture",
+                "probe_time": "2026-07-16T00:00:00Z",
+                "failure_class": "",
+                "checked_worktree": str(worktree.resolve()),
+                "failure_scope": "none",
+                "codex_command": "ok" if harness == "codex" else "not-applicable",
+                "retry_on_isolated_worktree": 0,
+            }
+            for harness in ("claude", "codex", "opencode")
+        ]
+        tracking_evidence = {
+            "spec_read": {"satisfied": True, "source": "fixture"},
+            "drift_verdict": "within-spec",
+            "workflow_mode": "tracked",
+            "artifact_guard": {"satisfied": True, "source": "fixture"},
+        }
+        route = CR.compile_route(
+            "autopilot-code", "dev", "standard", worktree, Path(td),
+            signals=[], transport="headless", tracking="tracked",
+            tracked_gate_evidence=tracking_evidence,
+            dispatch_evidence={"tuples": dispatch_rows, "native_subagent": []},
+        )
+        node = next(item for item in route["nodes"] if item.get("completion_gate") == "code-test")
+        # The public aggregation fixture exercises two exact QA children. Keep
+        # the route itself compiled from the live registry, then seal the
+        # bounded test-only subdivision permission into this route node.
+        node["subdivision"] = {
+            "min_intensity": "standard", "max_slices": 4,
+            "disjointness": "exact-fixed-files",
+        }
+        route["route_hash"] = CR.route_hash(route)
+        route["route_id"] = CR.ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
+        route_path.write_text(json.dumps(route), encoding="utf-8")
+        route["_route_file"] = str(route_path.resolve())
+
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        raw["route_id"] = route["route_id"]
+        raw["route_hash"] = route["route_hash"]
+        raw["completion_gate"] = "code-test"
+        raw["route_node"] = node["id"]
+        for index, session in enumerate(raw["sessions"], 1):
+            session["fixed_files"] = [str(worktree / f"test_logs/child-{index}.md")]
+        manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+        manifest = SSC.load_manifest(manifest_path, route=route, node=node)
+        jobs = Path(td) / "jobs.log"
+        self._write_jobs(jobs, route, manifest)
+        import review_source_subject as RSS
+        rows = jobs.read_text(encoding="utf-8").splitlines()
+        for index, session in enumerate(manifest["sessions"]):
+            if missing and index == 1:
+                continue
+            if mixed and index == 1:
+                (worktree / "source/file-2.py").write_text("value = 22\n", encoding="utf-8")
+            values = RSS.seal_attempt(jobs, route, node, session["attempt_id"], worktree=worktree)
+            if epoch_stale:
+                binding_path = RSS.binding_path(jobs, session["attempt_id"])
+                binding = json.loads(binding_path.read_text(encoding="utf-8"))
+                binding["source_epoch"] += 1
+                binding["binding_digest"] = RSS._binding_digest(binding)
+                binding_path.write_text(json.dumps(binding, sort_keys=True) + "\n", encoding="utf-8")
+                values["review_subject_binding_digest"] = binding["binding_digest"]
+            fields = rows[index].split("\t")
+            fields[5] += "," + ",".join(f"{key}={value}" for key, value in values.items())
+            rows[index] = "\t".join(fields)
+        if stale:
+            (worktree / "source/file-1.py").write_text("value = 111\n", encoding="utf-8")
+        jobs.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        evidence = Path(td) / "evidence.md"
+        evidence.write_text("checked outputs\n", encoding="utf-8")
+        return worktree, route, node, manifest_path, manifest, jobs, evidence
+
+    def _public_complete(self, route, node, manifest_path, jobs, evidence):
+        return subprocess.run(
+            [sys.executable, str(Path(CR.__file__).resolve()), "complete",
+             "--route", str(route["_route_file"]), "--node", node["id"],
+             "--evidence", str(evidence), "--jobs", str(jobs),
+             "--subsession-manifest", str(manifest_path)],
+            text=True, capture_output=True, timeout=30, check=False,
+            env={**os.environ, "AGENT_DISPATCH_JOBS": str(jobs),
+                 "PYTHONDONTWRITEBYTECODE": "1"})
+
     def _admit(self, route, node, manifest):
         """Record the admission-time baseline exactly as dispatch-batch does."""
         return CR.record_subdivision_baseline(route, node["id"], manifest)
@@ -265,6 +367,56 @@ class SubdivisionContractTest(unittest.TestCase):
                 slice_attempt_id = manifest["sessions"][0]["attempt_id"]
                 with self.assertRaisesRegex(ValueError, "subsession-has-no-stage-gate-authority"):
                     CR.complete_node(route, node, "execute", evidence, jobs=jobs_path, attempt_id=slice_attempt_id)
+
+    def test_code_test_aggregate_binds_exact_child_subjects_and_replays_historically(self):
+        import review_source_subject as RSS
+        for state in ("missing", "mixed", "stale", "epoch-stale"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as td:
+                worktree, route, node, manifest_path, manifest, jobs, evidence = self._source_test_fixture(
+                    td, missing=state == "missing", mixed=state == "mixed",
+                    stale=state == "stale", epoch_stale=state == "epoch-stale")
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}), \
+                     mock.patch.object(CR, "completion_dir",
+                                       side_effect=lambda route_id, **_kw: jobs.parent / "completion" / route_id), \
+                     mock.patch.object(CR, "dispatch_state_roots", return_value=[jobs.parent]):
+                    self._admit(route, node, manifest)
+                    expected = {
+                        "missing": "review-source-binding-missing",
+                        "mixed": "review-source-aggregate-binding-mixed",
+                        "stale": "review-source-aggregate-subject-stale",
+                        "epoch-stale": "review-source-aggregate-epoch-stale",
+                    }[state]
+                    completed = self._public_complete(route, node, manifest_path, jobs, evidence)
+                    self.assertEqual(completed.returncode, 64, completed.stdout + completed.stderr)
+                    self.assertIn(expected, completed.stderr)
+                    self.assertFalse((jobs.parent / "completion" / route["route_id"] / "execute.json").exists())
+
+        with tempfile.TemporaryDirectory() as td:
+            worktree, route, node, manifest_path, manifest, jobs, evidence = self._source_test_fixture(td)
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}), \
+                 mock.patch.object(CR, "completion_dir",
+                                   side_effect=lambda route_id, **_kw: jobs.parent / "completion" / route_id), \
+                 mock.patch.object(CR, "dispatch_state_roots", return_value=[jobs.parent]):
+                self._admit(route, node, manifest)
+                completed = self._public_complete(route, node, manifest_path, jobs, evidence)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                marker = json.loads(completed.stdout.splitlines()[0])
+                source = marker["source_subject"]
+                self.assertTrue(source["digest"])
+                synthetic = {"attempt_id": marker["attempt_id"], "route_id": route["route_id"],
+                             "route_hash": route["route_hash"], "route_node": node["id"],
+                             "review_subject_digest": source["digest"],
+                             "review_subject_binding_digest": source["binding_digest"]}
+                aggregate = RSS.read_binding(jobs, synthetic)
+                self.assertEqual(aggregate["aggregate_child_attempts"],
+                                 [session["attempt_id"] for session in manifest["sessions"]])
+                self.assertEqual(aggregate["subject_digest"], source["digest"])
+                self.assertEqual(aggregate["source_epoch"], source["epoch"])
+                (worktree / "source/file-1.py").write_text("changed after completion\n", encoding="utf-8")
+                replayed = self._public_complete(route, node, manifest_path, jobs, evidence)
+                self.assertEqual(replayed.returncode, 0, replayed.stdout + replayed.stderr)
+                replay = json.loads(replayed.stdout.splitlines()[0])
+                self.assertEqual(replay, marker)
 
     def test_post_exit_receipt_settles_a_slice_from_a_pid_namespace_out_of_sight(self):
         # A slice a codex owner ran inside its command sandbox is foreground-scoped

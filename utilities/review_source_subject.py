@@ -1022,6 +1022,55 @@ def read_binding(jobs: str | Path, metadata: dict, *, required: bool = True) -> 
     return record
 
 
+def aggregate_source_binding(jobs: str | Path, route: dict, node: dict, attempt_id: str,
+                             child_metadata, *, worktree: str | Path,
+                             completion_dir: str | Path) -> dict[str, str]:
+    """Bind an aggregate to the exact shared subject and epoch its children tested."""
+    records = []
+    for metadata in child_metadata:
+        record = read_binding(jobs, metadata, required=True)
+        if record is None:
+            raise SourceSubjectError("review-source-binding-missing",
+                                     str(metadata.get("attempt_id", "")))
+        records.append(record)
+    if not records:
+        raise SourceSubjectError("review-source-binding-missing", attempt_id)
+
+    def identity(record):
+        return (
+            record.get("route_id"), record.get("route_hash"), record.get("node_id"),
+            record.get("subject_digest"), record.get("source_epoch"),
+            record.get("family", "source"), _canonical(record.get("manifest")),
+            _canonical(record.get("scope")), _canonical(record.get("provenance")),
+        )
+
+    if any(identity(record) != identity(records[0]) for record in records[1:]):
+        raise SourceSubjectError("review-source-aggregate-binding-mixed", attempt_id)
+    first = records[0]
+    current = observe(route, node, worktree=worktree, jobs=jobs)
+    family = first.get("family", "source")
+    expected_epoch = source_epoch(route, node, current["digest"], completion_dir,
+                                  family=family,
+                                  exclude_attempt_ids={
+                                      str(item.get("attempt_id", ""))
+                                      for item in child_metadata
+                                  })
+    if current["digest"] != first["subject_digest"]:
+        raise SourceSubjectError("review-source-aggregate-subject-stale", attempt_id)
+    if expected_epoch != first["source_epoch"]:
+        raise SourceSubjectError("review-source-aggregate-epoch-stale", attempt_id)
+    aggregate = {key: value for key, value in first.items()
+                 if key not in {"attempt_id", "binding_digest"}}
+    aggregate["attempt_id"] = attempt_id
+    aggregate["aggregate_child_attempts"] = [
+        str(item.get("attempt_id", "")) for item in child_metadata
+    ]
+    aggregate["binding_digest"] = _binding_digest(aggregate)
+    _write_once(binding_path(jobs, attempt_id), aggregate)
+    return {"review_subject_digest": aggregate["subject_digest"],
+            "review_subject_binding_digest": aggregate["binding_digest"]}
+
+
 def annotate_rows(jobs: str | Path, rows, *, route: dict | None = None,
                   node: dict | None = None, family: str | None = None):
     """Add verified subject labels to an in-memory round census only."""
@@ -1143,7 +1192,8 @@ def _canonical_head(generation: dict, generation_dir: Path, node_id: str, candid
 
 
 def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Path,
-                 *, family: str = "source") -> int:
+                 *, family: str = "source",
+                 exclude_attempt_ids: set[str] | None = None) -> int:
     """Predict the route-wide source epoch from append-only marker history.
 
     Epoch changes only when source content changes. Marker sequence, report
@@ -1153,6 +1203,7 @@ def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Pat
     epoch across source-consuming markers carries across sibling branches too.
     """
     directory = Path(completion_dir)
+    excluded_attempts = exclude_attempt_ids or set()
     generations = _source_generations(route)
     completion_root = directory.parent
     observations = []
@@ -1205,6 +1256,8 @@ def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Pat
                 if "=" in part:
                     key, value = part.split("=", 1)
                     metadata[key] = value
+            if metadata.get("attempt_id") in excluded_attempts:
+                continue
             generation = route_by_id.get(metadata.get("route_id", ""))
             if generation is None or metadata.get("route_hash") != generation.get("route_hash"):
                 continue
@@ -1241,6 +1294,8 @@ def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Pat
             if "=" in part:
                 key, value = part.split("=", 1)
                 metadata[key] = value
+        if metadata.get("attempt_id") in excluded_attempts:
+            continue
         generation = route_by_id.get(metadata.get("route_id", ""))
         if generation is None or not (metadata.get("review_subject_digest")
                                       or metadata.get("review_subject_binding_digest")):

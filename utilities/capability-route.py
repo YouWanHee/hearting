@@ -10890,6 +10890,7 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
     rows = {}
     for item in projected:
         rows.setdefault(item["metadata"]["attempt_id"], []).append((item["fields"], item["metadata"]))
+    effective_child_metadata = []
     for session in manifest["sessions"]:
         matches=rows.get(effective_attempts[session["attempt_id"]],[])
         if len(matches)!=1:
@@ -10916,6 +10917,7 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
         process=attempt_process_quiescence(metadata,terminal_receipt=True)
         if process.state!="quiescent":
             raise ValueError(f"subsession process not quiescent:{session['attempt_id']}:{process.reason}")
+        effective_child_metadata.append(metadata)
     # AC 28 post-hoc diff-scope audit, measured against the subdivision's own
     # start state (anchor M3). `git status` sees the whole worktree, so the
     # audit subtracts the admission-time baseline first; what remains is what
@@ -10951,6 +10953,16 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
             "sessions": len(manifest["sessions"]),
             "resumed": True,
         }
+
+    from review_source_subject import aggregate_source_binding, has_review_subject
+    if has_review_subject(route, node, jobs_path):
+        metadata.update(attempt_id=attempt_id, route_id=route["route_id"],
+                        route_hash=route["route_hash"], route_node=node_id)
+        metadata.update(aggregate_source_binding(
+            jobs_path, route, node, attempt_id, effective_child_metadata,
+            worktree=manifest["worktree"],
+            completion_dir=completion_dir(route["route_id"]),
+        ))
 
     def _refuse(reason, detail):
         record_degradation(
@@ -11079,6 +11091,7 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
         marker=write_completion_marker(
             route,node,node_id,evidence,
             attempt_id=attempt_id,attempt_metadata=metadata,
+            jobs=jobs_path,
             owner_chain=True,
             _lock_held=True,
         )
