@@ -22,7 +22,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -257,63 +256,245 @@ class LegacyRouteCompatibilityTest(unittest.TestCase):
 
 
 class LegacyDesignRegistryBasisTest(unittest.TestCase):
-    def test_old_design_declaration_requires_exact_immutable_basis(self):
+    @staticmethod
+    def _legacy_value(value):
+        if isinstance(value, str):
+            if value == "designs":
+                return "designs/<cycle>"
+            if value.startswith("designs/"):
+                return "designs/<cycle>/" + value[len("designs/"):]
+            return value
+        if isinstance(value, list):
+            return [LegacyDesignRegistryBasisTest._legacy_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: LegacyDesignRegistryBasisTest._legacy_value(item)
+                    for key, item in value.items()}
+        return value
+
+    def _original_style_route(self, old_root):
         current = R.TOPO.load_registry()
+        old_registry = self._legacy_value(current)
+        base = Path(old_root).parent
+        artifact_root = base / "artifacts"
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        jobs = base / "jobs.log"
+        jobs.write_text("", encoding="utf-8")
+        checked = {
+            "parent_harness": "codex", "parent_transport": "headless",
+            "parent_sandbox": "workspace-write", "child_harness": "codex",
+            "launch_authority": "conductor", "status": "supported",
+            "probe_source": "fixture", "probe_time": "2026-10-25T00:00:00Z",
+            "failure_class": "", "checked_worktree": str(ROOT),
+            "failure_scope": "none", "codex_command": "ok",
+            "retry_on_isolated_worktree": 0,
+        }
+        gate = {
+            "spec_read": {"satisfied": True, "source": "fixture"},
+            "drift_verdict": "within-spec", "workflow_mode": "tracked",
+            "artifact_guard": {"satisfied": True, "source": "fixture"},
+        }
+        with mock.patch.dict(os.environ, {
+                "AGENT_HOME": str(ROOT), "AGENT_DISPATCH_JOBS": str(jobs),
+                "AGENT_ARTIFACT_ROOT": str(artifact_root), "HEARTING_GATES": "on",
+        }, clear=False):
+            route = R.compile_route(
+                capability="autopilot-design", capability_mode="default",
+                requested_intensity="standard", cwd=ROOT, artifact_root=artifact_root,
+                transport="headless", tracking="tracked", tracked_gate_evidence=gate,
+                dispatch_evidence={"tuples": [checked], "native_subagent": []},
+                registered_headless_evidence={"candidates": [{
+                    "harness": "codex", "transport": "headless",
+                    "surface": "registered-headless", "status": "supported",
+                    "probe_source": "fixture", "probe_time": "2026-10-25T00:00:00Z",
+                }]},
+            )
+        route = self._legacy_value(route)
+        route["registry_digest"] = R.TOPO.registry_digest(old_registry)
+        route["capability_registry_digest"] = R.TOPO.capability_registry_digest(
+            old_registry, "autopilot-design")
+        route["validation_basis"] = {
+            "basis_version": 1, "registry_root": str(old_root),
+            "runtime_root": str(old_root), "unit_catalog_root": str(old_root),
+            "runtime_root_validated": True, "runtime_root_match": True,
+        }
+        route["route_hash"] = R.route_hash(route)
+        route["route_id"] = "rt-" + route["route_hash"].split(":", 1)[1][:16]
+        return current, old_registry, route
 
-        def legacy_value(value):
-            if isinstance(value, str):
-                if value == "designs":
-                    return "designs/<cycle>"
-                if value.startswith("designs/"):
-                    return value.replace("designs/", "designs/<cycle>/", 1)
-                return value
-            if isinstance(value, list):
-                return [legacy_value(item) for item in value]
-            if isinstance(value, dict):
-                return {key: legacy_value(item) for key, item in value.items()}
-            return value
-
-        old_registry = legacy_value(current)
-        def flat_value(value):
-            if isinstance(value, str):
-                return value.replace("designs/<cycle>", "designs")
-            if isinstance(value, list):
-                return [flat_value(item) for item in value]
-            if isinstance(value, dict):
-                return {key: flat_value(item) for key, item in value.items()}
-            return value
-        self.assertEqual(flat_value(old_registry), current)
+    def test_unavailable_old_catalogue_and_release_verify_from_exact_digests(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "sealed-v3.43.6"
-            (root / "capabilities").mkdir(parents=True)
-            shutil.copytree(ROOT / "roles" / "units", root / "roles" / "units")
-            (root / "capabilities" / "topologies.json").write_text(
-                json.dumps(old_registry, ensure_ascii=False), encoding="utf-8")
-            unit_digest = R.unit_catalog_digest(root / "roles" / "units")
-            basis = {"basis_version": 1, "registry_root": str(root),
-                     "runtime_root": str(root), "unit_catalog_root": str(root),
-                     "runtime_root_validated": True, "runtime_root_match": True}
-            route = {"capability": "autopilot-design",
-                     "registry_digest": R.TOPO.registry_digest(old_registry),
-                     "capability_registry_digest": R.TOPO.capability_registry_digest(
-                         old_registry, "autopilot-design"),
-                     "unit_catalog_digest": unit_digest, "validation_basis": basis}
-            original_hash = R.route_hash(route)
-            actual_unit_digest = R.unit_catalog_digest
-            with mock.patch.object(R, "_verified_immutable_release_identity",
-                                   return_value={"version": "v3.43.6"}), \
-                 mock.patch.object(R, "unit_catalog_digest", side_effect=lambda path=None:
-                                   unit_digest if path is None else actual_unit_digest(path)):
-                accepted = R._authenticated_legacy_design_registry(route, basis, current)
-                self.assertEqual(accepted, old_registry)
-                self.assertEqual(R.route_hash(route), original_hash)
-                changed = json.loads(json.dumps(current))
-                changed["artifact_buckets"]["documents"] += "/tampered"
-                self.assertIsNone(R._authenticated_legacy_design_registry(route, basis, changed))
-                with mock.patch.object(R, "unit_catalog_digest", return_value="sha256:" + "0" * 64):
-                    self.assertIsNone(R._authenticated_legacy_design_registry(route, basis, current))
-            with mock.patch.object(R, "_verified_immutable_release_identity", return_value=None):
-                self.assertIsNone(R._authenticated_legacy_design_registry(route, basis, current))
+            self.base = Path(temporary)
+            for label, create_root in (("catalogue-missing", True), ("release-missing", False)):
+                with self.subTest(old_root=label):
+                    root = self.base / label
+                    if create_root:
+                        root.mkdir()
+                    current, old_registry, route = self._original_style_route(root)
+                    basis = route["validation_basis"]
+                    original = copy.deepcopy(route)
+                    original_hash = route["route_hash"]
+                    accepted = R._authenticated_legacy_design_registry(route, basis, current)
+                    self.assertEqual(accepted, old_registry)
+                    self.assertFalse((root / "capabilities" / "topologies.json").exists())
+                    self.assertEqual(route, original)
+                    self.assertEqual(R.route_hash(route), original_hash)
+
+                    route_file = self.base / f"{label}.json"
+                    route_bytes = json.dumps(route, sort_keys=True).encode() + b"\n"
+                    route_file.write_bytes(route_bytes)
+                    old_path_calls = []
+                    verified_identity = R._verified_immutable_release_identity
+
+                    def only_current_release(path):
+                        candidate = Path(path).resolve(strict=False)
+                        if candidate == root.resolve(strict=False):
+                            old_path_calls.append(str(candidate))
+                            raise AssertionError("historical validation root was reopened")
+                        return verified_identity(path)
+
+                    with mock.patch.dict(os.environ, {
+                            "AGENT_HOME": str(ROOT),
+                            "AGENT_DISPATCH_JOBS": str(self.base / "jobs.log"),
+                            "AGENT_ARTIFACT_ROOT": str(self.base / "artifacts"),
+                            "HEARTING_GATES": "on",
+                    }, clear=False), \
+                         mock.patch.object(R, "_verified_immutable_release_identity",
+                                           side_effect=only_current_release):
+                        self.assertEqual(R.verify_route(route, expected_cwd=ROOT)["route_hash"],
+                                         original_hash)
+                        compatible, mismatches = R.revalidate_launch_compatibility(route)
+                        self.assertTrue(compatible, mismatches)
+                        argv = ["capability-route.py", "verify", "--route", str(route_file),
+                                "--cwd", str(ROOT), "--launch-phase", "start"]
+                        with mock.patch.object(R.sys, "argv", argv):
+                            R.main()
+                    self.assertEqual(old_path_calls, [])
+                    self.assertEqual(route_file.read_bytes(), route_bytes)
+
+    def test_exact_bridge_rejects_digest_registry_unit_recipe_and_tuple_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self.base = Path(temporary)
+            root = self.base / "pruned-release"
+            current, old_registry, route = self._original_style_route(root)
+            basis = route["validation_basis"]
+            helper = R._authenticated_legacy_design_registry
+
+            for key in ("registry_digest", "capability_registry_digest"):
+                changed = copy.deepcopy(route)
+                changed[key] = "sha256:" + "0" * 64
+                self.assertIsNone(helper(changed, basis, current), key)
+
+            changed_registries = {}
+            changed = copy.deepcopy(current)
+            changed["artifact_buckets"]["documents"] += "/tampered"
+            changed_registries["unrelated-bytes"] = changed
+            changed = copy.deepcopy(current)
+            design = next(item for item in changed["recipes"]
+                          if item.get("capability") == "autopilot-design")
+            design["standard_plus"]["nodes"][0]["role"] = "fast implementer"
+            changed_registries["role"] = changed
+            changed = copy.deepcopy(current)
+            changed["parallel_group_max_width"] += 1
+            changed_registries["parallel-width"] = changed
+            changed = copy.deepcopy(current)
+            changed["owner_profile_by_intensity"]["standard"] = "balanced-deep"
+            changed_registries["profile"] = changed
+            for label, changed in changed_registries.items():
+                self.assertIsNone(helper(route, basis, changed), label)
+
+            with mock.patch.object(R, "unit_catalog_digest", return_value="sha256:" + "0" * 64):
+                self.assertIsNone(helper(route, basis, current), "current unit drift")
+
+            recipe_tamper = copy.deepcopy(route)
+            recipe_tamper["composed"] = True
+            recipe_tamper["composed_recipe"] = next(
+                item for item in old_registry["recipes"]
+                if item.get("capability") == "autopilot-design")
+            recipe_tamper["capability_registry_digest"] = R.TOPO.capability_registry_digest(
+                old_registry, "autopilot-design", [recipe_tamper["composed_recipe"]])
+            self.assertIsNone(helper(recipe_tamper, basis, current), "unverified embedded recipe")
+            recipe_tamper["composed_recipe"] = copy.deepcopy(recipe_tamper["composed_recipe"])
+            recipe_tamper["composed_recipe"]["standard_plus"]["nodes"][0]["role"] = "fast implementer"
+            recipe_tamper["capability_registry_digest"] = R.TOPO.capability_registry_digest(
+                old_registry, "autopilot-design", [recipe_tamper["composed_recipe"]])
+            self.assertIsNone(helper(recipe_tamper, basis, current), "tampered embedded recipe")
+
+            node_tamper = copy.deepcopy(route)
+            node_tamper["nodes"][0]["write_scope"] = ["designs/<cycle>/outside/**"]
+            node_tamper["route_hash"] = R.route_hash(node_tamper)
+            node_tamper["route_id"] = "rt-" + node_tamper["route_hash"].split(":", 1)[1][:16]
+            with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}, clear=False):
+                with self.assertRaisesRegex(ValueError, "node frame outputs outside write_scope|nodes differ"):
+                    R.verify_route(node_tamper, expected_cwd=ROOT)
+
+            tuple_tamper = copy.deepcopy(route)
+            tuple_tamper["launch_compatibility_tuple"]["registry_root"]["binding_digest"] = "sha256:" + "0" * 64
+            tuple_tamper["route_hash"] = R.route_hash(tuple_tamper)
+            tuple_tamper["route_id"] = "rt-" + tuple_tamper["route_hash"].split(":", 1)[1][:16]
+            with mock.patch.dict(os.environ, {
+                    "AGENT_HOME": str(ROOT), "HEARTING_GATES": "on",
+            }, clear=False):
+                compatible, mismatch = R.revalidate_launch_compatibility(tuple_tamper)
+            self.assertFalse(compatible)
+            self.assertIn("registry_root", mismatch)
+
+    def test_valid_composed_legacy_recipe_verifies_without_its_release(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            artifact_root = base / "artifacts"
+            artifact_root.mkdir()
+            jobs = base / "jobs.log"
+            jobs.write_text("", encoding="utf-8")
+            missing_release = base / "pruned-release"
+            current = R.TOPO.load_registry()
+            old_registry = self._legacy_value(current)
+            checked = {
+                "parent_harness": "codex", "parent_transport": "headless",
+                "parent_sandbox": "workspace-write", "child_harness": "codex",
+                "launch_authority": "conductor", "status": "supported",
+                "probe_source": "fixture", "probe_time": "2026-10-25T00:00:00Z",
+                "failure_class": "", "checked_worktree": str(ROOT),
+                "failure_scope": "none", "codex_command": "ok",
+                "retry_on_isolated_worktree": 0,
+            }
+            readiness = {
+                "tuples": [checked],
+                "candidates": [{
+                    "harness": "codex", "transport": "headless",
+                    "surface": "registered-headless", "status": "supported",
+                    "probe_source": "fixture", "probe_time": "2026-10-25T00:00:00Z",
+                }],
+            }
+            with mock.patch.dict(os.environ, {
+                    "AGENT_HOME": str(ROOT), "AGENT_DISPATCH_JOBS": str(jobs),
+                    "AGENT_ARTIFACT_ROOT": str(artifact_root), "HEARTING_GATES": "on",
+            }, clear=False), mock.patch.object(R, "_compose_readiness", return_value=readiness):
+                route = R.compose_route(
+                    capability="autopilot-design", capability_mode="default", shape="staged",
+                    graph="build,visual-verify,critic-review,handoff", slug="legacy-composed-fixture",
+                    cwd=ROOT, artifact_root=artifact_root, spec_read="fixture",
+                    drift_verdict="within-spec", tracking="tracked", artifact_guard="fixture",
+                    dispatch_evidence={"tuples": [checked], "native_subagent": []}, unassigned=True,
+                )
+            route = self._legacy_value(route)
+            route["registry_digest"] = R.TOPO.registry_digest(old_registry)
+            route["capability_registry_digest"] = R.TOPO.capability_registry_digest(
+                old_registry, "autopilot-design", [route["composed_recipe"]])
+            route["validation_basis"] = {
+                "basis_version": 1, "registry_root": str(missing_release),
+                "runtime_root": str(missing_release), "unit_catalog_root": str(missing_release),
+                "runtime_root_validated": True, "runtime_root_match": True,
+            }
+            route["route_hash"] = R.route_hash(route)
+            route["route_id"] = "rt-" + route["route_hash"].split(":", 1)[1][:16]
+            route_file = base / "composed-route.json"
+            # Preserve registry declaration order in this original-style route;
+            # the width-tier map is an ordered contract.
+            route_bytes = json.dumps(route, ensure_ascii=False, indent=2).encode() + b"\n"
+            route_file.write_bytes(route_bytes)
+            verified = R.verify_route(json.loads(route_file.read_text()), expected_cwd=ROOT)
+            self.assertEqual(verified["route_hash"], route["route_hash"])
+            self.assertEqual(route_file.read_bytes(), route_bytes)
 
 
 if __name__ == '__main__':

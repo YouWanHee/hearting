@@ -145,6 +145,103 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
                                                  jobs=self.jobs),
                          ("superseded", "completion-review-source-stale"))
 
+    def test_plan_execute_test_consumes_checklist_progress_and_keeps_plan_identity(self):
+        import review_input as INPUT
+
+        plan = {"id": "plan", "kind": "pipeline-stage", "unit": "plan/plan-author",
+                "completion_gate": "code-plan", "dispatch_depth": 2,
+                "outputs": ["plan.md", "checklist.md"],
+                "write_scope": ["plan.md", "checklist.md"], "depends_on": []}
+        review = {"id": "plan-check", "kind": "review-worker", "unit": "qa/plan-review",
+                  "completion_gate": "code-plan-check", "dispatch_depth": 2,
+                  "inputs": ["plan.md", "checklist.md"],
+                  "write_scope": ["_internal/reviews/plan-check/**"], "depends_on": ["plan"]}
+        execute = {"id": "execute", "kind": "pipeline-stage", "unit": "dev/backend",
+                   "completion_gate": "code-execute", "dispatch_depth": 2,
+                   "write_scope": ["source/**", "checklist.md", "dev_logs/**", "evidence/**"],
+                   "depends_on": ["plan-check"]}
+        test = {"id": "test", "kind": "pipeline-stage", "unit": "qa/test",
+                "completion_gate": "code-test", "dispatch_depth": 2,
+                "write_scope": ["test_logs/**"], "depends_on": ["execute"]}
+        self.route = {
+            "schema_version": 2, "dispatch_contract_version": 3,
+            "registry_digest": ROUTE_WRITER.TOPO.registry_digest(ROUTE_WRITER.TOPO.load_registry()),
+            "capability": "autopilot-code", "capability_mode": "debug",
+            "effective_intensity": "standard", "continuation_budget": {"review_round_cap": 2},
+            "cwd": str(self.repo), "artifact_root": str(self.artifact_root),
+            "nodes": [plan, review, execute, test],
+        }
+        self.route["route_hash"] = route_hash(self.route)
+        self.route["route_id"] = route_id_from_hash(self.route["route_hash"])
+        self.route_file.write_text(json.dumps(self.route, sort_keys=True), encoding="utf-8")
+        self.review_node = review
+        self.test_node = test
+
+        plan_path = self.artifact_root / "plan.md"
+        checklist_path = self.artifact_root / "checklist.md"
+
+        def publish_plan(attempt, text, checklist):
+            plan_path.write_text(text, encoding="utf-8")
+            checklist_path.write_text(checklist, encoding="utf-8")
+            return ROUTE_WRITER._publish_completion_locked(
+                self.route, plan, "plan", plan_path, jobs=self.jobs,
+                attempt_id=attempt, attempt_metadata=self._inline_metadata(plan, attempt),
+            )
+
+        def finish_plan_review(attempt):
+            candidate = INPUT.resolve_input(self.route, review, self.jobs)
+            metadata = self._metadata(review, attempt, "review")
+            metadata[INPUT.KEY] = INPUT.seal_binding(self.jobs, metadata, candidate)
+            metadata.update(SUBJECT.seal_attempt(
+                self.jobs, self.route, review, attempt, worktree=self.repo,
+                expected_subject_digest=None, attempt_metadata=metadata,
+            ))
+            self._row(metadata, extra={"launch_outcome": "reaped-before-publish"})
+            evidence = self.artifact_root / f"{attempt}.md"
+            evidence.write_text("independent plan review: PASS\n", encoding="utf-8")
+            marker = ROUTE_WRITER._publish_completion_locked(
+                self.route, review, review["id"], evidence, jobs=self.jobs,
+                attempt_id=attempt, attempt_metadata=metadata,
+            )
+            return candidate, metadata, marker
+
+        publish_plan("att-plan-A", "Plan A\n", "- [ ] implement\n")
+        admission_a = DISPATCH_NODE.admit_round(
+            self.route, review, self.jobs, record_auto_revisions=False)
+        candidate_a, metadata_a, _marker_a = finish_plan_review("att-plan-check-A")
+        digest_a = SUBJECT.read_binding(self.jobs, metadata_a)["subject_digest"]
+        self.assertEqual(admission_a.source_subject_digest, digest_a)
+
+        # A substantive plan update gets its own content budget before execute.
+        publish_plan("att-plan-B", "Plan B changes the API contract\n", "- [ ] implement\n")
+        admission_b = DISPATCH_NODE.admit_round(
+            self.route, review, self.jobs, record_auto_revisions=False)
+        candidate_b, metadata_b, marker_b = finish_plan_review("att-plan-check-B")
+        digest_b = SUBJECT.read_binding(self.jobs, metadata_b)["subject_digest"]
+        self.assertNotEqual(candidate_a["sha256"], candidate_b["sha256"])
+        self.assertNotEqual(digest_a, digest_b)
+        self.assertEqual(admission_b.source_subject_digest, digest_b)
+        self.assertEqual(admission_b.budget.verdict_rounds, 0)
+
+        # Execute consumes the current plan-check, then records routine progress
+        # in the companion checklist. Test depends directly on execute.
+        self.assertIsNone(DC.completion_marker_gate(
+            str(self.route_file), "execute", "start", self.agent_home, self.jobs))
+        checklist_path.write_text("- [x] implement\n", encoding="utf-8")
+        execute_evidence = self.artifact_root / "execute-after-plan.md"
+        execute_evidence.write_text("execute completed\n", encoding="utf-8")
+        ROUTE_WRITER._publish_completion_locked(
+            self.route, execute, "execute", execute_evidence, jobs=self.jobs,
+            attempt_id="att-execute-after-plan",
+            attempt_metadata=self._inline_metadata(execute, "att-execute-after-plan"),
+        )
+        completion = ROUTE_WRITER.completion_dir(self.route["route_id"], jobs=self.jobs)
+        self.assertEqual(SUBJECT.marker_currency(
+            self.route, review, marker_b, completion, jobs=self.jobs),
+            ("superseded", "completion-review-source-stale"))
+        self.assertIsNone(DC.completion_marker_gate(
+            str(self.route_file), "test", "start", self.agent_home, self.jobs))
+
     def test_handoff_consumer_requires_both_critic_group_completions(self):
         visual = {"id": "visual-verify", "kind": "review-worker", "depends_on": [],
                   "completion_gate": "design-verify", "parallel_group": "visual-verify"}

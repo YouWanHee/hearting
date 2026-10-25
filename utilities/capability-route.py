@@ -5491,63 +5491,78 @@ def _entry_scope_legacy_registry(registry):
 
 
 def _authenticated_legacy_design_registry(route, basis, current_registry):
-    """Authenticate the old literal design recipe through its sealed basis.
+    """Reconstruct the exact old design registry from today's flat registry.
 
-    This bridge is limited to the exact flat-layout migration. The old
-    registry must come from the route's verified immutable release, match its
-    sealed digests, and transform byte-for-byte to the current registry by
-    replacing only the design cycle component. Unit contracts stay current.
+    The validated basis is route provenance, not a pointer we need to reopen:
+    exact inverse reconstruction plus both route-sealed registry digests prove
+    the old declaration. Current units remain independently pinned. This
+    keeps the bridge usable after a historical release has been pruned without
+    treating an embedded recipe or a basis path as authority.
     """
     if (route.get("capability") != "autopilot-design" or not isinstance(basis, dict)
             or not isinstance(current_registry, dict)):
         return None
-    registry_root = Path(str(basis.get("registry_root") or ""))
-    runtime_root = Path(str(basis.get("runtime_root") or ""))
-    unit_root = Path(str(basis.get("unit_catalog_root") or ""))
-    if not all(path.is_absolute() for path in (registry_root, runtime_root, unit_root)):
-        return None
     try:
-        if not immutable_code_root_equivalent(registry_root, runtime_root):
+        TOPO.validate_registry(current_registry)
+        if (not isinstance(route.get("registry_digest"), str)
+                or not isinstance(route.get("capability_registry_digest"), str)
+                or not isinstance(route.get("unit_catalog_digest"), str)):
             return None
-        if _verified_immutable_release_identity(registry_root) is None:
+        if unit_catalog_digest() != route.get("unit_catalog_digest"):
             return None
-        sealed_path = registry_root / "capabilities" / "topologies.json"
-        info = sealed_path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            return None
-        sealed = json.loads(sealed_path.read_text(encoding="utf-8"))
-        if not isinstance(sealed, dict):
+
+        changed = False
+        invalid = object()
+
+        def restore_cycle_component(value):
+            nonlocal changed
+            if isinstance(value, str):
+                if "designs/<cycle>" in value:
+                    return invalid
+                if value == "designs":
+                    changed = True
+                    return "designs/<cycle>"
+                if value.startswith("designs/"):
+                    changed = True
+                    return "designs/<cycle>/" + value[len("designs/"):]
+                return value
+            if isinstance(value, list):
+                restored = [restore_cycle_component(item) for item in value]
+                return invalid if any(item is invalid for item in restored) else restored
+            if isinstance(value, dict):
+                restored = {}
+                for key, item in value.items():
+                    restored_value = restore_cycle_component(item)
+                    if restored_value is invalid:
+                        return invalid
+                    restored[key] = restored_value
+                return restored
+            return value
+
+        sealed = restore_cycle_component(current_registry)
+        if not changed or sealed is invalid or not isinstance(sealed, dict):
             return None
         TOPO.validate_registry(sealed)
-        TOPO.validate_registry(current_registry)
-        if TOPO.registry_digest(sealed) != route.get("registry_digest"):
-            return None
-        if (unit_catalog_digest(unit_root / "roles" / "units") != route.get("unit_catalog_digest")
-                or unit_catalog_digest() != route.get("unit_catalog_digest")):
-            return None
-        extras = ([route["composed_recipe"]]
-                  if route.get("composed") and isinstance(route.get("composed_recipe"), dict)
-                  else ())
-        sealed_capability = TOPO.capability_registry_digest(sealed, route["capability"], extras)
-        if (route.get("capability_registry_digest") is not None
-                and route.get("capability_registry_digest") != sealed_capability):
-            return None
         design_recipe = next((item for item in sealed.get("recipes", [])
                               if item.get("capability") == "autopilot-design"), None)
         if not isinstance(design_recipe, dict) or "designs/<cycle>" not in json.dumps(
                 design_recipe, ensure_ascii=False):
             return None
 
-        def flatten(value):
-            if isinstance(value, str):
-                return value.replace("designs/<cycle>", "designs")
-            if isinstance(value, list):
-                return [flatten(item) for item in value]
-            if isinstance(value, dict):
-                return {key: flatten(item) for key, item in value.items()}
-            return value
-
-        if flatten(sealed) != current_registry:
+        if TOPO.registry_digest(sealed) != route.get("registry_digest"):
+            return None
+        if route.get("composed"):
+            recipe = route.get("composed_recipe")
+            if (not isinstance(recipe, dict)
+                    or not _versioned_subgraph(sealed, recipe)):
+                return None
+            extras = [recipe]
+        else:
+            if route.get("composed_recipe") is not None:
+                return None
+            extras = ()
+        if TOPO.capability_registry_digest(sealed, route["capability"], extras) != route.get(
+                "capability_registry_digest"):
             return None
         return sealed
     except (OSError, ValueError, TypeError, KeyError):
