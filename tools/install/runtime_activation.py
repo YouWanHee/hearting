@@ -3201,27 +3201,26 @@ def _apply_transaction(
                 continue
             native_state = native_states.get(key)
             if native_state is not None:
-                with safe_fs.TargetLock(dest):
-                    current = _native_agent_current(
-                        paths.runtime_home(runtime, scope), dest,
-                        native_state, previous_native.get(key))
-                    if current is None:
-                        prior = previous_native.get(key)
-                        if prior is not None:
-                            if (prior.get("kind") == "render"
-                                    and desired_by_dest.get(key, {}).get("kind") == "symlink"
-                                    and safe_fs.capture_state(dest).kind == "file"):
-                                raise ActivationError(
-                                    f"destination collision; refusing to overwrite: {dest}")
-                            preserved.append(dict(prior))
-                            continue
-                        if (safe_fs.capture_state(dest) == native_state
-                                and native_state.kind == "symlink"
-                                and not native_agent_ownership.owned_link(
-                                    paths.runtime_home(runtime, scope), dest)):
-                            raise ActivationError(f"foreign native agent symlink collision: {dest}")
-                        raise ActivationError(
-                            f"expected-state-mismatch: native agent changed: {dest}")
+                current = _native_agent_current(
+                    paths.runtime_home(runtime, scope), dest,
+                    native_state, previous_native.get(key))
+                if current is None:
+                    prior = previous_native.get(key)
+                    if prior is not None:
+                        if (prior.get("kind") == "render"
+                                and desired_by_dest.get(key, {}).get("kind") == "symlink"
+                                and safe_fs.capture_state(dest).kind == "file"):
+                            raise ActivationError(
+                                f"destination collision; refusing to overwrite: {dest}")
+                        preserved.append(dict(prior))
+                        continue
+                    if (safe_fs.capture_state(dest) == native_state
+                            and native_state.kind == "symlink"
+                            and not native_agent_ownership.owned_link(
+                                paths.runtime_home(runtime, scope), dest)):
+                        raise ActivationError(f"foreign native agent symlink collision: {dest}")
+                    raise ActivationError(
+                        f"expected-state-mismatch: native agent changed: {dest}")
             kind = desired_by_dest.get(key, {}).get("kind", "remove")
             source = desired_by_dest.get(key, {}).get("source")
             if (runtime == "codex" and native_agent_ownership.agent_leaf(
