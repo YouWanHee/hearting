@@ -6,9 +6,11 @@ from pathlib import Path
 from unittest import mock
 
 from tools.fleet.tests.parity_compare import diff_frames
-from tools.fleet.tests.parity_today import (REFERENCE_MASK_VERSION, R14_REFERENCE_PROFILE,
+from tools.fleet.tests.parity_today import (REFERENCE_MASK_VERSION, R14_GENERIC_OVERFLOW_CASES,
+                                            R14_REFERENCE_PROFILE,
                                             R14_RESIDUAL_CELL_PAIRS, _frame_from_reference, _jsonable,
-                                            _unique_reference_copy_limitations, build_live_vm, classify, main)
+                                            _unique_reference_copy_limitations, _wide_continuation_pair_is_complete,
+                                            build_live_vm, classify, main)
 
 
 class TodayParityPlumbingTests(unittest.TestCase):
@@ -153,6 +155,25 @@ def _r14_residual_record(state, width, row, *, hits=None):
     return record
 
 
+def _r14_generic_overflow_record(state="OVERVIEW", width=80, row=5):
+    contract = R14_GENERIC_OVERFLOW_CASES[(state, width, row)]
+    record = _record(width=width)
+    record["state"] = state
+    trace_cells = []
+    for column, (expected, actual, kinds) in contract.items():
+        record["reference_cells"][row][column] = expected
+        record["fleet2_cells"][row][column] = actual
+        record["differences"].append({"kind": "cell", "row": row, "column": column,
+                                      "expected": list(expected), "actual": list(actual)})
+        trace_cells.append({"row": row, "column": column, "kinds": list(kinds)})
+    record["reference_rows"][row] = "".join(cell[0] or "" for cell in record["reference_cells"][row])
+    record["fleet2_rows"][row] = "".join(cell[0] or "" for cell in record["fleet2_cells"][row])
+    record["reference_profile"] = R14_REFERENCE_PROFILE
+    record["reference_overflow_mask"] = {"version": REFERENCE_MASK_VERSION,
+                                         "profile": R14_REFERENCE_PROFILE, "cells": trace_cells}
+    return record
+
+
 def _change_candidate_cell(record, row, column, actual):
     record["fleet2_cells"][row][column] = tuple(actual)
     diff = next((item for item in record["differences"]
@@ -164,6 +185,20 @@ def _change_candidate_cell(record, row, column, actual):
     diff["actual"] = list(actual)
     row_text = record["fleet2_rows"][row]
     record["fleet2_rows"][row] = row_text[:column] + (actual[0] or " ") + row_text[column + 1:]
+
+
+def _change_candidate_cells(record, row, updates):
+    for column, actual in updates.items():
+        record["fleet2_cells"][row][column] = tuple(actual)
+        diff = next((item for item in record["differences"]
+                     if item.get("kind") == "cell" and item.get("row") == row and
+                     item.get("column") == column), None)
+        if diff is None:
+            diff = {"kind": "cell", "row": row, "column": column,
+                    "expected": list(record["reference_cells"][row][column])}
+            record["differences"].append(diff)
+        diff["actual"] = list(actual)
+    record["fleet2_rows"][row] = "".join(cell[0] or "" for cell in record["fleet2_cells"][row])
 
 
 class ClassificationTests(unittest.TestCase):
@@ -191,25 +226,75 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual((docs[2]["entries"][0]["class"], docs[2]["entries"][0]["rule"]),
                          ("fleet2-defect", "session-context-line"))
 
-    def test_reference_overflow_exclusion_requires_versioned_trace_for_every_changed_cell(self):
-        record = _record(width=80, cells=[(10, 78, "x", "dim", " ", None)])
-        record["state"] = "COMPUTE"
-        record["reference_cells"][10][78] = ["x", "dim", None]
-        record["fleet2_cells"][10][78] = [" ", None, None]
-        record["reference_profile"] = "mock-r14-v87"
-        record["reference_overflow_mask"] = {"version": "r14-v87-explicit-cell-mask-v1", "profile": "mock-r14-v87",
-                                               "cells": [{"row": 10, "column": 78, "kinds": ["text-beyond-width"]}]}
+    def test_generic_r14_overflow_requires_exact_safe_case_trace_and_unchanged_prefix(self):
+        record = _r14_generic_overflow_record()
         accepted = classify([record])["entries"][0]
-        self.assertEqual((accepted["class"], accepted["rule"]), ("excluded", "r14-reference-overflow-mask"))
+        self.assertEqual((accepted["class"], accepted["rule"], accepted["difference_cells"]),
+                         ("excluded", "r14-reference-overflow-mask", [[5, 79]]))
 
-        record["differences"].append({"kind": "cell", "row": 10, "column": 50,
-                                      "expected": ["a", "dim", None], "actual": ["b", "dim", None]})
-        record["reference_cells"][10][50] = ["a", "dim", None]
-        record["fleet2_cells"][10][50] = ["b", "dim", None]
-        record["reference_rows"][10] = record["reference_rows"][10][:50] + "a" + record["reference_rows"][10][51:]
-        record["fleet2_rows"][10] = record["fleet2_rows"][10][:50] + "b" + record["fleet2_rows"][10][51:]
-        rejected = classify([record])["entries"][0]
-        self.assertEqual(rejected["class"], "unexplained")
+        rejected = []
+        wrong_glyph = _r14_generic_overflow_record()
+        _change_candidate_cell(wrong_glyph, 5, 79, ("X", None, None))
+        rejected.append(wrong_glyph)
+
+        wrong_style = _r14_generic_overflow_record()
+        _change_candidate_cell(wrong_style, 5, 79, (" ", "reverse", None))
+        rejected.append(wrong_style)
+
+        changed_neighbor = _r14_generic_overflow_record()
+        _change_candidate_cell(changed_neighbor, 5, 40, ("Z", "dim", None))
+        rejected.append(changed_neighbor)
+
+        wrong_trace = _r14_generic_overflow_record()
+        wrong_trace["reference_overflow_mask"]["cells"][0]["kinds"] = ["text-overlap"]
+        rejected.append(wrong_trace)
+
+        wrong_state = _r14_generic_overflow_record()
+        wrong_state["state"] = "PEERS"
+        rejected.append(wrong_state)
+
+        wrong_width = _r14_generic_overflow_record()
+        wrong_width["width"] = 100
+        rejected.append(wrong_width)
+
+        wrong_reference = _r14_generic_overflow_record()
+        wrong_reference["reference_cells"][5][79] = ("q", "dim", None)
+        wrong_reference["differences"][0]["expected"] = ["q", "dim", None]
+        wrong_reference["reference_rows"][5] = "".join(
+            cell[0] or "" for cell in wrong_reference["reference_cells"][5])
+        rejected.append(wrong_reference)
+
+        for index, candidate in enumerate(rejected):
+            with self.subTest(index=index):
+                self.assertEqual(classify([candidate])["entries"][0]["class"], "unexplained")
+
+    def test_generic_r14_overflow_validates_the_modeled_divider_and_terminal_pair(self):
+        record = _r14_generic_overflow_record("MODELS", 80, 20)
+        accepted = classify([record])["entries"][0]
+        self.assertEqual((accepted["class"], accepted["rule"], accepted["difference_cells"]),
+                         ("excluded", "r14-reference-overflow-mask", [[20, 78], [20, 79]]))
+
+        changed_pair = _r14_generic_overflow_record("MODELS", 80, 20)
+        _change_candidate_cells(changed_pair, 20, {78: ("界", "dim", None), 79: ("", "dim", None)})
+        self.assertEqual(classify([changed_pair])["entries"][0]["class"], "unexplained")
+
+    def test_generic_overflow_wide_glyphs_are_validated_as_a_complete_pair(self):
+        complete = [[("界", "dim", None), ("", "dim", None)]]
+        self.assertTrue(_wide_continuation_pair_is_complete(complete, 0, (0, 1)))
+        self.assertFalse(_wide_continuation_pair_is_complete(complete, 0, (1,)))
+        malformed = [[("界", "dim", None), ("x", "dim", None)]]
+        self.assertFalse(_wide_continuation_pair_is_complete(malformed, 0, (0, 1)))
+
+    def test_overflow_trace_does_not_override_invisible_foreground_only_blank_policy(self):
+        record = _record(width=80, cells=[(5, 79, " ", "dim", " ", None)])
+        record["state"] = "MODELS"
+        record["reference_profile"] = R14_REFERENCE_PROFILE
+        record["reference_overflow_mask"] = {
+            "version": REFERENCE_MASK_VERSION, "profile": R14_REFERENCE_PROFILE,
+            "cells": [{"row": 5, "column": 79, "kinds": ["text-beyond-pane"]}],
+        }
+        entry = classify([record])["entries"][0]
+        self.assertEqual((entry["class"], entry["rule"]), ("intended", "blank-cell-key"))
 
     def test_r14_overview_header_overlap_requires_exact_trace_and_candidate_geometry(self):
         record = _r14_residual_record("OVERVIEW", 80, 4)
@@ -289,15 +374,11 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual([entry["class"] for entry in entries], ["intended", "unexplained"])
 
     def test_adjacent_rows_keep_independent_reference_masks(self):
-        record = _record(width=80, cells=[(10, 78, "x", "dim", " ", None),
-                                          (11, 50, "a", "dim", "b", "dim")])
-        record["state"] = "COMPUTE"
-        record["reference_profile"] = "mock-r14-v87"
-        record["reference_overflow_mask"] = {"version": "r14-v87-explicit-cell-mask-v1", "profile": "mock-r14-v87",
-                                               "cells": [{"row": 10, "column": 78, "kinds": ["text-beyond-width"]}]}
+        record = _r14_generic_overflow_record("COMPUTE", 80, 7)
+        _change_candidate_cell(record, 8, 50, ("b", "dim", None))
         entries = classify([record])["entries"]
         self.assertEqual([(entry["rows"], entry["class"]) for entry in entries],
-                         [([10, 10], "excluded"), ([11, 11], "unexplained")])
+                         [([7, 7], "excluded"), ([8, 8], "unexplained")])
 
     def test_a_known_style_difference_gets_a_reason_and_an_owner(self):
         document = classify([_record(cells=[(1, 21, "━", "g_blocked", "━", "grp_live")])])

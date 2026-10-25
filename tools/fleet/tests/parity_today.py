@@ -98,6 +98,76 @@ R14_RESIDUAL_CELL_PAIRS = {
 R14_MODELS_FOOT_TEXT = "→ .bak backup · new sessions and launches only · sealed routes keep their choice"
 R14_MODELS_SECTION_META = "  input tokens · new sessions only"
 
+# Exact root-view R14 cells whose final-column text the narrow Fleet2 pane clips.
+# Candidate cells are the fixed blank suffix produced by frame.draw's width-80/100
+# pane_clip, except MODELS 80x45 row 20 which keeps the real right divider as a pair.
+_R14_CLIPPED_BLANK = (" ", None, None)
+R14_GENERIC_OVERFLOW_CASES = {
+    ("OVERVIEW", 80, 5): {79: (("p", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("PEERS", 80, 5): {79: (("v", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("PEERS", 100, 6): {99: (("O", "section_head", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 4): {79: (("H", "section_head", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 6): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 9): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 11): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 14): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 16): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 18): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 19): {79: (("c", "h_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 20): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 23): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 24): {79: (("c", "h_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 25): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 27): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 29): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 31): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 33): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 35): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 100, 4): {99: (("E", "section_head", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("QUESTIONS", 80, 7): {79: (("n", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("HISTORY", 80, 4): {79: (("N", "section_head", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 7): {79: (("━", "g_idle", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 9): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 11): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 14): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 20): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 24): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 26): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 29): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 31): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 100, 7): {99: (("B", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 100, 24): {99: (("W", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 100, 32): {99: (("r", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MEMORY", 80, 5): {79: (("0", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 4): {79: (("e", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 12): {79: (("d", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 20): {
+        78: (("n", "dim", None), ("│", "dim", None), ("text-overlap",)),
+        79: (("c", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",)),
+    },
+    ("MODELS", 80, 24): {79: (("s", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 27): {79: (("w", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 28): {79: (("s", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 29): {79: (("s", "loc_repo", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 30): {79: (("e", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 6): {99: (("t", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 7): {99: (("t", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 8): {99: (("r", "hb_opencode", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 9): {99: (("t", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 10): {99: (("-", "hb_opencode", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 11): {99: (("-", "hb_opencode", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 12): {99: (("p", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 25): {99: (("s", "loc_repo", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 27): {99: (("d", "loc_repo", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 30): {99: (("A", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("SYSTEM", 80, 7): {79: (("e", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("SYSTEM", 80, 8): {79: (("e", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("SYSTEM", 80, 11): {79: (("2", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("SYSTEM", 80, 12): {79: (("r", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("SYSTEM", 80, 18): {79: (("E", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("SYSTEM", 100, 8): {99: (("d", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+}
+
 
 def _reference_profile(reference):
     """Return the pinned R14 profile only when every renderer module matches the cycle trace."""
@@ -551,34 +621,89 @@ def _r14_residual_reference_mask(record, band):
 
 
 def _reference_overflow_mask(record, band):
-    """A narrow reference exception applies only when every changed cell is traced in the R14 mask."""
-    if _r14_residual_key(record, band):
-        # These cells need their row-specific candidate geometry checks below; a trace alone is insufficient.
+    """Accept only the exact R14 root clips and retained right-divider pair."""
+    if band.get("pane") != "right" or len(band.get("rows") or ()) != 1:
         return []
+    key = (record.get("state"), record.get("width"), band["rows"][0])
+    contract = R14_GENERIC_OVERFLOW_CASES.get(key)
+    if not contract or not _has_pinned_reference_trace(record, current=True):
+        return []
+    width, row = key[1], key[2]
+    columns = sorted(contract)
+    if (record.get("rows") != 45 or columns != sorted(set(columns)) or
+            [diff.get("column") for diff in band.get("diffs") or ()] != columns):
+        return []
+    row_diffs = _row_cell_diffs(record, row)
+    if [diff.get("column") for diff in row_diffs] != columns:
+        return []
+
+    reference_cells, fleet2_cells = record.get("reference_cells") or (), record.get("fleet2_cells") or ()
+    reference_rows, fleet2_rows = record.get("reference_rows") or (), record.get("fleet2_rows") or ()
+    if (row >= len(reference_cells) or row >= len(fleet2_cells) or
+            row >= len(reference_rows) or row >= len(fleet2_rows) or
+            len(reference_cells[row]) != width or len(fleet2_cells[row]) != width):
+        return []
+    if ("".join(cell[0] or "" for cell in reference_cells[row]) != reference_rows[row] or
+            "".join(cell[0] or "" for cell in fleet2_cells[row]) != fleet2_rows[row]):
+        return []
+    if any(tuple(reference_cells[row][column]) != tuple(fleet2_cells[row][column])
+           for column in range(width) if column not in contract):
+        return []
+
     trace = record.get("reference_overflow_mask") or {}
-    if (record.get("width") not in (80, 100) or not _has_pinned_reference_trace(record)):
+    row_trace = [item for item in trace.get("cells", ()) if item.get("row") == row]
+    if len({item.get("column") for item in row_trace}) != len(row_trace):
         return []
-    masks = {(item.get("row"), item.get("column")): item.get("kinds", ())
-             for item in trace.get("cells", ())}
-    reference_cells, fleet2_cells = record.get("reference_cells", ()), record.get("fleet2_cells", ())
-    diffs, accepted = band.get("diffs") or (), []
-    if not diffs:
-        return []
-    for diff in diffs:
-        row, column = diff.get("row"), diff.get("column")
-        kinds = masks.get((row, column))
-        if not kinds or row is None or column is None:
-            return []
-        if row >= len(reference_cells) or row >= len(fleet2_cells):
-            return []
-        if column >= len(reference_cells[row]) or column >= len(fleet2_cells[row]):
-            return []
-        if list(diff.get("expected") or ()) != list(reference_cells[row][column]):
-            return []
-        if list(diff.get("actual") or ()) != list(fleet2_cells[row][column]):
+    trace_by_column = {item.get("column"): tuple(sorted(item.get("kinds") or ())) for item in row_trace}
+    accepted = []
+    for diff in row_diffs:
+        column = diff.get("column")
+        expected, actual, kinds = contract[column]
+        if (trace_by_column.get(column) != kinds or
+                tuple(diff.get("expected") or ()) != expected or
+                tuple(diff.get("actual") or ()) != actual or
+                tuple(reference_cells[row][column]) != expected or
+                tuple(fleet2_cells[row][column]) != actual):
             return []
         accepted.append({"row": row, "column": column, "kinds": list(kinds)})
+
+    if not (_wide_continuation_pair_is_complete(reference_cells, row, columns) and
+            _wide_continuation_pair_is_complete(fleet2_cells, row, columns)):
+        return []
+    if key == ("MODELS", 80, 20):
+        if (columns != [78, 79] or contract[78][1] != ("│", "dim", None) or
+                contract[79][1] != _R14_CLIPPED_BLANK):
+            return []
+    elif (len(columns) != 1 or columns[0] != width - 1 or
+          contract[columns[0]][1] != _R14_CLIPPED_BLANK or
+          contract[columns[0]][0][0] in ("", " ") or
+          contract[columns[0]][2] != ("text-beyond-pane",)):
+        return []
     return accepted
+
+
+def _wide_continuation_pair_is_complete(cells, row, columns):
+    """A traced suffix cannot split a wide glyph from its continuation cell."""
+    allowed = set(columns)
+    if row >= len(cells):
+        return False
+    row_cells = cells[row]
+    for column in allowed:
+        if column < 0 or column >= len(row_cells):
+            return False
+        glyph = row_cells[column][0]
+        if glyph == "":
+            lead_column = column - 1
+            if lead_column not in allowed:
+                return False
+            lead = row_cells[lead_column][0]
+            if not lead or unicodedata.east_asian_width(lead[0]) not in ("W", "F"):
+                return False
+        elif isinstance(glyph, str) and glyph and unicodedata.east_asian_width(glyph[0]) in ("W", "F"):
+            continuation = column + 1
+            if continuation not in allowed or row_cells[continuation][0] != "":
+                return False
+    return True
 
 
 def _split_r14_models_row26(record, bands):
@@ -1023,8 +1148,8 @@ def classify(records):
                 reason = (("the pinned R14 trace and exact row cells prove this header collision or MODELS box-note overprint; "
                            "candidate glyphs, styles, prefixes and adjacent cells are checked against the residual contract")
                           if residual_cells else
-                          ("every differing cell is inside the versioned R14 reference put-trace mask; "
-                           "cells and styles outside those exact coordinates remain compared"))
+                          ("the exact R14 state/width/row, reference tuple, trace kind and safe blank clip or retained divider pair "
+                           "match the fixed case; every other cell in the row remains equal"))
             else:
                 for rule in RULES:
                     try:
