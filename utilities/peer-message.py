@@ -1448,6 +1448,17 @@ def reserve_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight",
         return dict(row, rpc_claim=claim)
 
 
+def _registered_submission_current(row):
+    from peer_obligations import registered_submission_current
+    body = row.get("text")
+    if row.get("body_ref") is not None:
+        try:
+            body = read_peer_payload(row["ref"])["body"]
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+    return registered_submission_current(row, original_body=body)
+
+
 def begin_pending_write(row, *, recipient=None, receipt=None, claimant=None):
     """Mark an exact reserved pending transfer unverified immediately before I/O.
 
@@ -1482,8 +1493,7 @@ def begin_pending_write(row, *, recipient=None, receipt=None, claimant=None):
             from peer_obligations import session_notice_delivery_current
             if not session_notice_delivery_current(current):
                 return None
-        from peer_obligations import registered_submission_current
-        if not registered_submission_current(current):
+        if not _registered_submission_current(current):
             return None
         updated = dict(current, state="unverified", receipt=receipt or claim.get("receipt")
                        or "delivery-inflight")
@@ -1606,8 +1616,7 @@ def deliver_pending_codex(ref, *, timeout=1.0):
                 from peer_obligations import session_notice_delivery_current
                 if not session_notice_delivery_current(current):
                     raise QueueDeliveryError("peer-notice-recipient-changed-before-add")
-            from peer_obligations import registered_submission_current
-            if not registered_submission_current(current):
+            if not _registered_submission_current(current):
                 raise QueueDeliveryError("peer-dispatch-recipient-changed-before-add")
             _save_pending(dict(current, state="unverified", receipt="native-queue-inflight"))
 

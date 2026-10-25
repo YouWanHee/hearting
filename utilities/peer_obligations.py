@@ -1170,10 +1170,10 @@ def session_notice_delivery_current(message):
     return bool(_current_session_notice_bindings(message))
 
 
-def registered_submission_current(message):
+def registered_submission_current(message, *, original_body=None):
     """Authorize every retained output member after all binding/native reads."""
     import dispatch_pending_delivery as pending
-    from dispatch_recipient_receipt import claimed_send_current
+    from dispatch_recipient_receipt import claimed_send_current, binding_digest, OPENCODE_MARKER_LINE_RE
     from dispatch_seat_handover import record_recipient_binding
     declared = message.get("dispatch_notices")
     if declared is None:
@@ -1185,6 +1185,18 @@ def registered_submission_current(message):
     matches = list(_registered_delivery_bindings(message))
     recipient = message.get("to") or {}
     if len(matches) != len(declared):
+        return False
+    # The immutable wire body already carries every original delivery identity.
+    # A later read must not silently adopt a replacement record as that body.
+    body = original_body if original_body is not None else message.get("text")
+    source = body.rstrip("\n") if isinstance(body, str) and message.get("body_ref") else body
+    expected_digest = message.get("source_sha256") if message.get("body_ref") else message.get("body_sha256")
+    if (not isinstance(source, str)
+            or hashlib.sha256(source.encode("utf-8")).hexdigest() != expected_digest):
+        return False
+    markers = set(OPENCODE_MARKER_LINE_RE.findall(body)) if isinstance(body, str) else set()
+    if any((delivery_id, binding_digest(record, storage)) not in markers
+           for _store, _duty, _row, record, _root, storage, delivery_id in matches):
         return False
     owners = {item["delivery_id"]: item["claim_owner"] for item in declared}
     # A deferred immutable peer transfer has never entered native I/O. Older

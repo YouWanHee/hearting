@@ -308,6 +308,65 @@ class ObligationStoreTest(unittest.TestCase):
             self.assertEqual(pending.received_ack_identity(fresh, recipient["session_id"], record["delivery_id"]),
                              pending.received_ack_identity(record, recipient["session_id"], record["delivery_id"]))
 
+    def test_registered_pending_body_keeps_original_identity_at_both_write_boundaries(self):
+        import dispatch_pending_delivery as pending
+        import codex_queue_delivery as queue
+        peer = peer_steward.peer_message
+        for harness, index in (("claude", 0), ("codex", 1)):
+            with self.subTest(harness=harness, index=index):
+                ref, recipient, records, _metas = self.registered_transfer(harness)
+                reserved = peer.reserve_pending_herdr(ref, recipient) if harness == "claude" else None
+                path = pending.record_path(self.root, recipient["session_id"], records[index]["delivery_id"])
+                raw = json.loads(path.read_text())
+                raw["route_node"] = "changed-original-identity"
+                path.write_text(json.dumps(raw))
+                before = path.read_bytes()
+                if reserved:
+                    self.assertIsNone(peer.begin_pending_write(reserved, recipient=recipient))
+                else:
+                    added = []
+                    def send(*_args, **kwargs):
+                        kwargs["before_add"]()
+                        added.append(kwargs["message"])
+                        return {"status": "queued", "queued_submission_id": "q"}
+                    with mock.patch("codex_queue_dispatch.resolve_queue_socket", return_value=self.root / "native.sock"), \
+                            mock.patch.object(queue, "send_at_least_once", side_effect=send):
+                        result = peer.deliver_pending_codex(ref)
+                    self.assertEqual(result["status"], "unverified")
+                    self.assertEqual(added, [])
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(peer._read_pending(ref)["state"], "pending")
+
+    def test_registered_reference_payload_keeps_original_marker_identity(self):
+        import dispatch_pending_delivery as pending
+        import codex_queue_delivery as queue
+        peer = peer_steward.peer_message
+        ref, recipient, records, _metas = self.registered_transfer("codex")
+        original = peer._read_pending(ref)
+        body = original["text"].split("\n\n(runtime-from:", 1)[0] + "\n" + "x" * 20000
+        with mock.patch.object(peer, "_reference_access_evidence_valid", return_value=True):
+            _text, referenced = peer.prepare_peer_message(body, original["from"], recipient,
+                defer=True, refs=original["refs"], producer_binding=original["producer_binding"],
+                reference_evidence={"fixture": "private-source-read-access"})
+        peer.bind_dispatch_notice(referenced, original["dispatch_notices"])
+        message = peer._read_pending(referenced)
+        self.assertIsNotNone(message.get("body_ref"))
+        self.assertTrue(peer._registered_submission_current(message))
+        path = pending.record_path(self.root, recipient["session_id"], records[-1]["delivery_id"])
+        raw = json.loads(path.read_text())
+        raw["route_node"] = "changed-reference-identity"
+        path.write_text(json.dumps(raw))
+        added = []
+        def send(*_args, **kwargs):
+            kwargs["before_add"]()
+            added.append(kwargs["message"])
+            return {"status": "queued", "queued_submission_id": "q"}
+        with mock.patch("codex_queue_dispatch.resolve_queue_socket", return_value=self.root / "native.sock"), \
+                mock.patch.object(queue, "send_at_least_once", side_effect=send):
+            result = peer.deliver_pending_codex(referenced)
+        self.assertEqual(result["status"], "unverified")
+        self.assertEqual(added, [])
+
     def test_registered_hook_context_recovery_preserves_existing_native_boundary(self):
         peer = peer_steward.peer_message
         ref, recipient, _records, _metas = self.registered_transfer("claude")
