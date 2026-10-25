@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -199,6 +200,147 @@ class OpenCodeRunCodecTest(unittest.TestCase):
                          "openai/gpt-6.1-sol")
         self.assertEqual(runtime.model_reference("opencode/model#old", "high"),
                          "opencode/model#high")
+
+
+    @staticmethod
+    def _cli(path, output="2.0.32", executable=True):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"#!/bin/sh\nprintf '{output}\\n'\n")
+        path.chmod(0o755 if executable else 0o644)
+        return path
+
+    def test_v2_cli_resolves_from_fixture_home_when_missing_from_path(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as empty_path:
+            binary = Path(home) / ".opencode" / "bin" / "opencode"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\nprintf '2.0.32\\n'\n")
+            binary.chmod(0o755)
+            env = {"HOME": home, "PATH": empty_path}
+            with unittest.mock.patch.dict(os.environ, {}, clear=True):
+                self.assertTrue(runtime.is_v2(environ=env))
+                self.assertEqual(runtime.resolve_binary(environ=env), str(binary))
+                self.assertFalse(runtime.is_v2(binary="injected-opencode", environ=env))
+                self.assertFalse(runtime.is_v2(environ=env, version=(1, 19, 0)))
+
+    def test_ambient_public_version_api_resolves_fixture_home_without_path_binary(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as empty_path:
+            binary = Path(home) / ".opencode" / "bin" / "opencode"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\nprintf '2.0.32\\n'\n")
+            binary.chmod(0o755)
+            runtime.runtime_version.cache_clear()
+            with unittest.mock.patch.dict(os.environ, {"HOME": home, "PATH": empty_path}, clear=True):
+                self.assertEqual(runtime.runtime_version(), (2, 0, 32))
+                runtime.runtime_version.cache_clear()
+                self.assertTrue(runtime.is_v2())
+            runtime.runtime_version.cache_clear()
+
+    def test_explicit_argument_wins_over_opencode_bin(self):
+        with tempfile.TemporaryDirectory() as temp:
+            chosen = self._cli(Path(temp) / "chosen" / "opencode", "1.19.0")
+            override = self._cli(Path(temp) / "override" / "opencode", "2.0.32")
+            env = {"HOME": temp, "PATH": "", "OPENCODE_BIN": str(override)}
+            self.assertEqual(runtime.resolve_binary(str(chosen), environ=env), str(chosen))
+
+    def test_opencode_bin_wins_over_path_and_home_and_is_probed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            path_dir = Path(temp) / "path"
+            local = self._cli(home / ".opencode/bin/opencode", "1.0.0")
+            on_path = self._cli(path_dir / "opencode", "1.0.0")
+            selected = self._cli(Path(temp) / "selected/opencode", "2.1.0")
+            env = {"HOME": str(home), "PATH": str(path_dir), "OPENCODE_BIN": str(selected)}
+            with unittest.mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(runtime.resolve_binary(environ=env), str(selected))
+                self.assertTrue(runtime.is_v2(environ=env))
+            self.assertTrue(local.is_file() and on_path.is_file())
+
+    def test_invalid_opencode_bin_does_not_fall_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            path_dir = Path(temp) / "path"
+            self._cli(home / ".opencode/bin/opencode")
+            self._cli(path_dir / "opencode")
+            missing = Path(temp) / "missing/opencode"
+            env = {"HOME": str(home), "PATH": str(path_dir), "OPENCODE_BIN": str(missing)}
+            with unittest.mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(runtime.resolve_binary(environ=env), str(missing))
+                self.assertFalse(runtime.is_v2(environ=env))
+
+    def test_path_precedes_home_and_home_requires_executable_regular_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            path_dir = Path(temp) / "path"
+            self._cli(home / ".opencode/bin/opencode", "1.0.0")
+            path_cli = self._cli(path_dir / "opencode", "2.0.0")
+            env = {"HOME": str(home), "PATH": str(path_dir)}
+            self.assertEqual(runtime.resolve_binary(environ=env), str(path_cli))
+            missing_env = {"HOME": str(Path(temp) / "missing-home"), "PATH": ""}
+            self.assertEqual(runtime.resolve_binary(environ=missing_env), "opencode")
+            self._cli(Path(missing_env["HOME"]) / ".opencode/bin/opencode", executable=False)
+            self.assertEqual(runtime.resolve_binary(environ=missing_env), "opencode")
+
+    def test_unknown_version_and_timeout_are_unknown_with_bounded_probe(self):
+        env = {"PATH": "", "HOME": ""}
+        with unittest.mock.patch.dict(os.environ, {}, clear=True), \
+             unittest.mock.patch.object(runtime.subprocess, "run", return_value=
+                                        unittest.mock.Mock(stdout="not a version", stderr="")) as run:
+            self.assertIsNone(runtime._runtime_version_for("opencode", env))
+            run.assert_called_once()
+            self.assertEqual(run.call_args.kwargs["timeout"], 3)
+            runtime.runtime_version.cache_clear()
+            run.side_effect = subprocess.TimeoutExpired(["opencode", "--version"], 3)
+            self.assertIsNone(runtime._runtime_version_for("opencode", env))
+
+    def test_custom_opencode_bin_name_is_never_probed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "executed"
+            wrapper = Path(temp) / "wrapper"
+            wrapper.write_text(f"#!/bin/sh\ntouch '{marker}'\nprintf '2.0.0\\n'\n")
+            wrapper.chmod(0o755)
+            # A basename other than opencode is not CLI evidence, even when
+            # selected through OPENCODE_BIN from the default is_v2() call.
+            env = {"PATH": "", "HOME": temp, "OPENCODE_BIN": str(wrapper)}
+            with unittest.mock.patch.dict(os.environ, {}, clear=True):
+                self.assertFalse(runtime.is_v2(environ=env))
+            self.assertFalse(marker.exists())
+
+    def test_v1_flags_and_v2_provider_variant_are_separate(self):
+        v1 = runtime.run_argv(binary="opencode", cwd="/work", agent="build",
+                              model="opencode-go/model", variant="high", pure=True,
+                              version=(1, 19, 0))
+        self.assertIn("--pure", v1)
+        self.assertIn("--dir", v1)
+        self.assertIn("--variant", v1)
+        v2 = runtime.run_argv(binary="opencode", cwd="/work", agent="build",
+                              model="opencode-go/model", variant="high", session="ses_exact",
+                              title="hearting-worker-att-x", pure=True, version=(2, 0, 32))
+        self.assertNotIn("--pure", v2)
+        self.assertNotIn("--standalone", v2)
+        self.assertNotIn("--dir", v2)
+        self.assertNotIn("--variant", v2)
+        self.assertEqual(v2[v2.index("--model") + 1], "opencode-go/model#high")
+        self.assertEqual(v2[v2.index("--session") + 1], "ses_exact")
+        self.assertEqual(v2[v2.index("--title") + 1], "hearting-worker-att-x")
+        private_v2 = runtime.run_argv(binary="opencode", model="fixture/model",
+                                      standalone=True, version=(2, 0, 32))
+        self.assertIn("--standalone", private_v2)
+        self.assertEqual(private_v2[private_v2.index("--model") + 1], "fixture/model")
+        self.assertNotIn("--standalone", runtime.run_argv(
+            binary="opencode", model="fixture/model", standalone=True, version=(1, 19, 0)))
+
+    def test_database_generation_never_selects_cli_generation(self):
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "1.19.0"}), \
+             unittest.mock.patch.object(runtime, "credential_store_present", return_value=True):
+            self.assertFalse(runtime.is_v2())
+        with unittest.mock.patch.dict(os.environ, {}, clear=True), \
+             unittest.mock.patch.object(runtime, "runtime_version", return_value=None), \
+             unittest.mock.patch.object(runtime, "credential_store_present", return_value=True):
+            self.assertFalse(runtime.is_v2())
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "2.0.32"}):
+            self.assertTrue(runtime.is_v2())
+
 
 
 class OpenCodeFullPartsTest(unittest.TestCase):

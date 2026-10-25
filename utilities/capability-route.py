@@ -19,6 +19,7 @@ import artifact_locator as ARTIFACT_LOCATOR
 import git_index_lock
 import route_identity as ROUTE_IDENTITY
 import route_lineage as ROUTE_LINEAGE
+import route_plan as ROUTE_PLAN
 import dispatch_runtime_support as RUNTIME_SUPPORT
 import dispatch_terminal_commit
 import model_profile as PROFILE
@@ -2759,7 +2760,7 @@ def compile_route(capability, capability_mode, requested_intensity, cwd, artifac
 # composition changes route shape only (WORKFLOW §7 compose-on-demand).
 # ---------------------------------------------------------------------------
 COMPOSE_SHAPES = ("direct", "solo", "staged", "framed")
-SHAPE_INTENSITY = {"direct": "direct", "solo": "quick", "staged": "standard", "framed": "standard"}
+SHAPE_INTENSITY = ROUTE_PLAN.SHAPE_INTENSITY
 # The compiler-internal capability behind `--shape framed`. No person and no model names it; a
 # route of any other shape can never seal it (`compose-shape-invalid`).
 ROUTE_FRAME_CAPABILITY = TOPO.ROUTE_FRAME_CAPABILITY
@@ -2776,7 +2777,6 @@ SELECTION_PIN_CONTRACT_VERSION = 1
 # "|" or ",".  Deliberately narrower than model_profile.SAFE_VALUE.
 SELECTION_PIN_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]*$")
 SELECTION_PIN_EFFORT = re.compile(r"^[a-z]+$")
-COMPOSE_SPEC_CANDIDATES = ("spec/prd.md",)
 
 
 def shape_for_intensity(effective):
@@ -3559,22 +3559,18 @@ DEFAULT_ARTIFACT_GUARD = "compose-prechecked"
 
 
 def compose_spec_read(cwd, artifact_root, explicit):
-    """`auto` is honest, not permissive: with no spec candidate it records the
-    absence; with a `spec/prd.md` present it is satisfied when this session's read
-    hook recorded reading that file unchanged, and otherwise refuses and names the
-    file the caller must read (or assert with `--spec-read <source>`). The spec-read gate is
-    a real invariant (WORKFLOW §7.0); compose only removes the boilerplate case.
-    A shared-spec `prd.md` never blocks compose: the record says which file is
-    there to read and `compose_card` passes that path on as one line."""
+    """Require this session's unchanged read only for the artifact root's governing
+    legacy `spec/prd.md`. Resolve that decision with the same `prd_candidates`
+    function as the read hook; shared revisions are informational, and a checkout
+    PRD outside the artifact root cannot satisfy or block the hook's marker gate."""
     if explicit not in (None, "", "auto"):
         return {"satisfied": explicit.lower() not in ("0", "false", "no"), "source": explicit}
-    present, shared = [], []
-    for root in (Path(cwd), Path(artifact_root)):
-        for rel in COMPOSE_SPEC_CANDIDATES:
-            candidate = root / rel
-            if candidate.is_file():
-                present.append(str(candidate))
-        shared.extend(_compose_shared_spec_prds(root))
+    import artifact_cutover as ARTIFACT_CUTOVER
+
+    root = Path(artifact_root).resolve()
+    candidates = ARTIFACT_CUTOVER.prd_candidates(root)
+    present = [str(root / "spec" / "prd.md")] if str(root / "spec" / "prd.md") in candidates else []
+    shared = _compose_shared_spec_prds(root)
     unread = sorted(set(present) - set(_spec_reads_recorded(present, artifact_root) if present else ()))
     if unread:
         raise ValueError("compose-spec-read-required:" + ",".join(unread))
@@ -3582,6 +3578,8 @@ def compose_spec_read(cwd, artifact_root, explicit):
         return {"satisfied": True, "source": SPEC_READ_MARKER_PREFIX + ",".join(sorted(set(present)))}
     if shared:
         return {"satisfied": True, "source": SPEC_READ_SHARED_PREFIX + ",".join(sorted(set(shared)))}
+    if (Path(cwd) / "spec" / "prd.md").is_file():
+        return {"satisfied": True, "source": "compose-auto: no governing artifact-root PRD; checkout spec/prd.md is informational"}
     return {"satisfied": True, "source": "compose-auto: no spec/prd.md under cwd or artifact root"}
 
 
@@ -3625,19 +3623,22 @@ def _compose_spec_read_notice(route):
 
 
 def _compose_shared_spec_prds(root):
-    """Latest `prd.md` of each admitted shared spec (`shared/spec/<ref>/revisions/<rrev>/`,
-    CORE artifact layout); older revisions are history, not what the caller must read."""
+    """The shared governing PRDs selected by artifact_cutover.prd_candidates.
+
+    Older revisions and other shared refs are history, not independent compose
+    requirements; the same candidate list controls both the hook and this notice.
+    """
+    import artifact_cutover as ARTIFACT_CUTOVER
+
+    root = Path(root).resolve()
+    shared_root = root / "shared" / "spec"
     found = []
-    for reference in sorted((root / "shared" / "spec").glob("*/reference.json")):
+    for candidate in ARTIFACT_CUTOVER.prd_candidates(root):
         try:
-            latest = json.loads(reference.read_text(encoding="utf-8")).get("latest_revision_id")
-        except (OSError, ValueError, AttributeError):
+            Path(candidate).relative_to(shared_root)
+        except ValueError:
             continue
-        if not isinstance(latest, str) or not re.fullmatch(r"rrev_[0-9a-f]+", latest):
-            continue
-        candidate = reference.parent / "revisions" / latest / "prd.md"
-        if candidate.is_file():
-            found.append(str(candidate))
+        found.append(str(candidate))
     return found
 
 
@@ -4075,11 +4076,11 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     if requested not in ORDER:
         raise ValueError("invalid intensity")
     if shape == "direct" and requested != "direct":
-        raise ValueError("compose-shape-intensity-mismatch:direct")
+        raise ValueError("compose-shape-intensity-mismatch:direct (allowed: direct)")
     if shape == "solo" and requested != "quick":
-        raise ValueError("compose-shape-intensity-mismatch:solo")
+        raise ValueError("compose-shape-intensity-mismatch:solo (allowed: quick)")
     if shape == "staged" and ORDER[requested] < ORDER["standard"]:
-        raise ValueError("compose-shape-intensity-mismatch:staged")
+        raise ValueError("compose-shape-intensity-mismatch:staged (allowed: standard,strong,thorough,adversarial)")
     cwd = str(Path(cwd).resolve(strict=True))
     artifact_root = str(Path(artifact_root).resolve())
     # The campaign is the agent's proposal for the work stream (CONVENTIONS
@@ -12957,15 +12958,22 @@ def main():
                         if attempt_id and not jobs:
                             jobs=inherited_jobs
                 if a.check:
-                    if not jobs or not attempt_id or a.output or review_claim or explicit_attempt_metadata or a.subsession_manifest:
+                    if a.output or review_claim or explicit_attempt_metadata or a.subsession_manifest:
                         raise ValueError("owner-closure-check-requires-exact-jobs-attempt-and-no-overrides")
                     if node.get("kind") != "review-worker":
-                        # Owner closure only answers a blocking review; this read-only question has no
-                        # answer elsewhere. Say so instead of refusing with an unrelated reason.
-                        print(json.dumps({"result": "not-applicable", "read_only": True, "route_id": route["route_id"],
-                                          "node_id": a.node, "reason": "owner-closure-review-nodes-only"},
-                                         sort_keys=True))
+                        # Owner closure answers only a blocking review. This
+                        # read-only question has no answer for a resource node.
+                        result = {"result": "not-applicable", "read_only": True,
+                                  "route_id": route["route_id"], "node_id": a.node,
+                                  "reason": "owner-closure-review-nodes-only"}
+                        if node.get("kind") == "resource-runner":
+                            result["next_action"] = (
+                                "use the resource node's existing start path; a completed compute-hosts "
+                                "candidate may be supplied with --compute-run <run-id>")
+                        print(json.dumps(result, sort_keys=True))
                         return
+                    if not jobs or not attempt_id:
+                        raise ValueError("owner-closure-check-requires-exact-jobs-attempt-and-no-overrides")
                     proof = owner_closure_plan(route, node, evidence, jobs, attempt_id)
                     print(json.dumps({"result": "ready", "read_only": True, "route_id": route["route_id"],
                                       "node_id": a.node, "owner_closure_proof": proof}, sort_keys=True))

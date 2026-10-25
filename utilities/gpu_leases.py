@@ -284,7 +284,10 @@ def identity(pid):
     try:
         fields = Path("/proc/%s/stat" % pid).read_text().rsplit(") ", 1)[1].split()
         return {"pid": int(pid), "starttime": fields[19],
-                "pid_namespace": os.readlink("/proc/self/ns/pid"), "state": fields[0]}
+                "process_group": int(fields[2]),
+                "pid_namespace": os.readlink("/proc/self/ns/pid"),
+                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                "state": fields[0]}
     except FileNotFoundError:
         return None
 
@@ -356,6 +359,19 @@ def snapshot(path):
 def serialized_payload_source():
     return _REMOTE_LEASE_CORE + '''
 import subprocess
+import time
+
+def write_receipt(path, receipt):
+    fd, temporary = tempfile.mkstemp(prefix=".launch-receipt.", dir=str(Path(path).parent))
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(receipt, handle, sort_keys=True)
+            handle.write("\\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError): os.unlink(temporary)
 
 def bind(path, lease, process):
     if not lease:
@@ -366,11 +382,28 @@ def bind(path, lease, process):
             raise GPUUnavailable("GPU reservation ended before payload launch")
         row.update(process)
 
-def payload(path, lease, inner):
-    bind(path, lease, identity(os.getpid()))
+def payload(path, lease, inner, receipt_path, run_id):
+    ident = identity(os.getpid())
+    bind(path, lease, ident)
+    receipt = {"schema_version": 1, "run_id": run_id,
+               "identity": ident, "host": socket.gethostname().lower().split(".")[0],
+               "started_at": time.time(), "state": "running"}
+    receipt_file = Path(receipt_path)
     try:
-        return subprocess.call(["bash", "-lc", inner])
+        write_receipt(receipt_file, receipt)
+    except OSError:
+        # Durable adoption evidence is advisory to ordinary compute launches.
+        # Missing receipt means the later handoff will fail closed.
+        pass
+    try:
+        code = subprocess.call(["bash", "-lc", inner])
+        return code
     finally:
+        receipt.update(state="finished", exit_code=locals().get("code"), ended_at=time.time())
+        try:
+            write_receipt(receipt_file, receipt)
+        except OSError:
+            pass
         release(path, lease)
 '''
 
@@ -563,9 +596,11 @@ def launch_compute(options, payload_source):
     devices = ",".join(lease["gpus"]) if lease else options.get("requested")
     inner = options["inner"].replace("__HEARTING_GPU_SETUP__",
         "export CUDA_VISIBLE_DEVICES=%s" % shlex.quote(devices) if devices is not None else ":")
-    script = payload_source + "\nraise SystemExit(payload(%r, %r, %r))\n" % (path, lease, inner)
-    command = "python3 -c " + shlex.quote(script)
     run_dir = Path(options["run_dir"])
+    receipt_path = str(run_dir / "launch-receipt.json")
+    script = payload_source + "\nraise SystemExit(payload(%r, %r, %r, %r, %r))\n" % (
+        path, lease, inner, receipt_path, options["run_id"])
+    command = "python3 -c " + shlex.quote(script)
     launch_cwd = options.get("cwd") or os.getcwd()
     if not isinstance(launch_cwd, str) or not os.path.isabs(launch_cwd):
         release(path, lease)
@@ -619,7 +654,8 @@ def launch_compute(options, payload_source):
         release(path, lease)
         raise
     return {"gpus": devices, "gpu_lease": lease,
-            "tmux_transport": tmux_transport}
+            "tmux_transport": tmux_transport,
+            "receipt": receipt_path}
 
 
 def requested_devices(command, default=None):
@@ -990,7 +1026,9 @@ def launch_compute_namespaced(options, payload_source):
             "    if safe_fd is not None: _ns_os.close(safe_fd)\n") % ({
                 "safe_run": (mapping, run_root, options["run_dir"]),
                 "enter": (mapping, run_root, options.get("cwd"), options["run_dir"]),
-                "payload": (path, lease, inner),
+                "payload": (path, lease, inner,
+                            str(Path(options["run_dir"]) / "launch-receipt.json"),
+                            options["run_id"]),
                 "release": (path, lease),
             }))
         fd = os.open(runner_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -1029,7 +1067,8 @@ def launch_compute_namespaced(options, payload_source):
         else:
             if lease:
                 raise GPUUnavailable("GPU launch did not establish its wrapper")
-        return {"gpus": devices, "gpu_lease": lease, "tmux_transport": transport}
+        return {"gpus": devices, "gpu_lease": lease, "tmux_transport": transport,
+                "receipt": str(Path(options["run_dir"]) / "launch-receipt.json")}
     except Exception:
         if runner_created:
             with contextlib.suppress(FileNotFoundError):
