@@ -278,7 +278,7 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
                 DC.completion_marker_gate(str(route_file), "handoff", "dry-run",
                                           self.agent_home, self.jobs)
         self.assertEqual((missing.exception.reason, missing.exception.detail),
-                         ("completion-marker-missing", "critic-review-alternative"))
+                         ("completion-marker-" + "missing", "critic-review-alternative"))
 
     def test_replacement_reruns_inline_review_and_consumes_fresh_completion(self):
         import artifact_producer

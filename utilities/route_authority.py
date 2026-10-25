@@ -653,9 +653,12 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                 from review_source_subject import is_implementation_review, is_source_test, is_deploy_review
                 known_history = any(meta.get("_review_subject_digest") or meta.get("review_subject_digest")
                                     for _status, meta in rows)
-                original_source = (is_implementation_review(route, node) or is_source_test(node)
-                                   or is_deploy_review(route, node))
-                if source_digest is not None and (not rows or known_history or original_source):
+                from review_input import is_review_node
+                resolved_content = (is_implementation_review(route, node) or is_source_test(node)
+                                    or is_deploy_review(route, node) or not is_review_node(node))
+                # Only a legacy document review needs its old node count when
+                # no historical selected input can identify the reviewed bytes.
+                if source_digest is not None and (not rows or known_history or resolved_content):
                     source_aware = True
                     budget_rows = [(status, meta) for status, meta in rows
                                    if meta.get("_review_subject_digest") == source_digest
