@@ -64,6 +64,20 @@ def _stubbed_runtime_projection():
 
 
 class PeerReconnectTest(unittest.TestCase):
+    def test_activation_reconnects_resources_using_the_new_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            utility = root / "utilities" / "resource-observers.py"
+            utility.parent.mkdir()
+            utility.touch()
+            with mock.patch.object(runtime_activation.subprocess, "Popen") as launch:
+                self.assertTrue(runtime_activation.reconnect_resource_observers(root))
+                args, kwargs = launch.call_args
+                self.assertEqual(args[0], [sys.executable, str(utility)])
+                self.assertEqual(kwargs['env']['AGENT_HOME'], str(root))
+                launch.side_effect = OSError('fixture spawn failure')
+                self.assertFalse(runtime_activation.reconnect_resource_observers(root))
+
     def test_callback_uses_activated_root_and_keeps_existing_registry(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

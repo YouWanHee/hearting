@@ -1464,6 +1464,12 @@ holds no model turn, opens no dispatch depth, and has no launch authority
 beyond the successor its sealed route already declares.
 
 Resource watches follow exact resource identity rather than a 24-hour deadline.
+Release activation reattaches observation to existing compute/resource runs,
+retaining payload, exit/sentinel and route/node identity. The argument-free
+`hearting run resource-observers` repeats that reconciliation. A registered
+`resource-runner observe` side run shares its live resource's route/node and
+recipients, with its own run id, log, progress and sentinel. Its success/failure
+is reported separately from the unchanged stage predecessor and completion.
 Start/resume and the parked owner controller reuse a live watch or reattach one
 under the existing resource-registry lock. Recovery changes only supervision
 metadata, never the payload, its identity, or producer outputs. A recovered watch

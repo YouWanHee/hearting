@@ -723,6 +723,7 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         public_observation = read_public_run_record(artifact_root, str(run_id))
     return {
         "job_type": "resource", "resource_class": "lab", "run_id": str(run_id),
+        "resource_policy": run.get("resource_policy"), "observer_of": run.get("observer_of"),
         "cwd": cwd, "elapsed_min": elapsed_min, "liveness": liveness,
         "pid": run.get("pid"), "starttime": run.get("starttime"),
         "command_hash": run.get("command_hash"), "process_group": run.get("process_group"),
@@ -789,7 +790,7 @@ def observe_run_if_due(run_id: str, run: dict, registry: Path, *, now=None,
                 candidate.get("row_started_at"), None))
     if not observation_rows and run.get("output_dir"):
         observation_rows.append((run["output_dir"], run.get("row_id") or "run", started_at, progress))
-    if not observation_rows and view.get("liveness") == "working":
+    if not observation_rows and view.get("liveness") in {"working", "exited"}:
         observation_rows.append((None, run.get("row_id") or "run", started_at, progress))
     for metric_root, row_key, row_start, row_progress in observation_rows:
         candidate_run = {**run, "run_id": str(run_id), "artifact_root": artifact_root}

@@ -2892,7 +2892,7 @@ class CompletionWatchTest(unittest.TestCase):
         self.addCleanup(runner.stop); self.addCleanup(recovery.stop)
         self.run_dir = self.root / "runs" / "here-1"
         self.run_dir.mkdir(parents=True)
-        self.meta = {"run_id": "here-1", "host": "here",
+        self.meta = {"run_id": "here-1", "host": "here", "artifact_root": str(self.root / "artifacts"),
                      "provenance": {"session": {"harness": "claude", "id": "sid-7"},
                                     "route": {"route_id": "rt-0123456789abcdef"}}}
         (self.run_dir / "meta.json").write_text(json.dumps(self.meta))
@@ -2982,6 +2982,7 @@ class CompletionWatchTest(unittest.TestCase):
         state = self.root / "runtime" / "state.json"
         state.parent.mkdir()
         meta = {"run_id": "remote-metrics-run", "host": "remote",
+                "artifact_root": str(self.root / "artifacts"),
                 "host_is_local": False, "run_root": "/shared/runs",
                 "output_dir": target + "/experiment", "path_namespace": mapping,
                 "started_at": "1970-01-01T00:00:00+00:00",

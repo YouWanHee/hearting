@@ -184,6 +184,11 @@ callback, and the session ended with no follow-up mechanism registered. See
 For `eval`, `eval-run` is likewise a supervised detached run whose termination
 advances `metrics`, and `sync` is the terminal node.
 
+Release activation attaches checks to existing runs without restarting them;
+`hearting run resource-observers` repeats this operation. For scoring alongside
+a live resource, `resource-runner observe` takes the usual start arguments and
+its own run id/log. It inherits the resource's route/node and recipients, records
+its own exit, and leaves the stage predecessor unchanged.
 Workload progress is optional. The resource runner supplies
 `AGENT_RESOURCE_PROGRESS_FILE`, `AGENT_RESOURCE_RUN_ID`, and `AGENT_RESOURCE_NODE`;
 `resource_progress.write_progress(done, "item", total=n)` atomically publishes an
