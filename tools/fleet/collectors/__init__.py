@@ -18,6 +18,7 @@ from ..refresh import LiveSnapshot
 
 _JOB_OBSERVATIONS = {}
 _OBSERVATION_SUCCESSES = {}
+FIRST_FRAME_USAGE_WAIT = 5.0
 
 
 def _observation_health(key, source, error=None):
@@ -466,17 +467,41 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
     except Exception:
         pass
 
-    # The journal wait joins after exact resume aliases and before the one liveness pass.
+    answer_waits = None
+    fleet_answer_waits = None
     try:
-        from . import interaction as _interaction
-        for failed_session, reason in _interaction.enrich_human_gates(sessions, jobs_path=jobs_path) or ():
-            identity = "%s:%s" % (getattr(failed_session, "harness", "unknown"),
-                                   getattr(failed_session, "session_id", "unknown"))
-            observations["human-gates:" + identity] = _observation_health(
-                identity, "human-gates", reason)
+        utilities = str(Path(__file__).resolve().parents[3] / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        import human_wait_state
+        answer_waits = human_wait_state.cached_fleet_view(now=_time.time())
+        if answer_waits is None:
+            answer_waits = {"items": [], "by_session": {}, "complete": False,
+                            "total": 0, "older": 0, "health": [
+                                {"source": "cache", "state": "unknown"}]}
+        from ..refresh import fleet_answer_wait_view
+        fleet_answer_waits = fleet_answer_wait_view(answer_waits)
+        for session in sessions:
+            key = (getattr(session, "harness", None), getattr(session, "session_id", None))
+            ids = {item.get("id") for item in answer_waits.get("items", ())
+                   if item.get("session_id") == key[1] and item.get("harness") == key[0]
+                   and item.get("stale") == "current"}
+            if ids:
+                session.interaction_observations.extend(
+                    {"kind": {"human gate": "decision", "blocked owner": "decision",
+                              "marker": "decision"}.get(item.get("kind"), item.get("kind")),
+                 "source": item.get("source"),
+                 "waiting_since": item.get("since"), "item_id": item.get("id")}
+                for item in answer_waits.get("items", ())
+                if item.get("id") in ids)
+        if not answer_waits.get("complete", False):
+            reasons = ";".join(str(item.get("state", "unknown"))
+                                for item in answer_waits.get("health", ()))
+            observations["answer-waits"] = _observation_health(
+                job_key, "answer-waits", reasons[:160] or "observation-incomplete")
     except Exception as exc:
-        observations["human-gates"] = _observation_health(
-            job_key, "human-gates", "%s: %s" % (type(exc).__name__, str(exc)[:160]))
+        observations["answer-waits"] = _observation_health(
+            job_key, "answer-waits", "%s: %s" % (type(exc).__name__, str(exc)[:160]))
 
     # One shared live assignment pass; peer trailers and Herdr read the same snapshot.
     tag_metadata = []
@@ -519,8 +544,22 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
                 continue
             snap = usage_cache.account_usage(harness, usage=usage if usage == "refresh" else "cache-only")
             usage_snapshots[harness] = snap
+            error_observation = snap.get("error_observation")
             usage_meta[harness] = {k: snap.get(k) for k in ("freshness", "observed_at")}
+            freshness = snap.get("freshness")
+            if freshness == "fresh":
+                observations["usage:" + harness] = {"state": "ok"}
+            elif usage == "refresh" and usage_cache.refresh_in_flight(
+                    harness, max_age=FIRST_FRAME_USAGE_WAIT):
+                observations["usage:" + harness] = {
+                    "state": "pending", "reason": "usage-refresh-in-flight"}
+            else:
+                observations["usage:" + harness] = {
+                    "state": "unavailable", "reason": "usage-not-fresh"}
             if harness == "opencode":
+                go_scope = opencode_scope = entitlement_scope = None
+                selected = None
+                opencode_v2 = False
                 try:
                     utilities = Path(__file__).resolve().parents[3] / "utilities"
                     if str(utilities) not in sys.path:
@@ -585,11 +624,60 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
                             payload.pop(key, None)
                 except Exception:
                     usage_meta[harness]["providers"] = []
+                if isinstance(error_observation, dict):
+                    error_scope = error_observation.get("account_scope")
+                    selected_unavailable = (selected is not None
+                                             and selected.state == "unavailable")
+                    local_reason = (getattr(selected, "reason", None)
+                                    if selected_unavailable else None)
+                    # An unscoped marker is meaningful only while the currently
+                    # selected credential still confirms that exact local absence.
+                    if (error_scope is None and not (
+                            selected_unavailable and local_reason == error_observation.get("reason")
+                            and local_reason in {"credential-not-found", "credential-store-unavailable",
+                                                 "credential-store-read-failed"})):
+                        error_observation = None
+                        snap["error_observation"] = None
+                    elif (error_scope is not None and error_scope != (go_scope or "unscoped")):
+                        error_observation = None
+                        snap["error_observation"] = None
+                if (opencode_v2 and selected is not None and selected.state == "unavailable"
+                        and getattr(selected, "reason", None) in {
+                            "credential-not-found", "credential-store-unavailable",
+                            "credential-store-read-failed"}
+                        and not (isinstance(snap.get("payload"), dict)
+                                 and snap["payload"].get("error"))
+                        and not isinstance(error_observation, dict)):
+                    snap["error_observation"] = {
+                        "error": "missing-credential",
+                        "reason": selected.reason,
+                        "observed_at": _time.time(),
+                    }
+                    error_observation = snap["error_observation"]
+                # Scope and credential details are comparison inputs only. The
+                # published snapshot carries the bounded reason and quota values.
+                if isinstance(error_observation, dict):
+                    safe_observation = {key: error_observation.get(key)
+                                        for key in ("error", "reason", "observed_at")}
+                    snap["error_observation"] = safe_observation
+                    error_observation = safe_observation
+                if isinstance(snap.get("payload"), dict):
+                    payload = snap["payload"]
+                    for private_key in ("detail", "account_scope", "credential_integration_id",
+                                        "credential_source", "credential_type"):
+                        payload.pop(private_key, None)
+                    availability = payload.get("provider_availability")
+                    if isinstance(availability, dict):
+                        for row in availability.values():
+                            if isinstance(row, dict):
+                                row.pop("account_scope", None)
             payload = snap.get("payload") or {}
             if not isinstance(payload, dict):
                 continue
             if payload.get("error"):
                 usage_meta[harness]["error"] = payload.get("error")
+            elif isinstance(error_observation, dict):
+                usage_meta[harness]["error"] = error_observation.get("error")
             account_windows = payload.get("rl_windows")
             if account_windows is None:
                 account_windows = payload.get("windows")
@@ -616,9 +704,16 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
                     # key present but rejected). Render shows the cause instead of a
                     # silently blank gauge.
                     s._usage_error = payload.get("error")
+                    s._usage_error_reason = payload.get("reason")
+                elif harness == "opencode" and isinstance(error_observation, dict):
+                    s._usage_error = error_observation.get("error")
+                    s._usage_error_reason = error_observation.get("reason")
                 s._usage_freshness = snap.get("freshness")
                 s._usage_observed_at = snap.get("observed_at")
     except Exception:
+        for harness in ("claude", "codex", "opencode"):
+            observations.setdefault("usage:" + harness, {
+                "state": "unavailable", "reason": "usage-collection-failed"})
         usage_meta = {}
         usage_snapshots = {}
     collect_all.last_usage = usage_meta
@@ -645,6 +740,20 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
         jobs = dispatch.collect(jobs_path=jobs_path, harness_filter=harness_filter,
                                 session_rows=sessions,
                                 **({"fast_first": True} if fast_first else {}))
+        if answer_waits is not None:
+            by_attempt = {}
+            for item in answer_waits.get("items", ()):
+                attempt = item.get("attempt_id")
+                if attempt and item.get("stale") == "current":
+                    by_attempt.setdefault(attempt, []).append(
+                        {"kind": {"human gate": "decision", "blocked owner": "decision",
+                                  "marker": "decision"}.get(item.get("kind"), item.get("kind")),
+                         "source": item.get("source"),
+                         "waiting_since": item.get("since"), "item_id": item.get("id")})
+            for job in jobs:
+                values = by_attempt.get(getattr(job, "attempt_id", None), ())
+                if values:
+                    job.interaction_observations.extend(values)
         # Capture the collector's output at its boundary, never in render or
         # from the independent detail worker. Older readers keep the attributes.
         node_evidence = copy.deepcopy(getattr(dispatch.collect, "last_route_nodes", {}) or {})
@@ -789,6 +898,7 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
         resource_diagnostics=copy.deepcopy(resource_diagnostics),
         observations=observations, tag_metadata=copy.deepcopy(tag_metadata),
         display_snapshot=display_snapshot,
+        answer_waits=fleet_answer_waits,
     )
     if not sessions and not jobs and node_evidence:
         from ..projection import terminal_route_entities

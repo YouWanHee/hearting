@@ -96,6 +96,8 @@ REASON_TEXT = {
     "usage-unknown": "현재 입력 토큰을 확인하지 못했습니다",
     "idle-card-not-accepted": "유휴 정리 카드를 접수하지 못했습니다",
 }
+# Reasons after which this seat holds no card for the next session to receive.
+NO_CARD_REASONS = frozenset({"card-taken", "idle-card-not-accepted"})
 # Continue skips the person caused (or chose) themselves: no result line for these.
 CONTINUE_QUIET = frozenset({"new-input", "draft", "card-changed", "handed-off", "no-card", "superseded", "off"})
 
@@ -1078,9 +1080,11 @@ def _refresh_compact_card(req: dict, observation: dict) -> None:
             held["snapshot_count"] = len(bindings)
             _write_reservation(held)
             st.update_compact_card_locked(seat, int(req.get("card_generation", 0) or 0), identity,
-                                          recent=str(observation.get("recent") or ""),
+                                          recent=str(observation.get("recent_post", observation.get("recent")) or ""),
                                           source=str(observation.get("source") or ""),
-                                          recent_partial=bool(observation.get("recent_partial")))
+                                          recent_partial=bool(observation.get("recent_partial")),
+                                          recent_preserved=str(observation.get("recent_preserved") or ""),
+                                          last_reply=observation.get("last_reply"))
     except BaseException:
         # The original complete summary remains authoritative; best-effort enrichment
         # and the extra snapshot do not turn missing transcript detail into a clear gate.
@@ -1522,11 +1526,12 @@ def followup_text(req: dict) -> str:
 def _notice_text(outcome: str, reason: str, harness: str) -> str:
     hint = CLEAR_COMMAND.get(harness, "/clear")
     why = REASON_TEXT.get(reason, reason or "알 수 없음")
+    kept = "" if reason in NO_CARD_REASONS else f" 카드는 저장돼 있어 {hint} 하면 새 창이 카드를 받습니다."
     if outcome == "unverified":
-        return f"[정리] 창 비우기를 요청했지만 결과를 확인하지 못했습니다. 창 상태를 확인하고 필요하면 {hint} 하세요."
+        return f"[정리] 창 비우기를 요청했지만 결과를 확인하지 못했습니다. 창 상태를 확인하고 필요하면 {hint} 하세요.{kept}"
     if outcome == "failed":
-        return f"[정리] 창 비우기에 실패했습니다({why}). 필요하면 {hint} 하세요."
-    return f"[정리] 창을 자동으로 비우지 않았습니다({why}). 필요하면 {hint} 하세요."
+        return f"[정리] 창 비우기에 실패했습니다({why}). 필요하면 {hint} 하세요.{kept}"
+    return f"[정리] 창을 자동으로 비우지 않았습니다({why}). 필요하면 {hint} 하세요.{kept}"
 
 
 def _continue_notice_text(outcome: str, reason: str, prompt_text: str = CONTINUE_TEXT) -> str:

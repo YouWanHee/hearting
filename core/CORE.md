@@ -194,7 +194,7 @@ never orders a move or a delete.
 | `shards/` | parallel-leg support material | `C-INT` |
 | `.runtime/` | artifact-root-scoped runtime state (route lifecycle records, producer cutover/cycle records, stage-session ledgers under `.runtime/stage-sessions/<route_id>/`, and similar); the only bucket name for this, legacy `_runtime/` is read-only | `C-RT` |
 | `.core-grounding/` | legacy core-read marker state (no longer written) | `C-RT` |
-| `.spec-grounding/` | spec read-guard state | `C-RT` |
+| `.spec-grounding/` | legacy release-local residue; canonical spec read-guard writes use `dispatch_contract.state_root(environ)/spec-grounding` | `C-RT` |
 | `routes/`, `_routes/` | legacy route-record locations outside `.runtime/` | `C-LRT` |
 | `notes/`, `proposals/`, `spec-research-alternative/`, `research-alternative/` | present containers whose owner is not declared — recognized, not adopted | `C-LEG(undeclared-container)` |
 | `.git/`, `.agents/`, `.codex/`, `.probe-*/` | runtime residue that lives beside artifacts without being one | `C-LEG(runtime-residue)` |
@@ -284,7 +284,7 @@ Invalid paths identify the locator and reason before payload reads or manifest
 publication.
 
 A payload directory may opt itself and its descendants out of new candidate
-collection with any one of three independent markers: a regular, no-follow
+collection with any one of the following independent markers: a regular, no-follow
 `CACHEDIR.TAG` whose first 43 bytes are exactly
 `Signature: 8a477f597d28d172789f06886806bc55`; a regular, no-follow
 `pyvenv.cfg` of any contents; or a regular, no-follow `.gitignore` whose entire
@@ -312,6 +312,20 @@ to self-exclusion markers and the structural runtime signals described here;
 historical rows remain unchanged for unrelated inclusion changes. Candidate
 bundle search uses this rule; validation of already-published bundle
 descriptors retains its recorded coverage behavior.
+
+Open-cycle interim checkpoints read `${XDG_CONFIG_HOME:-$HOME/.config}/hearting/checkpoint-limits.json`
+on each call. It is an optional flat JSON object with positive integer byte or
+file-count limits; for example
+`{"max_files":20000,"max_total_bytes":2147483648,"max_scanned_files":200000,"max_file_bytes":33554432}`.
+Missing settings use the existing defaults (2,000 candidates, 256 MiB total,
+20,000 scanned candidates, and 32 MiB per file). Invalid files are ignored as
+a whole. `max_scanned_files` controls the count of eligible checkpoint
+candidates considered, after hidden, binary, oversize, invalid-locator,
+symlink, and other exclusions. It does not count physical filesystem entries.
+The internal `max_walk_entries` setting remains an accepted alias. An explicit
+checkpoint limits object takes precedence over this user configuration.
+Finalization retains the sealed-manifest rules for declaring and digesting
+valid payload files.
 
 **Cycle payload buckets.** The top-level table above closes only the names
 directly under the artifact root. Inside a cycle, the first segment below

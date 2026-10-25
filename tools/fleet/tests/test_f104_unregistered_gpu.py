@@ -66,6 +66,13 @@ class UnregisteredGpuTestBase(unittest.TestCase):
 
 
 class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
+    def test_self_snapshot_is_visible_even_when_inventory_is_unconfigured(self):
+        snapshot = _snapshot((0, [_process()]))
+        snapshot.update(configured=False, status="template")
+        entry = compute_hosts.unregistered_gpu(snapshot)
+        self.assertEqual(len(entry), 1)
+        self.assertEqual(entry[0]["gpu_indexes"], [0])
+
     def test_unregistered_process_renders_in_its_project_card(self):
         text = self.lines(_snapshot((0, [_process()])))
         header = next(i for i, line in enumerate(text) if "SR_CorrNet_DSC/" in line)

@@ -550,6 +550,35 @@ module.main()
         self.assertEqual(json.loads(result.stdout), task)
         self.assertIn('fixture-run__a1', task)
 
+    def test_retry_recovery_shows_completed_compute_candidate_as_unverified(self):
+        route, path, jobs, registry, output, ledger, gates = self.fixture()
+        self.close_route(route, path)
+        armed = json.loads((ledger.root / 'armed/full-run.json').read_text())
+        with mock.patch('route_parent_close.linked_resources', return_value=[
+                {"kind": "compute", "run_id": "compute-candidate", "state": "finished"}]) as scan:
+            task = R.retry_step(route, armed, jobs, 'resource failed')['command']
+        scan.assert_called_once()
+        self.assertIn("compute-candidate", task)
+        self.assertIn("unverified", task)
+        self.assertIn("resource-runner start --compute-run compute-candidate", task)
+        self.assertNotIn("--compute-run latest", task)
+
+    def test_same_route_correction_keeps_completed_compute_candidate_unverified(self):
+        import dispatch_replacement as DR
+
+        route, path, jobs, _registry, _ledger, armed = self.owner_fixture()
+        self.owner_row(jobs, route, path, note="dead-worker-blocked")
+        with mock.patch.object(DR, "owner_parked_gate", return_value=None), \
+                mock.patch('route_parent_close.linked_resources', return_value=[
+                    {"kind": "compute", "run_id": "compute-candidate", "state": "finished"}]):
+            step = R.retry_step(route, armed, jobs, 'resource failed')
+        self.assertEqual(step["continuation"], "correct")
+        self.assertIn("--attempt-id att-parent --message-file /dev/stdin", step["command"])
+        task = shlex.split(step["command"])[2]
+        self.assertIn("unverified", task)
+        self.assertIn("resource-runner start --compute-run compute-candidate", task)
+        self.assertNotIn("--compute-run latest", task)
+
     def test_retry_of_a_retry_gets_a_distinct_identity_with_a_missing_registry(self):
         route, path, jobs, registry, output, ledger, gates = self.fixture()
         armed = json.loads((ledger.root / 'armed/full-run.json').read_text())

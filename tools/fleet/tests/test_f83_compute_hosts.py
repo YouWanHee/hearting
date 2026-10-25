@@ -33,10 +33,14 @@ class ComputeHostCollectorTest(unittest.TestCase):
 
     def test_unconfigured_inventory_is_guidance_not_an_error_panel(self):
         missing = self.root / "missing.yaml"
-        with mock.patch.dict(os.environ, {"COMPUTE_HOSTS_CONFIG": str(missing)}, clear=False):
+        self.tool.write_text(
+            "import json\nprint(json.dumps({'hosts': [{'host': 'local', 'self': True, "
+            "'reachable': True, 'gpus': []}]}))\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"COMPUTE_HOSTS_CONFIG": str(missing),
+                                          "FLEET_COMPUTE_HOSTS_TOOL": str(self.tool)}, clear=False):
             result = compute_hosts.collect()
-        self.assertEqual((result["configured"], result["status"], result["hosts"]),
-                         (False, "missing", []))
+        self.assertEqual((result["configured"], result["status"]), (False, "missing"))
+        self.assertEqual(result["hosts"][0]["host"], "local")
         self.assertEqual(result["path"], str(missing))
         self.assertNotIn("error", result)
 
@@ -44,12 +48,42 @@ class ComputeHostCollectorTest(unittest.TestCase):
         self.tool.write_text(
             "import sys\n"
             "print('compute-hosts: compute host inventory has no hosts yet: edit x',"
-            " file=sys.stderr)\nsys.exit(2)\n", encoding="utf-8")
+            " file=sys.stderr)\n"
+            "if sys.argv[1] == 'list': sys.exit(2)\n"
+            "print('{\"hosts\":[{\"host\":\"fixture\",\"self\":true,\"reachable\":true,\"gpus\":[]}]}')\n",
+            encoding="utf-8")
         with self._env():
             result = compute_hosts.collect()
         self.assertEqual((result["configured"], result["status"]), (False, "template"))
         self.assertIn("edit", result["hint"])
         self.assertNotIn("error", result)
+
+    def test_template_uses_self_observation_without_changing_config(self):
+        payload = {"hosts": [{"host": "machine", "self": True, "reachable": True,
+                              "cpu_count": 8, "cpu_utilization_pct": 25,
+                              "memory_used_mib": 2048, "memory_total_mib": 8192,
+                              "gpus": [{"index": 0}, {"index": 1}]}]}
+        self.tool.write_text(
+            "import json,sys\n"
+            "if sys.argv[1] == 'list':\n"
+            " print('compute-hosts: compute host inventory has no hosts yet', file=sys.stderr)\n"
+            " sys.exit(2)\n"
+            "print(json.dumps(" + repr(payload) + "))\n", encoding="utf-8")
+        before = self.config.read_bytes()
+        with self._env():
+            result = compute_hosts.collect(timeout=3)
+        self.assertFalse(result["configured"])
+        self.assertEqual(result["status"], "template")
+        self.assertEqual(len(result["hosts"]), 1)
+        self.assertEqual(result["hosts"][0]["gpus"], [{"index": 0}, {"index": 1}])
+        self.assertEqual(self.config.read_bytes(), before)
+        render.set_compute_hosts(result)
+        try:
+            text = "\n".join(render._plain(row) for row in render._compute_host_rows(120))
+            for token in ("machine", "CPU", "MEM", "0:", "1:", "template", "remote hosts"):
+                self.assertIn(token, text)
+        finally:
+            render.set_compute_hosts(None)
 
     def test_unconfigured_panel_renders_one_guidance_line(self):
         render.set_compute_hosts({"configured": False, "status": "template", "hosts": [],
