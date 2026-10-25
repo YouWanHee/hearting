@@ -559,6 +559,232 @@ class DeclaredResourceProgressTest(unittest.TestCase):
 
 
 class ExperimentObservationTest(unittest.TestCase):
+    def test_total_less_counter_rate_stays_separate_from_eta(self):
+        no_total = progress.evaluate_observation(now=300, started_at=0,
+            progress={"completed": 3, "unit": "item", "age_s": 0},
+            previous_progress={"completed": 2, "total": None, "unit": "item"},
+            previous_progress_at=60)
+        self.assertEqual(no_total["rate_per_second"], 1 / 240)
+        self.assertIsNone(no_total["eta_seconds"])
+        self.assertIsNone(no_total["predicted_total_seconds"])
+        with_total = progress.evaluate_observation(now=300, started_at=0,
+            progress={"completed": 3, "total": 10, "unit": "item", "age_s": 0},
+            previous_progress={"completed": 2, "total": 10, "unit": "item"},
+            previous_progress_at=60)
+        self.assertEqual(with_total["eta_seconds"], 7 * 240)
+        stale_pair = progress.evaluate_observation(now=900, started_at=0,
+            progress={"completed": 3, "unit": "item", "age_s": 0},
+            previous_progress={"completed": 2, "total": None, "unit": "item"},
+            previous_progress_at=100)
+        self.assertIsNone(stale_pair["rate_per_second"])
+        for now, completed, previous_at in ((60, 3, 60), (59, 3, 60), (300, 2, 60)):
+            with self.subTest(now=now, completed=completed):
+                invalid_pair = progress.evaluate_observation(now=now, started_at=0,
+                    progress={"completed": completed, "unit": "item", "age_s": 0},
+                    previous_progress={"completed": 2, "total": None, "unit": "item"},
+                    previous_progress_at=previous_at)
+                self.assertIsNone(invalid_pair["rate_per_second"])
+
+    def test_virtual_progress_tracker_preserves_last_increase_and_starts_new_episodes(self):
+        signal = {"completed": 4, "total": 20, "unit": "item",
+                  "stream_id": "counter", "generation": "generation-a"}
+        tracker, _, _ = progress._advance_progress_tracker(None, signal, 0)
+        tracker, _, first_increase = progress._advance_progress_tracker(
+            tracker, {**signal, "completed": 5}, 100)
+        self.assertIsNone(first_increase["stagnation"])
+        self.assertEqual(tracker["last_increase_at"], 100)
+        tracker, _, before = progress._advance_progress_tracker(
+            tracker, {**signal, "completed": 5}, 7299)
+        self.assertEqual(tracker["last_increase_at"], 100)
+        self.assertIsNone(before["stagnation"])
+        tracker, _, due = progress._advance_progress_tracker(
+            tracker, {**signal, "completed": 5}, 7300)
+        episode = due["stagnation"]["episode_id"]
+        self.assertEqual(due["stagnation"]["since"], "last-increase")
+        tracker, _, repeated = progress._advance_progress_tracker(
+            tracker, {**signal, "completed": 5}, 7400)
+        self.assertEqual(repeated["stagnation"]["episode_id"], episode)
+        tracker, _, recovered = progress._advance_progress_tracker(
+            tracker, {**signal, "completed": 6}, 7401)
+        self.assertIsNone(tracker["active_episode_id"])
+        tracker, _, restalled = progress._advance_progress_tracker(
+            tracker, {**signal, "completed": 6}, 14601)
+        self.assertNotEqual(restalled["stagnation"]["episode_id"], episode)
+        reset, _, reset_state = progress._advance_progress_tracker(
+            tracker, {**signal, "completed": 2}, 14602)
+        self.assertIsNone(reset["last_increase_at"])
+        self.assertIsNone(reset_state["stagnation"])
+        changed, _, _ = progress._advance_progress_tracker(
+            tracker, {**signal, "generation": "generation-b", "completed": 6}, 14603)
+        self.assertIsNone(changed["last_increase_at"])
+        changed_total, _, _ = progress._advance_progress_tracker(
+            tracker, {**signal, "total": 21, "completed": 6}, 14604)
+        self.assertIsNone(changed_total["last_increase_at"])
+        changed_unit, _, _ = progress._advance_progress_tracker(
+            tracker, {**signal, "unit": "epoch", "completed": 6}, 14605)
+        self.assertIsNone(changed_unit["last_increase_at"])
+        first, _, _ = progress._advance_progress_tracker(None,
+            {**signal, "completed": 1}, 1000)
+        first, _, before_first = progress._advance_progress_tracker(
+            first, {**signal, "completed": 1}, 8199)
+        self.assertIsNone(before_first["stagnation"])
+        first, _, after_first = progress._advance_progress_tracker(
+            first, {**signal, "completed": 1}, 8200)
+        self.assertEqual(after_first["stagnation"]["since"], "first-observation")
+
+    def test_metric_stream_uses_step_increase_and_ignores_value_plateau(self):
+        def sample(step, loss, accuracy, stamp):
+            return {"epoch": step, "unit": "step", "split": "valid",
+                "format": "epochs-jsonl", "metrics": {"loss": loss, "accuracy": accuracy},
+                "source_updated_at": stamp, "source_generation": "source-a"}
+        run = {"run_id": "metric-stream"}
+        first = progress._progress_signal(None, [sample(1, 4.0, 0.5, 100)], None,
+                                          run, "loss", 100)
+        tracker, _, _ = progress._advance_progress_tracker(None, first, 100)
+        rewritten = progress._progress_signal(None, [sample(1, 3.0, 0.8, 200)], None,
+                                              run, "loss", 200)
+        tracker, _, unchanged = progress._advance_progress_tracker(tracker, rewritten, 200)
+        self.assertIsNone(tracker["last_increase_at"])
+        self.assertIsNone(unchanged["stagnation"])
+        advanced = progress._progress_signal(None, [sample(2, 3.0, 0.8, 300)], None,
+                                             run, "loss", 300)
+        tracker, _, increased = progress._advance_progress_tracker(tracker, advanced, 300)
+        self.assertEqual(tracker["last_increase_at"], 300)
+        self.assertEqual(increased["rate_per_second"], 1 / 100)
+        selected = progress._progress_signal(None,
+            [sample(9, 4.0, 0.5, 400), {**sample(3, 2.0, 0.8, 400),
+             "unit": "epoch", "source_generation": "other-source"}],
+            None, run, None, 400)
+        self.assertEqual((selected["completed"], selected["unit"]), (3, "epoch"))
+
+    def test_rootless_admission_updates_public_record_and_notice_without_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            artifact = base / "artifact"
+            artifact.mkdir()
+            registry_dir = base / "registry"
+            bundle = registry_dir / "arbitrary-child"
+            bundle.mkdir(parents=True)
+            registry = registry_dir / "resource-runs.json"
+            registry.write_text("{}\n")
+            (bundle / "execution-record.json").write_text(json.dumps({
+                "run_id": "generic-run", "started_at": 0}))
+            admission_path = bundle / "any-file-name.json"
+            admission_path.write_text(json.dumps({"admitted": False,
+                "snapshot": {"t": 900}, "first_snapshot": {"t": 800},
+                "reasons": ["capacity"],
+                "preceding_evaluation_leases": [{"task": "evaluation", "host": "h1"}]}))
+            state = base / "runtime" / "state.json"
+            state.parent.mkdir()
+            run = {"run_id": "generic-run", "started_at": 0,
+                "artifact_root": str(artifact), "route_id": "route-a", "node": "run",
+                "owner_wait": {"harness": "codex", "session_id": "owner-session"}}
+            notices = []
+            def notify(*args, **kwargs):
+                notices.append(kwargs)
+                return {"state": "pending"}
+            with mock.patch.object(progress, "_observation_state_path", return_value=state), \
+                    mock.patch("session_notice.notify", side_effect=notify):
+                first = progress.observe_experiment(run, registry, 1000, row_key="run",
+                    started_at=0)
+                first_state = progress._read_observation_state(state)
+                first_episode = first["admission"]["episode_id"]
+                first_event = first_state["outbox"][0]["key"]
+                second = progress.observe_experiment(run, registry, 1061, row_key="run",
+                    started_at=0)
+                self.assertEqual(second["admission"]["denied_samples"], 1)
+                self.assertEqual(second["admission"]["episode_id"], first_episode)
+                self.assertEqual(notices[0]["key"], notices[-1]["key"])
+                self.assertIn("sample ratio=1.0", notices[0]["text"])
+                self.assertIn("admission=waiting", notices[0]["text"])
+                admission_path.write_text(json.dumps({"admitted": False,
+                    "snapshot": {"t": 1200}, "first_snapshot": {"t": 800},
+                    "reasons": ["capacity"],
+                    "preceding_evaluation_leases": [{"task": "evaluation", "host": "h1"}]}))
+                repeated = progress.observe_experiment(run, registry, 1201, row_key="run",
+                    started_at=0)
+                self.assertEqual(repeated["admission"]["denied_samples"], 2)
+                self.assertEqual(repeated["admission"]["episode_id"], first_episode)
+                self.assertEqual(progress._read_observation_state(state)["outbox"][0]["key"], first_event)
+                admission_path.write_text(json.dumps({"admitted": True,
+                    "snapshot": {"t": 1260}, "first_snapshot": {"t": 800}}))
+                admitted = progress.observe_experiment(run, registry, 1261, row_key="run",
+                    started_at=0)
+                admitted_public = progress.read_public_run_record(artifact, "generic-run")
+                stale = progress.observe_experiment(run, registry, 1861, row_key="run",
+                    started_at=0)
+            observation = first["observation"]
+            self.assertIsNone(observation["reached"])
+            self.assertIsNone(observation["rate_per_second"])
+            self.assertIsNone(observation["eta_seconds"])
+            self.assertEqual(first["admission"]["state"], "waiting")
+            self.assertEqual(first["admission"]["valid_samples"], 1)
+            self.assertEqual(first["admission"]["denied_sample_ratio"], 1.0)
+            self.assertIsNone(first["admission"]["wait_duration_seconds"])
+            self.assertIsNone(first["admission"]["time_ratio"])
+            self.assertEqual(admitted["admission"]["state"], "admitted")
+            self.assertEqual(admitted["admission"]["denied_samples"], 2)
+            self.assertEqual(admitted["admission"]["admitted_samples"], 1)
+            self.assertAlmostEqual(admitted["admission"]["denied_sample_ratio"], 2 / 3)
+            self.assertIsNone(admitted["admission"]["episode_id"])
+            self.assertEqual(admitted_public["admission"]["state"], "admitted")
+            self.assertEqual(stale["admission"]["state"], "unknown")
+            public = progress.read_public_run_record(artifact, "generic-run")
+            self.assertEqual(public["admission"]["state"], "unknown")
+            self.assertEqual(public["rows"][0]["admission"]["denied_samples"], 2)
+            self.assertIsNone(public["output_dir"])
+
+    def test_admission_recovery_starts_a_new_stagnation_grace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            artifact = base / "artifact"
+            artifact.mkdir()
+            registry_dir = base / "registry"
+            bundle = registry_dir / "bundle"
+            bundle.mkdir(parents=True)
+            registry = registry_dir / "index.json"
+            registry.write_text("{}\n")
+            (bundle / "run-record.json").write_text(json.dumps({
+                "run_id": "grace-run", "started_at": 0}))
+            decision = bundle / "decision.json"
+            decision.write_text(json.dumps({"admitted": False,
+                "snapshot": {"t": 0}, "first_snapshot": {"t": 0}}))
+            state = base / "runtime" / "state.json"
+            state.parent.mkdir()
+            run = {"run_id": "grace-run", "started_at": 0,
+                   "artifact_root": str(artifact), "status": "running"}
+            with mock.patch.object(progress, "_observation_state_path", return_value=state):
+                progress.observe_experiment(run, registry, 0, row_key="run", started_at=0,
+                    progress={"completed": 4, "total": 20, "unit": "item",
+                              "updated_at": 0, "age_s": 0}, notify_events=False)
+                decision.write_text(json.dumps({"admitted": False,
+                    "snapshot": {"t": 100}, "first_snapshot": {"t": 0}}))
+                progress.observe_experiment(run, registry, 100, row_key="run", started_at=0,
+                    progress={"completed": 5, "total": 20, "unit": "item",
+                              "updated_at": 100, "age_s": 0}, notify_events=False)
+                decision.write_text(json.dumps({"admitted": False,
+                    "snapshot": {"t": 7300}, "first_snapshot": {"t": 0}}))
+                waiting = progress.observe_experiment(run, registry, 7300, row_key="run", started_at=0,
+                    progress={"completed": 5, "total": 20, "unit": "item",
+                              "updated_at": 7300, "age_s": 0}, notify_events=False)
+                decision.write_text(json.dumps({"admitted": True,
+                    "snapshot": {"t": 7400}, "first_snapshot": {"t": 0}}))
+                recovered = progress.observe_experiment(run, registry, 7400, row_key="run", started_at=0,
+                    progress={"completed": 5, "total": 20, "unit": "item",
+                              "updated_at": 7400, "age_s": 0}, notify_events=False)
+                self.assertEqual(waiting["admission"]["state"], "waiting")
+                self.assertNotIn("progress-stagnation",
+                    {item["kind"] for item in waiting["observation"]["attention"]})
+                self.assertEqual(recovered["admission"]["state"], "admitted")
+                self.assertEqual(recovered["observation"]["stagnation"]["state"], "observing")
+                after_grace = progress.observe_experiment(run, registry, 14600, row_key="run", started_at=0,
+                    progress={"completed": 5, "total": 20, "unit": "item",
+                              "updated_at": 14600, "age_s": 0}, notify_events=False)
+            self.assertEqual(after_grace["observation"]["stagnation"]["state"], "stagnant")
+            self.assertEqual(after_grace["admission"]["state"], "unknown")
+            self.assertIn("progress-stagnation",
+                {item["kind"] for item in after_grace["observation"]["attention"]})
+
     def test_virtual_checkpoint_schedule_and_independent_matrix_rows(self):
         rows = []
         for index in range(13):

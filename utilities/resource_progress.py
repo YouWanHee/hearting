@@ -1,11 +1,11 @@
-"""Optional, bounded resource progress; counters never decide process lifecycle.
+"""Optional, bounded resource observations; they never decide run lifecycle.
 
-This observes existing producer metadata. It never imports a producer, scans a
-run tree, writes a registry, or changes the registered process lifecycle. Lab
-workloads may opt in with ``write_progress(12, "epoch", total=50)``: the runner
-supplies the path/run/node in AGENT_RESOURCE_PROGRESS_FILE/RUN_ID/NODE. With no
-progress environment, the writer does nothing. Readers use only the declared
-file, not logs; a missing or invalid observation stays unavailable.
+The counter reader uses the producer-declared file. Admission reads are
+separate: they use only shallow roots already supplied by exact run, registry,
+output, or mapped log provenance, and bind records by content. Neither reader
+imports a producer, searches a cwd/project tree, writes a registry, or changes
+the registered process lifecycle. A missing or invalid optional observation
+remains unknown.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import time
 MAX_BYTES = 65536
 MAX_PUBLIC_RUN_RECORD_BYTES = 4 * 1024 * 1024
 MAX_ARMS = 32
-OBSERVATION_VERSION = 1
+OBSERVATION_VERSION = 2
 CHECKPOINT_INTERVAL = 12 * 60 * 60
 _SAFE_RUN_ID = re.compile(r"[A-Za-z0-9._-]{1,160}\Z")
 
@@ -225,24 +225,34 @@ def evaluate_observation(*, now, started_at, planned_seconds=None, progress=None
         unit = progress.get("unit") or ("epoch" if "reached_epoch" in progress else None)
     rate = eta = predicted_total = None
     progress_age = None
+    progress_fresh = True
     if isinstance(progress, dict):
-        if isinstance(progress.get("age_s"), (int, float)):
-            progress_age = max(0.0, float(progress["age_s"]))
-        elif isinstance(progress.get("updated_at"), (int, float)):
-            progress_age = max(0.0, now - float(progress["updated_at"]))
-    progress_fresh = progress_age is None or progress_age <= 600
-    if (type(reached) is int and reached >= 0 and type(total) is int and total > 0
-            and reached <= total and isinstance(previous_progress, dict)
+        if (isinstance(progress.get("age_s"), (int, float))
+                and not isinstance(progress.get("age_s"), bool)
+                and math.isfinite(float(progress["age_s"]))):
+            progress_age = float(progress["age_s"])
+            progress_fresh = 0 <= progress_age <= 600
+        elif (isinstance(progress.get("updated_at"), (int, float))
+              and not isinstance(progress.get("updated_at"), bool)
+              and math.isfinite(float(progress["updated_at"]))):
+            progress_age = now - float(progress["updated_at"])
+            progress_fresh = 0 <= progress_age <= 600
+    if (type(reached) is int and reached >= 0
+            and (total is None or type(total) is int and total > 0 and reached <= total)
+            and isinstance(previous_progress, dict)
             and type(previous_progress.get("completed")) is int
             and previous_progress.get("unit") == unit
             and previous_progress.get("total") == total
-            and isinstance(previous_progress_at, (int, float)) and progress_fresh):
+            and isinstance(previous_progress_at, (int, float))
+            and not isinstance(previous_progress_at, bool) and progress_fresh
+            and progress.get("_comparison_valid", True) is not False):
         delta = reached - previous_progress["completed"]
         duration = now - float(previous_progress_at)
-        if delta > 0 and duration > 0:
+        if delta > 0 and 0 < duration <= 600:
             rate = delta / duration
-            eta = (total - reached) / rate
-            predicted_total = elapsed + eta
+            if type(total) is int and total > 0 and reached <= total:
+                eta = (total - reached) / rate
+                predicted_total = elapsed + eta
     attention = []
     if summary["nonfinite"]:
         attention.append({"kind": "nonfinite-metric", "metric": summary["metric"],
@@ -258,7 +268,7 @@ def evaluate_observation(*, now, started_at, planned_seconds=None, progress=None
         if distance > 10 * max(abs(best), 1.0):
             attention.append({"kind": "metric-divergence", "metric": summary["metric"],
                               "epoch": summary["latest"]["epoch"]})
-    if rate is not None:
+    if rate is not None and predicted_total is not None:
         if planned_seconds and predicted_total is not None and predicted_total >= 1.5 * float(planned_seconds):
             attention.append({"kind": "eta-over-plan", "predicted_total_seconds": predicted_total})
         elif not planned_seconds and predicted_total is not None and predicted_total > 6 * 3600:
@@ -334,6 +344,8 @@ def public_run_record(run, *, status=None, observation=None, metrics=None,
         "eta": observation.get("eta_seconds"),
         "planned_seconds": observation.get("planned_seconds", run.get("planned_seconds")),
         "metrics": record_metrics,
+        "admission": observation.get("admission"),
+        "stagnation": observation.get("stagnation"),
         "decision_metric": decision_metric,
         "proxy": proxy,
         "comparable_group": run.get("comparable_group", declared.get("comparable_group")),
@@ -444,6 +456,292 @@ def _merge_metric_sources(previous, current, samples):
     return result
 
 
+def _admission_roots(run, registry, metric_root):
+    """Return only existing roots already tied to this run by provenance."""
+    roots = []
+
+    def add(path):
+        if not isinstance(path, (str, Path)) or not str(path):
+            return
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            return
+        try:
+            info = candidate.lstat()
+            if stat.S_ISREG(info.st_mode):
+                candidate = candidate.parent
+                info = candidate.lstat()
+            if stat.S_ISDIR(info.st_mode) and str(candidate) not in roots:
+                roots.append(str(candidate))
+        except OSError:
+            return
+
+    add(metric_root)
+    try:
+        registry_root = Path(registry).absolute().parent
+        add(registry_root)
+    except (OSError, TypeError, ValueError):
+        registry_root = None
+    mapping = run.get("path_namespace")
+    for key in ("log", "log_path", "run_root"):
+        value = run.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        mapped = _reverse_namespace_path(value, mapping) if isinstance(mapping, dict) else None
+        if mapped is not None:
+            add(mapped)
+        elif run.get("host_is_local") is True:
+            add(value)
+        elif registry_root is not None:
+            try:
+                candidate = Path(value)
+                if candidate.is_absolute() and candidate.resolve(strict=False).is_relative_to(
+                        registry_root.resolve(strict=False)):
+                    add(value)
+            except (OSError, RuntimeError, ValueError):
+                pass
+    return roots
+
+
+def _progress_signal(progress, samples, metric_root, run, decision_metric, now):
+    """Choose one comparable counter or one exact metric stream."""
+    progress = progress if isinstance(progress, dict) else None
+    if progress is not None:
+        completed = progress.get("completed", progress.get("reached_epoch"))
+        if type(completed) is int and completed >= 0:
+            total = progress.get("total", progress.get("total_epochs"))
+            if not (type(total) is int and total > 0 and completed <= total):
+                total = None
+            age = progress.get("age_s")
+            updated = progress.get("updated_at")
+            if age is not None:
+                if not isinstance(age, (int, float)) or isinstance(age, bool):
+                    return None
+                try:
+                    age = float(age)
+                except OverflowError:
+                    return None
+                if not math.isfinite(age) or not 0 <= age <= 600:
+                    return None
+            if updated is not None:
+                if not isinstance(updated, (int, float)) or isinstance(updated, bool):
+                    return None
+                try:
+                    updated = float(updated)
+                except OverflowError:
+                    return None
+                if not math.isfinite(updated):
+                    return None
+            if (isinstance(updated, (int, float)) and not isinstance(updated, bool)
+                    and not 0 <= float(now) - updated <= 600):
+                return None
+            source_generation = progress.get("source_generation")
+            if source_generation is None and metric_root:
+                try:
+                    info = Path(metric_root).stat()
+                    source_generation = f"{info.st_dev}:{info.st_ino}"
+                except OSError:
+                    source_generation = None
+            execution = run.get("execution") if isinstance(run.get("execution"), dict) else {}
+            generation_data = {key: run.get(key) for key in
+                               ("run_id", "pid", "starttime", "command_hash", "config_sha256")}
+            generation_data.update(compute_run_id=execution.get("run_id"),
+                                   source_generation=source_generation)
+            generation = hashlib.sha256(json.dumps(generation_data, sort_keys=True,
+                separators=(",", ":"), default=str).encode()).hexdigest()[:20]
+            stream = progress.get("stream_id") or progress.get("source_path") or "counter"
+            return {"completed": completed, "total": total,
+                    "unit": str(progress.get("unit") or "item"),
+                    "stream_id": str(stream), "generation": generation,
+                    "updated_at": (float(updated) if isinstance(updated, (int, float))
+                                   and not isinstance(updated, bool)
+                                   and math.isfinite(float(updated)) else None),
+                    "age_s": (float(age) if isinstance(age, (int, float))
+                              and not isinstance(age, bool)
+                              and math.isfinite(float(age)) else None)}
+
+    decision_key = (decision_metric.get("key") if isinstance(decision_metric, dict)
+                    else decision_metric)
+    streams = {}
+    for sample in samples if isinstance(samples, list) else []:
+        if not isinstance(sample, dict) or type(sample.get("epoch")) is not int \
+                or sample["epoch"] < 0 or not isinstance(sample.get("metrics"), dict):
+            continue
+        split = str(sample.get("split") or "unknown")
+        unit = str(sample.get("unit") or "step")
+        fmt = str(sample.get("format") or "unknown")
+        source_time = sample.get("source_updated_at")
+        if isinstance(source_time, (int, float)) and not isinstance(source_time, bool):
+            age = float(now) - float(source_time)
+            if not math.isfinite(age) or age < 0 or age > 600:
+                continue
+        for metric in sample["metrics"]:
+            if not isinstance(metric, str) or (decision_key and metric != decision_key):
+                continue
+            key = (fmt, split, unit, metric)
+            prior = streams.get(key)
+            if prior is None or sample["epoch"] > prior["completed"]:
+                streams[key] = {"completed": sample["epoch"], "total": None,
+                    "unit": unit, "stream_id": "|".join(key),
+                    "generation": str(sample.get("source_generation") or
+                                       (str(Path(metric_root).resolve()) if metric_root else fmt)),
+                    "updated_at": None, "age_s": None}
+    if not streams:
+        return None
+    # Observe one deterministic stream; never construct progress by combining
+    # step counts from unrelated metrics or validation splits.
+    chosen = min(streams, key=lambda key:
+        (0 if key[1].lower() in {"valid", "validation", "val"} else 1, key))
+    return streams[chosen]
+
+
+def _advance_progress_tracker(previous, signal, now):
+    if not isinstance(signal, dict):
+        return None, None, None
+    value = signal.get("completed")
+    total = signal.get("total")
+    unit = signal.get("unit")
+    if type(value) is not int or value < 0 or not isinstance(unit, str):
+        return None, None, None
+    identity = (signal.get("stream_id"), signal.get("generation"), unit, total)
+    previous = previous if isinstance(previous, dict) else {}
+    previous_identity = (previous.get("stream_id"), previous.get("generation"),
+                         previous.get("unit"), previous.get("total"))
+    source_at = signal.get("updated_at")
+    has_source_time = (isinstance(source_at, (int, float)) and not isinstance(source_at, bool)
+                       and math.isfinite(float(source_at)))
+    source_at_valid = (has_source_time and float(source_at) <= float(now))
+    previous_at = previous.get("last_sample_at")
+    if source_at_valid and isinstance(previous_at, (int, float)) \
+            and not isinstance(previous_at, bool) and float(source_at) <= float(previous_at):
+        source_at_valid = False
+    sample_at = float(source_at) if source_at_valid else float(now)
+    rate_time_valid = source_at_valid or not has_source_time
+    if (not previous or identity != previous_identity
+            or type(previous.get("last_sample")) is not int
+            or value < previous.get("last_sample", value)):
+        tracker = {"stream_id": signal.get("stream_id"),
+                   "generation": signal.get("generation"), "unit": unit, "total": total,
+                   "first_observed_at": sample_at, "last_sample": value,
+                   "last_sample_at": sample_at, "last_increase_at": None,
+                   "active_episode_id": None}
+        return tracker, {"completed": value, "total": total, "unit": unit}, \
+            {"rate_per_second": None, "comparison_valid": False, "stagnation": None}
+
+    tracker = dict(previous)
+    last_sample = previous.get("last_sample")
+    last_sample_at = previous.get("last_sample_at")
+    if type(last_sample) is not int or not isinstance(last_sample_at, (int, float)) \
+            or isinstance(last_sample_at, bool):
+        tracker = {"stream_id": signal.get("stream_id"), "generation": signal.get("generation"),
+                   "unit": unit, "total": total, "first_observed_at": sample_at,
+                   "last_sample": value, "last_sample_at": sample_at,
+                   "last_increase_at": None, "active_episode_id": None}
+        return tracker, {"completed": value, "total": total, "unit": unit}, \
+            {"rate_per_second": None, "comparison_valid": False, "stagnation": None}
+    delta = value - last_sample
+    if delta < 0:
+        tracker.update(first_observed_at=sample_at, last_sample=value,
+                       last_sample_at=sample_at, last_increase_at=None,
+                       active_episode_id=None)
+        return tracker, {"completed": value, "total": total, "unit": unit}, \
+            {"rate_per_second": None, "comparison_valid": False, "stagnation": None}
+    rate = None
+    if delta > 0:
+        duration = sample_at - float(last_sample_at)
+        if rate_time_valid and 0 < duration <= 600:
+            rate = delta / duration
+        tracker.update(last_increase_at=sample_at, active_episode_id=None)
+    tracker.update(last_sample=value, last_sample_at=sample_at)
+    anchor = tracker.get("last_increase_at")
+    anchor_kind = "last-increase"
+    if not isinstance(anchor, (int, float)) or isinstance(anchor, bool):
+        anchor, anchor_kind = tracker.get("first_observed_at"), "first-observation"
+    stagnation = None
+    if isinstance(anchor, (int, float)) and not isinstance(anchor, bool):
+        seconds = float(now) - float(anchor)
+        if seconds >= 0:
+            episode = tracker.get("active_episode_id")
+            if seconds >= 7200 and not isinstance(episode, str):
+                grace = tracker.get("stagnation_grace_until")
+                episode_material = f"{identity!r}|{anchor_kind}|{float(anchor):.6f}|{grace!r}"
+                episode = hashlib.sha256(episode_material.encode()).hexdigest()[:20]
+                tracker["active_episode_id"] = episode
+            if seconds >= 7200:
+                stagnation = {"state": "stagnant", "signal": "counter", "unit": unit,
+                    "since": anchor_kind, "seconds_since_anchor": seconds,
+                    "last_increase_at": tracker.get("last_increase_at"),
+                    "first_observed_at": tracker.get("first_observed_at"),
+                    "episode_id": episode,
+                    "generation": signal.get("generation")}
+    comparison = {"completed": value, "total": total, "unit": unit}
+    return tracker, comparison, {"rate_per_second": rate,
+        "comparison_valid": bool(delta > 0 and rate is not None), "stagnation": stagnation}
+
+
+def _admission_summary(previous, decoded, now, run_id, row_key, started_at):
+    previous = previous if isinstance(previous, dict) else {}
+    decoded = decoded if isinstance(decoded, dict) else {}
+    counts = dict(previous.get("admission_counts", {}))
+    for key in ("admitted", "denied", "unknown"):
+        counts[key] = max(0, int(counts.get(key, 0))) if type(counts.get(key, 0)) is int else 0
+    observed_from, observed_to = previous.get("admission_from_at"), previous.get("admission_to_at")
+    for sample in decoded.get("samples", []):
+        state = sample.get("state") if isinstance(sample, dict) else None
+        bucket = state if state in {"admitted", "denied"} else "unknown"
+        counts[bucket] += 1
+        stamp = sample.get("at")
+        if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and math.isfinite(float(stamp)):
+            observed_from = float(stamp) if observed_from is None else min(float(observed_from), float(stamp))
+            observed_to = float(stamp) if observed_to is None else max(float(observed_to), float(stamp))
+    latest = decoded.get("latest") if isinstance(decoded.get("latest"), dict) else None
+    freshness = None
+    current = "unknown"
+    generation = decoded.get("generation")
+    if (decoded.get("coverage") == "observed" and latest is not None
+            and isinstance(latest.get("at"), (int, float))
+            and not isinstance(latest.get("at"), bool)
+            and math.isfinite(float(latest["at"]))):
+        freshness = float(now) - float(latest["at"])
+        if (0 <= freshness <= 600 and latest.get("state") in {"admitted", "denied"}
+                and isinstance(started_at, (int, float)) and not isinstance(started_at, bool)
+                and float(latest["at"]) >= float(started_at)):
+            current = "waiting" if latest["state"] == "denied" else "admitted"
+    valid = counts["admitted"] + counts["denied"]
+    ratio = counts["denied"] / valid if valid else None
+    old_generation = previous.get("admission_generation")
+    old_episode = previous.get("admission_wait_episode_id")
+    if current == "waiting":
+        if old_generation == generation and previous.get("admission_current_state") == "waiting" \
+                and isinstance(old_episode, str):
+            episode = old_episode
+        else:
+            sample_id = latest.get("sample_id") if latest else "unknown"
+            material = f"{run_id}|{row_key}|{generation}|{sample_id}"
+            episode = hashlib.sha256(material.encode()).hexdigest()[:20]
+    else:
+        episode = None
+    summary = {"state": current, "coverage": decoded.get("coverage", "unknown"),
+        "admitted_samples": counts["admitted"], "denied_samples": counts["denied"],
+        "unknown_samples": counts["unknown"], "valid_samples": valid,
+        "sample_count": sum(counts.values()), "denied_sample_ratio": ratio,
+        "observed_from_at": observed_from, "observed_to_at": observed_to,
+        "latest_at": latest.get("at") if latest else None,
+        "freshness_seconds": freshness,
+        "reasons": latest.get("reasons", []) if current == "waiting" and latest else [],
+        "priority_blockers": latest.get("priority_blockers", [])
+            if current == "waiting" and latest else [],
+        "wait_duration_seconds": None, "time_ratio": None,
+        "episode_id": episode, "generation": generation}
+    return summary, {"admission_counts": counts,
+        "admission_from_at": observed_from, "admission_to_at": observed_to,
+        "admission_generation": generation,
+        "admission_current_state": current,
+        "admission_wait_episode_id": episode,
+        "admission_cursor": decoded.get("cursor", previous.get("admission_cursor")),
+        "admission_warnings": decoded.get("warnings", [])}
+
+
 def _notice_targets(run):
     values = []
     owner = run.get("owner_wait") if isinstance(run.get("owner_wait"), dict) else {}
@@ -516,6 +814,8 @@ def _notice_targets(run):
 
 def _notice_texts(run, event_kind, observation, record_path, sources):
     summary = observation.get("summary") or {}
+    admission = observation.get("admission") if isinstance(observation.get("admission"), dict) else {}
+    stagnation = observation.get("stagnation") if isinstance(observation.get("stagnation"), dict) else {}
     latest, best = summary.get("latest"), summary.get("best")
     metric = summary.get("metric")
     def points(field, fallback):
@@ -542,6 +842,29 @@ def _notice_texts(run, event_kind, observation, record_path, sources):
     if run.get("row_id"):
         run_line += f" row={run['row_id']}"
     entries = [run_line, f"public run record={record}"]
+    admission_line = (f"admission={admission.get('state', 'unknown')}; coverage="
+        f"{admission.get('coverage', 'unknown')}; samples denied/valid="
+        f"{admission.get('denied_samples', 0)}/{admission.get('valid_samples', 0)}; "
+        f"sample ratio={admission.get('denied_sample_ratio') if admission.get('denied_sample_ratio') is not None else 'unknown'}")
+    if admission.get("state") == "waiting" and admission.get("reasons"):
+        admission_line += "; reason=" + ", ".join(admission["reasons"][:3])
+    blockers = admission.get("priority_blockers")
+    if admission.get("state") == "waiting" and isinstance(blockers, list) and blockers:
+        labels = []
+        for item in blockers[:3]:
+            labels.append(",".join(f"{key}={value}" for key, value in item.items()
+                                   if key in {"task", "host", "gpu", "owner"}))
+        labels = [item for item in labels if item]
+        if labels:
+            admission_line += "; observed blockers=" + " | ".join(labels)
+    if admission.get("sample_count", 0) or admission.get("coverage") != "unknown":
+        entries.append(admission_line)
+    if stagnation.get("state") == "stagnant":
+        anchor = ("last actual increase" if stagnation.get("since") == "last-increase"
+                  else "first comparable observation")
+        entries.append(f"no observed increase for {_duration(stagnation.get('seconds_since_anchor'))} since {anchor}")
+    elif stagnation.get("state") == "unknown":
+        entries.append("progress stagnation=unknown")
     if event_kind == "final":
         entries.append(f"status={run.get('status') or 'unknown'}; exit={run.get('exit_code')}")
         entries.append(f"마지막={points('latest_metrics', latest)}; 최고={points('best_metrics', best)}; 추세={summary.get('trend') or '판정 불가'}")
@@ -657,7 +980,7 @@ def read_experiment_observation(run, registry, row_key):
 def observe_experiment(run, registry, now, *, root=None, row_key=None,
                        started_at=None, planned_seconds=None, progress=None,
                        final=False, status=None, notify_events=True,
-                       poll_interval_seconds=60.0):
+                       poll_interval_seconds=60.0, row_scoped=None):
     """Advance one detached row's durable observation and public run record.
 
     Metric discovery is deliberately caller-bound: `root` must come from an
@@ -685,6 +1008,13 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
         except (OSError, RuntimeError, ValueError):
             metric_root = None
     identity = row_key or run.get("row_id") or "run"
+    row_scoped = (bool(row_key and str(row_key) != "run")
+                  if row_scoped is None else bool(row_scoped))
+    started = (started_at if isinstance(started_at, (int, float)) else
+               None if row_scoped else run.get("started_at"))
+    if not isinstance(started, (int, float)) or isinstance(started, bool) \
+            or not math.isfinite(float(started)):
+        started = None
     try:
         state_path = _observation_state_path(run, registry, str(identity))
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
@@ -734,18 +1064,51 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                     progress = {"completed": value.get("reached_epoch"),
                                 "total": value.get("total_epochs"), "unit": "epoch",
                                 "updated_at": value.get("updated_at"),
-                                "age_s": max(0.0, float(now) - float(value["updated_at"]))
-                                    if isinstance(value.get("updated_at"), (int, float)) else None}
-            except (OSError, ValueError, TypeError, RuntimeError) as exc:
+                                "age_s": (float(now) - float(value["source_updated_at"])
+                                    if isinstance(value.get("source_updated_at"), (int, float))
+                                    else None),
+                                "source_generation": value.get("source_generation"),
+                                "stream_id": value.get("source_path") or "counter"}
+            except (OSError, ValueError, TypeError, RuntimeError, OverflowError, RecursionError) as exc:
                 warnings.append("metric-source-unavailable:" + str(exc))
+        last_admission_observed_at = previous.get("last_admission_observed_at")
+        admission_roots = _admission_roots(run, registry, metric_root)
+        should_read_admission = bool(admission_roots and (final
+            or not isinstance(last_admission_observed_at, (int, float))
+            or float(now) - float(last_admission_observed_at) >= 60.0))
+        if should_read_admission:
+            try:
+                admission_decoded = __import__("resource_metric_sources").read_admission_sources(
+                    admission_roots, run_id=run_id,
+                    row_key=(str(identity) if row_scoped else None),
+                    registry_path=registry, started_at=started, now=now,
+                    cursor=previous.get("admission_cursor"))
+                warnings.extend(admission_decoded.get("warnings", []))
+            except (OSError, ValueError, TypeError, RuntimeError, OverflowError, RecursionError) as exc:
+                admission_decoded = {"samples": [], "latest": None, "generation": None,
+                    "cursor": previous.get("admission_cursor"), "coverage": "partial",
+                    "warnings": ["admission-source-unavailable:" + str(exc)]}
+                warnings.extend(admission_decoded["warnings"])
+        elif admission_roots:
+            admission_decoded = {"samples": [],
+                "latest": previous.get("admission_latest"),
+                "generation": previous.get("admission_generation"),
+                "cursor": previous.get("admission_cursor"),
+                "coverage": previous.get("admission_coverage", "unknown"),
+                "warnings": []}
+        else:
+            admission_decoded = {"samples": [], "latest": None,
+                "generation": None, "cursor": previous.get("admission_cursor"),
+                "coverage": "unknown", "warnings": []}
+        admission_summary, admission_state = _admission_summary(
+            previous, admission_decoded, now, run_id, str(identity), started)
+        admission_changed = any(admission_summary.get(key) !=
+            (previous.get("admission_summary") or {}).get(key) for key in
+            ("state", "coverage", "admitted_samples", "denied_samples", "unknown_samples",
+             "denied_sample_ratio", "observed_from_at", "observed_to_at", "latest_at",
+             "reasons", "priority_blockers", "episode_id", "generation"))
         samples = _merge_samples(previous.get("samples"), new_samples)
         sources = _merge_metric_sources(previous.get("sources"), sources, samples)
-        row_scoped = bool(row_key and str(row_key) != "run")
-        started = (started_at if isinstance(started_at, (int, float)) else
-                   None if row_scoped else run.get("started_at"))
-        if not isinstance(started, (int, float)) or isinstance(started, bool) \
-                or not math.isfinite(float(started)):
-            started = None
         clock_known = started is not None
         if not clock_known:
             warnings.append("row-start-unknown")
@@ -757,10 +1120,46 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
         plan = planned_seconds if planned_seconds is not None else _declared_plan(run)
         declared = run.get("observation") if isinstance(run.get("observation"), dict) else {}
         decision_metric = run.get("decision_metric", declared.get("decision_metric"))
+        progress_signal = _progress_signal(progress, samples, metric_root, run,
+                                           decision_metric, now)
+        old_tracker = previous.get("progress_tracker")
+        progress_tracker, next_progress, tracker_result = _advance_progress_tracker(
+            old_tracker, progress_signal, now)
+        tracker_result = tracker_result or {"rate_per_second": None,
+                                             "comparison_valid": False,
+                                             "stagnation": None}
+        was_waiting = previous.get("admission_current_state") == "waiting"
+        is_waiting = admission_summary.get("state") == "waiting"
+        if isinstance(progress_tracker, dict) and is_waiting:
+            progress_tracker["active_episode_id"] = None
+            tracker_result["stagnation"] = None
+        elif isinstance(progress_tracker, dict) and was_waiting:
+            progress_tracker["active_episode_id"] = None
+            progress_tracker["stagnation_grace_until"] = float(now) + 7200.0
+            tracker_result["stagnation"] = None
+        elif (isinstance(progress_tracker, dict)
+              and isinstance(progress_tracker.get("stagnation_grace_until"), (int, float))
+              and float(now) < float(progress_tracker["stagnation_grace_until"])):
+            progress_tracker["active_episode_id"] = None
+            tracker_result["stagnation"] = None
+        evaluation_progress = dict(progress_signal) if progress_signal else None
+        if evaluation_progress is not None:
+            evaluation_progress["_comparison_valid"] = tracker_result["comparison_valid"]
+        progress_identity_matches = bool(progress_signal and isinstance(old_tracker, dict)
+            and old_tracker.get("stream_id") == progress_signal.get("stream_id")
+            and old_tracker.get("generation") == progress_signal.get("generation")
+            and old_tracker.get("unit") == progress_signal.get("unit")
+            and old_tracker.get("total") == progress_signal.get("total"))
+        previous_progress = (previous.get("progress_sample")
+            if progress_identity_matches and type(old_tracker.get("last_sample")) is int
+            and type(progress_signal.get("completed")) is int
+            and progress_signal["completed"] > old_tracker["last_sample"] else None)
+        previous_progress_at = (old_tracker.get("last_sample_at")
+                                if previous_progress is not None else None)
         observation = evaluate_observation(
             now=now, started_at=schedule_started, planned_seconds=plan,
-            progress=progress, previous_progress=previous.get("progress_sample"),
-            previous_progress_at=previous.get("progress_at"), samples=samples,
+            progress=evaluation_progress, previous_progress=previous_progress,
+            previous_progress_at=previous_progress_at, samples=samples,
             decision_metric=(decision_metric.get("key") if isinstance(decision_metric, dict)
                              else decision_metric),
             direction=(decision_metric.get("direction") if isinstance(decision_metric, dict)
@@ -768,6 +1167,26 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             baseline=run.get("baseline_value", declared.get("baseline_value")), final=final,
             optional_rules=run.get("rules", declared.get("rules")),
             last_checkpoint_at=previous.get("last_checkpoint_at"))
+        stagnation = tracker_result.get("stagnation")
+        if stagnation is None and isinstance(progress_tracker, dict):
+            stagnation = {"state": "observing", "signal": "counter",
+                "unit": progress_tracker.get("unit"),
+                "first_observed_at": progress_tracker.get("first_observed_at"),
+                "last_increase_at": progress_tracker.get("last_increase_at"),
+                "episode_id": None, "generation": progress_tracker.get("generation")}
+        if stagnation is None:
+            stagnation = {"state": "unknown"}
+        observation["admission"] = admission_summary
+        observation["stagnation"] = stagnation
+        if stagnation.get("state") == "stagnant" and stagnation.get("episode_id"):
+            observation["attention"].append({"kind": "progress-stagnation",
+                "episode_id": stagnation["episode_id"],
+                "generation": stagnation.get("generation"),
+                "since": stagnation.get("since")})
+        if admission_summary.get("state") == "waiting" and admission_summary.get("episode_id"):
+            observation["attention"].append({"kind": "admission-wait",
+                "episode_id": admission_summary["episode_id"],
+                "generation": admission_summary.get("generation")})
         if not clock_known:
             # A wrapper clock is not a row birth. Keep the row's own clock
             # unknown while retaining its independently identified metrics.
@@ -775,9 +1194,6 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             observation["predicted_total_seconds"] = None
             observation["eta_seconds"] = None
             observation["eta_vs_plan"] = None
-        next_progress = ({key: progress.get(key) for key in
-                          ("completed", "total", "unit", "updated_at", "reached_epoch", "total_epochs")
-                          if key in progress} if isinstance(progress, dict) else None)
         artifact_root = run.get("artifact_root")
         record_locator = public_record_path(artifact_root, run_id) if artifact_root else None
         event_specs = []
@@ -785,7 +1201,8 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             event_specs.append(("final", f"final:{identity}"))
         elif notify_events and observation["attention"]:
             attention_identity = [{key: item.get(key) for key in
-                ("kind", "metric", "epoch", "op", "threshold")}
+                ("kind", "metric", "epoch", "op", "threshold", "episode_id",
+                 "generation", "since")}
                 for item in observation["attention"]]
             attention_digest = hashlib.sha256(json.dumps(attention_identity, sort_keys=True,
                 separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()[:16]
@@ -811,6 +1228,11 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                            "recipients": _notice_targets(run),
                            "texts": notice_texts, "text": notice_texts[0]})
             known.add(event_key)
+        previous_observation = previous.get("observation") if isinstance(previous.get("observation"), dict) else {}
+        previous_stagnation = previous_observation.get("stagnation") \
+            if isinstance(previous_observation.get("stagnation"), dict) else {}
+        stagnation_changed = any(stagnation.get(key) != previous_stagnation.get(key)
+            for key in ("state", "episode_id", "last_increase_at", "first_observed_at", "generation"))
         next_state = {"schema_version": OBSERVATION_VERSION, "run_id": run_id,
                       "row_key": str(identity), "cursor": cursor, "samples": samples,
                       "sources": sources,
@@ -819,16 +1241,21 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                       "row_started_at": float(started) if clock_known else None,
                       "last_observer_poll_at": float(now),
                       "last_observed_at": float(now) if should_read_sources else last_observed_at,
-                      "progress_sample": next_progress or previous.get("progress_sample"),
-                      "progress_at": (float(next_progress["updated_at"])
-                                      if next_progress and isinstance(next_progress.get("updated_at"), (int, float))
-                                      and not isinstance(next_progress.get("updated_at"), bool)
-                                      else float(now) if next_progress else previous.get("progress_at")),
+                      "last_admission_observed_at": (float(now) if should_read_admission
+                          else last_admission_observed_at),
+                      "progress_tracker": progress_tracker,
+                      "progress_sample": next_progress,
+                      "progress_at": (progress_tracker.get("last_sample_at")
+                                      if isinstance(progress_tracker, dict) else None),
+                      "admission_latest": admission_decoded.get("latest"),
+                      "admission_coverage": admission_decoded.get("coverage", "unknown"),
+                      "admission_summary": admission_summary,
                       "last_checkpoint_at": (float(now) if observation["checkpoint_due"]
                                              else previous.get("last_checkpoint_at")),
                       "last_public_write_at": previous.get("last_public_write_at"),
                       "public_status": previous.get("public_status"),
                       "last_delivery_at": previous.get("last_delivery_at"),
+                      **admission_state,
                       "observation": observation,
                       "warnings": sorted(set([*previous.get("warnings", []), *warnings]))[-64:],
                       "event_keys": list(seen)[-256:], "outbox": outbox[-32:]}
@@ -837,7 +1264,9 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             previous.get("last_public_write_at") is None or final
             or status != previous.get("public_status")
             or observation["checkpoint_due"] or new_event
-            or bool(new_samples) or sources != previous.get("sources", [])))
+            or bool(new_samples) or sources != previous.get("sources", [])
+            or admission_changed or stagnation_changed
+            or should_read_admission and bool(admission_summary.get("sample_count"))))
         if publish_public:
             record = public_run_record(run, status=status, observation=observation,
                 metrics=next_state["sources"], started_at=run.get("started_at"),
@@ -855,7 +1284,9 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                          "ended_at": (run.get("ended_at") if run.get("ended_at") is not None else now)
                             if final else None,
                          "planned_seconds": observation.get("planned_seconds"),
-                         "eta": observation.get("eta_seconds")}
+                         "eta": observation.get("eta_seconds"),
+                         "admission": admission_summary,
+                         "stagnation": stagnation}
             record["rows"] = [row_entry]
             if metric_root is not None:
                 record["output_dir"] = str(metric_root)
@@ -867,6 +1298,8 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                          and (cursor != previous.get("cursor") or bool(new_samples)
                               or sources != previous.get("sources", []))
                          or next_progress != previous.get("progress_sample")
+                         or admission_changed or stagnation_changed
+                         or should_read_admission
                          or observation["checkpoint_due"] or final
                          or warnings != []
                          or next_state["last_observer_poll_at"] != previous_poll)
@@ -933,6 +1366,7 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             _write_observation_state(state_path, next_state)
         return {"available": True, "observation": observation,
                 "metrics": next_state["sources"], "metric_root": str(metric_root) if metric_root else None,
+                "admission": admission_summary, "stagnation": stagnation,
                 "record_path": str(record_path) if record_path else None,
                 "delivery": delivery,
                 "warnings": sorted(set(warnings)), "state_path": str(state_path)}
