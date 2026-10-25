@@ -420,13 +420,101 @@ class ResourceRegistryTest(unittest.TestCase):
                    "started_at": 0, "route": str(route), "route_id": "route-fixture",
                    "command": ["python", "train.py", "--config", "configs/run.json"],
                    "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest()}
-            with mock.patch.object(resource_progress, "_observation_state_path", return_value=state_path):
+            with mock.patch.object(resource_progress, "_observation_state_path", return_value=state_path), \
+                    mock.patch.object(registry, "proc_identity", return_value=identity):
                 view = registry.normalize_run("run-view", row, root / "resource-runs.json",
                     identity_reader=lambda _pid: identity, now=7200)
             self.assertEqual(view["liveness"], "working")
-            self.assertEqual(view["experiment_run_record"]["route_id"], "route-fixture")
+            self.assertIsNone(view["experiment_run_record"])
+            self.assertFalse(state_path.exists())
+            self.assertFalse((artifact / "resource-runs" / "run-view.json").exists())
+            with mock.patch.object(resource_progress, "_observation_state_path", return_value=state_path), \
+                    mock.patch.object(registry, "proc_identity", return_value=identity):
+                observed = registry.observe_run_if_due(
+                    "run-view", row, root / "resource-runs.json", now=7200)
+                view = registry.normalize_run("run-view", row, root / "resource-runs.json",
+                    identity_reader=lambda _pid: identity, now=7201)
+            self.assertEqual(observed["experiment_run_record"]["route_id"], "route-fixture")
             self.assertEqual(view["experiment_run_record"]["output_dir"], str(output))
             self.assertEqual(view["experiment_run_record"]["metric_summary"]["latest"]["value"], -8.77)
+
+    def test_normalize_scan_and_read_cli_leave_observation_record_and_pending_unchanged(self):
+        import resource_progress
+        import dispatch_session_sweep as sweep
+        import session_notice
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs.log"
+            jobs.touch()
+            artifact = root / "artifact"
+            artifact.mkdir()
+            output = root / "run"
+            (output / "logs").mkdir(parents=True)
+            (output / "logs" / "epochs.jsonl").write_text(
+                '{"epoch":1,"split":"valid","losses":{"L_se":-8.0}}\n')
+            registry_path = root / "resource-runs.json"
+            identity = {"pid": 71, "starttime": "12", "command_hash": "b" * 64,
+                        "process_group": 71}
+            row = {**identity, "run_id": "read-only-run", "status": "running",
+                   "started_at": 0, "output_dir": str(output),
+                   "artifact_root": str(artifact), "jobs": str(jobs),
+                   "route_id": "route-read-only", "node": "eval",
+                   "notify": {"harness": "claude", "id": "fixture-supervisor"}}
+            registry_path.write_text(json.dumps({"schema_version": 1,
+                                                  "runs": {"read-only-run": row}}))
+            state_path = root / "runtime" / "resource-observations" / "row.json"
+            state_path.parent.mkdir(parents=True)
+            resource_progress._write_observation_state(state_path, {
+                "schema_version": 1, "run_id": "read-only-run", "row_key": "run",
+                "outbox": [], "event_keys": [], "sources": [], "samples": [], "warnings": [],
+            })
+            record_path = resource_progress.write_public_run_record(artifact, "read-only-run", {
+                "run_id": "read-only-run", "route_id": "route-read-only", "status": "running",
+                "metrics": [], "rows": [],
+            })
+            with mock.patch("peer_obligations.ensure_normal_runner", return_value=False), \
+                    mock.patch("peer_obligations.request_dispatch_reconciliation", return_value=False):
+                existing = session_notice.notify("claude", "fixture-supervisor",
+                    key="existing-notice", subject="existing", text="existing pending notice",
+                    jobs=jobs)
+            pending_root = root / "pending-delivery"
+            duties_root = root / "peer-steward" / "obligations"
+
+            def snapshot():
+                return {
+                    "state": state_path.read_bytes(),
+                    "record": record_path.read_bytes(),
+                    "pending": {str(path.relative_to(pending_root)): path.read_bytes()
+                                for path in sorted(pending_root.rglob("*.json"))},
+                    "duties": {path.name: path.read_bytes()
+                               for path in sorted(duties_root.glob("*.json"))},
+                    "notice": sweep.pending_delivery.read(root, "fixture-supervisor",
+                                                          existing["delivery_id"]),
+                }
+
+            before = snapshot()
+            with mock.patch.object(resource_progress, "_observation_state_path",
+                                   return_value=state_path), \
+                    mock.patch.object(registry, "proc_identity", return_value=identity), \
+                    mock.patch.object(registry, "indexed_paths", return_value=([registry_path], [])), \
+                    mock.patch("session_notice.notify",
+                               side_effect=AssertionError("read triggered delivery")):
+                normalized = registry.normalize_run("read-only-run", row, registry_path, now=7200)
+                scanned, diagnostics = registry.scan(identity_reader=lambda _pid: identity, now=7200)
+            self.assertIsNotNone(normalized["experiment_run_record"])
+            self.assertEqual([item["run_id"] for item in scanned], ["read-only-run"])
+            self.assertEqual(diagnostics, [])
+            cli_env = {**os.environ, "AGENT_ARTIFACT_ROOT": str(artifact),
+                       "AGENT_DISPATCH_JOBS": str(jobs), "AGENT_RUNTIME_DIR": str(root / "runtime"),
+                       "HOME": str(root / "home"), "CODEX_HOME": str(root / "codex")}
+            cli = subprocess.run([sys.executable, "-B",
+                                  str(Path(__file__).with_name("resource-runner.py")),
+                                  "--registry", str(registry_path), "observation", "--run-id",
+                                  "read-only-run", "--json"], capture_output=True, text=True,
+                                 env=cli_env, check=False)
+            self.assertEqual(cli.returncode, 0, cli.stderr)
+            self.assertEqual(json.loads(cli.stdout)["route_id"], "route-read-only")
+            self.assertEqual(snapshot(), before)
 
 
 if __name__ == "__main__":

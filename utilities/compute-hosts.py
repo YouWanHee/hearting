@@ -3286,11 +3286,17 @@ def cmd_watch_run(args, *, sleep=time.sleep, now=time.time):
         sys.path.insert(0, here)
     try:
         from session_notice import notify
-        for harness, session_id in notice_targets:
+        for target in notice_targets:
+            if isinstance(target, dict):
+                harness, session_id = target.get("harness"), target.get("session_id")
+                lineage = target.get("lineage")
+            else:
+                harness, session_id = target
+                lineage = None
             notify(harness, session_id,
                    key=f"compute-run:{run_id}:{harness}:{session_id}",
                    subject="compute run", text=text, route_id=route.get("route_id") or "route-free",
-                   required_action="report-to-user")
+                   required_action="report-to-user", lineage=lineage)
     except Exception:  # noqa: BLE001 -- the run and its exit code are already recorded
         return 0
     return 0

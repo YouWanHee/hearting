@@ -2796,6 +2796,10 @@ class CompletionWatchTest(unittest.TestCase):
         })
         self._runtime_env.start()
         self.addCleanup(self._runtime_env.stop)
+        runner = mock.patch("peer_obligations.ensure_normal_runner", return_value=False)
+        recovery = mock.patch("peer_obligations.request_dispatch_reconciliation", return_value=False)
+        runner.start(); recovery.start()
+        self.addCleanup(runner.stop); self.addCleanup(recovery.stop)
         self.run_dir = self.root / "runs" / "here-1"
         self.run_dir.mkdir(parents=True)
         self.meta = {"run_id": "here-1", "host": "here",

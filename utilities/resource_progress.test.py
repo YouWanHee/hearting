@@ -819,11 +819,11 @@ class ExperimentObservationTest(unittest.TestCase):
                    "node": "train", "status": "running"}
             with mock.patch.object(progress, "_observation_state_path", return_value=state):
                 first = progress.observe_experiment(run, root / "registry.json", 7200,
-                    root=str(root), row_key="arm-1")
+                    root=str(root), row_key="arm-1", started_at=0)
                 second = progress.observe_experiment(run, root / "registry.json", 7201,
-                    root=str(root), row_key="arm-1")
+                    root=str(root), row_key="arm-1", started_at=0)
                 third = progress.observe_experiment(run, root / "registry.json", 7202,
-                    root=str(root), row_key="arm-2")
+                    root=str(root), row_key="arm-2", started_at=0)
             self.assertTrue(first["observation"]["checkpoint_due"])
             self.assertTrue(first["observation"]["attention"])
             self.assertFalse(second["observation"]["checkpoint_due"])
@@ -834,6 +834,29 @@ class ExperimentObservationTest(unittest.TestCase):
             record = progress.read_public_run_record(artifact, "persisted-run")
             self.assertEqual(record["route_id"], "route-a")
             self.assertTrue(record["metrics"])
+
+    def test_unknown_arm_birth_does_not_inherit_the_wrapper_clock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "artifact"
+            artifact.mkdir()
+            output = root / "run"
+            (output / "logs").mkdir(parents=True)
+            (output / "logs" / "epochs.jsonl").write_text(
+                '{"epoch":1,"split":"valid","losses":{"L_se":-8.0}}\n')
+            state = root / "runtime" / "state.json"
+            state.parent.mkdir()
+            run = {"run_id": "unknown-arm", "started_at": 0,
+                   "artifact_root": str(artifact), "route_id": "route-a"}
+            with mock.patch.object(progress, "_observation_state_path", return_value=state):
+                observed = progress.observe_experiment(run, root / "registry.json", 7200,
+                    root=str(output), row_key="arm-reused-label")
+            self.assertIn("row-start-unknown", observed["warnings"])
+            self.assertIsNone(observed["observation"]["elapsed_seconds"])
+            record = progress.read_public_run_record(artifact, "unknown-arm")
+            row, = record["rows"]
+            self.assertIsNone(row["started_at"])
+            self.assertEqual(row["clock_scope"], "unknown")
 
     def test_checkpoint_uses_existing_notice_queue_for_exact_owner_and_supervisor(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -889,6 +912,100 @@ class ExperimentObservationTest(unittest.TestCase):
                 self.assertIn("run=carrier-run", receipt["text"])
                 self.assertIn("record=" + str(artifact / "resource-runs" / "carrier-run.json"),
                               receipt["text"])
+
+    def test_notice_targets_keep_the_start_binding_and_exact_supervisor_parent_row(self):
+        import dispatch_contract
+        import dispatch_resource_wait
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs.log"
+            meta = ",".join(("attempt_schema_version=2", "attempt_id=att-owner",
+                "dispatch_depth=1", "worker_type=owner", "harness=codex",
+                "parent_sid=sid-supervisor", "parent_completion_delivery=claude-parent-runtime"))
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            jobs.write_text("\t".join((stamp, "open", "/repo", "/wt", "owner", meta)) + "\n")
+            state = dispatch_contract.dispatch_state_root(jobs) / "supervisor-state" / "att-owner.json"
+            state.parent.mkdir(parents=True)
+            dispatch_resource_wait._write(state, "att-owner", set(),
+                {"session_id": "sid-owner", "delivered": [], "outbox": None}, "running-turn")
+            run = {"jobs": str(jobs), "parent_attempt_id": "att-owner",
+                   "owner_wait": {"parent_attempt_id": "att-owner", "session_id": "sid-owner"},
+                   "session": {"harness": "codex", "id": "sid-owner"}}
+            targets = progress._notice_targets(run)
+            by_session = {item["session_id"]: item for item in targets}
+            self.assertEqual(len(targets), 2, "owner and supervisor sessions are deduplicated")
+            self.assertEqual(by_session["sid-owner"], {
+                "harness": "codex", "session_id": "sid-owner",
+                "lineage": {"kind": "owner-session", "attempt_id": "att-owner",
+                            "harness": "codex", "session_id": "sid-owner"}})
+            self.assertEqual(by_session["sid-supervisor"], {
+                "harness": "claude", "session_id": "sid-supervisor",
+                "lineage": {"kind": "attempt-parent", "attempt_id": "att-owner",
+                            "harness": "claude", "session_id": "sid-supervisor"}})
+            from peer_obligations import _ordinary_notice_target
+            self.assertEqual(_ordinary_notice_target({"jobs": str(jobs),
+                "storage_recipient": "sid-owner", "lineage": by_session["sid-owner"]["lineage"]},
+                "codex-native-queue"), ("codex", "sid-owner", "sid-owner"))
+            self.assertEqual(_ordinary_notice_target({"jobs": str(jobs),
+                "storage_recipient": "sid-supervisor",
+                "lineage": by_session["sid-supervisor"]["lineage"]},
+                "claude-parent-runtime"), ("claude", "sid-supervisor", "sid-supervisor"))
+
+    def test_terminal_observation_keeps_durable_live_checkpoint_and_adds_one_final_notice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "artifact"
+            artifact.mkdir()
+            output = root / "run"
+            output.mkdir()
+            state = root / "runtime" / "state.json"
+            state.parent.mkdir()
+            run = {"run_id": "live-terminal", "started_at": 0,
+                   "artifact_root": str(artifact), "route_id": "route-a", "node": "eval",
+                   "status": "running", "notify": {"harness": "claude", "id": "owner-sid"}}
+            notices = []
+            with mock.patch.object(progress, "_observation_state_path", return_value=state), \
+                    mock.patch("session_notice.notify", side_effect=lambda *a, **kw:
+                               notices.append(kw) or {"state": "pending"}):
+                progress.observe_experiment(run, root / "registry.json", 7200,
+                    root=str(output), row_key="run", started_at=0)
+                terminal = progress.observe_experiment({**run, "status": "succeeded",
+                    "ended_at": 7201}, root / "registry.json", 7201,
+                    root=str(output), row_key="run", started_at=0, final=True)
+            self.assertEqual([item["subject"] for item in notices], [
+                "experiment checkpoint (1/1)", "experiment checkpoint (1/1)",
+                "experiment final (1/1)"])
+            self.assertEqual(notices[0]["key"], notices[1]["key"])
+            self.assertNotEqual(notices[1]["key"], notices[2]["key"])
+            self.assertIn("지표 없음", notices[2]["text"])
+            persisted = progress._read_observation_state(state)
+            self.assertEqual([item["kind"] for item in persisted["outbox"]],
+                             ["checkpoint", "final"])
+            self.assertTrue(terminal["available"])
+
+    def test_unavailable_notice_recipient_does_not_block_the_other_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "artifact"
+            artifact.mkdir()
+            output = root / "run"
+            output.mkdir()
+            state = root / "runtime" / "state.json"
+            state.parent.mkdir()
+            run = {"run_id": "partial-fanout", "started_at": 0,
+                   "artifact_root": str(artifact), "route_id": "route-a", "node": "eval",
+                   "status": "running",
+                   "owner_wait": {"harness": "codex", "session_id": "owner-thread"},
+                   "session": {"harness": "claude", "id": "supervisor-session"}}
+            with mock.patch.object(progress, "_observation_state_path", return_value=state), \
+                    mock.patch("session_notice.notify", side_effect=[OSError("fixture unavailable"),
+                                                                     {"state": "acked"}]) as notify:
+                result = progress.observe_experiment(run, root / "registry.json", 7200,
+                    root=str(output), row_key="run", started_at=0)
+            self.assertEqual(notify.call_count, 2)
+            recipient_states = {item["state"] for item in result["delivery"][0]["recipients"]}
+            self.assertEqual(recipient_states, {"unavailable", "acked"})
+            persisted = progress._read_observation_state(state)
+            self.assertEqual(len(persisted["outbox"]), 1)
 
 
 if __name__ == "__main__":

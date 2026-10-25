@@ -24,7 +24,6 @@ INDEX_SCHEMA = 1
 REGISTRY_SCHEMA = 1
 IDENTITY_KEYS = ("pid", "starttime", "command_hash")
 _LEGACY_RESOURCE_IDENTITY_CACHE: dict[str, tuple[tuple[str, int, int], dict[str, list[dict]]]] = {}
-_EXPERIMENT_OBSERVATION_POLL_CACHE: dict[tuple, tuple[float, str, bool]] = {}
 
 
 def agent_home() -> Path:
@@ -691,50 +690,34 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         except (OSError, ValueError, TypeError):
             pass
     if artifact_root or run.get("output_dir") or (training_progress and training_progress.get("directory")):
-        from resource_progress import observe_experiment, read_public_run_record
+        from resource_progress import read_experiment_observation
         observation_rows = []
         if training_progress and training_progress.get("directory"):
             observation_rows.append((training_progress.get("directory"),
                 training_progress.get("arm") or training_progress.get("pid"),
-                training_progress.get("row_started_at") or started_at))
+                training_progress.get("row_started_at")))
         for candidate in remote_training:
             if candidate.get("directory"):
                 observation_rows.append((candidate["directory"],
                     candidate.get("arm") or candidate.get("compute_run_id") or candidate.get("pid"),
-                    candidate.get("row_started_at") or started_at))
+                    candidate.get("row_started_at")))
         if not observation_rows and run.get("output_dir"):
             observation_rows.append((run["output_dir"], run.get("row_id") or "run", started_at))
         if not observation_rows and liveness == "working":
             observation_rows.append((None, run.get("row_id") or "run", started_at))
         for metric_root, row_key, row_start in observation_rows:
-            row_progress = progress if len(observation_rows) == 1 else None
-            candidate_run = {**run, "run_id": str(run_id),
-                             "artifact_root": artifact_root,
-                             "started_at": row_start or started_at}
-            result = observe_experiment(candidate_run, registry, now,
-                root=metric_root, row_key=str(row_key), started_at=row_start or started_at,
-                planned_seconds=run.get("planned_seconds"),
-                progress=({"completed": row_progress.get("completed"),
-                           "total": row_progress.get("total"), "unit": row_progress.get("unit"),
-                           "updated_at": row_progress.get("updated_at"),
-                           "age_s": row_progress.get("age_s")}
-                          if row_progress else None),
-                final=liveness != "working",
-                status=(run.get("status") if run.get("status") not in {None, "running"}
-                        else liveness))
-            if result.get("available"):
+            candidate_run = {**run, "run_id": str(run_id), "artifact_root": artifact_root}
+            if row_start is None and str(row_key) != "run":
+                candidate_run.pop("started_at", None)
+            else:
+                candidate_run["started_at"] = row_start if row_start is not None else started_at
+            result = read_experiment_observation(candidate_run, registry, str(row_key))
+            if result and result.get("available"):
                 experiment_observation = result
     public_observation = None
     if artifact_root:
         from resource_progress import read_public_run_record
         public_observation = read_public_run_record(artifact_root, str(run_id))
-        if public_observation is not None and liveness != "working":
-            from resource_progress import write_public_run_record
-            public_observation = {**public_observation,
-                "status": (run.get("status") if run.get("status") not in {None, "running", "launching"}
-                           else liveness),
-                "ended_at": run.get("ended_at") if isinstance(run.get("ended_at"), (int, float)) else public_observation.get("ended_at")}
-            write_public_run_record(artifact_root, str(run_id), public_observation)
     return {
         "job_type": "resource", "resource_class": "lab", "run_id": str(run_id),
         "cwd": cwd, "elapsed_min": elapsed_min, "liveness": liveness,
@@ -752,7 +735,7 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         # Root-scoped quiescence consumes these as additive attribution inputs.
         # Existing resource-runner rows carry only route/node; newer ad-hoc
         # registrars may carry an explicit root or the route's expected identity.
-        "artifact_root": run.get("artifact_root"),
+        "artifact_root": artifact_root,
         "route_file": run.get("route_file"),
         "route_id": run.get("route_id"), "route_hash": run.get("route_hash"),
         "route_node": run.get("route_node"),
@@ -779,20 +762,49 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
 
 def observe_run_if_due(run_id: str, run: dict, registry: Path, *, now=None,
                        interval_seconds=60.0):
-    """Use the existing supervisor poll for bounded resource observation."""
+    """Advance local observation from the explicit supervisor polling owner."""
     now = time.time() if now is None else float(now)
-    identity = tuple(str(run.get(key) or "") for key in ("pid", "starttime", "command_hash"))
-    key = (str(Path(registry).resolve(strict=False)), str(run_id), identity)
-    raw_status = str(run.get("status") or "")
-    previous = _EXPERIMENT_OBSERVATION_POLL_CACHE.get(key)
-    if previous:
-        last_at, last_status, terminal = previous
-        if raw_status == last_status and (terminal or now - last_at < max(1.0, interval_seconds)):
-            return None
-    view = normalize_run(run_id, run, Path(registry), now=now)
-    terminal = view.get("liveness") != "working"
-    _EXPERIMENT_OBSERVATION_POLL_CACHE[key] = (now, raw_status, terminal)
-    return view
+    view = normalize_run(run_id, run, Path(registry), identity_reader=proc_identity, now=now)
+    from resource_progress import observe_experiment
+    artifact_root = view.get("artifact_root")
+    if not (artifact_root or run.get("output_dir")
+            or (view.get("training_progress") or {}).get("directory")):
+        return view
+    started_at = view.get("started_at")
+    progress = view.get("progress")
+    training_progress = view.get("training_progress")
+    remote_training = view.get("remote_training") or []
+    observation_rows = []
+    if training_progress and training_progress.get("directory"):
+        observation_rows.append((training_progress.get("directory"),
+            training_progress.get("arm") or training_progress.get("pid"),
+            training_progress.get("row_started_at"), progress if len(remote_training) == 0 else None))
+    for candidate in remote_training:
+        if candidate.get("directory"):
+            observation_rows.append((candidate["directory"],
+                candidate.get("arm") or candidate.get("compute_run_id") or candidate.get("pid"),
+                candidate.get("row_started_at"), None))
+    if not observation_rows and run.get("output_dir"):
+        observation_rows.append((run["output_dir"], run.get("row_id") or "run", started_at, progress))
+    if not observation_rows and view.get("liveness") == "working":
+        observation_rows.append((None, run.get("row_id") or "run", started_at, progress))
+    for metric_root, row_key, row_start, row_progress in observation_rows:
+        candidate_run = {**run, "run_id": str(run_id), "artifact_root": artifact_root}
+        if row_start is None and str(row_key) != "run":
+            candidate_run.pop("started_at", None)
+        else:
+            candidate_run["started_at"] = row_start if row_start is not None else started_at
+        observe_experiment(candidate_run, Path(registry), now, root=metric_root,
+            row_key=str(row_key), started_at=row_start,
+            planned_seconds=run.get("planned_seconds"),
+            progress=({key: row_progress.get(key) for key in
+                       ("completed", "total", "unit", "updated_at", "age_s")
+                       if key in row_progress} if isinstance(row_progress, dict) else None),
+            final=view.get("liveness") != "working",
+            status=(run.get("status") if run.get("status") not in {None, "running"}
+                    else view.get("liveness")),
+            poll_interval_seconds=interval_seconds)
+    return normalize_run(run_id, run, Path(registry), identity_reader=proc_identity, now=now)
 
 
 def scan(index_path=None, identity_reader=proc_identity, now=None,

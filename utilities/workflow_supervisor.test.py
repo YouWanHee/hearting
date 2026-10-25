@@ -4216,6 +4216,91 @@ class TestComputePollObservationBoundary(WorkflowFixture):
         armed = SUP.read_armed(ledger)["run"]
         return route, path, jobs, registry, ledger, armed
 
+    def local_observation_fixture(self, *, row_started_at):
+        import dispatch_resource_wait as OWNER_RESOURCE
+        route, path, jobs, registry, ledger, armed = self.compute_fixture()
+        output = self.base / "local-output"
+        (output / "logs").mkdir(parents=True)
+        (output / "logs" / "epochs.jsonl").write_text(
+            '{"epoch":1,"split":"valid","losses":{"L_se":-8.0}}\n')
+        artifact = self.base / "artifact"
+        artifact.mkdir()
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        def stop_process():
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        self.addCleanup(stop_process)
+        identity = SUP.RR.proc_identity(proc.pid)
+        identity_deadline = time.monotonic() + 5
+        while identity is None and time.monotonic() < identity_deadline:
+            time.sleep(0.005)
+            identity = SUP.RR.proc_identity(proc.pid)
+        self.assertIsNotNone(identity)
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        row = data["runs"]["fixture-resource"]
+        row.pop("execution", None)
+        row.pop("compute_run_id", None)
+        row.pop("compute_host", None)
+        row.update(**identity, status="running", started_at=time.time() - 7200,
+            artifact_root=str(artifact), output_dir=str(output), planned_seconds=3600,
+            route_id=route["route_id"], node="run", route=str(path.resolve()),
+            jobs=str(jobs.resolve()))
+        data["runs"]["fixture-resource"] = row
+        registry.write_text(json.dumps(data), encoding="utf-8")
+        armed["resource_binding"] = OWNER_RESOURCE.resource_body_digest(row)
+        (ledger.root / "armed" / "run.json").write_text(json.dumps(armed), encoding="utf-8")
+        return route, jobs, registry, ledger, row, identity, output, artifact, proc
+
+    def test_supervisor_poll_owns_due_local_observation_without_fleet_or_prompt(self):
+        import resource_progress
+        route, jobs, registry, ledger, row, identity, output, artifact, proc = \
+            self.local_observation_fixture(row_started_at=time.time() - 7200)
+        rows = {"directory": str(output), "arm": "arm-known", "row_started_at": time.time() - 7200}
+        runtime = self.base / "runtime"
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs),
+                                          "AGENT_RUNTIME_DIR": str(runtime),
+                                          "AGENT_ARTIFACT_ROOT": str(artifact)}), \
+                mock.patch.object(resource_progress, "collect", return_value=rows), \
+                mock.patch.object(resource_progress, "remote_candidates", return_value=[]):
+            SUP.poll_once(route, ledger)
+            state_path = resource_progress._observation_state_path(
+                row, registry, "arm-known", create=False)
+            state = resource_progress._read_observation_state(state_path)
+            public = resource_progress.read_public_run_record(artifact, row["run_id"])
+        self.assertIsNone(proc.poll(), "observation must not stop the workload")
+        self.assertTrue(state["observation"]["checkpoint_due"])
+        self.assertEqual(state["row_started_at"], rows["row_started_at"])
+        self.assertIsNotNone(public)
+        self.assertEqual(public["rows"][0]["clock_scope"], "row")
+
+    def test_supervisor_registry_caller_keeps_missing_arm_birth_unknown(self):
+        import resource_progress
+        route, jobs, registry, ledger, row, identity, output, artifact, proc = \
+            self.local_observation_fixture(row_started_at=None)
+        rows = {"directory": str(output), "arm": "arm-unknown", "row_started_at": None}
+        runtime = self.base / "runtime"
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs),
+                                          "AGENT_RUNTIME_DIR": str(runtime),
+                                          "AGENT_ARTIFACT_ROOT": str(artifact)}), \
+                mock.patch.object(resource_progress, "collect", return_value=rows), \
+                mock.patch.object(resource_progress, "remote_candidates", return_value=[]):
+            SUP.poll_once(route, ledger)
+            state_path = resource_progress._observation_state_path(
+                row, registry, "arm-unknown", create=False)
+            state = resource_progress._read_observation_state(state_path)
+            public = resource_progress.read_public_run_record(artifact, row["run_id"])
+        self.assertIsNone(proc.poll())
+        self.assertEqual(state["clock_scope"], "unknown")
+        self.assertIsNone(state["row_started_at"])
+        self.assertIsNone(state["observation"]["elapsed_seconds"])
+        self.assertIsNone(public["rows"][0]["started_at"])
+        self.assertEqual(public["rows"][0]["clock_scope"], "unknown")
+
     def owner_terminal_settled_compute_fixture(self):
         import dispatch_resource_wait as OWNER_RESOURCE
 

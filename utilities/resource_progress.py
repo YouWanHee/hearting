@@ -371,7 +371,7 @@ def _public_metric_point(point):
             "nonfinite": not finite, "path": point.get("path")}
 
 
-def _observation_state_path(run, registry, row_key):
+def _observation_state_path(run, registry, row_key, *, create=True):
     jobs = run.get("jobs") or os.environ.get("AGENT_DISPATCH_JOBS")
     try:
         from resource_run_registry import agent_home
@@ -387,8 +387,13 @@ def _observation_state_path(run, registry, row_key):
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":"),
                                        ensure_ascii=False).encode()).hexdigest()
     directory = Path(state_root) / "resource-observations"
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if directory.is_symlink():
+    if create:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        mode = directory.lstat().st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and (stat.S_ISLNK(mode) or not stat.S_ISDIR(mode)):
         raise ValueError("observation-state-directory-symlink")
     return directory / (digest + ".json")
 
@@ -441,27 +446,71 @@ def _merge_metric_sources(previous, current, samples):
 def _notice_targets(run):
     values = []
     owner = run.get("owner_wait") if isinstance(run.get("owner_wait"), dict) else {}
+    jobs = (run.get("jobs") or owner.get("jobs")
+            or os.environ.get("AGENT_DISPATCH_JOBS"))
+
+    def add(harness, session_id, attempt_id=None, binding_kind="provenance"):
+        if harness not in {"claude", "codex", "opencode"} or not session_id:
+            return
+        lineage = {"kind": "provenance", "harness": str(harness),
+                   "session_id": str(session_id)}
+        if attempt_id and jobs:
+            try:
+                from dispatch_completion_join import exact_attempt_row
+                row = exact_attempt_row(Path(jobs), str(attempt_id))
+                metadata = row.metadata if row is not None else {}
+                if binding_kind == "owner-session" and metadata.get("harness") == harness:
+                    lineage = {"kind": "owner-session", "attempt_id": str(attempt_id),
+                               "harness": str(harness), "session_id": str(session_id)}
+                elif binding_kind == "attempt-parent" and metadata.get("parent_sid") == session_id:
+                    from harness_capabilities import HARNESSES, parent_completion
+                    parent_harness = next((name for name in HARNESSES
+                        if parent_completion(name).get("carrier")
+                        == metadata.get("parent_completion_delivery")), None)
+                    if parent_harness == harness:
+                        lineage = {"kind": "attempt-parent", "attempt_id": str(attempt_id),
+                                   "harness": str(harness), "session_id": str(session_id)}
+            except (OSError, ValueError, TypeError, RuntimeError):
+                pass
+        values.append((str(harness), str(session_id), lineage))
+
     owner_harness, owner_session = owner.get("harness"), owner.get("session_id")
-    if owner_session and not owner_harness:
-        jobs = run.get("jobs") or os.environ.get("AGENT_DISPATCH_JOBS")
-        attempt = owner.get("parent_attempt_id") or run.get("parent_attempt_id")
+    owner_attempt = owner.get("parent_attempt_id") or run.get("parent_attempt_id")
+    if owner_session and owner_attempt:
         try:
             from dispatch_completion_join import exact_attempt_row
-            row = exact_attempt_row(Path(jobs), str(attempt)) if jobs and attempt else None
+            row = exact_attempt_row(Path(jobs), str(owner_attempt)) if jobs and owner_attempt else None
             metadata = row.metadata if row is not None else {}
-            if metadata.get("parent_sid") == owner_session:
-                owner_harness = metadata.get("harness")
+            owner_harness = owner_harness or metadata.get("harness")
+            if owner_harness:
+                add(owner_harness, owner_session, owner_attempt, "owner-session")
+            parent_session = metadata.get("parent_sid")
+            parent_carrier = metadata.get("parent_completion_delivery")
+            if parent_session and parent_carrier:
+                from harness_capabilities import HARNESSES, parent_completion
+                supervisor_harness = next((name for name in HARNESSES
+                    if parent_completion(name).get("carrier") == parent_carrier), None)
+                if supervisor_harness:
+                    add(supervisor_harness, parent_session, owner_attempt, "attempt-parent")
         except (OSError, ValueError, TypeError, RuntimeError):
             pass
-    if owner_harness and owner_session:
-        values.append((owner_harness, owner_session))
+    elif owner_harness and owner_session:
+        add(owner_harness, owner_session)
     provenance = run.get("provenance") if isinstance(run.get("provenance"), dict) else {}
     for candidate in (run.get("notify"), run.get("session"), run.get("supervisor_session"),
                       provenance.get("notify"), provenance.get("session")):
         if isinstance(candidate, dict) and candidate.get("harness") and candidate.get("id"):
-            values.append((candidate["harness"], candidate["id"]))
-    return list(dict.fromkeys((str(harness), str(session)) for harness, session in values
-                              if harness in {"claude", "codex", "opencode"} and session))
+            candidate_attempt = candidate.get("parent_attempt_id") or candidate.get("attempt_id")
+            add(candidate["harness"], candidate["id"], candidate_attempt,
+                "attempt-parent" if candidate_attempt else "provenance")
+    result = {}
+    for harness, session, lineage in values:
+        key = harness, session
+        previous = result.get(key)
+        if previous is None or (lineage["kind"] == "attempt-parent"
+                                and previous["lineage"]["kind"] != "attempt-parent"):
+            result[key] = {"harness": harness, "session_id": session, "lineage": lineage}
+    return list(result.values())
 
 
 def _notice_texts(run, event_kind, observation, record_path, sources):
@@ -583,9 +632,30 @@ def _read_observation_state(path):
     return _restore_special_numbers(_json(raw))
 
 
+def read_experiment_observation(run, registry, row_key):
+    """Read one persisted observation projection without creating runtime state."""
+    try:
+        path = _observation_state_path(run, registry, row_key, create=False)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+        value = _read_observation_state(path)
+        if (value.get("run_id") != run.get("run_id")
+                or value.get("row_key") != str(row_key)):
+            return None
+        return {"available": True, "observation": value.get("observation"),
+                "metrics": value.get("sources", []), "metric_root": None,
+                "record_path": None, "delivery": [], "warnings": value.get("warnings", []),
+                "state_path": str(path)}
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return None
+
+
 def observe_experiment(run, registry, now, *, root=None, row_key=None,
                        started_at=None, planned_seconds=None, progress=None,
-                       final=False, status=None, notify_events=True):
+                       final=False, status=None, notify_events=True,
+                       poll_interval_seconds=60.0):
     """Advance one detached row's durable observation and public run record.
 
     Metric discovery is deliberately caller-bound: `root` must come from an
@@ -630,6 +700,18 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                 previous = {}
         except (OSError, ValueError, TypeError):
             previous = {}
+        previous_poll = previous.get("last_observer_poll_at")
+        if (not final and isinstance(previous_poll, (int, float))
+                and not isinstance(previous_poll, bool)
+                and float(now) - float(previous_poll) < max(1.0, float(poll_interval_seconds))
+                and status == previous.get("public_status")):
+            cached_observation = dict(previous.get("observation") or {})
+            cached_observation["checkpoint_due"] = False
+            cached_observation["due_checkpoint_at"] = None
+            return {"available": True, "observation": cached_observation,
+                    "metrics": previous.get("sources", []), "metric_root": None,
+                    "record_path": None, "delivery": [],
+                    "warnings": previous.get("warnings", []), "state_path": str(state_path)}
         warnings, sources, new_samples, cursor = [], [], [], previous.get("cursor")
         last_observed_at = previous.get("last_observed_at")
         should_read_sources = (metric_root is not None and
@@ -656,16 +738,25 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                 warnings.append("metric-source-unavailable:" + str(exc))
         samples = _merge_samples(previous.get("samples"), new_samples)
         sources = _merge_metric_sources(previous.get("sources"), sources, samples)
-        started = started_at if isinstance(started_at, (int, float)) else run.get("started_at")
+        row_scoped = bool(row_key and str(row_key) != "run")
+        started = (started_at if isinstance(started_at, (int, float)) else
+                   None if row_scoped else run.get("started_at"))
         if not isinstance(started, (int, float)) or isinstance(started, bool) \
                 or not math.isfinite(float(started)):
-            started = float(now)
+            started = None
+        clock_known = started is not None
+        if not clock_known:
             warnings.append("row-start-unknown")
+        schedule_started = (float(started) if clock_known else
+                            previous.get("schedule_started_at"))
+        if not isinstance(schedule_started, (int, float)) or isinstance(schedule_started, bool) \
+                or not math.isfinite(float(schedule_started)):
+            schedule_started = float(now)
         plan = planned_seconds if planned_seconds is not None else _declared_plan(run)
         declared = run.get("observation") if isinstance(run.get("observation"), dict) else {}
         decision_metric = run.get("decision_metric", declared.get("decision_metric"))
         observation = evaluate_observation(
-            now=now, started_at=started, planned_seconds=plan,
+            now=now, started_at=schedule_started, planned_seconds=plan,
             progress=progress, previous_progress=previous.get("progress_sample"),
             previous_progress_at=previous.get("progress_at"), samples=samples,
             decision_metric=(decision_metric.get("key") if isinstance(decision_metric, dict)
@@ -675,6 +766,13 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             baseline=run.get("baseline_value", declared.get("baseline_value")), final=final,
             optional_rules=run.get("rules", declared.get("rules")),
             last_checkpoint_at=previous.get("last_checkpoint_at"))
+        if not clock_known:
+            # A wrapper clock is not a row birth. Keep the row's own clock
+            # unknown while retaining its independently identified metrics.
+            observation["elapsed_seconds"] = None
+            observation["predicted_total_seconds"] = None
+            observation["eta_seconds"] = None
+            observation["eta_vs_plan"] = None
         next_progress = ({key: progress.get(key) for key in
                           ("completed", "total", "unit", "updated_at", "reached_epoch", "total_epochs")
                           if key in progress} if isinstance(progress, dict) else None)
@@ -714,6 +812,10 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
         next_state = {"schema_version": OBSERVATION_VERSION, "run_id": run_id,
                       "row_key": str(identity), "cursor": cursor, "samples": samples,
                       "sources": sources,
+                      "schedule_started_at": schedule_started,
+                      "clock_scope": "row" if clock_known else "unknown",
+                      "row_started_at": float(started) if clock_known else None,
+                      "last_observer_poll_at": float(now),
                       "last_observed_at": float(now) if should_read_sources else last_observed_at,
                       "progress_sample": next_progress or previous.get("progress_sample"),
                       "progress_at": (float(next_progress["updated_at"])
@@ -736,11 +838,13 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             or bool(new_samples) or sources != previous.get("sources", [])))
         if publish_public:
             record = public_run_record(run, status=status, observation=observation,
-                metrics=next_state["sources"], started_at=started,
+                metrics=next_state["sources"], started_at=run.get("started_at"),
                 ended_at=(run.get("ended_at") if run.get("ended_at") is not None else now)
                     if final else None)
             record["source_warnings"] = sorted(set(warnings))
-            row_entry = {"row_id": str(identity), "started_at": started,
+            row_entry = {"row_id": str(identity),
+                         "started_at": float(started) if clock_known else None,
+                         "clock_scope": "row" if clock_known else "unknown",
                          "output_dir": str(metric_root) if metric_root else None,
                          "metrics": next_state["sources"],
                          "last_checkpoint": record["last_checkpoint"],
@@ -762,7 +866,8 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                               or sources != previous.get("sources", []))
                          or next_progress != previous.get("progress_sample")
                          or observation["checkpoint_due"] or final
-                         or warnings != [])
+                         or warnings != []
+                         or next_state["last_observer_poll_at"] != previous_poll)
         if record_path or state_changed:
             if record_path:
                 next_state["last_public_write_at"] = float(now)
@@ -787,16 +892,25 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                     all_received = True
                     texts = event.get("texts") if isinstance(event.get("texts"), list) else [event.get("text", "")]
                     for part_index, part_text in enumerate(texts, 1):
-                        for harness, session_id in targets:
-                            receipt = notify(harness, session_id,
-                                key=f"experiment:{run_id}:{event['key']}:{part_index}:{harness}:{session_id}",
-                                subject=f"experiment {event['kind']} ({part_index}/{len(texts)})",
-                                text=part_text, route_id=run.get("route_id") or "route-free",
-                                required_action="read-notice",
-                                jobs=(run.get("jobs")
-                                      or (run.get("owner_wait") or {}).get("jobs")
-                                      or os.environ.get("AGENT_DISPATCH_JOBS")))
-                            state = receipt.get("state") if isinstance(receipt, dict) else "unavailable"
+                        for target in targets:
+                            if isinstance(target, dict):
+                                harness, session_id = target.get("harness"), target.get("session_id")
+                                lineage = target.get("lineage")
+                            else:
+                                harness, session_id = target
+                                lineage = None
+                            try:
+                                receipt = notify(harness, session_id,
+                                    key=f"experiment:{run_id}:{event['key']}:{part_index}:{harness}:{session_id}",
+                                    subject=f"experiment {event['kind']} ({part_index}/{len(texts)})",
+                                    text=part_text, route_id=run.get("route_id") or "route-free",
+                                    required_action="read-notice", lineage=lineage,
+                                    jobs=(run.get("jobs")
+                                          or (run.get("owner_wait") or {}).get("jobs")
+                                          or os.environ.get("AGENT_DISPATCH_JOBS")))
+                                state = receipt.get("state") if isinstance(receipt, dict) else "unavailable"
+                            except (OSError, ValueError, TypeError, RuntimeError):
+                                receipt, state = None, "unavailable"
                             attempted_delivery = True
                             delivered_to.append({"harness": harness, "session_id": session_id,
                                                  "part": part_index, "state": state})
