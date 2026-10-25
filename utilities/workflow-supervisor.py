@@ -288,6 +288,7 @@ def resume_recovered_resource_owner(route, ledger):
 
 def resource_evidence(armed):
     """Terminal evidence for a detached resource child, settled if it is gone."""
+    import dispatch_resource_wait as OWNER_RESOURCE
     registry = Path(armed["resource_registry"])
     run_id = armed["predecessor_id"]
     try:
@@ -297,12 +298,41 @@ def resource_evidence(armed):
         return {"terminal": False, "reason": f"resource-registry-unreadable:{exc}"}
     if not isinstance(row, dict):
         return {"terminal": False, "reason": "resource-run-absent"}
+    execution = row.get("execution")
+    if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+        if (row.get("resource_policy") != "supervised-owner"
+                or row.get("route") != armed.get("route_file")
+                or row.get("node") != armed.get("node")
+                or row.get("jobs") != armed.get("jobs")
+                or row.get("compute_run_id") != execution.get("run_id")
+                or row.get("sentinel") != str(Path(execution.get("run_root", ""))
+                                                / str(execution.get("run_id", "")) / "exit_code")
+                or row.get("log") != str(Path(execution.get("run_root", ""))
+                                           / str(execution.get("run_id", "")) / "log")
+                or (execution.get("provenance") or {}).get("route_id") != armed.get("route_id")
+                or (execution.get("provenance") or {}).get("route_hash") != armed.get("route_hash")
+                or row.get("status") not in ("succeeded", "failed")
+                or armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(row)):
+            return {"terminal": False, "reason": "compute-resource-binding-mismatch"}
+        observation = RR.compute_execution_observation(row)
+        identity = RR.compute_execution_identity(row)
+        if observation.get("state") != "quiescent" or not identity:
+            return {"terminal": False, "reason": observation.get("reason", "compute-run-observation-unavailable"),
+                    "liveness": observation.get("state"), "identity": identity}
+        return {"terminal": True, "succeeded": row.get("status") == "succeeded",
+                "identity": identity, "liveness": "exited", "quiescent": True,
+                "exit_code": row.get("exit_code"), "sentinel": row.get("sentinel"),
+                "sentinel_present": bool(row.get("sentinel")) and Path(str(row["sentinel"])).is_file(),
+                "ended_at": row.get("ended_at"), "failure_class": row.get("failure_class"),
+                "never_started": False, "reason": "compute-hosts-process-group-empty",
+                "log": row.get("log"), "parent_attempt_id": row.get("parent_attempt_id"),
+                "resource_sha256": RESOURCE_RESUME.row_digest(row),
+                "execution_observation": observation}
     resume = row.get("resource_policy") in {"verified-resume", "supervised-owner"}
     if resume and (row.get("route") != armed.get("route_file") or row.get("node") != armed.get("node")
                    or row.get("jobs") != armed.get("jobs")):
         return {"terminal": False, "reason": "resource-binding-mismatch"}
     if row.get("resource_policy") == "supervised-owner":
-        import dispatch_resource_wait as OWNER_RESOURCE
         if armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(row):
             return {"terminal": False, "reason": "resource-body-binding-mismatch"}
     if resume and row.get("status") == "launching":
@@ -540,6 +570,18 @@ def cmd_arm(args):
     import resource_run_evidence as RUN_EVIDENCE
     output_receipt = RUN_EVIDENCE.paths(record, prepare=True)
     ledger = ledger_for(route, getattr(args, "jobs", None))
+    prior_observation = None
+    target = armed_dir(ledger) / f"{args.node}.json"
+    if args.predecessor_kind == "resource" and target.is_file():
+        try:
+            prior_record = json.loads(target.read_text(encoding="utf-8"))
+            prior_registry = json.loads(Path(prior_record["resource_registry"]).read_text(encoding="utf-8"))
+            prior_row = prior_registry["runs"][prior_record["predecessor_id"]]
+            prior_execution = prior_row.get("execution") if isinstance(prior_row, dict) else None
+            if isinstance(prior_execution, dict) and prior_execution.get("kind") == "compute-hosts":
+                prior_observation = (prior_record, resource_evidence(prior_record))
+        except (OSError, ValueError, KeyError, TypeError):
+            prior_observation = None
     with ledger.lock():
         if cancelled_mutation(route, ledger):
             return 0
@@ -550,7 +592,11 @@ def cmd_arm(args):
         if args.predecessor_kind == "resource" and target.exists():
             prior = json.loads(target.read_text())
             if any(_comparable_armed(prior, record).get(k) != record.get(k) for k in record if k != "armed_at"):
-                replace_resource_predecessor(route, ledger, prior, record, resource)
+                if prior_observation is not None:
+                    replace_resource_predecessor(route, ledger, prior, record, resource,
+                        preobserved=prior_observation)
+                else:
+                    replace_resource_predecessor(route, ledger, prior, record, resource)
             else:
                 print(json.dumps({"armed": args.node, "replayed": True,
                                   **output_receipt,
@@ -601,7 +647,7 @@ def _start_successor(armed, successor, key):
     finally:
         if handle is not None:
             handle.close()
-    identity = RR.proc_identity(proc.pid) or {}
+    identity = RR.launched_identity(proc) or {}
     return {"started": True, "surface": "detached", "pid": proc.pid,
             "starttime": identity.get("starttime"), "command": command,
             "log": log_path}
@@ -633,11 +679,18 @@ def _checked_resource_row(armed, evidence, *, require_success=True):
     """Recheck the existing exit tuple at the resource admission boundary."""
     from route_authority import resource_predecessor_finished
     row = json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
+    execution = row.get("execution") if isinstance(row, dict) else None
+    if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+        # The fresh observation is captured before writer locks. Under a lock,
+        # revalidate its row digest and receipt tuple without probing the host.
+        observation = evidence.get("execution_observation") or {}
+        finished = observation.get("state") == "quiescent"
+    else:
+        finished = resource_predecessor_finished(row)
     if (RESOURCE_RESUME.row_digest(row) != evidence.get("resource_sha256")
             or runner().read_sentinel(row.get("sentinel")) != evidence.get("exit_code")
             or (require_success and evidence.get("exit_code") != 0)
-            or (RR.classify_identity(row)[0] != "exited" if require_success
-                else not resource_predecessor_finished(row))):
+            or not finished):
         return None
     return row
 
@@ -670,7 +723,7 @@ def resource_output_evidence(route, armed, evidence):
     return RUN_EVIDENCE.write(armed, row, preserve=preserve)
 
 
-def reopen_resource_output_failure(route, ledger, armed):
+def reopen_resource_output_failure(route, ledger, armed, *, observed_evidence=None):
     """Append recovery of missing output, without treating a file as an exit."""
     stage = ledger.state()["nodes"].get(armed["node"], {})
     previous = stage.get("evidence") or {}
@@ -693,7 +746,7 @@ def reopen_resource_output_failure(route, ledger, armed):
     if any(row.get("state") in WS.vocabulary()["failure_states"]
            for node, row in ledger.state()["nodes"].items() if node != armed["node"]):
         return False
-    current = resource_evidence(armed)
+    current = observed_evidence if observed_evidence is not None else resource_evidence(armed)
     if (not current.get("succeeded") or current.get("identity") != previous.get("identity")
             or current.get("liveness") != "exited" or not current.get("sentinel_present")
             or current.get("exit_code") != 0
@@ -810,6 +863,111 @@ def _owner_input_is_current(armed, resource_row, owner_attempt_id, owner_session
             )
     except (INPUT.InputError, OSError, ValueError, KeyError, TypeError):
         return False
+
+
+def _owner_settlement_snapshot(route, ledger, armed, row=None):
+    """Return only a current, exact compute-owner settlement suitable for local reuse."""
+    import dispatch_contract as DC
+    import dispatch_resource_wait as OWNER_RESOURCE
+
+    if armed.get("predecessor_kind") != "resource":
+        return None
+    if row is None:
+        try:
+            document = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
+            row = (document.get("runs") or {}).get(armed["predecessor_id"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+    if not isinstance(row, dict):
+        return None
+    execution = row.get("execution")
+    if not isinstance(execution, dict) or execution.get("kind") != "compute-hosts":
+        return None
+
+    owner = row.get("owner_wait") or {}
+    if not isinstance(owner, dict):
+        return None
+    owner_attempt_id = row.get("parent_attempt_id")
+    identity = RR.compute_execution_identity(row)
+    row_digest = RESOURCE_RESUME.row_digest(row)
+    resource_binding = OWNER_RESOURCE.resource_body_digest(row)
+    node_id = armed.get("node")
+    stage = ledger.state().get("nodes", {}).get(node_id, {})
+    if not isinstance(stage, dict):
+        return None
+    evidence = stage.get("evidence") or {}
+    if not isinstance(evidence, dict):
+        return None
+    owner_successor_start = evidence.get("owner_successor_start") is True
+    owner_terminal_settlement = evidence.get("owner_terminal_settlement") is True
+    route_file = armed.get("route_file")
+    jobs = armed.get("jobs")
+    provenance = execution.get("provenance") or {}
+    if (not isinstance(route_file, str) or not isinstance(jobs, str)
+            or not isinstance(provenance, dict)):
+        return None
+    try:
+        canonical_jobs = str(Path(jobs).resolve())
+        canonical_route_file = str(Path(route_file).resolve())
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if (stage.get("state") != "STAGE_SUCCEEDED"
+            or not (owner_successor_start or owner_terminal_settlement)
+            or not owner_attempt_id or owner.get("parent_attempt_id") != owner_attempt_id
+            or evidence.get("owner_attempt_id") != owner_attempt_id
+            or (evidence.get("owner_session_id") is not None
+                and evidence.get("owner_session_id") != owner.get("session_id"))
+            or row.get("run_id") != armed.get("predecessor_id")
+            or row.get("resource_policy") != "supervised-owner"
+            or row.get("status") != "succeeded" or row.get("exit_code") != 0
+            or row.get("route") != route_file or row.get("node") != node_id
+            or row.get("jobs") != jobs
+            or jobs != canonical_jobs or route_file != canonical_route_file
+            or armed.get("route_id") != route.get("route_id")
+            or armed.get("route_hash") != route.get("route_hash")
+            or owner.get("route_id") != route.get("route_id")
+            or owner.get("route_hash") != route.get("route_hash")
+            or owner.get("jobs") != jobs or not owner.get("session_id")
+            or not identity or identity != evidence.get("identity")
+            or identity != evidence.get("resource_execution_identity")
+            or evidence.get("resource_sha256") != row_digest
+            or evidence.get("terminal") is not True
+            or evidence.get("succeeded") is not True
+            or evidence.get("exit_code") != 0
+            or evidence.get("liveness") != "exited"
+            or evidence.get("quiescent") is not True
+            or evidence.get("sentinel_present") is not True
+            or armed.get("resource_binding") != resource_binding
+            or row.get("compute_run_id") != execution.get("run_id")
+            or provenance.get("route_id") != route.get("route_id")
+            or provenance.get("route_hash") != route.get("route_hash")):
+        return None
+
+    artifacts = evidence.get("artifacts")
+    if (not isinstance(artifacts, dict) or artifacts.get("checked") is not True
+            or artifacts.get("missing")):
+        return None
+    node = WS.route_node(route, node_id)
+    if node is None:
+        return None
+    marker_path = route_module().completion_dir(route["route_id"], jobs=jobs) / f"{node_id}.json"
+    try:
+        marker_bytes = marker_path.read_bytes()
+        marker = json.loads(marker_bytes)
+        if (marker.get("resource_execution_identity") != identity
+                or not DC.completion_marker_is_current(
+                    route, node, marker_path, marker, jobs=jobs)):
+            return None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return {
+        "identity": identity,
+        "row_digest": row_digest,
+        "resource_binding": resource_binding,
+        "owner_attempt_id": owner_attempt_id,
+        "settlement_evidence": evidence,
+        "marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
+    }
 
 
 def _successor_registry_snapshot_unstarted(route, armed):
@@ -988,7 +1146,8 @@ def _resume_legacy_resource_retraction(route, ledger, armed, event):
     return ledger.state()["nodes"].get(node_id, {}).get("state") == "RUNNING"
 
 
-def reconcile_legacy_supervised_resource_success(route, ledger, armed, *, candidate=None):
+def reconcile_legacy_supervised_resource_success(route, ledger, armed, *, candidate=None,
+                                                   observed_evidence=None):
     """Retract only a poll success contradicted by the same owner's unstarted next run."""
     if armed.get("predecessor_kind") != "resource" or armed.get("successor_external") is not True:
         return False
@@ -1001,7 +1160,7 @@ def reconcile_legacy_supervised_resource_success(route, ledger, armed, *, candid
         return False
     if prior_row.get("resource_policy") != "supervised-owner":
         return False
-    evidence = resource_evidence(armed)
+    evidence = observed_evidence if observed_evidence is not None else resource_evidence(armed)
     checked = _checked_resource_row(armed, evidence) if evidence.get("terminal") else None
     if (checked is None or evidence.get("succeeded") is not True or evidence.get("exit_code") != 0
             or evidence.get("liveness") != "exited" or evidence.get("sentinel_present") is not True
@@ -1087,7 +1246,7 @@ def reconcile_legacy_supervised_resource_success(route, ledger, armed, *, candid
     return _resume_legacy_resource_retraction(route, ledger, armed, event)
 
 
-def replace_resource_predecessor(route, ledger, prior, record, resource):
+def replace_resource_predecessor(route, ledger, prior, record, resource, *, preobserved=None):
     """Called under the ledger lock, with the old run and journal preserved."""
     import dispatch_resource_wait as OWNER_RESOURCE
     changing = {"predecessor_id", "resource_registry", "resource_binding", "armed_at"}
@@ -1097,7 +1256,20 @@ def replace_resource_predecessor(route, ledger, prior, record, resource):
             or any(comparable.get(k) != record.get(k) for k in set(comparable) | set(record) if k not in changing)
             or resource.get("resource_policy") not in {"supervised-owner", "verified-resume"}):
         raise SupervisorError("resource-watch-binding-conflict")
-    evidence = resource_evidence(prior)
+    if preobserved is not None:
+        observed_armed, evidence = preobserved
+        if observed_armed != prior:
+            raise SupervisorError("resource-evidence-changed")
+    else:
+        try:
+            recorded = json.loads(Path(prior["resource_registry"]).read_text(encoding="utf-8"))[
+                "runs"][prior["predecessor_id"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            recorded = {}
+        execution = recorded.get("execution") if isinstance(recorded, dict) else None
+        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+            raise SupervisorError("resource-compute-observation-unavailable")
+        evidence = resource_evidence(prior)
     old = _checked_resource_row(prior, evidence, require_success=False) if evidence.get("terminal") else None
     missing = artifact_evidence(prior)
     state = ledger.state()
@@ -1108,10 +1280,14 @@ def replace_resource_predecessor(route, ledger, prior, record, resource):
             and (stage.get("state") == "STAGE_SUCCEEDED"
                  or (stage.get("state") == "FAILED_RETRYABLE"
                      and latest.get("actor") == "resource-false-success-reconciliation"))):
-        reconcile_legacy_supervised_resource_success(route, ledger, prior, candidate=resource)
+        reconcile_legacy_supervised_resource_success(route, ledger, prior, candidate=resource,
+                                                       observed_evidence=evidence)
         state = ledger.state()
         stage = state["nodes"].get(prior["node"], {})
-    if (old is None or not OWNER_RESOURCE.resource_execution_finished(old)
+    execution = old.get("execution") if isinstance(old, dict) else None
+    compute_finished = (isinstance(execution, dict) and execution.get("kind") == "compute-hosts"
+                        and evidence.get("execution_observation", {}).get("state") == "quiescent")
+    if (old is None or (not compute_finished and not OWNER_RESOURCE.resource_execution_finished(old))
             or (evidence.get("succeeded") and old.get("resource_policy") != "supervised-owner"
                 and (not missing.get("checked") or
                 (not missing.get("missing") and not (stage.get("evidence") or {}).get("runtime_only_output"))))
@@ -1142,7 +1318,26 @@ def replace_resource_predecessor(route, ledger, prior, record, resource):
                   "execution": evidence, "next_resource": record["predecessor_id"]}, actor="arm")
 
 
-def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, terminal_gates=None):
+def resource_failure_observations(ledger):
+    """Capture compute failure observations for a later locked resolution pass."""
+    captured = {}
+    for node, armed in read_armed(ledger).items():
+        if armed.get("predecessor_kind") != "resource":
+            continue
+        try:
+            row = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))[
+                "runs"][armed["predecessor_id"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        execution = row.get("execution") if isinstance(row, dict) else None
+        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+            captured[node] = {"armed": armed, "row": row,
+                              "observation": RR.compute_execution_observation(row)}
+    return captured
+
+
+def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, terminal_gates=None,
+                                 compute_observations=None):
     """Resolve a late output at exact owner settlement, without starting work.
 
     Called under the ledger lock after the owner's terminal gates pass. The
@@ -1151,10 +1346,11 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, termi
     """
     import dispatch_resource_wait as OWNER_RESOURCE
     import resource_failure_resolution
+    compute_observations = compute_observations or {}
     resource_failure_resolution.reconcile(route, ledger,
         terminal_gates if terminal_gates is not None else
         route_module().terminal_gate_observation(route, jobs=jobs, exact_terminal=True),
-        jobs, route_module())
+        jobs, route_module(), compute_observations=compute_observations)
     resolved_nodes = []
     journal = ledger.journal()
     for node, armed in read_armed(ledger).items():
@@ -1223,12 +1419,12 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, termi
             raise WS.WorkflowStateError(f"resource-stage-output-pending:{node}")
 
 
-def _evaluate(route, ledger, armed, results):
+def _evaluate(route, ledger, armed, results, *, observed_evidence=None):
     node_id = armed["node"]
     kind = armed["continuation_kind"]
     row_data = None
     if armed["predecessor_kind"] == "resource":
-        evidence = resource_evidence(armed)
+        evidence = observed_evidence if observed_evidence is not None else resource_evidence(armed)
     else:
         evidence = registered_evidence(armed)
     if (armed["predecessor_kind"] == "resource" and evidence.get("terminal") and evidence.get("succeeded")
@@ -1375,6 +1571,26 @@ def admit_owner_successor_start(route, successor, jobs, owner_attempt_id, owner_
         raise SupervisorError("resource-successor-route-node-missing")
     import dispatch_owner_input as INPUT
     ledger = ledger_for(route, str(jobs))
+    # Compute-host evidence may require SSH. Capture it before either writer
+    # lock, then compare the exact armed record and resource digest after lock.
+    preobserved = {}
+    for predecessor, armed in read_armed(ledger).items():
+        if (predecessor not in (route_node.get("depends_on") or [])
+                or successor not in (armed.get("successors") or [])
+                or armed.get("predecessor_kind") != "resource"):
+            continue
+        try:
+            data = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
+            row = data["runs"][armed["predecessor_id"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        execution = row.get("execution") if isinstance(row, dict) else None
+        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+            settled_snapshot = _owner_settlement_snapshot(route, ledger, armed, row)
+            preobserved[predecessor] = (
+                armed, {"settled_snapshot": settled_snapshot}
+                if settled_snapshot is not None else resource_evidence(armed)
+            )
     admitted = False
     with ledger.lock():
         if resource_continuation_cancelled(route, ledger):
@@ -1382,16 +1598,40 @@ def admit_owner_successor_start(route, successor, jobs, owner_attempt_id, owner_
         armed_rows = read_armed(ledger)
         for predecessor in route_node.get("depends_on") or []:
             armed = armed_rows.get(predecessor)
+            captured_predecessor = preobserved.get(predecessor)
+            captured_settlement = (
+                captured_predecessor[1].get("settled_snapshot")
+                if captured_predecessor is not None
+                and isinstance(captured_predecessor[1], dict) else None
+            )
             if (not armed or armed.get("predecessor_kind") != "resource"
                     or successor not in (armed.get("successors") or [])):
+                if captured_settlement is not None:
+                    raise SupervisorError("resource-owner-successor-binding-conflict")
                 continue
             try:
                 data = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
                 row = data["runs"][armed["predecessor_id"]]
             except (OSError, ValueError, KeyError, TypeError):
+                if captured_settlement is not None:
+                    raise SupervisorError("resource-owner-successor-binding-conflict")
                 continue
             if row.get("resource_policy") != "supervised-owner":
+                if captured_settlement is not None:
+                    raise SupervisorError("resource-owner-successor-binding-conflict")
                 continue
+            execution = row.get("execution") if isinstance(row, dict) else None
+            is_compute = isinstance(execution, dict) and execution.get("kind") == "compute-hosts"
+            if is_compute:
+                if (captured_predecessor is None or captured_predecessor[0] != armed):
+                    if captured_settlement is not None:
+                        raise SupervisorError("resource-owner-successor-binding-conflict")
+                    continue
+                if captured_settlement is not None and _owner_settlement_snapshot(
+                        route, ledger, armed, row) != captured_settlement:
+                    raise SupervisorError("resource-owner-successor-binding-conflict")
+            elif captured_settlement is not None:
+                raise SupervisorError("resource-owner-successor-binding-conflict")
             owner = row.get("owner_wait") or {}
             if (armed.get("route_id") != route.get("route_id")
                     or armed.get("route_hash") != route.get("route_hash")
@@ -1407,17 +1647,27 @@ def admit_owner_successor_start(route, successor, jobs, owner_attempt_id, owner_
             stage_evidence = stage.get("evidence") or {}
             if stage.get("state") == "STAGE_SUCCEEDED":
                 owner_settled = (
-                    stage_evidence.get("owner_attempt_id") == owner_attempt_id
-                    and stage_evidence.get("resource_execution_identity") == stage_evidence.get("identity")
-                    and (stage_evidence.get("owner_successor_start") is True
-                         or stage_evidence.get("owner_terminal_settlement") is True)
+                    _owner_settlement_snapshot(route, ledger, armed, row) is not None
+                    if is_compute else
+                    (stage_evidence.get("owner_attempt_id") == owner_attempt_id
+                     and stage_evidence.get("resource_execution_identity") == stage_evidence.get("identity")
+                     and (stage_evidence.get("owner_successor_start") is True
+                          or stage_evidence.get("owner_terminal_settlement") is True))
                 )
-                if not owner_settled and reconcile_legacy_supervised_resource_success(route, ledger, armed):
-                    # The old marker is now history. The ordinary read-only
-                    # marker gate below will refuse this start and the owner can
-                    # continue the approved resource sequence on the same route.
-                    continue
                 if not owner_settled:
+                    if captured_predecessor is not None:
+                        if (is_compute and captured_settlement is not None):
+                            raise SupervisorError("resource-owner-successor-binding-conflict")
+                        reconciled = reconcile_legacy_supervised_resource_success(
+                            route, ledger, armed, observed_evidence=captured_predecessor[1])
+                    else:
+                        reconciled = reconcile_legacy_supervised_resource_success(
+                            route, ledger, armed)
+                    if reconciled:
+                        # The old marker is now history. The ordinary read-only
+                        # marker gate below will refuse this start and the owner can
+                        # continue the approved resource sequence on the same route.
+                        continue
                     continue
             elif stage.get("state") != "RUNNING":
                 continue
@@ -1446,10 +1696,16 @@ def admit_owner_successor_start(route, successor, jobs, owner_attempt_id, owner_
                         _claim_owner_successors(route, ledger, armed, predecessor, stage_evidence)
                         admitted = True
                         continue
-                    if _admit_owner_resource_stage_locked(
+                    captured_predecessor = preobserved.get(predecessor)
+                    if captured_predecessor is not None:
+                        admitted_stage = _admit_owner_resource_stage_locked(
                             route, ledger, armed, predecessor, jobs, owner_attempt_id,
-                            owner_session_id,
-                    ):
+                            owner_session_id, captured_predecessor)
+                    else:
+                        admitted_stage = _admit_owner_resource_stage_locked(
+                            route, ledger, armed, predecessor, jobs, owner_attempt_id,
+                            owner_session_id)
+                    if admitted_stage:
                         admitted = True
             except INPUT.InputError as error:
                 raise SupervisorError("resource-owner-input-unavailable") from error
@@ -1457,9 +1713,14 @@ def admit_owner_successor_start(route, successor, jobs, owner_attempt_id, owner_
 
 
 def _admit_owner_resource_stage_locked(route, ledger, armed, predecessor, jobs,
-                                       owner_attempt_id, owner_session_id):
+                                       owner_attempt_id, owner_session_id, preobserved=None):
     """Settle one verified resource while the ledger and owner-input locks are held."""
-    evidence = resource_evidence(armed)
+    if preobserved is not None:
+        observed_armed, evidence = preobserved
+        if observed_armed != armed:
+            return False
+    else:
+        evidence = resource_evidence(armed)
     checked = _checked_resource_row(armed, evidence) if evidence.get("terminal") else None
     if (checked is None or evidence.get("succeeded") is not True
             or evidence.get("exit_code") != 0 or evidence.get("liveness") != "exited"
@@ -1515,7 +1776,53 @@ def _claim_owner_successors(route, ledger, armed, node_id, evidence):
     return claims
 
 
-def _poll_once_locked(route, ledger):
+def _poll_compute_evidence(armed, compute_observations):
+    """Use only an exact pre-lock compute snapshot; local rows keep their old path."""
+    import dispatch_resource_wait as OWNER_RESOURCE
+
+    changed = {"terminal": False, "reason": "compute-resource-binding-changed"}
+    captured = compute_observations.get(armed.get("node"))
+    if not armed.get("resource_registry"):
+        return changed if captured is not None else None
+    try:
+        data = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))
+        row = (data.get("runs") or {}).get(armed["predecessor_id"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return changed if captured is not None else {
+            "terminal": False, "reason": "resource-run-absent"}
+
+    execution = row.get("execution") if isinstance(row, dict) else None
+    is_compute = isinstance(execution, dict) and execution.get("kind") == "compute-hosts"
+    if captured is None:
+        return changed if is_compute else None
+
+    if (not isinstance(captured, dict) or captured.get("armed") != armed
+            or not is_compute or not isinstance(row, dict)):
+        return changed
+    evidence = captured.get("evidence")
+    if not isinstance(evidence, dict):
+        return changed
+    resource_sha256 = RESOURCE_RESUME.row_digest(row)
+    resource_binding = OWNER_RESOURCE.resource_body_digest(row)
+    identity = RR.compute_execution_identity(row)
+    evidence_sha256 = evidence.get("resource_sha256")
+    if (not identity or evidence.get("identity") != identity
+            or captured.get("resource_sha256") != resource_sha256
+            or captured.get("resource_binding") != resource_binding
+            or armed.get("resource_binding") != resource_binding
+            or (evidence_sha256 is not None and evidence_sha256 != resource_sha256)
+            or (evidence.get("terminal") is True and evidence_sha256 != resource_sha256)):
+        return changed
+    return evidence
+
+
+def _poll_once_locked(route, ledger, *, compute_observations=None):
+    compute_observations = compute_observations or {}
+
+    def evidence_for(armed):
+        evidence = _poll_compute_evidence(armed, compute_observations)
+        return resource_evidence(armed) if evidence is None else evidence
+
     import route_parent_close
     closing = route_parent_close.ledger_intent(route, ledger)
     if closing:
@@ -1524,7 +1831,7 @@ def _poll_once_locked(route, ledger):
         results = []
         for node_id, armed in sorted(read_armed(ledger).items()):
             if armed["predecessor_kind"] == "resource":
-                evidence = resource_evidence(armed)
+                evidence = evidence_for(armed)
                 if evidence.get("terminal"):
                     prior = [e for e in ledger.journal() if (e.get("evidence") or {}).get(
                         "cancelled_resource_result", {}).get("identity") == evidence.get("identity")]
@@ -1538,27 +1845,85 @@ def _poll_once_locked(route, ledger):
     results = []
     for node_id, armed in sorted(read_armed(ledger).items()):
         state = ledger.state()["nodes"].get(node_id, {}).get("state")
+        captured = compute_observations.get(node_id)
+        settled_snapshot = (captured.get("settled_snapshot")
+                            if isinstance(captured, dict) else None)
+        if settled_snapshot is not None:
+            current_snapshot = (
+                _owner_settlement_snapshot(route, ledger, armed)
+                if captured.get("armed") == armed else None
+            )
+            if (state != "STAGE_SUCCEEDED" or current_snapshot != settled_snapshot):
+                results.append({"node": node_id, "action": "wait",
+                                "evidence": {"terminal": False,
+                                             "reason": "compute-resource-binding-changed"}})
+            else:
+                results.append({"node": node_id, "action": "settled", "state": state})
+            continue
+        observed_evidence = (
+            _poll_compute_evidence(armed, compute_observations)
+            if armed.get("predecessor_kind") == "resource" else None
+        )
         if (state == "STAGE_SUCCEEDED" and armed.get("predecessor_kind") == "resource"):
-            if reconcile_legacy_supervised_resource_success(route, ledger, armed):
+            reconciled = (
+                reconcile_legacy_supervised_resource_success(
+                    route, ledger, armed, observed_evidence=observed_evidence)
+                if observed_evidence is not None else
+                reconcile_legacy_supervised_resource_success(route, ledger, armed)
+            )
+            if reconciled:
                 state = ledger.state()["nodes"].get(node_id, {}).get("state")
         if state in ("STAGE_SUCCEEDED", "FAILED_TERMINAL", "CANCELLED"):
             results.append({"node": node_id, "action": "settled", "state": state})
             continue
         if state in {"FAILED_RETRYABLE", "READY", "RUNNING"}:
-            recovered = reopen_resource_output_failure(route, ledger, armed)
+            recovered = (
+                reopen_resource_output_failure(
+                    route, ledger, armed, observed_evidence=observed_evidence)
+                if observed_evidence is not None else
+                reopen_resource_output_failure(route, ledger, armed)
+            )
             if state == "FAILED_RETRYABLE" and not recovered:
                 results.append({"node": node_id, "action": "halted", "state": state})
                 continue
         if armed["continuation_kind"] == "human-gate":
             results.append({"node": node_id, "action": "human-gate"})
             continue
-        _evaluate(route, ledger, armed, results)
+        if observed_evidence is not None:
+            _evaluate(route, ledger, armed, results, observed_evidence=observed_evidence)
+        else:
+            _evaluate(route, ledger, armed, results)
     return results
 
 
 def poll_once(route, ledger):
+    import dispatch_resource_wait as OWNER_RESOURCE
+
+    compute_observations = {}
+    for node, armed in read_armed(ledger).items():
+        if armed.get("predecessor_kind") != "resource":
+            continue
+        try:
+            row = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))[
+                "runs"][armed["predecessor_id"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        execution = row.get("execution") if isinstance(row, dict) else None
+        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+            settled_snapshot = _owner_settlement_snapshot(route, ledger, armed, row)
+            if settled_snapshot is not None:
+                compute_observations[node] = {
+                    "armed": armed, "settled_snapshot": settled_snapshot,
+                }
+            else:
+                compute_observations[node] = {
+                    "armed": armed,
+                    "resource_sha256": RESOURCE_RESUME.row_digest(row),
+                    "resource_binding": OWNER_RESOURCE.resource_body_digest(row),
+                    "evidence": resource_evidence(armed),
+                }
     with ledger.lock():
-        results = _poll_once_locked(route, ledger)
+        results = _poll_once_locked(route, ledger, compute_observations=compute_observations)
         import route_parent_close
         closing = route_parent_close.ledger_intent(route, ledger)
     if closing:
@@ -3105,6 +3470,7 @@ def cmd_status(args):
 def cmd_complete(args):
     route = load_route(args.route)
     ledger = ledger_for(route, getattr(args, "jobs", None))
+    compute_observations = resource_failure_observations(ledger)
     terminal_nodes = WS.route_terminal_nodes(route)
     if not terminal_nodes:
         raise SupervisorError("route declares no terminal node")
@@ -3124,7 +3490,8 @@ def cmd_complete(args):
             return 3
         import resource_failure_resolution
         resource_failure_resolution.reconcile(route, ledger, gates,
-            getattr(args, "jobs", None) or ledger.root.parent.parent / "jobs.log", route_module())
+            getattr(args, "jobs", None) or ledger.root.parent.parent / "jobs.log", route_module(),
+            compute_observations=compute_observations)
         ledger.complete(terminal_nodes, gates)
     print(json.dumps({"complete": True, **ledger_metadata(getattr(args, "jobs", None), ledger),
                       "terminal_nodes": terminal_nodes,

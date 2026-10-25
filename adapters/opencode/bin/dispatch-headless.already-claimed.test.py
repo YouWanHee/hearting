@@ -33,11 +33,12 @@ class AlreadyClaimedTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        # The harness CLI only has to exist on PATH: the launch itself is mocked,
-        # and CI runners have no opencode binary installed.
+        # The fake supplies the launch's version protocol before the mocked
+        # launch claim; CI needs no installed OpenCode.
         self.fakebin = self.root / "bin"
         self.fakebin.mkdir()
-        (self.fakebin / "opencode").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (self.fakebin / "opencode").write_text(
+            '#!/bin/sh\n[ "$1" = --version ] && echo 1.19.0\nexit 0\n', encoding="utf-8")
         (self.fakebin / "opencode").chmod(0o755)
         self.repo = self.root / "repo"
         self.repo.mkdir()

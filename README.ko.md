@@ -54,7 +54,7 @@ Hearting은 지원되는 코딩 에이전트 런타임에서 조사, 계획, 구
 
 ### 요구 사항
 
-- Python 3.10 이상
+- Python 3.11 이상
 - 그 Python용 PyYAML (예: `python3 -m pip install --user pyyaml`): framed
   경로가 frame 제안을 읽을 때 쓰며, `hearting verify`가 확인합니다
 - `curl` 또는 `wget`
@@ -73,15 +73,9 @@ tag의 archive를 SHA-256으로 확인한 뒤 설치합니다. 세 런타임에 
 user-level 일일 update 확인도 등록합니다. Runtime credential, session, log,
 database는 건드리지 않습니다.
 
-Codex가 설치되어 있으면 같은 transaction이 복구 가능한
-`$CODEX_HOME/.harness/bin/codex` 보호 ingress도 설치합니다. 평범하게 `codex`, `codex resume`,
-`codex fork`를 실행하면 자동으로 harness-managed App Server로 들어가고,
-`codex exec`, plugin 관리, login 등 비대화형 명령은 기록해 둔 실제 CLI로
-그대로 전달됩니다. Update는 launcher를 복구하며 `hearting uninstall codex`는
-설치 전 command binding을 정확히 복원합니다. 프로필 PATH 변경은 명시적인
-`--profile-policy manage` 권한이 필요하며 현재 터미널은 바꾸지 않습니다.
-`legacy-inplace-v1`은 명시적인 제한 모드에서만 가능합니다. Codex가 아직 없으면 이 단계만
-skip으로 보고하고 나중에 runtime refresh로 적용할 수 있습니다.
+Codex 실행 파일과 command binding은 Codex가 소유합니다. Runtime activation은
+보호 ingress를 설치하거나 shell profile을 편집하지 않으며, `codex` 실행 파일은
+vendor 소유로 유지됩니다.
 
 `~/.local/bin`을 `PATH`에 넣은 뒤에는 다음처럼 관리합니다.
 
@@ -102,10 +96,14 @@ launcher와 공용 `compute-hosts` operator launcher도 함께 설치합니다. 
 
 `compute-hosts`는 host를 명시적으로 선택하며 사용자가 소유한
 `${XDG_CONFIG_HOME:-$HOME/.config}/hearting/compute-hosts.yaml`을 읽습니다.
-설치와 update는 이 inventory를 만들거나 바꾸지 않고, shell startup 파일도
-수정하지 않습니다. 자동 GPU scheduler나 remote agent dispatch는 없습니다.
+설치와 runtime activation은 이 파일이 없을 때 주석 template을 한 번 만들고,
+기존 파일과 symlink는 보존합니다. shell startup 파일도 수정하지 않습니다.
+자동 GPU scheduler나 remote agent dispatch는 없습니다.
 외부 PATH 파일과 symlink는 보존되며, 전체 uninstall만 소유한 공용 link를
 제거하고 부분 runtime uninstall은 이를 유지합니다.
+
+Inventory가 비어 있어도 Fleet는 이 기계의 읽기 전용 compute 관측을 보여 주며,
+원격 host와 detached run에는 계속 inventory 설정이 필요합니다.
 
 `hearting update`는 새 release를 staging에서 검증한 뒤 active pointer를
 전환하고 실패하면 이전 release로 rollback합니다. 이미 열린 agent session이
@@ -271,8 +269,9 @@ git config core.hooksPath tools/git-hooks
 ```
 
 `pre-push`는 CI가 돌리는 것과 동일한 생성물 검사를 수행하고 실패할 push를
-거부합니다. 커밋이 공개되고 release workflow가 태그를 붙이기 전에 drift를
-잡습니다. `git push --no-verify`로 우회할 수 있습니다.
+거부해 커밋이 공개되기 전에 drift를 잡습니다. 릴리스 workflow는 별도의
+유지보수자 요청 뒤에 게시합니다. `git push --no-verify`로 hook을 우회할 수
+있습니다.
 
 공유 정의를 변경한 후에는 모든 생성 projection을 갱신하고 drift를
 검사합니다.

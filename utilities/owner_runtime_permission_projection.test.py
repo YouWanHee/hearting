@@ -360,7 +360,8 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
         context = wrapper.opencode_context
         attempt = "att-opencode-owner-cap-refresh"
         opencode = self.fakebin / "opencode"
-        opencode.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        opencode.write_text(
+            '#!/bin/sh\n[ "$1" = --version ] && echo 2.0.32\nexit 0\n', encoding="utf-8")
         opencode.chmod(0o755)
 
         env = self.route_binding_env(self.base_env(self.jobs["opencode"]))
@@ -502,6 +503,9 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
         launch_env = launch_envs[0]
         permission_context = commit_policy.read_runtime_permission_context(launch_env)
         self.assertIsNotNone(permission_context)
+        runtime_dir = launch_env.get("AGENT_RUNTIME_DIR")
+        self.assertTrue(runtime_dir)
+        self.assertIn(runtime_dir, permission_context["execution_access_roots"])
         base_config = json.loads(permission_context["opencode_config_base"])
         self.assertEqual(base_config["providers"][provider]["models"][model_id]["limit"], {
             "context": 800000, "input": 580000, "output": 12000,
@@ -567,6 +571,18 @@ class OwnerRuntimePermissionProjectionTest(unittest.TestCase):
             self.assertEqual(model_config["variants"],
                              {selected_variant: {"reasoningEffort": "high"}})
             self.assertEqual(model_config["options"], {"temperature": 0.2})
+            config = row["config"]
+            legacy_roots = config.get("permission", {}).get("external_directory", {})
+            legacy_allowed = (isinstance(legacy_roots, dict)
+                              and legacy_roots.get(runtime_dir) == "allow")
+            native_allowed = any(
+                permission.get("action") == "external_directory"
+                and permission.get("resource") == runtime_dir
+                and permission.get("effect") == "allow"
+                for permission in config.get("permissions", [])
+                if isinstance(permission, dict)
+            )
+            self.assertTrue(legacy_allowed or native_allowed, config)
         self.assertNotIn("--session", turns[0]["argv"])
         self.assertEqual(turns[1]["argv"][turns[1]["argv"].index("--session") + 1],
                          "ses_ownerfixture")

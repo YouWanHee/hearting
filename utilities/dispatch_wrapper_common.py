@@ -147,6 +147,15 @@ def resolve_artifact_root(worktree: str) -> str:
     return value
 
 
+def prepare_runtime_root(artifact_root: str, environ=None, *, repository_kind=None, source_root=None) -> str:
+    """Best-effort runtime home setup; failure only suppresses the optional root."""
+    import worker_bootstrap
+    values = os.environ if environ is None else environ
+    candidate = worker_bootstrap.runtime_dir_candidate(
+        artifact_root, values, repository_kind=repository_kind, source_root=source_root)
+    return worker_bootstrap.prepare_runtime_dir(candidate)
+
+
 def is_report_bundle_publish_stage(route_file: str | None, route_node: str | None) -> bool:
     if not route_file or route_node != "publish":
         return False
@@ -519,14 +528,22 @@ def append_job(jobs: Path, args: argparse.Namespace, *, harness: str, runtime_sa
         # from the captured projection above.
         commit_policy.assert_launch_permission_projection(args)
     jobs.parent.mkdir(parents=True, exist_ok=True)
-    repo = subprocess.check_output(["git", "-C", args.worktree, "rev-parse", "--show-toplevel"], text=True).strip()
+    repo = getattr(args, "repository_identity", None)
+    if not repo:
+        from dispatch_contract import work_root_identity
+        repo = work_root_identity(
+            args.worktree,
+            route_file=getattr(args, "route_file", None)
+            or os.environ.get("AGENT_OWNER_ROUTE_FILE"),
+        )
     pipe = (
         f"capability={args.capability},capability_mode={args.capability_mode},qa={args.qa},"
         f"intensity={args.intensity},attempt_schema_version=2,"
         f"dispatch_depth={args.dispatch_depth},transport=headless,"
         f"execution_surface={args.execution_surface},"
-        f"registered_worker={int(bool(args.registered_worker))},"
-        f"fallback_hop={args.fallback_hop},harness={harness}"
+        + ("repository=non-git," if getattr(args, "repository_kind", "git") == "non-git" else "")
+        + f"registered_worker={int(bool(args.registered_worker))},"
+        + f"fallback_hop={args.fallback_hop},harness={harness}"
     )
     if args.parent_slug:
         pipe += f",parent={args.parent_slug}"

@@ -18,6 +18,7 @@ from ..refresh import LiveSnapshot
 
 _JOB_OBSERVATIONS = {}
 _OBSERVATION_SUCCESSES = {}
+FIRST_FRAME_USAGE_WAIT = 5.0
 
 
 def _observation_health(key, source, error=None):
@@ -385,13 +386,6 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
             codex_tick = prepare(sessions, wait_timeout=0.0 if fast_first else 0.2)
     except Exception:
         pass
-    opencode_tick = None
-    try:
-        prepare = getattr(modules.get("opencode"), "prepare_tick", None)
-        if prepare and any(s.harness == "opencode" for s in sessions):
-            opencode_tick = prepare(sessions)
-    except Exception:
-        pass
     for s in sessions:
         s._fast_first = bool(fast_first)
         fn = enrichers.get(s.harness)
@@ -401,8 +395,6 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
             try:
                 if s.harness == "codex" and codex_tick is not None:
                     fn(s, tick=codex_tick)
-                elif s.harness == "opencode" and opencode_tick is not None:
-                    fn(s, tick=opencode_tick)
                 else:
                     fn(s)
             except Exception:
@@ -423,10 +415,8 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
             share_registry_state(sessions)
     except Exception:
         pass
-    # Issue #158: one opencode session id → one row. A session leader plus its
-    # helper child (or any two processes that created nothing themselves) share
-    # the one directory-fallback guess and would otherwise render as identical
-    # rows. Runs here, after every binding is known and before the exact
+    # One exact OpenCode session id → one row. If multiple process rows prove
+    # the same current selection, keep the strongest binding before the exact
     # herdr/steward/peer joins below, which all key on session_id.
     try:
         collapse = getattr(modules.get("opencode"), "collapse_duplicate_sids", None)
@@ -530,8 +520,22 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
                 continue
             snap = usage_cache.account_usage(harness, usage=usage if usage == "refresh" else "cache-only")
             usage_snapshots[harness] = snap
+            error_observation = snap.get("error_observation")
             usage_meta[harness] = {k: snap.get(k) for k in ("freshness", "observed_at")}
+            freshness = snap.get("freshness")
+            if freshness == "fresh":
+                observations["usage:" + harness] = {"state": "ok"}
+            elif usage == "refresh" and usage_cache.refresh_in_flight(
+                    harness, max_age=FIRST_FRAME_USAGE_WAIT):
+                observations["usage:" + harness] = {
+                    "state": "pending", "reason": "usage-refresh-in-flight"}
+            else:
+                observations["usage:" + harness] = {
+                    "state": "unavailable", "reason": "usage-not-fresh"}
             if harness == "opencode":
+                go_scope = opencode_scope = entitlement_scope = None
+                selected = None
+                opencode_v2 = False
                 try:
                     utilities = Path(__file__).resolve().parents[3] / "utilities"
                     if str(utilities) not in sys.path:
@@ -596,11 +600,60 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
                             payload.pop(key, None)
                 except Exception:
                     usage_meta[harness]["providers"] = []
+                if isinstance(error_observation, dict):
+                    error_scope = error_observation.get("account_scope")
+                    selected_unavailable = (selected is not None
+                                             and selected.state == "unavailable")
+                    local_reason = (getattr(selected, "reason", None)
+                                    if selected_unavailable else None)
+                    # An unscoped marker is meaningful only while the currently
+                    # selected credential still confirms that exact local absence.
+                    if (error_scope is None and not (
+                            selected_unavailable and local_reason == error_observation.get("reason")
+                            and local_reason in {"credential-not-found", "credential-store-unavailable",
+                                                 "credential-store-read-failed"})):
+                        error_observation = None
+                        snap["error_observation"] = None
+                    elif (error_scope is not None and error_scope != (go_scope or "unscoped")):
+                        error_observation = None
+                        snap["error_observation"] = None
+                if (opencode_v2 and selected is not None and selected.state == "unavailable"
+                        and getattr(selected, "reason", None) in {
+                            "credential-not-found", "credential-store-unavailable",
+                            "credential-store-read-failed"}
+                        and not (isinstance(snap.get("payload"), dict)
+                                 and snap["payload"].get("error"))
+                        and not isinstance(error_observation, dict)):
+                    snap["error_observation"] = {
+                        "error": "missing-credential",
+                        "reason": selected.reason,
+                        "observed_at": _time.time(),
+                    }
+                    error_observation = snap["error_observation"]
+                # Scope and credential details are comparison inputs only. The
+                # published snapshot carries the bounded reason and quota values.
+                if isinstance(error_observation, dict):
+                    safe_observation = {key: error_observation.get(key)
+                                        for key in ("error", "reason", "observed_at")}
+                    snap["error_observation"] = safe_observation
+                    error_observation = safe_observation
+                if isinstance(snap.get("payload"), dict):
+                    payload = snap["payload"]
+                    for private_key in ("detail", "account_scope", "credential_integration_id",
+                                        "credential_source", "credential_type"):
+                        payload.pop(private_key, None)
+                    availability = payload.get("provider_availability")
+                    if isinstance(availability, dict):
+                        for row in availability.values():
+                            if isinstance(row, dict):
+                                row.pop("account_scope", None)
             payload = snap.get("payload") or {}
             if not isinstance(payload, dict):
                 continue
             if payload.get("error"):
                 usage_meta[harness]["error"] = payload.get("error")
+            elif isinstance(error_observation, dict):
+                usage_meta[harness]["error"] = error_observation.get("error")
             account_windows = payload.get("rl_windows")
             if account_windows is None:
                 account_windows = payload.get("windows")
@@ -627,9 +680,16 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
                     # key present but rejected). Render shows the cause instead of a
                     # silently blank gauge.
                     s._usage_error = payload.get("error")
+                    s._usage_error_reason = payload.get("reason")
+                elif harness == "opencode" and isinstance(error_observation, dict):
+                    s._usage_error = error_observation.get("error")
+                    s._usage_error_reason = error_observation.get("reason")
                 s._usage_freshness = snap.get("freshness")
                 s._usage_observed_at = snap.get("observed_at")
     except Exception:
+        for harness in ("claude", "codex", "opencode"):
+            observations.setdefault("usage:" + harness, {
+                "state": "unavailable", "reason": "usage-collection-failed"})
         usage_meta = {}
         usage_snapshots = {}
     collect_all.last_usage = usage_meta

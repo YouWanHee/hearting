@@ -198,9 +198,22 @@ defaults to the named **Existing-result analysis** composition in
 `metrics → diagnose → report`, adding `independent-verify` at strong or higher
 with its declared group and automatic owner close. Include `eval-run` only when
 the request needs new raw results, using its existing inputs and write scope.
-The parent chooses the capability: omitting `--capability` in ordinary compose
+In a Git folder, the parent chooses the capability: omitting `--capability` in ordinary compose
 uses the fixed `autopilot-code` default, not a classifier of the task text; framed work
-leaves that choice to its frame.
+leaves that choice to its frame. A depth-0 `compose --start --shape direct` in a non-Git
+folder runs inline in the current session. Its task purpose selects the capability when
+clear; an explicit `--capability` and mode take precedence, and an unclear purpose is shown
+as unresolved while retaining the existing storage fallback. The session performs that
+capability's work and can close it through the normal inline `finish` path. The start card
+says `git 아닌 폴더 — 이 세션이 직접 진행. 작업자가 필요하면 --shape 없이 다시 시작(원본 수정은 git init 필요)`.
+An omitted shape follows the Git default: the start is framed and its frame decides, as in a
+Git folder. Any other shape, including a route-plan leg whose own shape is not direct, is a
+worker request. In a non-Git folder, a compiled artifact-only worker route may run in the
+bound folder; a route whose compiled write scope mutates source is refused with the reason
+and the next action (`git init` and restart, or continue this session with `--shape direct`).
+The classification comes from the compiled write scope, not a capability-name list.
+A later compose in a Git repository follows the
+existing Git behavior.
 Likewise, code review within an implementation/debug cycle belongs to
 `autopilot-code --mode audit`; independent inspection of completed work belongs
 to `audit`. Both may inspect code; purpose, not file type, decides the owner.
@@ -225,18 +238,27 @@ a mode retains its existing deployment/release behavior (`default`).
 | "Write an independent presentation for the recipient" | `autopilot-draft` | New document goal, not file collection |
 | "Deploy the application to production" | `autopilot-ship` | Obtain deploy approval at route start; retain post-deploy verification |
 
+For the non-Git direct start only, task classification is conservative: clear research,
+fixed-result evaluation, reusable code, document correction or drafting, project analysis,
+and packaging use their corresponding existing capabilities. Generic analysis, conflicting
+purposes, negation, and quoted examples stay unresolved; they add no required question or flag.
+
 
 ### 0.2.1. Shape Before Preset (SD-135)
 
 Compose and start show intensity and its source, sealed node profiles, and the
 initial node/worker-dispatch/resource counts before launch. Unspecified intensity
 adds one nonblocking suggestion to consider `strong` for judgment or root-cause
-analysis; intensity does not change model profiles. These observations add no
+analysis, except framed routes which already start with two top-tier frame legs; intensity does not change model profiles. These observations add no
 approval or required input. New compose records retain the two input sources in
 the existing `selection_basis`; old routes display `sealed-route` when the
 original explicit/default choice was not recorded. Worker estimates count stage
 and frame legs, excluding the separately shown owner and any retries or later
 routes chosen by a frame.
+
+framed는 기본 두 갈래다. 작고 국소적인 일이면 `--intensity quick`을 붙일
+수 있고, 과제가 공통 규칙·spec·여러 어댑터를 건드리면 하팅이 두 갈래로
+지킨다.
 
 The precedence above decides which capability **owns the artifacts** of a
 request. It does not oblige the session to run that entry's whole recipe.
@@ -275,7 +297,7 @@ has no frame nodes, and neither has a `solo` or `staged` compose: those shapes
 compile without the recipe's frame pair (a route sealed earlier keeps the
 frame nodes it was sealed with).
 
-A `framed` route's one leg is `deep`; both legs of a two-leg `framed` route and of a preset recipe's own frame pair are `top`: a pin with a profile or an explicit profile wins and is not lowered automatically; a frame-rule `top` that stops at a usage limit is retried once at `deep` through the SD-157 replacement lineage, and the lowering is recorded. The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향과 경로를 조립해 제안합니다" and the cost line, "비용: frame 한 갈래 · 방향 확인 질문 1회" or, with both legs, "비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회".
+A `framed` route runs two `top` legs by default; the simplified one-leg route runs at `deep`. A preset recipe's own frame pair is also `top`: a pin with a profile or an explicit profile wins and is not lowered automatically; a frame-rule `top` that stops at a usage limit is retried once at `deep` through the SD-157 replacement lineage, and the lowering is recorded. The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향과 경로를 조립해 제안합니다" and the cost line, "비용: frame 한 갈래 · 방향 확인 질문 1회" or, with both legs, "비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회".
 
 **Staged assembly guidance.** Staged assembly guidance is for frame brief
 authors and routes whose capability and stages the person explicitly named.
@@ -450,10 +472,13 @@ reason and continues from the original cwd. Preview, explain, non-start
 `compose`, and low-level `compile` remain read-only), artifact root
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
-`compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the
-artifact root and neither this session's read hook recorded reading it unchanged
-nor the caller named what was read; the latest `prd.md` of
-a `shared/spec/<ref>/` revision only adds one `[경로]` card line with its path), and both
+`compose-spec-read-required` when the artifact root's governing legacy
+`spec/prd.md` is selected and this session's read hook has not recorded reading
+it unchanged, unless the caller named what was read; the governing candidates
+come from `artifact_cutover.prd_candidates`, so a shared revision supersedes a
+legacy copy and only adds one `[경로]` card line with its path. A checkout PRD
+outside the artifact root is informational and is not a marker-gate input;
+absence evidence distinguishes that checkout file from a governing PRD), and both
 eligibility probes (`dispatch-readiness`). The result is sealed, verified,
 bound, and guarded exactly like a recipe route: `selection.route_origin`
 records `compose` or `preset`, `selection.shape` records the shape, a staged
@@ -920,8 +945,12 @@ itself cannot carry the closure, because `route_hash` covers every other field.
 An unclosed route is indistinguishable from abandoned work, and the same applies
 to the other things a finished attempt leaves behind: a merged worktree and
 branch, a spec `pipeline_state.yaml` still naming a live phase, and a memory
-handoff still `pending` after its obligation is met. Close what the attempt
-opened, or the next session pays for it in reconstruction.
+handoff still `pending` after its obligation is met. Registered delivery
+reconciliation expires only the exact record whose original recipient has
+positive dead PID/start evidence; a closed identity-matched route settles its
+bound duty as not-required while retaining the record. Unknown liveness and a
+live successor remain pending, and unchanged observations are not rewritten.
+Close what the attempt opened, or the next session pays for it in reconstruction.
 
 ### 0.6. Tracked-Workflow Lifecycle and Continuation
 
@@ -941,13 +970,28 @@ or unobservable recorded process group remains pending; exact prior-boot
 evidence or a complete empty-group observation can establish execution end.
 Exact inspection reads the worker's result; requesting more failure detail is
 optional and cannot become a second completion gate.
+
+On the same OPEN route, the current owner may start a new supervised resource
+retry with `resource-runner start --compute-run <run-id>` after a completed
+`compute-hosts` execution. Before creating the retry row, the runtime checks
+the sealed command, inputs and provenance, exit evidence, output receipts, and
+fresh remote process-group quiescence; it preserves the prior failure row and
+sentinel. The owner's normal start admits verification separately; compute
+exit is execution evidence only.
 The runtime acknowledges a delivered notification after its receiving turn
-finishes. Delivery does not restrict the owner's tools or prove stage success;
+finishes. Claude PostToolUse events with a nonempty `agent_id` belong to a
+subagent or teammate even when `session_id` names the parent conversation; they
+record outbound SendMessage calls but leave inbound parent context pending for
+the main session. `agent_type` alone does not identify that case. Delivery does
+not restrict the owner's tools or prove stage success;
 launch dependencies, write authorization and terminal cleanup scopes own those
 decisions. Repeating a notification cannot declare the owner abandoned.
 
 A steward's idle-notify subscription is observation, not a continuation; the
 registered-continuation obligation below still applies (`core/OPERATIONS.md §5.14`).
+The Claude gate carrier may claim, emit, or settle a gate only while it still
+holds the arm and effective seat; a handed-away carrier leaves the gate record
+for its successor.
 
 This section is capability-independent. `autopilot-lab`, `autopilot-code`,
 `autopilot-ship`, spec/research, CI and GitHub check cycles, external-state
@@ -1128,6 +1172,8 @@ Autopilot entrypoints choose `intensity`; verification rigor is derived from it 
 | Important multi-file or risk-bearing work | `strong` | A `deep` owner plus the declared plan/review groups; selected high-value anchors may widen to a third profile/perspective leg while other groups remain width two |
 | Complex cross-domain or cross-harness work | `thorough` | Bounded dispatch-depth-2 perspective and verifier workers |
 | High-stakes, irreversible, security, or external-facing work | `adversarial` | Thorough plus an explicit adversary, failure-mode, or security pass |
+
+The quick row describes the lighter procedure, not a smaller deliverable. The original request, approved endpoint, and assigned scope remain the completion boundary: examples and concise reports do not replace requested investigation, results, or verification. A report endpoint ends with the approved report; a bounded stage finishes only its assigned work and reports any actual unfinished duty through the existing outcome semantics.
 
 Only `direct` has no plan. Every other autopilot graph includes a plan check, but independent QA is not repeated after every sub-stage by default. Independent passes use route-declared bounded groups with separate execution contexts and distinct personas, retaining model-profile/perspective asymmetry where declared; every review — down to a `direct`/`quick` self-check — carries the refute-by-default adversarial stance. `CONVENTIONS §1` is canonical for the graph.
 
