@@ -141,6 +141,53 @@ class ParentCloseTest(unittest.TestCase):
     def close(self, **kwargs):
         return CLOSE.close(self.route, self.path, jobs=self.jobs, **kwargs)
 
+    def _explicit_jobs_handoff(self):
+        import artifact_identity
+        import artifact_producer as PRODUCER
+        import route_authority as AUTH
+
+        ambient = self.base / "ambient-dispatch" / "jobs.log"
+        ambient.parent.mkdir()
+        ambient.write_text("")
+        os.environ["AGENT_DISPATCH_JOBS"] = str(ambient)
+        ids = artifact_identity.IdAllocator()
+        PRODUCER.activate(self.artifacts, repository_id=ids.allocate("repository"),
+                          artifact_root_id=ids.allocate("artifact_root"),
+                          w7={"campaign_id": ids.allocate("campaign")})
+        owner = self.row("explicit-owner", harness="codex")
+        begun = PRODUCER.begin(
+            self.artifacts, route_file=self.path, capability=self.route["capability"],
+            intensity=self.route["effective_intensity"], jobs=self.jobs,
+            owner_attempt_id=owner["attempt_id"])
+        for target in ("owner", "worker"):
+            AUTH.record_pin_change(
+                self.route, target=target,
+                pin={"harness": "claude", "model": None, "effort": None},
+                by={"harness": "codex", "session_id": "fixture-parent"},
+                source="probe", tuples=[], candidates=[])
+        outcome = CLOSE.close(self.route, self.path, jobs=self.jobs,
+                              summary=work_start.PIN_HANDOFF_SUMMARY)
+        record = PRODUCER.read_cycle_record(self.artifacts, begun["cycle_id"])
+        self.assertEqual(outcome["state"], "cancelled", outcome)
+        self.assertEqual(CLOSE._rows(self.jobs)[owner["attempt_id"]][1]["failure_class"], "cancelled")
+        self.assertNotIn(owner["attempt_id"], CLOSE._rows(ambient))
+        self.assertEqual(record["state"], "open", record)
+        self.assertIsNotNone(CLOSE.verified_owner_pin_handoff_close(self.route, jobs=self.jobs))
+        return begun["cycle_id"], outcome, ambient
+
+    def test_explicit_jobs_handoff_stays_open_on_fresh_close(self):
+        cycle_id, _outcome, _ambient = self._explicit_jobs_handoff()
+        import artifact_producer as PRODUCER
+        self.assertEqual(PRODUCER.read_cycle_record(self.artifacts, cycle_id)["state"], "open")
+
+    def test_explicit_jobs_handoff_stays_open_on_settled_replay(self):
+        cycle_id, outcome, _ambient = self._explicit_jobs_handoff()
+        replay = CLOSE.close(self.route, self.path, jobs=self.jobs,
+                             summary=work_start.PIN_HANDOFF_SUMMARY)
+        self.assertEqual(replay, outcome)
+        import artifact_producer as PRODUCER
+        self.assertEqual(PRODUCER.read_cycle_record(self.artifacts, cycle_id)["state"], "open")
+
     def terminal_fail_stage(self, *, parent="att-owner", name="att-terminal-fail",
                             status="done", foreground=True, cleanup=True,
                             invalid_foreground=False, cleanup_overrides=None,
@@ -613,6 +660,13 @@ class ParentCloseTest(unittest.TestCase):
             # retain the same cycle; the second close is the historical preimage boundary.
             final_handoff = outcomes[-1]
             self.assertEqual(PRODUCER.read_cycle_record(fixture.artifacts, cycle_id)["state"], "open")
+            live_review_lease_path = PRODUCER._review_lease_path(
+                fixture.artifacts, cycle_id, "historical-live-review")
+            PRODUCER.review_lease_acquire(
+                fixture.artifacts, cycle_id=cycle_id, attempt_id="historical-live-review")
+            live_review_lease_bytes = live_review_lease_path.read_bytes()
+            PRODUCER.review_lease_release(
+                fixture.artifacts, cycle_id=cycle_id, attempt_id="historical-live-review")
             abandoned = PRODUCER.finalize(
                 fixture.artifacts, cycle_id=cycle_id, state="abandoned",
                 abandon_reason="operator-decision")
@@ -710,11 +764,168 @@ class ParentCloseTest(unittest.TestCase):
                     fixture.jobs, "done", exact_attempt_row(fixture.jobs, final_owner["attempt_id"]).metadata)
             self.assertEqual(interrupted.result, "recoverable", interrupted)
             self.assertTrue(PRODUCER.journal_path(fixture.artifacts, cycle_id).exists())
+
+            # Probe the real historical completion context while the exact finish is
+            # stopped after manifest publication. These checks use the same abandoned
+            # snapshot and immutable terminal binding as the production retry below.
+            historical_record = PRODUCER.read_cycle_record(fixture.artifacts, cycle_id)
+            exact_binding = TERMINAL.load_producer_binding(
+                artifact_root=fixture.artifacts, route_id=final_route["route_id"],
+                owner_attempt_id=final_owner["attempt_id"]).binding
+            def historical_context(expected=exact_binding):
+                return PRODUCER._historical_handoff_completion_context(
+                    fixture.artifacts, historical_record, prior_document, expected)
+
+            historical = historical_context()
+            self.assertIsNotNone(historical, "baseline historical handoff proof must remain valid")
+            completion_binding, _sealed_route, historical_outcome, preserved, _gates = historical
+            completed_path = cycle_dir / "manifest.json"
+            completed_candidate = json.loads(completed_path.read_text())
+            self.assertTrue(PRODUCER._evaluate_provisional_completion(
+                fixture.artifacts, historical_record, completed_candidate, completion_binding,
+                historical_outcome, preserved=preserved, first_completion=True))
+
+            missing_role = json.loads(json.dumps(completed_candidate))
+            missing_role["artifacts"] = []
+            missing_role["artifact_revisions"] = []
+            self.assertFalse(PRODUCER._evaluate_provisional_completion(
+                fixture.artifacts, historical_record, missing_role, completion_binding,
+                historical_outcome, preserved=preserved, first_completion=True),
+                "first historical completion must retain the required-role check")
+
+            primary_revision = next(
+                row for row in completed_candidate["artifact_revisions"]
+                if (row.get("locator") or {}).get("path", "").endswith("spec/prd.md"))
+            primary_payload = cycle_dir / primary_revision["locator"]["path"]
+            primary_bytes = primary_payload.read_bytes()
+            try:
+                primary_payload.write_bytes(primary_bytes + b" changed during historical finish\n")
+                self.assertFalse(PRODUCER._evaluate_provisional_completion(
+                    fixture.artifacts, historical_record, completed_candidate, completion_binding,
+                    historical_outcome, preserved=preserved, first_completion=True),
+                    "first historical completion must verify current payload bytes")
+            finally:
+                primary_payload.write_bytes(primary_bytes)
+
+            foreign_binding = dict(exact_binding)
+            foreign_binding["cycle_id"] = "cyc_" + "f" * 32
+            self.assertIsNone(historical_context(foreign_binding),
+                              "a foreign cycle binding cannot prove this history")
+            foreign_binding = dict(exact_binding)
+            foreign_binding["owner_attempt_id"] = fixture.aid("foreign-owner")
+            self.assertIsNone(historical_context(foreign_binding),
+                              "a foreign owner binding cannot prove this history")
+
+            # A canonical, correctly hashed sibling continuation is a real fork
+            # candidate; it must make the abandoned history ineligible.
+            import route_identity as ROUTE_IDENTITY
+            fork = json.loads(final_path.read_text())
+            current_pin = fork["selection_pins"]["owner"]["harness"]
+            fork["selection_pins"]["owner"]["harness"] = (
+                "opencode" if current_pin != "opencode" else "claude")
+            fork["route_hash"] = ROUTE_IDENTITY.route_hash(fork)
+            fork["route_id"] = ROUTE_IDENTITY.route_id_from_hash(fork["route_hash"])
+            fork_path = ROUTE.canonical_route_path(fixture.artifacts, fork["route_id"])
+            self.assertNotEqual(fork_path, final_path)
+            fork_path.write_text(json.dumps(fork), encoding="utf-8")
+            PRODUCER._ROUTE_EDGES.clear()
+            try:
+                fork_admission = PRODUCER.cycle_route_admission(
+                    fixture.artifacts, historical_record, final_route,
+                    finalize=True, validation_only=True)
+                self.assertEqual(fork_admission.reason,
+                                 "cycle-route-binding-mismatch:lineage-fork")
+                self.assertIsNone(historical_context(), "a forked continuation cannot take the cycle")
+            finally:
+                fork_path.unlink()
+                PRODUCER._ROUTE_EDGES.clear()
+
+            # Missing and contradictory parent-close history both reject the
+            # same real historical consumer; restore exact journal bytes after each probe.
+            predecessor = json.loads(route_bytes[-2][0].read_text())
+            close_ledger = WS.WorkflowLedger(
+                predecessor["route_id"], predecessor["route_hash"], jobs=fixture.jobs)
+            journal_before = close_ledger.journal_path.read_bytes()
+            journal_lines = journal_before.decode("utf-8").splitlines(keepends=True)
+            missing_result_lines = []
+            removed_results = 0
+            for line in journal_lines:
+                entry = json.loads(line)
+                evidence = entry.get("evidence") or {}
+                if isinstance(evidence.get("parent_close_result"), dict):
+                    removed_results += 1
+                else:
+                    missing_result_lines.append(line)
+            self.assertGreater(removed_results, 0)
+            try:
+                close_ledger.journal_path.write_text("".join(missing_result_lines), encoding="utf-8")
+                self.assertIsNone(historical_context(), "missing close result history must fail closed")
+            finally:
+                close_ledger.journal_path.write_bytes(journal_before)
+
+            contradictory_lines = []
+            changed_results = 0
+            for line in journal_lines:
+                entry = json.loads(line)
+                evidence = entry.get("evidence") or {}
+                close_result = evidence.get("parent_close_result")
+                if isinstance(close_result, dict):
+                    close_result["owner_attempt_id"] = fixture.aid("foreign-owner")
+                    changed_results += 1
+                    line = json.dumps(entry, ensure_ascii=False) + "\n"
+                contradictory_lines.append(line)
+            self.assertGreater(changed_results, 0)
+            try:
+                close_ledger.journal_path.write_text("".join(contradictory_lines), encoding="utf-8")
+                self.assertIsNone(historical_context(), "contradictory close result history must fail closed")
+            finally:
+                close_ledger.journal_path.write_bytes(journal_before)
+
+            # The exact owner and children must be quiescent. Exercise both a
+            # live child and an unobservable namespace using real registry rows.
+            jobs_before = fixture.jobs.read_bytes()
+            live_process = fixture.process("historical-live-child")
+            fixture.row(
+                "historical-live-child", parent="historical-final-owner", process=live_process,
+                route_node=review_node["id"], capability="autopilot-spec", capability_mode="update",
+                artifact_root=str(fixture.artifacts), intensity="standard")
+            try:
+                self.assertIsNone(historical_context(), "a live child blocks historical completion")
+            finally:
+                if live_process.poll() is None:
+                    live_process.terminate()
+                    live_process.wait(timeout=5)
+                fixture.jobs.write_bytes(jobs_before)
+
+            jobs_before = fixture.jobs.read_bytes()
+            unknown_child = fixture.terminal_fail_stage(
+                parent="historical-final-owner", name="historical-unknown-child",
+                status="running", foreground=False, cleanup=False)
+            self.assertNotEqual(
+                DC.attempt_process_quiescence(unknown_child, terminal_receipt=True).state,
+                "quiescent")
+            try:
+                self.assertIsNone(historical_context(), "unknown child execution blocks historical completion")
+            finally:
+                fixture.jobs.write_bytes(jobs_before)
+
+            live_review_lease_path.write_bytes(live_review_lease_bytes)
+            try:
+                self.assertIsNone(historical_context(), "a live review lease blocks historical completion")
+            finally:
+                live_review_lease_path.unlink()
+            unknown_lease_path = PRODUCER._review_lease_path(
+                fixture.artifacts, cycle_id, "historical-unknown-review")
+            unknown_lease_path.write_text("{not-json", encoding="utf-8")
+            try:
+                self.assertIsNone(historical_context(), "an unreadable review lease blocks historical completion")
+            finally:
+                unknown_lease_path.unlink()
+
             first = TERMINAL.settle_owner_completion(
                 fixture.jobs, "done", exact_attempt_row(fixture.jobs, final_owner["attempt_id"]).metadata)
             self.assertEqual(first.result, "completed", first)
             self.assertEqual(first.shared_publication["status"], "admitted", first.shared_publication)
-            completed_path = cycle_dir / "manifest.json"
             completed_bytes = completed_path.read_bytes()
             completed = json.loads(completed_bytes)
             self.assertEqual(completed["cycle"]["state"], "completed")

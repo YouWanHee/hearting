@@ -807,7 +807,7 @@ def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
     ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
     prior = settled_result(route, ledger)
     if prior:
-        _finish_existing_cycle(route)
+        _finish_existing_cycle(route, jobs=jobs)
         return prior
     resources = _resources_for_close(value, jobs)
     protected = {(r["kind"], r["run_id"], r.get("registry")): r
@@ -934,17 +934,17 @@ def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
                         "route_hash": route["route_hash"], "actor": "parent-close",
                         "evidence": {"parent_close_result": outcome}})
         WS._atomic_write(target, json.dumps(outcome, indent=2) + "\n")
-    _finish_existing_cycle(route)
+    _finish_existing_cycle(route, jobs=jobs)
     return outcome
 
 
-def _finish_existing_cycle(route):
+def _finish_existing_cycle(route, *, jobs=None):
     # This is ordinary producer closure, never a dependency on retaining its
     # files. Absence/deletion leaves the cancellation result fully replayable.
     import artifact_producer as AP
     root = Path(route["artifact_root"])
     try:
-        if verified_owner_pin_handoff_close(route):
+        if verified_owner_pin_handoff_close(route, jobs=jobs):
             return
         cycle = AP.route_cycle_for(root, route)
         if cycle and cycle.get("state") == "open":
