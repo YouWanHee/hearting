@@ -82,7 +82,7 @@ def _source_states(snapshot):
 def _readiness(snapshot):
     """Derive readiness from required source observations, never generation count."""
     states = _source_states(snapshot)
-    required = ["basic", "required-details", "remote-host"]
+    required = ["basic", "required-details", "resource-runs", "remote-host"]
     required.extend("usage:" + name for name in ("claude", "codex", "opencode"))
     pending = []
     for name in required:
@@ -92,6 +92,8 @@ def _readiness(snapshot):
             complete = state in {"success", "failed", "absent"} and (
                 item.get("attempted") is True or state in {"success", "failed"}
             )
+        elif name == "resource-runs":
+            complete = state in {"ok", "success", "absent"} and item.get("attempted") is True
         elif name.startswith("usage:"):
             complete = state in _OBSERVED_STATES
         else:

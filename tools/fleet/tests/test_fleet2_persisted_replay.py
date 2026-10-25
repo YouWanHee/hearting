@@ -19,7 +19,9 @@ def complete_readiness(at=100.0, generation=3):
         "observed_at": at, "generation": generation,
         "generation_identity": "generation-" + str(generation),
         "sources": {"basic": {"state": "complete", "observed_at": at},
-                    "required-details": {"state": "complete", "observed_at": at}},
+                    "required-details": {"state": "complete", "observed_at": at},
+                    "resource-runs": {"state": "absent", "attempted": True,
+                                      "all_new": True, "observed_at": at}},
     }
 
 

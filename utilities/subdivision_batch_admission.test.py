@@ -595,25 +595,57 @@ class FailedStartClosesUnclaimedRowTest(AdmissionFixture):
         self.assertEqual(self._status(jobs, "att-claimed"), "open")
         self.assertIn(f"note={SUBDIV.BATCH_START_FAILED}", jobs.read_text())
 
-    def test_failed_start_closes_that_slice_and_reports_it(self):
-        admission = StartAdmittedBatchPartialFailureTest._admission(self, 2)
-        closed: list[str] = []
+    def test_raised_starts_return_per_slice_results_and_preserve_claimed_live_row(self):
+        admission = StartAdmittedBatchPartialFailureTest._admission(self, 3)
+        jobs = self.base / "jobs.log"
+        rows_lock = threading.Lock()
+        by_slug = {session["slug"]: session for session in admission.sessions}
+
+        def write_row(session, *, status="open", claimed="0"):
+            line = self._row(session["attempt_id"], claimed).split("\t")
+            line[1] = status
+            with rows_lock:
+                current = jobs.read_text(encoding="utf-8") if jobs.exists() else ""
+                current_rows = [row for row in current.splitlines()
+                                if f"attempt_id={session['attempt_id']}," not in row]
+                jobs.write_text("\n".join([*current_rows, "\t".join(line)]) + "\n",
+                                encoding="utf-8")
 
         def fake_run(cmd, env):
             action = cmd[cmd.index("--action") + 1]
             slug = cmd[cmd.index("--slug") + 1]
-            if action == "start" and slug == "slice-1":
-                return subprocess.CompletedProcess(cmd, 65, "", "start-failed")
-            return subprocess.CompletedProcess(cmd, 0, "ok", "")
+            session = by_slug[slug]
+            if action == "register":
+                write_row(session)
+                return subprocess.CompletedProcess(cmd, 0, "registered", "")
+            if slug == "slice-1":
+                raise OSError(11, "resource temporarily unavailable")
+            if slug == "slice-2":
+                write_row(session, status="running", claimed="1")
+                raise OSError(11, "launch claimed before runner failed")
+            write_row(session, status="running", claimed="1")
+            return subprocess.CompletedProcess(cmd, 0, "started", "")
 
-        results = SUBDIV.start_admitted_batch(
-            admission, parent="owner", jobs=self.base / "jobs.log",
-            governor_reservation_env="AGENT_DISPATCH_GOVERNOR_RESERVATION",
-            run=fake_run, close_unclaimed=lambda jobs, attempt: closed.append(attempt) or 1,
-        )
-        self.assertEqual([row["started"] for row in results], [0, 1])
-        self.assertEqual([row["closed_unclaimed"] for row in results], [1, 0])
-        self.assertEqual(closed, [admission.sessions[0]["attempt_id"]])
+        with mock.patch.object(SUBDIV, "terminal_claim_observation", return_value=None), \
+             mock.patch.object(SUBDIV, "dispatch_command",
+                               side_effect=lambda manifest, session, action, parent, jobs:
+                               ["x", "--action", action, "--slug", session["slug"]]):
+            results = SUBDIV.start_admitted_batch(
+                admission, parent="owner", jobs=jobs,
+                governor_reservation_env="AGENT_DISPATCH_GOVERNOR_RESERVATION",
+                run=fake_run,
+            )
+
+        attempts = [session["attempt_id"] for session in admission.sessions]
+        self.assertEqual([row["subsession_id"] for row in results],
+                         [session["subsession_id"] for session in admission.sessions])
+        self.assertEqual([row["started"] for row in results], [0, 0, 1])
+        self.assertEqual([row["closed_unclaimed"] for row in results], [1, 0, 0])
+        self.assertEqual([row["exit_code"] == 0 for row in results], [False, False, True])
+        self.assertIn("Errno 11", results[0]["stderr"])
+        self.assertEqual(self._status(jobs, attempts[0]), "done")
+        self.assertEqual(self._status(jobs, attempts[1]), "running")
+        self.assertEqual(self._status(jobs, attempts[2]), "running")
 
 
 class ReadSlicesTest(unittest.TestCase):

@@ -850,14 +850,18 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
     # Resources remain a separate source/count, but their exact parent edge feeds
     # the common projection before any group/process/JSON consumer sees the snapshot.
     resource_jobs = []
+    resource_collector = None
+    resource_collection_error = None
     try:
-        from . import resource_runs
-        resource_jobs = resource_runs.collect()
-    except Exception:
-        pass
+        from . import resource_runs as resource_collector
+        resource_jobs = resource_collector.collect()
+    except Exception as exc:
+        resource_collection_error = "%s: %s" % (type(exc).__name__, str(exc)[:160])
     collect_all.last_resource_jobs = resource_jobs
     resource_diagnostics = list(getattr(
-        resource_runs.collect, "last_diagnostics", [])) if "resource_runs" in locals() else []
+        resource_collector.collect, "last_diagnostics", []) or []) if resource_collector is not None else []
+    if resource_collection_error is not None:
+        resource_diagnostics = [{"kind": "resource-collector", "error": resource_collection_error}]
     collect_all.last_resource_diagnostics = resource_diagnostics
 
     # v16: all surfaces receive one projection after evidence collection and association.
@@ -913,6 +917,22 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
     display_snapshot = build_display_snapshot(sessions, jobs, resource_jobs)
     basic_identity = "fleet:%d:%d" % (os.getpid(), _time.time_ns())
     basic_observed_at = _time.time()
+    resource_source_failed = (resource_collection_error is not None or any(
+        not (isinstance(item, dict)
+             and item.get("kind") == "missing-registry"
+             and item.get("reason") == "registered-path-absent"
+             and item.get("blocking") is False)
+        for item in resource_diagnostics
+    ))
+    observations["resource-runs"] = {
+        "state": ("failed" if resource_source_failed else
+                  "ok" if resource_jobs else "absent"),
+        "attempted": True,
+        "all_new": not resource_source_failed,
+        "generation_identity": basic_identity,
+        "observed_at": basic_observed_at,
+        **({"reason": "resource-census-incomplete"} if resource_source_failed else {}),
+    }
     observations["basic"] = {
         "state": "ok" if job_error is None else "failed",
         "generation_identity": basic_identity,

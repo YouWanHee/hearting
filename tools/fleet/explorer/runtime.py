@@ -572,7 +572,7 @@ class ExplorerRuntime:
                 expected_usage = (self._cache_context or {}).get("harness_filter")
                 if expected_usage is None:
                     expected_usage = ("claude", "codex", "opencode")
-                required = ["basic", "required-details"] + [
+                required = ["basic", "required-details", "resource-runs"] + [
                     "usage:" + str(harness) for harness in expected_usage
                 ] + ["remote-host"]
                 incomplete = []
@@ -587,6 +587,9 @@ class ExplorerRuntime:
                         complete = (state in {"ok", "success", "failed", "absent", "unavailable"}
                                     and ((item or {}).get("attempted") is True
                                          or state in {"ok", "success", "failed"}))
+                    elif name == "resource-runs":
+                        complete = (state in {"ok", "success", "absent"}
+                                    and (item or {}).get("attempted") is True)
                     elif name.startswith("usage:"):
                         # The cache-only lookup itself is complete when it returns ok
                         # or unavailable. Pending HTTP refresh is separately represented.

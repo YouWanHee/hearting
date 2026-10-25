@@ -106,6 +106,8 @@ def _child_main(evidence_dir, explorer=False):
                             "observed_at": observed_at, "all_new": True},
             "usage:opencode": {"state": "absent", "attempted": True,
                                "observed_at": observed_at, "all_new": True},
+            "resource-runs": {"state": "absent", "attempted": True,
+                              "observed_at": observed_at, "all_new": True},
             "remote-host": {"state": "absent", "attempted": True,
                             "observed_at": observed_at},
         })

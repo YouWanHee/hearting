@@ -1,4 +1,5 @@
 """Fleet audit P3: failed observations never establish negative facts."""
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from fleet import collectors, details, herdr_projection, projection, render, session_tags
 from fleet.collectors import dispatch, herdr, procscan, resource_runs, usage_cache
-from fleet.model import DispatchJob, Session
+from fleet.model import DispatchJob, ResourceJob, Session
 from fleet.refresh import LiveSnapshot
 
 
@@ -192,6 +193,90 @@ class JobFailures(unittest.TestCase):
         self.assertIn("audit-owner", text)
         self.assertEqual(recovered.jobs, [])
         self.assertEqual(recovered.observations["jobs"]["state"], "idle")
+
+    def test_resource_census_failure_blocks_cache_and_recovers_without_dropping_rows(self):
+        from fleet.explorer.runtime import ExplorerRuntime
+        from fleet.explorer.view_model import ExplorerViewModel
+
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            jobs_path = Path(td) / "jobs.log"
+            for target, result in (
+                ("fleet.collectors.procscan.scan", []),
+                ("fleet.collectors.herdr.list_agents", []),
+                ("fleet.collectors.herdr.enrich", None),
+                ("fleet.collectors.usage_cache.account_usage", {}),
+                ("fleet.projection.attach_projections", None),
+                ("fleet.session_tags.refresh", None),
+                ("fleet.session_tags.assign", []),
+                ("fleet.herdr_projection._report", None),
+                ("fleet.route_chain.enrich", None),
+                ("fleet.collectors.peer_messages.collect", None),
+            ):
+                stack.enter_context(mock.patch(target, return_value=result))
+            dispatch_reader = stack.enter_context(mock.patch.object(dispatch, "collect", return_value=[]))
+            dispatch_reader.last_malformed = 0
+            dispatch_reader.last_route_nodes = {}
+            dispatch_reader.last_degradations = {}
+            dispatch_reader.last_pending_delivery = None
+            resource_reader = stack.enter_context(mock.patch.object(
+                resource_runs, "collect",
+                side_effect=[OSError("first resource read failed"), [],
+                             OSError("resource read temporarily failed"),
+                             [ResourceJob(run_id="resource-recovered", liveness="working")]],
+            ))
+            resource_reader.last_diagnostics = []
+
+            runtime = ExplorerRuntime(Path(td) / "state", strict_readiness=True)
+            runtime.configure_persistence({"codex"}, strict_readiness=True)
+            vm = ExplorerViewModel.from_mapping({"identity": "resource-test", "clock": 100.0})
+
+            def observe(generation):
+                snapshot = collectors.collect_all(
+                    harness_filter={"codex"}, jobs_path=str(jobs_path), fast_first=True)
+                identity = snapshot.observations["basic"]["generation_identity"]
+                snapshot.observations.update({
+                    "required-details": {"state": "ok", "generation_identity": identity,
+                                          "all_new": True},
+                    "usage:codex": {"state": "absent", "attempted": True, "all_new": True},
+                    "remote-host": {"state": "absent", "attempted": True},
+                })
+                _model, readiness = runtime.prepare(
+                    snapshot, None, vm=vm, generation=generation, now=100.0 + generation)
+                return snapshot, readiness
+
+            failed, failed_readiness = observe(1)
+            self.assertEqual(failed.observations["resource-runs"]["state"], "failed")
+            self.assertTrue(failed.observations["resource-runs"]["attempted"])
+            self.assertFalse(failed_readiness["ready"])
+            self.assertFalse(failed_readiness["all_new"])
+            self.assertIn("resource-runs", failed_readiness["pending"])
+            self.assertIsNone(runtime.persist_complete_async(vm, failed_readiness))
+            self.assertFalse(runtime.cache_path.exists())
+
+            empty, empty_readiness = observe(2)
+            self.assertEqual(empty.observations["resource-runs"]["state"], "absent")
+            self.assertTrue(empty_readiness["ready"])
+            empty_write = runtime.persist_complete_async(vm, empty_readiness)
+            self.assertIsNotNone(empty_write)
+            empty_write.join(2)
+            previous_cache = runtime.cache_path.read_bytes()
+
+            failed_again, failed_again_readiness = observe(3)
+            self.assertEqual(failed_again.observations["resource-runs"]["state"], "failed")
+            self.assertFalse(failed_again_readiness["ready"])
+            self.assertIsNone(runtime.persist_complete_async(vm, failed_again_readiness))
+            self.assertEqual(runtime.cache_path.read_bytes(), previous_cache)
+            self.assertIsNotNone(runtime.load_last_complete({"codex"}))
+
+            recovered, recovered_readiness = observe(4)
+            self.assertEqual(recovered.observations["resource-runs"]["state"], "ok")
+            self.assertTrue(recovered_readiness["ready"])
+            self.assertTrue(recovered_readiness["all_new"])
+            self.assertEqual([row.run_id for row in recovered.resources], ["resource-recovered"])
+            recovered_write = runtime.persist_complete_async(vm, recovered_readiness)
+            self.assertIsNotNone(recovered_write)
+            recovered_write.join(2)
+            self.assertNotEqual(runtime.cache_path.read_bytes(), previous_cache)
 
 
 class PaneMetadata(unittest.TestCase):

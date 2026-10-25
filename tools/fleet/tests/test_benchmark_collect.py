@@ -45,6 +45,7 @@ class BenchmarkCollectTest(unittest.TestCase):
             observations = {
                 "basic": {"state": "complete", "all_new": True},
                 "required-details": {"state": "pending"},
+                "resource-runs": {"state": "absent", "attempted": True, "all_new": True},
                 "remote-host": {"state": "success", "attempted": True},
                 "usage:claude": {"state": "complete"},
                 "usage:codex": {"state": "complete"},

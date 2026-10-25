@@ -45,6 +45,7 @@ class InitialReadinessTests(unittest.TestCase):
                 "basic": {"state": "complete", "observed_at": 10,
                           "generation_identity": "g-1"},
                 "required-details": {"state": "pending"},
+                "resource-runs": {"state": "absent", "attempted": True, "all_new": True},
                 "usage:codex": {"state": "complete", "observed_at": 10},
                 "remote-host": {"state": "pending", "attempted": False},
             }
@@ -81,7 +82,7 @@ class InitialReadinessTests(unittest.TestCase):
         self.assertFalse(readiness["ready"])
         self.assertEqual(set(readiness["pending"]),
                          {"basic", "required-details", "usage:claude", "usage:codex",
-                          "usage:opencode", "remote-host"})
+                          "usage:opencode", "resource-runs", "remote-host"})
 
 
 class DetailCallbackSelection(unittest.TestCase):

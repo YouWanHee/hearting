@@ -458,11 +458,22 @@ def start_admitted_batch(
     persist_chain_manifest(Path(jobs), admission.manifest)
     def start_one(pair):
         session, token = pair
-        env = os.environ.copy()
-        env[governor_reservation_env] = token
-        # Slices share one worktree: `git status` must not take index.lock.
-        env["GIT_OPTIONAL_LOCKS"] = "0"
-        start = runner(dispatch_command(admission.manifest, session, "start", parent, jobs), env)
+        cmd = []
+        try:
+            env = os.environ.copy()
+            env[governor_reservation_env] = token
+            # Slices share one worktree: `git status` must not take index.lock.
+            env["GIT_OPTIONAL_LOCKS"] = "0"
+            cmd = dispatch_command(admission.manifest, session, "start", parent, jobs)
+            start = runner(cmd, env)
+        except Exception as exc:
+            # A spawn failure is this slice's failed start, not a reason to
+            # abandon results from siblings that have already launched.
+            code = getattr(exc, "errno", None)
+            start = subprocess.CompletedProcess(
+                cmd, code if isinstance(code, int) and code else 1,
+                "", "%s: %s" % (type(exc).__name__, str(exc)[:240]),
+            )
         return session, start
 
     with ThreadPoolExecutor(max_workers=max(1, len(admission.sessions)),

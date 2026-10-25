@@ -62,6 +62,7 @@ class BenchmarkNavigationReadinessTest(unittest.TestCase):
                     "basic": {"state": "complete", "all_new": True},
                     "required-details": {"state": detail, "all_new": all_new,
                                          "continuation_validated": detail == "continued"},
+                    "resource-runs": {"state": "absent", "attempted": True, "all_new": True},
                 }}
 
     def test_generation_with_pending_required_detail_is_not_fresh(self):
