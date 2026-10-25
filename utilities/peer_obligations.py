@@ -958,10 +958,53 @@ def retain_registered_notice(jobs, record):
     return True
 
 
+def _delivery_peer_module():
+    spec = importlib.util.spec_from_file_location(
+        "_peer_obligations_session_notice", Path(__file__).with_name("peer-message.py"))
+    module = sys.modules.get(spec.name)
+    if module is None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+def _exact_delivery_receipt(message):
+    """Reuse the receiver's existing immutable-transfer/native-history proof."""
+    try:
+        return _delivery_peer_module()._validated_pending_receiver_proof(message) is not None
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return False
+
+
+def _delivery_record_for_body(message, record, storage, *, original_body=None):
+    """Carry only an identity bound by the verified original wire body."""
+    import dispatch_pending_delivery as pending
+    from dispatch_recipient_receipt import IDENTITY_KEY, identity_binding, OPENCODE_MARKER_LINE_RE
+    try:
+        body = original_body if original_body is not None else message.get("text")
+        if message.get("body_ref") and original_body is None:
+            body = _delivery_peer_module().read_peer_payload(message["ref"])["body"]
+        source = body.rstrip("\n") if isinstance(body, str) and message.get("body_ref") else body
+        digest = message.get("source_sha256") if message.get("body_ref") else message.get("body_sha256")
+        if (not isinstance(source, str)
+                or hashlib.sha256(source.encode("utf-8")).hexdigest() != digest):
+            return None
+        identity = pending.received_ack_identity(record, storage, record["delivery_id"])
+        if (record["delivery_id"], identity_binding(identity)) not in set(
+                OPENCODE_MARKER_LINE_RE.findall(body)):
+            return None
+        return {**record, IDENTITY_KEY: identity}
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+
+
 def _registered_delivery_bindings(message, roots=None, *, received_only=False,
-                                  require_current_recipient=True, read_context=None):
+                                  require_current_recipient=True, read_context=None,
+                                  original_body=None):
     if (received_only and (message.get("state") != "received"
-            or message.get("receipt") not in {"exact-peer-ref", "exact-native-history"})):
+            or message.get("receipt") not in {"exact-peer-ref", "exact-native-history"}
+            or not _exact_delivery_receipt(message))):
         return
     if message.get("state") not in {"pending", "queued", "unverified", "received"}:
         return
@@ -980,7 +1023,7 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False,
                 {**member, "dispatch_notice": binding}, roots,
                 received_only=received_only,
                 require_current_recipient=require_current_recipient,
-                read_context=read_context)
+                read_context=read_context, original_body=original_body)
         return
     binding = message.get("dispatch_notice") or {}
     expected_binding = {"duty_id", "jobs", "attempt_id", "carrier", "recipient_sid",
@@ -1087,26 +1130,24 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False,
                 or (record.get("row_revisions") or {}).get(row.attempt_id)
                     != row.metadata.get("delivery_row_revision"))):
             return
-        identity = pending.received_ack_identity(record, storage, delivery_id)
+        record = _delivery_record_for_body(message, record, storage, original_body=original_body)
+        if record is None:
+            return
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return
     yield store, duty, row, record, root, storage, delivery_id
 
 
-def _session_notice_delivery_bindings(message, roots=None, *, received_only=False):
+def _session_notice_delivery_bindings(message, roots=None, *, received_only=False,
+                                    original_body=None):
     if (received_only and (message.get("state") != "received"
-            or message.get("receipt") not in {"exact-peer-ref", "exact-native-history"})):
+            or message.get("receipt") not in {"exact-peer-ref", "exact-native-history"}
+            or not _exact_delivery_receipt(message))):
         return
     binding = message.get("producer_binding") or {}
     sender = message.get("from") or {}
     recipient = message.get("to") or {}
-    spec = importlib.util.spec_from_file_location(
-        "_peer_obligations_session_notice", Path(__file__).with_name("peer-message.py"))
-    module = sys.modules.get(spec.name)
-    if module is None:
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+    module = _delivery_peer_module()
     if not module._valid_session_notice_producer_binding(
             binding, sender, recipient, message.get("refs")):
         return
@@ -1127,7 +1168,10 @@ def _session_notice_delivery_bindings(message, roots=None, *, received_only=Fals
             identity = intent.get("identity") or {}
             storage, delivery_id = item["storage_sid"], item["delivery_id"]
             import dispatch_pending_delivery as pending
-            record = pending.read(root, storage, delivery_id)
+            try:
+                record = pending.read(root, storage, delivery_id)
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                continue
             expected_identity = {"state_root": str(root), "storage_sid": storage,
                                  "harness": recipient.get("harness"),
                                  "delivery_id": delivery_id,
@@ -1138,12 +1182,15 @@ def _session_notice_delivery_bindings(message, roots=None, *, received_only=Fals
                     or record.get("recipient_kind") != carrier
                     or record.get("recipient_digest") != pending.recipient_digest(storage)
                     or record.get("delivery_id") != delivery_id):
-                return
+                continue
             try:
                 import session_notice
                 session_notice.validate_pending_record(record)
             except (ImportError, ValueError, TypeError, KeyError):
-                return
+                continue
+            record = _delivery_record_for_body(message, record, storage, original_body=original_body)
+            if record is None:
+                continue
             yield store, duty, record, root, storage, delivery_id
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return
@@ -1167,14 +1214,16 @@ def _current_session_notice_bindings(message):
 
 def session_notice_delivery_current(message):
     """Recheck a prepared notice immediately before its existing transport's first write."""
-    return bool(_current_session_notice_bindings(message))
+    matches = _current_session_notice_bindings(message)
+    return bool(matches) and _retained_submission_current(message, [
+        (record, root, storage, "retained-rewake:" + duty["id"], None)
+        for _store, duty, record, root, storage, _delivery_id in matches])
 
 
 def registered_submission_current(message, *, original_body=None):
     """Authorize every retained output member after all binding/native reads."""
-    import dispatch_pending_delivery as pending
-    from dispatch_recipient_receipt import claimed_send_current, binding_digest, OPENCODE_MARKER_LINE_RE
-    from dispatch_seat_handover import record_recipient_binding
+    if (message.get("producer_binding") or {}).get("schema") == "session-notice-runtime-v1":
+        return session_notice_delivery_current(message)
     declared = message.get("dispatch_notices")
     if declared is None:
         declared = [message["dispatch_notice"]] if message.get("dispatch_notice") else []
@@ -1182,61 +1231,61 @@ def registered_submission_current(message, *, original_body=None):
         # Runtime producers must acquire their exact dispatch bindings before
         # the first write. Ordinary peer transfers have no registered duty.
         return (message.get("producer_binding") or {}).get("schema") != "registered-runtime-completion-v1"
-    matches = list(_registered_delivery_bindings(message))
-    recipient = message.get("to") or {}
+    matches = list(_registered_delivery_bindings(message, original_body=original_body))
     if len(matches) != len(declared):
         return False
-    # The immutable wire body already carries every original delivery identity.
-    # A later read must not silently adopt a replacement record as that body.
-    body = original_body if original_body is not None else message.get("text")
-    source = body.rstrip("\n") if isinstance(body, str) and message.get("body_ref") else body
-    expected_digest = message.get("source_sha256") if message.get("body_ref") else message.get("body_sha256")
-    if (not isinstance(source, str)
-            or hashlib.sha256(source.encode("utf-8")).hexdigest() != expected_digest):
-        return False
-    markers = set(OPENCODE_MARKER_LINE_RE.findall(body)) if isinstance(body, str) else set()
-    if any((delivery_id, binding_digest(record, storage)) not in markers
-           for _store, _duty, _row, record, _root, storage, delivery_id in matches):
-        return False
     owners = {item["delivery_id"]: item["claim_owner"] for item in declared}
+    return _retained_submission_current(message, [
+        (record, root, storage, owners[delivery_id], Path(duty["intent"]["identity"]["jobs"]))
+        for _store, duty, _row, record, root, storage, delivery_id in matches])
+
+
+def _retained_submission_current(message, members):
+    """Use the same original-identity, renewal and final claim boundary for both producers."""
+    import dispatch_pending_delivery as pending
+    from dispatch_recipient_receipt import claimed_send_current, IDENTITY_KEY
+    from dispatch_seat_handover import record_recipient_binding
+    recipient = message.get("to") or {}
     # A deferred immutable peer transfer has never entered native I/O. Older
     # retained producers stamped its underlying record sent-ambiguous already
     # at preparation. Only this still-pending exact transfer may finish that
     # first write; queued/unverified transfers keep their no-resend path.
     hook_context_recovery = (message.get("state") == "queued"
         and message.get("receipt") == "hook-context-emitted"
-        and recipient.get("harness") == "claude")
+        and recipient.get("harness") == "claude"
+        and (message.get("producer_binding") or {}).get("schema") != "session-notice-runtime-v1")
     if message.get("state") != "pending" and not hook_context_recovery:
         return False
-    for _store, duty, _row, record, root, storage, delivery_id in matches:
-        jobs = Path(duty["intent"]["identity"]["jobs"])
+    for record, root, storage, owner, jobs in members:
+        delivery_id = record["delivery_id"]
         if (record_recipient_binding(record, storage, harness=recipient.get("harness"), jobs=jobs)
                 != (recipient.get("harness"), recipient.get("session_id"))
-                or record.get("claim_owner") != owners[delivery_id]):
+                or record.get("claim_owner") != owner):
             return False
         deadline = record.get("claim_deadline_ns")
         if (record.get("state") in {"claimed", "sent-ambiguous"}
                 and type(deadline) is int and deadline <= time.monotonic_ns()):
             try:
                 pending.renew_unsubmitted_claim(root, storage, delivery_id,
-                    claim_owner=owners[delivery_id], target_session=recipient["session_id"],
-                    expected_identity=pending.received_ack_identity(record, storage, delivery_id),
+                    claim_owner=owner, target_session=recipient["session_id"],
+                    expected_identity=record[IDENTITY_KEY],
                     lease_seconds=30)
             except (OSError, ValueError, RuntimeError):
                 return False
-    return all(claimed_send_current(root, storage, record, owners[delivery_id],
-        recipient.get("harness"), recipient.get("session_id"), jobs=Path(
-            (duty.get("intent") or {})["identity"]["jobs"]),
+    return all(claimed_send_current(root, storage, record, owner,
+        recipient.get("harness"), recipient.get("session_id"), jobs=jobs,
         claim_states=("claimed", "sent-ambiguous"))
-        for _store, duty, _row, record, root, storage, delivery_id in matches)
+        for record, root, storage, owner, jobs in members)
 
 
 def session_notice_submission_current(message):
     """A new transfer additionally requires the existing courier's current claim."""
+    from dispatch_recipient_receipt import claimed_send_current
     matches = _current_session_notice_bindings(message)
-    return bool(matches) and all(record.get("state") == "claimed"
-               and record.get("claim_owner") == "retained-rewake:" + duty["id"]
-               for _store, duty, record, _root, storage, _delivery in matches)
+    recipient = message.get("to") or {}
+    return bool(matches) and all(claimed_send_current(root, storage, record,
+               "retained-rewake:" + duty["id"], recipient.get("harness"), recipient.get("session_id"))
+               for _store, duty, record, root, storage, _delivery in matches)
 
 
 def registered_delivery_settled(message, *, roots=None, read_context=None):
@@ -1272,7 +1321,7 @@ def received_registered_ack(jobs, record, recipient_sid) -> bool:
         if not message or (message.get("to") or {}).get("session_id") != recipient_sid:
             return False
         for _store, _duty, _row, exact, _root, storage, delivery_id in _registered_delivery_bindings(
-                message, roots=[root], received_only=True):
+                message, roots=[root], received_only=True, require_current_recipient=False):
             if pending.received_ack_identity(exact, storage, delivery_id) == pending.received_ack_identity(
                     record, storage, delivery_id):
                 return True
@@ -1293,12 +1342,13 @@ def acknowledge_registered_delivery(message, *, roots=None):
     import dispatch_pending_delivery as pending
     matched = False
     for store, duty, row, record, root, storage, delivery_id in _registered_delivery_bindings(
-            message, roots, received_only=True):
+            message, roots, received_only=True, require_current_recipient=False):
         matched = True
         settled = record
         if record["state"] in pending.OPEN_STATES:
             try:
-                identity = pending.received_ack_identity(record, storage, delivery_id)
+                from dispatch_recipient_receipt import IDENTITY_KEY
+                identity = record[IDENTITY_KEY]
                 settled = pending.ack_received(root, storage, delivery_id,
                     expected_identity=identity, acked_by="peer-received:" + message["ref"])
             except (OSError, ValueError, RuntimeError):
@@ -1327,7 +1377,8 @@ def acknowledge_session_notice_delivery(message, *, roots=None):
         matched = True
         if record.get("state") in pending.OPEN_STATES:
             try:
-                identity = pending.received_ack_identity(record, storage, delivery_id)
+                from dispatch_recipient_receipt import IDENTITY_KEY
+                identity = record[IDENTITY_KEY]
                 record = pending.ack_received(root, storage, delivery_id,
                     expected_identity=identity, acked_by="peer-received:" + message["ref"])
             except (OSError, ValueError, RuntimeError):

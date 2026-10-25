@@ -383,7 +383,8 @@ def _prepare_peer_message(body, sender, recipient, *, include_trailer=True,
             and producer_binding.get("schema") == _SESSION_NOTICE_PRODUCER_SCHEMA):
         from peer_obligations import session_notice_submission_current
         if not session_notice_submission_current({"producer_binding": producer_binding,
-                "from": sender, "to": recipient, "refs": list(refs)}):
+                "from": sender, "to": recipient, "refs": list(refs), "text": body,
+                "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()}):
             raise ValueError("peer-notice-recipient-changed")
     if sender.get("harness") == "runtime" and producer_binding is None:
         raise ValueError("peer-runtime-producer-binding-required")
@@ -1489,10 +1490,6 @@ def begin_pending_write(row, *, recipient=None, receipt=None, claimant=None):
                     and not _pending_target_matches(current, recipient))
                 or _registered_delivery_settled(current)):
             return None
-        if (current.get("producer_binding") or {}).get("schema") == _SESSION_NOTICE_PRODUCER_SCHEMA:
-            from peer_obligations import session_notice_delivery_current
-            if not session_notice_delivery_current(current):
-                return None
         if not _registered_submission_current(current):
             return None
         updated = dict(current, state="unverified", receipt=receipt or claim.get("receipt")
@@ -1612,10 +1609,6 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             current = _read_pending(ref)
             if not current or current["state"] == "received" or (current.get("rpc_claim") or {}).get("token") != token:
                 raise QueueDeliveryError("peer-claim-changed-before-add")
-            if (current.get("producer_binding") or {}).get("schema") == _SESSION_NOTICE_PRODUCER_SCHEMA:
-                from peer_obligations import session_notice_delivery_current
-                if not session_notice_delivery_current(current):
-                    raise QueueDeliveryError("peer-notice-recipient-changed-before-add")
             if not _registered_submission_current(current):
                 raise QueueDeliveryError("peer-dispatch-recipient-changed-before-add")
             _save_pending(dict(current, state="unverified", receipt="native-queue-inflight"))
@@ -1662,7 +1655,7 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             if rc:
                 _save_pending(dict(current, rpc_claim=None))
                 return {"status": "unverified", "reason": "peer-receive-ledger-unavailable"}
-            received = dict(current, state="received", text=None, rpc_claim=None,
+            received = dict(current, state="received", text=_received_delivery_text(current), rpc_claim=None,
                             receipt="exact-native-history",
                             actual_message_id=native_message_id,
                             exact_receiver_receipt=proof)
@@ -2328,6 +2321,17 @@ def acknowledge_message_obligations(received, *, pending_lock_held=False):
         return False
 
 
+def _received_delivery_text(row, original_text=None):
+    """Retain the existing original body while an exact delivery ACK may need retrying."""
+    if (row.get("dispatch_notice") or row.get("dispatch_notices")
+            or (row.get("producer_binding") or {}).get("schema") == _SESSION_NOTICE_PRODUCER_SCHEMA):
+        text = row.get("text") or original_text
+        if (isinstance(text, str)
+                and hashlib.sha256(text.encode("utf-8")).hexdigest() == row.get("body_sha256")):
+            return text
+    return None
+
+
 def _ack_registered_delivery(received, *, message_obligation=True):
     registered = False
     try:
@@ -2809,7 +2813,7 @@ def receive_peer_message(text, recipient, project="", *, summary_text=""):
                 return rc
         received_at = proof["received_at"]
         if pending:
-            received = dict(pending, state="received", text=None, rpc_claim=None,
+            received = dict(pending, state="received", text=_received_delivery_text(pending, text), rpc_claim=None,
                             receipt="exact-peer-ref", received_at=received_at,
                             exact_receiver_receipt=proof)
             _save_pending(received)
@@ -3104,7 +3108,7 @@ def cmd_pending(args):
                     producer_binding=row.get("producer_binding")))
                 if rc:
                     return rc
-            received = dict(row, state="received", text=None, rpc_claim=None,
+            received = dict(row, state="received", text=_received_delivery_text(row), rpc_claim=None,
                             receipt="exact-native-history", received_at=time.time(),
                             actual_message_id=message_id,
                             exact_receiver_receipt=proof)

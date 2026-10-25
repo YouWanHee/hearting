@@ -7156,12 +7156,13 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
         if transferred and peer_obligations.registered_delivery_settled(
                 transferred, roots=[jobs.parent], read_context=read_context):
             transferred = None
-        elif transferred and transferred.get("state") == "received" and bound_received:
+        elif transferred and transferred.get("state") == "received":
             # The exact recipient receipt is durable even when this ACK write
             # failed. Keep the existing duty/ref for the next natural retry;
             # preparing another transfer would duplicate a known receipt.
             store.update(duty["id"], observation={**observation,
-                "reason": "received-delivery-ack-pending"})
+                "reason": ("received-delivery-ack-pending" if bound_received else
+                           "received-delivery-identity-unresolved")})
             return
     parent = [row.metadata.get(key, "") for key in
               ("parent_runtime_pid", "parent_runtime_pid_start", "parent_runtime_ns")]
@@ -7498,7 +7499,9 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
         if prepared or code in {0, 3}:
             for member in transfer_members:
                 pending.mark_sent_ambiguous(jobs.parent, storage_recipient,
-                    member["delivery_id"], claim_owner=claim_owner)
+                    member["delivery_id"], claim_owner=claim_owner,
+                    expected_identity=pending.received_ack_identity(
+                        member["record"], storage_recipient, member["delivery_id"]))
                 store.update(member["duty_id"], state="pending",
                              delivery="peer-courier", cleanup="pending")
         else:
@@ -8231,6 +8234,7 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
     from dispatch_notice_state import keep_claim
     from dispatch_seat_handover import record_recipient
     from dispatch_session_sweep import STORAGE_KEY, IDENTITY_KEY, delivery_context
+    from dispatch_recipient_receipt import claimed_send_current, release_unsubmitted_claim
     import session_notice
 
     root = store.root.parent.parent.resolve()
@@ -8298,6 +8302,7 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
     harness, recipient_sid = group_key
     batch = groups[group_key][:8]
     pending_transfers = []
+    retargeted = {}
     for item in batch:
         obs = item[0].get("observation") or {}
         ref = obs.get("transfer_ref")
@@ -8310,7 +8315,20 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
             if message and message.get("state") in {"queued", "unverified"}:
                 return
             if message and message.get("state") == "pending":
-                pending_transfers.append(message)
+                target = message.get("to") or {}
+                if ((target.get("harness"), target.get("session_id")) == (harness, recipient_sid)
+                        and peer_obligations._current_session_notice_bindings(message)):
+                    pending_transfers.append(message)
+                else:
+                    # An exact unsent transfer for an earlier holder stays
+                    # immutable. Its original identity can recover at today's
+                    # holder after the existing same-owner lease expires.
+                    originals = list(peer_obligations._session_notice_delivery_bindings(message, roots=[root]))
+                    if (not originals or len(originals) != len(
+                            (message.get("producer_binding") or {}).get("records") or ())):
+                        return
+                    for _store, _duty, record, _root, storage, delivery_id in originals:
+                        retargeted[(storage, delivery_id)] = (ref, record)
             elif not message:
                 # An unavailable prepared transfer is not proof of no send.
                 return
@@ -8358,25 +8376,53 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
                     or record_recipient(fresh, storage_sid, harness=item_harness,
                                         read_context=None) != item_sid
                     or _resolve_target(pane)[:2] != (harness, recipient_sid)):
+                if (storage_sid, original["delivery_id"]) in retargeted:
+                    return
                 continue
             owner = "retained-rewake:" + item_duty["id"]
+            prior = retargeted.get((storage_sid, fresh["delivery_id"]))
             try:
-                if pending.read_submission_fence(root, storage_sid, fresh["delivery_id"],
-                        expected_identity=pending.submission_fence_identity(fresh, item_sid)) is not None:
-                    continue
-                # Recover only an expired reservation that never reached a
-                # transport. Prepared/accepted work and queue fences above
-                # retain their existing receipt/no-resend responsibility.
-                if fresh.get("state") == "claimed":
-                    deadline = fresh.get("claim_deadline_ns")
-                    if (not isinstance(deadline, int) or isinstance(deadline, bool)
-                            or time.monotonic_ns() < deadline):
+                with peer_message.pending_lock(prior[0]) if prior else contextlib.nullcontext():
+                    if prior:
+                        transfer = peer_message._read_pending(prior[0], roots=[root], state_root=root)
+                        if transfer and transfer.get("state") == "received":
+                            peer_obligations.acknowledge_session_notice_delivery(transfer, roots=[root])
+                            return
+                        if not transfer or transfer.get("state") != "pending":
+                            return
+                        originals = list(peer_obligations._session_notice_delivery_bindings(transfer, roots=[root]))
+                        if len(originals) != len(transfer["producer_binding"]["records"]):
+                            return
+                        fresh = pending.read(root, storage_sid, original["delivery_id"])
+                        if (not fresh or (fresh.get("claim_owner") != owner
+                                and not (fresh.get("state") == "pending" and fresh.get("claim_owner") is None))
+                                or pending.received_ack_identity(fresh, storage_sid, fresh["delivery_id"])
+                                   != prior[1][IDENTITY_KEY]):
+                            return
+                    if pending.read_submission_fence(root, storage_sid, fresh["delivery_id"],
+                            expected_identity=pending.submission_fence_identity(fresh, item_sid)) is not None:
+                        if prior:
+                            return
                         continue
-                    fresh = pending.reclaim(root, storage_sid, fresh["delivery_id"],
-                                            now_ns=time.monotonic_ns())
-                claim = pending.claim(root, storage_sid, fresh["delivery_id"], claim_owner=owner,
-                    lease_seconds=30, require_generation_proof=False, jobs=jobs,
-                    retry_context=f"{harness}:{recipient_sid}:{pane}:{item_duty['id']}")
+                    # Only a verified still-pending transfer explains a legacy
+                    # sent-ambiguous preparation; native ambiguity stays held.
+                    if fresh.get("state") == "claimed" or prior and fresh.get("state") == "sent-ambiguous":
+                        deadline = fresh.get("claim_deadline_ns")
+                        if type(deadline) is not int or time.monotonic_ns() < deadline:
+                            if prior:
+                                return
+                            continue
+                        fresh = pending.reclaim(root, storage_sid, fresh["delivery_id"],
+                                                now_ns=time.monotonic_ns())
+                    claim = pending.claim(root, storage_sid, fresh["delivery_id"], claim_owner=owner,
+                        lease_seconds=30, require_generation_proof=False, jobs=jobs,
+                        retry_context=f"{harness}:{recipient_sid}:{pane}:{item_duty['id']}")
+                    original_identity = (prior[1][IDENTITY_KEY] if prior else
+                        pending.received_ack_identity(original, storage_sid, original["delivery_id"]))
+                    if pending.received_ack_identity(claim, storage_sid, fresh["delivery_id"]) != original_identity:
+                        release_unsubmitted_claim(root, storage_sid,
+                            {**original, IDENTITY_KEY: original_identity}, owner, item_sid)
+                        return
                 if not keep_claim(root, storage_sid, fresh["delivery_id"], claim, owner, jobs=jobs):
                     continue
                 stored = dict(claim)
@@ -8387,6 +8433,8 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
                     "delivery_id": fresh["delivery_id"], "receipt_digest": fresh["receipt_digest"]})
                 refs.extend((item_duty["id"], fresh["delivery_id"]))
             except (OSError, ValueError, RuntimeError):
+                if prior:
+                    return
                 continue
         if not claimed:
             return
@@ -8412,14 +8460,7 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
             args = build_parser().parse_args(["prompt", pane, "--body-file", body_file.name,
                                                *ref_args])
             for _duty, storage_sid, delivery_id, owner, stored, _view in claimed:
-                fresh = pending.read(root, storage_sid, delivery_id)
-                if (not fresh or fresh.get("state") != "claimed"
-                        or fresh.get("claim_owner") != owner
-                        or pending.read_submission_fence(root, storage_sid, delivery_id,
-                            expected_identity=pending.submission_fence_identity(fresh, recipient_sid)) is not None
-                        or pending.received_ack_identity(fresh, storage_sid, delivery_id)
-                           != pending.received_ack_identity(stored, storage_sid, delivery_id)
-                        or record_recipient(fresh, storage_sid, harness=harness) != recipient_sid
+                if (not claimed_send_current(root, storage_sid, stored, owner, harness, recipient_sid)
                         or _resolve_target(pane)[:2] != (harness, recipient_sid)):
                     return
             code = cmd_prompt(args, expected_recipient=(harness, recipient_sid),
@@ -8427,16 +8468,17 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
             submitted = code in {0, 3}
     finally:
         globals()["_HERDR_SESSION"] = old_server
-        for item_duty, storage_sid, delivery_id, owner, *_ in claimed:
+        for item_duty, storage_sid, delivery_id, owner, stored, _view in claimed:
             try:
                 current = pending.read(root, storage_sid, delivery_id)
                 if current and current.get("state") == "acked":
                     continue
                 if prepared or submitted:
-                    pending.mark_sent_ambiguous(root, storage_sid, delivery_id, claim_owner=owner)
+                    pending.mark_sent_ambiguous(root, storage_sid, delivery_id, claim_owner=owner,
+                        expected_identity=pending.received_ack_identity(stored, storage_sid, delivery_id))
                     store.update(item_duty["id"], state="pending", delivery="peer-courier", cleanup="pending")
                 else:
-                    pending.release_claim(root, storage_sid, delivery_id, claim_owner=owner)
+                    release_unsubmitted_claim(root, storage_sid, stored, owner, recipient_sid)
             except (OSError, ValueError, RuntimeError):
                 pass  # The original lease and prepared transfer remain recoverable.
 

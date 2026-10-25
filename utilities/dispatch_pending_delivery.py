@@ -1336,7 +1336,8 @@ def _member_batch_snapshot(batch: dict | None, record: dict) -> dict | None:
 
 
 def mark_sent_ambiguous(
-    root: Path, recipient_key: str, delivery_id: str, *, claim_owner: str
+    root: Path, recipient_key: str, delivery_id: str, *, claim_owner: str,
+    expected_identity: dict | None = None,
 ) -> dict:
     """``claimed -> sent-ambiguous`` after a token-less emit (no ``acked``
     transition follows on that surface -- the carrier simply stops here)."""
@@ -1346,6 +1347,9 @@ def mark_sent_ambiguous(
         value = _read_unlocked(path)
         if value is None:
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
+        if (expected_identity is not None
+                and received_ack_identity(value, recipient_key, delivery_id) != expected_identity):
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "send-identity-changed")
         if value["state"] != "claimed" or value["claim_owner"] != claim_owner:
             raise PendingDeliveryError(
                 "pending-delivery-claim-refused", f"state={value['state']}"

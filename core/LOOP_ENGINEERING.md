@@ -35,7 +35,10 @@ For durable completion delivery, an exact native receipt remains valid after
 the transport claim expires or changes owner. All carriers reuse that receipt
 through the delivery's existing immutable identity and `ack_received` CAS; an
 ACK write failure leaves the verified receipt usable for suppressing another
-send while settlement is retried naturally. Output, process exit, queue
+send while settlement is retried naturally. The original body's receipt markers
+bind that identity for first writes and receipt retries, including retained
+notices; a replacement row remains a different identity even with the same
+receipt digest. Output, process exit, queue
 acceptance, or an incomplete native-history read is not receipt evidence.
 Receiving a notice settles delivery only: it does not complete the work or its
 follow-up. When native receipt evidence is absent or unknown, emission remains

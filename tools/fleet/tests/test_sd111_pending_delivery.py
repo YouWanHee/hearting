@@ -63,6 +63,9 @@ def _record(**overrides):
         row_revisions={"att-0000000000000000000000000000bbbb": "deadbeef"},
     )
     base.update(overrides)
+    if base["root"] is not None and "receipt" not in overrides:
+        base["receipt"] = {**receipt, "job_registry": str(Path(base["root"]) / "jobs.log")}
+        base["receipt_digest"] = pending_delivery._canonical_receipt_digest(base["receipt"])
     return base
 
 
@@ -222,7 +225,7 @@ class PendingDeliveryCountsTest(unittest.TestCase):
                 "native_sid_complete": True,
                 "live": set(live),
             }
-        def resolve_recipient(_record, key, *, harness, read_context=None):
+        def resolve_recipient(_record, key, *, harness, jobs=None, read_context=None):
             sid = (recipient_by_storage or {}).get(key, recipient_sid)
             return (harness, sid) if sid is not None else None
 
@@ -459,6 +462,105 @@ class PendingDeliveryCountsTest(unittest.TestCase):
             self.state_root, "dead-A", dead["delivery_id"])["state"], "pending")
         self.assertEqual(pending_delivery.read(
             self.state_root, "expired-A", expired["delivery_id"])["state"], "expired")
+
+    def _registered_registry_fixture(self, root, filename, suffix, *, target="claude", same_sid=False):
+        import dispatch_seat_handover as handover
+        import session_tidy as tidy
+        from route_identity import route_hash
+        root.mkdir(parents=True, exist_ok=True)
+        jobs = root / filename
+        sid, aid, did = "storage-" + suffix, "att-registry-" + suffix, "delivery-registry-" + suffix
+        holder = sid if same_sid else "holder-" + suffix
+        route = {"route_id": "rt-registry-" + suffix, "parent_cycle_id": "cycle-" + suffix,
+                 "nodes": [{"id": "frame"}]}
+        route["route_hash"] = route_hash(route)
+        route_path = root / "route.json"; route_path.write_text(json.dumps(route))
+        receipt = {"schema_version": 2, "state": "ready", "parent_attempt_id": "att-parent",
+            "job_registry": str(jobs), "delivery_classification": "success", "children": [{
+                "attempt_id": aid, "status": "done", "readiness": "ready", "reason": "terminal-complete",
+                "required_action": "advance-completed", "harness": "claude", "delivery_classification": "success"}]}
+        record = pending_delivery.create(root, recipient_kind="claude-parent-runtime", recipient_key=sid,
+            delivery_id=did, session_generation="", session_generation_supported="0", attempt_ids=[aid],
+            parent_attempt_id="att-parent", route_id=route["route_id"], route_node="frame", receipt=receipt,
+            receipt_digest=pending_delivery._canonical_receipt_digest(receipt), row_revisions={aid: "revision"})
+        meta = {"attempt_id": aid, "attempt_schema_version": "2", "dispatch_depth": "1",
+            "registered_worker": "1", "worker_type": "frame", "parent_sid": sid, "parent_harness": "claude",
+            "parent_completion_delivery": "claude-parent-runtime", "delivery_intent": "1",
+            "delivery_id": did, "delivery_receipt_digest": record["receipt_digest"],
+            "delivery_row_revision": "revision", "failure_class": "pass", "note": "completed-marker",
+            "launch_outcome": "reaped-before-publish", "route_id": route["route_id"],
+            "route_file": str(route_path), "route_hash": route["route_hash"], "route_node": "frame"}
+        jobs.write_text("now\tdone\t/fixture/repo\t/fixture/wt\tframe\t" +
+                        ",".join(key + "=" + value for key, value in meta.items()) + "\n")
+        seat = tidy.Seat("pane", "registry-" + suffix)
+        tidy._append_ledger_entry(seat, dict(event="start", harness="claude", sid=sid, ts=1))
+        tidy._append_ledger_entry(seat, dict(event="handover", source="retire", harness=target,
+            sid=holder, **{"from": {"harness": "claude", "sid": sid}}, ts=2,
+            bindings=[handover.binding_of(jobs, meta)]))
+        self.assertEqual(handover.record_recipient_binding(record, sid, harness="claude", jobs=jobs),
+                         (target, holder))
+        return jobs, record, sid, (target, holder)
+
+    def _observed_registry_count(self, paths, live):
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                  for path in self.state_root.rglob("*") if path.is_file()}
+        observation = dict(complete=True, herdr_complete=True, process_complete=True,
+                           native_sid_complete=True, live=live)
+        counts = dispatch._pending_delivery_counts(paths, session_observation=observation)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
+                          for path in self.state_root.rglob("*") if path.is_file()}, before)
+        return counts
+
+    def test_original_named_registries_override_empty_and_copied_defaults_read_only(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            first = self._registered_registry_fixture(self.state_root / "one", "route-jobs.tsv", "one")
+            second = self._registered_registry_fixture(self.state_root / "two", "another-registry.txt", "two")
+            default = self.state_root / "copied-jobs.log"
+            for data in (b"", first[0].read_bytes()):
+                default.write_bytes(data)
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(default)}):
+                    live = {("claude", first[2]), ("claude", second[2])}
+                    self.assertEqual(self._observed_registry_count([first[0], second[0]], live)["no_recipient"], 2)
+                    self.assertEqual(self._observed_registry_count([first[0], second[0]],
+                                     {first[3], second[3]})["no_recipient"], 0)
+                    original = first[0].read_bytes(); first[0].unlink()
+                    self.assertIsNone(self._observed_registry_count([first[0], second[0]], live)["no_recipient"])
+                    first[0].write_bytes(original)
+                    self.assertEqual(self._observed_registry_count([first[0], second[0]], live)["no_recipient"], 2)
+
+    def test_cross_harness_same_sid_and_every_duplicate_body_keep_original_registry(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, record, sid, holder = self._registered_registry_fixture(
+                self.state_root / "original", "original.tsv", "pair", target="codex", same_sid=True)
+            default = self.state_root / "default.log"; default.write_bytes(jobs.read_bytes())
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(default)}):
+                self.assertEqual(self._observed_registry_count([jobs], {("claude", sid)})["no_recipient"], 1)
+                self.assertEqual(self._observed_registry_count([jobs], {holder})["no_recipient"], 0)
+                other = self.state_root / "duplicate"; other.mkdir()
+                copied = other / "copied.tsv"; copied.write_bytes(jobs.read_bytes())
+                # Same identity/body in another root has an explicitly conflicting original registry.
+                duplicate = pending_delivery.record_path(other, sid, record["delivery_id"])
+                duplicate.parent.mkdir(parents=True)
+                duplicate.write_bytes(pending_delivery.record_path(jobs.parent, sid, record["delivery_id"]).read_bytes())
+                for paths in ([jobs, copied], [copied, jobs]):
+                    with self.subTest(paths=paths):
+                        self.assertIsNone(self._observed_registry_count(paths, {holder})["no_recipient"])
+
+    def test_route_free_notice_keeps_registry_free_absence_accounting(self):
+        import peer_obligations
+        import session_notice
+        import session_tidy as tidy
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history"),
+                "AGENT_DISPATCH_JOBS": str(self.state_root / "unavailable.tsv")}), \
+             mock.patch.object(peer_obligations, "ensure_normal_runner", return_value=False):
+            jobs = self.state_root / "unavailable.tsv"
+            session_notice.notify("claude", "route-free-storage", key="registry-free",
+                                  subject="completed", text="done", jobs=jobs)
+            tidy._append_ledger_entry(tidy.Seat("pane", "route-free"),
+                                     dict(event="start", harness="claude", sid="route-free-storage", ts=1))
+            self.assertFalse(jobs.exists())
+            self.assertEqual(self._observed_registry_count([jobs], set())["no_recipient"], 1)
+            self.assertEqual(self._observed_registry_count([jobs], {("claude", "route-free-storage")})["no_recipient"], 0)
 
     def test_render_and_overview_show_known_count_but_never_unknown_as_zero(self):
         from fleet import render

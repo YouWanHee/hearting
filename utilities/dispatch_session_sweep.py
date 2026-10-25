@@ -255,13 +255,19 @@ def _reconcile_canonical_dispatch_state(root: Path) -> None:
         pass
 
 
-def record_jobs(root: Path, record: dict) -> Path | None:
-    """Use the receipt's registry or the canonical selection, preserving its filename."""
+def record_jobs(root: Path, record: dict, *, observed_jobs=None) -> Path | None:
+    """Use the receipt, observed registry, then canonical selection, preserving its filename."""
     from dispatch_contract import resolve_agent_home, resolve_global_registry
-    raw = (record.get("receipt") or {}).get("job_registry")
+    receipt = record.get("receipt") or {}
+    raw = receipt.get("job_registry")
     try:
-        jobs = (Path(raw).expanduser() if isinstance(raw, str) and raw else
-                resolve_global_registry(resolve_agent_home(), None, 0, "read").path)
+        if "job_registry" in receipt:
+            if not isinstance(raw, str) or not raw:
+                return None
+            jobs = Path(raw).expanduser()
+        else:
+            jobs = (Path(observed_jobs) if observed_jobs is not None else
+                    resolve_global_registry(resolve_agent_home(), None, 0, "read").path)
         if jobs.is_symlink():
             return None
         jobs = jobs.resolve(strict=True)

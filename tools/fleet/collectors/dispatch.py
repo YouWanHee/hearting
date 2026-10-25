@@ -4087,7 +4087,13 @@ def _pending_delivery_counts(paths, *, session_observation=None):
                     identity = (delivery_id, recipient_digest)
                     try:
                         from dispatch_seat_handover import record_recipient_binding
-                        recipient = record_recipient_binding(record, storage_sid, harness=harness)
+                        from dispatch_session_sweep import record_jobs
+                        jobs = record_jobs(root, record, observed_jobs=path)
+                        if jobs is None and (record.get("receipt") or {}).get("kind") != "notice":
+                            no_recipient_unknown = True
+                            continue
+                        recipient = record_recipient_binding(
+                            record, storage_sid, harness=harness, jobs=jobs)
                     except Exception:
                         recipient = None
                     if recipient is None:
