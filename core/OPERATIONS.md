@@ -486,6 +486,14 @@ work the observer cannot see; it is not a HOME retention interval. Commit
 background sweep closed unseen work and pending runtime settlement, so HOME
 reclamation does not shorten the route policy.
 
+**Dispatch launch diagnostics.** The shared batch leg collector saves each
+wrapper's return code and the last 64 KiB of stdout and stderr beside that
+attempt's existing log, as `<slug>.<attempt>.<harness>.wrapper.json`. A failed
+launch fence saves its original exception and traceback tail in the matching
+`.launch-fence.txt`, even before a worker transcript exists. These bounded,
+best-effort sidecars are diagnostic only: receipts, launch decisions, gates,
+and successful command output retain their existing behavior across harnesses.
+
 **Dispatch log retention.** Only regular Hearting attempt logs bound by an
 exact registry `attempt_id`, harness, and canonical jobs-state `logs/` path are
 eligible for automatic retirement. A log becomes eligible only after its
@@ -1056,7 +1064,7 @@ A legacy hash collision is diagnostic
    - **Owner route binding and duplicate launch receipt under SD-97:** `dispatch-owner --route-evidence` fills the owner-tuple flags a route-backed call omits (`route_defaults=` in the receipt; a cwd, capability, mode, or intensity that contradicts the route is refused typed), and verifies the route against cwd, capability, mode, intensity, hash, and owner harness; an owner is never fabricated as a route node. An exact duplicate claim starts zero children and reports `launch_state=existing-active|existing-dead|existing-unverified|existing-completed` (the open-row word comes from the shared process verdict, with one plain `note=` line for dead/unverified); a caller requiring a new start must branch on it.
    - **Post-launch owner-route lifecycle under SD-97:** a registered dispatch-depth-1 owner may start without route evidence and compile generation 0 after launch; the compiler attaches that immutable route to the exact owner attempt through a separate atomic lifecycle record and never rewrites the route or the launch-sealed tuple. The owner route advances only through verified generation `n -> n+1` edges adopted by a registered depth-2 child row; a childless candidate is inert.
    - **Fleet owner-lineage projection under SD-97:** Fleet projects the same verified current owner generation; two real successors or unverifiable lineage stay the typed `multiple-owner-routes` ambiguity, and timestamp ordering or "latest route" heuristics are forbidden. Display-parent resolution consumes the exact managed-session binding before classifying a missing visible thread as orphan; the collector owns that decision and rendering consumes it without changing completion delivery identity.
-   - **Declared runtime requirements and lifecycle evidence under SD-97:** a node may declare only registry-known `runtime_requirements`; `loopback-listen` means localhost bind while outbound network remains denied, and a runtime that cannot express that reports `loopback-only-unsupported` and uses the checked main/inline handoff rather than widening outbound access.
+   - **Declared runtime requirements and lifecycle evidence under SD-97:** a node may declare only registry-known `runtime_requirements`; `loopback-listen` means localhost bind with outbound denied. Sealed lab HTML verification derives that same requirement without resealing old routes. Review source stays read-only; assigned canonical verdicts remain writable and precede optional sinks. Use the existing headless shell without broad Unix-socket access. Unsupported runtimes retain `loopback-only-unsupported` and the checked main/inline fallback.
 3. **Merge and cleanup belong to main or the orchestrator:** merge only after an explicit user signal or while harvesting a background job that main dispatched. Do not self-merge the current turn's substantive branch; finish with the branch and a concise report while preserving main unless the user has already authorized integration. Review `git diff main...<branch>`, skip regressions or duplicated work, resolve conflicts by interpreting both intents rather than choosing a side automatically, stop when ambiguity would revert an established result, and verify the integrated build. “Merge everything” means merge all valid work selectively, not blindly accept every diff.
    - After merge, integrated verification, and a successful push of the
      integration ref, main automatically runs
@@ -1464,6 +1472,12 @@ holds no model turn, opens no dispatch depth, and has no launch authority
 beyond the successor its sealed route already declares.
 
 Resource watches follow exact resource identity rather than a 24-hour deadline.
+Release activation reattaches observation to existing compute/resource runs,
+retaining payload, exit/sentinel and route/node identity. The argument-free
+`hearting run resource-observers` repeats that reconciliation. A registered
+`resource-runner observe` side run shares its live resource's route/node and
+recipients, with its own run id, log, progress and sentinel. Its success/failure
+is reported separately from the unchanged stage predecessor and completion.
 Start/resume and the parked owner controller reuse a live watch or reattach one
 under the existing resource-registry lock. Recovery changes only supervision
 metadata, never the payload, its identity, or producer outputs. A recovered watch
@@ -1495,7 +1509,7 @@ and opening its private launch fence.
 The owner receives intermediate execution success with no successor admission;
 an unacknowledged success or failure remains recoverable from its original binding after the
 next registration, with no lifetime receipt-count ceiling.
-The resource that supplies the declared stage outputs can complete the stage.
+The resource that supplies the declared stage outputs can complete the stage. Continuation retains that admitted resource identity and quiescence; it requires no model attempt sidecar for the resource prefix.
 
 **Registry selection is workflow-ledger authority.** When a supervisor command
 or any adapter launch fence receives an explicit `--jobs`, the ledger is always
@@ -2543,8 +2557,8 @@ acceptance and actual receipt are separate facts:
 
 | Runtime | Transport and acceptance | Exact native receipt | Wake and limits |
 |---|---|---|---|
-| Claude | `peer-steward.py prompt` stores/reuses a ref bound to sender, recipient session and body digest; existing hook context carries the sealed message. | The exact receiving callback acknowledges the bound ref. Context output alone is not receipt. | Plain interactive TUI has no supported wake; its pending ref remains for the next native callback. No pane send or composer read. |
-| Codex | The freshly proven exact thread/client queue accepts one sealed ref and returns its `client_message_id`; a legitimate TUI process restart may continue the same exact thread. | The exact message in the bound thread history confirms consumption. | Uses the existing queue and hook path; no pane typing or transcript inference. |
+| Claude | `peer-steward.py prompt` stores/reuses a ref bound to sender, recipient session and body digest; existing hook context carries the sealed message. | The exact receiving callback acknowledges the bound ref. Context output alone is not receipt. | Plain interactive TUI has no supported wake; its pending ref remains for the next native callback. |
+| Codex | The freshly proven exact thread/client queue accepts one sealed ref and returns its `client_message_id`; a legitimate TUI process restart may continue the same exact thread. | The exact message in the bound thread history confirms consumption. | Uses the existing queue and hook path; no transcript inference. |
 | OpenCode | The plugin saves one `noReply` user message through its current client at the exact selected root SID. Its native ID marks it queued. | Only an error-free completed assistant message whose `parentID` is that ID in the same SID marks it received. | On a verified idle root, `promptAsync` continues the persisted message by ID. Busy, question, permission, child, ambiguous history or SID change cannot consume it. |
 
 Queue acceptance never means delivery or consumption. A pending retry of the same
@@ -2753,7 +2767,7 @@ pane-only sidless first-input path, and a queued carrier result remains
 distinct from exact receiver evidence.
 
 Clear and retire retain their checked foreground/form/draft and successor safety.
-Claude peer submission uses `herdr agent prompt` only for the guarded idle plain-TUI
+For Claude peers, `peer-steward.py prompt` uses `herdr agent prompt` for the guarded idle plain-TUI
 case above; busy Claude delivery waits for its existing callback. Neither a helper
 return nor a status flip is a receive receipt. Continue retains its existing native
 carrier and booking checks. The memory handoff channel is pull-only (next prompt's

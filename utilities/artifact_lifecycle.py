@@ -688,6 +688,7 @@ def evaluate_cycle_completion(
     inline_finish_id: Optional[str] = None,
     preserved: Optional[Sequence[Mapping[str, Any]]] = None,
     payload_verified: bool = False,
+    first_completion: bool = False,
 ) -> Decision:
     """`preserved` marks a document the runtime has already refreshed after the
     close (§45 D-124): earlier documents of the cycle resolve its references,
@@ -717,7 +718,7 @@ def evaluate_cycle_completion(
         role for role in criterion.get("required_artifact_roles", [])
         if role not in revised_roles
     )
-    if missing_roles and preserved is None:
+    if missing_roles and (preserved is None or first_completion):
         return Decision(
             "reject",
             (_violation("completion-required-artifact-missing", detail=",".join(missing_roles)),),
@@ -734,6 +735,19 @@ def evaluate_cycle_completion(
         event.get("event_type") == "route.terminal.recorded" for event in cycle_events
     ):
         return Decision("reject", (_violation("completion-terminal-evidence-unbound"),))
+    if first_completion:
+        if not preserved or not any(
+            isinstance(old, Mapping)
+            and old.get("manifest_id") == document.get("manifest_id")
+            and old.get("artifact_root_id") == document.get("artifact_root_id")
+            and old.get("repository_id") == document.get("repository_id")
+            and (old.get("cycle") or {}).get("cycle_id") == cycle.get("cycle_id")
+            and (old.get("cycle") or {}).get("campaign_id") == cycle.get("campaign_id")
+            and (old.get("cycle") or {}).get("input_digest") == cycle.get("input_digest")
+            and (old.get("cycle") or {}).get("state") == "abandoned"
+            for old in preserved
+        ):
+            return Decision("reject", (_violation("completion-history-unverified"),))
     report = (artifact_manifest.validate(document) if preserved is None
               else artifact_manifest.validate_update(document, preserved=preserved, published=True))
     if not report.ok:
@@ -741,7 +755,7 @@ def evaluate_cycle_completion(
         return Decision("reject", (_violation("completion-manifest-invalid", detail=details),))
     if document.get("cycle", {}).get("state") != "completed":
         return Decision("incomplete", (_violation("completion-cycle-not-completed"),))
-    if preserved is None and not payload_verified:
+    if (preserved is None or first_completion) and not payload_verified:
         payload_check = verify_published_payload(content_root, document)
         if not payload_check.ok:
             return payload_check
@@ -880,7 +894,8 @@ def evaluate_cycle_completion(
 
 
 def _derive_terminal_evidence(
-    document: Mapping[str, Any], binding: RouteBinding, route: Mapping[str, Any]
+    document: Mapping[str, Any], binding: RouteBinding, route: Mapping[str, Any], *,
+    recorded_gates: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Derive trusted runtime digests into a private manifest copy.
 
@@ -890,7 +905,8 @@ def _derive_terminal_evidence(
     """
     result = json.loads(json.dumps(document))
     route_module = _load_capability_route()
-    marker_digest = _marker_digest(route_module, route)
+    marker_digest = _marker_digest(route_module, route, recorded=recorded_gates is not None,
+                                   recorded_gates=recorded_gates)
     outcome_digest = _sha256_path(Path(binding.outcome_file))
     rows = [
         row

@@ -4113,6 +4113,22 @@ def reconnect_peer_obligations(active_root: str | Path) -> bool:
         return False
 
 
+def reconnect_resource_observers(active_root: str | Path) -> bool:
+    """Adopt pre-update observations after activation commits, on every harness."""
+    root = Path(active_root).resolve()
+    utility = root / "utilities" / "resource-observers.py"
+    if not utility.is_file():
+        return False
+    try:
+        subprocess.Popen([sys.executable, str(utility)],
+            env={**os.environ, "AGENT_HOME": str(root), "PYTHONDONTWRITEBYTECODE": "1"},
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True, start_new_session=True)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def refresh(runtime: str, scope: str = "global") -> dict:
     _validate_scope(runtime, scope)
     state = _load_json(_state_path(runtime, scope))

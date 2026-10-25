@@ -184,6 +184,11 @@ callback, and the session ended with no follow-up mechanism registered. See
 For `eval`, `eval-run` is likewise a supervised detached run whose termination
 advances `metrics`, and `sync` is the terminal node.
 
+Release activation attaches checks to existing runs without restarting them;
+`hearting run resource-observers` repeats this operation. For scoring alongside
+a live resource, `resource-runner observe` takes the usual start arguments and
+its own run id/log. It inherits the resource's route/node and recipients, records
+its own exit, and leaves the stage predecessor unchanged.
 Workload progress is optional. The resource runner supplies
 `AGENT_RESOURCE_PROGRESS_FILE`, `AGENT_RESOURCE_RUN_ID`, and `AGENT_RESOURCE_NODE`;
 `resource_progress.write_progress(done, "item", total=n)` atomically publishes an
@@ -476,10 +481,10 @@ not absorb their artifact ownership.
 
 | Adapter | Realization |
 |---|---|
-| Claude Code | `adapters/claude/skills/autopilot-lab/SKILL.md` and `skills/autopilot-lab/SKILL.md` are byte-identical (enforced by `check-adaptation-boundary.sh`'s `diff -qr`); the only difference is the runtime discovery path — Claude Code discovers `adapters/claude/skills/autopilot-lab/SKILL.md`, while `skills/autopilot-lab/SKILL.md` remains the compatibility reference kept for parity/drift checks. |
+| Claude Code | `adapters/claude/skills/autopilot-lab/SKILL.md` and `skills/autopilot-lab/SKILL.md` are byte-identical (enforced by `check-adaptation-boundary.sh`'s `diff -qr`); the only difference is the runtime discovery path — Claude Code discovers `adapters/claude/skills/autopilot-lab/SKILL.md`, while `skills/autopilot-lab/SKILL.md` remains a generated compatibility projection sourced from `capabilities/` and kept for parity/drift checks. |
 | Codex | Read this spec and run `adapters/codex/bin/preflight.sh capability-info autopilot-lab`. Use `adapters/codex/skills/autopilot-lab/SKILL.md` as the native Codex Skill projection; do not consume `skills/autopilot-lab/SKILL.md` or Claude command files as native Codex configuration. |
 | OpenCode | Read this spec and run `adapters/opencode/bin/preflight.sh capability-info autopilot-lab`. Use `adapters/opencode/skills/autopilot-lab/SKILL.md` and `adapters/opencode/commands/autopilot-lab.md` as native OpenCode projections; do not consume `skills/autopilot-lab/SKILL.md` or Claude command files as native OpenCode configuration. |
 
 ## Compatibility Reference
 
-`skills/autopilot-lab/SKILL.md` and `adapters/claude/skills/autopilot-lab/SKILL.md` are byte-identical (enforced by `check-adaptation-boundary.sh`'s `diff -qr`); the only difference is the runtime discovery path — Claude Code discovers `adapters/claude/skills/autopilot-lab/SKILL.md`, while `skills/autopilot-lab/SKILL.md` remains the compatibility reference kept for parity/drift checks.
+`skills/autopilot-lab/SKILL.md` and `adapters/claude/skills/autopilot-lab/SKILL.md` are byte-identical (enforced by `check-adaptation-boundary.sh`'s `diff -qr`); the only difference is the runtime discovery path — Claude Code discovers `adapters/claude/skills/autopilot-lab/SKILL.md`, while `skills/autopilot-lab/SKILL.md` remains a generated compatibility projection sourced from `capabilities/` and kept for parity/drift checks.

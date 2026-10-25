@@ -56,6 +56,7 @@ from replica_batch_contract import (  # noqa: E402
     effective_independence_axes,
     verify_manifest,
 )
+from dispatch_launch_evidence import OUTPUT_TAIL_BYTES, save_wrapper_evidence  # noqa: E402
 from dispatch_degradation import record_degradation  # noqa: E402
 from dispatch_allocation_receipt import record_allocation_receipt  # noqa: E402
 from dispatch_quality_peer import quality_peer_families  # noqa: E402
@@ -104,7 +105,6 @@ NODE_SPEC.loader.exec_module(DISPATCH_NODE)
 SUPPORTED_BATCH_HARNESSES = ("codex", "claude", "opencode")
 SAFE_SLUG = re.compile(r"[^A-Za-z0-9._-]+")
 RESERVATION_TOKEN = re.compile(r"[0-9a-f]{32}")
-OUTPUT_TAIL_BYTES = 65536
 DEFAULT_PROMPT = "Execute the selected immutable parallel leg and emit its completion evidence."
 
 # Closed degradation vocabulary. An unconstrained free-text reason reproduces
@@ -3664,6 +3664,8 @@ def main(argv: list[str] | None = None) -> int:
                     original_leg, token, proc = futures[future]
                     try:
                         leg, _, proc, stdout, stderr = future.result()
+                        save_wrapper_evidence(jobs, leg, proc.returncode, stdout, stderr,
+                                              log_dir=args.log_dir)
                         result = wrapper_result(leg, proc, stdout, stderr)
                         if result["launch_state"] == "existing":
                             checked = existing_leg_result(

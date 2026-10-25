@@ -53,11 +53,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Reader-facing report gates whose format is specified outside their stage contract.
 REPORT_CONTRACT_REFERENCES = {
-    "lab-report": ("skills/autopilot-lab/references/eval-procedure.md",
-                   "skills/autopilot-lab/references/data-contract.md"),
-    "research-report": ("skills/autopilot-research/references/report-generation.md",),
-    "draft-finalize": ("skills/autopilot-draft/references/pipeline-steps.md",),
-    "audit-report": ("skills/audit/references/report-and-autofix.md",),
+    "lab-report": ("capabilities/autopilot-lab/references/eval-procedure.md",
+                   "capabilities/autopilot-lab/references/data-contract.md"),
+    "research-report": ("capabilities/autopilot-research/references/report-generation.md",),
+    "draft-finalize": ("capabilities/autopilot-draft/references/pipeline-steps.md",),
+    "audit-report": ("capabilities/audit/references/report-and-autofix.md",),
 }
 
 # Vocabulary a unit may declare under its optional `bootstrap:` frontmatter block.
@@ -549,6 +549,8 @@ def node_scope_prompt(scope: "NodeScope") -> str:
         lines.append("Cycle-wide artifact scope covers only the approved task's deliverables, not other work or cycles.")
     if source_scope:
         lines.append(f"worktree_source_scope={json.dumps(source_scope, ensure_ascii=False)}")
+    elif artifact_scope and scope.output_dir:
+        lines.append("Source is read-only; declared artifact outputs remain writable. Save them locally before any optional artifact sink.")
     if not scope.output_dir:
         lines.append("Cycle is unbound (no open cycle is bound); do not write durable artifacts under the artifact root.")
     if not scope.worktree_dir and ("source/**" in scope.write_scope or "source-alternative/**" in scope.write_scope
@@ -881,7 +883,9 @@ def assignment_prompt(args, task: str, environ) -> str:
             source_worktree=source_worktree,
             source_worktree_verified=source_worktree is not None,
         )
+        from verification_runtime import assignment_hint
         return (f"Assignment:\n{task.rstrip()}\n\n{completion_scope_prompt()}"
+                f"{assignment_hint(route, getattr(args, 'route_node', None))}"
                 f"{plan_leg_prompt(route, getattr(args, 'route_node', None))}"
                 f"{node_scope_prompt(scope)}{input_sources_prompt(route, getattr(args, 'route_node', None))}\n"
                 f"{automatic_consumer_prompt(route, getattr(args, 'route_node', None))}"
