@@ -2163,15 +2163,95 @@ class ActiveTurnDeadlineParityTest(unittest.TestCase):
             "item/agentMessage/delta",
             "item/plan/delta",
             "item/commandExecution/outputDelta",
+            "item/reasoning/summaryTextDelta",
+            "item/reasoning/textDelta",
         )
         for method in accepted:
             with self.subTest(method=method):
+                params = {"threadId": "thread-1", "turnId": "turn-1",
+                          "itemId": "item-1", "delta": "working"}
+                if method == "item/reasoning/summaryTextDelta":
+                    params["summaryIndex"] = 0
+                elif method == "item/reasoning/textDelta":
+                    params["contentIndex"] = 0
                 self.assertTrue(module.codex_payload_progress({
                     "method": method,
-                    "params": {"threadId": "thread-1", "turnId": "turn-1",
-                               "itemId": "item-1", "delta": "working"},
+                    "params": params,
                 }, "thread-1", "turn-1"))
+
+        accepted_work_events = (
+            {"method": "item/started", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "item": {"type": "commandExecution", "id": "cmd-1"}}},
+            {"method": "item/completed", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "item": {"type": "agentMessage", "id": "message-1"}}},
+            {"method": "turn/plan/updated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "explanation": None,
+             "plan": [{"step": "inspect", "status": "inProgress"}]}},
+            {"method": "turn/diff/updated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "diff": "diff --git a/file b/file"}},
+            {"method": "item/fileChange/patchUpdated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "itemId": "file-1", "changes": [{
+                 "path": "file", "kind": {"type": "update", "move_path": None},
+                 "diff": "@@ -1 +1 @@"}]}},
+            {"method": "item/mcpToolCall/progress", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "itemId": "mcp-1", "message": "working"}},
+            {"method": "item/commandExecution/terminalInteraction", "params": {
+             "threadId": "thread-1", "turnId": "turn-1", "itemId": "cmd-1",
+             "processId": "process-1", "stdin": "continue\n"}},
+        )
+        for event in accepted_work_events:
+            with self.subTest(accepted_method=event["method"]):
+                self.assertTrue(module.codex_payload_progress(event, "thread-1", "turn-1"))
+
         for event in (
+            {"method": "item/started", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "item": {}}},
+            {"method": "item/completed", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "item": {"type": "agentMessage", "id": "  "}}},
+            {"method": "item/started", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "item": {"type": "unknownItem", "id": "item-1"}}},
+            {"method": "item/started", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "item": {"type": "commandExecution", "id": []}}},
+            {"method": "item/started", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "item": []}},
+            {"method": "item/started", "params": {"threadId": "thread-1",
+             "turnId": "turn-1"}},
+            {"method": "turn/plan/updated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "explanation": None}},
+            {"method": "turn/plan/updated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "explanation": None, "plan": []}},
+            {"method": "turn/plan/updated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "explanation": None, "plan": "inspect"}},
+            {"method": "turn/plan/updated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "explanation": None,
+             "plan": [{"step": "", "status": "inProgress"}]}},
+            {"method": "turn/plan/updated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "explanation": None,
+             "plan": [{"step": "inspect", "status": {}}]}},
+            {"method": "turn/plan/updated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "plan": [{"step": "inspect", "status": "pending"}]}},
+            {"method": "turn/diff/updated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1"}},
+            {"method": "turn/diff/updated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "diff": ""}},
+            {"method": "turn/diff/updated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "diff": []}},
+            {"method": "item/fileChange/patchUpdated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "itemId": "file-1", "changes": []}},
+            {"method": "item/fileChange/patchUpdated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "itemId": "file-1", "changes": [{
+                 "path": "file", "kind": {"type": "unknown"}, "diff": "diff"}]}},
+            {"method": "item/fileChange/patchUpdated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "itemId": "file-1", "changes": [{
+                 "path": "file", "kind": {"type": "update"}, "diff": "diff"}]}},
+            {"method": "item/fileChange/patchUpdated", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "changes": [{
+                 "path": "file", "kind": {"type": "add"}, "diff": "diff"}]}},
+            {"method": "item/mcpToolCall/progress", "params": {"threadId": "thread-1",
+             "turnId": "turn-1", "itemId": "mcp-1", "message": "  "}},
+            {"method": "item/commandExecution/terminalInteraction", "params": {
+             "threadId": "thread-1", "turnId": "turn-1", "itemId": "cmd-1",
+             "processId": "process-1", "stdin": ""}},
             {"method": "item/agentMessage/delta", "params": {
                 "threadId": "thread-other", "turnId": "turn-1",
                 "itemId": "item-1", "delta": "foreign thread"}},
@@ -2190,6 +2270,26 @@ class ActiveTurnDeadlineParityTest(unittest.TestCase):
                 "threadId": "thread-1", "turnId": "turn-1", "name": "status"}},
             {"method": "item/agentMessage/delta", "params": {
                 "threadId": "thread-1", "turnId": "turn-1", "delta": "no item id"}},
+            {"method": "item/commandExecution/outputDelta", "params": {
+                "threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1",
+                "delta": []}},
+            {"method": "item/reasoning/summaryTextDelta", "params": {
+                "threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1",
+                "delta": "working"}},
+            {"method": "item/reasoning/summaryTextDelta", "params": {
+                "threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1",
+                "delta": "working", "summaryIndex": -1}},
+            {"method": "item/reasoning/textDelta", "params": {
+                "threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1",
+                "delta": "working", "contentIndex": True}},
+            {"method": "item/reasoning/summaryPartAdded", "params": {
+                "threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1",
+                "summaryIndex": 1}},
+            {"method": "item/fileChange/outputDelta", "params": {
+                "threadId": "thread-1", "turnId": "turn-1", "itemId": "file-1",
+                "delta": "legacy"}},
+            {"method": "item/autoApprovalReview/started", "params": {
+                "threadId": "thread-1", "turnId": "turn-1"}},
         ):
             self.assertFalse(module.codex_payload_progress(event, "thread-1", "turn-1"),
                              event["method"])
@@ -2204,9 +2304,9 @@ class ActiveTurnDeadlineParityTest(unittest.TestCase):
                     if request.get('method') == 'turn/start':
                         send({'jsonrpc':'2.0','id':request['id'],'result':{'turn':{'id':'turn-1'}}})
                         for index in range(12):
-                            send({'jsonrpc':'2.0','method':'item/agentMessage/delta','params':{
+                            send({'jsonrpc':'2.0','method':'item/reasoning/summaryTextDelta','params':{
                                 'threadId':'thread-1','turnId':'turn-1',
-                                'itemId':'message-1','delta':'part'}})
+                                'itemId':'reasoning-1','delta':'part','summaryIndex':0}})
                             time.sleep(0.05)
                         send({'jsonrpc':'2.0','method':'item/completed','params':{
                             'threadId':'thread-1','turnId':'turn-1','item':{
@@ -2259,7 +2359,7 @@ class ActiveTurnDeadlineParityTest(unittest.TestCase):
                             activity=activity)
         self.assertIsNone(server.owner_turn_activity)
 
-    def test_token_accounting_events_do_not_hide_confirmed_owner_inactivity(self):
+    def test_malformed_same_turn_events_and_accounting_do_not_hide_owner_inactivity(self):
         from foreground_activity import ActivityObservation
         from session_supervisor_decisions import OwnerTurnActivity
         module = load_supervisor_module()
@@ -2268,16 +2368,29 @@ class ActiveTurnDeadlineParityTest(unittest.TestCase):
             script.write_text(textwrap.dedent("""\
                 import json, sys, time
                 def send(value): print(json.dumps(value), flush=True)
+                notifications = [
+                    {'method':'thread/tokenUsage/updated','params':{
+                        'threadId':'thread-1','turnId':'turn-1',
+                        'tokenUsage':{'last':{'totalTokens':1}}}},
+                    {'method':'item/started','params':{
+                        'threadId':'thread-1','turnId':'turn-1','item':{}}},
+                    {'method':'item/completed','params':{
+                        'threadId':'thread-1','turnId':'turn-1',
+                        'item':{'type':'unknownItem','id':'item-1'}}},
+                    {'method':'turn/plan/updated','params':{
+                        'threadId':'thread-1','turnId':'turn-1'}},
+                    {'method':'turn/diff/updated','params':{
+                        'threadId':'thread-1','turnId':'turn-1','diff':''}},
+                ]
                 for line in sys.stdin:
                     value = json.loads(line)
                     if value.get('method') == 'turn/start':
                         send({'jsonrpc':'2.0','id':value['id'],'result':{'turn':{'id':'turn-1'}}})
                         deadline = time.monotonic() + 2
                         while time.monotonic() < deadline:
-                            send({'jsonrpc':'2.0','method':'thread/tokenUsage/updated','params':{
-                                'threadId':'thread-1','turnId':'turn-1',
-                                'tokenUsage':{'last':{'totalTokens':1}}}})
-                            time.sleep(0.02)
+                            for notification in notifications:
+                                send({'jsonrpc':'2.0',**notification})
+                                time.sleep(0.01)
             """))
             server = module.AppServer([sys.executable, str(script)], temp, dict(os.environ))
             self.addCleanup(server.close)

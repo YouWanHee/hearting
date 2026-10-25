@@ -1074,27 +1074,99 @@ def context_window_arguments(args: argparse.Namespace) -> list[str]:
     return [] if value is None else ["-c", f"model_context_window={value}"]
 
 
+CODEX_THREAD_ITEM_TYPES = frozenset({
+    "userMessage", "hookPrompt", "agentMessage", "functionCallOutput", "plan",
+    "reasoning", "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall",
+    "collabAgentToolCall", "subAgentActivity", "webSearch", "imageView", "sleep",
+    "imageGeneration", "enteredReviewMode", "exitedReviewMode", "contextCompaction",
+})
+
+
 def codex_payload_progress(event: dict[str, Any], thread_id: str, turn_id: str) -> bool:
-    """Accept only native work payloads bound to this thread and turn."""
+    """Accept shaped, attributable App Server work payloads for this turn."""
     method = event.get("method")
     params = event.get("params")
-    if not isinstance(params, dict):
+    if (not isinstance(method, str) or not isinstance(params, dict)
+            or params.get("threadId") != thread_id or params.get("turnId") != turn_id):
         return False
-    if params.get("threadId") != thread_id or params.get("turnId") != turn_id:
-        return False
-    if method in {"turn/plan/updated", "turn/diff/updated"}:
-        return True
+
+    def nonempty_string(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
     if method in {"item/started", "item/completed"}:
-        return isinstance(params.get("item"), dict)
+        item = params.get("item")
+        if not isinstance(item, dict):
+            return False
+        item_type = item.get("type")
+        item_id = item.get("id")
+        return (isinstance(item_type, str) and item_type in CODEX_THREAD_ITEM_TYPES
+                and nonempty_string(item_id))
+
+    if method == "turn/plan/updated":
+        plan = params.get("plan")
+        explanation = params.get("explanation")
+        if (not isinstance(plan, list) or not plan
+                or "explanation" not in params
+                or (explanation is not None and not isinstance(explanation, str))):
+            return False
+        return all(
+            isinstance(step, dict)
+            and nonempty_string(step.get("step"))
+            and isinstance(step.get("status"), str)
+            and step["status"] in {"pending", "inProgress", "completed"}
+            for step in plan
+        )
+
+    if method == "turn/diff/updated":
+        return nonempty_string(params.get("diff"))
+
+    if method == "item/fileChange/patchUpdated":
+        changes = params.get("changes")
+        if not nonempty_string(params.get("itemId")) or not isinstance(changes, list) or not changes:
+            return False
+        for change in changes:
+            if (not isinstance(change, dict) or not nonempty_string(change.get("path"))
+                    or not isinstance(change.get("diff"), str)):
+                return False
+            kind = change.get("kind")
+            if (not isinstance(kind, dict) or not isinstance(kind.get("type"), str)
+                    or kind["type"] not in {"add", "delete", "update"}):
+                return False
+            if kind.get("type") == "update":
+                if "move_path" not in kind:
+                    return False
+                move_path = kind.get("move_path")
+                if move_path is not None and not nonempty_string(move_path):
+                    return False
+        return True
+
+    if method == "item/mcpToolCall/progress":
+        return (nonempty_string(params.get("itemId"))
+                and nonempty_string(params.get("message")))
+
+    if method == "item/commandExecution/terminalInteraction":
+        return (nonempty_string(params.get("itemId"))
+                and nonempty_string(params.get("processId"))
+                and isinstance(params.get("stdin"), str) and bool(params["stdin"]))
+
     if method in {
         "item/agentMessage/delta",
         "item/plan/delta",
         "item/commandExecution/outputDelta",
+        "item/reasoning/summaryTextDelta",
+        "item/reasoning/textDelta",
     }:
         item_id = params.get("itemId")
         delta = params.get("delta")
-        return (isinstance(item_id, str) and bool(item_id)
-                and isinstance(delta, str) and bool(delta))
+        if not nonempty_string(item_id) or not isinstance(delta, str) or not delta:
+            return False
+        if method == "item/reasoning/summaryTextDelta":
+            index = params.get("summaryIndex")
+            return isinstance(index, int) and not isinstance(index, bool) and index >= 0
+        if method == "item/reasoning/textDelta":
+            index = params.get("contentIndex")
+            return isinstance(index, int) and not isinstance(index, bool) and index >= 0
+        return True
     return False
 
 
