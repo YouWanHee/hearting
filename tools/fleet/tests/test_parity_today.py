@@ -11,7 +11,8 @@ from tools.fleet.tests.parity_compare import diff_frames
 from tools.fleet.tests.parity_today import (REFERENCE_MASK_VERSION, R14_GENERIC_OVERFLOW_CASES,
                                             R14_HEADER_IDENTITY_PRD_SHA256, R14_REFERENCE_PROFILE,
                                             R14_RESIDUAL_CELL_PAIRS, _frame_from_reference, _jsonable,
-                                            _unique_reference_copy_limitations, _validated_header_identity,
+                                            _unique_reference_copy_limitations, _validated_header_hosts,
+                                            _validated_header_identity,
                                             _wide_continuation_pair_is_complete, build_live_vm, classify, main)
 
 
@@ -39,9 +40,15 @@ class TodayParityPlumbingTests(unittest.TestCase):
                 encoding="utf-8")
             self.assertEqual(_validated_header_identity(capture), {
                 "version": "v3.50.3-20-gad247e2b6", "install_method": "managed/stable"})
+            source.write_text(json.dumps({"compute_hosts": {"hosts": [
+                {"host": "moving4", "self": True}, {"host": "cnn", "self": False}]}}),
+                encoding="utf-8")
+            self.assertEqual(_validated_header_hosts(capture), [
+                {"mark": "⌂", "name": "moving4"}, {"mark": "◇", "name": "cnn"}])
             source.write_text("{}", encoding="utf-8")
             self.assertEqual(_validated_header_identity(capture), {
                 "version": "unknown", "install_method": "unmanaged"})
+            self.assertEqual(_validated_header_hosts(capture), [])
 
     def test_cli_returns_failure_for_unexplained_strict_residue(self):
         residue = _record(cells=[(20, 50, "a", "dim", "b", "dim")])
@@ -122,6 +129,11 @@ def _r14_narrow_header_record(working=0, idle=0, blocked=0, version="v3.50.3-20-
     candidate = host + " " * gap + census
     record = _rows_record(80, "OVERVIEW", {0: (reference, candidate)}, profile=R14_REFERENCE_PROFILE)
     record["validated_header_identity"] = {"version": version, "install_method": "unmanaged"}
+    record["validated_header_hosts"] = [
+        {"mark": "⌂", "name": "moving4"}, {"mark": "◇", "name": "cnn"},
+        {"mark": "◇", "name": "xavier"}, {"mark": "◇", "name": "larynx"},
+        {"mark": "◇", "name": "mpwav"},
+    ]
     record["reference_edge"][0] = True
     record["reference_overflow_mask"]["version"] = REFERENCE_MASK_VERSION
     record["reference_overflow_mask"]["profile"] = R14_REFERENCE_PROFILE
@@ -149,6 +161,62 @@ def _r14_narrow_header_record(working=0, idle=0, blocked=0, version="v3.50.3-20-
     record["fleet2_rows"][0] = "".join(cell[0] for cell in candidate_cells[0])
     record["differences"] = []
     for column, (expected, actual) in enumerate(zip(record["reference_cells"][0], candidate_cells[0])):
+        if expected != actual:
+            record["differences"].append({"kind": "cell", "row": 0, "column": column,
+                                          "expected": list(expected), "actual": list(actual)})
+    return record
+
+
+def _r14_wide_header_record(working=0, idle=0, blocked=0, version="v3.50.3-20-gad247e2b6",
+                            clock="02:38", method="unmanaged"):
+    width = 168
+    hosts = [{"mark": "⌂", "name": "moving4"}, {"mark": "◇", "name": "cnn"},
+             {"mark": "◇", "name": "xavier"}, {"mark": "◇", "name": "larynx"},
+             {"mark": "◇", "name": "mpwav"}]
+    host = " hosts ⌂ moving4  ◇ cnn  ◇ xavier  ◇ larynx  ◇ mpwav 5/5"
+    old_census = (f"⠏ {working} working  ● {idle} idle  ● {blocked} answer needed   hearting "
+                  f"{version}  {clock}")
+    new_census = (f"⠏ {working} working  ● {idle} idle  ● {blocked} answer needed   hearting "
+                  f"{version} · {method}  {clock}")
+    old_start, new_start = width - 1 - len(old_census), width - 1 - len(new_census)
+    reference = host + " " * (old_start - len(host)) + old_census + " "
+    candidate = host + " " * (new_start - len(host)) + new_census + " "
+    record = _rows_record(width, "OVERVIEW", {0: (reference, candidate)}, profile=R14_REFERENCE_PROFILE)
+    record["validated_header_identity"] = {"version": version, "install_method": method}
+    record["validated_header_hosts"] = hosts
+    record["reference_overflow_mask"]["version"] = REFERENCE_MASK_VERSION
+
+    host_parts = [(" hosts ", "dim"), ("⌂ ", "g_work"), ("moving4", "g_work"), ("  ", "branch_s"),
+                  ("◇ ", "dim"), ("cnn", "loc_repo"), ("  ", "branch_s"),
+                  ("◇ ", "dim"), ("xavier", "loc_repo"), ("  ", "branch_s"),
+                  ("◇ ", "dim"), ("larynx", "loc_repo"), ("  ", "branch_s"),
+                  ("◇ ", "dim"), ("mpwav", "loc_repo"), (" 5/5", "dim")]
+    base_census = [(f"⠏ {working}", "g_spin"), (" working", "dim"),
+                   (f"  ● {idle}", "g_work_off"), (" idle", "dim"),
+                   (f"  ● {blocked}", "g_blocked"), (" answer needed", "dim"),
+                   ("   ", "branch_s"), ("hearting", "hearting_name"),
+                   (" " + version, "version_release")]
+    reference_census = base_census + [("  " + clock, "dim")]
+    candidate_census = base_census + [(" · ", "dim"), (method, "version_method"),
+                                      ("  " + clock, "dim")]
+
+    def style_parts(cells, start, parts):
+        for text, style in parts:
+            for glyph in text:
+                cells[0][start] = (glyph, style, None)
+                start += 1
+        return start
+
+    style_parts(record["reference_cells"], 0, host_parts)
+    style_parts(record["fleet2_cells"], 0, host_parts)
+    for column in range(len(host), old_start):
+        record["reference_cells"][0][column] = (" ", None, None)
+    for column in range(len(host), new_start):
+        record["fleet2_cells"][0][column] = (" ", None, None)
+    style_parts(record["reference_cells"], old_start, reference_census)
+    style_parts(record["fleet2_cells"], new_start, candidate_census)
+    record["differences"] = []
+    for column, (expected, actual) in enumerate(zip(record["reference_cells"][0], record["fleet2_cells"][0])):
         if expected != actual:
             record["differences"].append({"kind": "cell", "row": 0, "column": column,
                                           "expected": list(expected), "actual": list(actual)})
@@ -562,6 +630,53 @@ class ClassificationTests(unittest.TestCase):
                 self.assertGreater(result["summary"]["unexplained"], 0)
         hit_result = classify([changed_hits])
         self.assertIn(("prd-narrow-host-identity", "intended"),
+                      [(entry["rule"], entry["class"]) for entry in hit_result["entries"]])
+        self.assertIn(("hits", "unexplained", "unexplained"),
+                      [(entry["kind"], entry["class"], entry["rule"]) for entry in hit_result["entries"]])
+
+    def test_r14_wide_method_insertion_is_source_bound_and_tuple_exact(self):
+        record = _r14_wide_header_record()
+        entry = classify([record])["entries"][0]
+        self.assertEqual((entry["class"], entry["rule"], entry["rows"]),
+                         ("intended", "prd-f70-install-method", [0, 0]))
+        self.assertIn(R14_HEADER_IDENTITY_PRD_SHA256, entry["reason"])
+
+        candidates = []
+        row = record["fleet2_rows"][0]
+        for column, actual in (
+                (row.index("unmanaged"), ("l", "version_method", None)),
+                (row.index("hearting"), ("x", "hearting_name", None)),
+                (row.index("⠏"), ("⠙", "g_spin", None)),
+                (row.index("moving4"), ("X", "g_work", None)),
+                (row.index("02:38") + 4, ("9", "dim", None)),
+                (row.index("gad247"), ("g", "dim", None)),
+        ):
+            altered = copy.deepcopy(record)
+            _change_candidate_cell(altered, 0, column, actual)
+            candidates.append(altered)
+        wrong_source_method = copy.deepcopy(record)
+        wrong_source_method["validated_header_identity"]["install_method"] = "linked"
+        candidates.append(wrong_source_method)
+        wrong_source_host = copy.deepcopy(record)
+        wrong_source_host["validated_header_hosts"][0]["name"] = "other"
+        candidates.append(wrong_source_host)
+        wide_pair = copy.deepcopy(record)
+        version_column = wide_pair["fleet2_rows"][0].index("gad247")
+        _change_candidate_cells(wide_pair, 0, {
+            version_column: ("界", "version_release", None),
+            version_column + 1: ("", "version_release", None),
+        })
+        candidates.append(wide_pair)
+
+        for altered in candidates:
+            with self.subTest(row=altered["fleet2_rows"][0][:28]):
+                self.assertGreater(classify([altered])["summary"]["unexplained"], 0)
+
+        changed_hits = copy.deepcopy(record)
+        changed_hits["differences"].append({"kind": "hits", "expected": [],
+                                            "actual": [[0, 0, 1, ["ui"]]]})
+        hit_result = classify([changed_hits])
+        self.assertIn(("prd-f70-install-method", "intended"),
                       [(entry["rule"], entry["class"]) for entry in hit_result["entries"]])
         self.assertIn(("hits", "unexplained", "unexplained"),
                       [(entry["kind"], entry["class"], entry["rule"]) for entry in hit_result["entries"]])

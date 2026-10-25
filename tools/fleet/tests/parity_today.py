@@ -319,7 +319,7 @@ def _slug(label):
 
 
 def _capture_pair(reference, vm, state, width, rows, outdir, label, reference_profile=None,
-                  validated_header_identity=None):
+                  validated_header_identity=None, validated_header_hosts=None):
     """Draw one state at one width from the copy (fed this view model) and from fleet2."""
     from tools.fleet.explorer.frame import draw
     from tools.fleet.tests.parity_compare import diff_frames
@@ -346,6 +346,7 @@ def _capture_pair(reference, vm, state, width, rows, outdir, label, reference_pr
                                for row in reference_frame.cells],
             "fleet2_rows": ["".join(cell[0] for cell in row) for row in fleet_frame.cells],
             "validated_header_identity": dict(validated_header_identity or {}),
+            "validated_header_hosts": [dict(row) for row in (validated_header_hosts or ())],
             "differences": diffs}
 
 
@@ -418,7 +419,7 @@ def build_live_vm(capture_dir):
 
 
 def compare_vm(vm, reference, out_dir, widths=WIDTHS, rows=45, only=None,
-               validated_header_identity=None):
+               validated_header_identity=None, validated_header_hosts=None):
     """Every root view plus one repo, session and route page at every width."""
     out_dir.mkdir(parents=True, exist_ok=True)
     states = [(view, "-", view) for view in VIEWS]
@@ -435,7 +436,8 @@ def compare_vm(vm, reference, out_dir, widths=WIDTHS, rows=45, only=None,
         for width in widths:
             records.append(_capture_pair(Path(reference), vm, _nav(scope, view), width, rows, out_dir, label,
                                          reference_profile=reference_profile,
-                                         validated_header_identity=validated_header_identity))
+                                         validated_header_identity=validated_header_identity,
+                                         validated_header_hosts=validated_header_hosts))
     return records
 
 
@@ -451,6 +453,24 @@ def _validated_header_identity(capture_dir):
         "version": version if isinstance(version, str) and version else "unknown",
         "install_method": method if isinstance(method, str) and method else "unmanaged",
     }
+
+
+def _validated_header_hosts(capture_dir):
+    """Read the captured, configured host names independently of the candidate frame."""
+    payload = json.loads((Path(capture_dir) / "fleet-json.json").read_text(encoding="utf-8"))
+    compute = payload.get("compute_hosts") if isinstance(payload, dict) else None
+    hosts = compute.get("hosts") if isinstance(compute, dict) else None
+    if not isinstance(hosts, list):
+        return []
+    result = []
+    for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        name = host.get("host")
+        if not isinstance(name, str) or not name:
+            name = "·"
+        result.append({"mark": "⌂" if host.get("self") is True else "◇", "name": name})
+    return result
 
 
 def _unique_reference_copy_limitations(records):
@@ -860,15 +880,63 @@ _CANDIDATE_NARROW_HEADER = re.compile(
     r"^\s*(?P<working>\d+)\s+●\s*(?P<idle>\d+)\s+●\s*(?P<blocked>\d+)\s+"
     r"hearting\s+(?P<version>\S+)\s+·\s+(?P<method>\S+)\s+"
     r"(?P<clock>\d{2}:\d{2})\s*$")
+_CANDIDATE_WIDE_HEADER = re.compile(
+    r"^\s*(?P<working>\d+)\s+working\s*●\s*(?P<idle>\d+)\s+idle\s*●\s*"
+    r"(?P<blocked>\d+)\s+answer needed\s+hearting\s+(?P<version>\S+)\s+·\s+"
+    r"(?P<method>\S+)\s+(?P<clock>\d{2}:\d{2})\s*$")
 _F70_METHODS = frozenset({"managed/stable", "managed/pinned", "linked", "packaged",
                           "mixed", "unmanaged", "unknown"})
 R14_HEADER_IDENTITY_PRD_SHA256 = "5391e658c94fc575fb39ffbc85b6cff76a742c47dec1132cedaa1aa6cde42386"
 
 
+def _header_identity_from_record(record):
+    value = record.get("validated_header_identity")
+    if not isinstance(value, dict):
+        return None
+    version, method = value.get("version"), value.get("install_method")
+    if not isinstance(version, str) or not version or method not in _F70_METHODS:
+        return None
+    return version, method
+
+
+def _header_hosts_from_record(record):
+    hosts = record.get("validated_header_hosts")
+    if not isinstance(hosts, list) or not hosts:
+        return None
+    clean = []
+    for host in hosts:
+        if (not isinstance(host, dict) or host.get("mark") not in ("⌂", "◇") or
+                not isinstance(host.get("name"), str) or not host["name"]):
+            return None
+        clean.append((host["mark"], host["name"]))
+    return clean
+
+
+def _header_row_text(cells, width):
+    if len(cells) != width or any(not isinstance(cell, (list, tuple)) or len(cell) < 3 or
+                                  len(str(cell[0] or "")) != 1 for cell in cells):
+        return None
+    return "".join(str(cell[0] or "") for cell in cells)
+
+
+def _compact_host_prefix(hosts):
+    mark, name = hosts[0]
+    return f"{mark} {name}" + (f" +{len(hosts) - 1}" if len(hosts) > 1 else "")
+
+
+def _full_host_prefix(hosts):
+    parts = [" hosts "]
+    for index, (mark, name) in enumerate(hosts):
+        parts.append(f"{mark} {name}")
+        parts.append(f" {len(hosts)}/{len(hosts)}" if index == len(hosts) - 1 else "  ")
+    return "".join(parts)
+
+
 def _r14_narrow_host_identity(record, band):
-    """Allow only the validated F70 identity and host/census tuple required by PRD v87."""
+    """Allow the exact source-backed compact host/count/F70 tuple on 80/100/140 cells."""
     trace = record.get("reference_overflow_mask") or {}
-    if (record.get("width") != 80 or record.get("rows") != 45 or record.get("state") not in VIEWS or
+    width = record.get("width")
+    if (width not in (80, 100, 140) or record.get("rows") != 45 or record.get("state") not in VIEWS or
             band.get("pane") != "frame" or band.get("rows") != [0] or
             record.get("reference_profile") != R14_REFERENCE_PROFILE or
             trace.get("profile") != R14_REFERENCE_PROFILE or trace.get("version") != REFERENCE_MASK_VERSION or
@@ -877,48 +945,46 @@ def _r14_narrow_host_identity(record, band):
     references, candidates = record.get("reference_cells") or (), record.get("fleet2_cells") or ()
     if not references or not candidates or not references[0] or not candidates[0]:
         return False
-
-    def row_text(cells):
-        if len(cells) != 80 or any(not isinstance(cell, (list, tuple)) or len(cell) < 3 or
-                                   len(str(cell[0] or "")) != 1 for cell in cells):
-            return None
-        return "".join(str(cell[0] or "") for cell in cells)
-
-    reference, candidate = row_text(references[0]), row_text(candidates[0])
-    if (reference is None or candidate is None or len(reference) != 80 or len(candidate) != 80 or
-            not record.get("reference_edge", [False])[0] or reference[-1] not in _SPINNER_GLYPHS or
-            "moving4" in reference):
+    reference = _header_row_text(references[0], width)
+    candidate = _header_row_text(candidates[0], width)
+    identity = _header_identity_from_record(record)
+    hosts = _header_hosts_from_record(record)
+    if reference is None or candidate is None or identity is None or hosts is None:
         return False
-    host_prefix = "⌂ moving4 +4"
+    expected_version, expected_method = identity
+    host_prefix = _compact_host_prefix(hosts)
     if not candidate.startswith(host_prefix):
+        return False
+    if width == 80 and (not record.get("reference_edge", [False])[0] or
+                        reference[-1] not in _SPINNER_GLYPHS or hosts[0] != ("⌂", "moving4") or
+                        "moving4" in reference):
         return False
     reference_spinner = [index for index, char in enumerate(reference) if char in _SPINNER_GLYPHS]
     candidate_spinner = [index for index, char in enumerate(candidate) if char in _SPINNER_GLYPHS]
     if (len(reference_spinner) != 1 or len(candidate_spinner) != 1 or
             reference[reference_spinner[0]] != candidate[candidate_spinner[0]]):
         return False
-    reference_census = reference[:reference_spinner[0]] + reference[reference_spinner[0] + 1:]
+    ref_spin = reference_spinner[0]
+    reference_census = (reference[:ref_spin] if ref_spin == width - 1 else reference[ref_spin + 1:])
     candidate_census = candidate[candidate_spinner[0] + 1:]
     reference_match = _REFERENCE_NARROW_HEADER.fullmatch(reference_census)
     candidate_match = _CANDIDATE_NARROW_HEADER.fullmatch(candidate_census)
     if not reference_match or not candidate_match:
         return False
-    identity = record.get("validated_header_identity")
-    if not isinstance(identity, dict):
-        return False
-    expected_version, expected_method = identity.get("version"), identity.get("install_method")
-    if (not isinstance(expected_version, str) or not expected_version or
-            expected_method not in _F70_METHODS or candidate_match.group("method") != expected_method):
+    if candidate_match.group("method") != expected_method:
         return False
     names = ("working", "idle", "blocked", "version", "clock")
     if (any(reference_match.group(name) != candidate_match.group(name) for name in names) or
             candidate_match.group("version") != expected_version):
         return False
 
-    # The actual Fleet JSON identity is an independent oracle; the candidate cannot bless itself.
-    # Exact tuples admit the approved host, existing colored glyph/count census, F70 fields and clock.
-    expected_host = [("⌂", "g_work"), (" ", "g_work")] + [(char, "g_work") for char in "moving4"] + [
-        (" ", "dim"), ("+", "dim"), ("4", "dim")]
+    # The actual Fleet JSON hosts and identity are independent of the candidate frame.
+    mark, name = hosts[0]
+    host_style = "g_work" if mark == "⌂" else "dim"
+    name_style = "g_work" if mark == "⌂" else "loc_repo"
+    expected_host = [(mark, host_style), (" ", host_style)] + [(char, name_style) for char in name]
+    if len(hosts) > 1:
+        expected_host += [(" ", "dim"), ("+", "dim")] + [(char, "dim") for char in str(len(hosts) - 1)]
     for column, (glyph, style) in enumerate(expected_host):
         if tuple(candidates[0][column][:3]) != (glyph, style, None):
             return False
@@ -938,10 +1004,72 @@ def _r14_narrow_host_identity(record, band):
     column = spinner
     for text, style in census_parts:
         for glyph in text:
-            if column >= 80 or tuple(candidates[0][column][:3]) != (glyph, style, None):
+            if column >= width or tuple(candidates[0][column][:3]) != (glyph, style, None):
                 return False
             column += 1
-    return column == 80
+    return column == width
+
+
+def _r14_wide_f70_method(record, band):
+    """Allow only the exact F70 method insertion at the full-host 168-cell layout."""
+    trace = record.get("reference_overflow_mask") or {}
+    if (record.get("width") != 168 or record.get("rows") != 45 or record.get("state") not in VIEWS or
+            band.get("pane") != "frame" or band.get("rows") != [0] or
+            record.get("reference_profile") != R14_REFERENCE_PROFILE or
+            trace.get("profile") != R14_REFERENCE_PROFILE or trace.get("version") != REFERENCE_MASK_VERSION or
+            any(diff.get("kind") != "cell" or diff.get("row") != 0 for diff in band.get("diffs", ()))):
+        return False
+    references, candidates = record.get("reference_cells") or (), record.get("fleet2_cells") or ()
+    if not references or not candidates:
+        return False
+    reference = _header_row_text(references[0], 168)
+    candidate = _header_row_text(candidates[0], 168)
+    identity = _header_identity_from_record(record)
+    hosts = _header_hosts_from_record(record)
+    if reference is None or candidate is None or identity is None or hosts is None:
+        return False
+    version, method = identity
+    host_prefix = _full_host_prefix(hosts)
+    if not candidate.startswith(host_prefix):
+        return False
+    ref_spinners = [index for index, char in enumerate(reference) if char in _SPINNER_GLYPHS]
+    candidate_spinners = [index for index, char in enumerate(candidate) if char in _SPINNER_GLYPHS]
+    if (len(ref_spinners) != 1 or len(candidate_spinners) != 1 or
+            reference[ref_spinners[0]] != candidate[candidate_spinners[0]]):
+        return False
+    ref_match = _REFERENCE_NARROW_HEADER.fullmatch(reference[ref_spinners[0] + 1:])
+    candidate_match = _CANDIDATE_WIDE_HEADER.fullmatch(candidate[candidate_spinners[0] + 1:])
+    if not ref_match or not candidate_match:
+        return False
+    if (candidate_match.group("method") != method or candidate_match.group("version") != version or
+            any(ref_match.group(name) != candidate_match.group(name)
+                for name in ("working", "idle", "blocked", "version", "clock"))):
+        return False
+    identity_text = f"hearting {version} · {method}"
+    if candidate.count(identity_text) != 1:
+        return False
+    identity_start = candidate.index("hearting")
+    version_start = identity_start + len("hearting ")
+    method_start = version_start + len(version)
+    method_text = " · " + method
+    method_end = method_start + len(method_text)
+    candidate_cells = candidates[0]
+    for begin, count, style in (
+            (identity_start, len("hearting"), "hearting_name"),
+            (version_start - 1, len(" ") + len(version), "version_release"),
+            (method_start, len(" · "), "dim"),
+            (method_start + len(" · "), len(method), "version_method")):
+        if any(tuple(candidate_cells[index][1:3]) != (style, None)
+               for index in range(begin, begin + count)):
+            return False
+
+    # Exact method removal plus the matching right-alignment shift must reproduce all 168 R14 tuples.
+    inserted = len(method_text)
+    spinner = candidate_spinners[0]
+    normalized = (list(candidate_cells[:spinner]) + [(" ", None, None)] * inserted +
+                  list(candidate_cells[spinner:method_start]) + list(candidate_cells[method_end:]))
+    return (len(normalized) == 168 and
+            [tuple(cell) for cell in normalized] == [tuple(cell) for cell in references[0]])
 
 
 def _unknown_compute_track(record, band):
@@ -1097,11 +1225,17 @@ RULES = [
      "only blank cells differ, and only in their foreground key: a space has no glyph and no background, so nothing visible differs",
      _blank_cell_key),
     ("prd-narrow-host-identity", "intended", None,
-     "at 80 columns the pinned R14 header omits the connected host identity; PRD v87 requires the host name on the first line "
-     "and F70 requires `hearting <version> · <install-method>` (SHA256 " + R14_HEADER_IDENTITY_PRD_SHA256 + "). The candidate "
-     "must match the independently captured Fleet JSON version/method, exact moving4/+4 prefix, reference counts/clock, "
-     "approved styles, and bounded row-0 tuples",
+     "at 80/100/140 columns the PRD-sized header uses its compact host and existing colored glyph/count form to keep "
+     "connected host, census, clock, and the F70 `hearting <version> · <install-method>` identity together "
+     "(SHA256 " + R14_HEADER_IDENTITY_PRD_SHA256 + "). The exact host/count comes from captured Fleet JSON; version/method "
+     "must match its independent identity, reference counts/clock, approved styles, and bounded row-0 tuples",
      _r14_narrow_host_identity),
+    ("prd-f70-install-method", "intended", None,
+     "at 168 columns the R14 census/host tuple remains unchanged; the exact F70 method field is appended to the validated "
+     "hearting/version identity and right-alignment shifts only the preceding header group. Every tuple matches the "
+     "reference after removing that exact field (PRD v87 SHA256 " + R14_HEADER_IDENTITY_PRD_SHA256 + "); the identity and "
+     "full host inventory come from captured Fleet JSON",
+     _r14_wide_f70_method),
     ("prd-census-spinner-order", "intended", None,
      "the current PRD moves only the spinner; census, version, clock and every other styled cell match after its position is normalized",
      _spinner_row_order),
@@ -1353,7 +1487,9 @@ def run_capture(out, reference, approved=None, source_bundle=None, from_capture=
         vm, now = build_live_vm(capture_dir)
     side_dir = Path(out) / "evidence/parity/side-by-side/today"
     header_identity = _validated_header_identity(capture_dir)
-    records = compare_vm(vm, reference, side_dir, validated_header_identity=header_identity)
+    header_hosts = _validated_header_hosts(capture_dir)
+    records = compare_vm(vm, reference, side_dir, validated_header_identity=header_identity,
+                         validated_header_hosts=header_hosts)
     copy_limitations = _unique_reference_copy_limitations(records)
     summary = [{key: row[key] for key in ("state", "width", "rows", "equal", "difference_count", "png")}
                for row in records]
