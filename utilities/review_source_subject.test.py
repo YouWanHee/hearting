@@ -139,6 +139,234 @@ class SourceSubjectTest(unittest.TestCase):
         ))
         self.assertTrue(SUBJECT.has_source_subject(self.route, self.route["nodes"][0]))
 
+    def _design_fixture(self, *, legacy=False):
+        import artifact_producer
+        output = Path(self.temp.name) / ("legacy-cycle" if legacy else "flat-cycle") / "artifacts"
+        build_scopes = (["designs/<cycle>/02_tokens/**", "designs/<cycle>/03_components/**",
+                         "spec/design/02_tokens/**", "spec/design/03_components/**"] if legacy else
+                        ["designs/02_tokens/**", "designs/03_components/**",
+                         "spec/design/02_tokens/**", "spec/design/03_components/**"])
+        build = {"id": "build", "kind": "pipeline-stage", "completion_gate": "design-build",
+                 "write_scope": build_scopes, "depends_on": []}
+        visual = {"id": "visual-verify", "kind": "review-worker", "unit": "design/verifier",
+                  "completion_gate": "design-verify", "depends_on": ["build"]}
+        critic = {"id": "critic-review", "kind": "review-worker", "unit": "design/critic",
+                  "completion_gate": "design-critic", "depends_on": ["build"]}
+        route = {"route_id": "rt-design-subject", "route_hash": "sha256:design-subject",
+                 "artifact_root": str(Path(self.temp.name) / "artifacts"),
+                 "cwd": str(self.repo), "nodes": [build, visual, critic]}
+        root = "designs/<cycle>" if legacy else "designs"
+        for rel, data in ((f"{root}/02_tokens/tokens.json", b'{"color":"blue"}\n'),
+                          (f"{root}/03_components/card.html", b"<article>Card</article>\n"),
+                          ("spec/design/02_tokens/contract.json", b'{"token":"color"}\n')):
+            path = output / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        cycle = {"campaign_id": "camp_fixture", "cycle_id": "cyc_fixture",
+                 "route_id": route["route_id"]}
+        return route, visual, critic, output, cycle, artifact_producer
+
+    def test_design_review_uses_same_sealed_build_subject_and_excludes_review_output(self):
+        route, visual, critic, output, cycle, producer = self._design_fixture()
+        with mock.patch.object(producer, "route_cycle_for", return_value=cycle), \
+             mock.patch.object(producer, "cycle_dir", return_value=output.parent):
+            before = SUBJECT.observe(route, visual)
+            self.assertEqual(SUBJECT.observe(route, critic)["digest"], before["digest"])
+            self.assertEqual(before["family"], "design-build")
+            report = output / "designs/04_review/verify/verdict.yaml"
+            report.parent.mkdir(parents=True)
+            report.write_text("verdict: PASS\n", encoding="utf-8")
+            self.assertEqual(SUBJECT.observe(route, visual)["digest"], before["digest"])
+            token = output / "designs/02_tokens/tokens.json"
+            token.write_bytes(b'{"color":"green"}\n')
+            changed = SUBJECT.observe(route, visual)
+            self.assertNotEqual(changed["digest"], before["digest"])
+            token.write_bytes(b'{"color":"blue"}\n')
+            self.assertEqual(SUBJECT.observe(route, visual)["digest"], before["digest"])
+
+    def test_literal_legacy_design_build_scopes_are_observed_without_rewriting_them(self):
+        route, visual, _critic, output, cycle, producer = self._design_fixture(legacy=True)
+        self.assertIn("designs/<cycle>/02_tokens/**", route["nodes"][0]["write_scope"])
+        with mock.patch.object(producer, "route_cycle_for", return_value=cycle), \
+             mock.patch.object(producer, "cycle_dir", return_value=output.parent):
+            subject = SUBJECT.observe(route, visual)
+        self.assertTrue(any(item["path"].startswith("designs/<cycle>/")
+                            for item in subject["manifest"]))
+
+    def test_review_input_subject_hashes_consumed_bytes_not_publication_path(self):
+        import review_input
+        producer = {"id": "plan", "write_scope": ["plan.md", "checklist.md"]}
+        node = {"id": "plan-check", "kind": "review-worker", "unit": "qa/plan-review",
+                "completion_gate": "code-plan-check", "depends_on": ["plan"]}
+        route = {"route_id": "rt-plan-subject", "route_hash": "sha256:plan-subject",
+                 "nodes": [producer, node]}
+        left = Path(self.temp.name) / "first" / "plan.md"
+        right = Path(self.temp.name) / "republished" / "plan.md"
+        for path in (left, right):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("approved plan\n", encoding="utf-8")
+            (path.parent / "checklist.md").write_text("same checklist\n", encoding="utf-8")
+        def candidate(path, publication):
+            return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "producer": {"attempt_id": publication, "marker_digest": publication}}
+        first = SUBJECT.observe(route, node, reviewed_input=candidate(left, "attempt-A"))
+        second = SUBJECT.observe(route, node, reviewed_input=candidate(right, "attempt-B"))
+        self.assertTrue(SUBJECT.has_review_subject(route, node, reviewed_input=candidate(left, "A")))
+        self.assertEqual(first["family"], "document:plan")
+        self.assertEqual(first["digest"], second["digest"])
+        (right.parent / "checklist.md").write_text("changed checklist\n", encoding="utf-8")
+        self.assertNotEqual(first["digest"], SUBJECT.observe(
+            route, node, reviewed_input=candidate(right, "attempt-C"))["digest"])
+        tampered = candidate(left, "attempt-A")
+        tampered["sha256"] = "0" * 64
+        with self.assertRaises(SUBJECT.SourceSubjectError):
+            SUBJECT.observe(route, node, reviewed_input=tampered)
+
+    def test_unmarked_intermediate_review_binding_advances_design_generation(self):
+        route, visual, _critic, output, cycle, producer = self._design_fixture()
+        state = Path(self.temp.name) / "design-dispatch"
+        state.mkdir()
+        jobs = state / "jobs.log"
+        jobs.write_text("", encoding="utf-8")
+        completion = state / "completion" / route["route_id"]
+        def register(attempt):
+            binding = SUBJECT.seal_attempt(jobs, route, visual, attempt,
+                                           expected_subject_digest=None)
+            metadata = {"attempt_id": attempt, "route_id": route["route_id"],
+                        "route_hash": route["route_hash"], "route_node": visual["id"],
+                        **binding}
+            row = "\t".join(("fixture", "done", str(self.repo), str(self.repo), attempt,
+                             ",".join(f"{key}={value}" for key, value in metadata.items())))
+            with jobs.open("a", encoding="utf-8") as stream:
+                stream.write(row + "\n")
+            return SUBJECT.read_binding(jobs, metadata)
+        with mock.patch.object(producer, "route_cycle_for", return_value=cycle), \
+             mock.patch.object(producer, "cycle_dir", return_value=output.parent):
+            a1 = register("att-design-A1")
+            (output / "designs/02_tokens/tokens.json").write_bytes(b'{"color":"green"}\n')
+            _b = register("att-design-B")  # no completion marker for B
+            (output / "designs/02_tokens/tokens.json").write_bytes(b'{"color":"blue"}\n')
+            a2 = register("att-design-A2")
+        self.assertEqual(a1["subject_digest"], a2["subject_digest"])
+        self.assertLess(a1["source_epoch"], a2["source_epoch"])
+
+    def test_other_capped_reviews_bind_only_concrete_sealed_artifact_inputs(self):
+        import artifact_producer
+        build = {"id": "report", "kind": "pipeline-stage", "depends_on": [],
+                 "write_scope": ["report/REPORT.md", "report/index.html",
+                                 "report/report_manifest.json", "report/media/**"]}
+        verify = {"id": "independent-verify", "kind": "review-worker",
+                  "completion_gate": "lab-independent-verify", "unit": "qa/reviewer",
+                  "depends_on": ["report"], "inputs": ["report/REPORT.md", "report/index.html",
+                      "report/report_manifest.json", "report/media/**"],
+                  "write_scope": ["reviews/eval/**"]}
+        route = {"route_id": "rt-report-review", "route_hash": "sha256:report-review",
+                 "artifact_root": str(Path(self.temp.name) / "artifacts"),
+                 "cwd": str(self.repo), "nodes": [build, verify]}
+        cycle_dir = Path(self.temp.name) / "report-cycle"
+        output = cycle_dir / "artifacts"
+        for relative, data in (("report/REPORT.md", b"report A"),
+                               ("report/index.html", b"<main>A</main>"),
+                               ("report/report_manifest.json", b'{"version":1}'),
+                               ("report/media/image.png", b"image A")):
+            path = output / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        cycle = {"campaign_id": "camp_report", "cycle_id": "cyc_report",
+                 "route_id": route["route_id"]}
+        with mock.patch.object(artifact_producer, "route_cycle_for", return_value=cycle), \
+             mock.patch.object(artifact_producer, "cycle_dir", return_value=cycle_dir):
+            first = SUBJECT.observe(route, verify)
+            self.assertEqual(first["family"], "artifact-review:lab-independent-verify")
+            self.assertTrue(SUBJECT.has_review_subject(route, verify))
+            output_report = output / "reviews/eval/verdict.yaml"
+            output_report.parent.mkdir(parents=True)
+            output_report.write_text("verdict: PASS\n", encoding="utf-8")
+            self.assertEqual(SUBJECT.observe(route, verify)["digest"], first["digest"])
+            report = output / "report/REPORT.md"
+            report.write_bytes(b"report B")
+            self.assertNotEqual(SUBJECT.observe(route, verify)["digest"], first["digest"])
+            report.unlink()
+            outside = Path(self.temp.name) / "outside-report.md"
+            outside.write_bytes(b"outside")
+            report.symlink_to(outside)
+            with self.assertRaises(SUBJECT.SourceSubjectError) as refused:
+                SUBJECT.observe(route, verify)
+            self.assertEqual(refused.exception.reason, "review-artifact-input-symlink")
+
+        resource = {"id": "smoke", "kind": "review-worker", "completion_gate": "hash-bound-smoke",
+                    "inputs": ["experiment-scaffold", "config"], "depends_on": [],
+                    "write_scope": ["reviews/smoke/**"]}
+        resource_route = {"route_id": "rt-resource", "nodes": [resource]}
+        self.assertFalse(SUBJECT.has_review_subject(resource_route, resource))
+
+    def test_missing_optional_artifact_bytes_do_not_create_a_new_input_gate(self):
+        import artifact_producer
+        producer = {"id": "report", "kind": "pipeline-stage", "depends_on": [],
+                    "write_scope": ["report/REPORT.md"]}
+        verify = {"id": "independent-verify", "kind": "review-worker",
+                  "completion_gate": "lab-independent-verify", "unit": "qa/reviewer",
+                  "depends_on": ["report"], "inputs": ["report/REPORT.md"],
+                  "write_scope": ["reviews/eval/**"]}
+        artifact_root = Path(self.temp.name) / "missing-root"
+        cycle_dir = Path(self.temp.name) / "missing-cycle"
+        route = {"route_id": "rt-missing-report", "route_hash": "sha256:missing-report",
+                 "artifact_root": str(artifact_root), "cwd": str(self.repo),
+                 "nodes": [producer, verify]}
+        cycle = {"campaign_id": "camp_missing", "cycle_id": "cyc_missing",
+                 "route_id": route["route_id"]}
+        with mock.patch.object(artifact_producer, "route_cycle_for", return_value=cycle), \
+             mock.patch.object(artifact_producer, "cycle_dir", return_value=cycle_dir):
+            self.assertFalse(SUBJECT.has_review_subject(route, verify))
+            self.assertIsNone(SUBJECT.marker_currency(
+                route, verify, {"attempt_id": "att-legacy"},
+                Path(self.temp.name) / "state" / "completion" / route["route_id"],
+                jobs=Path(self.temp.name) / "state" / "jobs.log"))
+
+    def test_capped_selector_table_keeps_unresolved_symbols_on_the_legacy_budget(self):
+        import artifact_producer
+        cases = (
+            ("quality-review", ["draft/**"], ["draft/**"], [("draft/body.md", b"draft")], True),
+            ("run-verify", ["run.json", "logs/**"], ["run.json", "logs/**"],
+             [("run.json", b'{"run":1}'), ("logs/output.log", b"large log")], True),
+            ("claim-verify", ["report/**", "cards/**"], ["report/**", "cards/**"],
+             [("report/claim.md", b"claim"), ("cards/one.md", b"card")], True),
+            ("release-review", ["release-config/**", "ship-checklist"],
+             ["release-config/**", "ship-checklist"], [("release-config/release.json", b"{}")], True),
+            ("post-deploy-verify", ["deploy-record.json", "release-config/**"],
+             ["deploy-record.json", "release-config/**"],
+             [("deploy-record.json", b"{}"), ("release-config/release.json", b"{}")], True),
+            ("verify", ["user_profile/**"], ["user_profile/**"],
+             [("root:user_profile/profile.md", b"profile")], True),
+            ("smoke", ["experiment-scaffold", "config"],
+             ["experiment-scaffold/**", "config/**"],
+             [("experiment-scaffold/scaffold.json", b"{}"), ("config/config.json", b"{}")], False),
+            ("inspect", ["target-artifact"], ["target-artifact"], [], False),
+            ("qa", ["analysis_project/<mode>/**"], ["analysis_project/<mode>/**"], [], False),
+        )
+        with mock.patch.object(artifact_producer, "route_cycle_for", side_effect=lambda _root, route: {
+                "campaign_id": "camp-table", "cycle_id": "cyc-table", "route_id": route["route_id"]}), \
+             mock.patch.object(artifact_producer, "cycle_dir", side_effect=lambda _root, *_args:
+                               self.repo / "generic-cycle"):
+            for index, (node_id, inputs, scopes, payloads, expected) in enumerate(cases):
+                artifact_root = Path(self.temp.name) / f"root-{index}"
+                output = self.repo / "generic-cycle" / "artifacts"
+                output.mkdir(parents=True, exist_ok=True)
+                producer = {"id": "producer", "write_scope": scopes, "depends_on": []}
+                node = {"id": node_id, "kind": "review-worker", "completion_gate": node_id,
+                        "inputs": inputs, "depends_on": ["producer"],
+                        "unit": "qa/reviewer", "write_scope": ["reviews/check/**"]}
+                route = {"route_id": f"rt-selector-{index}", "route_hash": "sha256:"+str(index)*64,
+                         "artifact_root": str(artifact_root), "nodes": [producer, node]}
+                for relative, data in payloads:
+                    if relative.startswith("root:"):
+                        path = artifact_root / relative[5:]
+                    else:
+                        path = output / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
+                self.assertEqual(SUBJECT.has_review_subject(route, node), expected, node_id)
+
     def test_custom_code_test_gate_binds_source_and_uses_ancestor_source_scope(self):
         self.assertTrue(SUBJECT.has_review_subject(self.route, self.test_node))
         self.assertTrue(SUBJECT.has_source_subject(self.route, self.test_node))

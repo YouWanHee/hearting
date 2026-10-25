@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, contextlib, hashlib, importlib.util, io, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
+import base64, contextlib, copy, hashlib, importlib.util, io, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -160,6 +160,25 @@ class TestRoute(unittest.TestCase):
   # recipe's declared bindings) -- assert that explicitly now that
   # autopilot-code's recipe declares a non-empty frame-review binding.
   self.assertEqual(a["human_gate_bindings"],[])
+ def test_code_spec_authoring_scope_flows_to_standard_quick_and_direct_routes(self):
+  standard=R.compile_route(**self.args(requested_intensity="standard",predicates=[],signals=[],
+   transport="headless",inline_reason=None,dispatch_evidence=self.dispatch(self.nested())))
+  execute=next(n for n in standard["nodes"] if n["id"]=="execute")
+  self.assertTrue(standard["spec_touch"])
+  self.assertIn("spec/**",execute["write_scope"])
+  self.assertEqual(execute["guard_preconditions"],["artifact-order-prechecked"])
+  R.verify_route(standard,R.ROOT)
+  quick=R.compile_route(**self.args(predicates=[],signals=[],transport=None,inline_reason=None,
+   registered_headless_evidence=self.registered_headless()))
+  owner=next(n for n in quick["nodes"] if n["id"]=="one-shot")
+  self.assertEqual(quick["effective_intensity"],"quick")
+  self.assertTrue(quick["spec_touch"])
+  self.assertIn("spec/**",owner["write_scope"])
+  R.verify_route(quick,R.ROOT)
+  direct=R.compile_route(**self.args())
+  self.assertTrue(direct["spec_touch"])
+  self.assertIn("spec/**",direct["nodes"][0]["write_scope"])
+  R.verify_route(direct,R.ROOT)
  def test_slug_is_canonicalized_and_sealed_while_legacy_absence_verifies(self):
   legacy=R.compile_route(**self.args())
   self.assertNotIn("slug",legacy)
@@ -2679,7 +2698,8 @@ class TestContinuation(unittest.TestCase):
   route["route_hash"]=R.route_hash(route)
   route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]
   return route
- def _complete_node(self,route,node,evidence_root,attempt_id=None):
+ def _complete_node(self,route,node,evidence_root,attempt_id=None,*,seal_review_input=True,
+                    reviewed_evidence=None):
   attempt_id=attempt_id or f"att-continuation-{node['id']}"
   evidence=Path(evidence_root)/f"{node['id']}.md"
   evidence.parent.mkdir(parents=True,exist_ok=True)
@@ -2693,7 +2713,19 @@ class TestContinuation(unittest.TestCase):
    "route_hash":route["route_hash"],"route_node":node["id"],
   }
   from review_source_subject import is_implementation_review,is_source_test,seal_attempt
-  if is_implementation_review(route,node) or is_source_test(node):
+  review_input_key=None
+  if seal_review_input and node.get("kind")=="review-worker":
+   import review_input
+   try:
+    candidate=review_input.resolve_input(route,node,jobs,reviewed_evidence)
+   except D.DispatchContractError:
+    candidate=None
+   if candidate is not None:
+    review_input_key=review_input.KEY
+    metadata[review_input_key]=review_input.seal_binding(jobs,metadata,candidate)
+    metadata.update(seal_attempt(
+     jobs,route,node,attempt_id,worktree=route["cwd"],attempt_metadata=metadata))
+  if is_implementation_review(route,node) or is_source_test(node) or review_input_key:
    metadata.update(seal_attempt(jobs,route,node,attempt_id,worktree=route["cwd"]))
    # This fixture models a settled completion, not the child lifecycle. Use
    # the common marker writer with the exact source binding; the matching
@@ -2723,10 +2755,11 @@ class TestContinuation(unittest.TestCase):
    jobs,route["route_id"],node["id"],attempt_id,
    extra_metadata={"route_hash":route["route_hash"],
                    **{key:value for key,value in metadata.items()
-                      if key.startswith("review_subject_")}},
+                      if key.startswith("review_subject_") or key==review_input_key}},
   )
   return evidence
- def _complete_prefix(self,route,resume_from,evidence_root,skip=(),attempt_namespace=None):
+ def _complete_prefix(self,route,resume_from,evidence_root,skip=(),attempt_namespace=None,
+                      seal_review_inputs=True):
   evidence={}
   for node in route["nodes"][:next(
       index for index,row in enumerate(route["nodes"]) if row["id"]==resume_from
@@ -2734,7 +2767,11 @@ class TestContinuation(unittest.TestCase):
    if node["id"] in skip: continue
    attempt_id=(f"att-continuation-{node['id']}-{attempt_namespace}"
                if attempt_namespace else None)
-   evidence[node["id"]]=self._complete_node(route,node,evidence_root,attempt_id=attempt_id)
+   reviewed_evidence=(str(evidence["plan"]) if seal_review_inputs
+                      and node["id"]=="plan-check" and "plan" in evidence else None)
+   evidence[node["id"]]=self._complete_node(route,node,evidence_root,attempt_id=attempt_id,
+                                            seal_review_input=seal_review_inputs,
+                                            reviewed_evidence=reviewed_evidence)
   # A reused human-gate predecessor proves more than source completion. Seal a
   # real raise+proceed pair in the fixture ledger, matching production.
   prefix_ids={node["id"] for node in route["nodes"][:next(
@@ -2960,22 +2997,17 @@ class TestContinuation(unittest.TestCase):
    outside.write_text("changed\n",encoding="utf-8")
    self.assertEqual(with_link,R.evidence_digest(renamed))
 
- def test_gate_off_continuation_reuses_current_evidence_after_edit(self):
+ def test_gate_off_continuation_does_not_reuse_unbound_legacy_review_pass(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=Path(tmp)
    source=self._source(root/"artifacts")
-   evidence=self._complete_prefix(source,"test",root/"evidence")
+   evidence=self._complete_prefix(source,"test",root/"evidence",seal_review_inputs=False)
    evidence["plan"].write_text("revised plan\n")
    with mock.patch.dict(os.environ,{"HEARTING_GATES":"off"}), contextlib.redirect_stderr(io.StringIO()):
     continuation=self._build(source,last_turn_id="current-turn")
-    self.assertIsNone(continuation["first_runnable_blocker"])
-    self.assertIsNone(continuation["requested_boundary_blocker"])
-    reused=next(row for row in continuation["reused_nodes"] if row["node_id"]=="plan")
-    self.assertEqual(reused["output_evidence_digest"],R.evidence_digest(evidence["plan"]))
-    R.verify_route(continuation,source["cwd"])
-    output=R.canonical_route_path(root/"artifacts",continuation["route_id"])
-    R.publish_continuation_route(continuation,source,output)
-    self.assertTrue(output.is_file())
+    self.assertEqual(continuation["first_runnable_blocker"],
+                     "continuation-source-node-unverified:plan-check:completion-review-subject-unknown")
+    self.assertNotIn("plan-check", {row["node_id"] for row in continuation["reused_nodes"]})
 
  def test_slug_metadata_is_inherited_by_continuation(self):
   with tempfile.TemporaryDirectory() as tmp:
@@ -3782,7 +3814,7 @@ class TestContinuation(unittest.TestCase):
    repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
    source=self._source(artifact,cwd=repo)
    pinned=source["source_commit"]
-   self._complete_prefix(source,"execute",Path(tmp)/"evidence")
+   self._complete_prefix(source,"execute",Path(tmp)/"evidence",seal_review_inputs=True)
    execute=next(node for node in source["nodes"] if node["id"]=="execute")
    self.assertTrue(R._node_mutates_worktree(execute))
    (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
@@ -3811,39 +3843,31 @@ class TestContinuation(unittest.TestCase):
    self.assertNotEqual(rebound["source_commit"],pinned)
    self.assertIn("execute",[node["id"] for node in rebound["nodes"]])
 
- def test_a_sd156_7_rebind_ignores_registry_state_entirely(self):
-  # SD-156, replacing review round 2 B2/round 3 B2's registry-unreadable
-  # coverage: a moved HEAD re-pins the same way whether the registry is
-  # intact, deleted, a directory, or unbound -- the builder no longer reads
-  # the registry to decide.
+ def test_a_sd156_7_rebind_requires_exact_review_registry(self):
+  # A current plan-check row is part of the rebind proof. A valid registry
+  # permits the SD-156 re-pin; deleting or making it unreadable must leave the
+  # old route intact and refuse the unproved review prefix.
   import subprocess
   with tempfile.TemporaryDirectory() as tmp:
    repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
    source=self._source(artifact,cwd=repo)
    pinned=source["source_commit"]
-   self._complete_prefix(source,"execute",Path(tmp)/"evidence")
+   self._complete_prefix(source,"execute",Path(tmp)/"evidence",seal_review_inputs=True)
    (repo/"x").write_text("b")
    subprocess.run(["git","-C",str(repo),"commit","-qam","execute output"],check=True)
    moved=self._git_head(repo)
    self.assertNotEqual(moved,pinned)
    sealed=Path(source["launch_compatibility_tuple"]["jobs_path"]["path"])
-   for name,wreck in (
-    ("registry intact",lambda: None),
-    ("registry deleted",lambda: sealed.unlink()),
-   ):
-    with self.subTest(name):
-     if sealed.is_dir(): sealed.rmdir()
-     elif sealed.exists(): sealed.unlink()
-     sealed.parent.mkdir(parents=True,exist_ok=True)
-     sealed.write_text("",encoding="utf-8")
-     wreck()
-     rebound=self._build(source,resume_from_node="execute",requested_boundary="execute")
-     self.assertEqual(rebound["source_commit"],moved)
-   # A registry that is a directory is unreadable for a DIFFERENT, unrelated
-   # reason (the reused-prefix evidence snapshot at `frame`, not this rebind)
-   # and still blocks the continuation before source_commit is even sealed --
-   # unaffected by SD-156.
-   if sealed.exists(): sealed.unlink()
+   original_registry=sealed.read_bytes()
+   rebound=self._build(source,resume_from_node="execute",requested_boundary="execute")
+   self.assertIn("source_commit",rebound,rebound.get("first_runnable_blocker"))
+   self.assertEqual(rebound["source_commit"],moved)
+   self.assertEqual(sealed.read_bytes(),original_registry)
+   sealed.unlink()
+   missing=self._build(source,resume_from_node="execute",requested_boundary="execute")
+   self.assertEqual(missing["first_runnable_blocker"],
+    "continuation-source-node-unverified:plan-check:completion-review-subject-registry-missing")
+   self.assertNotIn("source_commit",missing)
    sealed.mkdir()
    with self.subTest("registry is a directory"):
     blocked=self._build(source,resume_from_node="execute",requested_boundary="execute")
@@ -4453,11 +4477,8 @@ class TestContinuation(unittest.TestCase):
     else: os.environ["AGENT_HOME"]=previous_home
     if previous_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
     else: os.environ["AGENT_DISPATCH_JOBS"]=previous_jobs
- def test_f47_3_continuation_outputs_byte_identical(self):
-  """SD-118 (F47-3): the 6 SD-104 continuation outputs are byte-identical to a
-  golden captured before SD-118 touched capability-route.py/tools/fleet/route.py
-  (plan.md §7.2). Fixture is generated once via F47_3_EMIT_GOLDEN=1 and never
-  regenerated afterward -- this test only compares."""
+ def test_f47_3_continuation_outputs_match_the_review_currency_golden(self):
+  """Pin continuation output after excluding unbound legacy review PASS rows."""
   golden_path=R.ROOT/"utilities"/"fixtures"/"f47-3-continuation-golden.json"
   keys=(
    "source_route_supersession","supersession_edges","continuation_id",
@@ -4557,7 +4578,7 @@ class TestContinuation(unittest.TestCase):
     fixture_head=subprocess.run(["git","-C",str(cwd),"rev-parse","HEAD"],
                                 check=True,text=True,capture_output=True).stdout.strip()
     source=self._source(root/"artifacts",cwd=cwd)
-    self._complete_prefix(source,"test",root/"evidence")
+    self._complete_prefix(source,"test",root/"evidence",seal_review_inputs=False)
     continuation=self._build(source)
   finally:
    if previous_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
@@ -4599,7 +4620,7 @@ class TestContinuation(unittest.TestCase):
    golden_path.write_text(json.dumps({
     "base_commit":R._git_commit(R.ROOT),
     "generated_before_sd118":False,
-    "note":"regenerated after tokenizing the checkout path; guards drift from the regeneration commit onward",
+    "note":"regenerated after source-content review currency made unbound legacy review PASS rows non-current",
     "payload":serialized,
    },indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
    return
@@ -5781,11 +5802,13 @@ class VerifiedRouteLineageTest(TestContinuation):
    full_source=self._source(full_root)
    full_source_path=R.canonical_route_path(full_root,full_source["route_id"])
    R.write_once(full_source_path,full_source)
-   self._complete_prefix(full_source,"test",Path(tmp)/"full-prefix-evidence")
+   self._complete_prefix(full_source,"test",Path(tmp)/"full-prefix-evidence",
+                         attempt_namespace="full-prefix")
    full=R.build_continuation_route(
     full_source,resume_from_node="test",requested_boundary="test",
     reason="full-prefix-cut",artifact_root=full_root,
    )
+   self.assertIn("route_id",full,full.get("first_runnable_blocker"))
    R.publish_continuation_route(full,full_source,
                                 R.canonical_route_path(full_root,full["route_id"]))
    self.assertTrue(any(row["node_id"]=="plan-check" for row in full["reused_nodes"]))
@@ -10842,6 +10865,80 @@ class NonGitArtifactDeltaTest(unittest.TestCase):
    created=output/"created.md";created.write_text("new\n")
    delta=R._artifact_delta(baseline,output)
    self.assertEqual(delta,{changed,deleted,created})
+
+
+class LegacyDesignBasisVerifyTest(unittest.TestCase):
+ def setUp(self):
+  self.fixture=TestRoute("runTest")
+  self.fixture.setUp()
+  self.addCleanup(self.fixture.doCleanups)
+
+ def _route(self):
+  current=R.TOPO.load_registry()
+  def legacy(value):
+   if isinstance(value,str):
+    if value=="designs": return "designs/<cycle>"
+    if value.startswith("designs/"): return value.replace("designs/","designs/<cycle>/",1)
+    return value
+   if isinstance(value,list): return [legacy(item) for item in value]
+   if isinstance(value,dict): return {key:legacy(item) for key,item in value.items()}
+   return value
+  old=legacy(current)
+  kwargs=self.fixture.args(capability="autopilot-design",capability_mode="default",
+      requested_intensity="quick",predicates=[],transport=None,inline_reason=None,
+      registered_headless_evidence=self.fixture.registered_headless())
+  route=legacy(R.compile_route(**kwargs))
+  temporary=tempfile.TemporaryDirectory()
+  self.addCleanup(temporary.cleanup)
+  root=Path(temporary.name)/"sealed-v3.43.6"
+  (root/"capabilities").mkdir(parents=True)
+  shutil.copytree(R.ROOT/"roles"/"units",root/"roles"/"units")
+  (root/"capabilities"/"topologies.json").write_text(
+      json.dumps(old,ensure_ascii=False),encoding="utf-8")
+  unit_digest=R.unit_catalog_digest(root/"roles"/"units")
+  route["registry_digest"]=R.TOPO.registry_digest(old)
+  route["capability_registry_digest"]=R.TOPO.capability_registry_digest(old,"autopilot-design")
+  route["unit_catalog_digest"]=unit_digest
+  route["validation_basis"]={"basis_version":1,"registry_root":str(root),
+      "runtime_root":str(root),"unit_catalog_root":str(root),
+      "runtime_root_validated":True,"runtime_root_match":True}
+  route["route_hash"]=R.route_hash(route)
+  route["route_id"]="rt-"+route["route_hash"].split(":",1)[1][:16]
+  return route,old,root,unit_digest,current
+
+ def test_old_literal_graph_verifies_from_exact_basis_and_rejects_registry_or_unit_drift(self):
+  route,old,root,unit_digest,current=self._route()
+  actual_unit_digest=R.unit_catalog_digest
+  with mock.patch.object(R,"_verified_immutable_release_identity",return_value={"version":"v3.43.6"}), \
+       mock.patch.object(R,"unit_catalog_digest",side_effect=lambda path=None:
+          unit_digest if path is None else actual_unit_digest(path)):
+   verified=R.verify_route(route,expected_cwd=R.ROOT)
+   self.assertEqual(verified["route_hash"],route["route_hash"])
+   self.assertTrue(any("designs/<cycle>" in scope
+                       for node in verified["nodes"] for scope in node.get("write_scope",[])))
+   self.assertFalse(any("designs/01_refs" in scope
+                        for node in verified["nodes"] for scope in node.get("write_scope",[])))
+   changed=copy.deepcopy(old)
+   changed["artifact_buckets"]["documents"] += "/tampered"
+   (root/"capabilities"/"topologies.json").write_text(
+       json.dumps(changed,ensure_ascii=False),encoding="utf-8")
+   with mock.patch.dict(os.environ,{"HEARTING_GATES":"on"}),self.assertRaisesRegex(ValueError,"registry"):
+    R.verify_route(route,expected_cwd=R.ROOT)
+   (root/"capabilities"/"topologies.json").write_text(
+       json.dumps(old,ensure_ascii=False),encoding="utf-8")
+   with mock.patch.object(R,"unit_catalog_digest",return_value="sha256:"+"0"*64), \
+        mock.patch.dict(os.environ,{"HEARTING_GATES":"on"}),self.assertRaisesRegex(ValueError,"registry|unit.catalog"):
+    R.verify_route(route,expected_cwd=R.ROOT)
+
+ def test_fresh_design_route_uses_flat_cycle_local_paths(self):
+  kwargs=self.fixture.args(capability="autopilot-design",capability_mode="default",
+      requested_intensity="quick",predicates=[],transport=None,inline_reason=None,
+      registered_headless_evidence=self.fixture.registered_headless())
+  route=R.compile_route(**kwargs)
+  self.assertTrue(any("designs/**" in scope for node in route["nodes"]
+                      for scope in node.get("write_scope",[])))
+  self.assertFalse(any("designs/<cycle>" in str(node) for node in route["nodes"]))
+  R.verify_route(route,expected_cwd=R.ROOT)
 
 
 

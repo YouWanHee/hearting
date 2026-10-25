@@ -24,6 +24,10 @@ S = importlib.util.spec_from_file_location("topology", P); T = importlib.util.mo
 # `balanced-deep`; group digests and every other node field are unchanged.
 # 2026-10-02 entry approvals: only refine review's declared preview output changes;
 # all other node fields and parallel group digests remain at their pinned values.
+# 2026-10-25 flat design cycle-local outputs: only the autopilot-design node census is re-frozen;
+# the declared design parallel-group digest is unchanged.
+# 2026-10-25 route-local spec authoring: only the code execute node's spec/**
+# scope and artifact-order-prechecked declaration change its node census.
 PRESERVED_FULL_FIELD_DIGESTS = {
     # Added with the compiler-internal framed recipe (v3.0 part 3): two `top` frame legs and the
     # model-less runtime terminal. No other entry moves.
@@ -48,11 +52,11 @@ PRESERVED_FULL_FIELD_DIGESTS = {
         "a9b802f929cb1efdf839e4bae6f9f7c03bad3466d6193b9ff23d22a4ba9faaa9",
     ),
     ("autopilot-code", ('audit', 'debug', 'dev')): (
-        "2a5544328e29101bdb53dc3c649ff74adff685375e86999938189628a274ed1a",
+        "f2860df23ae5f7d983d261d8dbdd8367df32499c428421bdf869f28a466c632e",
         "c04f23733b6f6ad650d53b8997143b735c771631b5eaa8fb8679bb2f38555cbc",
     ),
     ("autopilot-design", ('default',)): (
-        "450e191eb79a83aabbcdd0430d9dd0fe1dc5361e28799b29560edeb9b333b3d7",
+        "ada624f2f8ce6303a9be8e064525353a7a3099037494118552b16868af067389",
         "535ac7afb655d7d8040841733ed2b46bb7cb7d467279b7ed83cf34496659fca5",
     ),
     ("autopilot-draft", ('doc', 'paper', 'presentation')): (
@@ -143,14 +147,25 @@ class TestTopology(unittest.TestCase):
         r=copy.deepcopy(self.r); r["recipes"][0]["standard_plus"]["nodes"][1]["write_scope"]=["source/**"]; self.assertRaises(T.TopologyError,T.validate_registry,r)
         r=copy.deepcopy(self.r); d=next(x for x in r["recipes"] if x["capability"]=="autopilot-design"); d["standard_plus"]["nodes"][0]["write_scope"]=["design/**"]; self.assertRaises(T.TopologyError,T.validate_registry,r)
     def test_concurrent_overlap(self):
-        r=copy.deepcopy(self.r); d=next(x for x in r["recipes"] if x["capability"]=="autopilot-design"); critic=next(n for n in d["standard_plus"]["nodes"] if n["id"]=="critic-review"); critic["depends_on"]=[]; critic["outputs"]=["designs/<cycle>/04_review/verify/critic-verdict.json"]; critic["write_scope"]=["designs/<cycle>/04_review/verify/**"]; self.assertRaisesRegex(T.TopologyError,"overlap",T.validate_registry,r)
+        r=copy.deepcopy(self.r); d=next(x for x in r["recipes"] if x["capability"]=="autopilot-design"); critic=next(n for n in d["standard_plus"]["nodes"] if n["id"]=="critic-review"); critic["depends_on"]=[]; critic["outputs"]=["designs/04_review/verify/critic-verdict.json"]; critic["write_scope"]=["designs/04_review/verify/**"]; self.assertRaisesRegex(T.TopologyError,"overlap",T.validate_registry,r)
     def test_spec_scope_requires_owner_or_precondition(self):
         r=copy.deepcopy(self.r); code=next(x for x in r["recipes"] if x["capability"]=="autopilot-code")
         execute=next(n for n in code["standard_plus"]["nodes"] if n["id"]=="execute")
         execute["write_scope"]=["spec/**","checklist.md","dev_logs/**"]
+        execute.pop("guard_preconditions",None)
         self.assertRaisesRegex(T.TopologyError,"spec write scope requires",T.validate_registry,r)
         execute["guard_preconditions"]=["artifact-order-prechecked"]
         T.validate_registry(r)
+    def test_code_authoring_scope_is_limited_to_quick_and_execute(self):
+        code=next(x for x in self.r["recipes"] if x["capability"]=="autopilot-code")
+        self.assertIn("spec/**",code["quick"]["write_scope"])
+        self.assertEqual(code["quick"]["guard_preconditions"],["artifact-order-prechecked"])
+        nodes=code["standard_plus"]["nodes"]
+        execute=next(n for n in nodes if n["id"]=="execute")
+        self.assertIn("spec/**",execute["write_scope"])
+        self.assertEqual(execute["guard_preconditions"],["artifact-order-prechecked"])
+        self.assertEqual([n["id"] for n in nodes if any(
+            scope=="spec" or scope.startswith("spec/") for scope in n["write_scope"])], ["execute"])
     def test_tracking_and_rollout_schema_fail_closed(self):
         r=copy.deepcopy(self.r); r["tracking_values"]=["tracked"]
         self.assertRaisesRegex(T.TopologyError,"tracking_values",T.validate_registry,r)
@@ -873,7 +888,7 @@ class PartCatalogTest(unittest.TestCase):
         self.assertEqual(move(synthesis("audit", "default"), "pipeline-stage", "cards/**"),
                          ["parts/autopilot-research/synthesis/cards/**"])
         self.assertEqual(move(synthesis("autopilot-design", "default"), "pipeline-stage", "cards/**"), [
-            "designs/<cycle>/parts/autopilot-research/synthesis/cards/**",
+            "designs/parts/autopilot-research/synthesis/cards/**",
             "spec/design/parts/autopilot-research/synthesis/cards/**"])
         audit = T.resolve_recipe(self.r, "audit", "default")
         retrieval = T.resolve_shared_part(self.r, audit, "autopilot-research:retrieval")

@@ -539,11 +539,13 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
             if finished and verified.get("updated_since"):
                 # Information only: the stored receipt keeps the revision it finished at.
                 result["manifest_updated_since"] = verified["current_manifest_digest"]
-            if route.get("capability") == "autopilot-spec":
-                # Route/cycle/receipt are already committed. A failed shared
-                # publication stays retryable beside them, never before them.
-                result["shared_publication"] = artifact_producer.completed_spec_publication(
-                    root, cycle_id=record["cycle_id"], settle=True)
+            # Route/cycle/receipt are already committed. Producer eligibility
+            # decides whether this completed cycle has a spec publication to
+            # settle; unrelated code work remains a no-op.
+            publication = artifact_producer.completed_spec_publication(
+                root, cycle_id=record["cycle_id"], settle=True)
+            if publication.get("status") != "not-applicable":
+                result["shared_publication"] = publication
                 _fault("after-admission")
             # Information only, projected fresh on the first finish and on every replay; the stored
             # receipt and its identity are untouched, and nothing here starts the next leg.

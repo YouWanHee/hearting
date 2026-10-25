@@ -33,9 +33,9 @@ shape and is **never retro-fitted** — the entry fence in
 `utilities/dispatch_contract.py` reads only the route object it was handed.
 
 Depth-0 launches the frame pair (both legs `top`, a pin or explicit profile wins; a route composed from an approved proposal via `--route-plan`, or as a `solo` or `staged` compose, has no frame nodes), joins both direction briefs, and builds
-`designs/<cycle>/01_refs/frame-summary.json` (five fields — 방향/대안/위험/범위
+`designs/01_refs/frame-summary.json` (five fields — 방향/대안/위험/범위
 변경/비용, ≤1KB) plus the **frame interview**
-`designs/<cycle>/01_refs/frame/interview.json` (SD-129: a one-sentence
+`designs/01_refs/frame/interview.json` (SD-129: a one-sentence
 restatement the user confirms, a plain-language brief, and at most
 `frame_interview.py`'s `QUESTION_CAP` short questions — one topic each, 2–4
 options, one recommended, no harness vocabulary, only decisions the user alone
@@ -79,11 +79,13 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    begins the cycle. The command is `artifact_producer.py begin --artifact-root
    <root> --route <route file> --capability autopilot-design --intensity <intensity>`.
    While the cutover is inactive this returns `legacy-compat` and the legacy
-   `<artifact-root>/designs/` layout stays writable; once active it
+   `<artifact-root>/designs/` remains the standalone legacy layout; once active it
    issues `campaign_id`/`cycle_id`/`producer_id` and the cycle directory
    `campaigns/<campaign-locator>/<cycle-locator>/artifacts/` before any artifact exists.
 2. **write only inside the open cycle.** Every durable artifact goes under
-   `<cycle_dir>/artifacts/designs/...` (`AGENT_ARTIFACT_OUTPUT_DIR`).
+   `<cycle_dir>/artifacts/designs/...` (`AGENT_ARTIFACT_OUTPUT_DIR`), using
+   cycle-local `designs/01_refs`, `02_tokens`, `03_components`, `04_review`,
+   and `05_handoff` paths. The producer cycle is already the outer namespace.
    `artifact_producer.py` owns cycle output paths and shared revisions.
 3. **stage workers join, never fork.** `standard+` stage workers receive
    `AGENT_ARTIFACT_CAMPAIGN_ID`/`CYCLE_ID`/`PRODUCER_ID`/`CYCLE_DIR`/`OUTPUT_DIR`

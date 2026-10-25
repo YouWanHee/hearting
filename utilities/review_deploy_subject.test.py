@@ -73,6 +73,14 @@ class DeployReviewSubjectTest(unittest.TestCase):
         self.assertFalse(SUBJECT.has_review_subject(self.route, self.review, self.jobs))
         self.assertFalse(SUBJECT.has_review_subject(self.route, self.review))
 
+    def test_request_without_scoped_inputs_keeps_the_plain_completion_identity(self):
+        self.write_request()
+        self.review["inputs"] = ["unrelated/**"]
+        self.assertFalse(SUBJECT.has_review_subject(self.route, self.review, self.jobs))
+        self.assertIsNone(SUBJECT.marker_subject(self.route, self.review,
+            attempt_id="att-no-scoped-input", attempt_metadata={"registered_worker": "1"},
+            jobs=self.jobs, completion_dir=self.jobs.parent / "completion"))
+
     def test_subject_follows_in_scope_input_content_only(self):
         self.write_request()
         self.assertTrue(SUBJECT.has_review_subject(self.route, self.review, self.jobs))

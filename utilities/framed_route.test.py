@@ -443,8 +443,47 @@ class RegistryRegistrationTest(unittest.TestCase):
     def registry(self):
         return CT.load_registry()
 
+    def before_design_layout(self):
+        # Keep every frozen hash below. Authenticate exactly the intentional
+        # flat-design delta, then compare the original framed-route surface.
+        registry = copy.deepcopy(self.registry())
+        self.assertEqual(registry["artifact_buckets"]["designs"], "designs")
+        def restore(value):
+            if isinstance(value, str):
+                self.assertNotIn("designs/<cycle>", value)
+                if value == "designs":
+                    return "designs/<cycle>"
+                if value.startswith("designs/"):
+                    return "designs/<cycle>/" + value[len("designs/"):]
+                return value
+            if isinstance(value, list):
+                return [restore(item) for item in value]
+            if isinstance(value, dict):
+                return {key: restore(item) for key, item in value.items()}
+            return value
+        return restore(registry)
+
     def recipe(self, registry):
         return next(r for r in registry["recipes"] if r["capability"] == "route-frame")
+
+    def _assert_code_authoring_delta_and_restore_historical_scopes(self, recipes):
+        # Code-route PRD authoring intentionally changes these exact fields.
+        # Keep the historical baseline literals for every remaining field;
+        # capability_topology.test.py also pins the full current code recipe.
+        codes = [r for r in recipes if r["capability"] == "autopilot-code"]
+        self.assertEqual(len(codes), 1)
+        code = codes[0]
+        self.assertEqual(code["quick"]["write_scope"],
+                         ["source-scoped", "plans/<cycle>/**", "spec/**"])
+        self.assertEqual(code["quick"]["guard_preconditions"], ["artifact-order-prechecked"])
+        execute = next(n for n in code["standard_plus"]["nodes"] if n["id"] == "execute")
+        self.assertEqual(execute["write_scope"],
+                         ["source/**", "spec/**", "checklist.md", "dev_logs/**", "evidence/**"])
+        self.assertEqual(execute["guard_preconditions"], ["artifact-order-prechecked"])
+        code["quick"]["write_scope"].remove("spec/**")
+        del code["quick"]["guard_preconditions"]
+        execute["write_scope"].remove("spec/**")
+        del execute["guard_preconditions"]
 
     def test_the_internal_recipe_is_registered_with_the_smallest_surface(self):
         registry = self.registry()
@@ -497,12 +536,13 @@ class RegistryRegistrationTest(unittest.TestCase):
         self.assertFalse(CT.is_route_frame_terminal(other, other["standard_plus"]["nodes"][-1]))
 
     def test_the_global_tables_that_seal_every_digest_are_untouched(self):
-        after = self.registry()
+        after = self.before_design_layout()
         for key, digest in FROZEN_GLOBAL_TABLE_DIGESTS.items():
             self.assertEqual(_frozen_digest(after[key]), digest, key)
         # No global table was added either: the only other keys are the two per-name tables.
         self.assertEqual(set(after) - set(FROZEN_GLOBAL_TABLE_DIGESTS), {"recipes", "completion_gate_contracts"})
         recipes = copy.deepcopy(after["recipes"][:FROZEN_RECIPE_COUNT])
+        self._assert_code_authoring_delta_and_restore_historical_scopes(recipes)
         for recipe in recipes:
             if recipe["capability"] == "autopilot-lab" and "setup" in recipe["modes"]:
                 self.assertEqual(recipe["promotion_signals"].count("gpu"), 1)
@@ -516,7 +556,8 @@ class RegistryRegistrationTest(unittest.TestCase):
         self.assertEqual(_frozen_digest(rest), FROZEN_GATE_CONTRACT_DIGEST)
 
     def test_other_capabilities_keep_their_registry_digest(self):
-        registry = copy.deepcopy(self.registry())
+        registry = self.before_design_layout()
+        self._assert_code_authoring_delta_and_restore_historical_scopes(registry["recipes"])
         for recipe in registry["recipes"]:
             if recipe["capability"] == "autopilot-lab" and "setup" in recipe["modes"]:
                 self.assertEqual(recipe["promotion_signals"].count("gpu"), 1)

@@ -1,18 +1,18 @@
 {
  "capability_registry_digest": {
-  "analyze-project": "sha256:160c04dc760b81584a7d445da0733c778d7caaabd12f43d606e72a00fb9ca574",
-  "analyze-user": "sha256:a787e6d28fbc54ba019dc635f462ddb9b5ffd1112f9a08ecf56dab950761899a",
-  "audit": "sha256:d2e6741875289ba300b4334b9a84e1cf99fcf1a4e60c73c6c594a1bcaa65d314",
-  "autopilot-apply": "sha256:317c03fb47f59789c1a12b15c1a0dcf93f60fcee57408f0ae1ab4cb45f6f7cd5",
-  "autopilot-code": "sha256:8f1f6572ba2e1038c0bceaf6ca411d6f0a2118bac69464429ccfd05d6fb78fe9",
-  "autopilot-design": "sha256:95ea188edc7350bc83af19a78aec602c1d6e6d84fdde553c29036be997078f46",
-  "autopilot-draft": "sha256:1f6ff17e9bd5f3cec8d38f32cd7415913ff2d9111762cda3f44b8ea718334067",
-  "autopilot-lab": "sha256:0d8abcee90861a84161e9d64df97caf2f1423ae421b1d9659b2c76ed55e92ff5",
-  "autopilot-refine": "sha256:1721bbf230492a6f2c1994924a938e2e4c451ea21b7d16165ab9647d6e5f5e7a",
-  "autopilot-research": "sha256:f1c4802cdf4250d3a97350e875d5414af32bf74fa628a8db69c7401e550421dd",
-  "autopilot-ship": "sha256:6a874217db61f46e3b80550487fd6819532244a5c9f1d0bb05f01db1279e9181",
-  "autopilot-spec": "sha256:0b14f71a5d072886272f23dcb3d3abebe1d4c901f2f1893937ae0cff8504e9bb",
-  "route-frame": "sha256:00b90489f7ac06edb802424cbccb44a60f5c12fc01813e150c0bdbd9f85b1979"
+  "analyze-project": "sha256:d0faea20e4c62c2d4465541d82aeba6b8ad6dd8ee5236d982fa78cde5c7a0f54",
+  "analyze-user": "sha256:4fb46a83a6f9e595c440b61eb52206b11e38683c82f65a95eb176348e907162d",
+  "audit": "sha256:3d6278291d2e9ad796b3500bcaae924ad89c042b1b8b6c58426aab926fa05139",
+  "autopilot-apply": "sha256:ab4c98a0e93c7b34fafc323d456f0332676db09d7ca258449bcc2ac6f32900e4",
+  "autopilot-code": "sha256:9fc6f29048ae130a7206f5a552324d81b61baa85938e1b833635d24515eccabd",
+  "autopilot-design": "sha256:b8cb9abe5c1ced6024e07296597c6b4ad77b67938735445474f0eb9cb93c9410",
+  "autopilot-draft": "sha256:80f17676081d2b7eea54bfaaa6cf8b437b1e985e834493bdfe1137a905643edb",
+  "autopilot-lab": "sha256:c5cf9a7a813b09348b2daf325b220feee34d0aa81b4d156c8235bf7ef1231460",
+  "autopilot-refine": "sha256:49c3dba58c1e2c335dc33c4c40bfe2837e470ccce626abdf64c859b97b9fc5f0",
+  "autopilot-research": "sha256:4e442e4e6ea3767f4ad675c34db35eb168b30f556b55a528014f759b461d14b8",
+  "autopilot-ship": "sha256:75b448bf45ab27b4610682b5df90cd67c9a8858e2ba23219a655da57e1135cb1",
+  "autopilot-spec": "sha256:3f5f14192cf03c57df3f10d994441c3d70ae75935f17df182cfa20e6cf308776",
+  "route-frame": "sha256:c1a34b9eda676df56ac37144137b783f7275fb78e3ac25681c295f9712ffd9f0"
  },
  "scenarios": {
   "framed:route-frame": {
@@ -183,18 +183,18 @@
   },
   "full:autopilot-design:default": {
    "briefs": {
-    "build": "a00c44e77fd99c500974",
-    "critic-review": "cdec76cc5870c1c29c67",
-    "frame": "97829d85a081a1004447",
-    "frame-alternative": "4233b578588dd32002d6",
-    "handoff": "d672287db5aee6b8f284",
-    "refs": "f4d03e541fc59fe5da7d",
-    "refs-alternative": "fa5f70fbd9c8a3db5fcb",
-    "visual-verify": "75a641c18060fdc2f81f"
+    "build": "accba5a5cb246c39ec06",
+    "critic-review": "e0d4125ed9442d07030d",
+    "frame": "7c8d3e8fa3acf4f34a8e",
+    "frame-alternative": "00547b15a7d09f81a17a",
+    "handoff": "909a8e04c7a61afe7546",
+    "refs": "09d2ecd431f293e84ae7",
+    "refs-alternative": "f044d83bb49409a86090",
+    "visual-verify": "f762b3a7bfc101811e4d"
    },
    "card": "[경로] autopilot-design · staged(standard) frame→frame-alternative→refs→refs-alternative→build→visual-verify→critic-review→handoff · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
    "completion_gates": "38b9e69ad8dc899ec595",
-   "composed_recipe": "0a0c1635ec4fd5d686b1",
+   "composed_recipe": "6fe8c744a643752e8574",
    "conditional_extensions": "4f53cda18c2baa0c0354",
    "human_gate_bindings": "2b60d578c2167df7eb77",
    "human_gates": "5b005605a5f0ddb1dfdf",
@@ -210,14 +210,14 @@
     "handoff"
    ],
    "nodes": {
-    "build": "c5090fd1c60edd227efb",
-    "critic-review": "c5127078b910c3e4f26b",
-    "frame": "0f1d2d80552321e495c5",
-    "frame-alternative": "497de28b410345634c59",
-    "handoff": "c6f03fbb83bc6f22bebf",
-    "refs": "646330cf1023f9a6177d",
-    "refs-alternative": "f644e4997492b717feb4",
-    "visual-verify": "ab86d70cf8131556a6f6"
+    "build": "da0082d9a618757e42fb",
+    "critic-review": "457a3367117d185e2249",
+    "frame": "0f35fbcdf1606bfe2b2b",
+    "frame-alternative": "ec2d18ca403cab0e1f98",
+    "handoff": "0e000c11ed4597de23f5",
+    "refs": "c7f6c64cd66a2f671e7c",
+    "refs-alternative": "9531b31562d6260a3804",
+    "visual-verify": "f6ebc8e8cee0739c5942"
    },
    "parallel_groups": "58ee499b14b3866130f3",
    "resume_retry_boundaries": "b1ff0e9e2e748109fa7d",
@@ -1131,14 +1131,14 @@
   },
   "preset:autopilot-design:default:standard": {
    "briefs": {
-    "build": "a00c44e77fd99c500974",
-    "critic-review": "cdec76cc5870c1c29c67",
-    "frame": "97829d85a081a1004447",
-    "frame-alternative": "4233b578588dd32002d6",
-    "handoff": "d672287db5aee6b8f284",
-    "refs": "f4d03e541fc59fe5da7d",
-    "refs-alternative": "fa5f70fbd9c8a3db5fcb",
-    "visual-verify": "75a641c18060fdc2f81f"
+    "build": "accba5a5cb246c39ec06",
+    "critic-review": "e0d4125ed9442d07030d",
+    "frame": "7c8d3e8fa3acf4f34a8e",
+    "frame-alternative": "00547b15a7d09f81a17a",
+    "handoff": "909a8e04c7a61afe7546",
+    "refs": "09d2ecd431f293e84ae7",
+    "refs-alternative": "f044d83bb49409a86090",
+    "visual-verify": "f762b3a7bfc101811e4d"
    },
    "card": "[경로] autopilot-design · staged(standard) frame→frame-alternative→refs→refs-alternative→build→visual-verify→critic-review→handoff · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
    "completion_gates": "4fb32a3fc3c7c2f1a70f",
@@ -1157,14 +1157,14 @@
     "handoff"
    ],
    "nodes": {
-    "build": "89f360f894ab033b22bf",
-    "critic-review": "4b52a2069190def77a9f",
-    "frame": "0f1d2d80552321e495c5",
-    "frame-alternative": "497de28b410345634c59",
-    "handoff": "b2c90b6d8adb26184f92",
-    "refs": "200b42bbfecb1d192ad9",
-    "refs-alternative": "73e3ecb484519fccab5b",
-    "visual-verify": "5af720e981f57853b872"
+    "build": "f738a55158e6c254c6c4",
+    "critic-review": "4aa7b8016e560305b742",
+    "frame": "0f35fbcdf1606bfe2b2b",
+    "frame-alternative": "ec2d18ca403cab0e1f98",
+    "handoff": "c2a6bb79069d9d72e9ac",
+    "refs": "5a741344a33df2ce8f18",
+    "refs-alternative": "f9f91c6201ef39ff1006",
+    "visual-verify": "75e4c94681519f6bf897"
    },
    "parallel_groups": "58ee499b14b3866130f3",
    "resume_retry_boundaries": "b1ff0e9e2e748109fa7d",
@@ -1172,16 +1172,16 @@
   },
   "preset:autopilot-design:default:strong": {
    "briefs": {
-    "build": "383d6cef0d9d9feb21e9",
-    "critic-review": "7f5fc713d7d266b2a08c",
-    "critic-review-alternative": "11ecaf8c7d26556fe28e",
-    "frame": "66cf873905ff4a0d48f9",
-    "frame-alternative": "af573bb4029507925dcb",
-    "handoff": "7a0c965650d965eed09f",
-    "refs": "ca31700e776fe13fa74a",
-    "refs-alternative": "c7a24567b6b6acd08c30",
-    "visual-verify": "4369d926753a69df19e1",
-    "visual-verify-alternative": "eaaa2b7e9b0f16cb071b"
+    "build": "b007ce30dea3fbe77226",
+    "critic-review": "09ced2be5b677e659f20",
+    "critic-review-alternative": "b5d55065287e7a833863",
+    "frame": "86dabd96cdcd32bd2569",
+    "frame-alternative": "7165ec8e335a4036ad5a",
+    "handoff": "ee57c0c820b044fda892",
+    "refs": "9c3d300aac1cac610042",
+    "refs-alternative": "90017b2ea46b67ffcb36",
+    "visual-verify": "59f183af02618c2f5f88",
+    "visual-verify-alternative": "21372a923d5ed609b2cb"
    },
    "card": "[경로] autopilot-design · staged(strong) frame→frame-alternative→refs→refs-alternative→build→visual-verify→visual-verify-alternative→critic-review→critic-review-alternative→handoff · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
    "completion_gates": "4fb32a3fc3c7c2f1a70f",
@@ -1202,16 +1202,16 @@
     "handoff"
    ],
    "nodes": {
-    "build": "89f360f894ab033b22bf",
-    "critic-review": "6faa722dbdf50f2b8769",
-    "critic-review-alternative": "819f501d4d9953e24b0b",
-    "frame": "0f1d2d80552321e495c5",
-    "frame-alternative": "497de28b410345634c59",
-    "handoff": "ffcf5e4339f5a4a7ab10",
-    "refs": "200b42bbfecb1d192ad9",
-    "refs-alternative": "73e3ecb484519fccab5b",
-    "visual-verify": "941d2a749211d7eb1ab4",
-    "visual-verify-alternative": "34615e95e69bc7801583"
+    "build": "f738a55158e6c254c6c4",
+    "critic-review": "f4c4bec282217715fc67",
+    "critic-review-alternative": "d568a080982746c04269",
+    "frame": "0f35fbcdf1606bfe2b2b",
+    "frame-alternative": "ec2d18ca403cab0e1f98",
+    "handoff": "088db96645c850112268",
+    "refs": "5a741344a33df2ce8f18",
+    "refs-alternative": "f9f91c6201ef39ff1006",
+    "visual-verify": "639c15bedb3b9fe8a727",
+    "visual-verify-alternative": "9d692747d2be68cae6c8"
    },
    "parallel_groups": "6cf8b76887c4fe678262",
    "resume_retry_boundaries": "b1ff0e9e2e748109fa7d",
@@ -1219,16 +1219,16 @@
   },
   "preset:autopilot-design:default:thorough": {
    "briefs": {
-    "build": "ac586ca94baebe6b5bdc",
-    "critic-review": "fc042d90443981ab7112",
-    "critic-review-alternative": "8345cf9d3349f0582ee3",
-    "frame": "fc9ece5fbb9f721c60b4",
-    "frame-alternative": "34702833683bebfc9fbc",
-    "handoff": "df158090ec73e2762186",
-    "refs": "ba86cd37a1a4e1c29c5a",
-    "refs-alternative": "a54bc0ec6e28de76bb96",
-    "visual-verify": "2f690fa1c42593b55e19",
-    "visual-verify-alternative": "3397306638ad3e0674b8"
+    "build": "446d9044eb786b72ec99",
+    "critic-review": "5034228844b914123351",
+    "critic-review-alternative": "fbbed7cafb5bd5a6ccea",
+    "frame": "976043675d9c40ec4636",
+    "frame-alternative": "7a0801cde21afef44824",
+    "handoff": "7ffcf2a24b6ac2819c92",
+    "refs": "f03c20dd416e56841a1b",
+    "refs-alternative": "a478d6d164eef08c5a00",
+    "visual-verify": "7ecbd42bf81d5e5a957e",
+    "visual-verify-alternative": "eeaedb1397fd000c78ad"
    },
    "card": "[경로] autopilot-design · staged(thorough) frame→frame-alternative→refs→refs-alternative→build→visual-verify→visual-verify-alternative→critic-review→critic-review-alternative→handoff · route <rt> · origin compose · 사람 게이트 frame-review\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
    "completion_gates": "4fb32a3fc3c7c2f1a70f",
@@ -1249,16 +1249,16 @@
     "handoff"
    ],
    "nodes": {
-    "build": "89f360f894ab033b22bf",
-    "critic-review": "6faa722dbdf50f2b8769",
-    "critic-review-alternative": "819f501d4d9953e24b0b",
-    "frame": "0f1d2d80552321e495c5",
-    "frame-alternative": "497de28b410345634c59",
-    "handoff": "ffcf5e4339f5a4a7ab10",
-    "refs": "200b42bbfecb1d192ad9",
-    "refs-alternative": "73e3ecb484519fccab5b",
-    "visual-verify": "941d2a749211d7eb1ab4",
-    "visual-verify-alternative": "34615e95e69bc7801583"
+    "build": "f738a55158e6c254c6c4",
+    "critic-review": "f4c4bec282217715fc67",
+    "critic-review-alternative": "d568a080982746c04269",
+    "frame": "0f35fbcdf1606bfe2b2b",
+    "frame-alternative": "ec2d18ca403cab0e1f98",
+    "handoff": "088db96645c850112268",
+    "refs": "5a741344a33df2ce8f18",
+    "refs-alternative": "f9f91c6201ef39ff1006",
+    "visual-verify": "639c15bedb3b9fe8a727",
+    "visual-verify-alternative": "9d692747d2be68cae6c8"
    },
    "parallel_groups": "6cf8b76887c4fe678262",
    "resume_retry_boundaries": "b1ff0e9e2e748109fa7d",

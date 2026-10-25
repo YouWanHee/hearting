@@ -4,6 +4,7 @@ The local host mode runs everything in-process, so the whole lifecycle —
 launch, log, exit code, listing — is exercised without a network.
 """
 
+import contextlib
 import importlib.util
 import io
 import datetime
@@ -739,6 +740,41 @@ class ComputeRunQuiescenceTest(unittest.TestCase):
     def test_live_or_unknown_remote_group_never_proves_quiescence(self):
         self.assertEqual(self.observe({"state": "populated"})["state"], "not-quiescent")
         self.assertEqual(self.observe({"state": "unknown"})["state"], "unknown")
+
+    def test_cancelled_execution_needs_no_exit_or_outputs_but_still_observes_group(self):
+        (self.run_dir / "exit_code").unlink()
+        (self.run_dir / "outputs.json").unlink()
+        self.module._record_stop(self.run_dir)
+        for remote_state, expected in (("empty", "quiescent"), ("populated", "not-quiescent"),
+                                       ("unknown", "unknown")):
+            with self.subTest(remote_state=remote_state):
+                call = mock.Mock(return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps({"state": remote_state, "reason": "fixture-group"}), ""))
+                result = self.module.observe_run_quiescence(
+                    self.config, self.run_id, expected=self.expected,
+                    cancelled=True, remote_call=call)
+                self.assertEqual(result["state"], expected)
+                call.assert_called_once()
+                self.assertIn(self.identity["pid_namespace"], call.call_args.args[1])
+        self.assertNotEqual(self.observe({"state": "empty"})["state"], "quiescent")
+
+    def test_cancelled_observation_keeps_identity_and_running_receipts_protected(self):
+        path = self.run_dir / "launch-receipt.json"
+        original = path.read_bytes()
+        for change in ({"state": "running"}, {"identity": {}}, {"run_id": "other"}):
+            with self.subTest(change=change):
+                path.write_text(json.dumps({**json.loads(original), **change}))
+                expected = {**self.expected, "receipt_sha256":
+                            self.module.hashlib.sha256(path.read_bytes()).hexdigest()}
+                call = mock.Mock()
+                result = self.module.observe_run_quiescence(
+                    self.config, self.run_id, expected=expected, cancelled=True, remote_call=call)
+                self.assertEqual(result["state"], "not-quiescent")
+                call.assert_not_called()
+        path.write_bytes(original + b" ")
+        self.assertEqual(self.module.observe_run_quiescence(
+            self.config, self.run_id, expected=self.expected, cancelled=True)["reason"],
+            "compute-run-evidence-changed")
 
     def test_changed_exit_bytes_invalidate_the_observation(self):
         (self.run_dir / "exit_code").write_text("1\n")
@@ -2018,6 +2054,60 @@ class ComputeHostsTest(unittest.TestCase):
         self.assertEqual(
             (run_dir / "stop_reason").read_text(encoding="utf-8").strip(),
             "stopped")
+
+    def test_unconfirmed_launches_are_unknown_without_repairing_history(self):
+        module = load_module()
+        config = {"run_root": self.run_root}
+        run_ids = ("xavier-20261024-193701-ami-tf-a1-historical-parity",
+                   "xavier-20261024-191238-ami-leg2-e1-recovery",
+                   "just-created")
+        for run_id in run_ids:
+            run_dir = self.run_root / run_id
+            run_dir.mkdir(parents=True)
+            if run_id != "just-created":
+                os.utime(run_dir, (1, 1))
+            self.assertEqual(module._run_state(config, run_id)["state"], "unknown")
+        # Listing never probes a host or fabricates an exit for an unconfirmed
+        # launch. The ordinary CLI corrects both old and newly created records.
+        with mock.patch.object(module, "load_config", return_value=config), \
+             mock.patch.object(module, "_tmux_session_alive") as probe, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(module.cmd_runs(SimpleNamespace(limit=10, host=None, json=True)), 0)
+        probe.assert_not_called()
+        rows = json.loads(output.getvalue())
+        self.assertEqual({row["run_id"] for row in rows}, set(run_ids))
+        self.assertTrue(all(row["state"] == "unknown" and row["exit_code"] is None
+                            and not row["stale"] for row in rows))
+        listed = self.run_tool("runs")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(listed.stdout.count("unknown"), 3)
+        self.assertNotIn("running", listed.stdout)
+        for run_id in run_ids:
+            self.assertEqual(list((self.run_root / run_id).iterdir()), [])
+
+    def test_unconfirmed_launch_observes_metadata_or_exit_when_they_arrive(self):
+        module = load_module()
+        config = {"run_root": self.run_root}
+        run_dir = self.run_root / "launch-in-progress"
+        run_dir.mkdir(parents=True)
+        self.assertEqual(module._run_state(config, run_dir.name)["state"], "unknown")
+        receipt = {"schema_version": 1, "run_id": run_dir.name,
+                   "identity": {"pid": 1234, "starttime": "fixture-start"}}
+        (run_dir / "launch-receipt.json").write_text(json.dumps(receipt))
+        observed = module._run_state(config, run_dir.name)
+        self.assertEqual(observed["state"], "unknown")
+        self.assertEqual(observed["launch_receipt"], receipt)
+        # The payload can finish even before the launcher records metadata.
+        (run_dir / "exit_code").write_text("0\n")
+        self.assertEqual(module._run_state(config, run_dir.name)["state"], "finished")
+        (run_dir / "exit_code").unlink()
+        (run_dir / "meta.json").write_text(json.dumps({
+            "host": "here", "command": ["sleep", "30"],
+            "tmux_transport": {"kind": "nohup-v1"}}))
+        self.assertEqual(module._run_state(config, run_dir.name)["state"], "running")
+        listed = self.run_tool("runs", "--json")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(json.loads(listed.stdout)[0]["state"], "running")
 
     def test_runs_stays_running_when_session_state_is_unknown(self):
         module = load_module()
