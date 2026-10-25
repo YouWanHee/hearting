@@ -79,6 +79,9 @@ class AnswerWaitSurfaceTests(unittest.TestCase):
             {"id": "s3", "source": "S3", "kind": "decision", "since": 100,
              "attempt_id": "att", "owner": {"harness": "claude", "session_id": "b"},
              "question": "PRIVATE-BLOCKER", "stale": True},
+            {"id": "s3-old", "source": "S3", "kind": "decision", "since": 90,
+             "attempt_id": "older", "owner": {"harness": None, "session_id": None},
+             "question": "PRIVATE-OLD-S3", "stale": True},
             {"id": "s4", "source": "S4", "kind": "decision", "since": 100,
              "owner": {"harness": "claude", "session_id": "c"},
              "question": "PRIVATE-QUESTION", "stale": False},
@@ -90,20 +93,21 @@ class AnswerWaitSurfaceTests(unittest.TestCase):
         self.assertNotIn(b'"recommendation"', payload)
         self.assertNotIn(b'"seat_key"', payload)
         for sentinel in (b"PRIVATE-QUESTION", b"PRIVATE-CHOICE", b"PRIVATE-REC",
-                         b"PRIVATE-SEAT", b"PRIVATE-BLOCKER"):
+                         b"PRIVATE-SEAT", b"PRIVATE-BLOCKER", b"PRIVATE-OLD-S3"):
             self.assertNotIn(sentinel, payload)
         view = human_wait_state.cached_fleet_view(now=101, request=False)
         self.assertEqual([item["source"] for item in view["items"]],
-                         ["S1-approval", "S1-question", "S2", "S3", "S4"])
+                         ["S1-approval", "S1-question", "S2", "S3", "S3", "S4"])
         self.assertEqual([item["kind"] for item in view["items"]],
-                         ["approval", "decision", "human gate", "blocked owner", "marker"])
+                         ["approval", "decision", "human gate", "blocked owner",
+                          "blocked owner", "marker"])
         self.assertEqual([item["stale"] for item in view["items"]],
-                         ["current", "current", "current", "older", "current"])
+                         ["current", "current", "current", "older", "older", "current"])
         self.assertEqual([item.get("pane_id") for item in view["items"]],
-                         [None, None, None, None, None])
+                         [None, None, None, None, None, None])
         self.assertEqual(view["total"], 4)
-        self.assertEqual(view["older"], 1)
-        self.assertEqual(view["unattributed"], ["s2"])
+        self.assertEqual(view["older"], 2)
+        self.assertEqual(view["unattributed"], ["s2", "s3-old"])
         ids_before = [item["id"] for item in view["items"]]
         self.assertTrue(human_wait_state.publish_cache(result))
         second = human_wait_state.cached_fleet_view(now=101, request=False)
