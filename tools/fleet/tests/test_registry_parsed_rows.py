@@ -1,5 +1,6 @@
 """File-generation reuse contract for parsed registry rows."""
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,29 @@ from fleet.collectors import dispatch
 
 
 class ParsedRegistryRowsTest(unittest.TestCase):
+    def test_fast_spacing_guard_matches_the_legacy_regex(self):
+        legacy_pattern = re.compile(r"(?:^|,)[^=,]*\s[^=,]*=|=\s|\s+[^\s,]*=")
+        examples = (
+            "capability=code,mode=dev",
+            "model_role=deep  maker,mode=dev",
+            "model_role=deep maker=fast",
+            "model_role=deep\t maker",
+            "capability=code, model_role=deep maker",
+            "capability=code,note=foo,bar",
+            "capability:code(x)",
+            "a=wide\u2003b=value",
+            "a=wide\u2003value",
+            "a=\u2003wide",
+        )
+        for raw in examples:
+            eq_pos, colon_pos = raw.find("="), raw.find(":")
+            expected = ("(" in raw or eq_pos < 0
+                        or colon_pos >= 0 and colon_pos < eq_pos
+                        or any("=" not in part for part in raw.split(","))
+                        or bool(legacy_pattern.search(raw)))
+            self.assertEqual(dispatch._registry_metadata_needs_legacy_parser(raw),
+                             expected, raw)
+
     def test_comma_delimited_role_values_reuse_the_existing_generation_parse(self):
         raw = "capability=autopilot-code,model_role=deep  maker,mode=dev"
         expected = dispatch._parse_pipe_meta_uncached(raw)
@@ -49,6 +73,62 @@ class ParsedRegistryRowsTest(unittest.TestCase):
             self.assertEqual(rows[0][2]["_name"], "code")
             self.assertEqual(rows[0][2]["mode"], "dev")
             self.assertEqual(dispatch._parse_pipe_meta_cached.cache_info().misses, 0)
+
+    def test_canonical_metadata_skips_legacy_whitespace_pattern(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            raw = "capability=autopilot-code,mode=dev,attempt_id=att-1"
+            path.write_text("t\topen\t/repo\t/work\towner\t" + raw + "\n")
+            with (dispatch._dispatch_registry_cache.registry_read_scope(),
+                  mock.patch.object(dispatch, "_parse_pipe_meta",
+                                    side_effect=AssertionError("canonical metadata reparsed"))):
+                rows = dispatch.parsed_registry_rows(path)
+        self.assertEqual(dict(rows[0][2]), dispatch._parse_pipe_meta_uncached(raw))
+
+    def test_attempt_index_preserves_first_duplicate_registry_row(self):
+        first = {"order": 1, "meta": {"attempt_id": "att-1", "value": "first"}}
+        duplicate = {"order": 2, "meta": {"attempt_id": "att-1", "value": "later"}}
+        missing = {"order": 3, "meta": {"value": "missing-attempt"}}
+        index = dispatch._index_registry_rows_by_attempt([first, duplicate, missing])
+        self.assertIs(index["att-1"], first)
+        self.assertIs(index[None], missing)
+
+    def test_orphan_row_adapter_matches_dispatch_registry_contract(self):
+        registry = dispatch._orphan_registry_module()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            path.write_text(
+                "t\topen\t/repo\t/work\towner\tcapability=code,attempt_id=att-1\n"
+                "malformed\trow\n"
+                "t\tdone\t/repo\t/work\tlegacy\tcapability:code(x)\n"
+                "t\topen\t/repo\t/work\tworker\tmodel_role=deep  maker,attempt_id=att-2\n",
+                encoding="utf-8")
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                parsed = dispatch.parsed_registry_rows(path)
+                expected_lines = ["\t".join(fields) for _order, fields, _meta in parsed]
+                expected = registry.read_rows(path, lines=expected_lines)
+                for row, (physical_order, fields, _meta) in zip(expected, parsed):
+                    row["order"] = physical_order
+                    row["raw"] = "\t".join(fields)
+                actual = dispatch._orphan_registry_rows(path, registry)
+        self.assertEqual(actual, expected)
+
+    def test_orphan_rows_are_shared_only_through_explicit_pass_cache(self):
+        registry = object()
+        rows = [{"order": 0, "meta": {"attempt_id": "att-1"}}]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            cache = {}
+            with mock.patch.object(dispatch, "_orphan_registry_rows",
+                                   return_value=rows) as reader:
+                first = dispatch._orphan_registry_rows_for_pass(path, registry, cache)
+                second = dispatch._orphan_registry_rows_for_pass(
+                    os.path.abspath(path), registry, cache)
+                self.assertIs(first, second)
+                self.assertEqual(reader.call_count, 1)
+                dispatch._orphan_registry_rows_for_pass(path, registry, None)
+                dispatch._orphan_registry_rows_for_pass(path, registry, None)
+                self.assertEqual(reader.call_count, 3)
 
     def test_collection_falls_back_for_legacy_and_whitespace_continuation_metadata(self):
         with tempfile.TemporaryDirectory() as directory:

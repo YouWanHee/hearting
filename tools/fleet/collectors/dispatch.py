@@ -84,6 +84,9 @@ _LOOPS = re.compile(r"loops/(oncall|note|study|drill|runtime-watch)")
 _LOOP_KEYS = ("oncall", "note", "study", "drill", "runtime-watch")
 _DRILL_LOG_PATH = re.compile(r"(/[^\s'\";]*drill[^\s'\";]*\.log)")
 _DRILL_CASE_LINE = re.compile(r"^▶\s+(.+?)\s+\(work=", re.MULTILINE)
+_REGISTRY_METADATA_WHITESPACE_RE = re.compile(r"\s")
+_REGISTRY_METADATA_LEGACY_RE = re.compile(
+    r"(?:^|,)[^=,]*\s[^=,]*=|=\s|\s+[^\s,]*=")
 _MODE = re.compile(r"(?:^|\s)--mode(?:=|\s+)([a-z][a-z0-9-]*(?:/[a-z][a-z0-9-]*)?)")
 _CAPABILITY_MODE = re.compile(r"(?:^|\s)--capability-mode(?:=|\s+)([a-z][a-z0-9-]*)")
 _WORKER_MODE = re.compile(r"(?:^|\s)--worker-mode(?:=|\s+)([a-z][a-z0-9-]*/[a-z][a-z0-9-]*)")
@@ -271,12 +274,34 @@ def _orphan_registry_rows(path, registry):
     """Adapt parsed rows to dispatch-registry's established row contract."""
     parsed = parsed_registry_rows(path)
     _raise_registry_read_error(path, ignore_missing=True)
-    lines = ["\t".join(fields) for _order, fields, _meta in parsed]
-    rows = registry.read_rows(Path(path), lines=lines)
-    for row, (physical_order, fields, _meta) in zip(rows, parsed):
-        row["order"] = physical_order
-        row["raw"] = "\t".join(fields)
+    rows = []
+    for physical_order, fields, parsed_meta in parsed:
+        raw_meta = fields[5] or ""
+        eq_pos, colon_pos = raw_meta.find("="), raw_meta.find(":")
+        simple = (not _REGISTRY_METADATA_WHITESPACE_RE.search(raw_meta)
+                  and "(" not in raw_meta and eq_pos >= 0
+                  and (colon_pos < 0 or colon_pos > eq_pos)
+                  and all("=" in part for part in raw_meta.split(","))
+                  and not any(part.split("=", 1)[0] == "_name"
+                              for part in raw_meta.split(",")))
+        meta = None
+        if simple:
+            meta = dict(parsed_meta)
+            meta.pop("_name", None)
+        row = registry._row_from_fields(physical_order, fields, meta=meta)
+        if row is not None:
+            rows.append(row)
     return rows
+
+
+def _orphan_registry_rows_for_pass(path, registry, cache):
+    """Share orphan rows only inside the caller's pinned collection pass."""
+    if cache is None:
+        return _orphan_registry_rows(path, registry)
+    key = os.path.abspath(os.fspath(path))
+    if key not in cache:
+        cache[key] = _orphan_registry_rows(path, registry)
+    return cache[key]
 
 
 def _parse_registry_lines(path, lines, generation, *, first_line=0,
@@ -318,24 +343,37 @@ def _remember_parsed_registry_rows(path, generation, rows, complete_count,
     return result
 
 
-def _registry_record_metadata(record):
-    """Reuse the pinned registry's parsed key/value metadata when formats agree."""
-    raw = record.fields[5] or ""
+def _registry_metadata_needs_legacy_parser(raw):
+    """Skip the detailed legacy spacing scan when metadata has no whitespace."""
     eq_pos, colon_pos = raw.find("="), raw.find(":")
     if ("(" in raw or eq_pos < 0
             or (colon_pos >= 0 and colon_pos < eq_pos)):
-        return _parse_pipe_meta(raw)
+        return True
     if any("=" not in part for part in raw.split(",")):
-        return _parse_pipe_meta(raw)
-    # Keep whitespace in values (e.g. a role name), but reject whitespace in
-    # keys, an initially blank value, or an embedded whitespace-delimited field.
-    if re.search(r"(?:^|,)[^=,]*\s[^=,]*=|=\s|\s+[^\s,]*=", raw):
+        return True
+    return bool(_REGISTRY_METADATA_WHITESPACE_RE.search(raw)
+                and _REGISTRY_METADATA_LEGACY_RE.search(raw))
+
+
+def _registry_record_metadata(record):
+    """Reuse the pinned registry's parsed key/value metadata when formats agree."""
+    raw = record.fields[5] or ""
+    if _registry_metadata_needs_legacy_parser(raw):
         return _parse_pipe_meta(raw)
     metadata = record.completion_metadata()
     for key, value in metadata.items():
-        metadata[key] = " ".join(value.split())
+        if _REGISTRY_METADATA_WHITESPACE_RE.search(value):
+            metadata[key] = " ".join(value.split())
     metadata["_name"] = _strip_autopilot_prefix(metadata.get("capability"))
     return metadata
+
+
+def _index_registry_rows_by_attempt(rows):
+    """Index rows once while preserving read_rows' first-match duplicate behavior."""
+    indexed = {}
+    for row in rows:
+        indexed.setdefault(row["meta"].get("attempt_id"), row)
+    return indexed
 
 
 def _parse_registry_view(path, view, generation):
@@ -3047,7 +3085,9 @@ def _scan_registry_evidence(paths):
         path_attempts = {}
         rows = parsed_registry_rows(path)
         for registry_order, fields, parsed_meta in rows:
-            meta = dict(parsed_meta)
+            # Parsed metadata is immutable and every consumer below is read-only.
+            # Avoid copying every key/value in the large registry for this pass.
+            meta = parsed_meta
             ts, status, _repo, _worktree, slug, pipe = fields
             attempt_contract = _attempt_contract(meta)
             route_id = meta.get("route_id")
@@ -3838,7 +3878,7 @@ def _route_lineage(route_id, route_file, limit=32):
     return out
 
 
-def _retain_dead_terminal_owners(jobs, now, jobs_path=None):
+def _retain_dead_terminal_owners(jobs, now, jobs_path=None, *, orphan_rows_cache=None):
     """F-83: keep a supervisor-closed dead owner visible only while its route is
     incomplete and no newer owner attempt binds the same route; otherwise drop it.
     Read-only against the registry the row came from (SD-64/71 primitives via
@@ -3856,13 +3896,16 @@ def _retain_dead_terminal_owners(jobs, now, jobs_path=None):
         return [j for j in jobs if not getattr(j, "_dead_terminal_owner", False)]
     from pathlib import Path as _Path
     rows_by_path = {}
+    rows_by_attempt = {}
 
     def _rows_for(path):
         if path not in rows_by_path:
             try:
-                rows_by_path[path] = _orphan_registry_rows(path, registry)
+                rows = _orphan_registry_rows_for_pass(path, registry, orphan_rows_cache)
             except Exception:
-                rows_by_path[path] = []
+                rows = []
+            rows_by_path[path] = rows
+            rows_by_attempt[path] = _index_registry_rows_by_attempt(rows)
         return rows_by_path[path]
 
     class _Args:
@@ -3872,7 +3915,7 @@ def _retain_dead_terminal_owners(jobs, now, jobs_path=None):
     for j in dead:
         path = getattr(j, "_registry_path", None) or jobs_path
         rows = _rows_for(path) if path else []
-        row = next((r for r in rows if r["meta"].get("attempt_id") == j.attempt_id), None)
+        row = rows_by_attempt.get(path, {}).get(j.attempt_id)
         if row is None:
             drop.add(id(j)); continue
         if (j.elapsed_min or 0) > RETAIN_DEAD_OWNER_MAX_MIN:
@@ -3927,7 +3970,7 @@ def _retain_dead_terminal_owners(jobs, now, jobs_path=None):
     return [j for j in jobs if id(j) not in drop]
 
 
-def _annotate_orphan_conductors(jobs, now, jobs_path=None):
+def _annotate_orphan_conductors(jobs, now, jobs_path=None, *, orphan_rows_cache=None):
     """SD-64/71: stamp note/resume_boundary on a dead dispatch-depth-1 owner row that is a
     detected orphan (route incomplete + a registered open child or a ready
     un-started successor). Read-only — never mutates the registry."""
@@ -3945,7 +3988,7 @@ def _annotate_orphan_conductors(jobs, now, jobs_path=None):
         return
     try:
         from pathlib import Path as _Path
-        rows = _orphan_registry_rows(jobs_path, registry)
+        rows = _orphan_registry_rows_for_pass(jobs_path, registry, orphan_rows_cache)
     except Exception:
         return
     newest = {}
@@ -3953,6 +3996,7 @@ def _annotate_orphan_conductors(jobs, now, jobs_path=None):
         key = (row["meta"].get("route_id"), row["meta"].get("route_node"))
         if all(key):
             newest[key] = row["order"]
+    rows_by_attempt = _index_registry_rows_by_attempt(rows)
 
     class _Args:
         pass
@@ -3963,7 +4007,7 @@ def _annotate_orphan_conductors(jobs, now, jobs_path=None):
     args.integration_ref = None
     args.now = now
     for j in dead_owners:
-        row = next((r for r in rows if r["meta"].get("attempt_id") == j.attempt_id), None)
+        row = rows_by_attempt.get(j.attempt_id)
         if row is None:
             continue
         try:
@@ -4318,6 +4362,8 @@ def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fa
     paths = _candidate_jobs_paths(jobs_path)
     split_registries = _validated_split_registry_paths(paths, session_rows=session_rows)
     paths.extend(split_registries)
+    orphan_rows_cache = ({} if _dispatch_registry_cache.registry_scope_active()
+                         else None)
     try:
         route_nodes, terminal_attempts = _scan_registry_evidence(paths)
     except Exception:
@@ -4372,7 +4418,9 @@ def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fa
     jobs = proc_jobs + log_jobs
     # F-83 retention uses registry/route evidence, never stream telemetry. Apply
     # that existing rule before any location/title/log reads for discarded owners.
-    jobs = _retain_dead_terminal_owners(jobs, time.time(), jobs_path=jobs_path)
+    jobs = _retain_dead_terminal_owners(
+        jobs, time.time(), jobs_path=jobs_path,
+        orphan_rows_cache=orphan_rows_cache)
     # The first display can perform native reads too. Admission is nonblocking;
     # a failed mark leaves the row on its already collected observations.
     for j in jobs:
@@ -4506,8 +4554,10 @@ def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fa
             j.liveness = _dispatch_liveness(j, now, codex_index=codex_index)
             j.attempt_decision = attempt_decision_payload(
                 str(j.status or ""), getattr(j, "_registry_metadata", None), j.state_evidence)
-        jobs = _retain_dead_terminal_owners(jobs, now, jobs_path=jobs_path)
-        _annotate_orphan_conductors(jobs, now, jobs_path=jobs_path)
+        jobs = _retain_dead_terminal_owners(
+            jobs, now, jobs_path=jobs_path, orphan_rows_cache=orphan_rows_cache)
+        _annotate_orphan_conductors(
+            jobs, now, jobs_path=jobs_path, orphan_rows_cache=orphan_rows_cache)
     # Plan QA is display detail. Resolve it only after dedup/retention and the
     # single liveness pass, never for old rows the normal board does not draw.
     for j in jobs:

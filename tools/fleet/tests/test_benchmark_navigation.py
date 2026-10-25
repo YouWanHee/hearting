@@ -127,6 +127,22 @@ class BenchmarkNavigationReadinessTest(unittest.TestCase):
 
 class BenchmarkProductionContractTest(unittest.TestCase):
 
+    def test_production_observer_source_compiles_with_optional_startup_profiling(self):
+        compile(benchmark._observer_source(), "production-observer", "exec")
+        profile = benchmark._startup_profile_summary([
+            {"kind": "installinfo-call", "fast_local": True, "duration_ns": 500},
+            {"kind": "synchronous-draw", "loading": True, "duration_ns": 300},
+            {"kind": "readiness-check", "ready": False, "duration_ns": 100},
+        ])
+        imports = benchmark._importtime_profile(
+            b"import time: 10 | 30 | fleet.collectors\n"
+            b"import time: 5 | 8 | json\n")
+        self.assertEqual(imports["entry_count"], 2)
+        self.assertEqual(imports["largest_cumulative"][0]["module"], "fleet.collectors")
+        self.assertEqual(len(profile["installinfo_calls"]), 1)
+        self.assertEqual(len(profile["synchronous_draw_samples"]), 1)
+        self.assertEqual(len(profile["readiness_check_samples"]), 1)
+
     def test_production_schedule_keeps_exact_key_count_and_duration(self):
         schedule = benchmark._production_schedule(100, 60)
         self.assertEqual(len(schedule), 100)
@@ -177,7 +193,54 @@ class BenchmarkProductionContractTest(unittest.TestCase):
             self.assertEqual(env["XDG_STATE_HOME"], "/private/user/state")
             self.assertNotIn("AGENT_ROUTE_FILE", env)
             self.assertNotIn("AGENT_DISPATCH_MODEL_ROLE", env)
+            self.assertNotIn("PYTHONDONTWRITEBYTECODE", env)
+            self.assertEqual(env["PYTHONPYCACHEPREFIX"], str(root / "runtime" / "pycache"))
             self.assertTrue(env["PYTHONPATH"].startswith(str(observer)))
+
+    def test_explicit_no_bytecode_setting_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.dict(os.environ, {"PYTHONDONTWRITEBYTECODE": "1"}, clear=True):
+                env = benchmark._production_environment(
+                    root, root / "cache", root / "observer", 22, 1234,
+                    root / "runtime")
+        self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
+
+    def test_fresh_paint_does_not_mask_nonzero_process_exit(self):
+        # A painted fresh frame is evidence of rendering, not a successful process exit.
+        status, error = benchmark._production_status(
+            1, agent_home_matches_tree=True, seed=False, cache_seed_valid=False)
+        self.assertEqual(status, "nonzero-exit")
+        self.assertIsNone(error)
+
+    def test_post_exit_drain_keeps_trailing_telemetry_and_nonzero_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / "fake-fleet2"
+            launcher.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "fd = int(os.environ['FLEET_BENCHMARK_TELEMETRY_FD'])\n"
+                "record = b'{\"kind\":\"diagnostic-padding\",\"padding\":\"' + b'x' * 96 + b'\"}\\n'\n"
+                "payload = record * 3200\n"
+                "while payload:\n"
+                "    written = os.write(fd, payload)\n"
+                "    payload = payload[written:]\n"
+                "os.write(fd, b'{\"kind\":\"process-exit\",\"process_times\":{}}\\n')\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8")
+            launcher.chmod(0o700)
+            with mock.patch.object(benchmark, "_production_argv",
+                                   return_value=[str(launcher)]):
+                result = benchmark._production_run(
+                    "candidate", root, root / "cache", root / "observer",
+                    root / "runtime", root / "run", keys=0, duration=0,
+                    event_timeout=1)
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["status"], "nonzero-exit")
+        self.assertTrue(result["shutdown"]["process_exit_event_seen"])
+        self.assertTrue(result["shutdown"]["telemetry_eof_seen"])
+        self.assertGreater(result["telemetry_raw"]["bytes"], 262144)
 
     def test_missing_or_unpainted_keys_are_retained_as_samples(self):
         sent = [

@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 import curses
 import datetime
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import platform
 import pty
+import re
 import resource
 import selectors
 import signal
@@ -157,18 +159,46 @@ def _pump_phase_samples(events):
     return samples
 
 
+def _startup_profile_summary(events):
+    draws = [item for item in events if item.get("kind") == "synchronous-draw"]
+    readiness = [item for item in events if item.get("kind") == "readiness-check"]
+    installinfo = [item for item in events if item.get("kind") == "installinfo-call"]
+    return {
+        "enabled": bool(draws or readiness or installinfo),
+        "installinfo_calls": installinfo,
+        "synchronous_draw_samples": draws,
+        "readiness_check_samples": readiness,
+    }
+
+
+def _importtime_profile(transcript):
+    pattern = re.compile(rb"^import time:\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(.*)$")
+    entries = []
+    for line in transcript.splitlines():
+        match = pattern.match(line)
+        if match is None:
+            continue
+        entries.append({"self_us": int(match.group(1)),
+                        "cumulative_us": int(match.group(2)),
+                        "module": match.group(3).decode("utf-8", "replace")})
+    entries.sort(key=lambda item: item["cumulative_us"], reverse=True)
+    return {"entry_count": len(entries), "largest_cumulative": entries[:30]}
+
+
 def _observer_source():
     return r'''import atexit
 import curses
 import hashlib
 import json
 import os
+import signal
 from importlib.machinery import PathFinder
 from pathlib import Path
 import sys
 import time
 
 FD = int(os.environ.get("FLEET_BENCHMARK_TELEMETRY_FD", "-1"))
+PROFILE_STARTUP = bool(os.environ.get("FLEET_BENCHMARK_PROFILE_STARTUP"))
 _emit_ns = 0
 _input_id = 0
 _pending_input = None
@@ -220,6 +250,15 @@ def _times():
     return {"user_seconds": value.user, "system_seconds": value.system,
             "children_user_seconds": value.children_user,
             "children_system_seconds": value.children_system}
+
+def _signal_handler_name(number):
+    handler = signal.getsignal(number)
+    if handler == signal.SIG_DFL:
+        return "default"
+    if handler == signal.SIG_IGN:
+        return "ignored"
+    return "%s.%s" % (getattr(handler, "__module__", "unknown"),
+                       getattr(handler, "__qualname__", type(handler).__name__))
 
 def _states(readiness):
     sources = readiness.get("sources", readiness) if isinstance(readiness, dict) else {}
@@ -360,11 +399,50 @@ def install():
             emit({"kind": "cache-configured", "cache_path": str(result)})
             return result
         ExplorerRuntime.configure_persistence = configure
+        if PROFILE_STARTUP:
+            original_ready = ExplorerRuntime.publication_ready
+            readiness_samples = {"count": 0}
+            def publication_ready(runtime, *args, **kwargs):
+                started = time.monotonic_ns()
+                result = original_ready(runtime, *args, **kwargs)
+                readiness_samples["count"] += 1
+                if readiness_samples["count"] <= 20:
+                    emit({"kind": "readiness-check", "ready": bool(result),
+                          "duration_ns": time.monotonic_ns() - started})
+                return result
+            ExplorerRuntime.publication_ready = publication_ready
     except Exception as error:
         emit({"kind": "observer-unsupported", "component": "explorer-runtime",
               "error_type": type(error).__name__})
     try:
         from fleet import render
+        if PROFILE_STARTUP:
+            from fleet import installinfo
+            original_installinfo_collect = installinfo.collect
+            installinfo_samples = {"count": 0}
+            def collect_installinfo(*args, **kwargs):
+                started = time.monotonic_ns()
+                result = original_installinfo_collect(*args, **kwargs)
+                installinfo_samples["count"] += 1
+                if installinfo_samples["count"] <= 8:
+                    emit({"kind": "installinfo-call",
+                          "fast_local": bool(kwargs.get("fast_local")),
+                          "refresh_remote": bool(kwargs.get("refresh_remote")),
+                          "duration_ns": time.monotonic_ns() - started})
+                return result
+            installinfo.collect = collect_installinfo
+            original_draw = render._draw
+            draw_samples = {"count": 0}
+            def draw(*args, **kwargs):
+                started = time.monotonic_ns()
+                result = original_draw(*args, **kwargs)
+                draw_samples["count"] += 1
+                if draw_samples["count"] <= 12:
+                    emit({"kind": "synchronous-draw",
+                          "loading": bool(kwargs.get("loading")),
+                          "duration_ns": time.monotonic_ns() - started})
+                return result
+            render._draw = draw
         from fleet.refresh import RefreshPump
         from fleet.collectors import dispatch
         original_init = RefreshPump.__init__
@@ -422,8 +500,10 @@ def install():
             if ch not in (curses.ERR, getattr(curses, "KEY_RESIZE", -999999)):
                 state["input_id"] += 1
                 state["pending_input"] = state["input_id"]
+                input_kind = {ord("q"): "quit", ord("Q"): "quit",
+                              curses.KEY_UP: "up", curses.KEY_DOWN: "down"}.get(ch)
                 emit({"kind": "input-decoded", "input_id": state["input_id"],
-                      "time_ns": time.monotonic_ns()})
+                      "input_kind": input_kind, "time_ns": time.monotonic_ns()})
             return value
         render._CursesInput.read = read
 
@@ -433,6 +513,7 @@ def install():
             event.update({"kind": "flush", "flush_id": state["flush_id"],
                           "flush_path": path, "input_id": state["pending_input"],
                           "time_ns": time.monotonic_ns(), "process_times": _times(),
+                          "sigterm_handler": _signal_handler_name(signal.SIGTERM),
                           "observer_emit_ns": _emit_ns})
             state["pending_input"] = None
             emit(event)
@@ -454,18 +535,52 @@ def install():
                     state["refresh_depth"] -= 1
                     if succeeded:
                         record_flush("stdscr.refresh")
-                return func(WindowRefreshObserver(stdscr, before_refresh, after_refresh),
-                            *call_args, **call_kwargs)
-            return original_wrapper(observed_main, *args, **kwargs)
+                try:
+                    result = func(WindowRefreshObserver(stdscr, before_refresh, after_refresh),
+                                  *call_args, **call_kwargs)
+                except BaseException as error:
+                    emit({"kind": "tui-loop-exception",
+                          "error_type": type(error).__name__})
+                    raise
+                emit({"kind": "tui-loop-return",
+                      "return_code": result if isinstance(result, int) else None})
+                return result
+            try:
+                result = original_wrapper(observed_main, *args, **kwargs)
+            except BaseException as error:
+                emit({"kind": "curses-wrapper-exception",
+                      "error_type": type(error).__name__})
+                raise
+            emit({"kind": "curses-wrapper-return",
+                  "return_code": result if isinstance(result, int) else None})
+            return result
         curses.wrapper = observed_wrapper
+        original_run_live = render.run_live
+        def run_live(*args, **kwargs):
+            result = original_run_live(*args, **kwargs)
+            emit({"kind": "run-live-return",
+                  "return_code": result if isinstance(result, int) else None,
+                  "time_ns": time.monotonic_ns()})
+            return result
+        render.run_live = run_live
         emit({"kind": "observer-ready", "pid": os.getpid(), "argv": sys.argv,
               "python": sys.executable, "term": os.environ.get("TERM"),
               "agent_home": os.environ.get("AGENT_HOME"),
               "refresh_interval": os.environ.get("FLEET_REFRESH_INTERVAL"),
               "compute_interval": os.environ.get("FLEET_COMPUTE_HOST_INTERVAL"),
-              "process_times": _times()})
-        atexit.register(lambda: emit({"kind": "process-exit", "process_times": _times(),
-                                     "observer_emit_ns": _emit_ns}))
+              "time_ns": time.monotonic_ns(), "process_times": _times(),
+              "sigterm_handler": _signal_handler_name(signal.SIGTERM)})
+        def record_process_exit():
+            try:
+                os.fstat(FD)
+                telemetry_fd_open = True
+            except OSError:
+                telemetry_fd_open = False
+            emit({"kind": "process-exit", "time_ns": time.monotonic_ns(),
+                  "telemetry_fd_open": telemetry_fd_open,
+                  "sigterm_handler": _signal_handler_name(signal.SIGTERM),
+                  "process_times": _times(), "observer_emit_ns": _emit_ns})
+        atexit.register(record_process_exit)
     except Exception as error:
         emit({"kind": "observer-error", "component": "fleet-hooks",
               "error_type": type(error).__name__})
@@ -565,6 +680,32 @@ def _cache_envelope(path):
         return None
 
 
+def _python_cache_usage(path):
+    root = Path(path)
+    count = size = 0
+    if root.is_dir():
+        for item in root.rglob("*.pyc"):
+            try:
+                info = item.stat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                count += 1
+                size += info.st_size
+    return {"files": count, "bytes": size}
+
+
+def _production_status(exit_code, *, failure=None, agent_home_matches_tree=None,
+                       seed=False, cache_seed_valid=False):
+    if failure:
+        return "failed", failure
+    if agent_home_matches_tree is False:
+        return "failed", "AGENT_HOME does not resolve to the launched source tree"
+    if seed:
+        return ("seeded", None) if cache_seed_valid else ("seed-incomplete", None)
+    return ("completed", None) if exit_code == 0 else ("nonzero-exit", None)
+
+
 def _production_environment(tree, cache_home, observer_dir, telemetry_fd,
                             launch_start_ns, runtime_dir):
     env = os.environ.copy()
@@ -578,7 +719,6 @@ def _production_environment(tree, cache_home, observer_dir, telemetry_fd,
         env.pop(name, None)
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(observer_dir) + (os.pathsep + existing if existing else "")
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONPYCACHEPREFIX"] = str(Path(runtime_dir) / "pycache")
     env.setdefault("TERM", "xterm-256color")
     env.update({
@@ -616,13 +756,15 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
     telemetry_read, telemetry_write = os.pipe()
     os.set_blocking(master, False)
     os.set_blocking(telemetry_read, False)
-    launch_start_ns = time.monotonic_ns()
-    launch_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
     env = _production_environment(tree, cache_home, observer_dir, telemetry_write,
-                                  launch_start_ns, runtime_dir)
+                                  0, runtime_dir)
     keep_flags = ("TERM", "FLEET_REFRESH_INTERVAL", "FLEET_COMPUTE_HOST_INTERVAL",
-                  "FLEET_MOUSE", "FLEET_PYTHON")
+                  "FLEET_MOUSE", "FLEET_PYTHON", "PYTHONDONTWRITEBYTECODE",
+                  "PYTHONPYCACHEPREFIX", "PYTHONPROFILEIMPORTTIME",
+                  "FLEET_BENCHMARK_PROFILE_STARTUP")
     flags = {key: env.get(key) for key in keep_flags}
+    python_cache_path = Path(env["PYTHONPYCACHEPREFIX"])
+    python_cache_before = _python_cache_usage(python_cache_path)
     cpu_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     observer_cpu_start = time.process_time()
     parent_wall_start = time.monotonic()
@@ -633,8 +775,22 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
     rss_samples = []
     child_start = None
     failure = None
+    parent_actions = []
+    eof_descriptors = set()
+    telemetry_parse_errors = 0
     selector = selectors.DefaultSelector()
+    state_home = env.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
+    stderr_log_path = Path(state_home) / "agent-fleet" / "fleet-stderr.log"
     try:
+        stderr_before = stderr_log_path.stat()
+        stderr_before_signature = (stderr_before.st_dev, stderr_before.st_ino,
+                                   stderr_before.st_size)
+    except OSError:
+        stderr_before_signature = None
+    try:
+        launch_start_ns = time.monotonic_ns()
+        launch_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        env["FLEET_BENCHMARK_START_MONOTONIC_NS"] = str(launch_start_ns)
         proc = subprocess.Popen(
             _production_argv(role, {role: tree}), cwd=str(tree), env=env,
             stdin=slave, stdout=slave, stderr=slave, close_fds=True,
@@ -649,14 +805,27 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
         selector.register(telemetry_read, selectors.EVENT_READ, "telemetry")
 
         def drain(timeout=0.05):
+            nonlocal telemetry_parse_errors
             for selected, _mask in selector.select(timeout):
-                try:
-                    data = os.read(selected.fd, 262144)
-                except (BlockingIOError, OSError):
-                    data = b""
-                if selected.data == "pty" and data:
-                    transcript.extend(data)
-                elif selected.data == "telemetry" and data:
+                while True:
+                    try:
+                        data = os.read(selected.fd, 262144)
+                    except BlockingIOError:
+                        break
+                    except OSError as error:
+                        if error.errno not in (errno.EIO, errno.EBADF):
+                            telemetry_parse_errors += 1
+                        data = b""
+                    if not data:
+                        eof_descriptors.add(selected.fd)
+                        try:
+                            selector.unregister(selected.fd)
+                        except (KeyError, ValueError):
+                            pass
+                        break
+                    if selected.data == "pty":
+                        transcript.extend(data)
+                        continue
                     telemetry_buffer.extend(data)
                     while b"\n" in telemetry_buffer:
                         line, _, rest = telemetry_buffer.partition(b"\n")
@@ -664,6 +833,7 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
                         try:
                             record = json.loads(line)
                         except (ValueError, UnicodeError):
+                            telemetry_parse_errors += 1
                             continue
                         if isinstance(record, dict):
                             events.append(record)
@@ -721,30 +891,81 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
                 drain(0.05)
                 sample_process()
 
+        q_write_ns = None
+        q_write_error = None
+        sigterm_ns = None
+        sigkill_ns = None
         if proc is not None and proc.poll() is None:
+            q_write_ns = time.monotonic_ns()
             try:
-                os.write(master, b"q")
-            except OSError:
-                pass
+                q_bytes = os.write(master, b"q")
+            except OSError as error:
+                q_bytes = 0
+                q_write_error = type(error).__name__
+            parent_actions.append({"action": "write-q", "time_ns": q_write_ns,
+                                   "bytes": q_bytes, "error": q_write_error,
+                                   "process_alive": proc.poll() is None})
             exit_deadline = time.monotonic() + 2.0
             while time.monotonic() < exit_deadline and proc.poll() is None:
                 drain(0.05)
+                sample_process()
+            exit_after_q = proc.poll()
             if proc.poll() is None:
+                sigterm_ns = time.monotonic_ns()
                 try:
                     os.killpg(proc.pid, signal.SIGTERM)
                 except ProcessLookupError:
-                    pass
+                    parent_actions.append({"action": "sigterm", "time_ns": sigterm_ns,
+                                           "process_group_present": False})
+                else:
+                    parent_actions.append({"action": "sigterm", "time_ns": sigterm_ns,
+                                           "process_group_present": True})
                 try:
                     proc.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
+                    sigkill_ns = time.monotonic_ns()
                     try:
                         os.killpg(proc.pid, signal.SIGKILL)
                     except ProcessLookupError:
-                        pass
+                        parent_actions.append({"action": "sigkill", "time_ns": sigkill_ns,
+                                               "process_group_present": False})
+                    else:
+                        parent_actions.append({"action": "sigkill", "time_ns": sigkill_ns,
+                                               "process_group_present": True})
             exit_code = proc.wait()
+            parent_actions.append({"action": "process-reaped", "time_ns": time.monotonic_ns(),
+                                   "exit_code": exit_code,
+                                   "elapsed_after_q_ms": ((time.monotonic_ns() - q_write_ns) / 1e6
+                                                           if q_write_ns is not None else None)})
         else:
             exit_code = proc.wait() if proc is not None else None
-        drain(0.05)
+            exit_after_q = None
+
+        # Drain both descriptors to EOF or a bounded quiet point after wait().
+        # A final atexit record or PTY teardown bytes must not be lost to one short read.
+        final_drain_start = time.monotonic()
+        quiet_since = final_drain_start
+        while time.monotonic() - final_drain_start < 1.0:
+            old_lengths = (len(transcript), len(telemetry_buffer), len(events))
+            drain(0.05)
+            new_lengths = (len(transcript), len(telemetry_buffer), len(events))
+            if new_lengths != old_lengths:
+                quiet_since = time.monotonic()
+            elif time.monotonic() - quiet_since >= 0.15:
+                break
+            if len(eof_descriptors) == 2:
+                break
+        final_drain_ms = (time.monotonic() - final_drain_start) * 1000
+        telemetry_unterminated_bytes = len(telemetry_buffer)
+        if telemetry_buffer:
+            try:
+                record = json.loads(telemetry_buffer)
+            except (ValueError, UnicodeError):
+                telemetry_parse_errors += 1
+            else:
+                if isinstance(record, dict):
+                    events.append(record)
+            telemetry_buffer.clear()
         if not seed:
             key_samples = _match_production_keys(key_raw, events)
         else:
@@ -758,6 +979,7 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
         times = [item for item in events if item.get("kind") == "process-exit"]
         process_exit_times = times[-1].get("process_times") if times else None
         flushes = [item for item in events if item.get("kind") == "flush"]
+        first_flush = next((item for item in flushes if item.get("frame_present")), None)
         replay = next((item for item in flushes if item.get("replay")
                        and item.get("frame_present")), None)
         fresh = next((item for item in flushes if item.get("fresh_complete")), None)
@@ -768,6 +990,11 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
             "role": role, "tree": str(tree), "launcher": launcher,
             "launch_utc": launch_utc, "launch_start_ns": launch_start_ns,
             "wall_seconds": time.monotonic() - parent_wall_start,
+            "launch_elapsed_to_observer_ready_ms": next((
+                (item.get("time_ns") - launch_start_ns) / 1e6 for item in events
+                if item.get("kind") == "observer-ready" and isinstance(item.get("time_ns"), int)), None),
+            "launch_elapsed_to_first_frame_ms": ((first_flush["time_ns"] - launch_start_ns) / 1e6
+                                                   if first_flush else None),
             "launch_elapsed_to_replay_ms": ((replay["time_ns"] - launch_start_ns) / 1e6
                                              if replay else None),
             "launch_elapsed_to_fresh_ms": ((fresh["time_ns"] - launch_start_ns) / 1e6
@@ -809,9 +1036,35 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
                                       if item.get("kind") in ("flush", "process-exit")), None),
             "observer_unsupported": [item for item in events
                                      if item.get("kind") == "observer-unsupported"],
+            "shutdown": {
+                "parent_actions": parent_actions,
+                "q_decoded": any(item.get("kind") == "input-decoded"
+                                 and item.get("input_kind") == "quit" for item in events),
+                "exit_observed_before_sigterm": (exit_after_q is not None),
+                "sigterm_sent": sigterm_ns is not None,
+                "sigkill_sent": sigkill_ns is not None,
+                "exit_code_kind": ("signal" if isinstance(exit_code, int) and exit_code < 0
+                                   else "normal" if isinstance(exit_code, int) else "unknown"),
+                "process_exit_event_seen": bool(times),
+                "sigterm_handler": next((item.get("sigterm_handler") for item in events
+                                           if item.get("kind") == "observer-ready"), None),
+                "sigterm_handlers_during_run": sorted({
+                    item.get("sigterm_handler") for item in events
+                    if item.get("sigterm_handler")}),
+                "final_drain_ms": final_drain_ms,
+                "pty_eof_seen": master in eof_descriptors,
+                "telemetry_eof_seen": telemetry_read in eof_descriptors,
+                "telemetry_parse_errors": telemetry_parse_errors,
+                "telemetry_unterminated_bytes": telemetry_unterminated_bytes,
+                "stderr_log_path": str(stderr_log_path),
+                "stderr_log_delta_bytes": None,
+                "stderr_log_sha256": None,
+            },
             "pump_events": [item for item in events
                             if item.get("kind") in ("pump-start", "pump-done", "pump-error")],
             "pump_phase_samples": _pump_phase_samples(events),
+            "startup_profile": _startup_profile_summary(events),
+            "importtime_profile": _importtime_profile(transcript),
             "session_job_resource_counts": [
                 {key: item.get(key) for key in ("kind", "name", "sessions", "jobs", "resources")}
                 for item in events if item.get("kind") == "pump-done"],
@@ -830,20 +1083,40 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
                               "event_count": len(events)},
             "observer_cpu_seconds_parent": max(0.0, time.process_time() - observer_cpu_start),
         }
+        try:
+            stderr_after = stderr_log_path.stat()
+            after_signature = (stderr_after.st_dev, stderr_after.st_ino, stderr_after.st_size)
+            if stderr_before_signature is None:
+                delta_start = 0
+            elif after_signature[:2] == stderr_before_signature[:2]:
+                delta_start = min(stderr_before_signature[2], after_signature[2])
+            else:
+                delta_start = 0
+            with stderr_log_path.open("rb") as handle:
+                handle.seek(delta_start)
+                stderr_delta = handle.read()
+            run["shutdown"]["stderr_log_delta_bytes"] = len(stderr_delta)
+            run["shutdown"]["stderr_log_sha256"] = hashlib.sha256(stderr_delta).hexdigest()
+            run["shutdown"]["stderr_log_inode_changed"] = (
+                stderr_before_signature is not None
+                and after_signature[:2] != stderr_before_signature[:2])
+        except OSError as error:
+            run["shutdown"]["stderr_log_error"] = type(error).__name__
+        run["python_bytecode_cache"] = {
+            "prefix": str(python_cache_path),
+            "dont_write_bytecode": env.get("PYTHONDONTWRITEBYTECODE"),
+            "before": python_cache_before,
+            "after": _python_cache_usage(python_cache_path),
+        }
         cpu_after = resource.getrusage(resource.RUSAGE_CHILDREN)
         run["child_rusage_cpu_seconds"] = {
             "user": max(0.0, cpu_after.ru_utime - cpu_before.ru_utime),
             "system": max(0.0, cpu_after.ru_stime - cpu_before.ru_stime)}
         run["cache_seed_valid"] = _valid_cache(cache_path) if seed else None
-        if failure:
-            run["status"] = "failed"
-        elif run.get("agent_home_matches_tree") is False:
-            run["status"] = "failed"
-            run["error"] = "AGENT_HOME does not resolve to the launched source tree"
-        elif seed:
-            run["status"] = "seeded" if run["cache_seed_valid"] else "seed-incomplete"
-        else:
-            run["status"] = "completed" if exit_code == 0 else "nonzero-exit"
+        run["status"], run["error"] = _production_status(
+            exit_code, failure=failure,
+            agent_home_matches_tree=run.get("agent_home_matches_tree"),
+            seed=seed, cache_seed_valid=run["cache_seed_valid"])
         return run
     except BaseException as error:
         failure = type(error).__name__

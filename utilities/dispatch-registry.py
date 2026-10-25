@@ -130,6 +130,32 @@ def parse_meta(pipe):
     return dict(part.split("=", 1) for part in pipe.split(",") if "=" in part)
 
 
+def _row_from_fields(order, fields, *, meta=None):
+    """Build the established row contract from an already split six-field line."""
+    if len(fields) != 6:
+        return None
+    if meta is None:
+        meta = parse_meta(fields[5])
+    else:
+        meta = dict(meta)
+    raw_schema = meta.get("attempt_schema_version")
+    legacy = raw_schema in (None, "", "1")
+    contract_status = (
+        "legacy-read-only" if legacy
+        else "current" if raw_schema == "2"
+        else "invalid:attempt-schema-version"
+    )
+    if contract_status == "current":
+        try:
+            validate_attempt_metadata(meta)
+        except DispatchContractError as exc:
+            contract_status = f"invalid:{exc.reason}"
+    return {"order": order, "timestamp": fields[0], "status": fields[1],
+            "repo": fields[2], "worktree": fields[3], "slug": fields[4],
+            "pipe": fields[5], "meta": meta, "raw": "\t".join(fields),
+            "legacy_read_only": legacy, "attempt_contract_status": contract_status}
+
+
 def read_rows(jobs, *, lines=None):
     rows = []
     if lines is None:
@@ -138,25 +164,12 @@ def read_rows(jobs, *, lines=None):
     else:
         source = lines
     for order, line in enumerate(source):
-        fields = line.split("\t")
-        if len(fields) != 6: continue
-        meta = parse_meta(fields[5])
-        raw_schema = meta.get("attempt_schema_version")
-        legacy = raw_schema in (None, "", "1")
-        contract_status = (
-            "legacy-read-only" if legacy
-            else "current" if raw_schema == "2"
-            else "invalid:attempt-schema-version"
-        )
-        if contract_status == "current":
-            try:
-                validate_attempt_metadata(meta)
-            except DispatchContractError as exc:
-                contract_status = f"invalid:{exc.reason}"
-        rows.append({"order": order, "timestamp": fields[0], "status": fields[1],
-                     "repo": fields[2], "worktree": fields[3], "slug": fields[4],
-                     "pipe": fields[5], "meta": meta, "raw": line,
-                     "legacy_read_only": legacy, "attempt_contract_status": contract_status})
+        row = _row_from_fields(order, line.split("\t"))
+        if row is not None:
+            # Preserve the source line bytes/text exactly as before, including
+            # any tabs that the six-field split rejoins.
+            row["raw"] = line
+            rows.append(row)
     return rows
 
 
