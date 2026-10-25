@@ -68,6 +68,16 @@ class Fleet2DetailReadinessTests(unittest.TestCase):
         row.work_projection = WorkProjection(route_id="route-1", ambiguity="route-record-mismatch")
         self.assertFalse(required_projection_details_complete([row]))
 
+    def test_validated_continuation_needs_matching_route_binding(self):
+        row = DispatchJob(key="execute", slug="worker", route_id="route-2",
+                          route_hash="sha256:route-2")
+        row._continuation_validated = True
+        row.work_projection = WorkProjection(route_id="route-2", route_hash="sha256:route-2")
+        self.assertTrue(required_projection_details_complete([row]))
+
+        row.work_projection = WorkProjection(route_id="route-2", route_hash="sha256:stale")
+        self.assertFalse(required_projection_details_complete([row]))
+
     def test_merge_only_adopts_details_from_the_current_basic_identity(self):
         current = _basic("basic-current")
         completed = copy.deepcopy(current)
@@ -139,6 +149,23 @@ class Fleet2DetailReadinessTests(unittest.TestCase):
                          deliveries, peers, panes):
             optional.assert_not_called()
         self.assertTrue(result.snapshot.required_details_ready)
+
+    def test_required_detail_keeps_default_report_verification_policy(self):
+        source = _basic("basic-report-policy")
+        with mock.patch("tools.fleet.collectors.dispatch._fill_locations"), \
+                mock.patch("tools.fleet.collectors.dispatch._scan_degradations",
+                           return_value={}), \
+                mock.patch.object(route_chain, "enrich"), \
+                mock.patch.object(projection, "attach_projections") as attach, \
+                mock.patch.object(projection, "required_projection_details_complete",
+                                  return_value=True):
+            details._enrich(source, required_only=True)
+            self.assertIs(attach.call_args.kwargs["include_report_verification"], True)
+
+            attach.reset_mock()
+            details._enrich(source, required_only=True,
+                            include_report_verification=False)
+            self.assertIs(attach.call_args.kwargs["include_report_verification"], False)
 
 
 if __name__ == "__main__":

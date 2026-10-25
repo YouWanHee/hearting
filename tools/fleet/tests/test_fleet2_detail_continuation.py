@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from tools.fleet import details
 from tools.fleet.model import DispatchJob, Session, WorkProjection
@@ -14,7 +15,7 @@ def _job(route_id):
         route_hash="sha256:" + route_id[-1] * 64, route_file="/routes/" + route_id + ".json",
         route_node="execute", attempt_id="attempt-" + route_id, pid=200,
         proc_start=10, liveness="working", harness="codex")
-    row.work_projection = WorkProjection(route_id=route_id)
+    row.work_projection = WorkProjection(route_id=route_id, route_hash=row.route_hash)
     row.route_chain = {"nodes": [{"route_id": route_id}]}
     return row
 
@@ -176,7 +177,9 @@ class Fleet2DetailContinuationBoundaryTests(unittest.TestCase):
         current.jobs[1]._detail_activity_key = "activity-2-changed"
         continued = details.merge_continuation(current, details.restore_continuation(payload))
         self.assertFalse(continued.continuation_complete)
+        self.assertEqual(continued.continued_count, 1)
         self.assertEqual(continued.snapshot.jobs[0].summary, "safe route one")
+        self.assertTrue(continued.snapshot.jobs[0]._continuation_validated)
         self.assertIsNone(continued.snapshot.jobs[1].summary)
         self.assertEqual(continued.snapshot.observations["required-details"]["state"], "partial")
 
@@ -189,6 +192,201 @@ class Fleet2DetailContinuationBoundaryTests(unittest.TestCase):
             changed_live, details.restore_continuation(payload))
         self.assertFalse(dead_result.continuation_complete)
         self.assertIsNone(dead_result.snapshot.jobs[0].summary)
+
+    def test_mixed_continuation_refreshes_only_misses_and_stays_non_all_new(self):
+        from tools.fleet.refresh import set_required_details
+
+        evidence = {"route-1": {"execute": {"revision": 1}},
+                    "route-2": {"execute": {"revision": 1}}}
+        old = _snapshot(evidence, extra_route=True)
+        old.jobs[0].summary = "continued route one"
+        old.jobs[1].summary = "stale route two"
+        payload = details.export_continuation(_completed_detail(old))
+        self.assertIsNotNone(payload)
+
+        current = _snapshot({**evidence, "route-2": {"execute": {"revision": 2}}},
+                           extra_route=True)
+        continued = details.merge_continuation(current, details.restore_continuation(payload))
+        self.assertEqual(continued.continued_count, 1)
+        self.assertFalse(continued.continuation_complete)
+        self.assertEqual(continued.snapshot.jobs[0].summary, "continued route one")
+        self.assertIsNone(continued.snapshot.jobs[1].summary)
+        self.assertEqual(continued.snapshot.node_evidence["route-1"], evidence["route-1"])
+        self.assertEqual(continued.snapshot.node_evidence["route-2"],
+                         current.node_evidence["route-2"])
+
+        calls = []
+
+        def enrich_job(job):
+            calls.append(job.route_id)
+            job.summary = "fresh route two"
+
+        def attach(sessions, jobs, **kwargs):
+            targets = kwargs["only_entities"]
+            calls.append(("projection-targets", [job.route_id for job in targets]))
+            self.assertEqual(len(jobs), 2, "full row context must survive miss-only enrichment")
+            self.assertEqual(set(kwargs["node_evidence"]), {"route-1", "route-2"})
+            for row in targets:
+                row._details_pending = False
+
+        with mock.patch("tools.fleet.collectors.dispatch._fill_locations") as locations, \
+                mock.patch("tools.fleet.collectors.dispatch._note_home_view"), \
+                mock.patch("tools.fleet.collectors.dispatch._enrich_claude_stream_session"), \
+                mock.patch("tools.fleet.collectors.dispatch._enrich_codex_attempt_session",
+                           side_effect=enrich_job) as codex_details, \
+                mock.patch("tools.fleet.collectors.dispatch._enrich_opencode_attempt_session"), \
+                mock.patch("tools.fleet.collectors.dispatch._enrich_attempt_summary"), \
+                mock.patch("tools.fleet.collectors.dispatch.effective_qa",
+                           return_value=(None, "default")), \
+                mock.patch("tools.fleet.collectors.dispatch._scan_degradations",
+                           return_value={}), \
+                mock.patch("tools.fleet.route_chain.enrich") as route_enrich, \
+                mock.patch("tools.fleet.projection.attach_projections", side_effect=attach) as projections, \
+                mock.patch("tools.fleet.projection.required_projection_details_complete",
+                           return_value=True):
+            result = details._enrich(continued.snapshot, required_only=True)
+
+        locations.assert_called_once()
+        self.assertEqual([job.route_id for job in locations.call_args.args[0]], ["route-2"])
+        self.assertEqual(codex_details.call_count, 1)
+        self.assertEqual(codex_details.call_args.args[0].route_id, "route-2")
+        route_enrich.assert_not_called()
+        projections.assert_called_once()
+        self.assertEqual(calls, ["route-2", ("projection-targets", ["route-2"])])
+        self.assertTrue(result.snapshot.required_details_ready)
+        self.assertFalse(result.snapshot.required_details_all_new)
+        self.assertEqual(result.snapshot.observations["required-details"]["observed_at"] >
+                         payload["captured_at"], True)
+        self.assertEqual(result.snapshot.jobs[0].summary, "continued route one")
+        self.assertEqual(result.snapshot.jobs[1].summary, "fresh route two")
+        self.assertEqual(result.source_key, details.state_key(current))
+        self.assertIsNone(details.export_continuation(result),
+                          "mixed continuation must not replace an all-new persisted cache")
+        self.assertIsNone(current.jobs[0].summary)
+        self.assertIsNone(current.jobs[1].summary)
+        self.assertNotIn("_continuation_validated", vars(current.jobs[0]))
+        self.assertNotIn("required-details", current.observations)
+
+        updated_basic = _snapshot({"route-1": {"execute": {"revision": 1}},
+                                   "route-2": {"execute": {"revision": 2}}},
+                                  extra_route=True)
+        updated_basic.observations["basic"]["generation_identity"] = "basic-next"
+        fresh = _snapshot(updated_basic.node_evidence, extra_route=True)
+        fresh.observations["basic"]["generation_identity"] = "basic-next"
+        fresh.jobs[0].summary = "new all-new route one"
+        fresh.jobs[1].summary = "new all-new route two"
+        set_required_details(fresh, "ok", all_new=True, observed_at=payload["captured_at"] + 10)
+        fresh_detail = details.DetailSnapshot(details.state_key(updated_basic), fresh)
+        self.assertIsNotNone(details.export_continuation(fresh_detail))
+        replaced = details.merge(updated_basic, fresh_detail)
+        self.assertEqual(replaced.jobs[0].summary, "new all-new route one")
+        self.assertEqual(replaced.jobs[1].summary, "new all-new route two")
+        self.assertTrue(replaced.required_details_all_new)
+
+    def test_failed_miss_keeps_mixed_generation_pending(self):
+        evidence = {"route-1": {"execute": {"revision": 1}},
+                    "route-2": {"execute": {"revision": 1}}}
+        old = _snapshot(evidence, extra_route=True)
+        old.jobs[0].summary = "continued route one"
+        payload = details.export_continuation(_completed_detail(old))
+        current = _snapshot({**evidence, "route-2": {"execute": {"revision": 2}}},
+                            extra_route=True)
+        continued = details.merge_continuation(current, details.restore_continuation(payload))
+
+        def fail_miss(job):
+            raise OSError("required detail unavailable")
+
+        def attach(_sessions, jobs, **kwargs):
+            for row in kwargs["only_entities"]:
+                row._details_pending = False
+
+        with mock.patch("tools.fleet.collectors.dispatch._fill_locations"), \
+                mock.patch("tools.fleet.collectors.dispatch._note_home_view"), \
+                mock.patch("tools.fleet.collectors.dispatch._enrich_claude_stream_session"), \
+                mock.patch("tools.fleet.collectors.dispatch._enrich_codex_attempt_session",
+                           side_effect=fail_miss), \
+                mock.patch("tools.fleet.collectors.dispatch._enrich_opencode_attempt_session"), \
+                mock.patch("tools.fleet.collectors.dispatch._enrich_attempt_summary"), \
+                mock.patch("tools.fleet.collectors.dispatch.effective_qa",
+                           return_value=(None, "default")), \
+                mock.patch("tools.fleet.collectors.dispatch._scan_degradations",
+                           return_value={}), \
+                mock.patch("tools.fleet.route_chain.enrich"), \
+                mock.patch("tools.fleet.projection.attach_projections", side_effect=attach):
+            result = details._enrich(continued.snapshot, required_only=True)
+
+        self.assertFalse(result.snapshot.required_details_ready)
+        self.assertEqual(result.snapshot.observations["required-details"]["state"], "partial")
+        self.assertEqual(result.snapshot.jobs[0].summary, "continued route one")
+        self.assertIsNone(result.snapshot.jobs[1].summary)
+
+    def test_duplicate_current_identity_is_ambiguous_for_continuation(self):
+        old = _snapshot({"route-1": {"execute": {"revision": 1}}})
+        old.jobs[0].summary = "cached"
+        payload = details.export_continuation(_completed_detail(old))
+        current = _snapshot({"route-1": {"execute": {"revision": 1}}}, extra_route=True)
+        current.jobs[1] = current.jobs[0]
+
+        continued = details.merge_continuation(current, details.restore_continuation(payload))
+
+        self.assertEqual(continued.continued_count, 0)
+        self.assertFalse(continued.continuation_complete)
+        self.assertIsNone(continued.snapshot.jobs[0].summary)
+        self.assertIsNone(continued.snapshot.jobs[1].summary)
+
+    def test_render_handoff_uses_required_refresh_only_when_a_row_continues(self):
+        from tools.fleet import render
+
+        evidence = {"route-1": {"execute": {"revision": 1}},
+                    "route-2": {"execute": {"revision": 1}}}
+        old = _snapshot(evidence, extra_route=True)
+        old.jobs[0].summary = "continued route one"
+        payload = details.export_continuation(_completed_detail(old))
+        current = _snapshot({**evidence, "route-2": {"execute": {"revision": 2}}},
+                            extra_route=True)
+        required_refresh = mock.Mock(return_value="mixed-result")
+        fallback_refresh = mock.Mock(return_value="full-result")
+        collector = SimpleNamespace(required_detail_refresh=required_refresh,
+                                    detail_refresh=fallback_refresh)
+
+        result = render._explorer_resume_continuation(
+            collector, current, payload, details)
+
+        self.assertEqual(result, "mixed-result")
+        required_refresh.assert_called_once()
+        partial = required_refresh.call_args.args[0]
+        self.assertEqual(len(partial.jobs), 2)
+        self.assertEqual(partial.jobs[0].summary, "continued route one")
+        self.assertIsNone(partial.jobs[1].summary)
+        fallback_refresh.assert_not_called()
+
+        stale = _snapshot({"route-1": {"execute": {"revision": 9}},
+                           "route-2": {"execute": {"revision": 9}}}, extra_route=True)
+        required_refresh.reset_mock()
+        self.assertIsNone(render._explorer_resume_continuation(
+            collector, stale, payload, details))
+        required_refresh.assert_not_called()
+
+    def test_projection_recomputes_only_selected_rows_with_full_job_context(self):
+        from tools.fleet import projection
+
+        cached = WorkProjection(route_id="route-1", stage_label="continued")
+        continued = _job("route-1")
+        continued.work_projection = cached
+        missed = _job("route-2")
+
+        with mock.patch.object(projection, "resolve_work_projection",
+                               return_value=WorkProjection(route_id="route-2",
+                                                           stage_label="fresh")) as resolve:
+            projection.attach_projections(
+                [], [continued, missed], route_records={}, node_evidence={},
+                spec_markers={}, capability_groundings={}, only_entities=[missed])
+
+        resolve.assert_called_once()
+        self.assertIs(resolve.call_args.args[0], missed)
+        self.assertEqual(resolve.call_args.kwargs["jobs"], [continued, missed])
+        self.assertIs(continued.work_projection, cached)
+        self.assertEqual(missed.work_projection.stage_label, "fresh")
 
     def test_child_activity_is_part_of_the_continuation_witness(self):
         old = _snapshot({"route-1": {"execute": {"revision": 1}}})

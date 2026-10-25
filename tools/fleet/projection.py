@@ -1734,14 +1734,22 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                       route_records=None, node_evidence=None, artifact_root=None, now=None,
                       spec_markers=None, spec_marker_dir=None,
                       capability_groundings=None, degradations=None, resources=None,
-                      fast_first=False, *, include_report_verification=True):
-    """Attach work to every row and exact-owned context to live cards."""
+                      fast_first=False, *, include_report_verification=True,
+                      only_entities=None):
+    """Attach work to rows, optionally retaining full context but updating selected rows."""
     sessions, jobs = list(sessions), list(jobs)
+    update_ids = None if only_entities is None else {id(entity) for entity in only_entities}
+
+    def should_update(entity):
+        return update_ids is None or id(entity) in update_ids
+
     _attach_resource_children(jobs, resources)
     if fast_first:
         # Exact observation comes first. Route authority/progress stays unknown
         # until detail collection verifies it; resources already own exact attempts.
         for entity in sessions + jobs:
+            if not should_update(entity):
+                continue
             entity._details_pending = True
             owned = isinstance(entity, Session) or (entity.source == "plugin-queue"
                     or getattr(entity, "_dispatch_context_owned", False))
@@ -1779,10 +1787,14 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                  else capability_groundings)
     all_entities = sessions + jobs
     for session in sessions:
+        if not should_update(session):
+            continue
         public, private = normalize_context(_evidence(session), now=now, live=_is_live(session))
         session.context = public
         session._context_evidence = private
     for job in jobs:
+        if not should_update(job):
+            continue
         # F-50f plugin rows and F-65 registered attempts own their exact telemetry.
         # Arbitrary legacy/inferred job values remain fail-closed.
         owned = (job.source == "plugin-queue"
@@ -1806,6 +1818,8 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
     from . import route_chain as _route_chain
     now_for_chain = time.time() if now is None else now
     for session in sessions:
+        if not should_update(session):
+            continue
         marker = _capability_grounding_for(session, cap_index, now=now)
         elapsed_min = _field(session, "elapsed_min") or 0
         session.cap_grounding = _route_chain.current_capability(
@@ -1820,6 +1834,8 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
     report_verification_cache = {}
     try:
         for entity in all_entities:
+            if not should_update(entity):
+                continue
             entity.work_projection = resolve_work_projection(
                 entity, jobs=jobs, route_records=route_records,
                 node_evidence=node_evidence, artifact_root=artifact_root, now=now,
@@ -1893,6 +1909,14 @@ def required_projection_details_complete(entities):
         if not (_field(entity, "route_id") or _field(entity, "owner_route_id")):
             continue
         work = _field(entity, "work_projection")
+        if getattr(entity, "_continuation_validated", False):
+            route_id = _field(entity, "owner_route_id") or _field(entity, "route_id")
+            route_hash = _field(entity, "owner_route_hash") or _field(entity, "route_hash")
+            if (work is None or getattr(work, "ambiguity", None)
+                    or getattr(work, "route_id", None) != route_id
+                    or getattr(work, "route_hash", None) != route_hash):
+                return False
+            continue
         view = getattr(work, "_route_view", None) if work is not None else None
         record = view.get("record") if isinstance(view, dict) else None
         if (work is None or getattr(work, "ambiguity", None)

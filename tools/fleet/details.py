@@ -116,6 +116,7 @@ class DetailSnapshot:
     source_key: object
     snapshot: object
     continuation_complete: bool = False
+    continued_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -482,11 +483,16 @@ def merge_continuation(basic, restored):
     value.sessions, value.jobs = [], []
     total = len(basic.sessions) + len(basic.jobs)
     accepted = 0
+    current_counts = {}
+    for row in basic.sessions + basic.jobs:
+        key = _fingerprint(identity(row))
+        current_counts[key] = current_counts.get(key, 0) + 1
     for target, source_rows in ((value.sessions, basic.sessions), (value.jobs, basic.jobs)):
         for row in source_rows:
             current = copy.copy(row)
-            candidates = saved.get(_fingerprint(identity(row)), ())
-            if len(candidates) == 1:
+            identity_key = _fingerprint(identity(row))
+            candidates = saved.get(identity_key, ())
+            if current_counts.get(identity_key) == 1 and len(candidates) == 1:
                 item = candidates[0]
                 previous = copy.copy(row)
                 fields = item["fields"]
@@ -516,9 +522,13 @@ def merge_continuation(basic, restored):
                     for name in fields:
                         setattr(current, name, getattr(previous, name))
                     current._child_session_associated = item["child_activity"]["associated"]
+                    current._details_pending = False
+                    current._required_detail_error = False
+                    current._continuation_validated = True
                     accepted += 1
             target.append(current)
     complete = accepted == total
+    value._continuation_source_key = current_state
     if complete:
         set_required_details(value, "continued", all_new=False,
                              observed_at=payload["captured_at"], continuation_validated=True)
@@ -526,7 +536,7 @@ def merge_continuation(basic, restored):
         set_required_details(value, "partial", reason="continuation-row-not-validated",
                              all_new=False, observed_at=time.time())
     return DetailSnapshot(source_key=current_state, snapshot=value,
-                          continuation_complete=complete)
+                          continuation_complete=complete, continued_count=accepted)
 
 
 def _strip_report_verification(snapshot):
@@ -556,13 +566,19 @@ def _enrich(snapshot, *, include_report_verification=True, required=True,
     """Fill copied rows with display detail; never rescan or reclassify work."""
     from .collectors import dispatch, _adopt_child_titles, _enrich_steward, apply_peer_rows
     from . import projection, route_chain, titles
-    source_key = state_key(snapshot)
+    source_key = getattr(snapshot, "_continuation_source_key", None) or state_key(snapshot)
+    continued = {identity(row) for row in snapshot.sessions + snapshot.jobs
+                 if getattr(row, "_continuation_validated", False)}
     value = _copy_for_enrichment(snapshot, required_only=required_only)
     sessions, jobs = value.sessions, value.jobs
-    dispatch._fill_locations(jobs)
+    detail_sessions = [row for row in sessions if identity(row) not in continued]
+    detail_jobs = [row for row in jobs if identity(row) not in continued]
+    route_entities = list(value.route_entities or ())
+    detail_entities = detail_sessions + detail_jobs + route_entities
+    dispatch._fill_locations(detail_jobs)
     if not required_only:
         dispatch._campaign_labels(jobs)
-    for job in jobs:
+    for job in detail_jobs:
         job._details_error = False
         if required:
             job._required_detail_error = False
@@ -593,14 +609,35 @@ def _enrich(snapshot, *, include_report_verification=True, required=True,
         titles.annotate(sessions + jobs)
     if required:
         route_chain_ready = True
-        try:
-            route_chain.enrich(sessions, jobs=jobs, node_evidence=value.node_evidence, now=time.time())
-        except Exception:
-            route_chain_ready = False
+        if detail_sessions or not continued:
+            try:
+                route_chain.enrich(
+                    sessions, jobs=jobs, node_evidence=value.node_evidence, now=time.time(),
+                    only_sessions=detail_sessions if continued else None)
+            except Exception:
+                route_chain_ready = False
         degradations_ready = True
         try:
+            routes = set()
+            for entity in detail_entities:
+                for field in ("route_id", "owner_route_id"):
+                    route_id = getattr(entity, field, None)
+                    if route_id:
+                        routes.add(route_id)
+                work = getattr(entity, "work_projection", None)
+                route_id = getattr(work, "route_id", None)
+                if route_id:
+                    routes.add(route_id)
+                chain = getattr(entity, "route_chain", None) or {}
+                routes.update(node.get("route_id") for node in chain.get("nodes", ())
+                              if isinstance(node, dict) and node.get("route_id"))
+                neighbourhood = _projection_neighbourhood(entity, entity, source_key)
+                if neighbourhood is not None:
+                    routes.update(neighbourhood[2])
             degradations = dispatch._scan_degradations(
-                set(value.node_evidence) | {j.route_id for j in jobs if j.route_id}, jobs=jobs)
+                (routes if continued else
+                 set(value.node_evidence) | {j.route_id for j in jobs if j.route_id}),
+                jobs=jobs)
         except Exception:
             degradations_ready = False
             degradations = value.degradations or {}
@@ -609,16 +646,17 @@ def _enrich(snapshot, *, include_report_verification=True, required=True,
             projection.attach_projections(
                 sessions, jobs, node_evidence=value.node_evidence,
                 degradations=degradations, resources=value.resources, now=time.time(),
-                include_report_verification=include_report_verification)
+                include_report_verification=include_report_verification,
+                only_entities=detail_entities if continued else None)
         except Exception:
             projection_ready = False
         detail_ready = (route_chain_ready and degradations_ready and projection_ready
                         and projection.required_projection_details_complete(
-                            sessions + jobs + list(value.route_entities or ())))
+                            sessions + jobs + route_entities))
         set_required_details(
             value, "ok" if detail_ready else "partial",
             reason=None if detail_ready else "required-detail-source-incomplete",
-            all_new=detail_ready, observed_at=time.time())
+            all_new=detail_ready and not continued, observed_at=time.time())
         value.degradations = degradations
     else:
         # The complete basic pass already owns current routes and summaries.
@@ -648,6 +686,11 @@ def _enrich(snapshot, *, include_report_verification=True, required=True,
         refresh_observed_tag_metadata(value.tag_metadata)
     if not include_report_verification:
         _strip_report_verification(value)
+    for row in sessions + jobs:
+        if hasattr(row, "_continuation_validated"):
+            del row._continuation_validated
+    if hasattr(value, "_continuation_source_key"):
+        del value._continuation_source_key
     return DetailSnapshot(source_key, value)
 
 

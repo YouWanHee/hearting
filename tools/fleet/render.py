@@ -11157,6 +11157,34 @@ def _explorer_detail_callback(collector, *, optional=False):
     return (callback, False) if callable(callback) else (None, False)
 
 
+def _explorer_resume_continuation(collector, source, payload, details):
+    """Resume valid rows and refresh misses with the full current snapshot as context."""
+    restore = getattr(details, "restore_continuation", None)
+    merge = getattr(details, "merge_continuation", None)
+    if not callable(restore) or not callable(merge):
+        return None
+    continued = merge(source, restore(payload))
+    if isinstance(continued, tuple) and continued:
+        continued = continued[0]
+    if not hasattr(continued, "snapshot"):
+        return None
+    if getattr(continued, "continuation_complete", False):
+        return continued
+    if not getattr(continued, "continued_count", 0):
+        return None
+    # The callback retains neighbourhood and association evidence from all rows;
+    # continuation markers limit required-detail writes to the unvalidated rows.
+    callback, _required_only = _explorer_detail_callback(collector, optional=False)
+    if callable(callback):
+        try:
+            refreshed = callback(continued.snapshot)
+        except Exception:
+            refreshed = None
+        if refreshed is not None:
+            return refreshed
+    return continued
+
+
 def _loop(stdscr, collect_all, hfilter, section, interval):
     global _OFFSET, _BLINK_ON, _RESUME_ORDER, _RELOAD_FRAME, _HIT_VALID, _EXPLORER_RESULT, _EXPLORER_EARLIER
     global _EXPLORER_GENERATION, _EXPLORER_MODEL, _EXPLORER_PUBLISHED_MODEL
@@ -11230,13 +11258,10 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 merge_continuation = getattr(details, "merge_continuation", None)
                 if payload is not None and callable(restore_continuation) and callable(merge_continuation):
                     try:
-                        restored = restore_continuation(payload)
-                        continued = merge_continuation(source, restored)
-                        if isinstance(continued, tuple) and continued:
-                            continued = continued[0]
-                        if (hasattr(continued, "snapshot") and
-                                getattr(continued, "continuation_complete", False)):
-                            result = continued
+                        resumed = _explorer_resume_continuation(
+                            collect_all, source, payload, details)
+                        if resumed is not None:
+                            result = resumed
                             required_only_pass = True
                     except Exception:
                         result = None
