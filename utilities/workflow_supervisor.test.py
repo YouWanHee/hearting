@@ -4278,6 +4278,68 @@ class TestComputePollObservationBoundary(WorkflowFixture):
         self.assertIsNotNone(public)
         self.assertEqual(public["rows"][0]["clock_scope"], "row")
 
+    def test_supervisor_poll_observes_rootless_run_bound_admission_without_progress(self):
+        import resource_progress
+        route, path, jobs, registry, ledger, armed = self.compute_fixture()
+        artifact = self.base / "artifact-rootless"
+        artifact.mkdir()
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        def stop_process():
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        self.addCleanup(stop_process)
+        identity = SUP.RR.proc_identity(proc.pid)
+        identity_deadline = time.monotonic() + 5
+        while identity is None and time.monotonic() < identity_deadline:
+            time.sleep(0.005)
+            identity = SUP.RR.proc_identity(proc.pid)
+        self.assertIsNotNone(identity)
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        row = data["runs"]["fixture-resource"]
+        row.pop("execution", None)
+        row.pop("compute_run_id", None)
+        row.pop("compute_host", None)
+        row.pop("output_dir", None)
+        started = time.time() - 7200
+        row.update(**identity, status="running", started_at=started,
+            artifact_root=str(artifact), planned_seconds=3600,
+            route_id=route["route_id"], node="run", route=str(path.resolve()),
+            jobs=str(jobs.resolve()))
+        data["runs"]["fixture-resource"] = row
+        registry.write_text(json.dumps(data), encoding="utf-8")
+        bundle = self.base / "unfamiliar-bundle"
+        bundle.mkdir()
+        (bundle / "execution.json").write_text(json.dumps({
+            "run_id": "fixture-resource", "started_at": started}))
+        (bundle / "decision.json").write_text(json.dumps({
+            "admitted": False, "snapshot": {"t": time.time()},
+            "reasons": ["capacity"]}))
+        armed["resource_binding"] = __import__("dispatch_resource_wait").resource_body_digest(row)
+        (ledger.root / "armed" / "run.json").write_text(json.dumps(armed), encoding="utf-8")
+        runtime = self.base / "runtime-rootless"
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs),
+                                          "AGENT_RUNTIME_DIR": str(runtime),
+                                          "AGENT_ARTIFACT_ROOT": str(artifact)}), \
+                mock.patch.object(resource_progress, "collect", return_value=None), \
+                mock.patch.object(resource_progress, "remote_candidates", return_value=[]):
+            SUP.poll_once(route, ledger)
+            state_path = resource_progress._observation_state_path(
+                row, registry, "run", create=False)
+            state = resource_progress._read_observation_state(state_path)
+            public = resource_progress.read_public_run_record(artifact, row["run_id"])
+        self.assertIsNone(proc.poll())
+        self.assertEqual(state["observation"]["admission"]["state"], "waiting")
+        self.assertIsNone(state["observation"]["reached"])
+        self.assertIsNone(state["observation"]["eta_seconds"])
+        self.assertEqual(public["admission"]["state"], "waiting")
+        self.assertIsNone(public["output_dir"])
+        self.assertEqual(public["rows"][0]["admission"]["denied_samples"], 1)
+
     def test_supervisor_registry_caller_keeps_missing_arm_birth_unknown(self):
         import resource_progress
         route, jobs, registry, ledger, row, identity, output, artifact, proc = \

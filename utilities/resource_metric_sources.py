@@ -1,7 +1,8 @@
-"""Bounded, dependency-free readers for existing detached-run metric files.
+"""Bounded, dependency-free readers for metrics and optional run observations.
 
-This module only decodes bytes at the fixed locations documented by the lab
-runtime. It does not choose a run, decide whether to notify, or write state.
+Metric readers use fixed lab locations; the admission reader examines only
+shallow roots selected by exact caller provenance. This module does not choose
+a run, decide whether to notify, or write state.
 """
 from __future__ import annotations
 
@@ -13,12 +14,18 @@ from pathlib import Path
 import re
 import stat
 import struct
+import time
 
 MAX_JSONL_BYTES_PER_PASS = 1024 * 1024
 MAX_RECORD_BYTES = 64 * 1024
 MAX_EPOCH_FILE_BYTES = 64 * 1024
 MAX_DIRECTORY_ENTRIES = 4096
 MAX_TFRECORD_BYTES = 1024 * 1024
+MAX_ADMISSION_BYTES_PER_PASS = 1024 * 1024
+MAX_ADMISSION_RECORD_BYTES = 64 * 1024
+MAX_ADMISSION_ENTRIES = 4096
+ADMISSION_TIME_BUDGET_SECONDS = 0.250
+MAX_ADMISSION_SAMPLE_IDS = 4096
 _EPOCH_FILE = re.compile(r"^(valid|train)-epoch-(\d{4,})\.json$")
 _VALID_NUMBER = (int, float)
 
@@ -187,13 +194,17 @@ def decode_jsonl(root: str | Path, cursor: dict | None = None):
                     split = "valid" if split_key in {"val", "validation"} else split_key
                     row = _split_epoch_object({"epoch": value["epoch"], **nested}, split, path)
                     if row:
-                        nested_rows.append({**row, "format": "epochs-jsonl"})
+                        nested_rows.append({**row, "format": "epochs-jsonl",
+                            "source_updated_at": after.st_mtime,
+                            "source_generation": f"{after.st_dev}:{after.st_ino}"})
                 if nested_rows:
                     samples.extend(nested_rows)
                 else:
                     row = _split_epoch_object(value, str(value.get("split") or "unknown"), path)
                     if row:
-                        samples.append({**row, "format": "epochs-jsonl"})
+                        samples.append({**row, "format": "epochs-jsonl",
+                            "source_updated_at": after.st_mtime,
+                            "source_generation": f"{after.st_dev}:{after.st_ino}"})
                 continue
             step = value.get("step")
             if type(step) is not int or step < 0:
@@ -205,7 +216,9 @@ def decode_jsonl(root: str | Path, cursor: dict | None = None):
                     (_number(scalar) or (isinstance(scalar, float) and not math.isfinite(scalar))):
                 samples.append({"epoch": step, "unit": "step", "split": split,
                     "metrics": {name: float(scalar)}, "elapsed_seconds": None,
-                    "total_epochs": None, "source_path": str(path), "format": "epochs-jsonl"})
+                    "total_epochs": None, "source_path": str(path), "format": "epochs-jsonl",
+                    "source_updated_at": after.st_mtime,
+                    "source_generation": f"{after.st_dev}:{after.st_ino}"})
                 continue
             for split_key in ("train", "valid", "val", "validation", "test"):
                 nested = value.get(split_key)
@@ -214,7 +227,9 @@ def decode_jsonl(root: str | Path, cursor: dict | None = None):
                     samples.append({"epoch": step, "unit": "step",
                         "split": "valid" if split_key in {"val", "validation"} else split_key,
                         "metrics": mapped, "elapsed_seconds": None,
-                        "total_epochs": None, "source_path": str(path), "format": "epochs-jsonl"})
+                        "total_epochs": None, "source_path": str(path), "format": "epochs-jsonl",
+                        "source_updated_at": after.st_mtime,
+                        "source_generation": f"{after.st_dev}:{after.st_ino}"})
     except FileNotFoundError:
         return [], None, warnings, []
     except (OSError, ValueError, TypeError) as exc:
@@ -233,11 +248,26 @@ def _json_object(raw):
     return json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
 
 
+def _admission_json_object(raw):
+    def reject_constant(value):
+        raise ValueError("admission-nonfinite-number")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("admission-duplicate-key")
+            result[key] = value
+        return result
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=unique,
+                      parse_constant=reject_constant)
+
+
 def decode_epoch_files(root: str | Path):
     """List only the run root once and read recognized epoch JSON files."""
     root = Path(root).resolve(strict=True)
     warnings, samples, paths, entries = [], [], [], 0
     progress = None
+    root_info = root.stat()
     try:
         with os.scandir(root) as listing:
             for entry in listing:
@@ -253,9 +283,15 @@ def decode_epoch_files(root: str | Path):
                         total = value.get("total_epochs")
                         if (type(reached) is int and reached >= 0
                                 and (total is None or type(total) is int and total >= reached)):
+                            producer_updated_at = value.get("updated_at")
+                            if not (_number(producer_updated_at) and producer_updated_at >= 0):
+                                producer_updated_at = None
                             progress = {"reached_epoch": reached, "total_epochs": total,
                                 "best_updated": value.get("best_updated") is True,
-                                "updated_at": progress_info.st_mtime,
+                                "updated_at": producer_updated_at,
+                                "source_updated_at": progress_info.st_mtime,
+                                "source_generation": f"{progress_info.st_dev}:{progress_info.st_ino}",
+                                "root_generation": f"{root_info.st_dev}:{root_info.st_ino}",
                                 "source_path": entry.path}
                     except (OSError, ValueError, UnicodeError):
                         warnings.append("progress-json-unreadable")
@@ -264,10 +300,12 @@ def decode_epoch_files(root: str | Path):
                     continue
                 epoch = int(match.group(2))
                 try:
-                    raw, _ = _read_file(Path(entry.path), root, MAX_EPOCH_FILE_BYTES)
+                    raw, file_info = _read_file(Path(entry.path), root, MAX_EPOCH_FILE_BYTES)
                     value = _json_object(raw)
                     sample = _split_epoch_object(value, match.group(1), Path(entry.path), epoch)
                     if sample:
+                        sample["source_updated_at"] = file_info.st_mtime
+                        sample["source_generation"] = f"{root_info.st_dev}:{root_info.st_ino}"
                         samples.append(sample)
                         paths.append(entry.path)
                     else:
@@ -560,7 +598,9 @@ def decode_tfevents(root: str | Path, cursor=None):
                             or stat.S_ISLNK(current.st_mode)):
                         raise ValueError("tfevents-path-replaced")
                     values, issues, consumed = _decode_tfrecord(raw, path, with_offset=True)
-                    samples.extend(values)
+                    samples.extend({**row, "source_updated_at": after.st_mtime,
+                                    "source_generation": f"{after.st_dev}:{after.st_ino}"}
+                                   for row in values)
                     warnings.extend(issues)
                     consumed_raw = raw[:consumed]
                     if consumed_raw:
@@ -632,3 +672,510 @@ def read_sources(root: str | Path, *, cursor=None):
                                                   "tfevents": next_events_cursor},
             "warnings": sorted(set(warnings)), "conflicts": conflicts,
             "coverage": "partial" if "epochs-jsonl-partial-history" in warnings else "observed"}
+
+
+def _admission_objects(value, *, max_nodes=4096, max_depth=16):
+    pending = [(value, 0)]
+    visited = 0
+    while pending and visited < max_nodes:
+        current, depth = pending.pop()
+        visited += 1
+        if isinstance(current, dict):
+            yield current
+            if depth < max_depth:
+                pending.extend((child, depth + 1) for key, child in current.items()
+                               if key not in {"snapshot", "first_snapshot",
+                                              "preceding_evaluation_leases"})
+        elif isinstance(current, list) and depth < max_depth:
+            pending.extend((child, depth + 1) for child in reversed(current[:max_nodes]))
+
+
+def _admission_state(value):
+    admitted = value.get("admitted")
+    if type(admitted) is bool:
+        return "admitted" if admitted else "denied"
+    state = value.get("state", value.get("status"))
+    if isinstance(state, str):
+        state = state.strip().lower()
+        if any(key in value for key in
+               ("admission", "admission_id", "snapshot", "first_snapshot",
+                "reasons", "reason", "preceding_evaluation_leases")):
+            if state in {"admitted", "allowed", "ready"}:
+                return "admitted"
+            if state in {"denied", "blocked", "waiting", "queued"}:
+                return "denied"
+    return None
+
+
+def _admission_timestamp(value):
+    snapshot = value.get("snapshot")
+    stamp = (snapshot.get("t") if isinstance(snapshot, dict) else None)
+    if stamp is None:
+        stamp = next((value.get(key) for key in
+                      ("observed_at", "timestamp", "created_at", "at", "t")
+                      if key in value), None)
+    if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+        try:
+            converted = float(stamp)
+            if math.isfinite(converted):
+                return converted
+        except (OverflowError, ValueError):
+            pass
+    return None
+
+
+def _admission_reasons(value):
+    raw = value.get("reasons", value.get("reason"))
+    if isinstance(raw, (str, int, float)) and not isinstance(raw, bool):
+        raw = [raw]
+    elif isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raw = []
+    result = []
+    for item in raw:
+        if isinstance(item, dict):
+            item = next((item.get(key) for key in ("reason", "code", "label", "name")
+                         if isinstance(item.get(key), (str, int, float))
+                         and not isinstance(item.get(key), bool)), None)
+        if not isinstance(item, (str, int, float)) or isinstance(item, bool):
+            continue
+        text = " ".join(str(item).split())
+        if not text or re.search(r"\b(command|token)\b", text, re.I):
+            continue
+        text = re.sub(r"\b(?:pid|process[_ -]?id)\s*[:=#]?\s*\d+\b",
+                      "process", text, flags=re.I)
+        result.append(text[:160])
+    return sorted(set(result))[:8]
+
+
+def _admission_blockers(value):
+    leases = value.get("preceding_evaluation_leases")
+    if not isinstance(leases, list):
+        return []
+    result = {}
+    for lease in leases[:64]:
+        if not isinstance(lease, dict):
+            continue
+        kind = str(lease.get("kind", lease.get("type", ""))).lower()
+        if (kind == "shared_admission" or lease.get("shared_admission") is True
+                or lease.get("scope") == "shared-authorization"):
+            continue
+        summary = {}
+        for key in ("task", "host", "gpu", "owner"):
+            value = lease.get(key)
+            if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+                continue
+            label = " ".join(str(value).split())
+            if (not label or label.startswith("/")
+                    or re.search(r"\b(command|token|pid)\b", label, re.I)):
+                continue
+            summary[key] = label[:80] if isinstance(value, str) else value
+        if summary:
+            identity = json.dumps(summary, sort_keys=True, separators=(",", ":"))
+            result[identity] = summary
+    return [result[key] for key in sorted(result)[:8]]
+
+
+def _admission_decisions(documents):
+    rows = []
+    for document in documents:
+        for value in _admission_objects(document):
+            state = _admission_state(value)
+            if state is None:
+                continue
+            nested = value.get("admission")
+            if isinstance(nested, dict) and _admission_state(nested) is not None:
+                continue
+            try:
+                identity = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                      ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError):
+                identity = repr(sorted(value.keys()))
+            rows.append({"sample_id": hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+                         "state": state, "at": _admission_timestamp(value),
+                         "reasons": _admission_reasons(value),
+                         "priority_blockers": _admission_blockers(value)})
+    unique = {row["sample_id"]: row for row in rows}
+    return [unique[key] for key in sorted(unique)]
+
+
+def _admission_root(path):
+    """Accept only an existing, non-symlink directory supplied by the caller."""
+    raw = Path(path)
+    if not raw.is_absolute():
+        raise ValueError("admission-root-not-absolute")
+    absolute = Path(os.path.abspath(raw))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError("admission-root-symlink")
+    info = absolute.lstat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("admission-root-not-directory")
+    return absolute, info
+
+
+def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
+                           started_at=None, now=None, cursor=None,
+                           monotonic=None, time_budget=ADMISSION_TIME_BUDGET_SECONDS):
+    """Read exact-run-bound admission JSON from caller-selected shallow roots.
+
+    The reader examines only each supplied root and its immediate child
+    directories. It never searches a cwd or project tree. Cursor state records
+    root generations, bundle continuation and a bounded dedup inventory.
+    """
+    if not isinstance(run_id, str) or not run_id:
+        return {"samples": [], "latest": None, "generation": None, "cursor": {},
+                "coverage": "unknown", "warnings": ["admission-run-unknown"],
+                "roots": [], "entries": 0, "bytes": 0}
+    monotonic = monotonic or time.monotonic
+    deadline = monotonic() + max(0.001, float(time_budget))
+    now = (float(now) if isinstance(now, (int, float)) and not isinstance(now, bool)
+           and math.isfinite(float(now)) else None)
+    start = (float(started_at) if isinstance(started_at, (int, float))
+             and not isinstance(started_at, bool) and math.isfinite(float(started_at)) else None)
+    prior = cursor if isinstance(cursor, dict) else {}
+    warnings, roots_out, candidates = [], [], []
+    entry_count = byte_count = 0
+    partial = exhausted = False
+    sample_ids = ([item for item in prior.get("sample_ids", []) if isinstance(item, str)]
+                  if isinstance(prior.get("sample_ids"), list) else [])
+    sample_ids = sample_ids[-MAX_ADMISSION_SAMPLE_IDS:]
+    seen_ids = set(sample_ids)
+    raw_roots = roots if isinstance(roots, (list, tuple)) else [roots]
+    root_rows = []
+    for raw_root in raw_roots:
+        if not raw_root:
+            continue
+        try:
+            root, info = _admission_root(raw_root)
+        except (OSError, ValueError, TypeError) as exc:
+            warnings.append("admission-root-unavailable:" + str(exc))
+            partial = True
+            continue
+        if str(root) in {item["path"] for item in roots_out}:
+            continue
+        generation = f"{info.st_dev}:{info.st_ino}"
+        roots_out.append({"path": str(root), "generation": generation})
+        root_rows.append((root, generation))
+
+    previous_roots = prior.get("root_generations")
+    previous_roots = previous_roots if isinstance(previous_roots, dict) else {}
+    current_roots = {row["path"]: row["generation"] for row in roots_out}
+    uncertainty_reason = prior.get("uncertainty_reason")
+    uncertainty_reason = uncertainty_reason if isinstance(uncertainty_reason, str) else None
+    if previous_roots and previous_roots != current_roots:
+        warnings.append("admission-root-generation-changed")
+        uncertainty_reason = uncertainty_reason or "generation-changed"
+        prior_latest_at = None
+    else:
+        prior_latest_at = prior.get("latest_at")
+    new_valid_times = []
+    new_invalid_timestamp = False
+
+    registry_abs = Path(os.path.abspath(registry_path)) if registry_path else None
+    scan_state = dict(prior.get("scan", {})) if isinstance(prior.get("scan"), dict) else {}
+    for root, root_generation in root_rows:
+        if monotonic() >= deadline or entry_count >= MAX_ADMISSION_ENTRIES \
+                or byte_count >= MAX_ADMISSION_BYTES_PER_PASS:
+            partial = exhausted = True
+            break
+        root_key = str(root)
+        root_state = scan_state.get(root_key, {})
+        root_state = root_state if isinstance(root_state, dict) else {}
+        last_bundle = root_state.get("last_bundle") if isinstance(root_state.get("last_bundle"), str) else ""
+        last_root_entry = root_state.get("last_root_entry") \
+            if isinstance(root_state.get("last_root_entry"), str) else ""
+        try:
+            entries = []
+            root_entry_limit = max(1, min(MAX_ADMISSION_ENTRIES // 2,
+                                          MAX_ADMISSION_ENTRIES - 1))
+            root_listing_partial = False
+            def collect_root_entries(*, after_cursor):
+                nonlocal entry_count, root_listing_partial, exhausted, partial
+                collected = []
+                with os.scandir(root) as listing:
+                    for entry in listing:
+                        if monotonic() >= deadline or entry_count >= MAX_ADMISSION_ENTRIES:
+                            partial = True
+                            exhausted = True
+                            root_listing_partial = True
+                            break
+                        if last_root_entry and ((entry.name > last_root_entry) != after_cursor):
+                            continue
+                        if len(collected) >= root_entry_limit:
+                            root_listing_partial = True
+                            break
+                        entry_count += 1
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                collected.append((entry.name, Path(entry.path), True))
+                            elif entry.is_file(follow_symlinks=False):
+                                path = Path(entry.path)
+                                if (registry_abs is None or Path(os.path.abspath(path)) != registry_abs) \
+                                        and path.suffix.lower() != ".jsonl":
+                                    collected.append((entry.name, path, False))
+                            elif entry.is_symlink():
+                                warnings.append("admission-symlink-skipped")
+                                partial = True
+                            else:
+                                info = entry.stat(follow_symlinks=False)
+                                if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                                    warnings.append("admission-special-file-skipped")
+                                    partial = True
+                        except OSError:
+                            warnings.append("admission-entry-unreadable")
+                            partial = True
+                return collected
+            entries = collect_root_entries(after_cursor=True)
+            if (last_root_entry and len(entries) < root_entry_limit and not exhausted
+                    and not root_listing_partial):
+                wrapped = collect_root_entries(after_cursor=False)
+                names = {item[0] for item in entries}
+                entries.extend(item for item in wrapped if item[0] not in names)
+            if root_listing_partial:
+                partial = True
+            if entries:
+                last_root_entry = max(item[0] for item in entries)
+            entries.sort(key=lambda item: item[0])
+            if entries and last_bundle:
+                entries = ([item for item in entries if item[0] > last_bundle]
+                           + [item for item in entries if item[0] <= last_bundle])
+            root_files = [item for item in entries if not item[2]]
+            bundles = ([(root, root_files)] if root_files else [])
+            bundles.extend((path, None) for _, path, is_dir in entries if is_dir)
+            next_bundle = last_bundle
+            last_file = (root_state.get("last_file")
+                         if isinstance(root_state.get("last_file"), str) else "")
+            if last_bundle:
+                current_index = next((index for index, item in enumerate(bundles)
+                    if ("@root" if item[0] == root else item[0].name) == last_bundle), None)
+                if current_index is not None:
+                    if last_file:
+                        bundles = ([bundles[current_index], *bundles[current_index + 1:],
+                                    *bundles[:current_index]])
+                    else:
+                        bundles = ([*bundles[current_index + 1:], *bundles[:current_index],
+                                    bundles[current_index]])
+            next_file = last_file
+            for bundle, listed in bundles:
+                if monotonic() >= deadline or byte_count >= MAX_ADMISSION_BYTES_PER_PASS \
+                        or entry_count >= MAX_ADMISSION_ENTRIES:
+                    partial = exhausted = True
+                    break
+                files = listed
+                if files is None:
+                    files = []
+                    try:
+                        with os.scandir(bundle) as listing:
+                            for child in listing:
+                                if monotonic() >= deadline or entry_count >= MAX_ADMISSION_ENTRIES:
+                                    partial = exhausted = True
+                                    break
+                                entry_count += 1
+                                try:
+                                    if (child.is_file(follow_symlinks=False)
+                                            and not child.name.lower().endswith(".jsonl")):
+                                        files.append((child.name, Path(child.path), False))
+                                    elif child.is_symlink():
+                                        warnings.append("admission-symlink-skipped")
+                                        partial = True
+                                    else:
+                                        info = child.stat(follow_symlinks=False)
+                                        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                                            warnings.append("admission-special-file-skipped")
+                                            partial = True
+                                except OSError:
+                                    warnings.append("admission-entry-unreadable")
+                                    partial = True
+                    except OSError:
+                        warnings.append("admission-bundle-unreadable")
+                        partial = True
+                files.sort(key=lambda item: item[0])
+                bundle_key = "@root" if bundle == root else bundle.name
+                if last_file and bundle_key == last_bundle:
+                    files = ([item for item in files if item[0] > last_file]
+                             + [item for item in files if item[0] <= last_file])
+                documents = []
+                last_file_processed = last_file if bundle_key == last_bundle else ""
+                for file_name, path, _ in files:
+                    if monotonic() >= deadline or byte_count >= MAX_ADMISSION_BYTES_PER_PASS:
+                        partial = exhausted = True
+                        break
+                    try:
+                        if registry_abs is not None and Path(os.path.abspath(path)) == registry_abs:
+                            continue
+                        _check_parents(path, bundle)
+                        file_info = path.lstat()
+                        if not stat.S_ISREG(file_info.st_mode):
+                            warnings.append("admission-record-not-regular")
+                            partial = True
+                            last_file_processed = file_name
+                            continue
+                        if file_info.st_size > MAX_ADMISSION_RECORD_BYTES:
+                            if path.suffix.lower() == ".json":
+                                warnings.append("admission-record-unbounded")
+                                partial = True
+                            last_file_processed = file_name
+                            continue
+                        remaining = MAX_ADMISSION_BYTES_PER_PASS - byte_count
+                        if remaining <= 0:
+                            partial = exhausted = True
+                            break
+                        raw, _info = _read_file(path, bundle,
+                            min(MAX_ADMISSION_RECORD_BYTES, remaining))
+                        byte_count += len(raw)
+                        try:
+                            document = _admission_json_object(raw)
+                        except (ValueError, UnicodeError, RecursionError) as exc:
+                            if (path.suffix.lower() == ".json"
+                                    or raw.lstrip().startswith((b"{", b"["))):
+                                warnings.append("admission-record-unavailable:" + str(exc))
+                                partial = True
+                            last_file_processed = file_name
+                            continue
+                        if isinstance(document, (dict, list)):
+                            documents.append(document)
+                        elif path.suffix.lower() == ".json" or raw.lstrip().startswith((b"{", b"[")):
+                            warnings.append("admission-json-not-object")
+                            partial = True
+                    except (OSError, ValueError, TypeError, UnicodeError,
+                            OverflowError, RecursionError) as exc:
+                        warnings.append("admission-record-unavailable:" + str(exc))
+                        partial = True
+                    last_file_processed = file_name
+                next_bundle = bundle_key
+                next_file = last_file_processed if exhausted else ""
+                scan_state[root_key] = {"last_bundle": next_bundle, "last_file": next_file}
+                if exhausted:
+                    break
+                if not documents:
+                    continue
+                objects = [obj for doc in documents for obj in _admission_objects(doc)]
+                run_ids = {obj.get("run_id") for obj in objects
+                           if isinstance(obj.get("run_id"), str)}
+                if run_id not in run_ids:
+                    continue
+                row_ids = {obj.get(key) for obj in objects
+                           for key in ("row_id", "row_key", "arm_id", "arm")
+                           if isinstance(obj.get(key), str)}
+                generation_fields = [{key: obj.get(key) for key in
+                    ("run_id", "started_at", "pid", "starttime", "command_hash",
+                     "config_sha256", "row_id", "row_key") if key in obj}
+                    for obj in objects if obj.get("run_id") == run_id]
+                generation_material = json.dumps(sorted(generation_fields,
+                    key=lambda item: json.dumps(item, sort_keys=True)), sort_keys=True,
+                    separators=(",", ":"), ensure_ascii=False, default=str)
+                bundle_generation = hashlib.sha256(
+                    (root_generation + generation_material).encode("utf-8")).hexdigest()[:24]
+                if run_ids != {run_id} or (row_key and str(row_key) != "run"
+                                           and row_ids != {str(row_key)}):
+                    candidates.append({"ambiguous": True, "generation": bundle_generation,
+                                       "samples": [], "path": str(bundle)})
+                    continue
+                decisions = _admission_decisions(documents)
+                if not decisions:
+                    continue
+                current_rows = []
+                for row in decisions:
+                    stamp = row.get("at")
+                    if start is not None and stamp is not None and stamp < start:
+                        continue
+                    invalid_time = ((start is not None and stamp is None)
+                        or (now is not None and stamp is not None and stamp > now)
+                        or (isinstance(prior_latest_at, (int, float)) and stamp is not None
+                            and stamp < float(prior_latest_at)))
+                    if invalid_time:
+                        row = {**row, "state": "unknown"}
+                        if row["sample_id"] not in seen_ids:
+                            new_invalid_timestamp = True
+                    elif row["state"] in {"admitted", "denied"} and stamp is not None \
+                            and row["sample_id"] not in seen_ids:
+                        new_valid_times.append(float(stamp))
+                    current_rows.append(row)
+                unseen = []
+                for row in current_rows:
+                    if row["sample_id"] not in seen_ids:
+                        unseen.append(row)
+                        seen_ids.add(row["sample_id"])
+                        sample_ids.append(row["sample_id"])
+                candidates.append({"ambiguous": False, "generation": bundle_generation,
+                                   "samples": unseen, "all_samples": current_rows,
+                                   "path": str(bundle)})
+            scan_state[root_key] = {"last_bundle": next_bundle, "last_file": next_file,
+                                    "last_root_entry": last_root_entry}
+            if exhausted:
+                break
+        except (OSError, ValueError, TypeError) as exc:
+            warnings.append("admission-root-unreadable:" + str(exc))
+            partial = True
+
+    if len(sample_ids) > MAX_ADMISSION_SAMPLE_IDS:
+        sample_ids = sample_ids[-MAX_ADMISSION_SAMPLE_IDS:]
+        seen_ids = set(sample_ids)
+        warnings.append("admission-dedup-inventory-truncated")
+        partial = True
+    next_cursor = {"schema_version": 1, "root_generations": current_roots,
+                   "scan": scan_state, "sample_ids": sample_ids,
+                   "latest_at": prior_latest_at}
+    target_candidates = [candidate for candidate in candidates if not candidate.get("ambiguous")]
+    ambiguous = any(candidate.get("ambiguous") for candidate in candidates)
+    by_payload = {}
+    for candidate in target_candidates:
+        payload = tuple(sorted(row["sample_id"] for row in candidate.get("all_samples", [])))
+        by_payload.setdefault(payload, candidate)
+    selected = list(by_payload.values())
+    latest = generation = None
+    if not ambiguous and len(selected) == 1 and not partial and not exhausted:
+        chosen = selected[0]
+        generation = chosen.get("generation")
+        all_samples = chosen.get("all_samples", [])
+        latest = max(all_samples, key=lambda row: (row.get("at") is not None,
+                     row.get("at") if row.get("at") is not None else float("-inf"),
+                     row["sample_id"]), default=None)
+    source_error = any(any(marker in warning for marker in
+        ("record-unavailable", "root-unavailable", "bundle-unreadable",
+         "entry-unreadable", "symlink-skipped", "special-file-skipped", "record-unbounded",
+         "json-not-object", "nonfinite", "duplicate-key"))
+        for warning in warnings)
+    if source_error:
+        uncertainty_reason = "source-invalid"
+    if ambiguous:
+        uncertainty_reason = "ambiguous"
+    elif partial or exhausted:
+        uncertainty_reason = uncertainty_reason or "partial"
+    elif not selected:
+        if uncertainty_reason not in {"source-invalid", "timestamp-invalid"}:
+            uncertainty_reason = "source-missing"
+    if new_invalid_timestamp:
+        uncertainty_reason = "timestamp-invalid"
+    valid_times = [row.get("at") for candidate in target_candidates
+        for row in candidate.get("all_samples", [])
+        if row.get("state") in {"admitted", "denied"}
+        and isinstance(row.get("at"), (int, float)) and not isinstance(row.get("at"), bool)
+        and (now is None or row["at"] <= now) and (start is None or row["at"] >= start)]
+    if (new_valid_times and (prior_latest_at is None
+            or max(new_valid_times) >= float(prior_latest_at))
+            and not source_error and not ambiguous and not partial and not exhausted):
+        uncertainty_reason = None
+    elif (uncertainty_reason in {"partial", "generation-changed"}
+          and latest is not None and latest.get("state") in {"admitted", "denied"}
+          and not source_error and not ambiguous and not partial and not exhausted):
+        uncertainty_reason = None
+    if uncertainty_reason and latest is not None:
+        latest = {**latest, "state": "unknown"}
+    next_cursor["uncertainty_reason"] = uncertainty_reason
+    coverage = ("partial" if partial or exhausted else
+                "observed" if latest is not None else "unknown")
+    unique_new = {row["sample_id"]: row for candidate in target_candidates
+                  for row in candidate.get("samples", [])}
+    if valid_times:
+        next_cursor["latest_at"] = max(valid_times)
+    return {"samples": sorted(unique_new.values(), key=lambda row:
+                (row.get("at") is not None, row.get("at") or 0, row["sample_id"])),
+            "latest": latest, "generation": generation, "cursor": next_cursor,
+            "coverage": coverage, "warnings": sorted(set(warnings)),
+            "roots": roots_out, "entries": entry_count, "bytes": byte_count}

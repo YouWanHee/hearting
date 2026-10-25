@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import json
+import os
 from pathlib import Path
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 import resource_metric_sources as metrics
 
@@ -146,6 +148,202 @@ class MetricSourcesTest(unittest.TestCase):
         self.assertEqual([row["epoch"] for row in samples], [1])
         self.assertTrue(any("generation-changed" in warning for warning in warnings))
         self.assertEqual(reset_cursor[path.name]["offset"], len(first))
+
+    def test_admission_reader_binds_run_content_and_deduplicates_snapshots_and_leases(self):
+        root = self.root / "registry-parent"
+        bundle = root / "arbitrary-bundle-name"
+        bundle.mkdir(parents=True)
+        registry = root / "registry.json"
+        registry.write_text("{}\n")
+        (bundle / "execution-record.data").write_text(json.dumps({
+            "run_id": "run-a", "started_at": 50, "row_id": "row-a"}))
+        admission = {
+            "admitted": False,
+            "snapshot": {"t": 100},
+            "first_snapshot": {"t": 20},
+            "reasons": ["gpu capacity", "gpu capacity"],
+            "preceding_evaluation_leases": [
+                {"task": "evaluation", "host": "host-a", "gpu": 0},
+                {"task": "evaluation", "host": "host-a", "gpu": 0},
+                {"kind": "shared_admission", "task": "shared"},
+            ],
+        }
+        (bundle / "unrelated-file-prefix").write_text(json.dumps(admission))
+        result = metrics.read_admission_sources([root], run_id="run-a", row_key="row-a",
+            registry_path=registry, started_at=50, now=110)
+        self.assertEqual(result["coverage"], "observed")
+        sample, = result["samples"]
+        self.assertEqual((sample["state"], sample["at"]), ("denied", 100.0))
+        self.assertEqual(sample["reasons"], ["gpu capacity"])
+        self.assertEqual(sample["priority_blockers"], [
+            {"task": "evaluation", "host": "host-a", "gpu": 0}])
+        self.assertNotIn("wait_duration_seconds", sample)
+        self.assertNotIn("time_ratio", sample)
+        replay = metrics.read_admission_sources([root], run_id="run-a", row_key="row-a",
+            registry_path=registry, started_at=50, now=111, cursor=result["cursor"])
+        self.assertEqual(replay["samples"], [])
+        self.assertEqual(replay["latest"]["sample_id"], sample["sample_id"])
+
+    def test_admission_reader_rejects_wrong_foreign_and_ambiguous_bindings(self):
+        wrong = self.root / "wrong"
+        (wrong / "bundle").mkdir(parents=True)
+        (wrong / "bundle" / "record.json").write_text('{"run_id":"other"}')
+        (wrong / "bundle" / "admission.json").write_text(
+            '{"admitted":false,"snapshot":{"t":10}}')
+        result = metrics.read_admission_sources([wrong], run_id="target", now=20)
+        self.assertEqual((result["coverage"], result["latest"]), ("unknown", None))
+
+        ambiguous = self.root / "ambiguous"
+        (ambiguous / "bundle").mkdir(parents=True)
+        (ambiguous / "bundle" / "record.json").write_text(
+            '{"run_id":"target","other":{"run_id":"other"}}')
+        (ambiguous / "bundle" / "admission.json").write_text(
+            '{"admitted":false,"snapshot":{"t":10}}')
+        result = metrics.read_admission_sources([ambiguous], run_id="target", now=20)
+        self.assertEqual((result["coverage"], result["latest"]), ("unknown", None))
+
+        foreign_row = self.root / "foreign-row"
+        (foreign_row / "bundle").mkdir(parents=True)
+        (foreign_row / "bundle" / "record.json").write_text(
+            '{"run_id":"target","row_id":"row-other","started_at":0}')
+        (foreign_row / "bundle" / "admission.json").write_text(
+            '{"admitted":false,"row_id":"row-other","snapshot":{"t":10}}')
+        result = metrics.read_admission_sources([foreign_row], run_id="target",
+            row_key="row-target", started_at=0, now=20)
+        self.assertEqual((result["coverage"], result["latest"]), ("unknown", None))
+
+    def test_admission_reader_reports_invalid_links_and_json_as_partial_unknown(self):
+        root = self.root / "malformed"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "record.json").write_text('{"run_id":"target","started_at":0}')
+        (bundle / "duplicate-keys.json").write_text(
+            '{"admitted":false,"admitted":true,"snapshot":{"t":10}}')
+        (bundle / "nonfinite.json").write_text(
+            '{"admitted":false,"snapshot":{"t":NaN}}')
+        result = metrics.read_admission_sources([root], run_id="target", started_at=0, now=20)
+        self.assertEqual(result["coverage"], "partial")
+        self.assertIsNone(result["latest"])
+        self.assertTrue(any("duplicate-key" in warning for warning in result["warnings"]))
+        self.assertTrue(any("nonfinite" in warning for warning in result["warnings"]))
+        link_root = self.root / "link-root"
+        link_root.symlink_to(root, target_is_directory=True)
+        linked = metrics.read_admission_sources([link_root], run_id="target", now=20)
+        self.assertEqual(linked["coverage"], "partial")
+        self.assertTrue(any("symlink" in warning for warning in linked["warnings"]))
+
+    def test_admission_reader_resumes_after_entry_budget_and_observes_both_bundles(self):
+        root = self.root / "many-bundles"
+        for name, stamp in (("bundle-a", 10), ("bundle-b", 20)):
+            bundle = root / name
+            bundle.mkdir(parents=True)
+            (bundle / "record.json").write_text(json.dumps({"run_id": "target", "started_at": 0}))
+            (bundle / "decision.json").write_text(json.dumps({
+                "admitted": False, "snapshot": {"t": stamp}}))
+        cursor = None
+        samples = {}
+        with mock.patch.object(metrics, "MAX_ADMISSION_ENTRIES", 3):
+            for _ in range(4):
+                result = metrics.read_admission_sources([root], run_id="target",
+                    started_at=0, now=30, cursor=cursor)
+                cursor = result["cursor"]
+                for sample in result["samples"]:
+                    samples[sample["at"]] = sample
+                self.assertLessEqual(result["entries"], 3)
+        self.assertEqual(set(samples), {10.0, 20.0})
+
+    def test_admission_reader_keeps_backward_time_unknown_until_new_valid_sample(self):
+        root = self.root / "time-order"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "record.json").write_text(
+            '{"run_id":"target","started_at":0}')
+        decision = bundle / "decision.json"
+        decision.write_text('{"admitted":false,"snapshot":{"t":100}}')
+        first = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=110)
+        self.assertEqual(first["latest"]["state"], "denied")
+        import shutil
+        shutil.rmtree(bundle)
+        vanished = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=111, cursor=first["cursor"])
+        self.assertIsNone(vanished["latest"])
+        bundle.mkdir()
+        (bundle / "record.json").write_text(
+            '{"run_id":"target","started_at":0}')
+        decision.write_text('{"admitted":false,"snapshot":{"t":100}}')
+        reappeared = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=112, cursor=vanished["cursor"])
+        self.assertEqual(reappeared["latest"]["state"], "unknown")
+        decision.write_text('{"admitted":true,"snapshot":{"t":50}}')
+        backward = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=110, cursor=reappeared["cursor"])
+        self.assertEqual(backward["latest"]["state"], "unknown")
+        repeat = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=111, cursor=backward["cursor"])
+        self.assertEqual(repeat["latest"]["state"], "unknown")
+        replacement = bundle / "replacement.json"
+        replacement.write_text('{"admitted":true,"snapshot":{"t":120}}')
+        replacement.replace(decision)
+        recovered = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=121, cursor=repeat["cursor"])
+        self.assertEqual(recovered["latest"]["state"], "admitted")
+        self.assertIsNone(recovered["cursor"]["uncertainty_reason"])
+
+    def test_admission_reader_rejects_boolean_future_oversized_and_linked_records(self):
+        root = self.root / "invalid-samples"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "record.json").write_text(
+            '{"run_id":"target","started_at":0}')
+        decision = bundle / "decision.json"
+        decision.write_text('{"admitted":false,"snapshot":{"t":true}}')
+        boolean = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=100)
+        self.assertEqual(boolean["latest"]["state"], "unknown")
+        decision.write_text('{"admitted":false,"snapshot":{"t":1000}}')
+        future = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=100, cursor=boolean["cursor"])
+        self.assertEqual(future["latest"]["state"], "unknown")
+        decision.write_text('{"admitted":true,"snapshot":{"t":110}}')
+        valid = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=111, cursor=future["cursor"])
+        self.assertEqual(valid["latest"]["state"], "admitted")
+
+        outside = self.root / "outside.json"
+        outside.write_text('{"admitted":true,"snapshot":{"t":111}}')
+        (bundle / "linked.json").symlink_to(outside)
+        (bundle / "oversized.json").write_text('{"padding":"' + "x" * 70000 + '"}')
+        try:
+            os.mkfifo(bundle / "device.json")
+        except (AttributeError, NotImplementedError, OSError):
+            pass
+        damaged = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=112, cursor=valid["cursor"])
+        self.assertEqual(damaged["coverage"], "partial")
+        self.assertIsNone(damaged["latest"])
+        self.assertTrue(any("symlink" in warning for warning in damaged["warnings"]))
+        self.assertTrue(any("unbounded" in warning for warning in damaged["warnings"]))
+
+    def test_admission_reader_obeys_time_and_byte_budgets(self):
+        root = self.root / "bounded"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "record.json").write_text('{"run_id":"target","started_at":0}')
+        (bundle / "decision.json").write_text(
+            json.dumps({"admitted": False, "snapshot": {"t": 10}, "padding": "x" * 400}))
+        clock = [0.0]
+        def monotonic():
+            clock[0] += 0.0002
+            return clock[0]
+        timed = metrics.read_admission_sources([root], run_id="target", started_at=0,
+            now=20, monotonic=monotonic, time_budget=0.0008)
+        self.assertEqual(timed["coverage"], "partial")
+        self.assertLessEqual(timed["entries"], metrics.MAX_ADMISSION_ENTRIES)
+        with mock.patch.object(metrics, "MAX_ADMISSION_BYTES_PER_PASS", 128):
+            sized = metrics.read_admission_sources([root], run_id="target", started_at=0, now=20)
+        self.assertLessEqual(sized["bytes"], 128)
+        self.assertEqual(sized["coverage"], "partial")
 
 
 if __name__ == "__main__":

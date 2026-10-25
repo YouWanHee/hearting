@@ -3136,6 +3136,7 @@ def _observe_compute_experiment(meta, run_dir, now, *, final=False):
         started = None
     record = {
         "run_id": meta.get("run_id") or Path(run_dir).name,
+        "row_id": resource.get("row_id") or meta.get("row_id"),
         "campaign_id": resource.get("campaign_id") or meta.get("campaign_id"),
         "cycle_id": resource.get("cycle_id") or meta.get("cycle_id"),
         "route_id": route.get("route_id") or route_doc.get("route_id"),
@@ -3155,7 +3156,8 @@ def _observe_compute_experiment(meta, run_dir, now, *, final=False):
     try:
         import resource_progress
         return resource_progress.observe_experiment(record, Path(run_dir) / "meta.json", now,
-            root=output_dir, row_key=record["run_id"], started_at=started,
+            root=output_dir, row_key=record.get("row_id") or record["run_id"],
+            row_scoped=bool(record.get("row_id")), started_at=started,
             planned_seconds=record["planned_seconds"], final=final,
             status=record["status"], notify_events=not final)
     except Exception:  # noqa: BLE001 -- observation must never change run completion
@@ -3188,9 +3190,26 @@ def _compute_observation_summary(result):
     record = result.get("record_path") or "run 기록 경로 없음"
     plan = observation.get("planned_seconds")
     actual = observation.get("elapsed_seconds")
+    admission = observation.get("admission") if isinstance(observation.get("admission"), dict) else {}
+    admission_text = ""
+    if admission.get("sample_count", 0) or admission.get("coverage") != "unknown":
+        admission_text = (f"; admission {admission.get('state', 'unknown')} ({admission.get('coverage', 'unknown')}); "
+            f"denied/valid samples {admission.get('denied_samples', 0)}/{admission.get('valid_samples', 0)}; "
+            f"sample ratio {admission.get('denied_sample_ratio') if admission.get('denied_sample_ratio') is not None else 'unknown'}")
+    reasons = admission.get("reasons") if isinstance(admission.get("reasons"), list) else []
+    if admission.get("state") == "waiting" and reasons:
+        admission_text += "; reason " + ", ".join(str(value)[:120] for value in reasons[:2])
+    stagnation = observation.get("stagnation") if isinstance(observation.get("stagnation"), dict) else {}
+    if stagnation.get("state") == "stagnant":
+        since = "last actual increase" if stagnation.get("since") == "last-increase" else "first comparable observation"
+        stagnation_text = f"; no observed increase for {_duration_text(stagnation.get('seconds_since_anchor'))} since {since}"
+    elif stagnation.get("state") == "unknown":
+        stagnation_text = "; progress stagnation unknown"
+    else:
+        stagnation_text = ""
     return (f"; 마지막 {points('latest_metrics', latest)}; 최고 {points('best_metrics', best)}; 추세 {summary.get('trend') or '판정 불가'}"
             f"; 실제 {_duration_text(actual)} / 계획 {_duration_text(plan)}"
-            f"; run 기록 {record}")
+            f"; run 기록 {record}{admission_text}{stagnation_text}")
 
 
 def _duration_text(value):
