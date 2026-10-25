@@ -58,6 +58,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
+import copy
 import dataclasses
 import datetime
 import fcntl
@@ -593,12 +595,50 @@ def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] 
 # Seat ledger
 # ---------------------------------------------------------------------------
 
+_LEDGER_READ_SCOPE = contextvars.ContextVar("session_tidy_ledger_read_scope", default=None)
+_LEDGER_READ_ONLY = contextvars.ContextVar("session_tidy_ledger_read_only", default=False)
+
+
+@contextlib.contextmanager
+def seat_ledger_read_scope():
+    """Share parsed ledger rows within one read pass, with nested scope reuse."""
+    active = _LEDGER_READ_SCOPE.get()
+    token = _LEDGER_READ_SCOPE.set(active if active is not None else {})
+    try:
+        yield
+    finally:
+        _LEDGER_READ_SCOPE.reset(token)
+
+
+@contextlib.contextmanager
+def seat_ledger_readonly_scope():
+    """Avoid defensive row copies for trusted readers that only inspect ledger data."""
+    token = _LEDGER_READ_ONLY.set(True)
+    try:
+        yield
+    finally:
+        _LEDGER_READ_ONLY.reset(token)
+
+
+def _invalidate_ledger_read(seat: Seat) -> None:
+    scope = _LEDGER_READ_SCOPE.get()
+    if scope is not None:
+        scope.pop(os.fspath(_ledger_path(seat)), None)
+
 def _ledger_path(seat: Seat) -> Path:
     return state_root() / "sessions" / f"{seat.key}.jsonl"
 
 
 def _read_ledger_lines(seat: Seat) -> list[dict]:
-    raw = read_bytes(_ledger_path(seat))
+    path = _ledger_path(seat)
+    scope = _LEDGER_READ_SCOPE.get()
+    read_only = _LEDGER_READ_ONLY.get()
+    if scope is not None:
+        key = os.fspath(path)
+        cached = scope.get(key)
+        if cached is not None:
+            return cached if read_only else copy.deepcopy(cached)
+    raw = read_bytes(path)
     entries = []
     for line in (raw or b"").decode("utf-8", "replace").splitlines():
         try:
@@ -607,6 +647,9 @@ def _read_ledger_lines(seat: Seat) -> list[dict]:
             continue
         if isinstance(item, dict) and item.get("sid"):
             entries.append(item)
+    if scope is None:
+        return entries
+    scope[os.fspath(path)] = entries if read_only else copy.deepcopy(entries)
     return entries
 
 
@@ -617,9 +660,12 @@ def _append_ledger_entry(seat: Seat, entry: dict) -> None:
     _reject_symlink(path)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     try:
-        os.write(fd, (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+        try:
+            os.write(fd, (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        _invalidate_ledger_read(seat)
     _fold_ledger(seat)
 
 
@@ -1393,7 +1439,10 @@ def _fold_ledger(seat: Seat) -> None:
                 row[field] = item[field]
     body = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n"
                     for r in list(folded.values()) + relations + provenance + recent)
-    atomic_write(_ledger_path(seat), body.encode("utf-8"))
+    try:
+        atomic_write(_ledger_path(seat), body.encode("utf-8"))
+    finally:
+        _invalidate_ledger_read(seat)
 
 
 # ---------------------------------------------------------------------------

@@ -151,11 +151,21 @@ class JobFailures(unittest.TestCase):
                 self.assertNotIn("0 jobs", text)
 
     def test_registry_permission_error_is_not_an_empty_census(self):
-        with mock.patch("builtins.open", side_effect=PermissionError("NAS denied")):
-            with self.assertRaises(PermissionError):
-                dispatch._scan_jobs_log("/audit/jobs.log", set())
-            with self.assertRaises(PermissionError):
-                dispatch._jobs_log_fields(["/audit/jobs.log"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fresh-jobs.log"
+            path.write_text("1\trunning\t/repo\t/tmp/wt\tworker\t", encoding="utf-8")
+            read_text = Path.read_text
+
+            def denied(source, *args, **kwargs):
+                if source == path:
+                    raise PermissionError("NAS denied")
+                return read_text(source, *args, **kwargs)
+
+            with mock.patch.object(Path, "read_text", denied):
+                with self.assertRaises(PermissionError):
+                    dispatch._scan_jobs_log(path, set())
+                with self.assertRaises(PermissionError):
+                    dispatch._jobs_log_fields([path])
 
     def test_last_jobs_and_failure_are_one_publication_then_recover(self):
         owner = DispatchJob(key="owner", slug="audit-owner", attempt_id="audit-attempt",

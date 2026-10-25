@@ -34,6 +34,23 @@ def _observation_health(key, source, error=None):
             "last_success_at": success, "age": None if success is None else now - success}
 
 
+def _usage_cache_observation(snapshot, *, refresh_pending=False):
+    """A completed cache read is ready even while an optional HTTP refresh is pending."""
+    if not isinstance(snapshot, dict):
+        return {"state": "failed", "attempted": True,
+                "reason": "usage-cache-read-invalid"}
+    item = {"state": "ok", "cache_state": snapshot.get("freshness") or "unknown",
+            "attempted": True}
+    if snapshot.get("observed_at") is not None:
+        item["observed_at"] = snapshot.get("observed_at")
+    if refresh_pending:
+        item["refresh_state"] = "pending"
+    elif isinstance(snapshot.get("error_observation"), dict):
+        item["refresh_state"] = "failed"
+        item["refresh_reason"] = snapshot["error_observation"].get("reason")
+    return item
+
+
 def _same_path(a, b):
     if not a or not b:
         return False
@@ -351,7 +368,8 @@ def apply_peer_rows(sessions, by_key):
             )[:8]
 
 
-def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False):
+def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False, *,
+                 include_report_verification=True):
     """Return (sessions, jobs).
 
     harness_filter: optional iterable of harness names (fleet + dispatch both honor it).
@@ -543,19 +561,16 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
             if harness_filter is not None and harness not in set(harness_filter):
                 continue
             snap = usage_cache.account_usage(harness, usage=usage if usage == "refresh" else "cache-only")
+            if not isinstance(snap, dict):
+                raise TypeError("usage-cache-read-invalid")
             usage_snapshots[harness] = snap
             error_observation = snap.get("error_observation")
             usage_meta[harness] = {k: snap.get(k) for k in ("freshness", "observed_at")}
             freshness = snap.get("freshness")
-            if freshness == "fresh":
-                observations["usage:" + harness] = {"state": "ok"}
-            elif usage == "refresh" and usage_cache.refresh_in_flight(
-                    harness, max_age=FIRST_FRAME_USAGE_WAIT):
-                observations["usage:" + harness] = {
-                    "state": "pending", "reason": "usage-refresh-in-flight"}
-            else:
-                observations["usage:" + harness] = {
-                    "state": "unavailable", "reason": "usage-not-fresh"}
+            refresh_pending = (usage == "refresh" and usage_cache.refresh_in_flight(
+                harness, max_age=FIRST_FRAME_USAGE_WAIT))
+            observations["usage:" + harness] = _usage_cache_observation(
+                snap, refresh_pending=refresh_pending)
             if harness == "opencode":
                 go_scope = opencode_scope = entitlement_scope = None
                 selected = None
@@ -713,7 +728,8 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
     except Exception:
         for harness in ("claude", "codex", "opencode"):
             observations.setdefault("usage:" + harness, {
-                "state": "unavailable", "reason": "usage-collection-failed"})
+                "state": "failed", "attempted": True,
+                "reason": "usage-cache-read-failed"})
         usage_meta = {}
         usage_snapshots = {}
     collect_all.last_usage = usage_meta
@@ -822,13 +838,14 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
     except Exception:
         pass
 
+    route_chain_ready = True
     try:
         from .. import route_chain as _route_chain
         _route_chain.enrich(sessions, jobs=jobs,
                              node_evidence=node_evidence,
                              now=_time.time(), **({"fast_first": True} if fast_first else {}))
     except Exception:
-        pass
+        route_chain_ready = False
 
     # Resources remain a separate source/count, but their exact parent edge feeds
     # the common projection before any group/process/JSON consumer sees the snapshot.
@@ -844,6 +861,7 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
     collect_all.last_resource_diagnostics = resource_diagnostics
 
     # v16: all surfaces receive one projection after evidence collection and association.
+    projection_ready = True
     try:
         from ..projection import attach_projections
         # F-28a's terminal-row node evidence (dispatch.py's _scan_route_nodes) is the only
@@ -854,8 +872,11 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
                            now=_time.time(),
                            node_evidence=node_evidence,
                            degradations=degradations,
-                           resources=resource_jobs, **({"fast_first": True} if fast_first else {}))
+                           resources=resource_jobs,
+                           include_report_verification=include_report_verification,
+                           **({"fast_first": True} if fast_first else {}))
     except Exception:
+        projection_ready = False
         # Projection failure is fail-closed at the row boundary, never a reason to drop data.
         from ..model import WorkProjection
         for entity in sessions + jobs:
@@ -890,6 +911,14 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
     observations["jobs"] = _observation_health(job_key, "jobs", job_error)
     from ..display_snapshot import build as build_display_snapshot
     display_snapshot = build_display_snapshot(sessions, jobs, resource_jobs)
+    basic_identity = "fleet:%d:%d" % (os.getpid(), _time.time_ns())
+    basic_observed_at = _time.time()
+    observations["basic"] = {
+        "state": "ok" if job_error is None else "failed",
+        "generation_identity": basic_identity,
+        "observed_at": basic_observed_at,
+        "all_new": job_error is None,
+    }
     snapshot = LiveSnapshot(
         sessions=sessions, jobs=jobs, resources=resource_jobs,
         usage_snapshots=usage_snapshots, node_evidence=node_evidence,
@@ -902,7 +931,20 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
     )
     if not sessions and not jobs and node_evidence:
         from ..projection import terminal_route_entities
-        snapshot.route_entities = terminal_route_entities(node_evidence, degradations)
+        snapshot.route_entities = terminal_route_entities(
+            node_evidence, degradations,
+            include_report_verification=include_report_verification)
+    from ..projection import required_projection_details_complete
+    from ..refresh import set_required_details
+    details_ready = (not fast_first and route_chain_ready and projection_ready
+                     and job_error is None
+                     and required_projection_details_complete(
+                         sessions + jobs + snapshot.route_entities))
+    set_required_details(
+        snapshot, "pending" if fast_first else ("ok" if details_ready else "partial"),
+        reason=(None if details_ready else
+                "required-detail-pass-not-run" if fast_first else "required-detail-source-incomplete"),
+        all_new=details_ready, observed_at=_time.time())
     if job_error is None:
         # Cache projected rows, not a reference later mutated by another reader.
         _JOB_OBSERVATIONS[job_key] = copy.deepcopy(replace(
@@ -912,7 +954,8 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
     return snapshot
 
 
-def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False):
+def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False, *,
+                include_report_verification=True):
     """Run one Fleet observation with shared artifact, admission and registry inputs."""
     from contextlib import ExitStack
     from . import dispatch
@@ -922,9 +965,14 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         if dispatch.artifact_reader is not None:
             stack.enter_context(dispatch.artifact_reader.read_scope(
                 dispatch._ARTIFACT_READ_CACHE))
+        collection_read_scope = getattr(dispatch, "collection_read_scope", None)
+        if callable(collection_read_scope):
+            stack.enter_context(collection_read_scope())
         stack.enter_context(artifact_producer.artifact_index_observation_scope())
         stack.enter_context(dispatch_registry_cache.registry_read_scope())
-        return _collect_all(harness_filter, jobs_path, usage, fast_first)
+        return _collect_all(
+            harness_filter, jobs_path, usage, fast_first,
+            include_report_verification=include_report_verification)
 
 
 collect_all.last_resource_jobs = []

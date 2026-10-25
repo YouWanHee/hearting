@@ -168,10 +168,14 @@ def _record_view(record, route_id, jobs, node_evidence=None, now=None, degradati
     which already resolve marks via `resolve_and_build_views`."""
     from . import route
     jobs = list(jobs)
-    marks = route.resolve_gate_marks(
-        {route_id: record}, jobs=jobs,
-        node_evidence={route_id: node_evidence or {}},
-    ).get(route_id)
+    scope = _ROUND_SCOPE.get()
+    if scope is None:
+        marks = route.resolve_gate_marks(
+            {route_id: record}, jobs=jobs,
+            node_evidence={route_id: node_evidence or {}},
+        ).get(route_id)
+    else:
+        marks = scope.gate_marks_for(record, route_id)
     view = route._record_view(record, route_id, jobs, node_evidence or {},
                              time.time() if now is None else now,
                              gate_marks_for_route=marks,
@@ -1276,6 +1280,42 @@ def _owner_route_advance_binding(entity, owner_binding=None):
     }, "current"
 
 
+def _owner_anchor_key(owner_binding):
+    if not isinstance(owner_binding, dict):
+        return None
+    return tuple(owner_binding.get(key) for key in ("route_file", "route_id", "route_hash"))
+
+
+def _owner_route_advance_for_pass(entity, owner_binding=None, scope=None):
+    """Memoize lifecycle resolution by registry generation and exact owner anchor."""
+    if scope is None:
+        return _owner_route_advance_binding(entity, owner_binding)
+    jobs_path = _field(entity, "_registry_path")
+    attempt_id = _field(entity, "attempt_id")
+    if not jobs_path:
+        key = (None, None, attempt_id, _owner_anchor_key(owner_binding))
+        return scope.memoized(
+            "owner-route-lifecycle", key,
+            lambda: _owner_route_advance_binding(entity, owner_binding),
+        )
+    path = os.path.abspath(os.fspath(jobs_path))
+
+    def observe_generation():
+        try:
+            stat = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return None
+        return (stat.st_mode, stat.st_dev, stat.st_ino, stat.st_size,
+                getattr(stat, "st_mtime_ns", None), getattr(stat, "st_ctime_ns", None))
+
+    generation = scope.memoized("owner-registry-generation", path, observe_generation)
+    key = (path, generation, attempt_id, _owner_anchor_key(owner_binding))
+    return scope.memoized(
+        "owner-route-lifecycle", key,
+        lambda: _owner_route_advance_binding(entity, owner_binding),
+    )
+
+
 def _owner_route_binding(entity):
     """Return a complete wrapper-validated owner binding or its fail-closed error."""
     values = {
@@ -1287,7 +1327,7 @@ def _owner_route_binding(entity):
     if not any(present):
         return None, None
     try:
-        depth = int(_field(entity, "depth") or 1)
+        depth = int(_field(entity, "depth") or _field(entity, "_dispatch_depth") or 1)
     except (TypeError, ValueError):
         depth = None
     if (not all(present)
@@ -1397,7 +1437,8 @@ def resolve_work_projection(entity, jobs=(), route_records=None, node_evidence=N
                 source="none", attempt_id=_field(entity, "attempt_id"),
                 node_state="unknown", ambiguity=owner_binding_error,
             )
-    advance_binding, advance_status = _owner_route_advance_binding(entity, owner_binding)
+    advance_binding, advance_status = _owner_route_advance_for_pass(
+        entity, owner_binding, _ROUND_SCOPE.get())
     if advance_status == "multiple":
         return WorkProjection(
             source="none", attempt_id=_field(entity, "attempt_id"),
@@ -1682,7 +1723,7 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                       route_records=None, node_evidence=None, artifact_root=None, now=None,
                       spec_markers=None, spec_marker_home=None,
                       capability_groundings=None, degradations=None, resources=None,
-                      fast_first=False):
+                      fast_first=False, *, include_report_verification=True):
     """Attach work to every row and exact-owned context to live cards."""
     sessions, jobs = list(sessions), list(jobs)
     _attach_resource_children(jobs, resources)
@@ -1717,6 +1758,8 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                             "run_ids": [r.run_id for group in children.values() for r in group]}
         return sessions, jobs
     route_records = _load_evidence_records(node_evidence, route_records, sessions + jobs)
+    for entity in sessions + jobs:
+        entity._details_pending = False
     home = spec_marker_home or _grounding_home()
     if spec_markers is None:
         spec_markers = _spec_marker_index(home)
@@ -1774,7 +1817,8 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
             work = entity.work_projection
             route_view = getattr(work, "_route_view", None) or {}
             route_record = route_view.get("record") if isinstance(route_view, dict) else None
-            if (work.source == "route-exact" and not work.ambiguity
+            if (include_report_verification
+                    and work.source == "route-exact" and not work.ambiguity
                     and work.route_id and work.route_hash and isinstance(route_record, dict)
                     and route_record.get("route_id") == work.route_id
                     and route_record.get("route_hash") == work.route_hash):
@@ -1805,7 +1849,8 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
     return sessions, jobs
 
 
-def terminal_route_entities(node_evidence, degradations=None):
+def terminal_route_entities(node_evidence, degradations=None, *,
+                            include_report_verification=True):
     """Project observed routes without rows before publishing the snapshot."""
     carriers = []
     for rid, nodes in (node_evidence or {}).items():
@@ -1818,12 +1863,33 @@ def terminal_route_entities(node_evidence, degradations=None):
                               route_hash=evidence.get("route_hash"), route_node=node,
                               liveness="done")
         attach_projections([], [carrier], node_evidence=node_evidence,
-                           degradations=degradations, now=time.time())
+                           degradations=degradations, now=time.time(),
+                           include_report_verification=include_report_verification)
         carriers.append(carrier)
     return carriers
 
 
 attach_work_projections = attach_projections
+
+
+def required_projection_details_complete(entities):
+    """Require an exact current route record for every route-bound first-screen row."""
+    for entity in entities:
+        if (getattr(entity, "_details_pending", False)
+                or getattr(entity, "_required_detail_error", False)):
+            return False
+        if not (_field(entity, "route_id") or _field(entity, "owner_route_id")):
+            continue
+        work = _field(entity, "work_projection")
+        view = getattr(work, "_route_view", None) if work is not None else None
+        record = view.get("record") if isinstance(view, dict) else None
+        if (work is None or getattr(work, "ambiguity", None)
+                or not getattr(work, "route_id", None)
+                or not isinstance(record, dict)
+                or record.get("route_id") != work.route_id
+                or record.get("route_hash") != work.route_hash):
+            return False
+    return True
 
 
 def _verified_route_summary_item(item):

@@ -11,6 +11,7 @@ import argparse
 import cProfile
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -58,16 +59,93 @@ def _profile(sample, profiler):
     sample["top_cumulative"] = rows[:30]
 
 
+_COMPLETE_STATES = {"complete", "completed", "success", "observed"}
+_OBSERVED_STATES = _COMPLETE_STATES | {"absent"}
+
+
+def _source_states(snapshot):
+    observations = getattr(snapshot, "observations", None)
+    if not isinstance(observations, dict):
+        return {}
+    result = {}
+    for name, item in observations.items():
+        if isinstance(item, dict):
+            result[str(name)] = {
+                key: item[key] for key in ("state", "all_new", "attempted", "reason")
+                if key in item
+            }
+        else:
+            result[str(name)] = {"state": getattr(item, "state", "unknown")}
+    return result
+
+
+def _readiness(snapshot):
+    """Derive readiness from required source observations, never generation count."""
+    states = _source_states(snapshot)
+    required = ["basic", "required-details", "remote-host"]
+    required.extend("usage:" + name for name in ("claude", "codex", "opencode"))
+    pending = []
+    for name in required:
+        item = states.get(name, {})
+        state = str(item.get("state") or "unknown").lower()
+        if name == "remote-host":
+            complete = state in {"success", "failed", "absent"} and (
+                item.get("attempted") is True or state in {"success", "failed"}
+            )
+        elif name.startswith("usage:"):
+            complete = state in _OBSERVED_STATES
+        else:
+            complete = state in _COMPLETE_STATES
+        if not complete:
+            pending.append(name)
+    all_new = not pending and all(
+        states[name].get("all_new", True) is True
+        and str(states[name].get("state", "")).lower() != "continued"
+        for name in required
+    )
+    return {"ready": not pending, "all_new": all_new, "pending": pending,
+            "sources": states}
+
+
+def _collection_policy(collect_all, runtime, generation):
+    """Use the runtime policy where supported and disclose baseline compatibility."""
+    requested = runtime.collection_options(first_complete=(generation == 0))
+    try:
+        signature = inspect.signature(collect_all)
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD
+                             for param in signature.parameters.values())
+        accepted = {name for name in requested
+                    if name in signature.parameters or accepts_kwargs}
+    except (TypeError, ValueError):
+        accepted = set()
+    return ({name: value for name, value in requested.items() if name in accepted},
+            sorted(set(requested) - accepted))
+
+
+def _sample_phase(readiness, generation):
+    if not readiness["ready"]:
+        if generation == 0:
+            return "first-basic"
+        required = readiness["sources"].get("required-details", {})
+        if str(required.get("state") or "unknown").lower() not in _COMPLETE_STATES:
+            return "required-detail"
+        return "optional-detail"
+    return "all-new" if readiness["all_new"] else "steady"
+
+
 def _live(args):
     _source(args.source_tree)
     from fleet.collectors import collect_all
     from fleet.collectors import dispatch
+    from fleet.explorer.runtime import ExplorerRuntime
 
     samples = []
+    runtime = ExplorerRuntime(strict_readiness=True)
     parsed = getattr(dispatch, "parsed_registry_rows", None)
     previous_registry_objects = {}
-    for index in range(args.iterations + 1):
-        profiler = cProfile.Profile() if args.profile and index in (0, 1) else None
+    generation = 0
+    for _iteration in range(args.iterations + 1):
+        profiler = cProfile.Profile() if args.profile and generation in (0, 1) else None
         registry_calls = []
         if parsed is not None:
             def observe_registry(path):
@@ -76,15 +154,16 @@ def _live(args):
                 return value
             dispatch.parsed_registry_rows = observe_registry
         wall0, cpu0 = time.perf_counter_ns(), time.process_time_ns()
+        options, unsupported_options = _collection_policy(collect_all, runtime, generation)
         if profiler:
             profiler.enable()
-        # Explorer's first complete observation asks for a fast initial snapshot;
-        # every subsequent pass uses the normal collection contract.
-        snapshot = collect_all(harness_filter=None, fast_first=(index == 0))
+        try:
+            snapshot = collect_all(harness_filter=None, **options)
+        finally:
+            if parsed is not None:
+                dispatch.parsed_registry_rows = parsed
         if profiler:
             profiler.disable()
-        if parsed is not None:
-            dispatch.parsed_registry_rows = parsed
         current_registry_objects = {}
         for path, value in registry_calls:
             current_registry_objects.setdefault(path, []).append(value)
@@ -95,9 +174,15 @@ def _live(args):
             if any(value is previous for previous in previous_registry_objects.get(path, ()))
         )
         previous_registry_objects = current_registry_objects
-        sample = {"index": index, "kind": "first" if index == 0 else "steady",
+        readiness = _readiness(snapshot)
+        phase = _sample_phase(readiness, generation)
+        sample = {"generation": generation, "kind": phase,
                   "wall_ns": time.perf_counter_ns() - wall0,
                   "cpu_ns": time.process_time_ns() - cpu0,
+                  "collection_options": options,
+                  "unsupported_runtime_options": unsupported_options,
+                  "readiness": {key: readiness[key] for key in ("ready", "all_new", "pending")},
+                  "source_states": readiness["sources"],
                   "sessions": len(getattr(snapshot, "sessions", ())),
                   "jobs": len(getattr(snapshot, "jobs", ())),
                   "resources": len(getattr(snapshot, "resources", ())),
@@ -111,9 +196,15 @@ def _live(args):
         if profiler:
             _profile(sample, profiler)
         samples.append(sample)
+        generation += 1
+    by_phase = {}
+    for sample in samples:
+        by_phase.setdefault(sample["kind"], []).append(sample)
     return {"mode": "live", "source_tree": str(Path(args.source_tree).resolve()),
             "python": sys.version.split()[0], "platform": platform.platform(),
             "samples": samples, "summary": _summary(samples),
+            "phases": {name: {"samples": rows, "summary": _summary(rows)}
+                       for name, rows in by_phase.items()},
             "first": samples[0], "steady": _summary(samples[1:])}
 
 

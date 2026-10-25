@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -10,6 +11,59 @@ from fleet.collectors import dispatch
 
 
 class ParsedRegistryRowsTest(unittest.TestCase):
+    def test_comma_delimited_role_values_reuse_the_existing_generation_parse(self):
+        raw = "capability=autopilot-code,model_role=deep  maker,mode=dev"
+        expected = dispatch._parse_pipe_meta_uncached(raw)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            path.write_text("t\topen\t/repo\t/work\towner\t" + raw + "\n")
+            with dispatch._dispatch_registry_cache.registry_read_scope(), \
+                 mock.patch.object(dispatch, "_parse_pipe_meta", side_effect=AssertionError("reparsed")):
+                rows = dispatch.parsed_registry_rows(path)
+        self.assertEqual(dict(rows[0][2]), expected)
+
+    def test_noncanonical_metadata_keeps_the_legacy_parser_semantics(self):
+        examples = ["capability=autopilot-code model_role=deep maker",
+                    "capability=autopilot-code,model_role= deep maker",
+                    "capability=autopilot-code,note=foo =bar",
+                    "capability=autopilot-code,note=foo,bar",
+                    "capability=autopilot-code, model_role=deep maker"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            path.write_text("".join("t\topen\t/repo\t/work\towner\t" + raw + "\n"
+                                    for raw in examples))
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                rows = dispatch.parsed_registry_rows(path)
+        self.assertEqual([dict(row[2]) for row in rows],
+                         [dispatch._parse_pipe_meta_uncached(raw) for raw in examples])
+
+    def test_collection_adapts_registry_records_without_reparsing_common_metadata(self):
+        dispatch._parse_pipe_meta_cached.cache_clear()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            path.write_text(
+                "open\tslug\t/repo\t/work\tstamp\tcapability=autopilot-code,mode=dev\n")
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                rows = dispatch.parsed_registry_rows(path)
+            self.assertEqual(rows[0][2]["capability"], "autopilot-code")
+            self.assertEqual(rows[0][2]["_name"], "code")
+            self.assertEqual(rows[0][2]["mode"], "dev")
+            self.assertEqual(dispatch._parse_pipe_meta_cached.cache_info().misses, 0)
+
+    def test_collection_falls_back_for_legacy_and_whitespace_continuation_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            legacy = "open\tlegacy\t/repo\t/work\tstamp\tautopilot-code:dev(x)\n"
+            continuation = (
+                "open\tworker\t/repo\t/work\tstamp\t"
+                "capability=autopilot-code model_role=deep maker\n")
+            path.write_text(legacy + continuation)
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                rows = dispatch.parsed_registry_rows(path)
+            self.assertEqual(rows[0][2]["_name"], "code")
+            self.assertEqual(rows[0][2]["mode"], "dev")
+            self.assertEqual(rows[1][2]["model_role"], "deep maker")
+
     def test_reuses_immutable_rows_until_file_generation_changes(self):
         dispatch._parse_pipe_meta_cached.cache_clear()
         with tempfile.TemporaryDirectory() as directory:
@@ -106,6 +160,37 @@ class ParsedRegistryRowsTest(unittest.TestCase):
     def test_missing_registry_is_empty(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(dispatch.parsed_registry_rows(Path(directory) / "missing"), ())
+
+    def test_large_generation_keeps_every_unique_row_after_parser_lru_rollover(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            count = 8205
+            path.write_text("".join(
+                f"open\tslug-{index}\t/repo\t/work\tstamp\tkey=value-{index}\n"
+                for index in range(count)))
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                rows = dispatch.parsed_registry_rows(path)
+            self.assertEqual(len(rows), count)
+            self.assertEqual(rows[0][0], 0)
+            self.assertEqual(rows[-1][0], count - 1)
+            self.assertEqual(rows[0][2]["key"], "value-0")
+            self.assertEqual(rows[-1][2]["key"], f"value-{count - 1}")
+
+    def test_incomplete_tail_is_omitted_until_its_newline_arrives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            first = "stamp\topen\t/repo\t/work\tfirst\tkey=first\n"
+            tail = "stamp\topen\t/repo\t/work\tsecond\tkey=second"
+            path.write_text(first + tail)
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                rows = dispatch.parsed_registry_rows(path)
+            self.assertEqual([row[1][4] for row in rows], ["first"])
+
+            with path.open("a") as stream:
+                stream.write("\n")
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                completed = dispatch.parsed_registry_rows(path)
+            self.assertEqual([row[1][4] for row in completed], ["first", "second"])
 
 
 if __name__ == "__main__":

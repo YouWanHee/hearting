@@ -15,6 +15,7 @@ codex/opencode headless dispatch appears ONLY via jobs.log (their argv has no /a
 live_stage() derives the real pipeline stage from plans/*_<slug>/ artifacts (ported from
 statusline.sh:131-171) so the label reflects live progress, not the static argv.
 """
+import contextlib
 import functools
 from collections import OrderedDict
 import json
@@ -124,6 +125,19 @@ def _pinned_registry_lines(path):
         return None
 
 
+@contextlib.contextmanager
+def collection_read_scope():
+    """Bound ledger and Codex identity reuse to one Fleet collection pass."""
+    from contextlib import ExitStack
+    import session_tidy
+    from . import codex
+
+    with ExitStack() as stack:
+        stack.enter_context(session_tidy.seat_ledger_read_scope())
+        stack.enter_context(codex.daemon_identity_read_scope())
+        yield
+
+
 def _managed_parent_dir(sidecar_log):
     """Exact managed-session state dir from a registered sidecar path.
 
@@ -223,35 +237,117 @@ _parse_pipe_meta_cached = functools.lru_cache(maxsize=8192)(_parse_pipe_meta_unc
 _PARSED_REGISTRY_ROWS = OrderedDict()
 _PARSED_REGISTRY_LINE_COUNTS = {}
 _PARSED_REGISTRY_SEGMENTS = {}
+_PARSED_REGISTRY_DIAGNOSTICS = OrderedDict()
 _PARSED_REGISTRY_ROWS_LIMIT = 32
+
+
+def _registry_diagnostic_key(path, generation):
+    return os.path.abspath(os.fspath(path)), generation
+
+
+def _remember_registry_diagnostics(path, generation, error, malformed):
+    key = _registry_diagnostic_key(path, generation)
+    _PARSED_REGISTRY_DIAGNOSTICS[key] = (error, malformed)
+    _PARSED_REGISTRY_DIAGNOSTICS.move_to_end(key)
+    while len(_PARSED_REGISTRY_DIAGNOSTICS) > _PARSED_REGISTRY_ROWS_LIMIT:
+        _PARSED_REGISTRY_DIAGNOSTICS.popitem(last=False)
+
+
+def _registry_diagnostics(path):
+    absolute = os.path.abspath(os.fspath(path))
+    for (candidate, _generation), value in reversed(_PARSED_REGISTRY_DIAGNOSTICS.items()):
+        if candidate == absolute:
+            return value
+    return None, 0
+
+
+def _raise_registry_read_error(path, *, ignore_missing=False):
+    error, _malformed = _registry_diagnostics(path)
+    if error is not None and not (ignore_missing and isinstance(error, FileNotFoundError)):
+        raise error
+
+
+def _orphan_registry_rows(path, registry):
+    """Adapt parsed rows to dispatch-registry's established row contract."""
+    parsed = parsed_registry_rows(path)
+    _raise_registry_read_error(path, ignore_missing=True)
+    lines = ["\t".join(fields) for _order, fields, _meta in parsed]
+    rows = registry.read_rows(Path(path), lines=lines)
+    for row, (physical_order, fields, _meta) in zip(rows, parsed):
+        row["order"] = physical_order
+        row["raw"] = "\t".join(fields)
+    return rows
 
 
 def _parse_registry_lines(path, lines, generation, *, first_line=0,
                           complete_line_count=None, segments=None):
     """Parse registry rows once, retaining physical line positions."""
     rows = []
+    malformed = 0
     # Match the legacy registry_order contract: enumerate the physical lines from
     # zero, including blank and malformed lines, before filtering invalid rows.
     for line_number, line in enumerate(lines, first_line):
+        if complete_line_count is not None and line_number >= complete_line_count:
+            break
         fields = tuple(line.split("\t"))
         if len(fields) != 6:
+            malformed += bool(line.strip())
             continue
         metadata = MappingProxyType(dict(_parse_pipe_meta(fields[5] or "")))
         rows.append((line_number, fields, metadata))
     result = tuple(rows)
+    complete_count = (first_line + len(lines) if complete_line_count is None
+                      else complete_line_count)
+    return _remember_parsed_registry_rows(
+        path, generation, result, complete_count, segments, malformed)
+
+
+def _remember_parsed_registry_rows(path, generation, rows, complete_count,
+                                   segments, malformed):
+    result = tuple(rows)
     key = (os.path.abspath(os.fspath(path)), generation)
     _PARSED_REGISTRY_ROWS[key] = result
-    _PARSED_REGISTRY_LINE_COUNTS[key] = (
-        first_line + len(lines) if complete_line_count is None
-        else complete_line_count
-    )
+    _PARSED_REGISTRY_LINE_COUNTS[key] = complete_count
     _PARSED_REGISTRY_SEGMENTS[key] = tuple(segments) if segments is not None else None
     _PARSED_REGISTRY_ROWS.move_to_end(key)
     while len(_PARSED_REGISTRY_ROWS) > _PARSED_REGISTRY_ROWS_LIMIT:
         evicted, _value = _PARSED_REGISTRY_ROWS.popitem(last=False)
         _PARSED_REGISTRY_LINE_COUNTS.pop(evicted, None)
         _PARSED_REGISTRY_SEGMENTS.pop(evicted, None)
+    _remember_registry_diagnostics(path, generation, None, malformed)
     return result
+
+
+def _registry_record_metadata(record):
+    """Reuse the pinned registry's parsed key/value metadata when formats agree."""
+    raw = record.fields[5] or ""
+    eq_pos, colon_pos = raw.find("="), raw.find(":")
+    if ("(" in raw or eq_pos < 0
+            or (colon_pos >= 0 and colon_pos < eq_pos)):
+        return _parse_pipe_meta(raw)
+    if any("=" not in part for part in raw.split(",")):
+        return _parse_pipe_meta(raw)
+    # Keep whitespace in values (e.g. a role name), but reject whitespace in
+    # keys, an initially blank value, or an embedded whitespace-delimited field.
+    if re.search(r"(?:^|,)[^=,]*\s[^=,]*=|=\s|\s+[^\s,]*=", raw):
+        return _parse_pipe_meta(raw)
+    metadata = record.completion_metadata()
+    for key, value in metadata.items():
+        metadata[key] = " ".join(value.split())
+    metadata["_name"] = _strip_autopilot_prefix(metadata.get("capability"))
+    return metadata
+
+
+def _parse_registry_view(path, view, generation):
+    """Adapt already parsed immutable records without splitting the same rows again."""
+    rows = tuple((record.order, record.fields,
+                  MappingProxyType(_registry_record_metadata(record)))
+                 for record in view.records)
+    complete_count = view.line_count - int(view.has_partial_tail)
+    malformed = sum(1 for segment in view._segments
+                    for _order, line in segment.malformed_lines if line.strip())
+    return _remember_parsed_registry_rows(
+        path, generation, rows, complete_count, view._segments, malformed)
 
 
 def parsed_registry_rows(path):
@@ -268,6 +364,15 @@ def parsed_registry_rows(path):
         try:
             source = Path(path)
             before = source.stat()
+            generation = (before.st_dev, before.st_ino, before.st_size,
+                          before.st_mtime_ns, before.st_ctime_ns)
+            key = _registry_diagnostic_key(path, generation)
+            cached = _PARSED_REGISTRY_ROWS.get(key)
+            if cached is not None:
+                _PARSED_REGISTRY_ROWS.move_to_end(key)
+                if key in _PARSED_REGISTRY_DIAGNOSTICS:
+                    _PARSED_REGISTRY_DIAGNOSTICS.move_to_end(key)
+                return cached
             lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
             after = source.stat()
             if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
@@ -275,7 +380,10 @@ def parsed_registry_rows(path):
                                             after.st_mtime_ns, after.st_ctime_ns):
                 generation = (after.st_dev, after.st_ino, after.st_size,
                               after.st_mtime_ns, after.st_ctime_ns)
-        except OSError:
+            else:
+                generation = None
+        except OSError as exc:
+            _remember_registry_diagnostics(path, None, exc, 0)
             return ()
     else:
         try:
@@ -287,6 +395,13 @@ def parsed_registry_rows(path):
     cached = _PARSED_REGISTRY_ROWS.get(key) if generation is not None else None
     if cached is not None:
         _PARSED_REGISTRY_ROWS.move_to_end(key)
+        if key in _PARSED_REGISTRY_DIAGNOSTICS:
+            _PARSED_REGISTRY_DIAGNOSTICS.move_to_end(key)
+        else:
+            complete_count = view.line_count - int(view.has_partial_tail) if view is not None else len(lines)
+            malformed = sum(1 for line in lines[:complete_count]
+                            if line.strip() and len(line.split("\t")) != 6)
+            _remember_registry_diagnostics(path, generation, None, malformed)
         return cached
     # The shared registry cache already retains append-only byte segments. Reuse
     # the parsed prefix too, so a generation append parses only newly added rows.
@@ -312,25 +427,38 @@ def parsed_registry_rows(path):
                                         if row[0] < prefix_lines)
                     break
     if prefix_key is not None and prefix_lines <= len(lines):
+        prefix_diagnostics = _PARSED_REGISTRY_DIAGNOSTICS.get(prefix_key)
+        prefix_malformed = (prefix_diagnostics[1] if prefix_diagnostics is not None else
+                            sum(1 for line in lines[:prefix_lines]
+                                if line.strip() and len(line.split("\t")) != 6))
         suffix = _parse_registry_lines(
             path, lines[prefix_lines:], generation, first_line=prefix_lines,
             complete_line_count=view.line_count - int(view.has_partial_tail),
             segments=view._segments)
+        suffix_diagnostics = _PARSED_REGISTRY_DIAGNOSTICS.get(key)
+        suffix_malformed = suffix_diagnostics[1] if suffix_diagnostics is not None else 0
         result = tuple(prefix_rows) + tuple(suffix)
         _PARSED_REGISTRY_ROWS[key] = result
         _PARSED_REGISTRY_LINE_COUNTS[key] = view.line_count - int(view.has_partial_tail)
         _PARSED_REGISTRY_SEGMENTS[key] = tuple(view._segments)
+        _remember_registry_diagnostics(
+            path, generation, None, prefix_malformed + suffix_malformed)
         while len(_PARSED_REGISTRY_ROWS) > _PARSED_REGISTRY_ROWS_LIMIT:
             evicted, _value = _PARSED_REGISTRY_ROWS.popitem(last=False)
             _PARSED_REGISTRY_LINE_COUNTS.pop(evicted, None)
             _PARSED_REGISTRY_SEGMENTS.pop(evicted, None)
+            _PARSED_REGISTRY_DIAGNOSTICS.pop(evicted, None)
         return result
+    if (view is not None and view._prefix_reuse_eligible):
+        return _parse_registry_view(path, view, generation)
     if view is not None:
-        return _parse_registry_lines(
+        result = _parse_registry_lines(
             path, lines, generation,
             complete_line_count=view.line_count - int(view.has_partial_tail),
             segments=view._segments)
-    return _parse_registry_lines(path, lines, generation)
+    else:
+        result = _parse_registry_lines(path, lines, generation)
+    return result
 
 
 def _parse_pipe(pipe):
@@ -991,16 +1119,11 @@ def _parent_extinction_rows(paths):
     for path in paths:
         per_path = {}
         try:
-            lines = _pinned_registry_lines(path)
-            if lines is None:
-                lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+            parsed = parsed_registry_rows(path)
         except OSError:
             continue
-        for line in lines:
-            fields = line.split("\t")
-            if len(fields) != 6:
-                continue
-            meta = _parse_pipe_meta(fields[5] or "")
+        for _order, fields, parsed_meta in parsed:
+            meta = dict(parsed_meta)
             attempt_id = meta.get("attempt_id")
             if attempt_id:
                 per_path.setdefault(attempt_id, []).append((fields, meta))
@@ -2923,7 +3046,8 @@ def _scan_registry_evidence(paths):
         path_result = {}
         path_attempts = {}
         rows = parsed_registry_rows(path)
-        for registry_order, fields, meta in rows:
+        for registry_order, fields, parsed_meta in rows:
+            meta = dict(parsed_meta)
             ts, status, _repo, _worktree, slug, pipe = fields
             attempt_contract = _attempt_contract(meta)
             route_id = meta.get("route_id")
@@ -3262,18 +3386,17 @@ def _validated_split_registry_paths(canonical_paths, observed=None, session_rows
         if real in canonical or not _registry_file(raw_path):
             continue
         latest = {}
-        try:
-            with open(raw_path, encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    fields = line.rstrip("\n").split("\t")
-                    if len(fields) != 6:
-                        continue
-                    meta = _parse_pipe_meta(fields[5])
-                    attempt = meta.get("attempt_id")
-                    if attempt in attempts:
-                        latest[attempt] = meta
-        except FileNotFoundError:
+        parsed = parsed_registry_rows(raw_path)
+        error, _malformed = _registry_diagnostics(raw_path)
+        if isinstance(error, FileNotFoundError):
             continue
+        if error is not None:
+            raise error
+        for _order, _fields, parsed_meta in parsed:
+            meta = dict(parsed_meta)
+            attempt = meta.get("attempt_id")
+            if attempt in attempts:
+                latest[attempt] = meta
         matched = {attempt for attempt, meta in latest.items()
                    if (meta.get("parent_sid") or meta.get("parent_session_id")) in parent_ids}
         if matched:
@@ -3303,13 +3426,12 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
     jobs = []
     malformed = 0
     seen_attempts = set() if seen_attempts is None else seen_attempts
-    try:
-        rows = _pinned_registry_lines(path)
-        if rows is None:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                rows = f.read().splitlines()
-    except FileNotFoundError:
+    rows = parsed_registry_rows(path)
+    error, malformed = _registry_diagnostics(path)
+    if isinstance(error, FileNotFoundError):
         return jobs, 0
+    if error is not None:
+        raise error
     # Reconcile each job to its LATEST row before deciding live-ness. Identity key = slug,
     # NOT the worktree path: a terminal (done/killed/cancelled) row drops the worktree to '-'
     # after harvest, so a path key would never match the earlier running row and the job would
@@ -3318,15 +3440,11 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
     # `done` never cancel the running row — 290h phantom jobs. User report 2026-07-01.)
     latest = {}
     order = []
-    for registry_order, line in enumerate(rows):
-        if not line.strip():
+    for registry_order, fields, parsed_meta in rows:
+        if not "\t".join(fields).strip():
             continue
-        fields = line.split("\t")
-        if len(fields) != 6:
-            malformed += 1
-            continue
+        row_meta = dict(parsed_meta)
         slug = fields[4]
-        row_meta = _parse_pipe_meta(fields[5] or "")
         if allowed_attempt_ids is not None and row_meta.get("attempt_id") not in allowed_attempt_ids:
             continue
         # F-97e (2026-09-02): identity is the ATTEMPT, not the slug. An owner and its
@@ -3565,22 +3683,18 @@ def _jobs_log_fields(paths):
     fields_by_attempt = {}
     for path in paths:
         path_fields = {}
-        try:
-            rows = _pinned_registry_lines(path)
-            if rows is None:
-                with open(path, encoding="utf-8", errors="replace") as f:
-                    rows = f.read().splitlines()
-        except FileNotFoundError:
+        rows = parsed_registry_rows(path)
+        error, _malformed = _registry_diagnostics(path)
+        if isinstance(error, FileNotFoundError):
             continue
+        if error is not None:
+            raise error
         path_attempts = {}
-        for line in rows:
-            if not line.strip():
-                continue
-            fields = line.split("\t")
-            if len(fields) != 6:
+        for _order, fields, parsed_meta in rows:
+            if not "\t".join(fields).strip():
                 continue
             slug = fields[4]
-            value = _parse_pipe_meta(fields[5] or "")
+            value = dict(parsed_meta)
             value["_registry_path"] = path
             path_fields[slug] = value
             attempt_id = value.get("attempt_id")
@@ -3746,8 +3860,7 @@ def _retain_dead_terminal_owners(jobs, now, jobs_path=None):
     def _rows_for(path):
         if path not in rows_by_path:
             try:
-                rows_by_path[path] = registry.read_rows(
-                    _Path(path), lines=_pinned_registry_lines(path))
+                rows_by_path[path] = _orphan_registry_rows(path, registry)
             except Exception:
                 rows_by_path[path] = []
         return rows_by_path[path]
@@ -3832,7 +3945,7 @@ def _annotate_orphan_conductors(jobs, now, jobs_path=None):
         return
     try:
         from pathlib import Path as _Path
-        rows = registry.read_rows(_Path(jobs_path), lines=_pinned_registry_lines(jobs_path))
+        rows = _orphan_registry_rows(jobs_path, registry)
     except Exception:
         return
     newest = {}
@@ -3901,16 +4014,11 @@ def _pending_delivery_counts(paths):
     intent_rows = set()
     for path in paths:
         try:
-            lines = _pinned_registry_lines(path)
-            if lines is None:
-                lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+            rows = parsed_registry_rows(path)
         except OSError:
             continue
-        for line in lines:
-            fields = line.split("\t")
-            if len(fields) != 6:
-                continue
-            meta = _parse_pipe_meta(fields[5] or "")
+        for _order, _fields, parsed_meta in rows:
+            meta = dict(parsed_meta)
             if meta.get("delivery_intent") != "1":
                 continue
             attempt_id = meta.get("attempt_id") or ""

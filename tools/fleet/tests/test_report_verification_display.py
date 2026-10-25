@@ -69,6 +69,28 @@ class ReportVerificationDisplayTests(unittest.TestCase):
         self.assertEqual(public["report_verification"], self.payload)
         json.dumps(self.job.to_dict(), ensure_ascii=False)
 
+    def test_report_verification_opt_out_keeps_route_projection_without_reading_reports(self):
+        with mock.patch.object(report_verification_projection, "project_route",
+                               side_effect=AssertionError("explorer read report verification")) as resolver:
+            projection.attach_projections(
+                [], [self.job], route_records={self.record["route_id"]: self.record},
+                artifact_root="/tmp", now=100.0, include_report_verification=False)
+        resolver.assert_not_called()
+        self.assertEqual(self.job.work_projection.source, "route-exact")
+        self.assertIsNone(self.job.work_projection.report_verification)
+
+    def test_terminal_only_projection_honors_report_opt_out(self):
+        evidence = {self.record["route_id"]: {
+            "claim-a": {"route_file": COMPOSED, "route_hash": self.record["route_hash"]},
+        }}
+        with mock.patch.object(report_verification_projection, "project_route",
+                               side_effect=AssertionError("terminal explorer read report verification")) as resolver:
+            carriers = projection.terminal_route_entities(
+                evidence, include_report_verification=False)
+        resolver.assert_not_called()
+        self.assertEqual(len(carriers), 1)
+        self.assertEqual(carriers[0].work_projection.source, "route-exact")
+
     def test_render_uses_payload_only_clips_reasons_and_performs_no_resolution(self):
         projection.attach_projections([], [self.job], route_records={self.record["route_id"]: self.record},
                                       artifact_root="/tmp", now=100.0)

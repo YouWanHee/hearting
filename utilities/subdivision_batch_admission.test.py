@@ -12,6 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -387,7 +388,8 @@ class ParallelEntryFailClosedTest(unittest.TestCase):
                     admission, parent="owner", jobs=jobs, governor_reservation_env="TOKEN", run=_run,
                 )
             self.assertEqual([r["started"] for r in results], [1, 1])
-            self.assertEqual(seen, [("register", False), ("register", False), ("start", True), ("start", True)])
+            self.assertEqual(seen[:2], [("register", False), ("register", False)])
+            self.assertEqual(sorted(seen[2:]), [("start", True), ("start", True)])
             sealed = json.loads((jobs.parent / "session_chains" / "ssc-persist-1.json").read_text())
             self.assertEqual(sealed["chain_id"], "ssc-persist-1")
 
@@ -406,6 +408,61 @@ class StartAdmittedBatchPartialFailureTest(AdmissionFixture):
             reserve=lambda *a, **k: tokens,
             record_baseline=lambda *a, **k: recorded.append(a),
         )
+
+    def test_all_admitted_starts_enter_before_any_blocked_start_finishes(self):
+        admission = self._admission(4)
+        all_entered = threading.Event()
+        release_first = threading.Event()
+        lock = threading.Lock()
+        entered = [0]
+        first_finished_with = []
+        results_holder = []
+        errors = []
+
+        def fake_run(cmd, env):
+            action = cmd[cmd.index("--action") + 1]
+            if action == "register":
+                return subprocess.CompletedProcess(cmd, 0, "registered", "")
+            with lock:
+                entered[0] += 1
+                if entered[0] == len(admission.sessions):
+                    all_entered.set()
+            if env.get("AGENT_DISPATCH_GOVERNOR_RESERVATION") == admission.tokens[0]:
+                if not release_first.wait(3.0):
+                    return subprocess.CompletedProcess(cmd, 70, "", "barrier-timeout")
+                with lock:
+                    first_finished_with.append(entered[0])
+            return subprocess.CompletedProcess(cmd, 0, "started", "")
+
+        def start_batch():
+            try:
+                results_holder.extend(SUBDIV.start_admitted_batch(
+                    admission, parent="owner", jobs=self.base / "jobs.log",
+                    governor_reservation_env="AGENT_DISPATCH_GOVERNOR_RESERVATION",
+                    run=fake_run,
+                ))
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(SUBDIV, "terminal_claim_observation", return_value=None), \
+             mock.patch.object(SUBDIV, "dispatch_command",
+                               side_effect=lambda manifest, session, action, parent, jobs:
+                               ["x", "--action", action, "--slug", session["slug"]]):
+            caller = threading.Thread(target=start_batch, daemon=True)
+            caller.start()
+            observed_all_entered = all_entered.wait(2.0)
+            count_before_release = entered[0]
+            release_first.set()
+            caller.join(5.0)
+
+        self.assertTrue(observed_all_entered)
+        self.assertEqual(count_before_release, len(admission.sessions))
+        self.assertEqual(first_finished_with, [len(admission.sessions)])
+        self.assertFalse(caller.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual([row["subsession_id"] for row in results_holder],
+                         [row["subsession_id"] for row in admission.sessions])
+        self.assertEqual([row["started"] for row in results_holder], [1] * len(admission.sessions))
 
     def test_third_slice_register_failure_starts_no_slice_at_all(self):
         admission = self._admission(3)

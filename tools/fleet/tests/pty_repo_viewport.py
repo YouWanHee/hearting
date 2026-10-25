@@ -52,7 +52,7 @@ def _proc_start(pid):
 def _child_main(evidence_dir, explorer=False):
     from fleet import control, gitinfo, render
     from fleet.model import Session
-    from fleet.refresh import LiveSnapshot
+    from fleet.refresh import LiveSnapshot, set_required_details
 
     evidence_dir = Path(evidence_dir)
     render.set_explorer_mode(explorer)
@@ -96,7 +96,20 @@ def _child_main(evidence_dir, explorer=False):
                     for i, item in enumerate(fixture_vm.sessions)]
 
     def collect_all(**_kwargs):
-        return LiveSnapshot(sessions=list(sessions))
+        observed_at = time.time()
+        snapshot = LiveSnapshot(sessions=list(sessions), observations={
+            "basic": {"state": "ok", "generation_identity": "pty-fixture-generation",
+                      "observed_at": observed_at, "all_new": True},
+            "usage:claude": {"state": "absent", "attempted": True,
+                             "observed_at": observed_at, "all_new": True},
+            "usage:codex": {"state": "absent", "attempted": True,
+                            "observed_at": observed_at, "all_new": True},
+            "usage:opencode": {"state": "absent", "attempted": True,
+                               "observed_at": observed_at, "all_new": True},
+            "remote-host": {"state": "absent", "attempted": True,
+                            "observed_at": observed_at},
+        })
+        return set_required_details(snapshot, "ok", all_new=True, observed_at=observed_at)
 
     def forbidden(name):
         def reject(*args, **kwargs):
