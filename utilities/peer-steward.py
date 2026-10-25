@@ -8215,29 +8215,30 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
                     pass
 
 
-def _discover_session_notice_duties(store):
+def _discover_session_notice_duties(store, *, read_context=None):
     """Recover usable old notices; False keeps partial discovery with this runner."""
     import dispatch_pending_delivery as pending
     import session_notice
-    from dispatch_registry_cache import registry_snapshot
+    from peer_read_context import PeerReadContext
     from dispatch_seat_handover import (_registered_parent_harness,
                                         lineage_graph, record_recipient)
     state_root = store.root.parent.parent.resolve()
     jobs = state_root / "jobs.log"
     observed = True
     candidates = set()
+    read_context = read_context or PeerReadContext(registry_append_only=True)
     try:
-        candidates.update(lineage_graph().ledger_keys)
+        candidates.update(lineage_graph(read_context=read_context).ledger_keys)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         # Unavailable authority cannot authorize notices or abandon the runner's
         # other accepted work. Retry discovery on its next ordinary pass.
         observed = False
     try:
-        # The compatibility latest_rows helper hides unavailable reads as {}.
-        # Use the same parser's complete snapshot and keep its usable rows.
-        snapshot = registry_snapshot(jobs)
-        observed = snapshot.complete and observed
-        for status, meta in snapshot.view.handover_latest().values():
+        # Discovery and reconciliation consume one generation-checked view.
+        # Missing jobs is valid for route-free notices; partial input is not.
+        view = read_context.registry_view(jobs)
+        observed = (view is None or not view.completeness_reason) and observed
+        for status, meta in (view.handover_latest().values() if view is not None else ()):
             sid = str(meta.get("parent_sid") or "")
             harness = _registered_parent_harness(meta)
             if sid and harness:
@@ -8676,11 +8677,11 @@ def cmd_obligation_runner(args):
                 os.close(wake_fd)
             return 0
         store.begin_read_pass()
-        notice_discovery_observed = _discover_session_notice_duties(store)
-        duties = store.list()
         from peer_read_context import PeerReadContext
         from runtime_observation import ObservationContext
         read_context = PeerReadContext(registry_append_only=True)
+        notice_discovery_observed = _discover_session_notice_duties(store, read_context=read_context)
+        duties = store.list()
         observation_context = ObservationContext()
         _reconcile_obligations(store, duties, read_context=read_context,
                                retry_state=duty_retry_state,

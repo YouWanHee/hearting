@@ -37,7 +37,9 @@ through the delivery's existing immutable identity and `ack_received` CAS; an
 ACK write failure leaves the verified receipt usable for suppressing another
 send while settlement is retried naturally. The original body's receipt markers
 bind that identity for first writes and receipt retries, including retained
-notices; a replacement row remains a different identity even with the same
+notices. Native notice watchers use the same claim and recipient check at their
+add callback, and keep the original submission identity for historical receipt
+settlement; a replacement row remains a different identity even with the same
 receipt digest. Ordinary notices keep their stored provenance or exact parent
 or owner-session authority, then use the common confirmed recipient lineage.
 The existing notice courier carries both current and legacy duties through the
@@ -137,8 +139,9 @@ adding new refusal rules.
 Read-only work shared during one input may reuse that input's parsed snapshot.
 A shared registry view may live across scan passes while its file generation is
 unchanged; each pass still checks the current generation and re-observes any
-other input it depends on. The snapshot is not authority for a state-changing
-action: claims, acknowledgements, handovers, and sends recheck the current row
+other input it depends on. Notice discovery shares that pass's registry view
+and completeness judgment before reconciliation. The snapshot is not authority
+for a state-changing action: claims, acknowledgements, handovers, and sends recheck the current row
 and binding under their existing lock. Recovery callbacks reconnect the
 existing owner of work; they do not repeat work already owned by its live
 runner.

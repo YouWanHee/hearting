@@ -1390,7 +1390,13 @@ class ObligationStoreTest(unittest.TestCase):
                 ref, recipient, records, duties = self.notice_transfer("claude", member_count=4,
                                                                       suffix="-held-" + mutation)
                 sid, successor = recipient["session_id"], "current-" + mutation
+                last = max(records, key=lambda value: value["delivery_id"])
                 for record, duty in zip(records, duties):
+                    if mutation == "fence" and record["delivery_id"] == last["delivery_id"]:
+                        # Fence the add while live, then retain it after expiry.
+                        pending.prepare_submission_fence(self.root, sid, last["delivery_id"],
+                            claim_owner=last["claim_owner"],
+                            expected_identity=pending.submission_fence_identity(last, sid))
                     pending.mark_sent_ambiguous(self.root, sid, record["delivery_id"], claim_owner=record["claim_owner"])
                     self.store.update(duty["id"], observation={"transfer_ref": ref})
                     path = pending.record_path(self.root, sid, record["delivery_id"])
@@ -1406,9 +1412,6 @@ class ObligationStoreTest(unittest.TestCase):
                 elif mutation == "fence":
                     raw = json.loads(path.read_text()); raw["state"] = "claimed"
                     path.write_text(json.dumps(raw))
-                    pending.prepare_submission_fence(self.root, sid, last["delivery_id"],
-                        claim_owner=last["claim_owner"],
-                        expected_identity=pending.submission_fence_identity(last, sid))
                 else:
                     raw = json.loads(path.read_text())
                     raw.update({"claim_owner": "other-carrier"} if mutation == "owner" else
@@ -3206,7 +3209,13 @@ class CanonicalNoticeJoinTest(unittest.TestCase):
             with self.subTest(mutation=mutation):
                 ref, recipient, records, duties = self.transfer("claude", "canonical-held-" + mutation, 4)
                 sid, successor = recipient["session_id"], "current-" + mutation
+                last = max(records, key=lambda value: value["delivery_id"])
                 for record, duty in zip(records, duties):
+                    if mutation == "fence" and record["delivery_id"] == last["delivery_id"]:
+                        # Fence the add while live, then retain it after expiry.
+                        pending.prepare_submission_fence(self.root, sid, last["delivery_id"],
+                            claim_owner=last["claim_owner"],
+                            expected_identity=pending.submission_fence_identity(last, sid))
                     pending.mark_sent_ambiguous(self.root, sid, record["delivery_id"], claim_owner=record["claim_owner"])
                     self.store.update(duty["id"], observation={**self.store.get(duty["id"])["observation"], "transfer_ref": ref})
                     path = pending.record_path(self.root, sid, record["delivery_id"])
@@ -3222,9 +3231,6 @@ class CanonicalNoticeJoinTest(unittest.TestCase):
                 elif mutation == "fence":
                     raw = json.loads(path.read_text()); raw["state"] = "claimed"
                     path.write_text(json.dumps(raw))
-                    pending.prepare_submission_fence(self.root, sid, last["delivery_id"],
-                        claim_owner=last["claim_owner"],
-                        expected_identity=pending.submission_fence_identity(last, sid))
                 else:
                     raw = json.loads(path.read_text())
                     raw.update({"claim_owner": "other-carrier"} if mutation == "owner" else

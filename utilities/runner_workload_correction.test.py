@@ -104,6 +104,12 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             "OPENCODE_CONFIG_DIR": str(self.base / "opencode"),
         })
         self.addCleanup(self._restore_environment)
+        # This workload books every requester on the private "default" server.
+        # The imported module otherwise retains the driver's earlier endpoint,
+        # which makes its real successor mark contradict those same bookings.
+        endpoint = mock.patch.object(peer_steward, "_HERDR_SESSION", "default")
+        endpoint.start()
+        self.addCleanup(endpoint.stop)
         dispatch_registry_cache.clear_cache()
         dispatch_registry_cache.reset_metrics()
         self.addCleanup(dispatch_registry_cache.clear_cache)

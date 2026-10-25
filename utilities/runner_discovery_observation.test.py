@@ -165,8 +165,8 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
             if threading.current_thread() is main_thread:
                 ordinary_passes.append(current._active_list_context)
 
-        def discover(current):
-            observed = real_discovery(current)
+        def discover(current, **kwargs):
+            observed = real_discovery(current, **kwargs)
             discoveries.append(observed)
             return observed
 
