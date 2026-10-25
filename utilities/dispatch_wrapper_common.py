@@ -148,11 +148,12 @@ def resolve_artifact_root(worktree: str) -> str:
     return value
 
 
-def prepare_runtime_root(artifact_root: str, environ=None) -> str:
+def prepare_runtime_root(artifact_root: str, environ=None, *, repository_kind=None, source_root=None) -> str:
     """Best-effort runtime home setup; failure only suppresses the optional root."""
     import worker_bootstrap
     values = os.environ if environ is None else environ
-    candidate = worker_bootstrap.runtime_dir_candidate(artifact_root, values)
+    candidate = worker_bootstrap.runtime_dir_candidate(
+        artifact_root, values, repository_kind=repository_kind, source_root=source_root)
     return worker_bootstrap.prepare_runtime_dir(candidate)
 
 

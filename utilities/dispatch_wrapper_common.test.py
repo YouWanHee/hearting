@@ -296,6 +296,38 @@ class WrapperCommonTest(unittest.TestCase):
             self.assertEqual((conflict / ".gitignore").read_text(), "leave alone\n")
             self.assertEqual(C.prepare_runtime_root(str(artifact), {"AGENT_RUNTIME_DIR": "relative"}), "")
 
+    def test_non_git_runtime_preparation_keeps_external_artifact_and_source_roots_unchanged(self):
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "original"
+            source.mkdir()
+            user_file = source / "user.txt"
+            user_file.write_bytes(b"leave this source alone\n")
+            artifact = base / "external-artifacts"
+            artifact.mkdir()
+            home = base / "home"
+            before_names = set(os.listdir(source))
+            before_hash = hashlib.sha256(user_file.read_bytes()).hexdigest()
+            digest = hashlib.sha256(str(artifact.resolve()).encode("utf-8")).hexdigest()
+            expected = home / ".local/state/hearting/dispatch/project-runtimes" / digest
+            prepared = C.prepare_runtime_root(
+                str(artifact), {"HOME": str(home)}, repository_kind="non-git", source_root=str(source))
+            self.assertEqual(prepared, str(expected))
+            self.assertEqual((expected / ".gitignore").read_bytes(), b"*\n")
+            self.assertEqual(set(os.listdir(source)), before_names)
+            self.assertEqual(hashlib.sha256(user_file.read_bytes()).hexdigest(), before_hash)
+
+            conflict = expected.parent / ("e" * 64)
+            conflict.mkdir(parents=True)
+            (conflict / ".gitignore").write_text("preserve\n", encoding="utf-8")
+            self.assertEqual(C.prepare_runtime_root(
+                str(artifact), {"HOME": str(home), "AGENT_RUNTIME_DIR": str(conflict)},
+                repository_kind="non-git", source_root=str(source)), "")
+            self.assertEqual((conflict / ".gitignore").read_text(encoding="utf-8"), "preserve\n")
+            self.assertEqual(set(os.listdir(source)), before_names)
+
     def make_release(self, root: Path):
         root.mkdir(parents=True)
         (root / ".hearting-release.json").write_text(

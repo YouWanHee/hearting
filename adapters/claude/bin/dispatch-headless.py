@@ -1434,7 +1434,8 @@ def main(argv: list[str]) -> int:
         return fail(exc.reason, 65, detail=exc.detail, worktree=args.worktree, child_spawned="0")
     try:
         args.artifact_root = resolve_artifact_root(args.worktree)
-        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(args.artifact_root)
+        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(
+            args.artifact_root, repository_kind=args.repository_kind, source_root=args.worktree)
         args.report_bundle_root = resolve_report_bundle_root(args.route_file, args.route_node)
     except ValueError as e:
         return fail("writable-root-resolution-failed", 64, detail=str(e), worktree=args.worktree)

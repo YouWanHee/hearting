@@ -1307,7 +1307,8 @@ def main(argv: list[str]) -> int:
         return fail(exc.reason, 65, detail=exc.detail, worktree=args.worktree, child_spawned="0")
     try:
         args.artifact_root = resolve_artifact_root(args.worktree)
-        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(args.artifact_root)
+        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(
+            args.artifact_root, repository_kind=args.repository_kind, source_root=args.worktree)
         args.report_bundle_root = resolve_report_bundle_root(args.route_file, args.route_node)
         args.opencode_config_content = scoped_external_directory_config(
             args.artifact_root,
@@ -1882,8 +1883,9 @@ def main(argv: list[str]) -> int:
                                 if args.report_bundle_root is not None else None),
             execution_access_roots=[
                 str(value) for value in (
-                    args.execution_access_grant.additional_writable_roots
-                    if args.execution_access_grant is not None else ()
+                    (*((Path(args.runtime_dir),) if args.runtime_dir else ()),
+                     *(args.execution_access_grant.additional_writable_roots
+                       if args.execution_access_grant is not None else ()))
                 )
             ],
             execution_access_read_roots=[
