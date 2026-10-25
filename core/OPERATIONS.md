@@ -1777,8 +1777,8 @@ the child as `no-progress`; the launcher's finite execution budget remains the
 final hard timeout and cleanup authority. For an ordinary owner turn, the same
 conservative sampler is bound to the live native process and exact session or
 lease evidence; supervisor logs, unrelated sessions, broad transcript roots,
-and unrelated child activity do not renew its 7200-second idle window.
-Observation uncertainty is never proof of inactivity. Direct bounded calls,
+and unrelated child activity leave its 7200-second idle window running.
+Observation uncertainty counts as unknown, not as inactivity. Direct bounded calls,
 terminal cleanup, and the distinction between activity and semantic completion
 remain unchanged. Progress recovery leaves a delayed success intact. Per-tool
 bookkeeping is runtime-owned. Optional heartbeats are work hints: test→tool is
