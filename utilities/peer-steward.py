@@ -1315,9 +1315,10 @@ def _mark_seat_successor(pane, beside, kind, session_id):
         pass
 
 
-def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=None, recheck=None, wait=None):
-    """After `retire` proved the predecessor exited: when this session runs in the pane started
-    beside the predecessor, its routes become this session's, across harnesses
+def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=None, recheck=None, wait=None,
+                   retain_mark=False):
+    """Transfer to the exact successor; physical retirement settles separately.
+    The pane started beside the predecessor inherits its routes across harnesses
     (`dispatch_seat_handover.record_retire_handover`). Returns the receipt value, or None when
     this is not a seat change (the receipt then stays as it was); it never fails the retire."""
     pane = requester.get("pane") if requester is not None else _caller_pane()
@@ -1326,7 +1327,8 @@ def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=N
     try:
         with _seat_successor_lock(pane, wait=wait):
             return _seat_handover_locked(ident, own_sid, own_harness, pane,
-                                         requester=requester, accepted_at=accepted_at, recheck=recheck)
+                                         requester=requester, accepted_at=accepted_at, recheck=recheck,
+                                         retain_mark=retain_mark)
     except OSError:
         return "error"
 
@@ -1418,7 +1420,7 @@ def _legacy_requester_projection(duty, *, expected_pane=None):
 
 
 def _seat_handover_locked(ident, own_sid, own_harness, pane, *, requester=None, accepted_at=None,
-                          recheck=None):
+                          recheck=None, retain_mark=False):
     from opencode_session_runtime import _read_native_record, OpenCodeTransportError
     path = _seat_successor_path(pane)
     try:
@@ -1449,6 +1451,14 @@ def _seat_handover_locked(ident, own_sid, own_harness, pane, *, requester=None, 
                 or ident.get("server", "default") != server
                 or not _source_before_acceptance(record["source"], accepted_at, mark.get("at"))):
             return "skipped:successor-unverified"
+    if retain_mark:
+        current, reason = _prompt_current_candidate(
+            pane, expected_harness=own_harness, expected_sid=own_sid,
+            require_process_session=True)
+        if (reason or current is None or current.get("pane") != pane
+                or current.get("harness") != own_harness
+                or current.get("session_id") != own_sid):
+            return "skipped:successor-unverified"
     try:
         import dispatch_seat_handover as handover
         booked = {}
@@ -1465,7 +1475,7 @@ def _seat_handover_locked(ident, own_sid, own_harness, pane, *, requester=None, 
     except Exception:  # noqa: BLE001 - the retire itself already succeeded
         return "error"
     try:
-        if row is not None and _read_native_record(path) == record:
+        if row is not None and not retain_mark and _read_native_record(path) == record:
             path.unlink()
     except (OSError, OpenCodeTransportError):
         pass
@@ -1617,7 +1627,24 @@ def _retire_handover(duty, *, wait=None):
     return _seat_handover(identity, own_sid, own_harness, requester=requester,
                           accepted_at=duty.get("accepted_at"),
                           recheck=recheck if evidence or projected_legacy else None,
-                          wait=wait)
+                          wait=wait, retain_mark=(duty.get("state") != "complete"
+                              and (duty.get("observation") or {}).get("phase", "waiting") == "waiting"
+                              and _retire_subject_state(duty) != "gone"))
+
+
+def _retire_cutover(duty):
+    """Move a proven successor's parent duties before deciding whether to exit.
+
+    A valid mark with no eligible route is still a confirmed succession. Its
+    past notification uncertainty is not an executor in the retiring pane.
+    The normal input projection continues to protect native turns and actual
+    registered executors; delivery records and their ACKs remain untouched.
+    """
+    try:
+        result = _retire_handover(duty, wait=0)
+    except Exception:
+        return False
+    return isinstance(result, str) and (result == "none" or result.isdecimal())
 
 
 def _observed_start_agent(args, deadline=None, wait=False):
@@ -2450,6 +2477,7 @@ def _resume_retire_obligation(duty, store, *, read_context=None,
     old_server = _HERDR_SESSION
     _HERDR_SESSION = None if server == "default" else server
     try:
+        cutover = _retire_cutover(duty)
         subject = _retire_subject_state(duty)
         if subject == "gone":
             _complete_gone_retire(store, duty)
@@ -2470,6 +2498,7 @@ def _resume_retire_obligation(duty, store, *, read_context=None,
         readiness = _pane_readiness(target, state,
                                     expected_harness=ident["harness"],
                                     expected_sid=observed["session_id"],
+                                    purpose="input" if cutover else "completion",
                                     read_context=read_context)
         if readiness.state != "ready":
             store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
@@ -2589,6 +2618,7 @@ def cmd_retire(args):
     phase = (duty.get("observation") or {}).get("phase", "waiting")
     if phase != "waiting":
         return finish("retire-already-pending", pending=True)
+    cutover = _retire_cutover(duty)
     subject = _retire_subject_state(duty)
     if subject == "gone":
         if _complete_gone_retire(store, duty):
@@ -2605,7 +2635,8 @@ def cmd_retire(args):
     if reason or retire_state not in {"idle", "done"}:
         return finish(reason or f"agent-{retire_state}-{state_source}", pending=True)
     readiness = _pane_readiness(target, state, expected_harness=harness,
-                                expected_sid=ident["session_id"])
+                                expected_sid=ident["session_id"],
+                                purpose="input" if cutover else "completion")
     if readiness.state != "ready":
         return finish(readiness.reason, pending=True)
     identity = _retire_foreground(pane, harness)

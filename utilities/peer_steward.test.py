@@ -10278,6 +10278,123 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
 class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
     """The recorded successor inherits; observers and later pane occupants do not."""
 
+    def test_waiting_normal_retire_cuts_over_before_busy_or_unknown_without_exit(self):
+        for predecessor, successor in (("claude", "codex"), ("claude", "opencode"),
+                                      ("codex", "claude"), ("codex", "opencode"),
+                                      ("opencode", "claude"), ("opencode", "codex")):
+            for subject, readiness_state in (("same", "pending"), ("same", "unknown"),
+                                             ("unknown", "unknown")):
+                with self.subTest(predecessor=predecessor, successor=successor,
+                                  subject=subject, readiness=readiness_state), \
+                     tempfile.TemporaryDirectory() as root, \
+                     mock.patch.dict(os.environ, {"XDG_STATE_HOME": root,
+                                                  "AGENT_PEER_LEDGER_ROOT": root}):
+                    store, duty = self.booking(predecessor, successor)
+                    original_intent = json.loads(json.dumps(duty["intent"]))
+                    candidate = {"pane": "w1:pNew", "harness": successor,
+                                 "session_id": "new-sid"}
+                    old = dict(duty["intent"]["identity"])
+                    with mock.patch.object(peer_steward, "_retire_subject_state", return_value=subject), \
+                         mock.patch.object(peer_steward, "_prompt_current_candidate",
+                                           return_value=(candidate, None)), \
+                         mock.patch.object(peer_steward, "_retire_target",
+                                           return_value=("working", old, 0, None)), \
+                         mock.patch.object(peer_steward, "_pane_readiness", return_value=SimpleNamespace(
+                             state=readiness_state, reason="bound-registered-work-" + readiness_state)) as ready, \
+                         mock.patch.object(peer_steward.subprocess, "run") as native:
+                        peer_steward._resume_retire_obligation(duty, store)
+                        self.assert_authority()
+                        self.assertEqual(self.handover.effective_parent_harness(
+                            self.meta, self.jobs_path), successor)
+                        native.assert_not_called()
+                        if subject == "same":
+                            self.assertEqual(ready.call_args.kwargs["purpose"], "input")
+                        # The same accepted mark survives a busy pass; replay
+                        # still proves the recipient without another request.
+                        self.assertTrue(peer_steward._seat_successor_path("w1:pNew").exists())
+                        peer_steward._resume_retire_obligation(store.get(duty["id"]), store)
+                        self.assert_authority()
+                        native.assert_not_called()
+                    self.assertEqual(store.get(duty["id"])["intent"], original_intent)
+                    self.assertNotEqual(store.get(duty["id"])["state"], "complete")
+
+    def test_waiting_normal_retire_does_not_trust_an_unproven_successor(self):
+        for changed in ("missing", "late", "replaced", "unverified"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as root, \
+                 mock.patch.dict(os.environ, {"XDG_STATE_HOME": root,
+                                              "AGENT_PEER_LEDGER_ROOT": root}):
+                store, duty = self.booking()
+                path = peer_steward._seat_successor_path("w1:pNew")
+                if changed == "missing":
+                    path.unlink()
+                elif changed in {"late", "replaced"}:
+                    mark = json.loads(path.read_text())
+                    if changed == "late":
+                        mark["at"] = duty["accepted_at"] + 1
+                    else:
+                        mark["successor"]["session_id"] = "other-sid"
+                    path.write_text(json.dumps(mark))
+                candidate = {"pane": "w1:pNew", "harness": "opencode", "session_id": "new-sid"}
+                with mock.patch.object(peer_steward, "_retire_subject_state", return_value="unknown"), \
+                     mock.patch.object(peer_steward, "_prompt_current_candidate", return_value=(
+                         None if changed == "unverified" else candidate,
+                         "target-identity-unverified" if changed == "unverified" else None)), \
+                     mock.patch.object(peer_steward.subprocess, "run") as native:
+                    peer_steward._resume_retire_obligation(duty, store)
+                    native.assert_not_called()
+                self.assert_authority("old-sid")
+
+    def test_normal_retire_keeps_past_notification_states_and_protects_actual_executors(self):
+        from dispatch_attempt_policy import AttemptDecision, RegisteredWorkObservation
+        history = tuple(RegisteredWorkObservation(
+            attempt_id="past-" + str(i),
+            decision=AttemptDecision("succeeded", "advance", "owner", "completed"),
+            process_state="quiescent", evidence_state="terminal",
+            pane_relation="parent", delivery_state="unknown",
+            provenance=(("pending_state", state), ("membership", member)))
+            for i, (state, member) in enumerate((("rejected", "exact"),
+                ("acked", "replacement-one"), ("acked", "replacement-two"))))
+        for executor in (None, "live", "unknown"):
+            with self.subTest(executor=executor), tempfile.TemporaryDirectory() as root, \
+                 mock.patch.dict(os.environ, {"XDG_STATE_HOME": root,
+                                              "AGENT_PEER_LEDGER_ROOT": root}):
+                store, duty = self.booking("claude", "codex")
+                # A complete kernel identity, as the ordinary retire booking
+                # records it; only native observations are fixtures here.
+                duty["intent"]["identity"]["foreground"].update(group=4242, argv=["claude"])
+                peer_steward.peer_obligations._write_atomic(store._record_path(duty["id"]), duty)
+                world = _RetireWorld(harness="claude")
+                bound = history
+                if executor:
+                    bound += (RegisteredWorkObservation(
+                        attempt_id="actual-executor", decision=AttemptDecision(
+                            "running" if executor == "live" else "unknown", "wait", "owner", "active"),
+                        process_state=executor, evidence_state="unknown", pane_relation="executor"),)
+                candidate = {"pane": "w1:pNew", "harness": "codex", "session_id": "new-sid"}
+                pending = []
+                for i, item in enumerate(history):
+                    path = Path(root) / ("past-delivery-" + str(i) + ".json")
+                    path.write_text(json.dumps(dict(item.provenance)))
+                    pending.append((path, path.read_bytes()))
+                with mock.patch.object(peer_steward, "_prompt_current_candidate",
+                                       return_value=(candidate, None)), \
+                     mock.patch.object(peer_steward.peer_obligations, "bound_work_for_pane",
+                                       return_value=(bound, "observed")) as observed:
+                    rc, line = RetireTest.retire(self, world, clear_existing=False,
+                                                resume_request_id=duty["id"])
+                self.assertEqual(rc, 0, line)
+                self.assert_authority()
+                self.assertTrue(any(call.kwargs.get("include_parent") is False
+                                    for call in observed.call_args_list))
+                if executor:
+                    self.assertEqual(world.actions(), [], line)
+                    self.assertNotEqual(store.get(duty["id"])["state"], "complete")
+                else:
+                    self.assertIn("retired=true", line)
+                    self.assertEqual(store.get(duty["id"])["state"], "complete")
+                for path, original in pending:
+                    self.assertEqual(path.read_bytes(), original)
+
     def booking(self, predecessor="claude", successor="opencode"):
         import dispatch_seat_handover as handover
         self.handover = handover

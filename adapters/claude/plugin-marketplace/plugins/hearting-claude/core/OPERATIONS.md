@@ -2361,9 +2361,10 @@ their original storage; cards and notices are not moved. Physical retirement
 remains a separate retained duty and still observes the original process
 birth, executor work, busy state, drafts, and forms. A later retire replay
 reuses the same ledger row rather than creating another transfer.
-Deferred retirement resolves succession from the recorded requester session and
-pane, with the original successor mark predating acceptance and matching both
-requester and predecessor. Proven loss of the booked predecessor
+Deferred retirement uses the same early cutover when the original successor
+mark predates acceptance and its current native process proves the recorded
+requester. The mark stays available while exit waits. Past parent delivery
+uncertainty is separate from actual executor liveness. Proven loss of the booked predecessor
 lifetime can finish this same handover even when its pane has disappeared; it
 grants nothing to a later occupant. A completed retirement whose handover was
 missed is consumed by the ordinary lifecycle callback or the same
