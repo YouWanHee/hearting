@@ -159,7 +159,7 @@ A repeated pin may supply missing evidence without changing the choice.
 
 ### §2.2. Adapter Mapping
 
-Every adapter maps portable roles and execution profiles to runtime models, tools, and prompt profiles as a quality-reproduction contract. A route-bound dispatch always carries both axes; wrappers do not infer the execution budget from role wording or silently inherit the interactive model; a model differs from the profile default only through a route-sealed pin (receipt `model_source=pin`, `model_pin_status=`), a checked capacity retry, or the verified same-harness width-two pair rotation re-derived by shared code. Pair rotation never changes the sealed `--model-profile`, adds concrete model IDs outside `models.conf`, or overrides a concrete model pin. Update and read core before changing adapter maps or generated agents.
+Every adapter maps portable roles and execution profiles to runtime models, tools, and prompt profiles as a quality-reproduction contract. A route-bound dispatch always carries both axes; wrappers do not infer the execution budget from role wording or silently inherit the interactive model; a model differs from the profile default only through a route-sealed pin (receipt `model_source=pin`, `model_pin_status=`), a checked capacity retry, or the verified same-harness width-two pair rotation re-derived by shared code. Pair selection follows §1.1: its model comes from a declared adapter `models.conf` profile, with the sealed profile retained in route evidence. Update and read core before changing adapter maps or generated agents.
 
 The portable execution profiles are selected by the independent
 `judgment_requirement × execution_scope` demand resolver; profile names are not
