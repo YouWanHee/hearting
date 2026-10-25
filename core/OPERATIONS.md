@@ -2174,6 +2174,10 @@ code appears, the session gets one notice through its harness carrier
 Started by a registered owner or worker inside a route, the notice goes to the
 session that started that route's owner (its parent in the jobs registry),
 naming the launching attempt.
+A run with neither metadata nor an exit code has unknown launch state:
+`compute-hosts runs` shows it as `unknown`, including legacy empty run
+directories, without changing its files; metadata is recorded only after
+launch succeeds.
 
 ### §5.14. Peer-Session Steering (steward role)
 
