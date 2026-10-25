@@ -243,10 +243,11 @@ def _non_git_runtime_candidate(root: Path, values, source_root) -> str:
         candidate = (runtimes_root / digest).resolve(strict=False)
 
         # A state override may itself contain legacy internal symlinks, but the
-        # generated components must not leave the resolved dispatch state tree.
+        # generated components must remain proper descendants of their namespace.
         if (not runtimes_root_real.is_relative_to(state_root_real)
                 or runtimes_root_real == state_root_real
-                or not candidate.is_relative_to(runtimes_root_real)):
+                or not candidate.is_relative_to(runtimes_root_real)
+                or candidate == runtimes_root_real):
             return ""
 
         source = Path(source_root).expanduser().resolve(strict=False) if source_root else root.parent
