@@ -10358,6 +10358,98 @@ class RetireTerminalFollowupRegressionTest(_TmpRootMixin, unittest.TestCase):
 
 
 class RegisteredUnknownRetryTest(_TmpRootMixin, unittest.TestCase):
+    def test_unknown_notice_rechecks_new_successor_without_duty_change(self):
+        import dispatch_pending_delivery as pending
+        import session_notice
+        import session_tidy as tidy
+
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                storage_sid = harness + "-notice-storage"
+                successor_sid = harness + "-notice-successor"
+                with mock.patch.object(peer_steward.peer_obligations,
+                                       "ensure_normal_runner", return_value=False):
+                    notice = session_notice.notify(
+                        harness, storage_sid, key="unknown-lineage-" + harness,
+                        subject="run finished", text="keep the original storage key",
+                        jobs=self.jobs_path)
+                store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+                duty = next(row for row in store.list(kinds={"session-notice"})
+                            if row["intent"]["identity"]["storage_sid"] == storage_sid)
+                duty = store.update(duty["id"], observer_error="recipient-unavailable")
+                seat = tidy.Seat("pane", "unknown-notice-" + harness,
+                                 pane="w1:p-" + harness, harness=harness)
+                inventory = {"result": {"agents": []}}
+                deliveries = []
+
+                def courier(args, *, expected_recipient, on_prepared, producer_binding):
+                    deliveries.append((expected_recipient, producer_binding,
+                                       Path(args.body_file).read_text()))
+                    on_prepared("transfer-" + harness)
+                    return 0
+
+                retry_state = {}
+                with mock.patch.object(peer_steward.time, "monotonic", return_value=100.0), \
+                        mock.patch.object(peer_steward.subprocess, "run", side_effect=lambda *a, **kw:
+                            SimpleNamespace(stdout=json.dumps(inventory), returncode=0)), \
+                        mock.patch.object(peer_steward, "_resolve_target", return_value=(
+                            harness, successor_sid, "fixture")), \
+                        mock.patch.object(peer_steward, "cmd_prompt", side_effect=courier):
+                    peer_steward._reconcile_obligations(store, [duty], retry_state=retry_state)
+                    self.assertEqual(deliveries, [])
+                    # The first unavailable census writes its recipient into
+                    # observation. Let the next pass see those same bytes too.
+                    peer_steward._reconcile_obligations(
+                        store, [store.get(duty["id"])], retry_state=retry_state)
+                    duty_before = store.get(duty["id"])
+                    fingerprint_before = peer_steward._obligation_retry_fingerprint(duty_before)
+                    tidy._append_ledger_entry(seat, {
+                        "event": "succession", "source": "tidy-clear", "harness": harness,
+                        "from": {"harness": harness, "sid": storage_sid},
+                        "sid": successor_sid, "ts": 1,
+                    })
+                    inventory["result"]["agents"] = [{
+                        "agent": harness, "agent_session": {"value": successor_sid},
+                        "pane_id": seat.pane,
+                    }]
+                    self.assertEqual(store.get(duty["id"]), duty_before)
+                    self.assertEqual(peer_steward._obligation_retry_fingerprint(
+                        store.get(duty["id"])), fingerprint_before)
+                    peer_steward._reconcile_obligations(
+                        store, [store.get(duty["id"])], retry_state=retry_state)
+
+                self.assertEqual(len(deliveries), 1,
+                                 "new lineage must be observed before a stale unknown retry deadline")
+                recipient, producer, body = deliveries[0]
+                self.assertEqual(recipient, (harness, successor_sid))
+                self.assertEqual(producer["recipient"], {
+                    "harness": harness, "session_id": successor_sid})
+                self.assertEqual(producer["records"][0]["storage_sid"], storage_sid)
+                self.assertEqual(producer["records"][0]["delivery_id"], notice["delivery_id"])
+                self.assertIn("keep the original storage key", body)
+                self.assertIsNone(pending.read(self.tmp_root, successor_sid, notice["delivery_id"]))
+                self.assertEqual(pending.read(self.tmp_root, storage_sid,
+                    notice["delivery_id"])["state"], "sent-ambiguous",
+                    "queue acceptance alone cannot ACK the notice")
+
+    def test_unchanged_unknown_message_keeps_its_bounded_backoff(self):
+        store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        duty = store.create("message-unknown-backoff", "message",
+                            {"harness": "codex", "session_id": "message-recipient"}, {})
+        duty = store.update(duty["id"], observer_error="fixture-unavailable")
+        retry_state = {}
+        with mock.patch.object(peer_steward.time, "monotonic", return_value=100.0), \
+                mock.patch.object(peer_steward, "_resume_message_obligation") as resume:
+            peer_steward._reconcile_obligations(store, [duty], retry_state=retry_state)
+            peer_steward._reconcile_obligations(store, [duty], retry_state=retry_state)
+            self.assertEqual(resume.call_count, 1)
+            self.assertEqual(retry_state[duty["id"]][1], 101.0)
+        with mock.patch.object(peer_steward.time, "monotonic", return_value=101.0), \
+                mock.patch.object(peer_steward, "_resume_message_obligation") as resume:
+            peer_steward._reconcile_obligations(store, [duty], retry_state=retry_state)
+            resume.assert_called_once()
+            self.assertEqual(retry_state[duty["id"]][1], 103.0)
+
     def test_unknown_batch_rechecks_changed_exact_row_without_duty_change(self):
         from dispatch_completion_join import current_attempt_row
 

@@ -7927,8 +7927,11 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
         duty_id = duty.get("id", "")
         kind = (duty.get("intent") or {}).get("kind")
         fingerprint = _obligation_retry_fingerprint(duty)
+        # These duties observe authority outside their own bytes: registry rows
+        # for batches, and confirmed lineage/current recipients for notices.
+        # Their bounded consumers must see that authority on every runner pass.
         retryable = (duty.get("state") == "unknown" and fingerprint is not None
-                     and kind != "registered-batch")
+                     and kind not in {"registered-batch", "session-notice"})
         if retryable:
             prior = retry_state.get(duty_id)
             if (prior is not None and prior[0] == fingerprint
