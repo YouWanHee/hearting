@@ -8063,14 +8063,19 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
 
 
 def _discover_session_notice_duties(store):
-    """Recover valid open notice records written before duty retention existed."""
+    """Recover old open notices; return False when discovery is unavailable."""
     import dispatch_pending_delivery as pending
     import session_notice
     from dispatch_seat_handover import (_registered_parent_harness, latest_rows,
                                         lineage_graph, record_recipient)
     state_root = store.root.parent.parent.resolve()
     jobs = state_root / "jobs.log"
-    candidates = set(lineage_graph().ledger_keys)
+    try:
+        candidates = set(lineage_graph().ledger_keys)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        # Unavailable authority cannot authorize notices or abandon the runner's
+        # other accepted work. Retry discovery on its next ordinary pass.
+        return False
     try:
         for status, meta in latest_rows(jobs).values():
             sid = str(meta.get("parent_sid") or "")
@@ -8097,6 +8102,7 @@ def _discover_session_notice_duties(store):
                 peer_obligations.retain_session_notice(jobs, harness, storage_sid, record)
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 continue
+    return True
 
 
 def _resume_session_notice_obligations(duties, store, *, read_context=None,
@@ -8421,7 +8427,7 @@ def cmd_obligation_runner(args):
                 os.close(wake_fd)
             return 0
         store.begin_read_pass()
-        _discover_session_notice_duties(store)
+        notice_discovery_observed = _discover_session_notice_duties(store)
         duties = store.list()
         from peer_read_context import PeerReadContext
         from runtime_observation import ObservationContext
@@ -8465,7 +8471,8 @@ def cmd_obligation_runner(args):
                 pass
         current_duties = store.list()
         external_signature = _external_obligation_signature(external_snapshot)
-        if not _runner_duties(store, current_duties) and not any(external_signature):
+        if (notice_discovery_observed and not _runner_duties(store, current_duties)
+                and not any(external_signature)):
             # A producer that saw our held lock may already have accepted work.
             # Release before the final read: later producers can start a runner,
             # and work accepted before release is either reclaimed here or owned
@@ -8503,7 +8510,10 @@ def cmd_obligation_runner(args):
                 continue
             current_duties = latest_duties
             external_signature = latest_external
-        signature = (_runner_duty_signature(current_duties), external_signature)
+        # Unknown discovery is an observation, not proof of an empty backlog.
+        # Keep the same owner and bounded wait even before legacy duty recovery.
+        signature = (notice_discovery_observed,
+                     _runner_duty_signature(current_duties), external_signature)
         if previous_signature is None or signature != previous_signature:
             delay = 1.0
         else:

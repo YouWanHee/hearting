@@ -3954,7 +3954,7 @@ def _pending_delivery_counts(paths, *, session_observation=None):
                     no_recipient = None
     all_records = set()
     seen_roots = set()
-    seen_no_recipient = set()
+    seen_no_recipient = {}
     no_recipient_unknown = False
     try:
         from dispatch_pending_delivery import record_path as pending_record_path
@@ -4085,9 +4085,6 @@ def _pending_delivery_counts(paths, *, session_observation=None):
                         continue
 
                     identity = (delivery_id, recipient_digest)
-                    if identity in seen_no_recipient:
-                        continue
-                    seen_no_recipient.add(identity)
                     try:
                         from dispatch_seat_handover import record_recipient_binding
                         recipient = record_recipient_binding(record, storage_sid, harness=harness)
@@ -4095,8 +4092,15 @@ def _pending_delivery_counts(paths, *, session_observation=None):
                         recipient = None
                     if recipient is None:
                         no_recipient_unknown = True
-                    elif recipient not in live_sessions:
-                        no_recipient += 1
+                    elif identity in seen_no_recipient:
+                        # Every observed body must resolve, even when its count
+                        # is deduplicated. Conflicting bindings stay unknown.
+                        if seen_no_recipient[identity] != recipient:
+                            no_recipient_unknown = True
+                    else:
+                        seen_no_recipient[identity] = recipient
+                        if recipient not in live_sessions:
+                            no_recipient += 1
             elif state == "expired":
                 expired += 1
             elif not isinstance(state, str) or state not in {"acked", "rejected"}:
