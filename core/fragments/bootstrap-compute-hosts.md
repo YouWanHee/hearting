@@ -1,1 +1,2 @@
 - Reach compute hosts through `compute-hosts` and its inventory (`~/.config/hearting/compute-hosts.yaml`). `run` receipts include measured GPU headroom; `probe` remains available for host comparison.
+- A run with neither metadata nor an exit code has unknown launch state. `runs` shows it as `unknown`, including legacy empty run directories, without changing its files; metadata is recorded only after launch succeeds.
