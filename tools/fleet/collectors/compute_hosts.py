@@ -68,19 +68,40 @@ def _diagnostic(message, observed_at=None):
     }
 
 
+def _self_fallback(argv, snapshot, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        snapshot["error"] = "local compute observation timed out"
+        return snapshot
+    try:
+        result = subprocess.run(argv + ["self", "--json"], text=True, capture_output=True,
+                                timeout=remaining)
+        payload = json.loads(result.stdout) if result.returncode == 0 else None
+        if isinstance(payload, dict) and isinstance(payload.get("hosts"), list):
+            snapshot["hosts"] = payload["hosts"]
+            return snapshot
+    except (subprocess.TimeoutExpired, OSError, TypeError, ValueError):
+        pass
+    snapshot["error"] = "local compute observation unavailable"
+    return snapshot
+
+
 def collect(timeout=COLLECT_TIMEOUT):
     """Return a host snapshot, a probe diagnostic, or an unconfigured guidance block."""
+    started = time.monotonic()
+    deadline = started + max(0.0, float(timeout))
     path = _config_path()
-    if not path.is_file():
-        return _unconfigured("missing", path)
     argv = _tool_argv()
+    if not path.is_file():
+        snapshot = _unconfigured("missing", path)
+        return _self_fallback(argv, snapshot, deadline) if argv else snapshot
     if not argv:
         return _diagnostic("compute-hosts utility unavailable")
     observed_at = time.time()
     try:
         result = subprocess.run(
             argv + ["list", "--json"], text=True, capture_output=True,
-            timeout=max(0.1, float(timeout)),
+            timeout=max(0.1, deadline - time.monotonic()),
         )
     except subprocess.TimeoutExpired:
         return _diagnostic("compute-host probe timed out", observed_at)
@@ -92,9 +113,11 @@ def collect(timeout=COLLECT_TIMEOUT):
         # treat that race exactly like an initially absent config. A seeded but
         # still-commented template is guidance, not a probe failure.
         if "not initialized" in detail:
-            return _unconfigured("missing", path)
+            snapshot = _unconfigured("missing", path)
+            return _self_fallback(argv, snapshot, deadline)
         if "has no hosts yet" in detail:
-            return _unconfigured("template", path)
+            snapshot = _unconfigured("template", path)
+            return _self_fallback(argv, snapshot, deadline)
         return _diagnostic(detail, observed_at)
     try:
         payload = json.loads(result.stdout)
@@ -156,8 +179,7 @@ def unregistered_gpu(snapshot, resource_jobs=(), shown_sessions=frozenset(), age
     the F-88 session GPU line for its `session_owner` is on screen. `cwd` picks
     the project card only; it is never ownership evidence.
     """
-    if (not isinstance(snapshot, dict) or not snapshot.get("configured")
-            or snapshot.get("error")):
+    if (not isinstance(snapshot, dict) or snapshot.get("error")):
         return []
     hosts = snapshot.get("hosts")
     if not isinstance(hosts, (list, tuple)):

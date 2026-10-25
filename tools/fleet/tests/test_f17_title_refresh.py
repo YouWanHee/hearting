@@ -1287,7 +1287,22 @@ class SecurityTest(_ConfigHomeMixin, unittest.TestCase):
     def test_no_provider_installed_degrades_to_empty(self):
         import shutil as _shutil
         orig_which = _shutil.which
-        _shutil.which = lambda name: None
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        isolated_home = Path(home.name)
+        isolated_xdg = isolated_home / "xdg"
+        isolated_xdg.mkdir()
+        environ = mock.patch.dict(os.environ, {
+            "HOME": str(isolated_home),
+            "XDG_CONFIG_HOME": str(isolated_xdg),
+            "XDG_DATA_HOME": str(isolated_xdg / "data"),
+            "OPENCODE_BIN": "",
+        })
+        environ.start()
+        self.addCleanup(environ.stop)
+        # Preserve shutil.which's public signature because the resolver passes
+        # path= explicitly. No provider executable or user-local fallback exists.
+        _shutil.which = lambda name, *args, **kwargs: None
         try:
             self.assertEqual(rt.run_worker("some prompt"), "")
         finally:

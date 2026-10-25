@@ -102,6 +102,9 @@ launcher와 공용 `compute-hosts` operator launcher도 함께 설치합니다. 
 외부 PATH 파일과 symlink는 보존되며, 전체 uninstall만 소유한 공용 link를
 제거하고 부분 runtime uninstall은 이를 유지합니다.
 
+Inventory가 비어 있어도 Fleet는 이 기계의 읽기 전용 compute 관측을 보여 주며,
+원격 host와 detached run에는 계속 inventory 설정이 필요합니다.
+
 `hearting update`는 새 release를 staging에서 검증한 뒤 active pointer를
 전환하고 실패하면 이전 release로 rollback합니다. 이미 열린 agent session이
 자동으로 지침을 다시 읽는 것은 아니므로 update 뒤 `runtime status`에서

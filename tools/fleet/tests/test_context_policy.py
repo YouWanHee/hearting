@@ -78,6 +78,10 @@ class CodexStartupPolicyTest(unittest.TestCase):
                 "slug": "test-model", "effective_context_window_percent": 95,
                 "auto_compact_token_limit": None}]}))
         (self.home / "config.toml").write_text("model_auto_compact_token_limit = 100000\n")
+        # Leave a deterministic gap between fixture creation and the captured
+        # execution clock. Some filesystems otherwise round ctime to the same
+        # instant, making post-start edits appear to belong to startup.
+        time.sleep(0.01)
         self.start = time.time()
         _CODEX_EXECUTION_INPUTS.clear()
         self.addCleanup(_CODEX_EXECUTION_INPUTS.clear)
@@ -92,7 +96,11 @@ class CodexStartupPolicyTest(unittest.TestCase):
 
     def test_later_settings_change_does_not_change_a_captured_execution(self):
         self.assertEqual(self.policy()["applied_trigger_tokens"], 100000)
-        (self.home / "config.toml").write_text("model_auto_compact_token_limit = 50000\n")
+        config = self.home / "config.toml"
+        config.write_text("model_auto_compact_token_limit = 50000\n")
+        # The test filesystem clock can lag time.time(); use a known post-start
+        # mtime so a restarted observer must reject this changed input.
+        os.utime(config, (self.start + 1, self.start + 1))
         self.assertEqual(self.policy()["applied_trigger_tokens"], 100000)
         _CODEX_EXECUTION_INPUTS.clear()  # a restarted observer cannot recover the old value
         self.assertEqual(self.policy()["state"], "unknown")
@@ -121,12 +129,16 @@ class CodexStartupPolicyTest(unittest.TestCase):
 
     def test_private_attempt_can_fetch_its_own_catalogue_during_initialization(self):
         (self.home / "config.toml").write_text("")
+        # The private catalogue below is intentionally written after startup;
+        # keep its ctime unambiguously later than this execution's clock.
+        time.sleep(0.01)
         self.start = time.time()
         path = self.home / "models_cache.json"
         document = json.loads(path.read_text())
         document["models"][0]["auto_compact_token_limit"] = 42000
         path.write_text(json.dumps(document))
-        created = time.time()
+        os.utime(path, (self.start + 1, self.start + 1))
+        created = self.start + 2
         self.assertEqual(self.policy(attempt_id="att-private", private_runtime_home=True,
                                      execution_key="att-private", session_created_at=created)[
                                          "applied_trigger_tokens"], 42000)

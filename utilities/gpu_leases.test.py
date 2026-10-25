@@ -35,6 +35,11 @@ class LeasesTest(unittest.TestCase):
                              ("id", "/usr/bin/id"), ("sh", "/bin/sh"),
                              ("tr", "/usr/bin/tr"), ("env", "/usr/bin/env")):
             (self.no_tmux_bin / name).symlink_to(target)
+        tmux = next((Path(directory) / "tmux" for directory in os.get_exec_path()
+                     if (Path(directory) / "tmux").is_file()
+                     and os.access(Path(directory) / "tmux", os.X_OK)), None)
+        if tmux is not None:
+            (self.no_tmux_bin / "tmux").symlink_to(tmux)
 
     def acquire(self, **kwargs):
         return G.acquire(self.state, OBS, **kwargs)
@@ -692,6 +697,13 @@ class LeasesTest(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("_gpu_end_to_end_compute", Path(G.__file__).with_name("compute-hosts.py"))
         tool = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(tool)
+        tmux = self.no_tmux_bin / "tmux"
+        if not tmux.is_file():
+            tmux = None
+        if tmux is not None:
+            launch_server = G.tmux_server_name(self.state)
+            self.addCleanup(subprocess.run, [str(tmux), "-L", launch_server, "kill-server"],
+                            capture_output=True, timeout=5)
         finish = self.root / "finish"
         code = ("import os,time; from pathlib import Path; print(os.environ['CUDA_VISIBLE_DEVICES'],flush=True); "
                 "end=time.monotonic()+10; p=Path(%r); "

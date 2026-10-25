@@ -105,6 +105,9 @@ schedule GPU work, or dispatch remote agents. Foreign PATH files
 and symlinks are preserved; full uninstall removes only the owned shared link,
 while a partial runtime uninstall retains it.
 
+Fleet shows this machine's read-only compute observation even without inventory.
+Remote hosts and detached runs still need inventory configuration.
+
 `auto-update status` also reports the installed release, channel, and live
 scheduler health when Linux systemd-user or macOS LaunchAgent exposes it.
 Unavailable probes are reported as unknown; unsupported platforms are reported

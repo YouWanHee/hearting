@@ -641,6 +641,20 @@ class ComputeHostsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("not initialized", result.stderr)
 
+    def test_self_command_probes_local_without_loading_inventory(self):
+        module = load_module()
+        expected = {"host": "fixture-machine", "reachable": True, "gpus": [{"index": 0}]}
+        output = io.StringIO()
+        with mock.patch.object(module.socket, "gethostname", return_value="fixture-machine"), \
+                mock.patch.object(module, "load_config", side_effect=AssertionError("inventory read")), \
+                mock.patch.object(module, "probe_host", return_value=expected) as probe, \
+                mock.patch("sys.stdout", output):
+            self.assertEqual(module.main(["self", "--json"]), 0)
+        probe.assert_called_once_with("fixture-machine", {"ssh_host": "local"}, (), ())
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["hosts"][0]["host"], "fixture-machine")
+        self.assertTrue(payload["hosts"][0]["self"])
+
     def test_static_listing_reads_the_inventory(self):
         result = self.run_tool("list", "--static", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
