@@ -25,12 +25,19 @@ class RevisionPreviewTest(FIX.CompletionMarkerTest):
                 None if p.is_dir() else p.read_bytes())
                 for p in self.base.rglob('*') if p not in caches or p.is_symlink() or not p.is_file()}
 
-    def input_case(self, rounds=1):
+    def input_case(self, rounds=1, *, returned_content=False):
         route,node,output,owner = self.sd161_input_fixture()
-        evidence = output/'preview-plan.md';evidence.write_text('input A\n')
+        evidence = output/'preview-plan.md'
+        evidence.write_text('input B\n' if returned_content else 'input A\n')
         for i in range(1,rounds+1):
             attempt=f'att-preview-r{i}'
             self.review_blocking_row(attempt,i,directory=output)
+            self.sd161_bind_row(route,attempt,evidence)
+        if returned_content:
+            # A return to B must retain the B verdicts, unlike a first B input.
+            evidence.write_text('input A\n')
+            attempt='att-preview-intermediate'
+            self.review_blocking_row(attempt,rounds+1,directory=output)
             self.sd161_bind_row(route,attempt,evidence)
         evidence.write_text('input B\n')
         return route,node,evidence,owner,attempt
@@ -78,7 +85,17 @@ class RevisionPreviewTest(FIX.CompletionMarkerTest):
                 reviewed_evidence=str(evidence),record_auto_revisions=False)
             self.assertEqual(admission.auto_revisions,())
             self.assertEqual(admission.budget.state,'admit')
-            self.assertEqual(admission.budget.round_kind,'closure-check')
+            # The legacy raw-row cap+1 contract still holds. Content-aware
+            # admission also proves the changed B input starts its own budget.
+            rows=N.prior_round_attempts(self.jobs,route['route_id'],node['id'],route=route)
+            legacy=R.REVIEW_ROUND_CAP.round_budget(route,node,
+                [(cols[1],meta) for cols,meta in rows],
+                revisions=(preview['input_revision'],))
+            self.assertEqual(legacy.round_kind,'closure-check')
+            self.assertEqual(legacy.verdict_rounds,2)
+            self.assertEqual(legacy.state,'admit')
+            self.assertEqual(admission.budget.round_kind,'first')
+            self.assertEqual(admission.budget.verdict_rounds,0)
             self.assertEqual(admission.reviewed_input['path'],str(evidence))
             self.assertEqual(before,self.snapshot())
             written=R.publish_review_input_revision(route,node['id'],evidence,
@@ -90,7 +107,7 @@ class RevisionPreviewTest(FIX.CompletionMarkerTest):
             self.assertEqual(admission.budget,started.budget)
 
     def test_preview_self_input_third_verdict_cannot_authorize_fourth(self):
-        route,node,evidence,owner,attempt=self.input_case(rounds=3)
+        route,node,evidence,owner,attempt=self.input_case(rounds=3,returned_content=True)
         with mock.patch.dict(os.environ,self.base_env(),clear=True):
             before=self.snapshot()
             admission=N.admit_round(route,node,self.jobs,owner_attempt_id=owner,

@@ -27,6 +27,7 @@ EXPECTED = Counter({
     "test_mixed_one_sided_supersession_through_public_batch": 1,
     "test_one_sided_revision_uses_canonical_writer_and_reader": 1,
     "test_terminal_no_start_reuses_group_start_for_the_exact_gap": 1,
+    "test_current_owner_closure_peer_precedes_round_admission": 1,
 })
 
 
@@ -49,9 +50,11 @@ class ReviewBatchRevisionCollectionTest(unittest.TestCase):
             suite = unittest.defaultTestLoader.loadTestsFromModule(module)
             observed.update(test._testMethodName for test in _flatten(suite))
         self.assertEqual(observed, EXPECTED)
-        from review_batch_revision_fixture import RevisionBatchFixture, AdmissionSelectionFixture
+        from review_batch_revision_fixture import (RevisionBatchFixture, AdmissionSelectionFixture,
+                                                   CurrentDesignPeerSelectionTest)
         self.assertEqual(unittest.defaultTestLoader.getTestCaseNames(RevisionBatchFixture), [])
         self.assertEqual(unittest.defaultTestLoader.getTestCaseNames(AdmissionSelectionFixture), [])
+        self.assertEqual(unittest.defaultTestLoader.getTestCaseNames(CurrentDesignPeerSelectionTest), [])
 
 
 if __name__ == "__main__":
