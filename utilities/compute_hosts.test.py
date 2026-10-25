@@ -4,6 +4,7 @@ The local host mode runs everything in-process, so the whole lifecycle —
 launch, log, exit code, listing — is exercised without a network.
 """
 
+import contextlib
 import importlib.util
 import io
 import datetime
@@ -2018,6 +2019,60 @@ class ComputeHostsTest(unittest.TestCase):
         self.assertEqual(
             (run_dir / "stop_reason").read_text(encoding="utf-8").strip(),
             "stopped")
+
+    def test_unconfirmed_launches_are_unknown_without_repairing_history(self):
+        module = load_module()
+        config = {"run_root": self.run_root}
+        run_ids = ("xavier-20261024-193701-ami-tf-a1-historical-parity",
+                   "xavier-20261024-191238-ami-leg2-e1-recovery",
+                   "just-created")
+        for run_id in run_ids:
+            run_dir = self.run_root / run_id
+            run_dir.mkdir(parents=True)
+            if run_id != "just-created":
+                os.utime(run_dir, (1, 1))
+            self.assertEqual(module._run_state(config, run_id)["state"], "unknown")
+        # Listing never probes a host or fabricates an exit for an unconfirmed
+        # launch. The ordinary CLI corrects both old and newly created records.
+        with mock.patch.object(module, "load_config", return_value=config), \
+             mock.patch.object(module, "_tmux_session_alive") as probe, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(module.cmd_runs(SimpleNamespace(limit=10, host=None, json=True)), 0)
+        probe.assert_not_called()
+        rows = json.loads(output.getvalue())
+        self.assertEqual({row["run_id"] for row in rows}, set(run_ids))
+        self.assertTrue(all(row["state"] == "unknown" and row["exit_code"] is None
+                            and not row["stale"] for row in rows))
+        listed = self.run_tool("runs")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(listed.stdout.count("unknown"), 3)
+        self.assertNotIn("running", listed.stdout)
+        for run_id in run_ids:
+            self.assertEqual(list((self.run_root / run_id).iterdir()), [])
+
+    def test_unconfirmed_launch_observes_metadata_or_exit_when_they_arrive(self):
+        module = load_module()
+        config = {"run_root": self.run_root}
+        run_dir = self.run_root / "launch-in-progress"
+        run_dir.mkdir(parents=True)
+        self.assertEqual(module._run_state(config, run_dir.name)["state"], "unknown")
+        receipt = {"schema_version": 1, "run_id": run_dir.name,
+                   "identity": {"pid": 1234, "starttime": "fixture-start"}}
+        (run_dir / "launch-receipt.json").write_text(json.dumps(receipt))
+        observed = module._run_state(config, run_dir.name)
+        self.assertEqual(observed["state"], "unknown")
+        self.assertEqual(observed["launch_receipt"], receipt)
+        # The payload can finish even before the launcher records metadata.
+        (run_dir / "exit_code").write_text("0\n")
+        self.assertEqual(module._run_state(config, run_dir.name)["state"], "finished")
+        (run_dir / "exit_code").unlink()
+        (run_dir / "meta.json").write_text(json.dumps({
+            "host": "here", "command": ["sleep", "30"],
+            "tmux_transport": {"kind": "nohup-v1"}}))
+        self.assertEqual(module._run_state(config, run_dir.name)["state"], "running")
+        listed = self.run_tool("runs", "--json")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(json.loads(listed.stdout)[0]["state"], "running")
 
     def test_runs_stays_running_when_session_state_is_unknown(self):
         module = load_module()
