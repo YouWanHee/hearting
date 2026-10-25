@@ -2853,7 +2853,9 @@ def require_batch_reservation(
     Canonical digest checks compare the stored manifest to its stored digest.
     """
     import hashlib
-    from replica_batch_contract import DIGEST, ReplicaBatchContractError, verify_manifest
+    from replica_batch_contract import (
+        DIGEST, ReplicaBatchContractError, verify_manifest, verify_peer_proof,
+    )
     if expected is None:
         if payload.get("reservation_kind") in {"replica-batch", "parallel-batch"}:
             raise _contract_error(
@@ -2986,10 +2988,6 @@ def require_batch_reservation(
             else []
         )
         expected_peers = sorted(str(member.get("attempt_id", "")) for member in peer_members)
-        proof_keys = {
-            "agent_home", "attempt_id", "jobs", "manifest_sha256",
-            "reason", "route", "state",
-        }
         proofs = payload.get("batch_peer_set")
         if payload.get("batch_peer_count") != len(expected_peers):
             mismatches["batch_peer_count"] = (len(expected_peers), payload.get("batch_peer_count"))
@@ -2999,20 +2997,15 @@ def require_batch_reservation(
             actual_peers=[]
             for index, proof in enumerate(proofs):
                 label=f"batch_peer_set[{index}]"
-                if not isinstance(proof, dict) or set(proof) != proof_keys:
-                    mismatches[label] = ("canonical peer proof", proof)
+                try:
+                    verify_peer_proof(proof, parallel_group=str(
+                        verified.get("parallel_group") or verified.get("replica_group") or ""))
+                except ReplicaBatchContractError as exc:
+                    mismatches[label] = (f"canonical peer proof ({exc})", proof)
                     continue
                 actual_peers.append(str(proof.get("attempt_id", "")))
                 if proof.get("manifest_sha256") != manifest_digest:
                     mismatches[f"{label}.manifest_sha256"] = (manifest_digest, proof.get("manifest_sha256"))
-                if proof.get("state") not in {"active", "completed"}:
-                    mismatches[f"{label}.state"] = ("active|completed", proof.get("state"))
-                for key in ("agent_home", "jobs", "route"):
-                    value=proof.get(key)
-                    if not isinstance(value,str) or not Path(value).is_absolute():
-                        mismatches[f"{label}.{key}"] = ("absolute path", value)
-                if not isinstance(proof.get("reason"),str) or not proof.get("reason"):
-                    mismatches[f"{label}.reason"] = ("non-empty observation reason", proof.get("reason"))
             if actual_peers != expected_peers:
                 mismatches["batch_peer_set.attempts"] = (expected_peers, actual_peers)
             encoded=json.dumps(proofs,separators=(",",":"),sort_keys=True).encode("utf-8")
