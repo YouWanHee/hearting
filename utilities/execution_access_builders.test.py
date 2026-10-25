@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import hashlib
 import importlib.util
 import json
 import os
@@ -19,6 +20,7 @@ from execution_access import (
     AccessContext,
     ExecutionAccessError,
     ParentGrant,
+    adapter_default_roots,
     bind_request,
     build_grant,
     load_request,
@@ -221,6 +223,48 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         )
         self.assertIn(f"--writable-root {self.scoped}", command)
         self.assertNotIn("--add-dir", command)
+
+    def test_runtime_directory_appears_in_each_adapter_write_projection(self) -> None:
+        digest = hashlib.sha256(str(self.artifact.resolve()).encode("utf-8")).hexdigest()
+        runtime = self.state / "project-runtimes" / digest
+        runtime.mkdir(parents=True)
+        prompt, log = self.root / "prompt.txt", self.root / "launch.log"
+        for delivery in ("one-shot", "session-resume-supervised"):
+            args = self.claude_args(delivery)
+            args.runtime_dir = str(runtime)
+            with mock.patch.dict(os.environ, self.env, clear=True):
+                command = shlex.split(self.claude.shell_command(args, prompt, log))
+            self.assertIn(("--add-dir", str(runtime)), list(zip(command, command[1:])))
+        for delivery, transport, flag in (
+            ("one-shot", "raw-exec", "--add-dir"),
+            ("app-server-supervised", "raw-exec", "--writable-root"),
+            ("one-shot", "app-server-one-turn", "--writable-root"),
+        ):
+            args = self.codex_args(delivery)
+            args.runtime_dir = str(runtime)
+            args.resolved_stage_telemetry_transport = transport
+            with mock.patch.dict(os.environ, self.env, clear=True):
+                command = shlex.split(self.codex.shell_command(args, prompt, log))
+            self.assertIn((flag, str(runtime)), list(zip(command, command[1:])))
+        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": "{}"}, clear=True):
+            config_builds = (
+                self.opencode.scoped_external_directory_config(
+                    str(self.artifact), execution_access_roots=(runtime,),
+                    agent_home=self.agent_home, worktree=str(self.worktree), selected_agent="build"),
+                self.opencode.scoped_external_directory_config(
+                    str(self.artifact), execution_access_roots=(runtime, self.scoped),
+                    agent_home=self.agent_home, worktree=str(self.worktree), selected_agent="build"),
+            )
+        for raw in config_builds:
+            config = json.loads(raw)
+            self.assertEqual("allow", config["permission"]["external_directory"][str(runtime)])
+            self.assertNotIn(str(self.state), config["permission"]["external_directory"])
+
+        defaults = adapter_default_roots(argparse.Namespace(
+            worktree=str(self.worktree), artifact_root=str(self.artifact),
+            report_bundle_root=None, runtime_dir=str(runtime)))
+        self.assertIn(runtime.resolve(), defaults)
+        self.assertNotIn(self.state.resolve(), defaults)
 
     def test_lab_inventory_and_explicit_data_reach_both_codex_execution_builders(self) -> None:
         run_root = self.root / "inventory-runs"

@@ -862,6 +862,11 @@ class ResourceJob:
     command: Optional[list] = None  # registry argv, display only; never ownership proof
     process_group: Optional[int] = None
     pid_namespace: Optional[str] = None
+    # Recorded attribution for a composed remote compute execution. Displaying
+    # this receipt does not authorize a fresh remote observation.
+    execution: Optional[dict] = None
+    compute_host: Optional[str] = None
+    compute_run_id: Optional[str] = None
     registry_status: Optional[str] = None
     registry_path: Optional[str] = None
     log_path: Optional[str] = None
@@ -894,9 +899,8 @@ class ResourceJob:
     state_evidence: Optional[dict] = None
     # The registry scanner emits these; a field it produces and this class does
     # not accept raises TypeError inside the collector's per-row try, so the row
-    # is dropped into diagnostics nobody reads and Fleet shows *no* resource
-    # runs at all. Five such fields had accumulated (2026-09-10).
-    # `resource_runs.test.py` now pins the two key sets together.
+    # is dropped into diagnostics nobody reads and Fleet can show no resource
+    # runs at all. A producer/consumer key-set test pins this boundary.
     artifact_root: Optional[str] = None
     route_file: Optional[str] = None
     route_hash: Optional[str] = None

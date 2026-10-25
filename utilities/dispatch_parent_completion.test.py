@@ -243,6 +243,10 @@ class ParentDeliveryContract(unittest.TestCase):
                 stack.enter_context(mock.patch.object(wrapper.shutil, "which", return_value="/bin/runtime"))
                 if child == "opencode":
                     from fixtures.opencode_native_context import launch_context
+                    # This carrier-ordering fixture replaces the CLI, not the
+                    # independently tested private version-probe protocol.
+                    stack.enter_context(mock.patch.object(wrapper.opencode_runtime,
+                        "probe_launch_version", return_value=(1, 19, 0)))
                     stack.enter_context(mock.patch.object(wrapper.opencode_context,
                         "prepare_launch_context", side_effect=launch_context))
                 stack.enter_context(mock.patch.object(wrapper, "shell_command", return_value="true"))
