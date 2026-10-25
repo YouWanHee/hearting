@@ -78,7 +78,8 @@ DELIVERABLE_EXEMPLARS = {
     "code-report": ((), ("final_report.md", "plans/*/final_report.md", "plans/final_report.md")),
     "research-report": (("report/*.html", "research/*/report/*.html"),
                         ("report/*.md", "research/*/report/*.md")),
-    "design-handoff": (("designs/*/05_handoff/*.html",), ("designs/*/05_handoff/*.md",)),
+    "design-handoff": (("designs/05_handoff/*.html", "designs/*/05_handoff/*.html"),
+                       ("designs/05_handoff/*.md", "designs/*/05_handoff/*.md")),
     "draft-finalize": (("documents/*/*.html",), ("documents/*/*.md",)),
     "audit-report": ((), ("reviews/audit-report.md",)),
 }

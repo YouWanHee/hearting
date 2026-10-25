@@ -139,6 +139,47 @@ class FeedUnitTests(unittest.TestCase):
                 ],
             )
 
+    def test_flat_and_literal_design_payloads_have_one_feed_cycle_each(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary), all_d23=True)
+            campaign_id = "camp_" + "1" * 32
+            cycle_id = "cyc_" + "2" * 32
+            old_cycle_id = "cyc_" + "3" * 32
+            campaign = root / "campaigns" / "2026-10-25_design-fixture"
+            campaign.mkdir(parents=True)
+            (campaign / "campaign.json").write_text(json.dumps({
+                "campaign_id": campaign_id, "title": "design fixture",
+                "cycles": [cycle_id, old_cycle_id],
+            }), encoding="utf-8")
+            cycle_dir = campaign / "cycles" / "2026-10-25_flat"
+            old_cycle_dir = campaign / "cycles" / "2026-10-25_legacy"
+            for directory, cid in ((cycle_dir, cycle_id), (old_cycle_dir, old_cycle_id)):
+                (directory / "artifacts").mkdir(parents=True)
+                (directory / "manifest.json").write_text(json.dumps({
+                    "cycle": {"campaign_id": campaign_id, "cycle_id": cid},
+                }), encoding="utf-8")
+            flat = cycle_dir / "artifacts" / "designs"
+            for anchor in ("01_refs", "02_tokens", "03_components", "04_review", "05_handoff"):
+                (flat / anchor).mkdir(parents=True, exist_ok=True)
+            (flat / "05_handoff" / "final_report.md").write_text("flat handoff", encoding="utf-8")
+            legacy = old_cycle_dir / "artifacts" / "designs" / "<cycle>"
+            (legacy / "05_handoff").mkdir(parents=True)
+            (legacy / "05_handoff" / "final_report.md").write_text("legacy handoff", encoding="utf-8")
+
+            found = [cycle for cycle in feed.d23_cycles(root, "all-d23") if cycle.bucket == "designs"]
+            self.assertEqual({cycle.locator for cycle in found}, {
+                feed._locator(root, flat, directory=True),
+                feed._locator(root, legacy, directory=True),
+            })
+            self.assertEqual(len(found), 2)
+            for cycle in found:
+                self.assertEqual([path.name for path in feed._candidate_files(cycle)], ["final_report.md"])
+            inventory, _digest = feed._inventory(root, "all-d23")
+            for cycle in found:
+                selected = feed._cycle_inventory_rows(root, inventory, cycle)
+                self.assertTrue(any(row["locator"].endswith("05_handoff/final_report.md")
+                                    for row in selected))
+
     def test_exact_d25_pattern_precedence_and_a114_metrics(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = fixture_root(Path(temporary))

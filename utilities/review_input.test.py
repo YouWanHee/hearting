@@ -58,6 +58,14 @@ class ReviewInputTest(unittest.TestCase):
         self.meta[R.KEY] = R.seal_binding(self.jobs, self.meta, candidate, **kwargs)
         return candidate
 
+    def test_plan_check_group_variants_share_the_exact_review_input_resolver(self):
+        variant = {**self.node, 'id': 'plan-check-simplicity',
+                   'unit': 'qa/simplicity-check', 'completion_gate': 'code-plan-check'}
+        self.assertTrue(R.is_plan_review_node(variant))
+        self.assertTrue(R.is_review_node(variant))
+        self.assertEqual(R.resolve_input(self.route, variant, self.jobs, self.evidence)['sha256'],
+                         hashlib.sha256(b'original plan').hexdigest())
+
     def args(self, **updates):
         return SimpleNamespace(**(dict(self.meta, jobs_path=self.jobs,
                                reviewed_evidence=str(self.evidence), automatic_retry_of=None) | updates))
@@ -336,7 +344,10 @@ class ReviewInputTest(unittest.TestCase):
             fresh = node_module.admit_round(self.route, self.node, self.jobs, reviewed_evidence=corrected)
         self.assertEqual(stale.budget.state, 'exhausted')
         self.assertEqual(fresh.budget.state, 'admit')
-        self.assertEqual(fresh.budget.round_kind, 'closure-check')
+        # B is a different content subject with its own first independent
+        # budget. The former input-revision closure permission remains for
+        # that input family but cannot relabel a new content review.
+        self.assertEqual(fresh.budget.round_kind, 'first')
         # Between route admission and wrapper registration, B itself changes.
         # The atomic fence must not accept the new bytes against B's old record.
         corrected.write_text('unapproved bytes C')

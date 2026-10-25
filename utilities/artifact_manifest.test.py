@@ -405,6 +405,22 @@ class TestLocatorSafety(unittest.TestCase):
         self.assertIn("locator-invalid-component",
                       _codes(m.validate_locator_path("notes/A unified beamformer.md")))
 
+    def test_only_exact_historical_design_cycle_locator_is_accepted(self):
+        allowed = "artifacts/designs/<cycle>/02_tokens/tokens.json"
+        self.assertTrue(m.validate_locator_path(allowed).ok)
+        document = self._with_path(allowed)
+        self.assertTrue(m.validate(document).ok)
+        for path in (
+            "artifacts/designs/<cycle>",
+            "artifacts/designs/<cycle>-alternative/02_tokens/tokens.json",
+            "artifacts/designs/<token>/02_tokens/tokens.json",
+            "artifacts/other/<cycle>/tokens.json",
+            "designs/<cycle>/02_tokens/tokens.json",
+            "artifacts/designs/prefix<cycle>/tokens.json",
+        ):
+            with self.subTest(path=path):
+                self.assertIn("locator-invalid-component", _codes(m.validate_locator_path(path)))
+
     def test_rejects_reserved_manifest_filename_locator(self):
         self.assertIn("locator-reserved-name", _codes(m.validate_locators(self._with_path("manifest.json"))))
 
@@ -534,6 +550,11 @@ SHARED_PATH_CORPUS = (
     ("locator", "artifacts/_internal/candidate/round_1/manifest.json", "regular", False, True, None, {}),
     ("locator", "artifacts/_internal/candidate/round_2/manifest.json", "regular", False, True, None, {}),
     ("locator", "artifacts/.cache/manifest.json", "regular", False, True, None, {}),
+    ("locator", "artifacts/designs/<cycle>/02_tokens/tokens.json", "regular", False, True, None, {}),
+    ("locator", "artifacts/designs/<cycle>/03_components/reference.html", "regular", False, True, None, {}),
+    ("locator", "artifacts/designs/<cycle>-alternative/02_tokens/tokens.json", "regular", False, False, "locator-invalid-component", {"producer": "locator-invalid-component"}),
+    ("locator", "artifacts/designs/<token>/02_tokens/tokens.json", "regular", False, False, "locator-invalid-component", {"producer": "locator-invalid-component"}),
+    ("locator", "artifacts/other/<cycle>/tokens.json", "regular", False, False, "locator-invalid-component", {"producer": "locator-invalid-component"}),
     ("locator", ".runtime/spoof.json", "regular", False, False, "locator-hidden-component", {"producer": "file-outside-artifacts"}),
     ("locator", "campaigns/camp/.hidden", "regular", False, False, "locator-hidden-component", {"producer": "file-outside-artifacts"}),
     ("locator", "artifacts/../escape", "regular", False, False, "locator-dot-segment", {"producer": "file-outside-artifacts"}),

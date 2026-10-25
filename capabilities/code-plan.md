@@ -31,6 +31,11 @@ supplies this binding automatically in the full graph. The runtime binds the
 input to the attempt before execution; prompt text is not input authority.
 Corrections use SD-161 input revisions when there is no producer marker, keeping
 review admission separate from PASS and retaining the cap+1 verdict ceiling.
+The content budget follows the exact resolved input bytes and any additional
+sealed files the review consumes; producer identity, path placement, and marker
+sequence alone do not grant another review budget. The node-lineage round number
+remains unchanged, and an earlier PASS does not become current when content
+returns to an old digest.
 
 ## Slices Block
 
