@@ -76,6 +76,11 @@ class PendingDeliveryCountsTest(unittest.TestCase):
         self.state_root.mkdir(parents=True, exist_ok=True)
         self.jobs_path = self.state_root / "jobs.log"
         self.jobs_path.write_text("", encoding="utf-8")
+        # The original four-case probe reuses this fixture too. Keep its
+        # lineage within the tree covered by the read-only bytes/mtime check.
+        state_env = mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")})
+        state_env.start()
+        self.addCleanup(state_env.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
