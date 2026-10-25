@@ -457,6 +457,82 @@ class MetricSourcesTest(unittest.TestCase):
         self.assertTrue(all(sample["state"] == "unknown" for sample in result["samples"]))
         self.assertEqual(result["latest"]["state"], "unknown")
 
+    def test_admission_reader_observes_196_separate_decisions_across_bounded_pages(self):
+        root = self.root / "196-separate-admission-files"
+        bundle = root / "one-bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "run-record.json").write_text(json.dumps({
+            "run_id": "run-196", "started_at": 1, "row_id": "row-196"}))
+        for index in range(196):
+            admitted = index < 4
+            (bundle / f"admission-{index:03d}.json").write_text(json.dumps({
+                "row_id": "row-196",
+                "admitted": admitted,
+                "snapshot": {"t": 100 + index},
+                "reasons": ([] if admitted else ["evaluation GPU capacity is occupied"]),
+                "preceding_evaluation_leases": ([] if admitted else [{
+                    "task": "evaluation", "host": "gpu-node-a", "gpu": 0,
+                    "owner": "evaluation-queue-17"}]),
+            }))
+
+        input_bytes = sum(path.stat().st_size for path in bundle.iterdir())
+        self.assertLess(input_bytes, metrics.MAX_ADMISSION_PENDING_BYTES)
+
+        def assert_complete_observation(result):
+            self.assertEqual(result["coverage"], "observed")
+            self.assertNotIn("admission-binding-summary-limit", result["warnings"])
+            self.assertEqual(len(result["samples"]), 196)
+            denied = [sample for sample in result["samples"]
+                      if sample["state"] == "denied"]
+            admitted = [sample for sample in result["samples"]
+                        if sample["state"] == "admitted"]
+            self.assertEqual((len(denied), len(admitted)), (192, 4))
+            self.assertEqual(len(denied) / len(result["samples"]), 192 / 196)
+            latest = result["latest"]
+            self.assertEqual((latest["state"], latest["at"]), ("denied", 295.0))
+            self.assertEqual(latest["reasons"], ["evaluation GPU capacity is occupied"])
+            self.assertEqual(latest["priority_blockers"], [{
+                "task": "evaluation", "host": "gpu-node-a", "gpu": 0,
+                "owner": "evaluation-queue-17"}])
+            for key in ("progress", "rate", "eta", "eta_seconds",
+                        "wait_duration_seconds", "wait_seconds", "time_ratio"):
+                self.assertNotIn(key, result)
+            for sample in result["samples"]:
+                for key in ("progress", "rate", "eta", "eta_seconds",
+                            "wait_duration_seconds", "wait_seconds", "time_ratio"):
+                    self.assertNotIn(key, sample)
+
+        default = metrics.read_admission_sources([root], run_id="run-196",
+            row_key="row-196", started_at=1, now=400)
+        self.assertEqual(default["bytes"], input_bytes)
+        self.assertLessEqual(default["bytes"], metrics.MAX_ADMISSION_BYTES_PER_PASS)
+        assert_complete_observation(default)
+
+        cursor = None
+        paged = None
+        saw_partial_page = False
+        page_byte_limit = 12 * 1024
+        with mock.patch.object(metrics, "MAX_ADMISSION_BYTES_PER_PASS", page_byte_limit):
+            for _ in range(12):
+                paged = metrics.read_admission_sources([root], run_id="run-196",
+                    row_key="row-196", started_at=1, now=400, cursor=cursor)
+                self.assertLessEqual(paged["bytes"], page_byte_limit)
+                scan_state = paged["cursor"]["scan"][str(root)]
+                binding_state = scan_state.get("binding_state")
+                if binding_state is not None:
+                    summary_bytes = len(json.dumps(binding_state, sort_keys=True,
+                        separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+                    self.assertLessEqual(summary_bytes, metrics.MAX_ADMISSION_PENDING_BYTES)
+                    self.assertLessEqual(len(binding_state["source_files"]),
+                                         metrics.MAX_ADMISSION_SOURCE_FINGERPRINTS)
+                if paged["coverage"] == "observed":
+                    break
+                self.assertEqual(paged["coverage"], "partial")
+                saw_partial_page = True
+                cursor = paged["cursor"]
+        self.assertTrue(saw_partial_page)
+        assert_complete_observation(paged)
+
     def test_admission_oversized_root_and_child_lists_stop_without_rescanning_prefix(self):
         original_scandir = os.scandir
 

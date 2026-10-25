@@ -29,6 +29,10 @@ MAX_ADMISSION_SAMPLE_IDS = 4096
 MAX_ADMISSION_CACHED_ENTRIES = 8192
 MAX_ADMISSION_SOURCE_FILES = 128
 MAX_ADMISSION_PENDING_DECISIONS = 256
+# A cross-page fingerprint inventory can include one file per pending decision
+# plus the separately bounded run-binding source files.
+MAX_ADMISSION_SOURCE_FINGERPRINTS = (MAX_ADMISSION_SOURCE_FILES
+                                    + MAX_ADMISSION_PENDING_DECISIONS)
 MAX_ADMISSION_PENDING_BYTES = 128 * 1024
 _EPOCH_FILE = re.compile(r"^(valid|train)-epoch-(\d{4,})\.json$")
 _VALID_NUMBER = (int, float)
@@ -958,7 +962,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                 overflow_binding_summary(state)
                 return
             if file_name not in state["source_files"] \
-                    and len(state["source_files"]) >= MAX_ADMISSION_SOURCE_FILES:
+                    and len(state["source_files"]) >= MAX_ADMISSION_SOURCE_FINGERPRINTS:
                 if previous_binding is None:
                     state["binding_sources"].pop(file_name, None)
                 else:
@@ -981,7 +985,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
         decisions = _admission_decisions([document])
         if decisions:
             if file_name not in state["source_files"] \
-                    and len(state["source_files"]) >= MAX_ADMISSION_SOURCE_FILES:
+                    and len(state["source_files"]) >= MAX_ADMISSION_SOURCE_FINGERPRINTS:
                 overflow_binding_summary(state)
                 return
             previous_source = state["source_files"].get(file_name)
