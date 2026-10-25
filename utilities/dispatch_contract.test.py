@@ -2428,18 +2428,35 @@ class DispatchContractTest(unittest.TestCase):
  def test_pre_release_wait_yields_registry_writer_for_all_harnesses(self):
   for harness in ("claude", "codex", "opencode"):
    with self.subTest(harness=harness), tempfile.TemporaryDirectory() as td:
-    base=Path(td);jobs=base/"jobs.log";marker=base/"payload-started"
+    base=Path(td);jobs=base/"jobs.log";marker=base/"payload-started";ready=base/"launcher-ready"
     attempt=f"att-summary-{harness}"
     row=(f"2026-07-23T00:00:01Z\topen\t/repo\t/wt\tchild\t{CURRENT},"
          f"harness={harness},attempt_id={attempt}")
     self.assertTrue(D.claim_attempt_row(jobs,attempt,row,launch=False))
     writer_progress=[]
     def spawn(gate_fd):
-     return subprocess.Popen(
-      [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
-       "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
-       sys.executable,"-c",f"from pathlib import Path; import time; Path({str(marker)!r}).write_text('yes'); time.sleep(10)"],
-      pass_fds=(gate_fd,),start_new_session=True)
+     # Finish the real launch-fence imports before starting the protocol clock.
+     # It then publishes readiness and waits at the same release gate as a
+     # production launch. A bounded handshake keeps interpreter startup out of
+     # the one-second writer-release assertion below.
+     argv=["--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
+           "/bin/sh","-c",f"printf yes > {__import__('shlex').quote(str(marker))}; exec sleep 10"]
+     fence_path=str(Path(__file__).with_name("launch-fence.py"))
+     bootstrap=("import importlib.util as u; from pathlib import Path; p="+
+                repr(fence_path)+"; s=u.spec_from_file_location('fence_fixture',p); "+
+                "m=u.module_from_spec(s); s.loader.exec_module(m); Path("+
+                repr(str(ready))+").touch(); raise SystemExit(m.cli("+
+                repr(argv)+"))")
+     proc=subprocess.Popen([sys.executable,"-c",bootstrap],pass_fds=(gate_fd,),
+                           start_new_session=True)
+     ready_by=time.monotonic()+10
+     while not ready.exists() and proc.poll() is None and time.monotonic()<ready_by:
+      time.sleep(0.01)
+     if not ready.exists():
+      proc.kill()
+      proc.wait(timeout=5)
+      raise AssertionError("launch-fence child did not become ready before bounded startup deadline")
+     return proc
     def attach(_identity):
      self.assertFalse(marker.exists())
      with Path(f"{jobs}.lock").open("a") as contender:

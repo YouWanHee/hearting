@@ -191,6 +191,40 @@ class WrapperCommonTest(unittest.TestCase):
         self.assertEqual(args.model_profile, "top")
         self.assertEqual(receipt["model_diversity"], "rotated")
 
+    def test_frame_pair_uses_inherited_custom_registry_without_explicit_jobs(self):
+        from model_config import resolve_config
+        from model_profile import resolve_profile_demand, resolve_profile_values
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            config, _ = resolve_config("codex", source_root=ROOT)
+            top_model = resolve_profile_values("codex", config, "top")["model"]
+            route = {"route_id": "rt-inherited-frame", "route_hash": "sha256:inherited-frame",
+                     "profile_selection_contract_version": 1,
+                     "nodes": [{"id": name, "worker_type": "frame", "model_profile": "top",
+                                "profile_demand": None,
+                                "profile_selection": resolve_profile_demand(None, explicit_profile="top")}
+                               for name in ("frame", "frame-alternative")]}
+            route_path = base / "route.json"
+            route_path.write_text(json.dumps(route))
+            jobs = base / "custom" / "jobs.log"
+            jobs.parent.mkdir()
+            jobs.write_text("now\trunning\t/repo\t/tree\tframe\t"
+                f"route_id={route['route_id']},route_hash={route['route_hash']},route_node=frame,"
+                f"worker_type=frame,harness=codex,model={top_model},attempt_id=att-first\n")
+            args = argparse.Namespace(
+                model_profile="top", pair_model_profile="deep", route_file=str(route_path),
+                owner_route_binding=None, route_node="frame-alternative", worker_type="frame",
+                action="start", artifact_root=str(base), agent_home=str(ROOT), jobs=None, model=None,
+                registered_worker=1, dispatch_depth=1, inherit_model_settings=False,
+                model_role="frame", effort=None, variant=None, capacity_retry=0,
+            )
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}), \
+                 mock.patch("dispatch_capacity_evidence.usage_states", return_value={"codex": "ok"}):
+                context = C.prepare_pair_model_rotation(args, harness="codex")
+        self.assertEqual(context["status"], "rotated", context)
+        self.assertEqual(context["sibling_model"], top_model)
+        self.assertNotEqual(context["profile"], "top")
+
     def test_opencode_frame_pair_skips_collapsed_profiles_and_receipts_balanced_rotation(self):
         from model_config import resolve_config
         from model_profile import resolve_profile_demand, resolve_profile_values, selection_receipt
