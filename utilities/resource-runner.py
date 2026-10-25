@@ -1171,7 +1171,16 @@ def start_observer(registry, args, route, route_file, command):
     import dispatch_resource_wait as OWNER_RESOURCE
     from dispatch_resource_wait import resource_evidence_paths_conflict
     sup = OWNER_RESOURCE.supervisor()
-    jobs = args.jobs or os.environ.get("AGENT_DISPATCH_JOBS")
+    snapshot = json.loads(Path(registry).read_text())
+    recorded_jobs = {row['jobs'] for row in snapshot.get('runs', {}).values()
+                     if row.get('route') == str(route_file) and row.get('node') == args.node
+                     and row.get('jobs')}
+    inherited_jobs = os.environ.get('AGENT_DISPATCH_JOBS')
+    jobs = args.jobs or inherited_jobs or (next(iter(recorded_jobs)) if len(recorded_jobs) == 1 else None)
+    selected = Path(jobs).resolve() if jobs else None
+    if ((inherited_jobs and selected != Path(inherited_jobs).resolve())
+            or any(selected != Path(value).resolve() for value in recorded_jobs)):
+        fail('resource-dispatch-jobs-conflict')
     ledger = sup.ledger_for(route, jobs)
     log = Path(args.log).resolve()
     observer = {"run_id": args.run_id, "route": str(route_file), "node": args.node,
@@ -1199,6 +1208,8 @@ def start_observer(registry, args, route, route_file, command):
             if len(primaries) != 1:
                 raise ValueError("resource-observer-requires-live-resource")
             primary = primaries[0]
+            if primary.get('jobs') and Path(primary['jobs']).resolve() != selected:
+                raise ValueError('resource-dispatch-jobs-conflict')
             for row in rows.values():
                 if resource_evidence_paths_conflict(row, observer):
                     raise ValueError("resource-route-body-conflict")

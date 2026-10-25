@@ -53,7 +53,7 @@ class ObserverTest(FIX.WorkflowFixture):
 
     def start_side(self, registry, route, path, jobs, command, *, run_id='score', log=None):
         args = SimpleNamespace(run_id=run_id, route=str(path), node='full-run', cwd=str(self.base),
-                               log=str(log or (self.base / (run_id + '.log'))), jobs=str(jobs))
+                               log=str(log or (self.base / (run_id + '.log'))), jobs=str(jobs) if jobs else None)
         spawn = subprocess.Popen
         def launch(*a, **kw):
             proc = spawn(*a, **kw)
@@ -96,7 +96,8 @@ class ObserverTest(FIX.WorkflowFixture):
                 ledger = SUP.ledger_for(route, jobs)
                 armed_before = SUP.read_armed(ledger)
                 journal_before = ledger.journal_path.read_bytes()
-                side = self.start_side(registry, route, path, jobs, ['/bin/sh', '-c', f'exit {code}'])
+                side = self.start_side(registry, route, path, None, ['/bin/sh', '-c', f'exit {code}'])
+                self.assertEqual(side['jobs'], str(jobs))
                 self.assertEqual(side['observer_of'], 'fixture-run')
                 self.assertEqual(side['node'], primary['node'])
                 self.assertNotEqual(side['sentinel'], primary['sentinel'])
@@ -119,8 +120,17 @@ class ObserverTest(FIX.WorkflowFixture):
                 def receive(h, s, **kw):
                     notices.append((h, s, kw))
                     return {'status': 'accepted'}
-                with mock.patch.object(session_notice, 'notify', side_effect=receive):
-                    SUP.RR.observe_run_if_due(side['run_id'], ended, registry, interval_seconds=0)
+                observe = SUP.RR.observe_run_if_due
+                calls = []
+                def transient(*a, **kw):
+                    calls.append(True)
+                    if len(calls) == 1:
+                        raise OSError('transient observation failure')
+                    return observe(*a, **kw)
+                with mock.patch.object(session_notice, 'notify', side_effect=receive), \
+                     mock.patch.object(SUP.RR, 'observe_run_if_due', side_effect=transient):
+                    OBS.watch_resource(registry, side['run_id'], sleep=lambda _: None)
+                self.assertEqual(len(calls), 2)
                 self.assertEqual({(h, s) for h, s, _ in notices}, {(harness, 'owner'), (harness, 'supervisor')})
                 self.assertIn(f'exit={code}', ' '.join(n['text'] for _, _, n in notices))
                 record = progress.read_public_run_record(route['artifact_root'], side['run_id'])

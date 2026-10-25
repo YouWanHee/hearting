@@ -125,7 +125,11 @@ def watch_resource(registry, run_id, *, sleep=time.sleep):
             liveness = RR.classify_identity(row)[0]
             if liveness == 'exited' and runner.read_sentinel(row.get('sentinel')) is not None:
                 row, _ = runner.settle(registry, run_id, row)
-            RR.observe_run_if_due(run_id, row, registry)
+            try:
+                RR.observe_run_if_due(run_id, row, registry)
+            except Exception:  # optional observation retries without losing terminal delivery
+                sleep(60)
+                continue
             if RR.resource_never_started(row) or (liveness == 'exited' and row.get('ended_at') is not None):
                 return 0
             sleep(60)
