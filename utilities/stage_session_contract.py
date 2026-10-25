@@ -19,10 +19,58 @@ MODES = {"serial", "parallel"}
 ADAPTERS = {"claude", "codex", "opencode"}
 _ID = re.compile(r"^(?:ssc|ss)-[A-Za-z0-9._-]{4,200}$")
 _ATTEMPT = re.compile(r"^att-[A-Za-z0-9._-]{8,240}$")
+_REPORT_PATH = re.compile(r"^evidence/([a-z0-9][a-z0-9._-]{0,199})/report\.md$")
+_REPORT_LINE = re.compile(r"^\s*report\s*:\s*(.*?)\s*$", re.IGNORECASE)
 
 
 class StageSessionError(ValueError):
     """Raised when a stage-session manifest is unsafe or incomplete."""
+
+
+def report_path_from_brief(
+    brief_text: str, *, session_id: str, route_node: str | None, node,
+    explicit_only: bool = False,
+) -> str | None:
+    """Interpret the session's own in-scope report from its existing phase brief."""
+    if not isinstance(node, dict):
+        return None
+    import artifact_context
+
+    scopes = [
+        scope for scope in (node.get("write_scope") or [])
+        if isinstance(scope, str) and artifact_context.classify_scope(scope) == "artifact"
+    ]
+    evidence_probe = "evidence/__stage_session_scope_probe__/report.md"
+    has_evidence_scope = artifact_context.scope_matches(evidence_probe, scopes) or any(
+        "evidence" in scope.replace("\\", "/").split("/") for scope in scopes
+    )
+    if not has_evidence_scope:
+        return None
+
+    found = []
+    for line in brief_text.splitlines():
+        match = _REPORT_LINE.fullmatch(line)
+        if match:
+            raw = match.group(1).strip()
+            found.append(raw.split()[0].strip("`*_") if raw else "")
+    if len(found) > 1:
+        raise StageSessionError(f"report-path-ambiguous:{session_id}")
+    explicit = bool(found)
+    if explicit:
+        value = found[0]
+    elif explicit_only:
+        return None
+    elif route_node == "execute":
+        value = f"evidence/{session_id.lower()}/report.md"
+    else:
+        return None
+    if not _REPORT_PATH.fullmatch(value):
+        raise StageSessionError(f"report-path-invalid:{session_id}:{value}")
+    if not artifact_context.scope_matches(value, scopes):
+        if explicit:
+            raise StageSessionError(f"report-path-outside-write-scope:{session_id}:{value}")
+        return None
+    return value
 
 
 def _git_path(path: Path, flag: str) -> Path | None:
@@ -166,12 +214,26 @@ def derive_gap_retry_manifest(
     sessions = []
     for offset, session_id in enumerate(wanted, 1):
         source = by_id[session_id]
+        retry_id = f"ss-gap-{parent[:16]}-{offset}"
+        phase_brief = source["phase_brief"]
+        report_path = source.get("report_path")
+        if report_path:
+            brief_path = Path(phase_brief)
+            brief_text = brief_path.read_text(encoding="utf-8")
+            if not any(_REPORT_LINE.fullmatch(line) for line in brief_text.splitlines()):
+                continued_brief = Path(manifest["_manifest_path"]).parent / f"{retry_id}.brief.md"
+                continued_brief.write_text(
+                    brief_text.rstrip("\n")
+                    + f"\n\nreport: {report_path} (continues the assigned artifact report)\n",
+                    encoding="utf-8",
+                )
+                phase_brief = str(continued_brief)
         derived = {
-            "subsession_id": f"ss-gap-{parent[:16]}-{offset}",
+            "subsession_id": retry_id,
             "attempt_id": f"att-gap-{parent[:16]}-{offset}",
             "adapter": moved or source["adapter"],
             "slug": f"gap-{parent[:8]}-{offset}",
-            "phase_brief": source["phase_brief"],
+            "phase_brief": phase_brief,
             # The whole point of the derivation: the retry's fence is exactly
             # the failed slice's, never widened to the parent union.
             "fixed_files": list(source["fixed_files"]),
@@ -230,7 +292,9 @@ def derive_continuation_manifest(
     sessions = []
     for offset, index in enumerate(wanted, 1):
         source = by_index[index]
-        derived = {key: source[key] for key in ("adapter", "fixed_files", "narrow_verify", "expected_round_trips")}
+        derived = {key: source[key] for key in (
+            "adapter", "fixed_files", "narrow_verify", "expected_round_trips",
+        )}
         derived["adapter"] = moved or derived["adapter"]
         derived.update({
             "subsession_id": f"ss-cont-{parent[:16]}-{offset}",
@@ -243,12 +307,21 @@ def derive_continuation_manifest(
             derived["subsession_purpose"] = GAP_RETRY_PURPOSE
             derived["gap_retry_of"] = source["subsession_id"]
         lines = (notes or {}).get(index) or []
-        if lines:
+        report_path = source.get("report_path")
+        original_brief = Path(source["phase_brief"])
+        brief_text = original_brief.read_text(encoding="utf-8").rstrip("\n")
+        has_report_line = any(_REPORT_LINE.fullmatch(line) for line in brief_text.splitlines())
+        if lines or (report_path and not has_report_line):
             brief = Path(brief_dir) / f"{derived['subsession_id']}.brief.md"
             brief.parent.mkdir(parents=True, exist_ok=True)
-            brief.write_text(Path(source["phase_brief"]).read_text(encoding="utf-8").rstrip("\n")
-                             + "\n\n## From the previous attempt\n\n" + "".join(f"- {line}\n" for line in lines),
-                             encoding="utf-8")
+            content = brief_text
+            if lines:
+                content += "\n\n## From the previous attempt\n\n" + "".join(
+                    f"- {line}\n" for line in lines
+                )
+            if report_path and not has_report_line:
+                content += f"\nreport: {report_path} (continues the assigned artifact report)\n"
+            brief.write_text(content, encoding="utf-8")
             derived["phase_brief"] = str(brief)
         if "node" in source:
             derived["node"] = source["node"]
@@ -408,6 +481,7 @@ def load_manifest(
     normalized: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     seen_attempts: set[str] = set()
+    seen_reports: set[str] = set()
     for offset, item in enumerate(sessions, 1):
         if not isinstance(item, dict):
             raise StageSessionError(f"session-invalid:{offset}")
@@ -441,6 +515,15 @@ def load_manifest(
         if isinstance(rounds, bool) or not isinstance(rounds, int) or not 1 <= rounds <= 20:
             raise StageSessionError(f"expected-round-trips-invalid:{session_id}")
         fixed = _fixed_files(item.get("fixed_files"), worktree=worktree, session_id=session_id)
+        report_identity = item.get("gap_retry_of") or item.get("continues") or session_id
+        report_path = report_path_from_brief(
+            phase_brief.read_text(encoding="utf-8"), session_id=report_identity,
+            route_node=raw.get("route_node"), node=node,
+        )
+        if report_path and report_path in seen_reports:
+            raise StageSessionError(f"report-path-duplicate:{report_path}")
+        if report_path:
+            seen_reports.add(report_path)
         normalized.append({
             **item,
             "index": offset,
@@ -451,6 +534,7 @@ def load_manifest(
             "slug": slug,
             "phase_brief": str(phase_brief),
             "fixed_files": fixed,
+            "report_path": report_path,
             "narrow_verify": narrow_verify.strip(),
             "expected_round_trips": rounds,
         })

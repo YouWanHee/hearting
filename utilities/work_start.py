@@ -1784,27 +1784,19 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     delivery.append({"attempt_id": aid,
                                      "carrier": meta.get("parent_completion_delivery"),
                                      "reason": meta["parent_completion_reason"]})
-                if route.get("capability") == "autopilot-spec" and completion.state == "complete" and publication is None:
+                if completion.state == "complete" and publication is None:
                     from dispatch_terminal_commit import completed_owner_publication
                     publication = completed_owner_publication(jobs, status, meta)
-        if route.get("capability") == "autopilot-spec" and publication is None:
+        if publication is None:
             import artifact_producer
-            root_value = route.get("artifact_root")
-            if not isinstance(root_value, str) or not root_value.strip():
-                # A historical closed route may lack the compiled root. Keep
-                # its sealed result and report the publication gap without
-                # guessing a root from the caller's cwd or preparing new work.
-                publication = {"status": "pending", "reason": "spec-artifact-root-unavailable"}
-            else:
-                root = Path(root_value).resolve()
-                cycle = artifact_producer.route_cycle_for(root, route)
-                publication = (artifact_producer.completed_spec_publication(root, cycle_id=cycle["cycle_id"], settle=True)
-                               if cycle is not None else {"status": "pending", "reason": "spec-cycle-unavailable"})
-            if publication["status"] == "pending":
-                return {**result, "state": "needs-attention", "reason": "shared-spec-publication-pending",
-                        "required_action": "inspect-recovery", "outcome": closed, "shared_publication": publication,
-                        "next_step": "Preserve the completed work and inspect the publication reason. "
-                                     "The same normal completion retry keeps the original source/base; no model restarts."}
+            publication = artifact_producer.completed_route_spec_publication(route, settle=True)
+            if publication.get("status") == "not-applicable":
+                publication = None
+        if publication is not None and publication["status"] == "pending":
+            return {**result, "state": "needs-attention", "reason": "shared-spec-publication-pending",
+                    "required_action": "inspect-recovery", "outcome": closed, "shared_publication": publication,
+                    "next_step": "Preserve the completed work and inspect the publication reason. "
+                    "The same normal completion retry keeps the original source/base; no model restarts."}
         return _with_next_leg(route, {**result, "state": "completed", "required_action": "advance-completed",
                                       "outcome": closed,
                                       **({"completion_delivery": delivery} if delivery else {}),

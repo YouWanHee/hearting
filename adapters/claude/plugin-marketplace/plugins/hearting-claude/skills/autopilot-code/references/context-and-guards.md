@@ -70,14 +70,14 @@ Follow [OPERATIONS §5.10](../../../core/OPERATIONS.md#510-work-isolation-and-pa
 
 When `spec/` exists, compare the request with `spec/prd.md` and relevant contract files before planning:
 
-- **spec-significant:** route, schema, entity field, UI flow, external service, stack, migration, or existing spec drift. Run autopilot-spec update through `spec-transaction.py` first; the helper snapshots the exact old PRD automatically when it changes. Then implement against the new spec. Ask only when classification is ambiguous.
+- **spec-significant:** route, schema, entity field, UI flow, external service, stack, migration, or existing spec drift. The plan or code owner updates the affected component PRD before implementation through the same route: run `spec-transaction --node execute` inside `code-execute` for standard+, use the one-shot transaction for quick, and apply it inline for direct. The transaction preserves the exact old PRD snapshot and its revision/CAS guards. An explicit user deferral is the sole exception; no separate spec route or scope reconfirmation is needed. Ask only when classification is genuinely ambiguous.
 - **within-spec:** bug fix, refactor, or implementation detail. Continue.
 
 Write one verdict to chat and plan or logs before code-plan:
 
 ```text
 spec-significance: within-spec (implementation detail; no spec impact)
-spec-significance: SPEC-SIGNIFICANT (data_model: Task.category) → update autopilot-spec first
+spec-significance: SPEC-SIGNIFICANT (data_model: Task.category) → run spec-transaction --node execute within this route before implementation
 ```
 
 Together, entry triage, reverse-drift detection, and post-change impact detection keep code and spec synchronized in both directions.
@@ -99,7 +99,7 @@ Report detected changes and continue. In app mode, propose a grouped token updat
 - `package.json` `bin` or argparse → CLI concerns.
 - `configs/*.yaml` plus notebooks → research concerns.
 
-This is a partial fallback. Recommend autopilot-spec when full mode behavior is required. PRD, stack, skeleton, environment, migration guidance, and deployment setup belong to autopilot-spec; autopilot-code owns source changes.
+This is a partial fallback. Recommend autopilot-spec before entering the code route when full mode behavior is required. Initial PRDs, stack, skeleton, environment, migration guidance, and deployment setup belong to autopilot-spec; a spec-significant component update discovered during code work uses the route's existing `spec-transaction`, while autopilot-code owns implementation.
 
 ## Detect Post-Change Spec Impact
 
@@ -112,7 +112,7 @@ This is a partial fallback. Recommend autopilot-spec when full mode behavior is 
 | Major dependency or framework change | `stack_decision.md`, component and deployment diagrams |
 | Lifecycle state model | `data_model.md`, optional state diagram |
 
-Show one grouped update plan and let the user choose: update through autopilot-spec now, finish code and record deferred drift, or explicitly accept drift. autopilot-code never edits spec directly.
+The plan or code owner updates the affected component PRD before implementation through the same route: run `spec-transaction --node execute` inside `code-execute` for standard+, use the one-shot transaction for quick, and apply it inline for direct. Proceed without reconfirming the approved scope; only an explicit user deferral skips the update. The normal route completion publishes an actual seeded authoring change, while the code `final_report` remains cycle-local primary.
 
 ## Experiment-Readiness Branch
 

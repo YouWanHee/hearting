@@ -141,8 +141,9 @@ Precedence, highest first:
    evaluation. Updating a paper with finalized metrics stays refine/apply;
    interpreting and reporting the experiment itself stays lab/eval.
 3. A change to requirements, evaluation policy, or any blueprint surface adds
-   `autopilot-spec` update as a secondary spec-sync step; it never replaces
-   the execution primary.
+   the owning route's spec transaction as a secondary spec-sync step; it never
+   replaces the execution primary. For `autopilot-code`, that is the same-route
+   `spec-transaction` before implementation, not a return to `autopilot-spec`.
 4. `autopilot-draft` owns a new independent document goal: a paper,
    presentation, proposal, or report with its own audience and document brief.
    Writing inside an experiment report uses lab's report/editorial support
@@ -1224,7 +1225,7 @@ When a code or intent change affects the spec, update every affected surface in 
 | Public API change in a library | Public API, examples, semver impact, and module-dependency Component |
 | CLI command or option change | Commands, options, exit codes, README examples, and command-tree Component |
 
-`autopilot-spec refine` identifies the impact list, confirms it, and updates it atomically. If `autopilot-code` detects spec impact, it plans the bundle, confirms, and jumps back to `autopilot-spec`. After the final code report, Step 7 updates `analysis_project`: edit small changes directly or run incremental `/analyze-project --mode code --skip-qa` for large ones.
+`autopilot-spec refine` identifies the impact list, confirms it, and updates it atomically. When `autopilot-code` detects spec impact, its plan or code owner updates the affected component PRD before implementation through the same route: run `spec-transaction --node execute` inside `code-execute` for standard+, use the one-shot transaction for quick, and apply it inline for direct. It does not start a separate spec route or reconfirm the unchanged scope. After the final code report, Step 7 updates `analysis_project`: edit small changes directly or run incremental `/analyze-project --mode code --skip-qa` for large ones.
 
 ## 5. Entrypoint-to-Worker Routing
 
@@ -1289,7 +1290,7 @@ In a spec-backed project, a later fix or feature—especially in a new session�
 0. **Understand existing artifacts first:** follow the read-only orientation order in §0.1 before editing or choosing a capability, then read `spec/prd.md`, `pipeline_state.yaml`, and recent `plans/*`. Reading the spec that governs the declared work scope — root `prd.md` or the relevant `spec/<slug>/prd.md` — is a hard gate in a spec-backed cwd; which candidate governs remains agent judgment, recorded via route-record `spec_read.source`. Adapter-native markers and gates deny entry to spec-changing capabilities when a current spec of this project has not been read in the current session or has changed since the read.
 1. **Refresh analysis when needed:** if `analysis_project/code/` is stale or the domain is unfamiliar, run incremental `analyze-project --mode code` first.
 2. **Require a spec:** when absent, route to `autopilot-spec` before development. A single throwaway is the only exception, and repetition should graduate to a spec.
-3. **Check spec drift before code:** compare the request with `spec/prd.md`. A route, schema/entity, UI-flow, external integration, migration, or existing code drift is spec-significant and routes through `autopilot-spec` update; when the transaction changes an existing PRD, the helper preserves its exact pre-image under `_internal/versions/v{N}/`. Proceed autonomously and report when drift is clear; ask when it is genuinely ambiguous. Record “no spec impact” for within-spec implementation details. `autopilot-code` repeats this verdict in preflight Step 0 as a backstop.
+3. **Check spec drift before code:** compare the request with `spec/prd.md` and its relevant component PRD. A route, schema/entity, UI-flow, external integration, migration, or existing code drift is spec-significant. The plan or code owner updates that component PRD before implementation through the same route: run `spec-transaction --node execute` inside `code-execute` for standard+, use the one-shot transaction for quick, and apply it inline for direct. `spec_touch` remains scope-derived capacity, and only actual seeded PRD authoring changes publish through normal route completion; the code `final_report` remains cycle-local primary. The transaction preserves the exact pre-image under `_internal/versions/v{N}/` and retains its revision, CAS, transaction, and snapshot checks. Proceed autonomously when drift is clear; ask only when classification is genuinely ambiguous. An explicit user deferral is the sole exception. Record “no spec impact” for within-spec implementation details. `autopilot-code` repeats this verdict in preflight Step 0 as a backstop.
 4. **Run `autopilot-code`:** intensity selects the graph. Direct performs inline production plus sanity/report. Quick uses one registered-headless dispatch-depth-1 one-shot conductor for micro-plan, plan-check-lite, focused verification, and report with no dispatch depth 2. Only `standard+` creates a durable `plans/<date>_<slug>/` cycle. Derived rigor never creates a separate plan cycle by itself.
 
 These rules close three gaps: a broken trail caused by over-creating plans for quick work, spec drift that bypasses versioned spec update, and blind editing in a new session. Both `autopilot-spec` and `autopilot-code` are iterable; post-build change is another invocation of the same capability, not a new workflow family.
