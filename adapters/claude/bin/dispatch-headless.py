@@ -288,6 +288,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--profile", help="profiles/<name>.yaml masked config home to attach via CLAUDE_CONFIG_DIR")
     p.add_argument("--model-role", default=os.environ.get("CLAUDE_DISPATCH_MODEL_ROLE"))
     p.add_argument("--model-profile", default=os.environ.get("CLAUDE_DISPATCH_MODEL_PROFILE"))
+    p.add_argument("--pair-model-profile")
     p.add_argument("--model", default=os.environ.get("CLAUDE_DISPATCH_MODEL"))
     p.add_argument("--effort", default=os.environ.get("CLAUDE_DISPATCH_EFFORT"))
     p.add_argument(
@@ -532,7 +533,15 @@ def _select_model_settings(args: argparse.Namespace) -> dict[str, str]:
 
 
 def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
-    selected = _select_model_settings(args)
+    context = WRAPPER_COMMON.prepare_pair_model_rotation(args, harness="claude")
+    selection_args = args
+    if context.get("status") == "rotated":
+        import copy
+        selection_args = copy.copy(args)
+        selection_args.model_profile = context["profile"]
+    selected = _select_model_settings(selection_args)
+    if context.get("status") == "rotated" and selected.get("source") == "profile":
+        selected["source"] = "profile+diversity"
     return WRAPPER_COMMON.attach_context_window(selected, "claude", error=ModelSelectionError)
 
 
@@ -1425,7 +1434,8 @@ def main(argv: list[str]) -> int:
         return fail(exc.reason, 65, detail=exc.detail, worktree=args.worktree, child_spawned="0")
     try:
         args.artifact_root = resolve_artifact_root(args.worktree)
-        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(args.artifact_root)
+        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(
+            args.artifact_root, repository_kind=args.repository_kind, source_root=args.worktree)
         args.report_bundle_root = resolve_report_bundle_root(args.route_file, args.route_node)
     except ValueError as e:
         return fail("writable-root-resolution-failed", 64, detail=str(e), worktree=args.worktree)

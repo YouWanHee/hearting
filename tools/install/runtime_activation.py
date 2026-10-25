@@ -87,6 +87,7 @@ _IGNORE_NAMES = {
     ".claude_reports",
     ".core-grounding",
     ".route-grounding",
+    # Keep release-local residue out of snapshots; active spec markers use state_root.
     ".spec-grounding",
     ".harness",
     ".venv",
@@ -635,6 +636,130 @@ def _native_agent_catalog(source_root: Path, runtime: str) -> set[str]:
     return names
 
 
+def _shipped_agent_links(
+    runtime: str, source_root: Path, home: Path, allowed: set[str]
+) -> List[dict]:
+    """Link the shipped agent definitions named in `allowed` into the runtime home."""
+    if runtime == "codex":
+        return _children(
+            source_root / "adapters/codex/agents", home / "agents", "agent", "*.toml",
+            allowed=allowed,
+        )
+    if runtime == "claude":
+        return _children(
+            source_root / "adapters/claude/agents", home / "agents", "agent", "*.md",
+            allowed=allowed,
+        )
+    entries = []
+    agent_root = source_root / "adapters/opencode/agents"
+    if agent_root.is_dir():
+        for item in sorted(agent_root.glob("*/*.md")):
+            if item.parent.name in allowed:
+                entries.append(_entry(item, home / "agents" / item.name, "agent"))
+    return entries
+
+
+# One renderer run per (runtime, home, active source, selected conf bytes). The
+# cache lives for one process, which activates one source per runtime: the key
+# names the active root, so it never needs the activated source's own code in
+# this process. `status`, `activate` and the ownership scans all reach it.
+_NATIVE_AGENT_PLANS: Dict[tuple, tuple] = {}
+_AGENT_FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _bytes_sha256(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "absent"
+
+
+def _native_agent_entries(
+    runtime: str, active_root: Path, home: Path
+) -> tuple[List[dict], List[str]]:
+    """Agent projection entries and report lines for one runtime home.
+
+    The activated source's own `sync-native-agents.py --runtime-home` decides
+    every agent from the `models.conf` that home selects (the user's whole-file
+    copy, else the shipped file), so the renderer, formatter and model_config
+    are always the activated source's. Per agent: a link to the shipped
+    definition when the render equals it, an activation-owned regular file when
+    it differs, nothing when the selected config withholds its model. A source
+    with no renderer keeps the shipped links (`renderer-unavailable`).
+    """
+    projected = _kernel_agents(active_root) | _native_agent_catalog(active_root, runtime)
+    renderer = active_root / "adapters" / runtime / "bin" / "sync-native-agents.py"
+    if not (active_root / "utilities" / "native_agents.py").is_file() or not renderer.is_file():
+        return _shipped_agent_links(runtime, active_root, home, projected), []
+
+    key = (
+        runtime, str(active_root), str(home),
+        _bytes_sha256(home / "agent-config" / "models.conf"),
+        _bytes_sha256(active_root / "adapters" / runtime / "config" / "models.conf"),
+    )
+    if key not in _NATIVE_AGENT_PLANS:
+        if len(_NATIVE_AGENT_PLANS) > 32:
+            _NATIVE_AGENT_PLANS.clear()
+        _NATIVE_AGENT_PLANS[key] = _run_native_agent_plan(runtime, active_root, home, renderer, projected)
+    entries, lines = _NATIVE_AGENT_PLANS[key]
+    return [dict(entry) for entry in entries], list(lines)
+
+
+def _run_native_agent_plan(
+    runtime: str, active_root: Path, home: Path, renderer: Path, projected: set[str]
+) -> tuple[List[dict], List[str]]:
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(renderer), "--runtime-home", str(home), "--json"],
+            capture_output=True, text=True, timeout=60, cwd=str(active_root),
+        )
+        if proc.returncode != 0:
+            tail = " ".join((proc.stderr or proc.stdout).strip().splitlines()[-3:])
+            raise ActivationError(f"{runtime} native agent render failed: {tail[:300]}")
+        plan = json.loads(proc.stdout)
+        rows = plan["agents"]
+        static_names = set(plan["static_names"])
+        if plan["schema"] != "hearting.native-agents/v1" or not isinstance(rows, list):
+            raise ValueError("unexpected plan schema")
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as exc:
+        raise ActivationError(f"{runtime} native agent render unusable: {exc}") from exc
+
+    agents_dir = active_root / "adapters" / runtime / "agents"
+    entries: List[dict] = []
+    lines: List[str] = []
+    decided: set[str] = set()
+    for row in rows:
+        try:
+            name, status = row["name"], row["status"]
+            decided.add(name)
+            if status in ("shipped", "rendered"):
+                dest_name, relpath = row["dest_name"], row["shipped_relpath"]
+                if not _AGENT_FILE_NAME.fullmatch(dest_name) or ".." in Path(relpath).parts \
+                        or Path(relpath).is_absolute():
+                    raise ValueError(f"unsafe agent path for {name}")
+                shipped = agents_dir / relpath
+                if status == "shipped":
+                    entries.append(_entry(shipped, home / "agents" / dest_name, "agent"))
+                else:
+                    content = row["content"]
+                    entry = _entry(shipped if shipped.is_file() else renderer,
+                                   home / "agents" / dest_name, "agent", kind="render")
+                    entry["content"] = content
+                    entry["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    entries.append(entry)
+            else:
+                lines.append(f"{runtime} native agent {name} {status}: {row.get('reason', '')}")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ActivationError(f"{runtime} native agent plan row unusable: {exc}") from exc
+    # Hand-written shipped definitions the renderer never decides (Claude memory-scout).
+    entries.extend(_shipped_agent_links(runtime, active_root, home, static_names))
+    for name in sorted(projected - decided - static_names):
+        lines.append(f"{runtime} native agent {name} not-in-selected-catalog: "
+                     "the selected models.conf does not list it, so no definition is projected")
+    entries.sort(key=lambda entry: entry["dest"])
+    return entries, lines
+
+
 def _linked_entries(
     runtime: str,
     source_root: Path,
@@ -642,11 +767,6 @@ def _linked_entries(
 ) -> List[dict]:
     home = paths.runtime_home(runtime, scope)
     entries: List[dict] = []
-    # Kernel helpers plus the adapter's native subagent type catalog; both are
-    # projected into every activation. Retired team agents stay excluded.
-    projected_agents = _kernel_agents(source_root) | _native_agent_catalog(
-        source_root, runtime
-    )
 
     if runtime == "codex":
         fixed = [
@@ -681,15 +801,7 @@ def _linked_entries(
                 "skill",
             )
         )
-        entries.extend(
-            _children(
-                source_root / "adapters/codex/agents",
-                home / "agents",
-                "agent",
-                "*.toml",
-                allowed=projected_agents,
-            )
-        )
+        entries.extend(_native_agent_entries(runtime, source_root, home)[0])
 
     elif runtime == "claude":
         fixed = [
@@ -724,15 +836,7 @@ def _linked_entries(
                 "skill",
             )
         )
-        entries.extend(
-            _children(
-                source_root / "adapters/claude/agents",
-                home / "agents",
-                "agent",
-                "*.md",
-                allowed=projected_agents,
-            )
-        )
+        entries.extend(_native_agent_entries(runtime, source_root, home)[0])
         entries.extend(
             _children(source_root / "adapters/claude/commands", home / "commands", "skill", "*.md")
         )
@@ -759,12 +863,7 @@ def _linked_entries(
                 "skill",
             )
         )
-        agent_root = source_root / "adapters/opencode/agents"
-        if agent_root.is_dir():
-            for item in sorted(agent_root.glob("*/*.md")):
-                if item.parent.name not in projected_agents:
-                    continue
-                entries.append(_entry(item, home / "agents" / item.name, "agent"))
+        entries.extend(_native_agent_entries(runtime, source_root, home)[0])
         entries.extend(
             _children(
                 source_root / "adapters/opencode/commands",
@@ -2878,6 +2977,7 @@ def _trusted_owned(
     if not state:
         return trusted, {}
     allowed = {item["dest"] for item in desired}
+    desired_kind = {item["dest"]: item.get("kind") for item in desired}
     roots = []
     for key in ("source_root", "active_root"):
         value = state.get(key)
@@ -2918,6 +3018,11 @@ def _trusted_owned(
                     )
             except (OSError, RuntimeError, ValueError):
                 matches = False
+        elif item.get("kind") == "render" and not dest.is_symlink() and dest.is_file():
+            try:
+                matches = _bytes_sha256(dest) == item.get("content_sha256")
+            except OSError:
+                matches = False
         elif item.get("kind") == "copy" and not dest.is_symlink() and dest.is_file():
             try:
                 current_digest = hashlib.sha256(dest.read_bytes()).hexdigest()
@@ -2946,6 +3051,10 @@ def _trusted_owned(
             trusted.add(value)
         else:
             trusted.discard(value)
+            # Keep the renderer's existing collision behavior when a user-edited
+            # regular definition would be replaced by a shipped symlink.
+            if item.get("kind") == "render" and desired_kind.get(value) == "symlink":
+                continue
             user_changed[value] = item
     return trusted, user_changed
 
@@ -3057,6 +3166,23 @@ def _apply_transaction(
             if item["kind"] == "copytree":
                 _remove_path(dest)
                 shutil.copytree(source, dest, symlinks=False)
+            elif item["kind"] == "render":
+                # Rendered bytes replace a shipped link (the link itself, never
+                # its target) or an earlier render of this activation.
+                current = safe_fs.capture_state(dest)
+                try:
+                    auth = safe_fs.authority(
+                        dest,
+                        owner=f"runtime-activation:{runtime}:{item['surface']}:render",
+                        allowed_paths=(dest,), allow_leaf_symlink=True,
+                        expected=current,
+                    )
+                    safe_fs.atomic_write_bytes(
+                        auth, item["content"].encode("utf-8"), 0o644,
+                        expected=current, create_parents=True,
+                    )
+                except (OSError, safe_fs.SafetyError) as exc:
+                    raise ActivationError(str(exc)) from exc
             elif item["kind"] == "copy":
                 current = safe_fs.capture_state(dest)
                 try:
@@ -3092,6 +3218,7 @@ def _apply_transaction(
                     break
             _write_journal(journal_path, runtime, "applying", snapshots)
             applied = dict(item)
+            applied.pop("content", None)  # rendered state keeps content_sha256 only
             if item["kind"] == "copy":
                 applied["digest"] = hashlib.sha256(dest.read_bytes()).hexdigest()
             elif item["kind"] == "copytree":
@@ -3131,7 +3258,16 @@ def _apply_transaction(
 
 
 def _projection_digest(entries: List[dict]) -> str:
-    return _digest_paths(Path(item["source"]) for item in entries)
+    base = _digest_paths(Path(item["source"]) for item in entries)
+    rendered = sorted(
+        (item["dest"], item["content_sha256"]) for item in entries if item.get("kind") == "render"
+    )
+    if not rendered:
+        return base  # an install with no rendered agent keeps its existing digest
+    digest = hashlib.sha256(base.encode())
+    for dest, sha in rendered:
+        digest.update(f"\0render\0{dest}\0{sha}".encode())
+    return digest.hexdigest()
 
 
 def _activation_owned_paths(
@@ -3468,6 +3604,12 @@ def _entries_healthy(entries: List[dict]) -> tuple[bool, bool]:
         if item.get("kind") == "copytree":
             if _tree_digest(dest) != _tree_digest(source):
                 stale = True
+        elif item.get("kind") == "render":
+            try:
+                if dest.is_symlink() or not dest.is_file() or dest.read_bytes() != item["content"].encode("utf-8"):
+                    stale = True
+            except OSError:
+                stale = True
         elif item.get("kind") == "copy":
             try:
                 if (
@@ -3573,6 +3715,9 @@ def activate(
         raise ActivationError(str(exc)) from exc
 
     desired = _desired_entries(runtime, mode, source_root, active_root, revision, scope)
+    agent_report_lines = _native_agent_entries(
+        runtime, active_root, paths.runtime_home(runtime, scope))[1]
+    agent_report_lines.extend(_edited_render_lines(runtime, previous, desired))
     digest = _projection_digest(desired)
     packaged_checksum = _bundle_checksum(active_root) if mode == "packaged" else None
     if mode == "packaged" and packaged_checksum is None:
@@ -3726,8 +3871,27 @@ def activate(
     retired_memory_state.retire()  # distiller-era state files, once; silent
     report = status(runtime, scope)
     report["preserved"] = list(report.get("user_changed", []))
-    report["report_lines"] = list(context_report_lines) + list(report.get("report_lines", []))
+    report["report_lines"] = (list(context_report_lines) + list(agent_report_lines)
+                              + list(report.get("report_lines", [])))
     return report
+
+
+def _edited_render_lines(runtime: str, previous: Optional[dict], desired: List[dict]) -> List[str]:
+    """Report rendered agent files the user edited and this refresh leaves alone."""
+    wanted = {item["dest"] for item in desired}
+    lines = []
+    for item in (previous or {}).get("owned_paths", []):
+        dest = Path(item.get("dest", ""))
+        if (
+            item.get("kind") == "render"
+            and item["dest"] not in wanted
+            and dest.is_file()
+            and not dest.is_symlink()
+            and _bytes_sha256(dest) != item.get("content_sha256")
+        ):
+            lines.append(f"{runtime} native agent file {dest.name} was edited after it was rendered; "
+                         "kept as your file and no longer managed")
+    return lines
 
 
 def _status_missing(runtime: str, scope: str) -> dict:
@@ -3789,14 +3953,18 @@ def status(runtime: str, scope: str = "global") -> dict:
         desired_destinations = {item["dest"] for item in entries}
         for item in state.get("owned_paths", []):
             dest = Path(item.get("dest", ""))
-            if (
-                item.get("kind") == "symlink"
-                and str(dest) not in desired_destinations
-                and str(dest) not in changed_owned_items
-                and dest.is_symlink()
-                and _journal_dest_allowed(runtime, dest, scope)
-            ):
+            if (str(dest) in desired_destinations or str(dest) in changed_owned_items
+                    or not _journal_dest_allowed(runtime, dest, scope)):
+                continue
+            if item.get("kind") == "symlink" and dest.is_symlink():
                 missing = True
+            elif (
+                item.get("kind") == "render"
+                and dest.is_file()
+                and not dest.is_symlink()
+                and _bytes_sha256(dest) == item.get("content_sha256")
+            ):
+                missing = True  # a rendered file the selected config no longer wants
     except ActivationError:
         entries, digest, missing, stale, unexpected = [], None, True, False, []
         changed_owned_items = {}

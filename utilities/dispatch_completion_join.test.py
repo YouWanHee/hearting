@@ -148,6 +148,67 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.live.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.live.chmod(0o755)
 
+    @unittest.skipUnless(sys.platform == "linux", "namespace process evidence is Linux-specific")
+    def test_long_lived_join_refreshes_atomic_terminal_child_through_shared_cache(self):
+        attempt, parent = "att-cache-join", "att-cache-parent"
+        worker = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: worker.poll() is None and worker.kill())
+        identity = D.process_launch_identity(worker.pid)
+        namespace = D.process_namespace_identity()
+        identity.update(
+            harness="codex", worker_type="stage", fallback_hop="same-harness-headless",
+            pid_scope="namespace-local", pid_ns=namespace, pid_observer_ns=namespace,
+        )
+        original = row("open", attempt, parent, "cache-join", process_metadata=identity)
+        self.jobs.write_text(original, encoding="utf-8")
+        cache = sys.modules["dispatch_registry_cache"]
+        signature = lambda info: (info.st_dev, 676767, info.st_size, 17, 19)
+        sleeps = [0]
+
+        def publish_terminal_row(_seconds):
+            sleeps[0] += 1
+            if sleeps[0] != 1:
+                return
+            worker.terminate()
+            worker.wait(timeout=5)
+            terminal = dict(
+                identity, launch_lifecycle="foreground-scoped",
+                launch_outcome="governed-process-reaped",
+                group_reap_proof=D.GROUP_REAP_PROOF,
+                group_reap_pgid=str(identity["pgid"]),
+            )
+            replacement = self.jobs.with_name("jobs.terminal")
+            replacement.write_text(
+                row("done", attempt, parent, "cache-join", "completed-subsession",
+                    process_metadata=terminal)
+                + row("done", "att-padding", parent, "padding", "x" * 5000),
+                encoding="utf-8",
+            )
+            os.replace(replacement, self.jobs)
+
+        try:
+            with (mock.patch.object(cache, "_stat_signature", side_effect=signature),
+                  mock.patch.object(JOIN.time, "sleep", side_effect=publish_terminal_row),
+                  mock.patch.object(D, "_proc_observation", return_value=("missing", "", "")),
+                  mock.patch.object(D, "process_group_observation",
+                                    return_value=D.ProcessGroupObservation("empty")),
+                  mock.patch.object(D, "attempt_tagged_descendants",
+                                    return_value=D.ProcessGroupObservation("empty")),
+                  mock.patch.object(D, "attempt_scan_namespace_authority", return_value=True),
+                  mock.patch.object(D, "observer_namespace_extinct", return_value="present")):
+                receipt = JOIN.join_batch(
+                    jobs=self.jobs, parent_attempt_id=parent, interval=0.05, timeout=1,
+                    registry_append_only=True,
+                )
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait(timeout=5)
+        self.assertEqual(receipt["state"], "ready", receipt)
+        self.assertGreaterEqual(sleeps[0], 1)
+        self.assertEqual(receipt["children"][0]["status"], "done")
+        self.assertEqual(receipt["children"][0]["reason"], "registry-closed")
+
     def test_exact_attempt_row_reads_inside_a_passive_registry_scope(self):
         import dispatch_registry_cache
         self.jobs.write_text(row("open", "att-scope", "att-parent", "scope"), encoding="utf-8")
@@ -1137,8 +1198,10 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.assertEqual(partition.joinable, frozenset())
         self.assertEqual(partition.unstarted, frozenset())
 
+        staged = self.jobs.with_name("jobs.claimed")
         claimed = never_started.replace("launch_claimed=0", "launch_claimed=1")
-        self.jobs.write_text(claimed, encoding="utf-8")
+        staged.write_text(claimed, encoding="utf-8")
+        os.replace(staged, self.jobs)
         child = JOIN.current_children(self.jobs, parent)[0]
         partition = JOIN.partition_runtime_wait_children(
             self.jobs, parent, [child], {child.attempt_id}
@@ -1146,7 +1209,8 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         self.assertEqual(partition.unstarted, frozenset())
         self.assertEqual(partition.joinable, frozenset({"att-never"}))
 
-        self.jobs.write_text(claimed.replace("\tdone\t", "\topen\t"), encoding="utf-8")
+        staged.write_text(claimed.replace("\tdone\t", "\topen\t"), encoding="utf-8")
+        os.replace(staged, self.jobs)
         child = JOIN.current_children(self.jobs, parent)[0]
         partition = JOIN.partition_runtime_wait_children(
             self.jobs, parent, [child], {child.attempt_id}
@@ -4043,10 +4107,10 @@ class NextLegReceiptTest(unittest.TestCase):
         receipt = {"children": [{"attempt_id": "owner", "required_action": "advance-completed",
                                  "next_leg": self.NEXT_LEG}]}
         text = JOIN.completion_followup_text(receipt, jobs=str(jobs), surface="/fixture/preflight.sh")
-        self.assertIn("requested work is complete", text)
+        self.assertIn("Original request/format apply", text)
         self.assertIn(self.NEXT_LEG["compose_command"], text)
         self.assertIn("If this next leg is already approved, execute it in this turn", text)
-        self.assertIn("Receipt, queue consumption and ACK are not execution", text)
+        self.assertIn("Receipt/ACK isn't execution", text)
         plain = JOIN.completion_followup_text({"children": [{"attempt_id": "owner", "required_action": "advance-completed"}]},
                                               jobs=str(jobs), surface="/fixture/preflight.sh")
         self.assertNotIn("next leg", plain)
@@ -4061,13 +4125,16 @@ class NextLegReceiptTest(unittest.TestCase):
                                  "required_action": "advance-completed"}]}
         text = JOIN.completion_followup_text(
             receipt, jobs=str(jobs), surface="/fixture/preflight.sh")
-        required = (
-            "Continue and complete the original user task itself",
-            "preserving every explicit content and output-format requirement",
-            "this receipt supplements the task",
-            "does not replace it with a receipt-only response",
-        )
-        self.assertTrue(all(part in text for part in required))
+        from dispatch_session_sweep import COMPLETION_DELIVERY_HEADER
+        fixed_text = COMPLETION_DELIVERY_HEADER + "\n" + text
+        required = ("Original request/format apply", "Review result",
+                    "approved follow-through", "First close:",
+                    "checks run/reused/skipped/unrun", "commit/PR/deployment/serving",
+                    "No harvest/restart/manual finalize", "Receipt/ACK isn't execution",
+                    "handled exact repeats need no ACK", "new failures/conflicts",
+                    "unfinished work, questions")
+        self.assertTrue(all(part in fixed_text for part in required))
+        self.assertLessEqual(len(COMPLETION_DELIVERY_HEADER) + len(text), 583)
         receipt_only = "Receipt received. The queue was consumed and ACKed."
         self.assertFalse(all(part in receipt_only for part in required))
 
@@ -5382,7 +5449,7 @@ class WorkContinuationReceiptTest(unittest.TestCase):
         text = self.render([("owner","advance-completed")])
         self.assertNotIn("capability-route.py start",text)
         self.assertNotIn("preflight.sh harvest",text)
-        self.assertIn("requested work is complete",text)
+        self.assertIn("Original request/format apply",text)
         self.assertNotIn("advance the route",text)
 
     def test_parked_owner_followup_says_paused_and_keeps_start_handle(self):
@@ -5914,6 +5981,264 @@ class ProcessUnverifiableNoticeTest(unittest.TestCase):
         by_attempt = {child["attempt_id"]: child for child in receipt["children"]}
         self.assertEqual(by_attempt[sibling]["reason"], "process-alive")
         self.assertEqual(len(notices), 0)
+
+
+class RegisteredDeliveryExpiryHelperTest(unittest.TestCase):
+    def _completed_delivery(self, root, attempt, pid, start):
+        jobs = root / "jobs.log"
+        row = ReconcilePendingDeliveryTest()._row(attempt, ancestry=(str(pid), str(start)))
+        jobs.write_text(row + "\n", encoding="utf-8")
+        self.assertTrue(D.close_attempt_row(jobs, attempt, "completed-marker"))
+        self.assertIsNotNone(JOIN.materialize_after_terminal_close(jobs, attempt))
+        owner = JOIN.current_attempt_row(jobs, attempt)
+        record = JOIN.pending_delivery.read(
+            jobs.resolve(strict=False).parent, owner.metadata["parent_sid"],
+            owner.metadata["delivery_id"])
+        self.assertIsNotNone(record)
+        return jobs, owner.metadata, record
+
+    def test_helper_exposes_the_same_positive_dead_expiry_used_by_reconcile(self):
+        helper = getattr(JOIN, "expire_pending_for_dead_recipient", None)
+        self.assertTrue(callable(helper), "single-record expiry helper is missing")
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs, metadata, record = self._completed_delivery(
+                Path(tmp), "att-helper-dead", 999999999, "123456789")
+            result = helper(jobs, metadata, record, attempt_id="att-helper-dead")
+            self.assertEqual(result, "expired")
+            reread = JOIN.pending_delivery.read(
+                jobs.parent, metadata["parent_sid"], record["delivery_id"])
+            self.assertEqual((reread["state"], reread["expiry_reason"]),
+                             ("expired", "recipient-session-gone"))
+
+    def test_helper_never_expires_live_unknown_wrong_digest_or_changed_lineage(self):
+        helper = getattr(JOIN, "expire_pending_for_dead_recipient", None)
+        self.assertTrue(callable(helper), "single-record expiry helper is missing")
+        import dispatch_seat_handover as handover
+        cases = (
+            ("live", os.getpid(), D.process_start_ticks(os.getpid()), "pending"),
+            ("unknown", 424242, "111222333", "pending"),
+            ("wrong-digest", 999999999, "123456789", "skipped"),
+            ("wrong-row-revision", 999999999, "123456789", "skipped"),
+            ("changed-lineage", 999999999, "123456789", "protected"),
+        )
+        for label, pid, start, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                jobs, metadata, record = self._completed_delivery(
+                    Path(tmp), "att-helper-" + label, pid, start)
+                candidate = dict(record)
+                patches = []
+                if label == "unknown":
+                    patches.append(mock.patch.object(
+                        D, "_proc_observation", return_value=("inaccessible", "", "")))
+                elif label == "wrong-digest":
+                    candidate["recipient_digest"] = "0" * 64
+                elif label == "wrong-row-revision":
+                    candidate["row_revisions"][candidate["attempt_ids"][0]] = "foreign-revision"
+                elif label == "changed-lineage":
+                    patches.append(mock.patch.object(
+                        handover, "effective_parent", return_value="live-successor"))
+                with contextlib.ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    result = helper(jobs, metadata, candidate,
+                                    attempt_id="att-helper-" + label)
+                self.assertEqual(result, expected)
+                reread = JOIN.pending_delivery.read(
+                    jobs.parent, metadata["parent_sid"], record["delivery_id"])
+                self.assertEqual(reread["state"], "pending")
+
+    def test_periodic_sweep_calls_the_shared_single_record_rule(self):
+        helper = getattr(JOIN, "expire_pending_for_dead_recipient", None)
+        self.assertTrue(callable(helper), "reconcile must share the single-record expiry rule")
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs.log"
+            jobs.write_text(
+                ReconcilePendingDeliveryTest()._row(
+                    "att-helper-sweep", ancestry=("999999999", "123456789")) + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(D.close_attempt_row(jobs, "att-helper-sweep", "completed-marker"))
+            with mock.patch.object(JOIN, "expire_pending_for_dead_recipient",
+                                   wraps=helper) as shared_rule:
+                result = JOIN.reconcile_pending_delivery(jobs)
+            self.assertEqual(result["expired"], 1)
+            self.assertEqual(shared_rule.call_count, 1)
+
+    def test_adoption_committed_at_effect_boundary_keeps_dead_parent_delivery_pending(self):
+        import dispatch_seat_handover as handover
+        import session_tidy
+        import pane_ownership
+        import contextlib
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs.log"
+            attempt = "att-helper-seat-race"
+            row = ReconcilePendingDeliveryTest()._row(
+                attempt, ancestry=("999999999", "123456789"))
+            fields = row.split("\t")
+            fields[5] += ",worker_type=owner,route_hash=sha256:" + "a" * 64
+            jobs.write_text("\t".join(fields) + "\n", encoding="utf-8")
+            self.assertTrue(D.close_attempt_row(jobs, attempt, "completed-marker"))
+            JOIN.materialize_after_terminal_close(jobs, attempt)
+            owner = JOIN.current_attempt_row(jobs, attempt).metadata
+            record = JOIN.pending_delivery.read(jobs.parent, owner["parent_sid"], owner["delivery_id"])
+            self.assertIsNotNone(record)
+
+            pane = "fixture:dead-recipient-race"
+            env = {"XDG_STATE_HOME": str(root / "state"),
+                   "HARNESS_STATE_ROOT": str(root / "state" / "hearting"),
+                   "HERDR_PANE_ID": pane, "AGENT_DISPATCH_JOBS": str(jobs)}
+            proof = mock.patch.object(pane_ownership, "verified_pane",
+                                      side_effect=lambda value, *a, **kw: value or "")
+            proof.start()
+            self.addCleanup(proof.stop)
+            with mock.patch.dict(os.environ, env, clear=False):
+                seat = session_tidy.resolve_seat("claude", str(root), os.environ)
+                original_lock = session_tidy.seat_lock
+                successor = "sess-dead-recipient-successor"
+                adopted = threading.Event()
+                writer_lock_attempt = threading.Event()
+                order = []
+                local = threading.local()
+                effect_thread = threading.get_ident()
+
+                def commit_adoption():
+                    with original_lock(seat.key):
+                        now = session_tidy.now_epoch()
+                        session_tidy.record_event(seat, "claude", owner["parent_sid"], "start",
+                                                  cwd=str(root), now=now - 2)
+                        self.assertEqual(handover.publish_snapshot_locked(
+                            seat, "claude", owner["parent_sid"],
+                            [handover.binding_of(jobs, owner)], jobs=jobs, now=now - 1), 1)
+                        session_tidy.record_event(seat, "claude", successor, "start",
+                                                  source="clear", cwd=str(root), now=now)
+                        self.assertIsNotNone(handover.record_locked(
+                            seat, "claude", successor, "start", "clear", now))
+                    order.append("adopted")
+                    adopted.set()
+
+                @contextlib.contextmanager
+                def observed_lock(key, *, wait=None):
+                    if (key.startswith("lineage-binding-")
+                            and threading.get_ident() != effect_thread):
+                        writer_lock_attempt.set()
+                    with original_lock(key, wait=wait):
+                        previous = getattr(local, "binding", False)
+                        if key.startswith("lineage-binding-"):
+                            local.binding = True
+                        try:
+                            yield
+                        finally:
+                            local.binding = previous
+
+                real_effective_parent = handover.effective_parent
+                reads = {"count": 0}
+
+                def synchronized_real_read(meta, registry, **kwargs):
+                    current = real_effective_parent(meta, registry, **kwargs)
+                    if meta.get("attempt_id") == attempt and current == owner["parent_sid"]:
+                        reads["count"] += 1
+                        # The second real ownership read is inside the effect
+                        # transaction. On the old implementation no stable
+                        # binding mutex exists, so commit the real first clear
+                        # in the validation/effect gap. On the fixed path, the
+                        # writer waits for that mutex and commits after expiry.
+                        if reads["count"] == 2:
+                            if getattr(local, "binding", False):
+                                def writer():
+                                    commit_adoption()
+                                thread = threading.Thread(target=writer, daemon=True)
+                                thread.start()
+                                self.assertTrue(writer_lock_attempt.wait(2),
+                                                "writer did not reach the real binding lock")
+                            else:
+                                commit_adoption()
+                    return current
+
+                real_expire = JOIN.pending_delivery.expire_if_due
+
+                def mark_expiry(*args, **kwargs):
+                    order.append("expired")
+                    return real_expire(*args, **kwargs)
+
+                with mock.patch.object(session_tidy, "seat_lock", side_effect=observed_lock), \
+                     mock.patch.object(handover, "effective_parent",
+                                       side_effect=synchronized_real_read), \
+                     mock.patch.object(JOIN.pending_delivery, "expire_if_due",
+                                       side_effect=mark_expiry):
+                    result = JOIN.expire_pending_for_dead_recipient(
+                        jobs, owner, record, attempt_id=attempt)
+
+                self.assertTrue(adopted.wait(3), "first adoption did not finish after effect release")
+                self.assertEqual(handover.effective_parent(owner, jobs), successor)
+                retained = JOIN.pending_delivery.read(jobs.parent, owner["parent_sid"],
+                                                       owner["delivery_id"])
+                self.assertEqual(retained["state"], "expired")
+                self.assertEqual(result, "expired")
+                self.assertLess(order.index("expired"), order.index("adopted"), order)
+
+    def test_unreadable_snapshot_keeps_first_binding_effect_protected(self):
+        import dispatch_seat_handover as handover
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs, metadata, record = self._completed_delivery(
+                Path(tmp), "att-first-binding-unreadable", 999999999, "123456789")
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(tmp) / "state"),
+                                              "HARNESS_STATE_ROOT": str(Path(tmp) / "state" / "hearting")}):
+                snapshot_dir = handover._snapshot_dir()
+                snapshot_dir.mkdir(parents=True, exist_ok=True)
+                (snapshot_dir / "malformed.json").write_text("{", encoding="utf-8")
+                result = JOIN.expire_pending_for_dead_recipient(
+                    jobs, metadata, record, attempt_id="att-first-binding-unreadable")
+                self.assertEqual(result, "protected")
+                retained = JOIN.pending_delivery.read(
+                    jobs.parent, metadata["parent_sid"], record["delivery_id"])
+                self.assertEqual(retained["state"], "pending")
+
+    def test_binding_mutex_contention_skips_without_changing_delivery(self):
+        import dispatch_seat_handover as handover
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs, metadata, record = self._completed_delivery(
+                Path(tmp), "att-first-binding-contention", 999999999, "123456789")
+            ready, release = Path(tmp) / "lock-ready", Path(tmp) / "release-lock"
+            binding = json.dumps(handover.binding_of(jobs, metadata))
+            helper = (
+                "import json,sys,time; from pathlib import Path; "
+                f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r}); "
+                "import dispatch_seat_handover as h; "
+                f"binding=json.loads({binding!r}); ready=Path({str(ready)!r}); "
+                f"release=Path({str(release)!r}); "
+                "ctx=h.binding_mutexes([binding], wait=None); ctx.__enter__(); "
+                "ready.touch(); "
+                "deadline=time.monotonic()+5; "
+                "exec('while not release.exists() and time.monotonic()<deadline: time.sleep(0.01)'); "
+                "ctx.__exit__(None,None,None)"
+            )
+            holder = subprocess.Popen([sys.executable, "-c", helper], cwd=str(Path(__file__).resolve().parents[1]),
+                                      env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            deadline = time.monotonic() + 3
+            while not ready.exists() and time.monotonic() < deadline and holder.poll() is None:
+                time.sleep(0.01)
+            self.assertTrue(ready.exists(), "fixture subprocess did not acquire the real binding mutex")
+            try:
+                result = JOIN.expire_pending_for_dead_recipient(
+                    jobs, metadata, record, attempt_id="att-first-binding-contention")
+            finally:
+                release.touch()
+                try:
+                    _output, holder_error = holder.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    holder.kill()
+                    holder.communicate(timeout=2)
+                    self.fail("binding mutex holder subprocess exceeded its deadline")
+            self.assertEqual(holder.returncode, 0, holder_error)
+            self.assertEqual(result, "protected")
+            retained = JOIN.pending_delivery.read(
+                jobs.parent, metadata["parent_sid"], record["delivery_id"])
+            self.assertEqual(retained["state"], "pending")
 
 
 if __name__ == "__main__":

@@ -7,8 +7,11 @@ the snapshot does not carry is shown as ``?`` — never as 0 and never as a succ
 
 from collections.abc import Mapping
 
-from .ledger import HARNESS_ABBR, LIVENESS_GLYPH, LIVENESS_WORD
-from .output import clip
+from .grid import clip_cells as clip
+
+HARNESS_ABBR = {"claude": "CL", "codex": "CX", "opencode": "OC"}
+LIVENESS_GLYPH = {"working": "⠇", "idle": "·", "unknown": "?", "blocked": "◑"}
+LIVENESS_WORD = {"working": "도는 중", "idle": "쉼", "unknown": "확인 불가", "blocked": "답 대기"}
 
 HARNESS_ORDER = ("claude", "codex", "opencode")
 _WINDOW_LABEL = {"5h": "5h", "week": "주", "month": "월"}
@@ -26,6 +29,34 @@ def _get(value, key, default=None):
 
 def _jobs(snapshot):
     return list(_get(snapshot, "jobs", ()) or ())
+
+
+def _unattributed_wait_line(item, observed_at):
+    source = _get(item, "source")
+    label = {"S1": "질문 창 대기", "S2": "작업 경로 확인 대기",
+             "S3": "owner 답 대기", "S4": "턴 끝 질문"}.get(source, "답 대기")
+    owner = _get(item, "owner", {}) or {}
+    harness = {"claude": "Claude", "codex": "Codex", "opencode": "OpenCode"}.get(
+        _get(owner, "harness"))
+    parts = [label]
+    if harness:
+        parts.append(harness)
+    route_id, attempt_id = _get(item, "route_id"), _get(item, "attempt_id")
+    if route_id:
+        parts.append("경로 " + str(route_id)[-8:])
+    if attempt_id:
+        parts.append("시도 " + str(attempt_id)[-8:])
+    since = _get(item, "since")
+    if isinstance(since, (int, float)) and isinstance(observed_at, (int, float)):
+        elapsed = max(0, int(float(observed_at) - float(since)))
+        if elapsed >= 3600:
+            age = f"{elapsed // 3600}시간 경과"
+        elif elapsed >= 60:
+            age = f"{elapsed // 60}분 경과"
+        else:
+            age = "1분 미만 경과"
+        parts.append(age)
+    return "  · " + " · ".join(parts)
 
 
 # -- status band -----------------------------------------------------------------------------
@@ -47,8 +78,21 @@ def liveness_counts(snapshot):
 def job_summary(snapshot):
     counts = liveness_counts(snapshot)
     parts = [f"{word} {counts[key]}" for key, word in _JOB_WORDS]
-    if counts["blocked"]:
-        parts.insert(2, f"◑답 대기 {counts['blocked']}")
+    answer_waits = _get(snapshot, "answer_waits")
+    if answer_waits is None:
+        if counts["blocked"]:
+            parts.insert(2, f"◑답 대기 {counts['blocked']}")
+    elif not _get(answer_waits, "complete", False):
+        parts.insert(2, "◑답 대기 ?")
+    else:
+        current = [item for item in (_get(answer_waits, "items", ()) or ())
+                   if _get(item, "stale") == "current"]
+        gates = sum(_get(item, "source") == "S2" for item in current)
+        other_waits = len(current) - gates
+        if gates:
+            parts.insert(2, f"◑답 대기 {gates}")
+        if other_waits:
+            parts.insert(3 if gates else 2, f"답변 필요 {other_waits}")
     return " · ".join(parts)
 
 
@@ -155,10 +199,10 @@ def usage_gauges(snapshot):
 
 
 def usage_text(snapshot, spaced=False):
-    """'CL 5h29% · CX 주8% · OC 5h0%' (spaced: 'CL 5h 29%'); '사용량 ?' when nothing is known."""
+    """'CL 5h29% · CX 주8% · OC 5h0%' (spaced: 'CL 5h 29%'); '·' when nothing is known."""
     gauges = usage_gauges(snapshot)
     if not gauges:
-        return "사용량 ?"
+        return "·"
     parts = []
     for abbr, label, value in gauges:
         if label is None:
@@ -263,6 +307,22 @@ def system_lines(snapshot):
     running = " · ".join(f"{HARNESS_ABBR[h]} {counts[h]}" for h in HARNESS_ORDER)
     lines = ["시스템 · 사용량 / 배분 / host > GPU", usage_text(snapshot, spaced=True),
              f"실행 {running} / 동시 {governor_text(snapshot)}"]
+    answer_waits = _get(snapshot, "answer_waits")
+    if answer_waits is not None:
+        if not _get(answer_waits, "complete", False):
+            lines.append("답 대기 ? · 관측 미완료")
+        else:
+            lines.append(f"답 대기 {int(_get(answer_waits, 'total', 0) or 0)}")
+            if _get(answer_waits, "unattributed", ()):
+                unattributed = set(answer_waits["unattributed"])
+                lines.append(f"귀속 못 한 항목 {len(unattributed)}")
+                for item in (_get(answer_waits, "items", ()) or ()):
+                    if _get(item, "id") in unattributed:
+                        lines.append(_unattributed_wait_line(item, _get(answer_waits, "observed_at")))
+            stale = [item for item in (_get(answer_waits, "items", ()) or ())
+                     if _get(item, "stale") == "older"]
+            if stale:
+                lines.append(f"오래된 대기 {len(stale)}")
     views = host_views(snapshot)
     if views is None:
         lines.append("host > GPU ? · 읽지 못함")

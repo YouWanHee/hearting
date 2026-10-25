@@ -50,7 +50,7 @@ peer_message = importlib.util.module_from_spec(_PM_SPEC)
 _PM_SPEC.loader.exec_module(peer_message)
 
 sys.path.insert(0, str(_UTILITIES_DIR))
-from dispatch_contract import (process_start_ticks, resolve_agent_home,
+from dispatch_contract import (pidfd_open, process_start_ticks, resolve_agent_home,
                                resolve_dispatch_state_root)  # noqa: E402
 from parent_next_directive import steward_fields  # noqa: E402
 import peer_obligations  # noqa: E402
@@ -92,11 +92,11 @@ def _herdr_argv(*args):
 
 
 def _herdr_env_for_server(server, environ=None):
-    """Carry a socket path only when its inherited session still matches."""
+    """Carry an inherited socket only when its HERDR_SESSION owner still matches."""
     selected = server or "default"
     env = dict(os.environ if environ is None else environ)
-    configured = [env.get("AGENT_HERDR_SESSION"), env.get("HERDR_SESSION")]
-    if any(value and value != selected for value in configured):
+    socket_owner = env.get("HERDR_SESSION") or "default"
+    if socket_owner != selected:
         env.pop("HERDR_SOCKET_PATH", None)
     if selected == "default":
         env.pop("AGENT_HERDR_SESSION", None)
@@ -4059,6 +4059,7 @@ def cmd_watch(args):
             "timeout": args.timeout,
             "refs": list(args.ref or []),
             "server": server,
+            "steward_server": getattr(args, "steward_server", None) or server,
             "readiness_endpoint": (
                 herdr_observation.socket_path_for_endpoint(server)
                 or _WATCH_SERVER_ENDPOINT_PREFIX + herdr_observation.endpoint_name(server)),
@@ -4284,7 +4285,8 @@ def cmd_watch_run(args):
             if target_reason:
                 terminal_reason = target_reason
                 state, agent = "pane-exited", expected_agent
-            if steward_seat.get("kind") == "pane":
+            steward_server = arm.get("steward_server", server) or "default"
+            if steward_seat.get("kind") == "pane" and steward_server == server:
                 steward_agent = {**(arm.get("steward") or {}),
                                  "pane": steward_seat.get("pane", "-")}
                 steward_reason = _watch_terminal_from_view(
@@ -4307,7 +4309,7 @@ def cmd_watch_run(args):
                 if (observed_start is None or str(observed_start) != str(native.get("start"))):
                     terminal_reason = "steward-exited"
                 elif native_record and native_record.get("sessionId") == (arm.get("steward") or {}).get("session_id"):
-                    steward_pidfd = os.pidfd_open(native_pid, 0)
+                    steward_pidfd = pidfd_open(native_pid, 0)
                 elif native_record and native_record.get("sessionId"):
                     _confirmed_watch_successor(args.watch_id, arm)
             except (AttributeError, OSError, TypeError, ValueError):
@@ -4366,9 +4368,9 @@ def cmd_watch_run(args):
                     isinstance(wait_start, str) and bool(wait_start)
                     and _pid_identity_ok(wait_pid, wait_start)
                 )
-                if wait_identity_live and hasattr(os, "pidfd_open"):
+                if wait_identity_live:
                     try:
-                        wait_pidfd = os.pidfd_open(int(wait_pid), 0)
+                        wait_pidfd = pidfd_open(int(wait_pid), 0)
                     except OSError:
                         wait_pidfd = None
             elif wait_record.get("state") == "launching":
@@ -4433,9 +4435,9 @@ def cmd_watch_run(args):
                                    "reason": "native-wait-running", "native_wait": wait_record,
                                    "observed_ts": _utc_now()}
                     _write_watch_observation(paths, observation)
-                    if hasattr(os, "pidfd_open") and wait_start:
+                    if wait_start:
                         try:
-                            wait_pidfd = os.pidfd_open(int(wait_pid), 0)
+                            wait_pidfd = pidfd_open(int(wait_pid), 0)
                         except OSError:
                             wait_pidfd = None
 
@@ -7070,6 +7072,51 @@ def _settle_claude_native_dispatch_receipt(root, storage_recipient, row,
         return False
 
 
+def _closed_registered_route_outcome(row, jobs):
+    """Read route closure only when the exact current row binding matches it."""
+    if getattr(row, "status", None) != "done":
+        return None
+    metadata = row.metadata
+    try:
+        if (metadata.get("dispatch_depth") == "1"
+                and metadata.get("worker_type") == "owner"):
+            from owner_route_binding import OwnerRouteBinding, resolve_owner_route_lifecycle
+            sealed = (metadata.get("owner_route_file"), metadata.get("owner_route_id"),
+                      metadata.get("owner_route_hash"))
+            if not all(sealed):
+                return None
+            binding, _status = resolve_owner_route_lifecycle(
+                jobs, owner_attempt_id=row.attempt_id, sealed_binding=OwnerRouteBinding(*sealed))
+            if binding is None:
+                return None
+            route_id, route_hash = binding.route_id, binding.route_hash
+        else:
+            route_id, route_hash = metadata.get("route_id"), metadata.get("route_hash")
+        artifact_root = metadata.get("artifact_root")
+        if (not isinstance(artifact_root, str) or not Path(artifact_root).is_absolute()
+                or not route_id or not route_hash):
+            return None
+        from route_identity import route_id_from_hash
+        if route_id_from_hash(route_hash) != route_id:
+            return None
+        import artifact_campaign
+        import artifact_lifecycle
+        root = Path(artifact_root).resolve()
+        path = artifact_lifecycle.canonical_outcome_path(root, route_id)
+        try:
+            outcome, _raw = artifact_campaign.read_json(root, path)
+        except artifact_campaign.CampaignError:
+            return None
+        closed_at = outcome.get("closed_at")
+        if (outcome.get("route_id") != route_id or outcome.get("route_hash") != route_hash
+                or not isinstance(closed_at, str) or not closed_at):
+            return None
+        datetime.datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
+        return {"route_id": route_id, "route_hash": route_hash, "closed_at": closed_at}
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError, ImportError):
+        return None
+
+
 def _resume_registered_obligation(duty, store, *, read_context=None):
     """Wake an exact restored recipient through the existing durable peer courier."""
     intent = duty.get("intent") or {}
@@ -7082,7 +7129,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
     from dispatch_completion_join import current_attempt_row
     from dispatch_notice_state import keep_claim
     import dispatch_pending_delivery as pending
-    from dispatch_seat_handover import effective_parent, effective_parent_harness
+    from dispatch_seat_handover import effective_parent, effective_parent_harness, lineage_effect_lock
     from dispatch_session_sweep import (
         IDENTITY_KEY, STORAGE_KEY, addressed_records, delivery_context, is_human_gate_record,
     )
@@ -7156,6 +7203,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
     if row.status not in {"open", "running", "done"}:
         return
     notice_id = intent.get("notice_delivery_id")
+    record = None
     if notice_id:
         # A fresh handover is independent of the original completion ACK. Its
         # exact pending record already carries revision, lineage and authority.
@@ -7246,10 +7294,38 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
         matches = [a for a in agents if a.get("agent") == recipient_harness
                    and (a.get("agent_session") or {}).get("value") == recipient_sid]
         if len(matches) != 1:
-            if fresh_recipient_row() is None:
+            fresh = fresh_recipient_row()
+            if fresh is None:
                 return
+            row = fresh
+            original_sid = str(row.metadata.get("parent_sid") or "")
+            if len(matches) == 0 and recipient_sid == original_sid and row.status == "done":
+                with lineage_effect_lock(row.metadata, jobs, recipient_sid) as current_owner:
+                    final_row = current_attempt_row(jobs, identity["attempt_id"])
+                    if (not current_owner or final_row is None or final_row.status != "done"
+                            or any(final_row.metadata.get(key) != row.metadata.get(key)
+                                   for key in identity_fields)):
+                        return
+                    closed = _closed_registered_route_outcome(final_row, jobs)
+                    if closed is not None:
+                        store.update(duty["id"], state="complete", delivery="not-required",
+                            cleanup="complete", observation={**observation, "reason": "route-closed",
+                                **closed, "recipient_sid": recipient_sid}, skip_unchanged=True)
+                        return
+                if isinstance(record, dict):
+                    from dispatch_completion_join import expire_pending_for_dead_recipient
+                    expiry = expire_pending_for_dead_recipient(
+                        jobs, row.metadata, record, attempt_id=row.attempt_id)
+                    if expiry == "expired":
+                        store.update(duty["id"], observation={**observation,
+                            "reason": "recipient-session-gone", "session_id": recipient_sid,
+                            "recipient_pid": row.metadata.get("parent_runtime_pid", ""),
+                            "recipient_pid_start": row.metadata.get("parent_runtime_pid_start", "")},
+                            skip_unchanged=True)
+                        return
             store.update(duty["id"], observation={"reason": "recipient-unavailable",
-                                                  "session_id": recipient_sid})
+                                                  "session_id": recipient_sid},
+                         skip_unchanged=True)
             return
         pane = matches[0]["pane_id"]
         if _resolve_target(pane)[:2] != (recipient_harness, recipient_sid):
@@ -7282,74 +7358,156 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
         if record and record.get("state") in {"claimed", "sent-ambiguous"}:
             pending.reclaim(jobs.parent, storage_recipient, delivery_id,
                             now_ns=time.monotonic_ns())
-        record = pending.claim(jobs.parent, storage_recipient, delivery_id,
-                               claim_owner=owner, lease_seconds=30, require_generation_proof=False,
-                               jobs=jobs,
-                               retry_context=f"{recipient_harness}:{recipient_sid}:{pane}:{duty['id']}")
-        # keep_claim may project the in-memory receipt; receipt evidence and
-        # the rendered marker stay bound to the stored record.
-        stored = dict(record)
-        if not keep_claim(jobs.parent, storage_recipient, delivery_id, record, owner, jobs=jobs):
+        claim_owner = owner
+        try:
+            claimed_members = pending.claim_ready_batch(
+                jobs.parent, storage_recipient, delivery_id, claim_owner=claim_owner,
+                lease_seconds=30, jobs=jobs, require_generation_proof=False,
+                retry_context=f"{recipient_harness}:{recipient_sid}:{pane}:{duty['id']}")
+        except pending.PendingDeliveryError:
+            # Positive holds and claims owned by another carrier leave every
+            # obligation open for the runner's existing retry/backoff.
             return
-        if (recipient_harness == "claude"
+        member_context = []
+        transfer_members = []
+        for claimed in claimed_members:
+            member_id = claimed["delivery_id"]
+            stored_member = pending.read(jobs.parent, storage_recipient, member_id)
+            if (stored_member is None or not keep_claim(
+                    jobs.parent, storage_recipient, member_id, claimed, claim_owner, jobs=jobs)):
+                for acquired in claimed_members:
+                    pending.release_claim(jobs.parent, storage_recipient,
+                        acquired["delivery_id"], claim_owner=claim_owner)
+                return
+            attempt_ids = list(stored_member.get("attempt_ids") or [])
+            if not attempt_ids and member_id == delivery_id:
+                attempt_ids = [row.attempt_id]
+            matching_rows = ([row] if len(claimed_members) == 1 and member_id == delivery_id
+                             else [current_attempt_row(jobs, aid, read_context=read_context)
+                                   for aid in attempt_ids])
+            seed_notice = bool(notice_id and len(claimed_members) == 1
+                               and member_id == delivery_id)
+            matching_rows = [candidate for candidate in matching_rows
+                             if candidate is not None and candidate.status == "done"
+                             and (seed_notice or candidate.metadata.get("delivery_id") == member_id)]
+            if len(matching_rows) != 1:
+                for acquired in claimed_members:
+                    pending.release_claim(jobs.parent, storage_recipient,
+                        acquired["delivery_id"], claim_owner=claim_owner)
+                return
+            member_row = matching_rows[0]
+            if len(claimed_members) == 1 and member_id == delivery_id:
+                member_duty_id, member_duty = duty["id"], duty
+            else:
+                member_identity = {"jobs": str(jobs.resolve()),
+                    "attempt_id": member_row.attempt_id, "session_id": recipient_sid,
+                    "harness": harness, "server": identity.get("server") or "default"}
+                member_duty_id = peer_obligations.stable_duty_id(
+                    "registered-batch", member_identity)
+                member_duty = store.get(member_duty_id)
+            if (member_duty is None or (member_duty.get("intent") or {}).get("carrier")
+                    != intent["carrier"]):
+                for acquired in claimed_members:
+                    pending.release_claim(jobs.parent, storage_recipient,
+                        acquired["delivery_id"], claim_owner=claim_owner)
+                return
+            try:
+                member_ack = pending.received_ack_identity(
+                    stored_member, storage_recipient, member_id)
+            except pending.PendingDeliveryError:
+                member_ack = None
+            context_item = {**claimed, STORAGE_KEY: storage_recipient,
+                            **({IDENTITY_KEY: member_ack} if member_ack else {})}
+            member_context.append(context_item)
+            transfer_members.append({"duty_id": member_duty_id, "jobs": str(jobs),
+                "attempt_id": member_row.attempt_id,
+                "carrier": member_duty["intent"]["carrier"],
+                "recipient_sid": recipient_sid, "delivery_id": member_id,
+                "storage_recipient": storage_recipient, "claim_owner": claim_owner,
+                "receipt_digest": stored_member.get("receipt_digest"),
+                "row": member_row, "duty": member_duty, "record": stored_member})
+        if not transfer_members:
+            for acquired in claimed_members:
+                pending.release_claim(jobs.parent, storage_recipient,
+                    acquired["delivery_id"], claim_owner=claim_owner)
+            return
+        if (recipient_harness == "claude" and len(transfer_members) == 1
                 and _settle_claude_native_dispatch_receipt(
-                    jobs.parent, storage_recipient, row, recipient_sid, stored)):
+                    jobs.parent, storage_recipient, transfer_members[0]["row"],
+                    recipient_sid, transfer_members[0]["record"])):
             return
         from dispatch_supervision import CONTINUED_KEY, continue_for_parent
-        continued = continue_for_parent(record, session_id=recipient_sid,
-                                        recipient_kind=intent["carrier"])
-        try:
-            bound = {IDENTITY_KEY: pending.received_ack_identity(
-                stored, storage_recipient, delivery_id)}
-        except pending.PendingDeliveryError:
-            bound = {}  # Sent without a marker; its receipt stays on the fallback path.
-        context_record = {**record, STORAGE_KEY: storage_recipient, **bound,
-                          **({CONTINUED_KEY: continued} if continued else {})}
-        message = delivery_context([(jobs.parent, [context_record])])
+        for index, member in enumerate(transfer_members):
+            continued = continue_for_parent(member["record"], session_id=recipient_sid,
+                                            recipient_kind=member["carrier"])
+            if continued:
+                member_context[index][CONTINUED_KEY] = continued
+        message = delivery_context([(jobs.parent, member_context)])
+        first_member = transfer_members[0]
         producer_binding = {
             "schema": peer_message._RUNTIME_PRODUCER_SCHEMA,
-            "duty_id": duty["id"], "jobs": str(jobs), "attempt_id": row.attempt_id,
-            "carrier": intent["carrier"], "delivery_id": delivery_id,
-            "receipt_digest": record.get("receipt_digest"),
+            "duty_id": first_member["duty_id"], "jobs": str(jobs),
+            "attempt_id": first_member["attempt_id"],
+            "carrier": first_member["carrier"],
+            "delivery_id": first_member["delivery_id"],
+            "receipt_digest": first_member["receipt_digest"],
             "recipient": {"harness": recipient_harness, "session_id": recipient_sid},
-            "route_id": str(row.metadata.get("route_id") or ""),
-            "route_node": str(row.metadata.get("route_node") or ""),
+            "route_id": str(first_member["row"].metadata.get("route_id") or ""),
+            "route_node": str(first_member["row"].metadata.get("route_node") or ""),
         }
+        if len(transfer_members) > 1:
+            producer_binding["dispatch_notices"] = [
+                {key: member[key] for key in ("duty_id", "attempt_id", "delivery_id",
+                    "storage_recipient", "receipt_digest", "claim_owner")}
+                for member in transfer_members]
         runtime_sender = {"harness": "runtime", "session_id": None, "name": "Hearting runtime"}
-        transfer_refs = [duty["id"], row.attempt_id, delivery_id]
+        transfer_refs = [value for member in transfer_members for value in (
+            member["duty_id"], member["attempt_id"], member["delivery_id"])]
         if not peer_message._valid_runtime_producer_binding(
                 producer_binding, runtime_sender, producer_binding["recipient"], transfer_refs):
-            pending.release_claim(jobs.parent, storage_recipient, delivery_id, claim_owner=owner)
+            for member in transfer_members:
+                pending.release_claim(jobs.parent, storage_recipient,
+                    member["delivery_id"], claim_owner=claim_owner)
             return
         # The normal prompt command seals the body, checks the recipient again,
         # and retains it through forms, busy turns and sender/observer exit (#446).
         prepared = []
         def bind_transfer(ref):
-            binding = {"duty_id": duty["id"], "jobs": str(jobs), "attempt_id": row.attempt_id,
-                "carrier": intent["carrier"], "recipient_sid": recipient_sid,
-                "delivery_id": delivery_id, "storage_recipient": storage_recipient, "claim_owner": owner}
-            peer_message.bind_dispatch_notice(ref, binding)
-            store.update(duty["id"], observation={**observation, "transfer_ref": ref,
-                "delivery_id": delivery_id, "storage_recipient": storage_recipient,
-                "recipient_sid": recipient_sid, "claim_owner": owner,
-                "producer_binding": producer_binding})
+            bindings = [{key: member[key] for key in (
+                "duty_id", "jobs", "attempt_id", "carrier", "recipient_sid",
+                "delivery_id", "storage_recipient", "claim_owner", "receipt_digest")}
+                for member in transfer_members]
+            peer_message.bind_dispatch_notice(ref, bindings if len(bindings) > 1 else bindings[0])
+            for member in transfer_members:
+                member_observation = member["duty"].get("observation") or {}
+                store.update(member["duty_id"], observation={**member_observation,
+                    "transfer_ref": ref, "delivery_id": member["delivery_id"],
+                    "storage_recipient": storage_recipient, "recipient_sid": recipient_sid,
+                    "claim_owner": claim_owner, "producer_binding": producer_binding})
             prepared.append(ref)
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body:
             body.write(message)
             body.flush()
             args = build_parser().parse_args(["prompt", pane, "--body-file", body.name,
-                                              "--ref", duty["id"], "--ref", row.attempt_id,
-                                              "--ref", delivery_id])
+                *[item for member in transfer_members for item in (
+                    "--ref", member["duty_id"], "--ref", member["attempt_id"],
+                    "--ref", member["delivery_id"]) ]])
             code = cmd_prompt(args, expected_recipient=(recipient_harness, recipient_sid),
                               on_prepared=bind_transfer, producer_binding=producer_binding)
-        current = pending.read(jobs.parent, storage_recipient, delivery_id)
-        if current and current.get("state") == "acked":
+        current = [pending.read(jobs.parent, storage_recipient, member["delivery_id"])
+                   for member in transfer_members]
+        if current and all(item and item.get("state") == "acked" for item in current):
             return
         if prepared or code in {0, 3}:
-            pending.mark_sent_ambiguous(jobs.parent, storage_recipient, delivery_id, claim_owner=owner)
-            store.update(duty["id"], state="pending", delivery="peer-courier", cleanup="pending")
+            for member in transfer_members:
+                pending.mark_sent_ambiguous(jobs.parent, storage_recipient,
+                    member["delivery_id"], claim_owner=claim_owner)
+                store.update(member["duty_id"], state="pending",
+                             delivery="peer-courier", cleanup="pending")
         else:
-            pending.release_claim(jobs.parent, storage_recipient, delivery_id, claim_owner=owner)
+            for member in transfer_members:
+                pending.release_claim(jobs.parent, storage_recipient,
+                    member["delivery_id"], claim_owner=claim_owner)
     finally:
         globals()["_HERDR_SESSION"] = old_server
 
@@ -9579,6 +9737,7 @@ def main(argv=None):
     parsed_argv, agent_args = _split_agent_args(argv)
     args = build_parser().parse_args(parsed_argv)
     args.agent_args = agent_args
+    args.steward_server = herdr_observation.endpoint_name(os.environ.get("HERDR_SESSION"))
     if args.herdr_session:
         global _HERDR_SESSION
         _HERDR_SESSION = args.herdr_session
