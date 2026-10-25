@@ -483,8 +483,8 @@ class FirstLegInputsTest(ValidationBase):
                  ("autopilot-draft", "doc", "material-strategy", self.CANONICAL),
                  ("autopilot-refine", None, "review", self.CANONICAL),
                  ("autopilot-design", None, "refs", (
-                     "designs/<cycle>/01_refs/frame/direction-brief.md",
-                     "designs/<cycle>/01_refs/frame-alternative/direction-brief.md")),
+                     "designs/01_refs/frame/direction-brief.md",
+                     "designs/01_refs/frame-alternative/direction-brief.md")),
                  ("autopilot-spec", "api", "research", (
                      "spec/_internal/research/frame/direction-brief.md",
                      "spec/_internal/research/frame-alternative/direction-brief.md")))

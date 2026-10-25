@@ -10810,7 +10810,11 @@ def _review_source_registration_fence(jobs: Path, row_fields: list[str], metadat
             route = json.loads(route_path.read_text(encoding="utf-8"))
             node = next((item for item in route.get("nodes", [])
                          if item.get("id") == metadata.get("route_node")), None)
-            if node is not None and has_review_subject(route, node, jobs):
+            reviewed_input = None
+            if metadata.get("review_input_digest"):
+                from review_input import read_binding as read_review_input_binding
+                reviewed_input = read_review_input_binding(jobs, metadata)
+            if node is not None and has_review_subject(route, node, jobs, reviewed_input):
                 predecessor = (metadata.get("automatic_retry_of")
                                or metadata.get("replacement_original_attempt_id"))
                 if not predecessor and metadata.get("capacity_retry") == "1":
@@ -10818,7 +10822,8 @@ def _review_source_registration_fence(jobs: Path, row_fields: list[str], metadat
                 values = seal_attempt(jobs, route, node, metadata["attempt_id"],
                                       worktree=row_fields[3], predecessor_attempt_id=predecessor,
                                       expected_subject_digest=os.environ.get(
-                                          "AGENT_REVIEW_SOURCE_SUBJECT_DIGEST"))
+                                          "AGENT_REVIEW_SOURCE_SUBJECT_DIGEST"),
+                                      attempt_metadata=metadata)
                 for key, value in values.items():
                     prior = metadata.get(key)
                     if prior and prior != value:

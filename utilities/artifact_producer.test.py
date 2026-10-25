@@ -1059,6 +1059,17 @@ class CheckWriteTest(ProducerTestBase):
         self.assertEqual(P.check_write(self.root, self.root / ".runtime" / "spoof" / "manifest.json")["verdict"], "allow")
         ok = P.check_write(self.root, base / "artifacts" / "plans" / "plan.md")
         self.assertEqual((ok["verdict"], ok["reason"], ok["bucket"]), ("allow", "open-cycle-artifacts", "plans"))
+        literal_design = P.check_write(
+            self.root, base / "artifacts" / "designs" / "<cycle>" / "02_tokens" / "tokens.json")
+        self.assertEqual((literal_design["verdict"], literal_design["reason"]),
+                         ("allow", "open-cycle-artifacts"))
+        for unsafe in (
+                base / "artifacts" / "designs" / "<cycle>-alternative" / "tokens.json",
+                base / "artifacts" / "designs" / "<token>" / "tokens.json",
+                base / "artifacts" / "other" / "<cycle>" / "tokens.json",
+                base / "artifacts" / "designs" / "<cycle>"):
+            with self.subTest(unsafe=unsafe):
+                self.assertEqual(P.check_write(self.root, unsafe)["verdict"], "deny")
         for locator in ("manifest.json", ".cache/manifest.json",
                         "_internal/candidate/round_1/manifest.json",
                         "_internal/candidate/round_2/manifest.json"):

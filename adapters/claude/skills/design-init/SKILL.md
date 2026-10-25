@@ -90,7 +90,9 @@ Inspect:
 - `tokens.css` or `tailwind.config.ts`
 - `components/ui/` or the project-equivalent component directory
 - `public/icons/` or another SVG asset directory
-- prior design cycles under `$AGENT_ARTIFACT_OUTPUT_DIR/designs/*` or `design/`
+- prior design output under the current flat `$AGENT_ARTIFACT_OUTPUT_DIR/designs/01_refs`,
+  `02_tokens`, `03_components`, `04_review`, and `05_handoff` paths; also read
+  historical `$AGENT_ARTIFACT_OUTPUT_DIR/designs/*` cycles and standalone `design/`
 
 Write the result to `00_init/asset_inventory.md`. Existing project assets take precedence over remembered cross-project preferences.
 

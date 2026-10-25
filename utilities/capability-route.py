@@ -2,7 +2,7 @@
 """Compile, verify, and complete immutable capability routes."""
 from __future__ import annotations
 
-import argparse, base64, contextlib, fcntl, functools, hashlib, importlib.util, json, locale, os, re, shlex, shutil, subprocess, sys, tempfile, uuid
+import argparse, base64, contextlib, fcntl, functools, hashlib, importlib.util, json, locale, os, re, shlex, shutil, stat, subprocess, sys, tempfile, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -5490,6 +5490,70 @@ def _entry_scope_legacy_registry(registry):
     return legacy
 
 
+def _authenticated_legacy_design_registry(route, basis, current_registry):
+    """Authenticate the old literal design recipe through its sealed basis.
+
+    This bridge is limited to the exact flat-layout migration. The old
+    registry must come from the route's verified immutable release, match its
+    sealed digests, and transform byte-for-byte to the current registry by
+    replacing only the design cycle component. Unit contracts stay current.
+    """
+    if (route.get("capability") != "autopilot-design" or not isinstance(basis, dict)
+            or not isinstance(current_registry, dict)):
+        return None
+    registry_root = Path(str(basis.get("registry_root") or ""))
+    runtime_root = Path(str(basis.get("runtime_root") or ""))
+    unit_root = Path(str(basis.get("unit_catalog_root") or ""))
+    if not all(path.is_absolute() for path in (registry_root, runtime_root, unit_root)):
+        return None
+    try:
+        if not immutable_code_root_equivalent(registry_root, runtime_root):
+            return None
+        if _verified_immutable_release_identity(registry_root) is None:
+            return None
+        sealed_path = registry_root / "capabilities" / "topologies.json"
+        info = sealed_path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            return None
+        sealed = json.loads(sealed_path.read_text(encoding="utf-8"))
+        if not isinstance(sealed, dict):
+            return None
+        TOPO.validate_registry(sealed)
+        TOPO.validate_registry(current_registry)
+        if TOPO.registry_digest(sealed) != route.get("registry_digest"):
+            return None
+        if (unit_catalog_digest(unit_root / "roles" / "units") != route.get("unit_catalog_digest")
+                or unit_catalog_digest() != route.get("unit_catalog_digest")):
+            return None
+        extras = ([route["composed_recipe"]]
+                  if route.get("composed") and isinstance(route.get("composed_recipe"), dict)
+                  else ())
+        sealed_capability = TOPO.capability_registry_digest(sealed, route["capability"], extras)
+        if (route.get("capability_registry_digest") is not None
+                and route.get("capability_registry_digest") != sealed_capability):
+            return None
+        design_recipe = next((item for item in sealed.get("recipes", [])
+                              if item.get("capability") == "autopilot-design"), None)
+        if not isinstance(design_recipe, dict) or "designs/<cycle>" not in json.dumps(
+                design_recipe, ensure_ascii=False):
+            return None
+
+        def flatten(value):
+            if isinstance(value, str):
+                return value.replace("designs/<cycle>", "designs")
+            if isinstance(value, list):
+                return [flatten(item) for item in value]
+            if isinstance(value, dict):
+                return {key: flatten(item) for key, item in value.items()}
+            return value
+
+        if flatten(sealed) != current_registry:
+            return None
+        return sealed
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
 def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     """Verify a route for mutating/resume use.
 
@@ -5598,6 +5662,17 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
                 unit_catalog_root_now=ROOT, capability_digest_now=legacy_capability_digest)
             if classification["verdict"] == "current":
                 registry = legacy_registry
+    if classification["verdict"] != "current":
+        sealed_design = _authenticated_legacy_design_registry(route, basis, registry)
+        if sealed_design is not None:
+            # The original immutable release authenticates the old declaration;
+            # the current unit catalog and current launch checks remain active.
+            registry = sealed_design
+            classification = {
+                "registry": {"verdict": "authenticated-sealed-design", "message": None},
+                "unit_catalog": {"verdict": "current", "message": None},
+                "verdict": "current", "message": None, "basis_present": True,
+            }
     if classification["verdict"] != "current":
         if not allow_stale_registry:
             if gates_on():
@@ -7636,6 +7711,17 @@ def write_completion_marker(
     # the only `None` case) rather than the field being silently omitted.
     round_census=None
     census_subject=(source_subject or {}).get("digest")
+    if (census_subject is None and owner_override and node.get("kind") == "review-worker"
+            and jobs is not None):
+        reviewed_input = None
+        import review_input
+        if review_input.is_review_node(node):
+            reviewed_input = review_input.resolve_input(route, node, jobs)
+        from review_source_subject import has_review_subject, observe
+        if has_review_subject(route, node, jobs, reviewed_input):
+            current_subject = observe(route, node, worktree=route.get("cwd"), jobs=jobs,
+                                     reviewed_input=reviewed_input)
+            census_subject = current_subject["digest"]
     if REVIEW_ROUND_CAP.is_round_capped_node(node):
         rows=()
         census_jobs=Path(jobs or _compose_default_jobs())
@@ -9590,30 +9676,33 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
     if rounds is None:
         rounds=_review_round_rows(lines,route["route_id"],node_id,jobs=jobs)
     source_subject_digest = None
-    from review_source_subject import SourceSubjectError, has_review_subject, observe, read_binding, source_epoch
-    if has_review_subject(route, node, jobs):
+    reviewed_input = None
+    if jobs is not None:
+        import review_input
+        if review_input.is_review_node(node):
+            reviewed_input = review_input.resolve_input(route, node, jobs)
+    from review_source_subject import (SourceSubjectError, annotate_rows, has_review_subject,
+                                       observe, read_binding, source_epoch)
+    if has_review_subject(route, node, jobs, reviewed_input):
         try:
             binding = read_binding(jobs, row_metadata, required=False) if jobs else None
-            current = observe(route, node, worktree=route.get("cwd"), jobs=jobs)
-            epoch = source_epoch(route, node, current["digest"], completion_dir(route["route_id"], jobs=jobs))
+            current = observe(route, node, worktree=route.get("cwd"), jobs=jobs,
+                              reviewed_input=reviewed_input)
+            epoch = source_epoch(route, node, current["digest"],
+                                 completion_dir(route["route_id"], jobs=jobs),
+                                 family=current.get("family", "source"))
         except (SourceSubjectError, OSError, ValueError) as exc:
             refuse("source-subject-unverifiable", getattr(exc, "reason", str(exc)))
-        if binding is None:
-            refuse("source-subject-unknown", row_metadata.get("attempt_id", ""))
-        if (binding["subject_digest"] != current["digest"]
-                or binding["source_epoch"] != epoch):
+        if (binding is not None and (binding["subject_digest"] != current["digest"]
+                or binding.get("family", "source") != current.get("family", "source")
+                or binding["source_epoch"] != epoch)):
             refuse("source-subject-stale", row_metadata.get("attempt_id", ""))
-        source_subject_digest = binding["subject_digest"]
-        bound_rounds = []
-        for status, metadata in rounds:
-            try:
-                row_binding = read_binding(jobs, metadata, required=False)
-            except SourceSubjectError as exc:
-                refuse("source-subject-unverifiable", getattr(exc, "reason", str(exc)))
-            bound_rounds.append((status, metadata if row_binding is None else {
-                **metadata, "_review_subject_digest": row_binding["subject_digest"]
-            }))
-        rounds = bound_rounds
+        source_subject_digest = current["digest"]
+        try:
+            rounds = annotate_rows(jobs, rounds, route=route, node=node,
+                                   family=current.get("family", "source"))
+        except SourceSubjectError as exc:
+            refuse("source-subject-unverifiable", getattr(exc, "reason", str(exc)))
     choice = ROUTE_AUTHORITY.decide_continuation(route, action="owner-closure", node=node, rows=rounds,
         facts=({"source_subject_digest": source_subject_digest}
                if source_subject_digest is not None else None))

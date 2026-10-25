@@ -22,6 +22,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -253,6 +254,66 @@ class LegacyRouteCompatibilityTest(unittest.TestCase):
                 self.reseal(route)
                 with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
                     with self.assertRaises(ValueError): R.verify_route(route)
+
+
+class LegacyDesignRegistryBasisTest(unittest.TestCase):
+    def test_old_design_declaration_requires_exact_immutable_basis(self):
+        current = R.TOPO.load_registry()
+
+        def legacy_value(value):
+            if isinstance(value, str):
+                if value == "designs":
+                    return "designs/<cycle>"
+                if value.startswith("designs/"):
+                    return value.replace("designs/", "designs/<cycle>/", 1)
+                return value
+            if isinstance(value, list):
+                return [legacy_value(item) for item in value]
+            if isinstance(value, dict):
+                return {key: legacy_value(item) for key, item in value.items()}
+            return value
+
+        old_registry = legacy_value(current)
+        def flat_value(value):
+            if isinstance(value, str):
+                return value.replace("designs/<cycle>", "designs")
+            if isinstance(value, list):
+                return [flat_value(item) for item in value]
+            if isinstance(value, dict):
+                return {key: flat_value(item) for key, item in value.items()}
+            return value
+        self.assertEqual(flat_value(old_registry), current)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "sealed-v3.43.6"
+            (root / "capabilities").mkdir(parents=True)
+            shutil.copytree(ROOT / "roles" / "units", root / "roles" / "units")
+            (root / "capabilities" / "topologies.json").write_text(
+                json.dumps(old_registry, ensure_ascii=False), encoding="utf-8")
+            unit_digest = R.unit_catalog_digest(root / "roles" / "units")
+            basis = {"basis_version": 1, "registry_root": str(root),
+                     "runtime_root": str(root), "unit_catalog_root": str(root),
+                     "runtime_root_validated": True, "runtime_root_match": True}
+            route = {"capability": "autopilot-design",
+                     "registry_digest": R.TOPO.registry_digest(old_registry),
+                     "capability_registry_digest": R.TOPO.capability_registry_digest(
+                         old_registry, "autopilot-design"),
+                     "unit_catalog_digest": unit_digest, "validation_basis": basis}
+            original_hash = R.route_hash(route)
+            actual_unit_digest = R.unit_catalog_digest
+            with mock.patch.object(R, "_verified_immutable_release_identity",
+                                   return_value={"version": "v3.43.6"}), \
+                 mock.patch.object(R, "unit_catalog_digest", side_effect=lambda path=None:
+                                   unit_digest if path is None else actual_unit_digest(path)):
+                accepted = R._authenticated_legacy_design_registry(route, basis, current)
+                self.assertEqual(accepted, old_registry)
+                self.assertEqual(R.route_hash(route), original_hash)
+                changed = json.loads(json.dumps(current))
+                changed["artifact_buckets"]["documents"] += "/tampered"
+                self.assertIsNone(R._authenticated_legacy_design_registry(route, basis, changed))
+                with mock.patch.object(R, "unit_catalog_digest", return_value="sha256:" + "0" * 64):
+                    self.assertIsNone(R._authenticated_legacy_design_registry(route, basis, current))
+            with mock.patch.object(R, "_verified_immutable_release_identity", return_value=None):
+                self.assertIsNone(R._authenticated_legacy_design_registry(route, basis, current))
 
 
 if __name__ == '__main__':

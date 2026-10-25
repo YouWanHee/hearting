@@ -933,6 +933,23 @@ class DeliverableExemplarTest(unittest.TestCase):
         found = W._deliverable_exemplars("lab-report", self.root, self._env(current))
         self.assertEqual(found, [same / "artifacts/report/REPORT.md"])
 
+    def test_design_handoff_prefers_flat_path_and_keeps_literal_legacy_path(self):
+        current = self._current()
+        previous = _cycle(self.root, "camp-now", "2026-01-01_design", files=[
+            ("designs/05_handoff/handoff.md", 2048),
+            ("designs/05_handoff/preview.html", 2048),
+            ("designs/<cycle>/05_handoff/old.md", 2048),
+            ("designs/<cycle>/05_handoff/old.html", 2048),
+        ])
+        found = W._deliverable_exemplars("design-handoff", self.root, self._env(current))
+        self.assertEqual(found, [previous / "artifacts/designs/05_handoff/handoff.md",
+                                 previous / "artifacts/designs/05_handoff/preview.html"])
+        (previous / "artifacts/designs/05_handoff/handoff.md").unlink()
+        (previous / "artifacts/designs/05_handoff/preview.html").unlink()
+        found = W._deliverable_exemplars("design-handoff", self.root, self._env(current))
+        self.assertEqual(found, [previous / "artifacts/designs/<cycle>/05_handoff/old.md",
+                                 previous / "artifacts/designs/<cycle>/05_handoff/old.html"])
+
     def test_falls_back_to_project_when_campaign_has_none(self):
         current = self._current()
         _cycle(self.root, "camp-a", "2026-01-01_a", files=[("report/REPORT.md", 2048)])

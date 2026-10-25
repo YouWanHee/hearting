@@ -3,7 +3,7 @@
   "canonical_manifest": "harness-manifest.json",
   "topology_registry": {
     "source": "capabilities/topologies.json",
-    "digest": "sha256:67471577db7a8f65d3c1ae24df920d33031882ae214c938db8d1a628b26bfc2a",
+    "digest": "sha256:98269b25b87953dd3b6698862637f590966c364924876de84ccfb3abac9ee31f",
     "capabilities": 13,
     "recipes": 29
   },

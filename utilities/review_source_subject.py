@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import fnmatch
 import re
 import stat
 import subprocess
@@ -85,6 +86,61 @@ def is_deploy_review(route: dict, node: dict) -> bool:
                if isinstance(item, dict) and item.get("completion_gate") == "ship-deploy")
 
 
+def _design_review(node: dict) -> bool:
+    return (node.get("completion_gate") in {"design-verify", "design-critic"}
+            or node.get("id") in {"visual-verify", "critic-review"})
+
+
+def _review_input_binding(jobs: str | Path | None, metadata: dict | None) -> dict | None:
+    if jobs is None or not isinstance(metadata, dict) or not metadata.get("review_input_digest"):
+        return None
+    try:
+        from review_input import read_binding
+        return read_binding(jobs, metadata)
+    except Exception as exc:
+        raise SourceSubjectError("review-input-binding-unreadable",
+                                 str(metadata.get("attempt_id", ""))) from exc
+
+
+def _subject_family(route: dict, node: dict, reviewed_input: dict | None = None) -> str | None:
+    if is_implementation_review(route, node) or is_source_test(node):
+        return "source"
+    if is_deploy_review(route, node):
+        return "source"  # Preserve the existing deploy-request digest contract.
+    if _design_review(node):
+        return "design-build"
+    if isinstance(reviewed_input, dict) and isinstance(reviewed_input.get("sha256"), str):
+        try:
+            import review_input
+            if review_input.is_plan_review_node(node):
+                return "document:plan"
+            if review_input.is_spec_review_node(node):
+                return "document:spec"
+        except ImportError:
+            return None
+    if (isinstance(reviewed_input, dict)
+            and isinstance(reviewed_input.get("family"), str)
+            and reviewed_input["family"].startswith("artifact-review:")):
+        return reviewed_input["family"]
+    return None
+
+
+def _subject_digest(family: str, manifest: list[dict]) -> str:
+    if not isinstance(family, str):
+        return ""
+    identity = {"schema_version": SCHEMA_VERSION, "manifest": manifest}
+    if family not in {"source"}:
+        identity["family"] = family
+    return _sha(_canonical(identity))
+
+
+def _document_primary_subject(route: dict, node: dict, reviewed_input: dict) -> tuple[str, list[dict], str]:
+    family = _subject_family(route, node, reviewed_input) or "document:plan"
+    manifest = [{"path": "reviewed-input", "kind": "file",
+                 "content_sha256": str(reviewed_input.get("sha256", ""))}]
+    return family, manifest, _subject_digest(family, manifest)
+
+
 def _input_match(path: str, scopes: tuple[str, ...]) -> bool:
     import fnmatch
     for scope in scopes:
@@ -126,18 +182,28 @@ def deploy_request_subject(route: dict, node: dict, jobs: str | Path) -> dict | 
             manifest.append([relative, str(sha)])
     if not manifest:
         return None
-    return {"schema_version": SCHEMA_VERSION,
+    return {"schema_version": SCHEMA_VERSION, "family": "source",
             "digest": _sha(_canonical({"schema_version": SCHEMA_VERSION, "manifest": manifest})),
             "manifest": manifest, "scope": list(scopes),
             "provenance": {"source": "parent-deploy-request", "request_digest": value.get("request_digest")}}
 
 
-def has_review_subject(route: dict, node: dict, jobs: str | Path | None = None) -> bool:
-    """Whether launch, round admission, or completion binds to source content."""
+def has_review_subject(route: dict, node: dict, jobs: str | Path | None = None,
+                       reviewed_input: dict | None = None) -> bool:
+    """Whether launch, round admission, or completion binds to review content."""
     if is_implementation_review(route, node) or is_source_test(node):
         return True
-    return (jobs is not None and is_deploy_review(route, node)
-            and deploy_request_subject(route, node, jobs) is not None)
+    if is_deploy_review(route, node):
+        return jobs is not None and deploy_request_subject(route, node, jobs) is not None
+    try:
+        import review_input
+        if review_input.is_review_node(node) and reviewed_input is None:
+            return False
+    except ImportError:
+        pass
+    if _subject_family(route, node, reviewed_input) is not None:
+        return True
+    return _generic_artifact_review_subject(route, node) is not None
 
 
 def _ancestor_ids(route: dict, node: dict) -> list[str]:
@@ -416,14 +482,392 @@ def _snapshot_once(root: Path, scopes: tuple[str, ...], *, depth: int = 0) -> tu
     return manifest, provenance
 
 
+def _read_absolute_regular(path: Path) -> tuple[bytes, tuple[int, ...]]:
+    absolute = Path(path).absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:-1]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise SourceSubjectError("review-artifact-input-unavailable", str(path)) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise SourceSubjectError("review-artifact-input-kind-invalid", str(path))
+    try:
+        return _read_regular(absolute)
+    except (OSError, SourceSubjectError) as exc:
+        if isinstance(exc, SourceSubjectError):
+            raise
+        raise SourceSubjectError("review-artifact-input-unavailable", str(path)) from exc
+
+
+def _document_review_subject(route: dict, node: dict, reviewed_input: dict) -> dict:
+    path = reviewed_input.get("path")
+    expected_sha = reviewed_input.get("sha256")
+    if not isinstance(path, str) or not Path(path).is_absolute() or not re.fullmatch(
+            r"[0-9a-f]{64}", str(expected_sha or "")):
+        raise SourceSubjectError("review-input-binding-invalid", str(node.get("id", "")))
+    primary_path = Path(path)
+    try:
+        primary_bytes, _primary_identity = _read_absolute_regular(primary_path)
+        if _sha(primary_bytes) != expected_sha:
+            raise SourceSubjectError("review-input-content-changed", str(primary_path))
+    except (OSError, SourceSubjectError) as exc:
+        if isinstance(exc, SourceSubjectError):
+            raise
+        raise SourceSubjectError("review-input-unavailable", str(primary_path)) from exc
+    family = _subject_family(route, node, reviewed_input) or "document:plan"
+    _family, manifest, _primary_digest = _document_primary_subject(route, node, reviewed_input)
+    extra = None
+    if family == "document:plan":
+        producer = next((item for item in route.get("nodes", [])
+                         if isinstance(item, dict) and item.get("id") == "plan"), None)
+        declares_checklist = bool(producer and any(
+            isinstance(scope, str) and (scope == "checklist.md"
+                or scope.endswith("/checklist.md") or "checklist.md" in scope)
+            for scope in producer.get("write_scope", ())))
+        if declares_checklist:
+            candidate = primary_path.parent / "checklist.md"
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                data = None
+            except OSError as exc:
+                raise SourceSubjectError("review-artifact-input-unavailable", str(candidate)) from exc
+            else:
+                data, _identity = _read_absolute_regular(candidate)
+            if data is not None:
+                extra = {"path": "checklist.md", "kind": "file", "content_sha256": _sha(data)}
+                manifest.append(extra)
+    manifest.sort(key=lambda item: item["path"].encode("utf-8"))
+    return {"schema_version": SCHEMA_VERSION, "family": family,
+            "digest": _subject_digest(family, manifest), "manifest": manifest,
+            "scope": ["reviewed-input", *( ["checklist.md"] if extra else [])],
+            "provenance": {"input_producer": reviewed_input.get("producer")}}
+
+
+def _design_build_node(route: dict, node: dict) -> dict:
+    ancestors = set(_ancestor_ids(route, node))
+    build = next((item for item in route.get("nodes", [])
+                  if isinstance(item, dict) and item.get("id") in ancestors
+                  and item.get("completion_gate") == "design-build"), None)
+    if build is None:
+        raise SourceSubjectError("review-design-build-unavailable", str(node.get("id", "")))
+    return build
+
+
+def _design_review_subject(route: dict, node: dict) -> dict:
+    build = _design_build_node(route, node)
+    artifact_root = Path(str(route.get("artifact_root") or ""))
+    try:
+        import artifact_producer
+        cycle = artifact_producer.route_cycle_for(artifact_root, route)
+        if cycle is None:
+            raise SourceSubjectError("review-design-cycle-unavailable", str(node.get("id", "")))
+        cycle_dir = artifact_producer.cycle_dir(
+            artifact_root, str(cycle["campaign_id"]), str(cycle["cycle_id"]), cycle)
+    except SourceSubjectError:
+        raise
+    except Exception as exc:
+        raise SourceSubjectError("review-design-cycle-unavailable", str(node.get("id", ""))) from exc
+    output_candidate = cycle_dir / "artifacts"
+    try:
+        output_info = output_candidate.lstat()
+    except OSError as exc:
+        raise SourceSubjectError("review-design-output-unavailable", str(output_candidate)) from exc
+    if stat.S_ISLNK(output_info.st_mode) or not stat.S_ISDIR(output_info.st_mode):
+        raise SourceSubjectError("review-design-output-kind-invalid", str(output_candidate))
+    output_root = output_candidate.resolve(strict=True)
+    allowed_prefixes = ("designs/02_tokens", "designs/03_components",
+                        "designs/<cycle>/02_tokens", "designs/<cycle>/03_components",
+                        "spec/design")
+    scopes = []
+    for scope in build.get("write_scope", ()):
+        if not isinstance(scope, str):
+            continue
+        prefix = scope[:-3] if scope.endswith("/**") else scope
+        if prefix in allowed_prefixes or any(prefix.startswith(item + "/") for item in allowed_prefixes):
+            scopes.append(scope)
+    if not scopes:
+        raise SourceSubjectError("review-design-scope-unavailable", str(build.get("id", "")))
+    files: dict[str, dict] = {}
+    directories: dict[Path, tuple[int, ...]] = {}
+
+    def visit(path: Path, relative: str) -> None:
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise SourceSubjectError("review-design-input-unavailable", relative) from exc
+        if stat.S_ISLNK(before.st_mode):
+            raise SourceSubjectError("review-design-input-symlink", relative)
+        if stat.S_ISDIR(before.st_mode):
+            if any(part in {"_internal", "04_review", "05_handoff"}
+                   for part in PurePosixPath(relative).parts):
+                return
+            directories[path] = _stat_key(before)
+            try:
+                with os.scandir(path) as entries:
+                    children = sorted(entries, key=lambda entry: os.fsencode(entry.name))
+            except OSError as exc:
+                raise SourceSubjectError("review-design-input-unavailable", relative) from exc
+            for entry in children:
+                child_relative = relative + "/" + entry.name if relative else entry.name
+                visit(path / entry.name, child_relative)
+            return
+        if not stat.S_ISREG(before.st_mode):
+            raise SourceSubjectError("review-design-input-kind-invalid", relative)
+        data, identity = _read_regular(path)
+        files[relative] = {"path": relative, "kind": "file",
+                           "mode": stat.S_IMODE(identity[2]),
+                           "content_sha256": _sha(data)}
+
+    def visit_scope(relative: str) -> None:
+        parts = PurePosixPath(relative).parts
+        current = output_root
+        for part in parts[:-1]:
+            current = current / part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise SourceSubjectError("review-design-input-unavailable", relative) from exc
+            if stat.S_ISLNK(info.st_mode):
+                raise SourceSubjectError("review-design-input-symlink", relative)
+            if not stat.S_ISDIR(info.st_mode):
+                return
+        visit(output_root / relative, relative)
+
+    for scope in scopes:
+        if scope.endswith("/**"):
+            relative = scope[:-3].rstrip("/")
+            visit_scope(relative)
+        elif "*" not in scope and "?" not in scope:
+            visit_scope(scope)
+        else:
+            raise SourceSubjectError("review-design-scope-invalid", scope)
+    for directory, expected in directories.items():
+        try:
+            actual = _stat_key(directory.lstat())
+        except OSError as exc:
+            raise SourceSubjectError("review-design-input-changed", str(directory)) from exc
+        if actual != expected:
+            raise SourceSubjectError("review-design-input-changed", str(directory))
+    manifest = [files[key] for key in sorted(files, key=os.fsencode)]
+    if not manifest:
+        raise SourceSubjectError("review-design-payload-empty", str(build.get("id", "")))
+    return {"schema_version": SCHEMA_VERSION, "family": "design-build",
+            "digest": _subject_digest("design-build", manifest), "manifest": manifest,
+            "scope": scopes, "provenance": {"build_node": build.get("id"),
+                "cycle_id": cycle.get("cycle_id"), "route_id": cycle.get("route_id")}}
+
+
+def _generic_artifact_review_subject(route: dict, node: dict) -> dict | None:
+    """Observe only concrete, sealed artifact inputs a capped review consumes."""
+    if node.get("kind") != "review-worker":
+        return None
+    import review_round_cap
+    if not review_round_cap.is_round_capped_node(node):
+        return None
+    try:
+        import review_input
+        if review_input.is_review_node(node):
+            return None
+    except ImportError:
+        pass
+    sources = node.get("input_sources") if isinstance(node.get("input_sources"), dict) else {}
+    selectors = [value for value in (node.get("inputs") or ())
+                 if isinstance(value, str) and value and "<" not in value and ">" not in value
+                 and ("/" in value or PurePosixPath(value).suffix)
+                 and value not in {"logs/**", "checkpoints/**", "raw-results/**"}]
+    if not sources and not selectors:
+        return None
+    ancestors = _ancestor_ids(route, node)
+    by_id = {str(item.get("id")): item for item in route.get("nodes", [])
+             if isinstance(item, dict)}
+    producer_nodes = [by_id[item] for item in ancestors if item in by_id]
+    producer_scopes = [scope for producer in producer_nodes
+                       for scope in (producer.get("write_scope") or ())
+                       if isinstance(scope, str)]
+    artifact_root = Path(str(route.get("artifact_root") or ""))
+    output_root = None
+    cycle_id = None
+    import artifact_producer
+    try:
+        cycle = artifact_producer.route_cycle_for(artifact_root, route)
+        if cycle is not None:
+            cycle_id = cycle.get("cycle_id")
+            cycle_dir = artifact_producer.cycle_dir(
+                artifact_root, str(cycle["campaign_id"]), str(cycle["cycle_id"]), cycle)
+            output_root = cycle_dir / "artifacts"
+            info = output_root.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise SourceSubjectError("review-artifact-output-kind-invalid", str(output_root))
+    except SourceSubjectError:
+        raise
+    except artifact_producer.ProducerError as exc:
+        raise SourceSubjectError("review-artifact-cycle-unavailable", exc.code) from exc
+    except (OSError, ValueError, KeyError, TypeError):
+        output_root = None
+
+    family_anchor = (node.get("parallel_anchor") or node.get("completion_gate")
+                     or node.get("id"))
+    family = "artifact-review:" + str(family_anchor)
+    files: dict[str, dict] = {}
+    directories: dict[Path, tuple[int, ...]] = {}
+    observed_inputs = []
+    missing_exact = []
+    missing_globs = []
+
+    def visit(path: Path, relative: str, logical_prefix: str) -> None:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise SourceSubjectError("review-artifact-input-unavailable", relative) from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise SourceSubjectError("review-artifact-input-symlink", relative)
+        if stat.S_ISDIR(info.st_mode):
+            if any(part in {"checkpoints", "raw-results", "logs", "models", "__pycache__"}
+                   for part in PurePosixPath(relative).parts):
+                return
+            directories[path] = _stat_key(info)
+            try:
+                with os.scandir(path) as entries:
+                    children = sorted(entries, key=lambda entry: os.fsencode(entry.name))
+            except OSError as exc:
+                raise SourceSubjectError("review-artifact-input-unavailable", relative) from exc
+            for entry in children:
+                child_relative = relative + "/" + entry.name if relative else entry.name
+                visit(path / entry.name, child_relative, logical_prefix)
+            return
+        if not stat.S_ISREG(info.st_mode):
+            raise SourceSubjectError("review-artifact-input-kind-invalid", relative)
+        data, identity = _read_absolute_regular(path)
+        suffix = (relative[len(logical_prefix):].lstrip("/")
+                  if relative.startswith(logical_prefix) else relative)
+        logical = logical_prefix + ("/" + suffix if suffix else "")
+        files[logical] = {"path": logical, "kind": "file",
+                          "mode": stat.S_IMODE(identity[2]),
+                          "content_sha256": _sha(data)}
+
+    # A sealed input source is exact authority even when its producer belonged
+    # to an earlier cycle. The mapping key is its logical input name; physical
+    # placement and producer publication identity stay out of the digest.
+    sources = node.get("input_sources") if isinstance(node.get("input_sources"), dict) else {}
+    for name, source in sorted(sources.items()):
+        if not isinstance(name, str) or not isinstance(source, dict):
+            continue
+        source_path = source.get("path")
+        if not isinstance(source_path, str) or not source_path:
+            continue
+        path = Path(source_path)
+        if not path.is_absolute():
+            path = artifact_root / path
+        try:
+            path.resolve(strict=True).relative_to(artifact_root.resolve(strict=True))
+        except (OSError, ValueError) as exc:
+            raise SourceSubjectError("review-artifact-input-outside-root", name) from exc
+        data, identity = _read_absolute_regular(path)
+        logical = "sealed-input/" + name
+        files[logical] = {"path": logical, "kind": "file",
+                          "mode": stat.S_IMODE(identity[2]), "content_sha256": _sha(data)}
+        observed_inputs.append(name)
+
+    def normalized_scope(scope: str) -> str:
+        return scope[len("artifacts/"):] if scope.startswith("artifacts/") else scope
+
+    def matches_scope(selector: str, scope: str) -> bool:
+        selector_glob = selector.endswith("/**")
+        scope_glob = scope.endswith("/**")
+        selector_base = selector[:-3].rstrip("/") if selector_glob else selector
+        scope_base = scope[:-3].rstrip("/") if scope_glob else scope
+        if selector_glob:
+            return (scope_base == selector_base or scope_base.startswith(selector_base + "/")
+                    or selector_base.startswith(scope_base + "/"))
+        return (scope_base == selector_base or (scope_glob and selector_base.startswith(scope_base + "/")))
+
+    for selector in node.get("inputs") or ():
+        if not isinstance(selector, str) or not selector or "<" in selector or ">" in selector:
+            continue  # unresolved symbols/resources keep their existing identity contract
+        if selector.startswith("/") or ".." in PurePosixPath(selector).parts or "\\" in selector:
+            raise SourceSubjectError("review-artifact-input-path-invalid", selector)
+        if selector in {"logs/**", "checkpoints/**", "raw-results/**", "experiment-artifact"}:
+            continue
+        if not ("/" in selector or PurePosixPath(selector).suffix):
+            continue
+        matching_scopes = [normalized_scope(scope) for scope in producer_scopes
+                           if matches_scope(selector, normalized_scope(scope))]
+        if not matching_scopes:
+            continue
+        selector_glob = selector.endswith("/**")
+        selector_base = selector[:-3].rstrip("/") if selector_glob else selector
+        candidates = [output_root / selector_base] if output_root is not None else []
+        # Root-anchored producer scopes remain valid only at their declared
+        # path under this artifact root; cycle output still takes precedence.
+        candidates.append(artifact_root / selector_base)
+        target = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+        if (len(candidates) > 1 and target == candidates[-1]
+                and not any(scope == selector or scope.startswith(selector_base + "/")
+                            for scope in matching_scopes)):
+            continue
+        before = len(files)
+        visit(target, selector_base, selector_base)
+        if len(files) > before:
+            observed_inputs.append(selector)
+        elif selector_glob:
+            missing_globs.append(selector)
+        else:
+            missing_exact.append(selector)
+
+    for directory, expected in directories.items():
+        try:
+            actual = _stat_key(directory.lstat())
+        except OSError as exc:
+            raise SourceSubjectError("review-artifact-input-changed", str(directory)) from exc
+        if actual != expected:
+            raise SourceSubjectError("review-artifact-input-changed", str(directory))
+    # This resolver supplies content identity when a sealed file is present;
+    # it is not a second input gate. The stage's existing input contract owns
+    # missing-file refusals. An incomplete manifest therefore stays unbound.
+    if missing_exact or missing_globs:
+        return None
+    manifest = [files[key] for key in sorted(files, key=os.fsencode)]
+    if not manifest:
+        if missing_globs:
+            raise SourceSubjectError("review-artifact-input-unavailable", missing_globs[0])
+        return None
+    return {"schema_version": SCHEMA_VERSION, "family": family,
+            "digest": _subject_digest(family, manifest), "manifest": manifest,
+            "scope": sorted(set(observed_inputs)),
+            "provenance": {"producer_nodes": [str(item.get("id")) for item in producer_nodes],
+                           "cycle_id": cycle_id}}
+
+
 def observe(route: dict, node: dict, *, worktree: str | Path | None = None,
-            jobs: str | Path | None = None) -> dict:
-    """Return a stable effective-tree manifest and content-only digest."""
-    if jobs is not None and not is_implementation_review(route, node) and is_deploy_review(route, node):
+            jobs: str | Path | None = None, reviewed_input: dict | None = None) -> dict:
+    """Return a stable review-content manifest and content-only digest."""
+    family = _subject_family(route, node, reviewed_input)
+    if family == "design-build":
+        return _design_review_subject(route, node)
+    if family and family.startswith("document:"):
+        return _document_review_subject(route, node, reviewed_input)
+    if is_deploy_review(route, node):
+        if jobs is None:
+            raise SourceSubjectError("review-deploy-subject-unavailable", str(node.get("id", "")))
         subject = deploy_request_subject(route, node, jobs)
         if subject is None:
             raise SourceSubjectError("review-deploy-subject-unavailable", str(node.get("id", "")))
         return subject
+    if family and family.startswith("artifact-review:") and isinstance(reviewed_input, dict):
+        return reviewed_input
+    if family is None and node.get("kind") == "review-worker":
+        generic = _generic_artifact_review_subject(route, node)
+        if generic is not None:
+            return generic
     root = Path(worktree or route.get("cwd", "")).resolve()
     if not root.is_dir():
         raise SourceSubjectError("review-source-worktree-unavailable", str(root))
@@ -435,7 +879,8 @@ def observe(route: dict, node: dict, *, worktree: str | Path | None = None,
         try:
             manifest, provenance = _snapshot_once(root, scopes)
             digest = _sha(_canonical({"schema_version": SCHEMA_VERSION, "manifest": manifest}))
-            return {"schema_version": SCHEMA_VERSION, "digest": digest, "manifest": manifest,
+            return {"schema_version": SCHEMA_VERSION, "family": "source",
+                    "digest": digest, "manifest": manifest,
                     "scope": list(scopes), "provenance": provenance}
         except SourceSubjectError as exc:
             last_error = exc
@@ -472,8 +917,10 @@ def read_binding_record(jobs: str | Path, attempt_id: str, *, route_id=None,
         raise SourceSubjectError("review-source-binding-unreadable", attempt_id) from exc
     if not isinstance(record, dict):
         raise SourceSubjectError("review-source-binding-unreadable", attempt_id)
-    manifest_digest = _sha(_canonical({"schema_version": SCHEMA_VERSION, "manifest": record.get("manifest")}))
+    family = record.get("family", "source")
+    manifest_digest = _subject_digest(family, record.get("manifest"))
     if (record.get("schema_version") != SCHEMA_VERSION
+            or ("family" in record and not isinstance(family, str))
             or record.get("attempt_id") != attempt_id
             or (route_id is not None and record.get("route_id") != route_id)
             or (route_hash is not None and record.get("route_hash") != route_hash)
@@ -505,9 +952,11 @@ def _write_once(path: Path, payload: dict) -> None:
 
 def seal_attempt(jobs: str | Path, route: dict, node: dict, attempt_id: str, *,
                  worktree: str | Path | None = None, predecessor_attempt_id: str | None = None,
-                 expected_subject_digest: str | None = None) -> dict:
+                 expected_subject_digest: str | None = None,
+                 attempt_metadata: dict | None = None) -> dict:
     """Bind a new subject-bound review attempt, inheriting exact retry lineage."""
-    if not has_review_subject(route, node, jobs):
+    reviewed_input = _review_input_binding(jobs, attempt_metadata)
+    if not has_review_subject(route, node, jobs, reviewed_input):
         return {}
     path = binding_path(jobs, attempt_id)
     if predecessor_attempt_id:
@@ -515,17 +964,20 @@ def seal_attempt(jobs: str | Path, route: dict, node: dict, attempt_id: str, *,
             route_id=route["route_id"], route_hash=route["route_hash"], node_id=node["id"])
         if predecessor is None:
             return {}  # A legacy unknown attempt stays unknown through replacement.
-        current = observe(route, node, worktree=worktree, jobs=jobs)
+        current = observe(route, node, worktree=worktree, jobs=jobs, reviewed_input=reviewed_input)
         if expected_subject_digest and current["digest"] != expected_subject_digest:
             raise SourceSubjectError("review-source-admission-subject-changed", attempt_id)
         expected_epoch = source_epoch(route, node, current["digest"],
-                                      Path(jobs).resolve().parent / "completion" / route["route_id"])
-        if current["digest"] != predecessor["subject_digest"] or expected_epoch != predecessor["source_epoch"]:
+                                      Path(jobs).resolve().parent / "completion" / route["route_id"],
+                                      family=current.get("family", "source"))
+        if (current["digest"] != predecessor["subject_digest"]
+                or current.get("family", "source") != predecessor.get("family", "source")
+                or expected_epoch != predecessor["source_epoch"]):
             raise SourceSubjectError("review-source-replacement-subject-changed", predecessor_attempt_id)
         record = {k: v for k, v in predecessor.items() if k not in {"attempt_id", "binding_digest"}}
         record.update(attempt_id=attempt_id, predecessor_attempt_id=predecessor_attempt_id)
     else:
-        current = observe(route, node, worktree=worktree, jobs=jobs)
+        current = observe(route, node, worktree=worktree, jobs=jobs, reviewed_input=reviewed_input)
         if expected_subject_digest and current["digest"] != expected_subject_digest:
             raise SourceSubjectError("review-source-admission-subject-changed", attempt_id)
         completion_dir = Path(jobs).resolve().parent / "completion" / route["route_id"]
@@ -534,7 +986,9 @@ def seal_attempt(jobs: str | Path, route: dict, node: dict, attempt_id: str, *,
             "route_id": route["route_id"], "route_hash": route["route_hash"],
             "node_id": node["id"], "attempt_id": attempt_id,
             "subject_digest": current["digest"],
-            "source_epoch": source_epoch(route, node, current["digest"], completion_dir),
+            "family": current.get("family", "source"),
+            "source_epoch": source_epoch(route, node, current["digest"], completion_dir,
+                                          family=current.get("family", "source")),
             "scope": current["scope"], "manifest": current["manifest"],
             "provenance": current["provenance"],
         }
@@ -563,13 +1017,19 @@ def read_binding(jobs: str | Path, metadata: dict, *, required: bool = True) -> 
     return record
 
 
-def annotate_rows(jobs: str | Path, rows):
+def annotate_rows(jobs: str | Path, rows, *, route: dict | None = None,
+                  node: dict | None = None, family: str | None = None):
     """Add verified subject labels to an in-memory round census only."""
     result = []
     for status, metadata in rows:
         binding = read_binding(jobs, metadata, required=False)
-        result.append((status, metadata if binding is None else {
-            **metadata, "_review_subject_digest": binding["subject_digest"]
+        digest = binding["subject_digest"] if binding is not None else None
+        if digest is None and family and family.startswith("document:") and route and node:
+            reviewed_input = _review_input_binding(jobs, metadata)
+            if reviewed_input is not None and _subject_family(route, node, reviewed_input) == family:
+                _old_family, _manifest, digest = _document_primary_subject(route, node, reviewed_input)
+        result.append((status, metadata if digest is None else {
+            **metadata, "_review_subject_digest": digest
         }))
     return result
 
@@ -599,14 +1059,19 @@ def validate_attempt(jobs: str | Path, fields: list[str], metadata: dict, *,
         raise SourceSubjectError("review-source-route-identity-mismatch")
     node = next((item for item in route.get("nodes", [])
                  if item.get("id") == metadata.get("route_node")), None)
-    if node is None or not has_review_subject(route, node, jobs):
+    if node is None:
         return None
     record = read_binding(jobs, metadata, required=require_new)
     if record is None:
         return None  # A pre-feature registry row remains unknown, never inferred.
-    current = observe(route, node, worktree=fields[3], jobs=jobs)
+    reviewed_input = _review_input_binding(jobs, metadata)
+    if not has_review_subject(route, node, jobs, reviewed_input):
+        return None
+    current = observe(route, node, worktree=fields[3], jobs=jobs,
+                      reviewed_input=reviewed_input)
     current_epoch = source_epoch(route, node, current["digest"],
-                                  Path(jobs).resolve().parent / "completion" / route["route_id"])
+                                  Path(jobs).resolve().parent / "completion" / route["route_id"],
+                                  family=record.get("family", "source"))
     if current["digest"] != record["subject_digest"] or current_epoch != record["source_epoch"]:
         raise SourceSubjectError("review-source-subject-changed-before-launch", metadata.get("attempt_id", ""))
     return record
@@ -672,7 +1137,8 @@ def _canonical_head(generation: dict, generation_dir: Path, node_id: str, candid
     return marker
 
 
-def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Path) -> int:
+def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Path,
+                 *, family: str = "source") -> int:
     """Predict the route-wide source epoch from append-only marker history.
 
     Epoch changes only when source content changes. Marker sequence, report
@@ -699,6 +1165,8 @@ def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Pat
                 subject = marker.get("source_subject")
                 if not isinstance(subject, dict):
                     continue  # Legacy marker: preserve it as unknown history.
+                if subject.get("family", "source") != family:
+                    continue
                 if (isinstance(subject.get("epoch"), int)
                         and not isinstance(subject.get("epoch"), bool)
                         and isinstance(subject.get("digest"), str)):
@@ -709,6 +1177,80 @@ def source_epoch(route: dict, node: dict, digest: str, completion_dir: str | Pat
                 if isinstance(exc, SourceSubjectError):
                     raise
                 raise SourceSubjectError("review-source-marker-unreadable", node_id) from exc
+    # A registered subject is an observed generation even when its worker
+    # never published a completion marker. This preserves A→B→A currentness
+    # without changing any verdict count or inventing an unbound history row.
+    jobs_path = completion_root.parent / "jobs.log"
+    route_by_id = {str(item.get("route_id")): item for item in generations}
+    try:
+        lines = jobs_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        lines = []
+    except OSError as exc:
+        raise SourceSubjectError("review-source-registry-unreadable", str(jobs_path)) from exc
+    if isinstance(family, str) and family.startswith("document:"):
+        latest_digest = None
+        latest_epoch = 0
+        for line in lines:
+            fields = line.split("\t")
+            if len(fields) != 6:
+                continue
+            metadata = {}
+            for part in fields[5].split(","):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    metadata[key] = value
+            generation = route_by_id.get(metadata.get("route_id", ""))
+            if generation is None or metadata.get("route_hash") != generation.get("route_hash"):
+                continue
+            generation_node = next((item for item in generation.get("nodes", [])
+                                    if item.get("id") == metadata.get("route_node")), None)
+            if generation_node is None:
+                continue
+            binding = read_binding(jobs_path, metadata, required=False)
+            if binding is not None:
+                if binding.get("family", "source") != family:
+                    continue
+                epoch = binding.get("source_epoch")
+                if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
+                    raise SourceSubjectError("review-source-binding-identity-mismatch",
+                                             metadata.get("attempt_id", ""))
+                digest_value = binding["subject_digest"]
+            else:
+                reviewed = _review_input_binding(jobs_path, metadata)
+                if reviewed is None or _subject_family(generation, generation_node, reviewed) != family:
+                    continue
+                _old_family, _manifest, digest_value = _document_primary_subject(
+                    generation, generation_node, reviewed)
+                epoch = (0 if latest_digest is None
+                         else latest_epoch + (digest_value != latest_digest))
+            observations.append((epoch, digest_value))
+            latest_digest, latest_epoch = digest_value, epoch
+    else:
+      for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        metadata = {}
+        for part in fields[5].split(","):
+            if "=" in part:
+                key, value = part.split("=", 1)
+                metadata[key] = value
+        generation = route_by_id.get(metadata.get("route_id", ""))
+        if generation is None or not (metadata.get("review_subject_digest")
+                                      or metadata.get("review_subject_binding_digest")):
+            continue
+        if metadata.get("route_hash") != generation.get("route_hash"):
+            raise SourceSubjectError("review-source-binding-identity-mismatch",
+                                     metadata.get("attempt_id", ""))
+        binding = read_binding(jobs_path, metadata, required=True)
+        if binding.get("family", "source") != family:
+            continue
+        epoch = binding.get("source_epoch")
+        if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
+            raise SourceSubjectError("review-source-binding-identity-mismatch",
+                                     metadata.get("attempt_id", ""))
+        observations.append((epoch, binding["subject_digest"]))
     if not observations:
         return 0
     maximum = max(epoch for epoch, _subject in observations)
@@ -811,8 +1353,21 @@ def marker_subject(route: dict, node: dict, *, attempt_id: str | None = None,
                    owner_inline: bool = False,
                    evidence_sha256: str | None = None) -> dict | None:
     """Subject fields to put on a newly published completion marker."""
-    if not has_source_subject(route, node):
+    reviewed_input = _review_input_binding(jobs, attempt_metadata)
+    family = _subject_family(route, node, reviewed_input)
+    if family is None and node.get("kind") == "review-worker":
+        candidate = _generic_artifact_review_subject(route, node)
+        family = candidate.get("family") if candidate else None
+    if family is None and has_source_subject(route, node):
+        family = "source"
+    if family is None:
         return None
+    if has_source_subject(route, node) and not (is_implementation_review(route, node)
+                                                or is_source_test(node)):
+        current = observe(route, node, worktree=worktree)
+        epoch = source_epoch(route, node, current["digest"], completion_dir, family="source")
+        return {"schema_version": SCHEMA_VERSION, "digest": current["digest"], "epoch": epoch,
+                "manifest_sha256": _sha(_canonical(current["manifest"]))}
     if is_implementation_review(route, node) or is_source_test(node):
         if is_implementation_review(route, node) and owner_inline and attempt_id:
             current = observe(route, node, worktree=worktree)
@@ -850,10 +1405,21 @@ def marker_subject(route: dict, node: dict, *, attempt_id: str | None = None,
             raise SourceSubjectError("review-source-subject-changed-before-completion", str(attempt_id or ""))
         return {"schema_version": SCHEMA_VERSION, "digest": record["subject_digest"],
                 "epoch": record["source_epoch"], "binding_digest": record["binding_digest"]}
-    current = observe(route, node, worktree=worktree)
-    epoch = source_epoch(route, node, current["digest"], completion_dir)
-    return {"schema_version": SCHEMA_VERSION, "digest": current["digest"], "epoch": epoch,
-            "manifest_sha256": _sha(_canonical(current["manifest"]))}
+    registered = attempt_metadata.get("registered_worker") in (True, 1, "1", "true") if attempt_metadata else False
+    record = read_binding(jobs, attempt_metadata, required=registered) if jobs and attempt_metadata else None
+    if record is None:
+        if registered:
+            raise SourceSubjectError("review-source-binding-missing", str(attempt_id or ""))
+        return None  # Owner-closure is a disposition, not an independent subject verdict.
+    if record.get("family", "source") != family:
+        raise SourceSubjectError("review-source-binding-identity-mismatch", str(attempt_id or ""))
+    current = observe(route, node, worktree=worktree, jobs=jobs, reviewed_input=reviewed_input)
+    epoch = source_epoch(route, node, current["digest"], completion_dir, family=family)
+    if current["digest"] != record["subject_digest"] or epoch != record["source_epoch"]:
+        raise SourceSubjectError("review-source-subject-changed-before-completion", str(attempt_id or ""))
+    return {"schema_version": SCHEMA_VERSION, "digest": record["subject_digest"],
+            "epoch": record["source_epoch"], "family": family,
+            "binding_digest": record["binding_digest"]}
 
 
 def _currency_registry_path(route: dict, completion_dir: str | Path,
@@ -885,62 +1451,88 @@ def _currency_registry_path(route: dict, completion_dir: str | Path,
 
 def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str | Path,
                     *, jobs: str | Path | None = None) -> tuple[str, str] | None:
-    """Current source identity for a marker, or None for routes outside this contract."""
+    """Current review-content identity for a marker, or None outside this contract."""
     # Other scoped markers contribute source generations to the append-only
     # epoch history. Only implementation review and code-test gates consume
     # source currency as a gate result.
     source_test = is_source_test(node)
     implementation_review = is_implementation_review(route, node)
-    if not (implementation_review or source_test):
-        return None
     subject = marker.get("source_subject")
-    if not isinstance(subject, dict):
-        return "superseded", "completion-source-subject-unknown"
+    subject_family = subject.get("family", "source") if isinstance(subject, dict) else None
+    generic_review = isinstance(subject_family, str) and subject_family.startswith("artifact-review:")
+    document_review = False
     try:
-        current = observe(route, node)
-        epoch = source_epoch(route, node, current["digest"], completion_dir)
-    except SourceSubjectError as exc:
-        return "completion-evidence-unreadable", exc.reason
-    if (subject.get("schema_version") != SCHEMA_VERSION
-            or subject.get("digest") != current["digest"]
-            or subject.get("epoch") != epoch):
-        reason = ("completion-test-source-stale" if source_test else
-                  "completion-review-source-stale" if implementation_review else
-                  "completion-source-stale")
-        return "superseded", reason
-    if implementation_review or source_test:
-        attempt_id = marker.get("attempt_id")
-        binding_digest = subject.get("binding_digest")
-        if implementation_review and "inline_provenance" in subject:
-            inline = subject["inline_provenance"]
-            if (not isinstance(inline, dict)
-                    or set(inline) != {"kind", "attempt_id", "manifest_sha256"}
-                    or inline.get("kind") != "owner-inline"
-                    or not attempt_id or inline.get("attempt_id") != attempt_id
-                    or inline.get("manifest_sha256") != _sha(_canonical(current["manifest"]))
-                    or marker.get("reviewer_kind") != "owner-inline"
-                    or marker.get("review_independence") != "degraded"
-                    or marker.get("reviewer_identity") != attempt_id
-                    or marker.get("registered_worker") is not False
-                    or marker.get("execution_surface") != "inline"
-                    or binding_digest is not None):
-                return "integrity-broken:identity-mismatch", "completion-review-inline-provenance-invalid"
-            return None
-        if source_test and not binding_digest:
-            inline = (marker.get("registered_worker") is False
-                      and marker.get("execution_surface") == "inline")
-            if not inline:
-                return "superseded", "completion-test-source-binding-unknown"
-            if subject.get("manifest_sha256") != _sha(_canonical(current["manifest"])):
-                return "integrity-broken:identity-mismatch", "completion-test-source-manifest-invalid"
-            return None
-        if not attempt_id or not binding_digest:
-            return "superseded", ("completion-test-source-binding-unknown" if source_test else
-                                   "completion-review-source-binding-unknown")
-        # Stay with the resolved consumer path or the route's sealed selection;
-        # ambient process state must never redirect exact-row or binding lookup.
+        import review_input
+        from dispatch_contract import DispatchContractError
+        if review_input.is_review_node(node):
+            if (isinstance(subject_family, str) and subject_family.startswith("document:")):
+                document_review = True
+            elif (marker.get("review_gate_closure") == "owner-closure"
+                  and marker.get("review_independence") == "owner-overridden"):
+                document_review = True
+            elif jobs is not None:
+                candidate_possible = False
+                if review_input.is_plan_review_node(node):
+                    if review_input.has_plan_producer(route, node):
+                        marker_path = (Path(jobs).resolve().parent / "completion"
+                                       / str(route.get("route_id")) / "plan.json")
+                        candidate_possible = marker_path.is_file()
+                    elif not review_input.is_spec_review_node(node):
+                        try:
+                            candidate_possible = review_input.sealed_plan_input(route, node) is not None
+                        except DispatchContractError:
+                            candidate_possible = False
+                if candidate_possible:
+                    try:
+                        document_review = review_input.resolve_input(
+                            route, node, jobs) is not None
+                    except DispatchContractError:
+                        # Without an exact, currently selected input, a legacy
+                        # marker retains its pre-content identity.
+                        document_review = False
+    except ImportError:
+        document_review = False
+    artifact_review = _design_review(node) or document_review or generic_review
+    if (not isinstance(subject, dict) and node.get("kind") == "review-worker"
+            and not artifact_review and not (implementation_review or source_test
+                                             or is_deploy_review(route, node))):
+        try:
+            artifact_review = _generic_artifact_review_subject(route, node) is not None
+        except SourceSubjectError as exc:
+            return "completion-evidence-unreadable", exc.reason
+    if (not isinstance(subject, dict) and node.get("kind") == "review-worker"
+            and marker.get("review_gate_closure") == "owner-closure"
+            and marker.get("review_independence") == "owner-overridden"
+            and not (implementation_review or source_test or is_deploy_review(route, node))):
+        # Owner disposition is not an independent PASS. The shared completion
+        # and readiness readers still authenticate its route and exact evidence.
+        return None
+    if not (implementation_review or source_test or artifact_review):
+        return None
+    if not isinstance(subject, dict):
+        if not artifact_review:
+            return "superseded", "completion-source-subject-unknown"
+        return "superseded", "completion-review-subject-unknown"
+    family = subject.get("family", "source")
+    reviewed_input = None
+    attempt_id = marker.get("attempt_id")
+    binding_digest = subject.get("binding_digest")
+    inline_review = implementation_review and "inline_provenance" in subject
+    inline_test = (source_test and not binding_digest
+                   and marker.get("registered_worker") is False
+                   and marker.get("execution_surface") == "inline")
+    if implementation_review and not binding_digest and not inline_review:
+        return "superseded", "completion-review-source-binding-unknown"
+    if source_test and not binding_digest and not inline_test:
+        return "superseded", "completion-test-source-binding-unknown"
+    record = None
+    row = None
+    needs_binding = ((isinstance(family, str) and family.startswith("document:"))
+                     or family == "design-build"
+                     or ((implementation_review or source_test) and not (inline_review or inline_test)))
+    if needs_binding:
         jobs_path = _currency_registry_path(route, completion_dir, jobs)
-        exact_rows = []
+        rows = []
         try:
             for line in jobs_path.read_text(encoding="utf-8", errors="replace").splitlines():
                 fields = line.split("\t")
@@ -948,37 +1540,83 @@ def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str |
                     continue
                 metadata = dict(part.split("=", 1) for part in fields[5].split(",") if "=" in part)
                 if metadata.get("attempt_id") == attempt_id:
-                    exact_rows.append(metadata)
+                    rows.append(metadata)
         except OSError:
-            prefix = "completion-test-source" if source_test else "completion-review-source"
+            prefix = ("completion-test-source" if source_test else
+                      "completion-review-source" if implementation_review else
+                      "completion-review-subject")
             return "integrity-broken:identity-mismatch", prefix + "-registry-missing"
-        if len(exact_rows) != 1:
-            prefix = "completion-test-source" if source_test else "completion-review-source"
+        if len(rows) != 1:
+            prefix = ("completion-test-source" if source_test else
+                      "completion-review-source" if implementation_review else
+                      "completion-review-subject")
             return "integrity-broken:identity-mismatch", prefix + "-row-not-exact"
-        metadata = exact_rows[0]
-        if (metadata.get("route_id") != route.get("route_id")
-                or metadata.get("route_hash") != route.get("route_hash")
-                or metadata.get("route_node") != node.get("id")
-                or metadata.get("review_subject_digest") != subject.get("digest")
-                or metadata.get("review_subject_binding_digest") != binding_digest):
-            prefix = "completion-test-source" if source_test else "completion-review-source"
+        row = rows[0]
+        if (row.get("route_id") != route.get("route_id")
+                or row.get("route_hash") != route.get("route_hash")
+                or row.get("route_node") != node.get("id")
+                or row.get("review_subject_digest") != subject.get("digest")
+                or row.get("review_subject_binding_digest") != binding_digest):
+            prefix = ("completion-test-source" if source_test else
+                      "completion-review-source" if implementation_review else
+                      "completion-review-subject")
             return "integrity-broken:identity-mismatch", prefix + "-row-binding-mismatch"
         try:
-            record = read_binding_record(jobs_path, attempt_id,
-                route_id=route.get("route_id"), route_hash=route.get("route_hash"),
-                node_id=node.get("id"))
+            record = read_binding_record(jobs_path, str(attempt_id), route_id=route.get("route_id"),
+                route_hash=route.get("route_hash"), node_id=node.get("id"))
         except SourceSubjectError:
-            prefix = "completion-test-source" if source_test else "completion-review-source"
-            return "integrity-broken:identity-mismatch", prefix + "-binding-missing"
+            record = None
+        prefix = ("completion-test-source" if source_test else
+                  "completion-review-source" if implementation_review else
+                  "completion-review-subject")
         if record is None:
-            prefix = "completion-test-source" if source_test else "completion-review-source"
             return "integrity-broken:identity-mismatch", prefix + "-binding-missing"
-        if (record.get("binding_digest") != binding_digest or _binding_digest(record) != binding_digest
+        if (record.get("binding_digest") != binding_digest
+                or _binding_digest(record) != binding_digest
                 or record.get("subject_digest") != subject.get("digest")
+                or record.get("family", "source") != family
                 or record.get("attempt_id") != attempt_id
                 or record.get("route_id") != route.get("route_id")
                 or record.get("route_hash") != route.get("route_hash")
                 or record.get("node_id") != node.get("id")):
-            prefix = "completion-test-source" if source_test else "completion-review-source"
             return "integrity-broken:identity-mismatch", prefix + "-binding-invalid"
+    if isinstance(family, str) and family.startswith("document:"):
+        try:
+            reviewed_input = _review_input_binding(jobs_path, row)
+        except SourceSubjectError as exc:
+            return "integrity-broken:identity-mismatch", "completion-review-subject-input-binding-invalid"
+        if reviewed_input is None:
+            return "integrity-broken:identity-mismatch", "completion-review-input-binding-missing"
+    try:
+        current = observe(route, node, jobs=jobs, reviewed_input=reviewed_input)
+        if current is None:
+            return "superseded", "completion-review-subject-input-missing"
+        epoch = source_epoch(route, node, current["digest"], completion_dir, family=family)
+    except SourceSubjectError as exc:
+        return "completion-evidence-unreadable", exc.reason
+    if (subject.get("schema_version") != SCHEMA_VERSION
+            or family != current.get("family", "source")
+            or subject.get("digest") != current["digest"]
+            or subject.get("epoch") != epoch):
+        reason = ("completion-test-source-stale" if source_test else
+                  "completion-review-source-stale" if implementation_review else
+                  "completion-review-source-stale" if artifact_review else
+                  "completion-source-stale")
+        return "superseded", reason
+    if inline_review:
+        inline = subject["inline_provenance"]
+        if (not isinstance(inline, dict)
+                or set(inline) != {"kind", "attempt_id", "manifest_sha256"}
+                or inline.get("kind") != "owner-inline"
+                or not attempt_id or inline.get("attempt_id") != attempt_id
+                or inline.get("manifest_sha256") != _sha(_canonical(current["manifest"]))
+                or marker.get("reviewer_kind") != "owner-inline"
+                or marker.get("review_independence") != "degraded"
+                or marker.get("reviewer_identity") != attempt_id
+                or marker.get("registered_worker") is not False
+                or marker.get("execution_surface") != "inline"
+                or binding_digest is not None):
+            return "integrity-broken:identity-mismatch", "completion-review-inline-provenance-invalid"
+    elif inline_test and subject.get("manifest_sha256") != _sha(_canonical(current["manifest"])):
+        return "integrity-broken:identity-mismatch", "completion-test-source-manifest-invalid"
     return None

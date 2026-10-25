@@ -489,8 +489,18 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
                           if item.get("node_id")=="plan" and item.get("stage_authority")=="revision"),None)
  input_options = {"producer_preview": producer_preview} if not record_auto_revisions and producer_preview else {}
  reviewed_input = (resolve_input(route,node,jobs,reviewed_evidence,**input_options)
-                   if is_review_node(node) and (reviewed_evidence or producer_preview
-                                                or route.get("ancestor_plan_refresh")) else None)
+                   if is_review_node(node) else None)
+ if (source_subject_digest is None
+     and has_review_subject(route, node, jobs, reviewed_input)):
+  from review_source_subject import SourceSubjectError, annotate_rows, observe
+  try:
+   current_subject = observe(route, node, worktree=route.get("cwd"), jobs=jobs,
+                             reviewed_input=reviewed_input)
+   source_subject_digest = current_subject["digest"]
+   classified_rows = annotate_rows(jobs, classified_rows, route=route, node=node,
+                                   family=current_subject.get("family", "source"))
+  except SourceSubjectError as exc:
+   raise DispatchNodeError(exc.reason, detail=exc.detail) from exc
  dependency_revisions = ROUTE._dependency_revisions(route, node, jobs, reviewed_input=reviewed_input or {})
  dependency_ids = set(node.get("depends_on", ()))
  dependency_revisions.extend(

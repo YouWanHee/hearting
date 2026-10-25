@@ -41,10 +41,22 @@ SHARED_KIND_FOR_BUCKET = {"spec": "spec", "analysis_project": "analysis", "resea
 LAYOUT_CYCLE = "cycle"
 LAYOUT_SHARED = "shared"
 LAYOUT_LEGACY = "legacy-readonly"
+_FLAT_DESIGN_ANCHORS = frozenset({
+    "01_refs", "02_tokens", "03_components", "04_review", "05_handoff",
+})
 
 
 def _is_real_dir(path: Path) -> bool:
     return path.is_dir() and not os.path.islink(str(path))
+
+
+def is_flat_design_layout(path: Path) -> bool:
+    """Whether a designs bucket itself is the cycle-local flat output root."""
+    path = Path(path)
+    try:
+        return any(_is_real_dir(path / name) for name in _FLAT_DESIGN_ANCHORS)
+    except OSError:
+        return False
 
 
 def _cycle_state(root: Path, campaign_dir: Path, cycle_dir: Path) -> str:
@@ -261,6 +273,11 @@ def bucket_dirs(root: Path, bucket: str, *, include_shared: bool = True,
 def iter_bucket_children(root: Path, bucket: str, **kw) -> Iterator[Tuple[Path, Dict[str, str]]]:
     """Direct child directories of every bucket candidate (a cycle/component each)."""
     for base, meta in bucket_dirs(root, bucket, **kw):
+        if bucket == "designs" and is_flat_design_layout(base):
+            # The producer cycle is already the outer boundary. Treat the
+            # flat anchors as one design payload instead of five cycles.
+            yield base, {**meta, "design_layout": "flat"}
+            continue
         try:
             children = sorted(base.iterdir())
         except OSError:

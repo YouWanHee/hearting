@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import dataclasses
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -210,7 +211,8 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         for retry in range(3):
             stage_start = str(ROOT / 'utilities/stage-dispatch-fallback.py') in command
             before = self.atomic_state() if stage_start else None
-            result = subprocess.run(command, env=self.env, text=True, capture_output=True, timeout=45)
+            result = subprocess.run(command, env=self.env, text=True, capture_output=True,
+                                    timeout=120 if stage_start else 45)
             if result.returncode and (stage_start or
                     str(ROOT / 'utilities/dispatch_completion_join.py') in command):
                 self.failure_snapshot(command, result)
@@ -1094,6 +1096,251 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
                     stdout=result.stdout, stderr='fixture summary settlement: ' + diagnostic))
                 self.fail('fixture summary unknown/unsettled at deadline: ' + diagnostic)
             time.sleep(min(0.1, remaining))
+
+
+class CurrentDesignPeerSelectionTest(unittest.TestCase):
+    def _case_test_current_owner_closure_peer_precedes_round_admission(self):
+        import importlib.util
+        from types import SimpleNamespace
+        import replica_batch_contract as BATCH_CONTRACT
+        from recovery_history import INPUT_SCHEMA, batch_input_path
+
+        spec = importlib.util.spec_from_file_location(
+            "review_batch_current_peer_dispatch", ROOT / "utilities" / "dispatch-batch.py")
+        batch = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = batch
+        spec.loader.exec_module(batch)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            jobs = base / "dispatch" / "jobs.log"
+            jobs.parent.mkdir(parents=True)
+            route_id, route_hash, group = "rt-design-peer-fixture", "sha256:" + "a" * 64, "visual-verify"
+            nodes = [
+                {"id": "visual-verify", "kind": "review-worker", "completion_gate": "design-verify",
+                 "unit": "design/verifier", "dispatch_depth": 2, "parallel_group": group,
+                 "depends_on": ["build"], "perspective": "visual", "parallel_leg_index": 0,
+                 "parallel_leg_count": 2, "parallel_independence_axes": ["cross-harness", "perspective"],
+                 "model_profile": "light", "write_scope": ["designs/04_review/verify/**"]},
+                {"id": "visual-verify-alternative", "kind": "review-worker",
+                 "unit": "design/verifier", "completion_gate": "design-verify", "dispatch_depth": 2,
+                 "parallel_group": group, "depends_on": ["build"],
+                 "perspective": "visual-alternative", "parallel_leg_index": 1,
+                 "parallel_leg_count": 2, "parallel_independence_axes": ["cross-harness", "perspective"],
+                 "model_profile": "light", "write_scope": ["designs/04_review/verify-alternative/**"]},
+            ]
+            route = {"route_id": route_id, "route_hash": route_hash,
+                     "cwd": str(base), "artifact_root": str(base / ".agent_reports"),
+                     "capability": "autopilot-design", "capability_mode": "default",
+                     "effective_intensity": "standard", "nodes": [
+                         {"id": "build", "kind": "pipeline-stage", "completion_gate": "design-build",
+                          "write_scope": ["designs/02_tokens/**", "designs/03_components/**"],
+                          "depends_on": []}, *nodes]}
+            route_file = base / "route.json"
+            route_file.write_text(json.dumps(route), encoding="utf-8")
+            attempts = ("att-visual-primary", "att-visual-alternative")
+            prompt_text = "Verify the current design payload."
+            assignment_digest = "sha256:" + hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+            members = []
+            for index, (node, attempt, harness, perspective) in enumerate(zip(
+                    nodes, attempts, ("codex", "claude"), ("visual", "visual-alternative"))):
+                members.append({
+                    "assignment_sha256": assignment_digest,
+                    "attempt_id": attempt, "route_node": node["id"], "harness": harness,
+                    "fallback_hop": "same-harness-headless", "fallback_ordinal": 1,
+                    "model_profile": "light", "perspective": perspective,
+                    "parallel_leg_index": index, "leg_class": "peer",
+                })
+            manifest, digest, leg_digests = BATCH_CONTRACT.build_manifest(
+                parallel_group=group, route_id=route_id, parent_attempt_id="att-owner-current",
+                independence="cross-harness", members=members,
+                required_independence_axes=["cross-harness", "perspective"],
+                realized_independence_axes=["cross-harness", "perspective"],
+            )
+            rows = []
+            for node, attempt, member in zip(nodes, attempts, members):
+                metadata = {
+                    "attempt_schema_version": 2, "dispatch_depth": 2,
+                    "transport": "headless", "execution_surface": "registered-headless",
+                    "registered_worker": "1", "fallback_hop": member["fallback_hop"],
+                    "attempt_id": attempt, "route_id": route_id, "route_hash": route_hash,
+                    "route_node": node["id"], "parent_attempt_id": "att-owner-current",
+                    "parent": "owner", "route_file": str(route_file.resolve()),
+                    "harness": member["harness"], "child_harness": member["harness"],
+                    "fallback_ordinal": member["fallback_ordinal"],
+                    "reservation_kind": "parallel-batch", "batch_declared_size": len(nodes),
+                    "parallel_group": group, "replica_group": group, "batch_group": group,
+                    "batch_route_id": route_id, "batch_parent_attempt_id": "att-owner-current",
+                    "batch_attempt_id": attempt, "batch_route_node": node["id"],
+                    "batch_harness": member["harness"],
+                    "batch_fallback_hop": member["fallback_hop"],
+                    "batch_fallback_ordinal": member["fallback_ordinal"],
+                    "batch_independence": manifest["independence"],
+                    "batch_assignment_sha256": member["assignment_sha256"],
+                    "batch_manifest_sha256": digest, "batch_leg_sha256": leg_digests[attempt],
+                    "batch_model_profile": member["model_profile"],
+                    "batch_perspective": member["perspective"],
+                    "batch_parallel_leg_index": member["parallel_leg_index"],
+                    "batch_leg_class": member["leg_class"], "batch_auxiliary_check": "-",
+                    "note": "completed-marker", "launch_claimed": "1",
+                }
+                fields = ["fixture", "done", str(base), str(base), attempt,
+                          ",".join(f"{key}={value}" for key, value in metadata.items())]
+                rows.append("\t".join(fields))
+            jobs.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            input_path = batch_input_path(jobs, digest)
+            input_path.parent.mkdir(parents=True, exist_ok=True)
+            input_path.write_text(json.dumps({
+                "schema": INPUT_SCHEMA, "jobs": str(jobs.resolve()),
+                "route_id": route_id, "route_hash": route_hash,
+                "manifest": manifest, "manifest_digest": digest,
+                "options": {"parallel_group": group, "route": str(route_file.resolve()),
+                            "parent": "owner", "prompt_text": prompt_text},
+            }, separators=(",", ":"), sort_keys=True), encoding="utf-8")
+            state = base / "completion-state"
+            marker_dir = state / "completion" / route_id
+            marker_dir.mkdir(parents=True)
+            closure = {"route_id": route_id, "route_hash": route_hash,
+                       "node_id": nodes[1]["id"], "attempt_id": attempts[1],
+                       "review_gate_closure": "owner-closure",
+                       "review_independence": "owner-overridden"}
+            (marker_dir / f"{nodes[1]['id']}.json").write_text(
+                json.dumps(closure), encoding="utf-8")
+            closure_path = marker_dir / f"{nodes[1]['id']}.json"
+            closure_bytes = closure_path.read_bytes()
+            with mock.patch.object(batch, "dispatch_state_roots", return_value=[state]), \
+                 mock.patch.object(batch, "resolve_dispatch_state_root", return_value=state), \
+                 mock.patch.object(batch, "completion_marker_is_current",
+                                   side_effect=lambda _route, _node, _path, marker, **_kw:
+                                   marker.get("attempt_id") == attempts[1]), \
+                 mock.patch.object(batch, "completion_attempt_readiness",
+                                   return_value=SimpleNamespace(state="ready", reason="settled")):
+                peers = batch.current_completed_group_peers(
+                    jobs, route, nodes, group, base, prompt_text)
+                closure_path.write_text(json.dumps({"attempt_id": attempts[1]}), encoding="utf-8")
+                ordinary_pass = batch.current_completed_group_peers(
+                    jobs, route, nodes, group, base, prompt_text)
+                closure_path.write_bytes(closure_bytes)
+            self.assertEqual(set(peers), {nodes[1]["id"]})
+            self.assertEqual(ordinary_pass, {})
+            self.assertEqual(peers[nodes[1]["id"]]["attempt_id"], attempts[1])
+            self.assertEqual(peers[nodes[1]["id"]]["metadata"]["note"], "completed-marker")
+            pending = batch.pending_round_admission_nodes(nodes, peers)
+            self.assertEqual([node["id"] for node in pending], [nodes[0]["id"]])
+            self.assertIn('"review_independence": "owner-overridden"',
+                          (marker_dir / f"{nodes[1]['id']}.json").read_text())
+            self.assertEqual(batch.current_completed_group_peers(
+                jobs, route, nodes, group, base, "a different review request"), {})
+
+            agent_home = base / "agent-home"
+            agent_home.mkdir()
+            parent_identity = {"parent_harness": "codex", "parent_transport": "headless",
+                               "parent_sandbox": "workspace-write"}
+            round_calls = []
+            reserved = {}
+
+            def admission(_route, node, _jobs, **_kwargs):
+                round_calls.append(node["id"])
+                return SimpleNamespace(
+                    budget=SimpleNamespace(next_round=3, cap=2, state="admit", round_kind="first",
+                                            correction_round=False),
+                    planned_revision_nodes=frozenset(), requires_next_round=True,
+                    physical_attempt_ids=frozenset((attempts[0],)), current_attempt_ids=frozenset(),
+                    prior_attempt_ids=frozenset((attempts[0],)), reviewed_input=None,
+                    source_subject_digest="sha256:" + "c" * 64,
+                )
+
+            def assign(_route, selected_nodes, **kwargs):
+                fixed = kwargs.get("fixed", {})
+                self.assertEqual(fixed[nodes[1]["id"]], ("claude", "same-harness-headless", 1))
+                return ([(nodes[0], "codex", "same-harness-headless", 1),
+                         (nodes[1], "claude", "same-harness-headless", 1)],
+                        "cross-harness", {"degradation_cause": "", "degradation_detail": "",
+                            "sole_gate": "not-applicable", "allocation": {}, "capacity": {}})
+
+            def reserve(_governor, _root, pending, *, manifest, manifest_digest, peers=None, **_kw):
+                reserved["attempts"] = [leg["attempt_id"] for leg in pending]
+                reserved["peers"] = peers
+                reserved["members"] = [member["route_node"] for member in manifest["members"]]
+                reserved["digest"] = manifest_digest
+                governor_spec = importlib.util.spec_from_file_location(
+                    "model_worker_governor_visual_fixture",
+                    ROOT / "utilities" / "model-worker-governor.py")
+                governor = importlib.util.module_from_spec(governor_spec)
+                governor_spec.loader.exec_module(governor)
+                current_manifest, current_digest, current_leg_digests = BATCH_CONTRACT.verify_manifest(manifest)
+                with mock.patch.object(DC, "completion_marker_is_current", return_value=True), \
+                     mock.patch.object(DC, "completion_attempt_readiness",
+                                       return_value=SimpleNamespace(state="ready", reason="settled")), \
+                     mock.patch.object(DC, "dispatch_state_roots", return_value=[state]), \
+                     mock.patch.object(DC, "resolve_dispatch_state_root", return_value=state):
+                    reserved["owner_closure_proof"] = governor._validate_legacy_visual_closure_peer(
+                        peers[0], current_manifest, current_digest, current_leg_digests,
+                        [leg["attempt_id"] for leg in pending])
+                return ["reservation-fixture"]
+
+            def collect(item):
+                leg, token, proc = item
+                stdout = ("check=ok\n" f"adapter={leg['adapter']}\nstatus=start\n"
+                          f"attempt_id={leg['attempt_id']}\nregistered=1\nstarted=1\n"
+                          "child_spawned=1\nduplicate_attempt=0\n")
+                proc.returncode = 0
+                return leg, token, proc, stdout, ""
+
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, {
+                    "AGENT_DISPATCH_SELF_SLUG": "owner",
+                    "AGENT_DISPATCH_ATTEMPT_ID": "att-owner-current"}, clear=False))
+                stack.enter_context(mock.patch.object(batch, "load_route", return_value=route))
+                stack.enter_context(mock.patch.object(batch, "resolve_agent_home", return_value=agent_home))
+                stack.enter_context(mock.patch.object(batch, "resolve_global_registry",
+                                                       return_value=SimpleNamespace(path=jobs)))
+                stack.enter_context(mock.patch.object(batch.DISPATCH_NODE, "current_parent_identity",
+                                                       return_value=parent_identity))
+                stack.enter_context(mock.patch.object(batch, "resolve_live_parent_attempt"))
+                stack.enter_context(mock.patch.object(batch, "adopt_self_parent"))
+                stack.enter_context(mock.patch("dispatch_contract.work_root_identity", return_value=str(base)))
+                stack.enter_context(mock.patch.object(batch, "completion_marker_gate"))
+                stack.enter_context(mock.patch.object(batch.DISPATCH_NODE, "admit_round", side_effect=admission))
+                stack.enter_context(mock.patch.object(batch, "decide_continuation",
+                    return_value=SimpleNamespace(allowed=True, state="admit", next_action="", retry_when="")))
+                stack.enter_context(mock.patch.object(batch, "assign_harnesses", side_effect=assign))
+                stack.enter_context(mock.patch.object(batch, "resolve_model_governor_root",
+                                                       return_value=base / "governor"))
+                stack.enter_context(mock.patch.object(batch, "dispatch_state_roots", return_value=[state]))
+                stack.enter_context(mock.patch.object(batch, "resolve_dispatch_state_root", return_value=state))
+                stack.enter_context(mock.patch.object(batch, "completion_marker_is_current",
+                    side_effect=lambda _route, _node, _path, marker, **_kw:
+                    marker.get("attempt_id") == attempts[1]))
+                stack.enter_context(mock.patch.object(batch, "completion_attempt_readiness",
+                    return_value=SimpleNamespace(state="ready", reason="settled")))
+                stack.enter_context(mock.patch("dispatch_capacity_evidence.active_limits", return_value={}))
+                stack.enter_context(mock.patch("dispatch_replacement_batch.seal_launch_input"))
+                stack.enter_context(mock.patch.object(batch, "reserve_batch", side_effect=reserve))
+                stack.enter_context(mock.patch.object(batch, "cancel_unclaimed"))
+                stack.enter_context(mock.patch.object(batch, "node_launch_command", return_value=["fixture-launch"]))
+                stack.enter_context(mock.patch.object(batch.subprocess, "Popen",
+                    return_value=SimpleNamespace(pid=91234, returncode=0, poll=lambda: 0)))
+                stack.enter_context(mock.patch.object(batch, "collect_wrapper", side_effect=collect))
+                stack.enter_context(mock.patch.object(batch, "record_allocation_receipt", return_value=None))
+                stack.enter_context(mock.patch.object(batch, "record_degradation", return_value=None))
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    exit_code = batch.main(["--route", str(route_file), "--parallel-group", group,
+                        "--start", "--parent", "owner", "--jobs", str(jobs),
+                        "--prompt-text", prompt_text])
+            receipt = json.loads(stdout.getvalue().splitlines()[-1])
+            self.assertEqual(exit_code, 0, receipt)
+            self.assertEqual(round_calls, [nodes[0]["id"]])
+            self.assertEqual(reserved["attempts"], [receipt["legs"][0]["attempt_id"]])
+            self.assertEqual(len(reserved["attempts"]), 1)
+            self.assertEqual(reserved["members"], [node["id"] for node in nodes])
+            self.assertEqual(reserved["peers"][0]["attempt_id"], attempts[1])
+            closure_proof = reserved["owner_closure_proof"]["batch_peer_proof"]
+            self.assertTrue(closure_proof["legacy_owner_closure"])
+            self.assertEqual(closure_proof["source_manifest_sha256"], digest)
+            self.assertEqual(closure_proof["attempt_id"], attempts[1])
+            self.assertEqual(receipt["newly_started"], 1, receipt)
+            self.assertEqual(receipt["existing"], 1, receipt)
 
 
 class AdmissionSelectionFixture(unittest.TestCase):

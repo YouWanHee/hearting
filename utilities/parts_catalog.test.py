@@ -266,19 +266,19 @@ def golden_payload(case):
 
 
 class GoldenTest(CatalogBase):
-    """A165-5: catalog-free routes keep their pre-catalog bytes and capability digest."""
+    """Pin catalog-free routes while allowing the adopted design layout migration."""
 
     maxDiff = None
 
-    def test_catalog_free_routes_match_the_pre_catalog_golden(self):
+    def test_catalog_free_routes_match_the_current_layout_golden(self):
         payload = golden_payload(self)
         if os.environ.get("SD165_GOLDEN_WRITE") == "1":
             GOLDEN.parent.mkdir(parents=True, exist_ok=True)
             GOLDEN.write_text(payload + "\n", encoding="utf-8")
             return
         if not GOLDEN.is_file():
-            self.fail("utilities/fixtures/sd165-route-golden.json missing; generate it on the "
-                      "pre-catalog tree with SD165_GOLDEN_WRITE=1")
+            self.fail("utilities/fixtures/sd165-route-golden.json missing; regenerate it with "
+                      "SD165_GOLDEN_WRITE=1 after an intentional topology change")
         expected = json.loads(GOLDEN.read_text(encoding="utf-8"))
         actual = json.loads(payload)
         self.assertEqual(sorted(actual["scenarios"]), sorted(expected["scenarios"]))
@@ -449,9 +449,9 @@ class BorrowTest(CatalogBase):
                  "parts/autopilot-research/synthesis/cards/**"],
             # literal: every cycle anchor is kept
             ("autopilot-design", "default", "refs,autopilot-research:synthesis,build,visual-verify,handoff"):
-                ["designs/<cycle>/parts/autopilot-research/synthesis/analysis_summary.md",
+                ["designs/parts/autopilot-research/synthesis/analysis_summary.md",
                  "spec/design/parts/autopilot-research/synthesis/analysis_summary.md",
-                 "designs/<cycle>/parts/autopilot-research/synthesis/cards/**",
+                 "designs/parts/autopilot-research/synthesis/cards/**",
                  "spec/design/parts/autopilot-research/synthesis/cards/**"],
             ("autopilot-spec", "api", "research,autopilot-research:synthesis,review,prd-transaction"):
                 ["spec/parts/autopilot-research/synthesis/analysis_summary.md",
@@ -678,8 +678,8 @@ class StagesTest(unittest.TestCase):
         self.assertNotIn("autopilot-lab:full-run", by_host[("autopilot-draft", ("doc", "paper", "presentation"))])
         design = next(b for b in blocks if b["capability"] == "autopilot-design")
         self.assertEqual(design["frame_brief_inputs"], [
-            "designs/<cycle>/01_refs/frame/direction-brief.md",
-            "designs/<cycle>/01_refs/frame-alternative/direction-brief.md"])
+            "designs/01_refs/frame/direction-brief.md",
+            "designs/01_refs/frame-alternative/direction-brief.md"])
 
     def test_compute_execution_needs_live_only_on_the_part_catalog_rows(self):
         registry = TOPO.load_registry()
