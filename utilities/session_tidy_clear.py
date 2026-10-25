@@ -96,6 +96,8 @@ REASON_TEXT = {
     "usage-unknown": "현재 입력 토큰을 확인하지 못했습니다",
     "idle-card-not-accepted": "유휴 정리 카드를 접수하지 못했습니다",
 }
+# Reasons after which this seat holds no card for the next session to receive.
+NO_CARD_REASONS = frozenset({"card-taken", "idle-card-not-accepted"})
 # Continue skips the person caused (or chose) themselves: no result line for these.
 CONTINUE_QUIET = frozenset({"new-input", "draft", "card-changed", "handed-off", "no-card", "superseded", "off"})
 
@@ -365,18 +367,25 @@ def validate_idle_request(path, nonce: Optional[str] = None, *, now: Optional[fl
     return req, ""
 
 
+def reply_card_guide(nonce: str) -> str:
+    begin, end = st.reply_card_markers(nonce)
+    return ("Skill·지침·도구를 쓰지 말고 답 하나로 끝내세요. 답의 첫 줄은 정확히 " + begin + ", 마지막 줄은 정확히 "
+            + end + " 로 쓰고, 그 사이에 카드 본문으로 진행 중, 기다리는 결정, 다음 할 일, 관련(경로·PR·세션), "
+            "오늘 한 일, 사용자 지시(끝남/남음/보류) 여섯 항목을 사용자의 언어로 90줄 이내로 씁니다. "
+            "턴이 끝나면 하팅이 이 답을 카드로 저장하고 기억 정리를 접수합니다. ")
+
+
 def idle_card_request_text(req: dict) -> str:
     nonce = str(req.get("nonce") or "")
     if req.get("origin") == "compact":
-        return ("자동 압축 뒤 카드 작성 요청입니다. 지금까지의 이 대화만 바탕으로 기존 session-tidy 안내에 따라 "
-                "진행 중, 기다리는 결정, 다음 할 일, 관련 경로를 사용자의 언어로 짧게 작성하고 기존 card/enqueue를 "
-                "실행해 이 압축 건의 기억 정리를 접수하세요. 빈 요약을 만들거나 다음 작업을 시작하지 마세요. "
+        return ("자동 압축 뒤 카드 작성 요청입니다. 지금까지의 이 대화만 바탕으로 session-tidy 카드를 쓰세요. "
+                + reply_card_guide(nonce) +
+                "빈 요약을 만들거나 다음 작업을 시작하지 마세요. "
                 "이 요청이 끝나면 창 비우기와 이어서하기는 예약된 기존 절차가 처리합니다. "
                 f"요청 식별자: {nonce}")
-    return ("자동 유휴 정리 요청입니다. 지금까지의 이 대화만 바탕으로 session-tidy 카드의 "
-            "진행 중, 기다리는 결정, 다음 할 일, 관련 경로를 사용자의 언어로 짧게 작성하세요. "
-            "현재 session-tidy 안내에 따라 기존 card 작성 명령과 enqueue를 실행해 기억 정리를 접수하세요. "
-            "별도 작업을 시작하거나 이어서 하지 말고, 카드가 접수되면 다음 입력을 기다리세요. "
+    return ("자동 유휴 정리 요청입니다. 지금까지의 이 대화만 바탕으로 session-tidy 카드를 쓰세요. "
+            + reply_card_guide(nonce) +
+            "별도 작업을 시작하거나 이어서 하지 말고, 답을 마치면 다음 입력을 기다리세요. "
             f"요청 식별자: {nonce}")
 
 
@@ -1071,9 +1080,11 @@ def _refresh_compact_card(req: dict, observation: dict) -> None:
             held["snapshot_count"] = len(bindings)
             _write_reservation(held)
             st.update_compact_card_locked(seat, int(req.get("card_generation", 0) or 0), identity,
-                                          recent=str(observation.get("recent") or ""),
+                                          recent=str(observation.get("recent_post", observation.get("recent")) or ""),
                                           source=str(observation.get("source") or ""),
-                                          recent_partial=bool(observation.get("recent_partial")))
+                                          recent_partial=bool(observation.get("recent_partial")),
+                                          recent_preserved=str(observation.get("recent_preserved") or ""),
+                                          last_reply=observation.get("last_reply"))
     except BaseException:
         # The original complete summary remains authoritative; best-effort enrichment
         # and the extra snapshot do not turn missing transcript detail into a clear gate.
@@ -1515,11 +1526,12 @@ def followup_text(req: dict) -> str:
 def _notice_text(outcome: str, reason: str, harness: str) -> str:
     hint = CLEAR_COMMAND.get(harness, "/clear")
     why = REASON_TEXT.get(reason, reason or "알 수 없음")
+    kept = "" if reason in NO_CARD_REASONS else f" 카드는 저장돼 있어 {hint} 하면 새 창이 카드를 받습니다."
     if outcome == "unverified":
-        return f"[정리] 창 비우기를 요청했지만 결과를 확인하지 못했습니다. 창 상태를 확인하고 필요하면 {hint} 하세요."
+        return f"[정리] 창 비우기를 요청했지만 결과를 확인하지 못했습니다. 창 상태를 확인하고 필요하면 {hint} 하세요.{kept}"
     if outcome == "failed":
-        return f"[정리] 창 비우기에 실패했습니다({why}). 필요하면 {hint} 하세요."
-    return f"[정리] 창을 자동으로 비우지 않았습니다({why}). 필요하면 {hint} 하세요."
+        return f"[정리] 창 비우기에 실패했습니다({why}). 필요하면 {hint} 하세요.{kept}"
+    return f"[정리] 창을 자동으로 비우지 않았습니다({why}). 필요하면 {hint} 하세요.{kept}"
 
 
 def _continue_notice_text(outcome: str, reason: str, prompt_text: str = CONTINUE_TEXT) -> str:

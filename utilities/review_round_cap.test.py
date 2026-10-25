@@ -100,6 +100,25 @@ class ClassifyRoundRowTest(unittest.TestCase):
 
 
 class RoundBudgetTest(unittest.TestCase):
+    def test_no_start_census_retains_pending_and_reviewed_terminal_conflicts(self):
+        import json
+        for reviewed in (False, True):
+            history = {"late-result": {"note": "completed-marker", "failure_class": "pass"}}
+            if reviewed:
+                history["late-result"]["review_sha256"] = "f" * 64
+            metadata = {"launch_outcome": "never-launched", "launch_claimed": "0",
+                        "terminal_conflict": "1", "terminal_conflicts_b64":
+                        base64.b64encode(json.dumps(history).encode()).decode()}
+            rows = [row("done", "dead-capacity", failure_class="capacity", extra={
+                **metadata, "attempt_id": f"att-conflict-{index}"}) for index in (1, 2)]
+            physical = [(["now", status, "/repo", "/wt", "review", ""], meta)
+                        for status, meta in rows]
+            self.assertEqual(CAP.logical_round_records(physical), physical)
+            expected = "verdictless-bound" if reviewed else "blocked-unsettled"
+            self.assertEqual(CAP.round_budget(route(), review_node(), rows).state, expected)
+            self.assertEqual(AUTH.decide_continuation(
+                route(), action="round", node=review_node(), rows=rows).budget.state, expected)
+
     def test_owner_closed_fail_gets_one_approved_closure_without_becoming_pass(self):
         closed = row('done', 'completed-marker', failure_class='fail', extra={
             'attempt_id': 'att-review-2', 'review_gate_closure': 'owner-closure',

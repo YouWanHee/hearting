@@ -154,6 +154,7 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 module._resolve_compose_plan = lambda *args: (None, None)
+module._compose_git_diagnosis = lambda cwd: {"state": "git", "root": str(cwd)}
 def capture(**kwargs):
     print(json.dumps(kwargs["work_request"]["text"]))
     raise SystemExit(0)
@@ -167,6 +168,18 @@ module.main()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), task)
         self.assertIn('fixture-run__a1', task)
+
+    def test_retry_recovery_shows_completed_compute_candidate_as_unverified(self):
+        route, path, jobs, registry, output, ledger, gates = self.fixture()
+        armed = json.loads((ledger.root / 'armed/full-run.json').read_text())
+        with mock.patch('route_parent_close.linked_resources', return_value=[
+                {"kind": "compute", "run_id": "compute-candidate", "state": "finished"}]) as scan:
+            task = R.retry_step(route, armed, jobs, 'resource failed')['command']
+        scan.assert_called_once()
+        self.assertIn("compute-candidate", task)
+        self.assertIn("unverified", task)
+        self.assertIn("resource-runner start --compute-run compute-candidate", task)
+        self.assertNotIn("--compute-run latest", task)
 
     def test_retry_of_a_retry_gets_a_distinct_identity_with_a_missing_registry(self):
         route, path, jobs, registry, output, ledger, gates = self.fixture()

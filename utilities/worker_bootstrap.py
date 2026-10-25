@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -18,7 +19,7 @@ UNIT_REF_RE = re.compile(r"^[a-z-]+/[a-z-]+$")
 RESERVED_UNITS = ("_kernel/owner", "_kernel/resource")
 ARTIFACT_PRODUCER_CYCLE_ENV = (
     "AGENT_ARTIFACT_CAMPAIGN_ID", "AGENT_ARTIFACT_CYCLE_ID", "AGENT_ARTIFACT_PRODUCER_ID",
-    "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_OUTPUT_DIR",
+    "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_OUTPUT_DIR", "AGENT_RUNTIME_DIR",
 )
 _FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
 WORKER_KIND_TYPES = {
@@ -227,13 +228,70 @@ def artifact_cycle_environment(environ) -> dict[str, str]:
     return values
 
 
+def runtime_dir_candidate(artifact_root, environ=None) -> str:
+    """Purely resolve an optional project runtime path; never create it here."""
+    import os
+    values = os.environ if environ is None else environ
+    try:
+        root = Path(artifact_root).expanduser().resolve(strict=False)
+        raw = values.get("AGENT_RUNTIME_DIR", "")
+        if raw:
+            supplied = Path(raw).expanduser()
+            if not supplied.is_absolute():
+                return ""
+            candidate = supplied.resolve(strict=False)
+            default = (root.parent / ".agent_runtime").resolve(strict=False)
+            # Nested dispatch inherits this generated default as an override.
+            # Preserve exactly that path while keeping user overrides fenced.
+            if candidate == default:
+                return str(candidate)
+            home = Path.home().resolve(strict=False)
+            project = root.parent
+            if (candidate == Path("/") or candidate == home or candidate == project
+                    or candidate.is_relative_to(root) or candidate.is_relative_to(home)
+                    or candidate.is_relative_to(project)):
+                return ""
+            if "releases" in candidate.parts or ".harness" in candidate.parts:
+                return ""
+            return str(candidate)
+        return str(root.parent / ".agent_runtime")
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return ""
+
+
+def prepare_runtime_dir(candidate: str) -> str:
+    """Create only the optional runtime root and its private ignore marker."""
+    if not candidate:
+        return ""
+    try:
+        path = Path(candidate).resolve(strict=False)
+        if not path.is_absolute() or path == Path("/") or path == Path.home().resolve(strict=False):
+            return ""
+        path.mkdir(parents=True, exist_ok=True)
+        if not path.is_dir():
+            return ""
+        marker = path / ".gitignore"
+        if marker.exists() or marker.is_symlink():
+            if marker.is_symlink() or not marker.is_file() or marker.read_bytes() != b"*\n":
+                return ""
+        else:
+            marker.write_bytes(b"*\n")
+        return str(path)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return ""
+
+
 def artifact_context_prompt(environ) -> str:
     values = artifact_cycle_environment(environ)
     output = values["AGENT_ARTIFACT_OUTPUT_DIR"]
     if not output:
         return ""
+    runtime = values.get("AGENT_RUNTIME_DIR", "")
+    runtime_line = (f"- runtime_dir: {runtime}\n"
+                    "- Put environments, caches, external checkouts, and checkpoints under runtime_dir; keep reports and provenance in artifacts.\n") if runtime else ""
     return (f"- artifact_cycle_id: {values['AGENT_ARTIFACT_CYCLE_ID']}\n"
             f"- artifact_output_dir: {output}\n"
+            f"{runtime_line}"
             "- Resolve relative artifact paths beneath artifact_output_dir.\n")
 
 
@@ -443,6 +501,21 @@ def node_scope_prompt(scope: "NodeScope") -> str:
     return " ".join(lines) + "\n"
 
 
+def completion_scope_prompt() -> str:
+    """Keep procedure defaults subordinate to the approved request and node scope."""
+    return (
+        "Completion precedence:\n"
+        "Complete feasible remaining duties in the recorded request within the "
+        "approved endpoint and this node's assigned scope. Quick examples, concise "
+        "reports, and role or intensity defaults do not replace requested "
+        "investigation, deliverables, or verification. Stop at an approved report "
+        "endpoint; a bounded stage completes only its assigned portion and leaves "
+        "deferred stages to their owners. If assigned work remains unfinished or "
+        "blocked, report it with the existing outcome semantics instead of "
+        "presenting the whole request as complete.\n\n"
+    )
+
+
 def released_task_prompt(args) -> str:
     """Carry the same released task across owner/stage and runtime boundaries.
 
@@ -492,16 +565,33 @@ def released_task_prompt(args) -> str:
     return (
         "Released task context (frame-review):\n"
         "The recorded scope and decisions below govern this work. Apply the "
-        "assigned stage within that scope; role defaults do not expand it. Cite "
+        "assigned stage within that scope; role and intensity defaults neither "
+        "expand nor shrink it. Quick examples and concise reporting are procedure "
+        "defaults, not scope changes. Cite "
         "applicable decision ids in the output.\n\n"
         f"{intent}\n"
     )
 
 
-def runtime_progress_prompt() -> str:
-    return ("The runtime observes tool progress and publishes completion. "
+def runtime_progress_prompt(args=None, *, now=None) -> str:
+    text = ("The runtime observes tool progress and publishes completion. "
             "No per-tool heartbeat command is required. Complete the assigned work "
-            "and return its final artifact and verdict.\n\n")
+            "and return its final artifact and verdict.")
+    if args is not None and getattr(args, "worker_type", None) == "stage":
+        try:
+            seconds = float(args.foreground_timeout)
+            if seconds > 0 and seconds < float("inf"):
+                origin = now or datetime.now(timezone.utc)
+                if origin.tzinfo is None:
+                    origin = origin.replace(tzinfo=timezone.utc)
+                deadline = origin.astimezone(timezone.utc) + timedelta(seconds=seconds)
+                text += (f"\nThis attempt's execution budget is {seconds:g} seconds "
+                         f"({seconds / 60:g} minutes); approximate deadline: "
+                         f"{deadline.strftime('%Y-%m-%d %H:%M:%S UTC')}. "
+                         "Long waits, including waiting with sleep, use this budget.")
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            text += "\nThe attempt budget/deadline is unavailable in this prompt."
+    return text + "\n\n"
 
 
 def owner_gate_prompt(args) -> str:
@@ -723,7 +813,8 @@ def assignment_prompt(args, task: str, environ) -> str:
     if getattr(args, "worker_type", None) != "frame":
         route_file = getattr(args, "route_file", None)
         if not route_file:
-            return f"Assignment:\n{task.rstrip()}\n\n{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}"
+            return (f"Assignment:\n{task.rstrip()}\n\n{completion_scope_prompt()}"
+                    f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}")
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
         source_worktree = _linked_slice_source_worktree(args, route)
         scope_environment = _child_scope_environment(args, route, environ, source_worktree)
@@ -734,7 +825,8 @@ def assignment_prompt(args, task: str, environ) -> str:
             source_worktree=source_worktree,
             source_worktree_verified=source_worktree is not None,
         )
-        return (f"Assignment:\n{task.rstrip()}\n\n{plan_leg_prompt(route, getattr(args, 'route_node', None))}"
+        return (f"Assignment:\n{task.rstrip()}\n\n{completion_scope_prompt()}"
+                f"{plan_leg_prompt(route, getattr(args, 'route_node', None))}"
                 f"{node_scope_prompt(scope)}{input_sources_prompt(route, getattr(args, 'route_node', None))}\n"
                 f"{automatic_consumer_prompt(route, getattr(args, 'route_node', None))}"
                 f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}")

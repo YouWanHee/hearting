@@ -115,6 +115,21 @@ def git_operation_state(worktree) -> tuple[str | None, bool]:
 def runtime_permission_projection(args) -> dict[str, object]:
     """Project shared mutation/publication state for launch and same-session resume."""
     operation, known = git_operation_state(getattr(args, "worktree", ""))
+    unversioned = False
+    if not known:
+        try:
+            from dispatch_contract import validated_unversioned_route
+            env = dict(os.environ)
+            env["AGENT_ROUTE_FILE"] = (getattr(args, "route_file", None)
+                                       or getattr(args, "owner_route_file", None)
+                                       or env.get("AGENT_ROUTE_FILE")
+                                       or env.get("AGENT_OWNER_ROUTE_FILE", ""))
+            route = validated_unversioned_route(getattr(args, "worktree", ""), environ=env)
+            if route is not None:
+                operation, known = None, True
+                unversioned = True
+        except (OSError, ValueError, TypeError):
+            pass
     observation_only = not known or operation is not None
     authorized_commit = (
         getattr(args, "worker_type", None) == "owner" or stage_commit_enabled(args)
@@ -123,10 +138,11 @@ def runtime_permission_projection(args) -> dict[str, object]:
         "git_operation": operation,
         "git_state_known": known,
         "observation_only": observation_only,
-        "may_commit": authorized_commit and not observation_only,
+        "may_commit": authorized_commit and not observation_only and not unversioned,
         "task_publish_scope": (
             task_publish_scope(args)
-            if not observation_only and getattr(args, "worker_type", None) == "owner"
+            if not observation_only and not unversioned
+            and getattr(args, "worker_type", None) == "owner"
             else None
         ),
     }
@@ -427,8 +443,8 @@ def commit_git_metadata_dirs(args) -> tuple[Path, ...]:
 
 
 def prompt_clause(args) -> str:
-    operation, known = git_operation_state(getattr(args, "worktree", ""))
-    if not known or operation is not None:
+    projection = runtime_permission_projection(args)
+    if not projection["git_state_known"] or projection["git_operation"] is not None:
         return MERGE_OBSERVATION_CLAUSE
     return PROMPT_CLAUSE if no_commit_stage(args) else ""
 

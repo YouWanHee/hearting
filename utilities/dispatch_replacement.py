@@ -118,7 +118,21 @@ def _directory(jobs):
     return Path(jobs).resolve().parent / 'automatic-replacements'
 
 
+_ROWS_MEMO = [None, None]
+
+
 def _rows(lines):
+    """Registry rows by attempt id. Callers re-read the same registry many times in one
+    process, so the last parse is reused for identical content; each call gets copies."""
+    lines = tuple(lines)
+    key, cached = _ROWS_MEMO
+    if cached is None or key != lines:
+        cached = _parse_rows(lines)
+        _ROWS_MEMO[:] = [lines, cached]
+    return {aid: (list(fields), dict(meta)) for aid, (fields, meta) in cached.items()}
+
+
+def _parse_rows(lines):
     result = {}
     for line in lines:
         fields = line.split('\t')
@@ -494,6 +508,224 @@ def _instant(value):
     if moment.tzinfo is None:
         raise ValueError('instant-without-timezone')
     return moment
+
+
+def _source_scope_matches(path, scopes):
+    import fnmatch
+    from artifact_context import classify_scope
+    path = path.replace('\\', '/')
+    if any(part in {'.agent_reports', '.claude_reports', '.codex_reports',
+                    '.opencode_reports', 'artifacts'} for part in path.split('/')):
+        return False
+    in_tests = path.startswith('tests/')
+    for scope in scopes or ():
+        if classify_scope(scope) != 'source':
+            continue
+        if scope.startswith('tests/'):
+            if in_tests and fnmatch.fnmatchcase(path, scope):
+                return True
+        elif not in_tests:
+            # `source/**` and `source-alternative/**` denote source files in
+            # the route worktree; they are scope vocabulary, not disk paths.
+            return True
+    return False
+
+
+def _git_readonly(worktree, *args):
+    import artifact_context
+    try:
+        return subprocess.run(
+            ['git', '-C', str(worktree), *args], capture_output=True,
+            env=artifact_context._readonly_git_env(), timeout=3, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _stage_progress_block(jobs, aid, fields, meta, lines):
+    """Bounded factual observations for a failed stage attempt; never a completion claim."""
+    if (meta.get('worker_type') != 'stage'
+            or fields[1] not in {'done', 'cancelled', 'killed'}
+            or meta.get('note') not in {'dead-timeout', 'dead-no-progress'}):
+        return ''
+    observations = [f'- prior attempt: {aid}']
+    for key in ('note', 'failure_class', 'process_exit', 'exit_code', 'status'):
+        if meta.get(key) is not None:
+            observations.append(f'- recorded {key}: {str(meta[key])[:240]}')
+    start = None
+    try:
+        start = _instant(fields[0])
+    except (ValueError, TypeError, IndexError):
+        pass
+    end = None
+    for key in ('terminal_event_at', 'terminal_receipt_at', 'ended_at', 'completed_at'):
+        if meta.get(key):
+            try:
+                end = _instant(meta[key])
+                break
+            except (ValueError, TypeError):
+                continue
+    observed = datetime.now(timezone.utc)
+    if end:
+        observations.append(f'- recorded terminal time: {end.astimezone(timezone.utc).isoformat()}')
+    else:
+        observations.append(f'- end unavailable; observed at {observed.isoformat()}')
+    if start:
+        upper = end or observed
+        elapsed = max(0.0, (upper - start).total_seconds())
+        label = 'elapsed to recorded terminal time' if end else 'interval since recorded start'
+        observations.append(f'- {label}: {elapsed:.1f} seconds')
+    else:
+        observations.append('- elapsed unavailable: recorded start time is invalid or absent')
+
+    route = None
+    route_path = meta.get('route_file')
+    try:
+        if route_path:
+            route = _read(Path(route_path))
+        if not isinstance(route, dict):
+            raise ValueError('route unavailable')
+        DC._route_module().verify_route(route)
+    except Exception:
+        route = None
+    node = next((item for item in (route or {}).get('nodes', [])
+                 if item.get('id') == meta.get('route_node')), None)
+    worktree = (route or {}).get('cwd')
+    scopes = (node or {}).get('write_scope') or []
+    unversioned = bool(route and route.get('source_commit') == 'unversioned')
+    head = None
+    if unversioned:
+        observations.append('- git 아닌 폴더 — 커밋·미커밋 관찰 해당 없음')
+    elif worktree:
+        result = _git_readonly(worktree, 'rev-parse', 'HEAD')
+        if result is not None and result.returncode == 0:
+            head = result.stdout.decode('ascii', 'replace').strip()
+            observations.append(f'- current worktree HEAD: {head or "(empty response)"}')
+        else:
+            observations.append('- current worktree HEAD unavailable (Git observation failed)')
+    else:
+        observations.append('- worktree unavailable from the sealed route')
+
+    launch_head = meta.get('launch_head')
+    if unversioned:
+        observations.append('- commit range: 해당 없음 (unversioned route)')
+    elif not launch_head:
+        observations.append('- launch_head unavailable; commit range not observed')
+    elif not worktree or not head:
+        observations.append(f'- launch_head recorded ({launch_head}); commit range unavailable')
+    else:
+        result = _git_readonly(worktree, 'log', '--format=%H%x00%s%x1e',
+                               f'{launch_head}..HEAD')
+        if result is None or result.returncode != 0:
+            observations.append(f'- commit range {launch_head}..HEAD unavailable (Git observation failed)')
+        else:
+            commits = []
+            for record in result.stdout.split(b'\x1e'):
+                fields = record.strip(b'\r\n').split(b'\0')
+                if len(fields) != 2:
+                    continue
+                commit, subject = fields
+                if not re.fullmatch(rb'(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})', commit):
+                    continue
+                commits.append((commit.decode('ascii'),
+                                subject.decode('utf-8', 'replace').replace('\n', ' ')[:160]))
+            observations.append(f'- commits after launch_head: {len(commits)} observed')
+            for commit, subject in commits[:20]:
+                observations.append(f'  - {commit} {subject}')
+            if len(commits) > 20:
+                observations.append(f'  - truncated; {len(commits) - 20} more commit(s)')
+
+    if worktree and not unversioned:
+        result = _git_readonly(worktree, 'status', '--porcelain=v1', '-z',
+                               '--untracked-files=all')
+        if result is None or result.returncode != 0:
+            observations.append('- scoped uncommitted paths unavailable (Git status failed)')
+        else:
+            records = [item for item in result.stdout.split(b'\0') if item]
+            paths = []
+            index = 0
+            while index < len(records):
+                entry = records[index]
+                index += 1
+                status = entry[:2].decode('ascii', 'replace')
+                path = entry[3:].decode('utf-8', 'replace')
+                candidates = [path]
+                if 'R' in status or 'C' in status:
+                    if index < len(records):
+                        candidates.append(records[index].decode('utf-8', 'replace'))
+                        index += 1
+                for candidate in candidates:
+                    if _source_scope_matches(candidate, scopes):
+                        paths.append((status, candidate))
+            paths.sort(key=lambda item: item[1])
+            observations.append(f'- scoped uncommitted paths: {len(paths)} observed')
+            for status, path in paths[:40]:
+                observations.append(f'  - {status} {path}')
+            if len(paths) > 40:
+                observations.append(f'  - truncated; {len(paths) - 40} more path(s)')
+    elif unversioned:
+        observations.append('- scoped uncommitted paths: 해당 없음 (unversioned route)')
+
+    try:
+        import artifact_context
+        context = artifact_context.resolve_context(
+            environ={}, route=route, node_id=meta.get('route_node'),
+            explicit={'artifact_root': (route or {}).get('artifact_root')},
+        ) if route else None
+        output = context.output_dir if context else None
+        if output is None:
+            observations.append('- cycle outputs unavailable (no bound canonical cycle output)')
+        elif output.is_symlink():
+            observations.append('- cycle outputs unavailable (canonical output path is a symlink)')
+        elif not start:
+            observations.append('- cycle outputs unavailable (attempt start time unavailable)')
+        else:
+            declarations = [value for value in [*(node or {}).get('outputs', ()), *scopes]
+                            if artifact_context.classify_scope(value) == 'artifact'
+                            and not artifact_context.is_semantic_output(value)]
+            changed = []
+            seen = 0
+            truncated_scan = False
+            for base, dirs, files in os.walk(output, followlinks=False):
+                dirs[:] = sorted(name for name in dirs
+                                 if not (Path(base) / name).is_symlink())
+                for name in sorted(files):
+                    path = Path(base) / name
+                    seen += 1
+                    if seen > 5000:
+                        truncated_scan = True
+                        break
+                    if path.is_symlink():
+                        continue
+                    relative = path.relative_to(output).as_posix()
+                    if not artifact_context.scope_matches(relative, declarations):
+                        continue
+                    try:
+                        mtime = datetime.fromtimestamp(path.stat(follow_symlinks=False).st_mtime,
+                                                       timezone.utc)
+                    except OSError:
+                        continue
+                    if start <= mtime <= (end or observed):
+                        changed.append((mtime.isoformat(), relative))
+                if truncated_scan:
+                    break
+            changed.sort(key=lambda item: (item[0], item[1]))
+            observations.append(f'- scoped cycle output paths changed in observed interval: {len(changed)}')
+            for timestamp, relative in changed[:40]:
+                observations.append(f'  - {timestamp} {relative}')
+            if len(changed) > 40:
+                observations.append(f'  - truncated; {len(changed) - 40} more path(s)')
+            if truncated_scan:
+                observations.append('- cycle scan incomplete after 5000 files')
+            if not end:
+                observations.append('- mtime upper bound is observation time; mtime is not authorship proof and cannot show deleted or timestamp-preserved changes')
+    except Exception as exc:
+        observations.append(f'- cycle output observation unavailable: {type(exc).__name__}')
+    observations.extend([
+        '- These are observations only; commits are not a test/pass/completion or authorship claim.',
+        '- Empty observations describe only the current readable state; unavailable observations are stated separately.',
+    ])
+    return '\n\n## Observed prior-attempt progress\n' + '\n'.join(observations) + '\n'
 
 
 def owner_parked_gate(jobs, aid, *, lines=None):
@@ -1304,8 +1536,7 @@ def _completion_unproven(route, node, marker, currency):
     judged = (f"Completed node {node_id} reads {currency.state} ({currency.reason}); "
               "running the same start again cannot change that.")
     if action != '-':
-        error.next_step = (f"{judged} Run: {action} (outside an owner add "
-                           "--author-attempt-id <attempt that made the change>), then resume.")
+        error.next_step = f"{judged} Run: {action}, then resume."
     else:
         error.next_step = f"{judged} Inspect that node's completion marker and evidence, then resume."
     return error
@@ -1329,16 +1560,30 @@ def _reuse_snapshot(jobs, route, lines):
         if merge_unobservable:
             import commit_policy
             merge_unobservable = commit_policy.git_operation(route.get('cwd', '')) == 'merge'
-        if currency.state not in {'current', 'superseded'} and not merge_unobservable:
+        gates_off_edit = (currency.state == 'revised-unrecorded'
+                          and currency.reason == 'completion-evidence-revised-unrecorded'
+                          and not DC.gates_on())
+        if currency.state not in {'current', 'superseded'} and not merge_unobservable and not gates_off_edit:
             raise _completion_unproven(route, node, marker, currency)
         ready = DC.completion_attempt_readiness(route, node, marker, Path(jobs), registry_lines=lines)
         if ready.state != 'ready':
             raise DC.DispatchContractError('replacement-completion-unsettled', str(node['id']))
-        observations[str(node['id'])] = (node, path, marker, currency)
+        restored_from = None
+        revision = marker.get('revision') if isinstance(marker.get('revision'), dict) else {}
+        if (marker.get('stage_authority') == 'revision'
+                and revision.get('basis') == 'upstream-revision-consumed'):
+            try:
+                restored_from = _digest(_read(directory / f"{node['id']}.{revision['of_sequence']}.json"))
+            except (OSError, ValueError, KeyError, TypeError):
+                raise DC.DispatchContractError('replacement-restored-predecessor-unreadable', str(node['id']))
+        # Keep the predecessor digest with its own observation; the reuse
+        # rows below are built in a second pass over every node.
+        observations[str(node['id'])] = (node, path, marker, currency, restored_from)
         if currency.state == 'superseded' or merge_unobservable:
             invalidated[str(node['id'])] = {
                 'node': node['id'], 'marker_digest': _digest(marker),
                 'attempt_id': marker.get('attempt_id', ''),
+                **({'restored_from': restored_from} if restored_from else {}),
                 'currency': currency.state, 'currency_reason': currency.reason,
                 'depends_on_invalid': [],
             }
@@ -1348,7 +1593,7 @@ def _reuse_snapshot(jobs, route, lines):
     changed = True
     while changed:
         changed = False
-        for node_id, (node, _path, marker, currency) in observations.items():
+        for node_id, (node, _path, marker, currency, _restored_from) in observations.items():
             if node_id in invalidated:
                 continue
             invalid_parents = sorted(set(str(parent) for parent in node.get('depends_on') or ())
@@ -1366,12 +1611,13 @@ def _reuse_snapshot(jobs, route, lines):
         observation = observations.get(node_id)
         if observation is None or node_id in invalidated:
             continue
-        _node, path, marker, _currency = observation
+        _node, path, marker, _currency, restored_from = observation
         # A gates-off evidence edit is recorded only when this completion is
         # actually part of the successor's reusable evidence.
         DC.note_evidence_change(route, node, path, marker)
         completed.append({'node': node['id'], 'marker_digest': _digest(marker),
-                          'attempt_id': marker.get('attempt_id', '')})
+                          'attempt_id': marker.get('attempt_id', ''),
+                          **({'restored_from': restored_from} if restored_from else {})})
     pending = [str(node.get('id')) for node in route.get('nodes', [])
                if str(node.get('id')) not in {row['node'] for row in completed}]
     root = Path(route['artifact_root'])
@@ -1439,9 +1685,12 @@ def _reuse_preserved(previous, current):
                 return False
             continue
         if (not old_invalid or old_invalid.get('marker_digest') != row.get('marker_digest')
-                or old_invalid.get('attempt_id', '') != row.get('attempt_id', '')
-                or not reobserved_invalidation(old_invalid)):
-            return False
+                or old_invalid.get('attempt_id', '') != row.get('attempt_id', '')):
+            restored = (old_invalid and old_invalid.get('currency') == 'superseded'
+                        and row.get('restored_from') == old_invalid.get('marker_digest')
+                        and not row.get('depends_on_invalid'))
+            if not restored and (not old_invalid or not reobserved_invalidation(old_invalid)):
+                return False
     invalidated = {row.get('node'): row for row in current.get('invalidated', [])}
     if len(invalidated) != len(current.get('invalidated', [])):
         return False
@@ -1472,9 +1721,13 @@ def _reuse_preserved(previous, current):
             continue
         now_current = now.get(node)
         if (not now_current
-                or now_current.get('marker_digest') != old.get('marker_digest')
-                or now_current.get('attempt_id', '') != old.get('attempt_id', '')
-                or not reobserved_invalidation(old)):
+                or now_current.get('attempt_id', '') != old.get('attempt_id', '')):
+            return False
+        restored = (old.get('currency') == 'superseded'
+                    and now_current.get('restored_from') == old.get('marker_digest')
+                    and not now_current.get('depends_on_invalid'))
+        if not restored and (now_current.get('marker_digest') != old.get('marker_digest')
+                             or not reobserved_invalidation(old)):
             return False
     if any(node not in previous_completed and node not in previous_invalidated
            for node in invalidated):
@@ -2016,6 +2269,14 @@ def _advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capa
                 or rows[binding[1]][1].get('launch_claimed') == '1')):
             # Nothing is launched yet: limit, drift and cleanup are judged before anything durable is written.
             _, current_route = _route(jobs, aid, source)
+            try:
+                restore = DC._route_module().restore_consumed_tombstones(current_route, jobs=Path(jobs))
+                if restore.get("errors"):
+                    print("capability-route: restore-consumed-tombstones error=" + ";".join(restore["errors"]),
+                          file=sys.stderr)
+            except Exception as exc:
+                print(f"capability-route: restore-consumed-tombstones error={type(exc).__name__}:{exc}",
+                      file=sys.stderr)
             moved = (route_authority.moved_owner_harness(current_route, launch_input(jobs, aid, source).get('harness'))
                      if source.get('worker_type') == 'owner' else None)
             hold_source = {**source, 'harness': moved, 'model': None} if moved else source
@@ -2382,8 +2643,20 @@ def recovery_instructions(args):
             brief = launch_input(jobs, prior, source).get('retry_brief', brief)
     args.replacement_retry_brief = brief
     retry_context = ('\n\n## Partial-group retry brief\n' + brief + '\n') if brief else ''
+    stage_progress = ''
+    if prior and getattr(args, 'worker_type', '') == 'stage':
+        try:
+            progress_lines = Path(args.jobs_path).read_text(encoding='utf-8', errors='replace').splitlines()
+            progress_rows = _rows(progress_lines)
+            if prior in progress_rows:
+                source_fields, source_meta = progress_rows[prior]
+                stage_progress = _stage_progress_block(
+                    Path(args.jobs_path), prior, source_fields, source_meta, progress_lines)
+        except (OSError, ValueError, DC.DispatchContractError):
+            stage_progress = ('\n\n## Observed prior-attempt progress\n'
+                              f'- predecessor {prior} could not be read; no progress was inferred.\n')
     if not record or getattr(args, 'worker_type', '') != 'owner':
-        return retry_context
+        return retry_context + stage_progress
     lines = jobs.read_text(encoding='utf-8', errors='replace').splitlines()
     source = _rows(lines)[prior][1]
     _route_path, route = _route(jobs, prior, source)

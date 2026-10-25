@@ -20,7 +20,6 @@ inventory. It is adapter-owned output, not a legacy runtime mode copy.
 ## Use
 
 - Use Codex file, terminal, approval, sandbox, hook, and skill surfaces.
-- Run `adapters/codex/bin/preflight.sh write <file> [session-id]` before edits.
 - For `tool-contract` modes, run the named contract check before claiming the tool-backed result.
 - If a required local provider or executable is unavailable, report the unavailable contract instead of silently downgrading.
 - Treat `adapters/codex/modes/plan/plan-author.md` as the adapter-owned mode guide for this runtime.
@@ -105,6 +104,12 @@ Preload per `_shared/profile-preload.md`:
    read callers, callees, and related modules.
 3. **Analyze current state**: identify the current structure, dependencies, and
    potential impact areas.
+   For environments, caches, downloads, external checkouts, temporary files and
+   training checkpoints, judge placement against the supplied project `runtime_dir`
+   or an established external project location. Keep artifact outputs to reports,
+   configs and small provenance; point to datasets by path/hash rather than
+   planning automatic bulk copies. This is guidance, not a new plan field or
+   approval condition.
 4. **Create the plan file** at the path specified in the prompt, using the
    plan-document schema below.
    In a routed stage, use the node's declared plan output; standalone paths keep
@@ -130,11 +135,19 @@ semantics and are not mandatory literal headings):
 
 1. **Goal**: one-line summary that carries the source description and the comparison condition needed to recognize the subject; retain its original identifier as a reference. Do not infer the meaning of an unexplained key.
 2. **Current State Analysis**: current state of relevant files/functions (include
-   file paths and key line numbers).
+   file paths and key line numbers). Identify the closest existing implementation
+   and verification assets of the same function, and state what extending them
+   would involve. Treat extension as the default; when it is not appropriate,
+   explain why a new module or code path beside an existing one fits better and
+   compare the rough size and time of both options. For evaluation recipes, compare
+   the established optimizer/LR schedule, normalization, clipping, training
+   length, and augmentation before proposing a tuning change.
 3. **Change Plan**: step-by-step task list grouped by phase.
    - Group related steps into phases (e.g., "Phase 1: model changes", "Phase 2:
      engine changes").
    - Each step specifies the target file and expected changes.
+   - Give a rough changed-file and changed-line estimate with its basis; this is
+     an estimate for review, not a size limit.
    - Mark dependency order between phases and between steps within a phase.
    - Independent steps within the same phase can be parallelized during execution.
    - When the work splits into 2-4 packages with exactly disjoint files that can
@@ -148,7 +161,13 @@ semantics and are not mandatory literal headings):
      sessions while preserving one gate for the stage.
 4. **Risks**: potential side effects and caveats.
 5. **Verification**: concrete, executable test commands when possible — these are
-   consumed by the test stage after execution.
+   consumed by the test stage after execution. Estimate minutes per command and
+   in total. Execute normally runs within the attempt budget shown in your
+   prompt; compare the total with that budget.
+   Full training epochs, long regression suites, or any single run expected to
+   exceed about 30 minutes belong in a smoke, resource node, or later leg by
+   default; keep them in the code stage only with a stated reason. Count waits
+   such as `sleep` in the attempt-time estimate.
 6. **Decision Points** (optional): if any step involves an irreversible or high-risk
    action the user might want to confirm regardless of autonomy level, tag it:
    - In the step description, add: `[decision: critical|significant|routine] — {what to decide}`

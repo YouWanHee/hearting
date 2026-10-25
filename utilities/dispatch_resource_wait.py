@@ -86,6 +86,8 @@ def resource_body_digest(row):
     body = {key: row.get(key) for key in keys}
     if "launch_request" in row:
         body["launch_request"] = row["launch_request"]
+    if "execution" in row:
+        body["execution"] = row["execution"]
     return RESUME.row_digest(body)
 
 
@@ -130,13 +132,18 @@ def controller_intent(row):
 
 def resource_key(row):
     keys = ("run_id", "pid", "starttime", "command", "route", "node", "jobs", "owner_wait", "command_hash", "launch_argv", "process_group")
-    return RESUME.row_digest({key: row.get(key) for key in keys})
+    body = {key: row.get(key) for key in keys}
+    if "execution" in row:
+        body["execution"] = row["execution"]
+    return RESUME.row_digest(body)
 
 
 def context(args, control):
     """Read only exact armed records under the current owner route and registry."""
     import owner_route_binding as OWNER
-    from resource_run_registry import resource_never_started
+    from resource_run_registry import (
+        compute_execution_identity, resource_never_started,
+    )
     route_file = getattr(args, "route_file", "")
     if not route_file or not Path(route_file).is_file():
         return None
@@ -166,6 +173,14 @@ def context(args, control):
                 raise JOIN.JoinContractError("resource-owner-route-changed")
         expected = {"parent_attempt_id": args.parent_attempt_id, "session_id": control.thread_id,
             "route_id": args.route_id, "route_hash": args.route_hash, "jobs": str(jobs)}
+        remote_identity = compute_execution_identity(row)
+        execution = row.get("execution") if isinstance(row, dict) else None
+        identity_valid = (bool(remote_identity) and isinstance(execution, dict)
+                          and execution.get("receipt_state") in {"running", "finished"}
+                          if remote_identity else
+                          (controller_intent(row) or resource_never_started(row)
+                           or (type(row.get("pid")) is int and row["pid"] > 0
+                               and row.get("starttime"))))
         parent = JOIN.exact_attempt_row(jobs, args.parent_attempt_id)
         if parent.status not in {"open", "running"}:
             raise JOIN.JoinContractError("resource-owner-not-open")
@@ -176,9 +191,8 @@ def context(args, control):
                 or row.get("parent_attempt_id") != args.parent_attempt_id
                 or row.get("route") != binding.route_file or row.get("node") != node
                 or row.get("jobs") != str(jobs) or not row.get("command")
-                or not (controller_intent(row) or resource_never_started(row) or
-                        (type(row.get("pid")) is int and row["pid"] > 0 and row.get("starttime")))
-                or (row.get("pid_namespace") is not None and
+                or not identity_valid
+                or (not remote_identity and row.get("pid_namespace") is not None and
                     row["pid_namespace"] != os.readlink("/proc/self/ns/pid"))
                 or armed.get("route_id") != args.route_id or armed.get("route_hash") != args.route_hash
                 or armed.get("route_file") != binding.route_file or armed.get("jobs") != str(jobs)

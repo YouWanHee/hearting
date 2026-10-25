@@ -25,7 +25,13 @@ import fixture_processes  # noqa: E402
 
 def require_native_runtime(testcase):
     reason = None
-    if sys.platform != "linux":
+    try:
+        sandbox_init = Path("/proc/1/cmdline").read_bytes()
+    except OSError:
+        sandbox_init = b""
+    if (os.environ.get("CODEX_PERMISSION_PROFILE") or b"codex-linux-sandbox" in sandbox_init):
+        reason = "native Codex sandbox tests cannot nest inside an active Codex permission sandbox"
+    elif sys.platform != "linux":
         reason = "native Codex permission profiles require Linux"
     elif not shutil.which("codex"):
         reason = "Codex CLI is unavailable"
@@ -104,6 +110,48 @@ class PermissionProfileTest(unittest.TestCase):
             with mock.patch.object(profiles, "named_profiles_available", return_value=True):
                 return build()
 
+    def test_recordish_profile_keeps_cwd_read_only_and_allows_only_scoped_roots(self):
+        cwd = self.base / "recordish-docs"
+        artifact = cwd / ".agent_reports"
+        cwd.mkdir()
+        artifact.mkdir()
+        route_file = self.base / "route.json"
+        route_file.write_text(json.dumps({
+            "cwd": str(cwd), "artifact_root": str(artifact),
+            "source_commit": "unversioned",
+        }), encoding="utf-8")
+        roots = [str(artifact), str(self.dispatch_state), str(cwd)]
+        with mock.patch("dispatch_contract.launch_repository_identity",
+                        return_value=(str(cwd), "non-git")), \
+             mock.patch.object(profiles, "named_profiles_available", return_value=True):
+            config = profiles.recordish_profile_config(str(cwd), roots, str(route_file))
+        self.assertIsNotNone(config)
+        self.assertEqual(config["default_permissions"], profiles.RECORDISH_PROFILE_NAME)
+        body = config["permissions"][profiles.RECORDISH_PROFILE_NAME]
+        self.assertEqual(body["extends"], ":read-only")
+        self.assertNotIn(str(cwd.resolve()), body["filesystem"])
+        self.assertEqual(body["filesystem"][str(artifact.resolve())], "write")
+        self.assertEqual(body["filesystem"][str(self.dispatch_state.resolve())], "write")
+
+    def test_recordish_profile_carves_user_cwd_out_of_ancestor_artifact_root(self):
+        artifact = self.base / ".agent-workspace"
+        cwd = artifact / "documents"
+        output = artifact / "campaigns" / "cycle" / "artifacts"
+        output.mkdir(parents=True)
+        cwd.mkdir()
+        route_file = self.base / "ancestor-route.json"
+        route_file.write_text(json.dumps({"cwd": str(cwd), "artifact_root": str(artifact),
+                                          "source_commit": "unversioned"}), encoding="utf-8")
+        with mock.patch("dispatch_contract.launch_repository_identity",
+                        return_value=(str(cwd), "non-git")), \
+             mock.patch.object(profiles, "named_profiles_available", return_value=True):
+            config = profiles.recordish_profile_config(
+                str(cwd), [str(artifact), str(output), str(cwd)], str(route_file))
+        body = config["permissions"][profiles.RECORDISH_PROFILE_NAME]
+        self.assertEqual(body["filesystem"][str(artifact.resolve())], "write")
+        self.assertEqual(body["filesystem"][str(output.resolve())], "write")
+        self.assertEqual(body["filesystem"][str(cwd.resolve())], "read")
+
     def execution_grant(self, *, read_roots=(), network=False):
         request_path = self.base / "execution-access.json"
         request_path.write_text(json.dumps({
@@ -160,9 +208,10 @@ class PermissionProfileTest(unittest.TestCase):
 
     def test_owner_turn_profiles_keep_safe_default_and_commit_carveouts(self):
         with mock.patch.object(profiles, "named_profiles_available", return_value=True):
-            config = profiles.owner_turn_profile_config(
-                str(self.wt), list(map(str, self.roots)), "workspace-write",
-            )
+            with mock.patch.dict(os.environ, self.git_safety_env):
+                config = profiles.owner_turn_profile_config(
+                    str(self.wt), list(map(str, self.roots)), "workspace-write",
+                )
         self.assertEqual(config["default_permissions"], profiles.OWNER_OBSERVE_PROFILE_NAME)
         profiles_by_name = config["permissions"]
         self.assertEqual(set(profiles_by_name), {

@@ -1003,8 +1003,8 @@ class FrameAllocationInheritanceTest(SourceRepoStartBase):
 
 
 class OneLegFramedTest(StartBase):
-    """User decision 2026-10-07: ordinary work frames with one leg, and the same decision follows."""
-    FRAME_INTENSITY = None
+    """Explicit simple quick requests keep one deep leg and follow the same decision."""
+    FRAME_INTENSITY = "quick"
 
     def test_one_leg_reads_one_brief_and_its_proposal_starts_the_first_leg(self):
         self.assertEqual(RP.frame_legs(self.route), ("frame",))
@@ -1025,6 +1025,33 @@ class OneLegFramedTest(StartBase):
         del self.interview["route_proposals"]
         NoneEndingTest.assert_none(self, "proposal-not-read")
         self.assertEqual([row["node"] for row in self.record()["decision"]["proposals"]], ["frame"])
+
+
+class LegacyFramedStartTest(StartBase):
+    """Starting a basis-free historical route uses its sealed frame node count."""
+
+    run_fake = F.FramedStartTest.run_fake
+
+    def start(self, **kw):
+        return W.start_work(self.route, self.path, self.jobs, run=self.run_fake, **kw)
+
+    def start_legacy(self, intensity, expected_nodes):
+        route = F.legacy_framed_route(self, intensity)
+        self.route = R.verify_route(route, R.ROOT)
+        self.path = Path(L.admit_runtime_route(self.root, self.route).route_file)
+        self.calls = []
+        with mock.patch.object(W, "join_selected_attempts", return_value={"state": "timeout", "children": []}):
+            result = self.start()
+        self.assertEqual(result["state"], "preparing", result)
+        launched = [command[command.index("--route-node") + 1] for command in self.calls]
+        self.assertEqual(launched, expected_nodes)
+        self.assertEqual(len(self.calls), len(expected_nodes))
+
+    def test_basis_free_historical_one_leg_route_starts_only_frame(self):
+        self.start_legacy("quick", ["frame"])
+
+    def test_basis_free_historical_two_leg_route_starts_both_frames(self):
+        self.start_legacy("strong", F.FRAME_IDS)
 
 
 class LegPlanTest(StartBase):
