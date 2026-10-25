@@ -3306,7 +3306,8 @@ def _run_state(config, run_id):
     run_dir = config["run_root"] / run_id
     meta = {}
     meta_path = run_dir / "meta.json"
-    if meta_path.is_file():
+    has_metadata = meta_path.is_file()
+    if has_metadata:
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -3319,6 +3320,12 @@ def _run_state(config, run_id):
         except (OSError, ValueError):
             exit_code = None
     stop_reason = _read_stop_reason(run_dir)
+    # Launch writes metadata only after the remote receipt. An empty legacy
+    # directory and an in-flight launch are both unconfirmed, never proof of
+    # running or failure. Keep this observation read-only and age-independent.
+    state = ("finished" if exit_code is not None else
+             "stopped" if stop_reason else
+             "running" if has_metadata else "unknown")
     receipt = None
     receipt_path = run_dir / "launch-receipt.json"
     if receipt_path.is_file():
@@ -3357,7 +3364,7 @@ def _run_state(config, run_id):
             "launch_receipt": receipt,
             "experiment_observation": experiment_record,
             "experiment_record_path": str(experiment_record_path) if experiment_record_path else None,
-            "state": "finished" if exit_code is not None else "running"}
+            "state": state}
 
 
 def observe_run_quiescence(config, run_id, expected=None, *, remote_call=None):
@@ -3729,7 +3736,7 @@ def cmd_runs(args):
         if len(rows) >= args.limit:
             break
     for row in rows:
-        if row["exit_code"] is None and not row.get("stop_reason"):
+        if row["state"] == "running":
             host_name = row["meta"].get("host")
             alive = None
             if host_name:
@@ -3748,8 +3755,6 @@ def cmd_runs(args):
             row["state"] = "stopped" if alive is False else "running"
         else:
             row["stale"] = False
-            if row["exit_code"] is None and row.get("stop_reason"):
-                row["state"] = "stopped"
     if args.json:
         print(json.dumps([{k: (str(v) if k == "dir" else v)
                            for k, v in row.items() if k != "session_alive"}
@@ -3766,7 +3771,7 @@ def cmd_runs(args):
         elif row.get("stop_reason"):
             tail = f"stopped ({row['stop_reason']})"
         else:
-            tail = "running"
+            tail = row["state"]
         command = " ".join(row["meta"].get("command") or [])
         print(f"  {row['run_id']:<34} {tail:<20} {command[:60]}")
     if not rows:
