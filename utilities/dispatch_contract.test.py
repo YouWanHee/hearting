@@ -3118,6 +3118,52 @@ class DispatchContractTest(unittest.TestCase):
    winners=[p.communicate(timeout=10)[0].strip() for p in procs]
    self.assertEqual(winners.count("1"),1,winners)
    self.assertEqual(len(jobs.read_text().splitlines()),1)
+ def test_terminal_close_collapses_only_identical_legacy_immutable_duplicates(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; attempt="att-duplicate-source"
+   pipe=(f"{CURRENT},route_id=r,route_node=n,attempt_id={attempt},"
+         "model_source=profile+diversity,model_source=profile+diversity")
+   row=f"2026-07-16T00:00:00Z\topen\t/r\t/w\ts\t{pipe}\n"
+   jobs.write_text(row)
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D.annotate_attempt_row(jobs,attempt,{"launch_started":"1"})
+   self.assertEqual(caught.exception.reason,"attempt-immutable-metadata-duplicate")
+   with self.assertRaises(D.DispatchContractError):
+    D._updated_attempt_metadata(pipe,{"note":"completed-marker"},terminal=True)
+   self.assertFalse(D.close_attempt_row_if(jobs,attempt,"completed-marker",lambda _fields:True))
+   self.assertEqual(jobs.read_text(),row)
+   self.assertFalse(D.close_attempt_row_if(jobs,attempt,"dead-exact-pid",lambda _fields:False))
+   self.assertEqual(jobs.read_text(),row)
+   self.assertTrue(D.close_attempt_row_if(jobs,attempt,"dead-exact-pid",lambda _fields:True))
+   fields=jobs.read_text().strip().split("\t",5)
+   self.assertEqual(fields[1],"done")
+   self.assertEqual(fields[5].count("model_source="),1)
+   self.assertEqual(D.parse_registry_metadata(fields[5])["model_source"],"profile+diversity")
+   self.assertEqual(D.parse_registry_metadata(fields[5])["attempt_id"],attempt)
+   self.assertFalse(D.close_attempt_row_if(jobs,attempt,"dead-exact-pid",lambda _fields:True))
+
+ def test_identical_authority_duplicates_remain_refused_during_dead_settlement(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; attempt="att-duplicate-authority"
+   row=(f"2026-07-16T00:00:00Z\topen\t/r\t/w\ts\t{CURRENT},"
+        f"route_id=r,route_id=r,route_node=n,attempt_id={attempt}\n")
+   jobs.write_text(row); error={}
+   self.assertFalse(D.close_attempt_row_if(jobs,attempt,"dead-exact-pid",lambda _fields:True,
+                                          write_error=error))
+   self.assertEqual(error,{"reason":"attempt-immutable-metadata-duplicate","detail":"route_id"})
+   self.assertEqual(jobs.read_text(),row)
+
+ def test_conflicting_immutable_duplicates_report_writer_error_without_mutation(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; attempt="att-conflicting-source"
+   row=(f"2026-07-16T00:00:00Z\topen\t/r\t/w\ts\t{CURRENT},"
+        f"route_id=r,route_node=n,attempt_id={attempt},model_source=profile,model_source=explicit\n")
+   jobs.write_text(row); error={}
+   self.assertFalse(D.close_attempt_row_if(jobs,attempt,"dead-exact-pid",lambda _fields:True,
+                                          write_error=error))
+   self.assertEqual(error,{"reason":"attempt-immutable-metadata-duplicate","detail":"model_source"})
+   self.assertEqual(jobs.read_text(),row)
+
  def test_conditional_close_revalidates_under_lock(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log";attempt="att-revalidate001"
