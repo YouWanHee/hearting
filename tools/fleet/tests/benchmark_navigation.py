@@ -731,6 +731,58 @@ def _production_environment(tree, cache_home, observer_dir, telemetry_fd,
     return env
 
 
+# render._loop may join three pumps for 1s each and the install pump for 0.1s;
+# fleet's observation close waits up to 0.8s for active futures. Leave 1.1s for
+# synchronous transport close and PTY scheduling while keeping normal quit bounded.
+_PRODUCTION_NORMAL_QUIT_TIMEOUT_SECONDS = 5.0
+_PRODUCTION_SIGTERM_TIMEOUT_SECONDS = 2.0
+
+
+def _production_closeout(proc, q_write_ns, drain, sample_process, *,
+                         monotonic=time.monotonic,
+                         monotonic_ns=time.monotonic_ns,
+                         killpg=os.killpg):
+    """Wait for normal Fleet cleanup, then escalate and reap within fixed bounds."""
+    parent_actions = []
+    sigterm_ns = None
+    sigkill_ns = None
+    exit_deadline = monotonic() + _PRODUCTION_NORMAL_QUIT_TIMEOUT_SECONDS
+    while monotonic() < exit_deadline and proc.poll() is None:
+        drain(0.05)
+        sample_process()
+    exit_after_q = proc.poll()
+    if exit_after_q is None:
+        sigterm_ns = monotonic_ns()
+        try:
+            killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            parent_actions.append({"action": "sigterm", "time_ns": sigterm_ns,
+                                   "process_group_present": False})
+        else:
+            parent_actions.append({"action": "sigterm", "time_ns": sigterm_ns,
+                                   "process_group_present": True})
+        try:
+            proc.wait(timeout=_PRODUCTION_SIGTERM_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            sigkill_ns = monotonic_ns()
+            try:
+                killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                parent_actions.append({"action": "sigkill", "time_ns": sigkill_ns,
+                                       "process_group_present": False})
+            else:
+                parent_actions.append({"action": "sigkill", "time_ns": sigkill_ns,
+                                       "process_group_present": True})
+    exit_code = proc.wait()
+    parent_actions.append({"action": "process-reaped", "time_ns": monotonic_ns(),
+                           "exit_code": exit_code,
+                           "elapsed_after_q_ms": ((monotonic_ns() - q_write_ns) / 1e6
+                                                   if q_write_ns is not None else None)})
+    return {"exit_code": exit_code, "exit_after_q": exit_after_q,
+            "sigterm_ns": sigterm_ns, "sigkill_ns": sigkill_ns,
+            "parent_actions": parent_actions}
+
+
 def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
                     run_dir, *, keys=100, duration=60, seed=False,
                     event_timeout=2.0):
@@ -895,6 +947,7 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
         q_write_error = None
         sigterm_ns = None
         sigkill_ns = None
+        exit_after_q = None
         if proc is not None and proc.poll() is None:
             q_write_ns = time.monotonic_ns()
             try:
@@ -905,38 +958,12 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
             parent_actions.append({"action": "write-q", "time_ns": q_write_ns,
                                    "bytes": q_bytes, "error": q_write_error,
                                    "process_alive": proc.poll() is None})
-            exit_deadline = time.monotonic() + 2.0
-            while time.monotonic() < exit_deadline and proc.poll() is None:
-                drain(0.05)
-                sample_process()
-            exit_after_q = proc.poll()
-            if proc.poll() is None:
-                sigterm_ns = time.monotonic_ns()
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    parent_actions.append({"action": "sigterm", "time_ns": sigterm_ns,
-                                           "process_group_present": False})
-                else:
-                    parent_actions.append({"action": "sigterm", "time_ns": sigterm_ns,
-                                           "process_group_present": True})
-                try:
-                    proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    sigkill_ns = time.monotonic_ns()
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        parent_actions.append({"action": "sigkill", "time_ns": sigkill_ns,
-                                               "process_group_present": False})
-                    else:
-                        parent_actions.append({"action": "sigkill", "time_ns": sigkill_ns,
-                                               "process_group_present": True})
-            exit_code = proc.wait()
-            parent_actions.append({"action": "process-reaped", "time_ns": time.monotonic_ns(),
-                                   "exit_code": exit_code,
-                                   "elapsed_after_q_ms": ((time.monotonic_ns() - q_write_ns) / 1e6
-                                                           if q_write_ns is not None else None)})
+            closeout = _production_closeout(proc, q_write_ns, drain, sample_process)
+            exit_code = closeout["exit_code"]
+            exit_after_q = closeout["exit_after_q"]
+            sigterm_ns = closeout["sigterm_ns"]
+            sigkill_ns = closeout["sigkill_ns"]
+            parent_actions.extend(closeout["parent_actions"])
         else:
             exit_code = proc.wait() if proc is not None else None
             exit_after_q = None

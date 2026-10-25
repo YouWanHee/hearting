@@ -213,6 +213,103 @@ class BenchmarkProductionContractTest(unittest.TestCase):
         self.assertEqual(status, "nonzero-exit")
         self.assertIsNone(error)
 
+    def test_quit_wait_allows_bounded_cleanup_past_old_two_second_window(self):
+        clock = SimpleNamespace(now=0.0)
+        events = []
+        sampled = []
+
+        class Process:
+            pid = 123
+
+            def __init__(self):
+                self.q_decoded = False
+                self.returncode = None
+                self.reaped = False
+
+            def write_q(self):
+                self.q_decoded = True
+                events.append({"kind": "input-decoded", "input_kind": "quit"})
+
+            def poll(self):
+                if self.q_decoded and clock.now >= 4.25:
+                    self.returncode = 0
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.assert_poll_complete()
+                self.reaped = True
+                return self.returncode
+
+            def assert_poll_complete(self):
+                if self.poll() is None:
+                    raise AssertionError("normal quit wait returned before cleanup finished")
+
+        process = Process()
+        process.write_q()
+
+        def drain(_timeout):
+            clock.now += 0.25
+
+        result = benchmark._production_closeout(
+            process, 0, drain, lambda: sampled.append(clock.now),
+            monotonic=lambda: clock.now,
+            monotonic_ns=lambda: int(clock.now * 1_000_000_000),
+            killpg=lambda *_args: self.fail("normal cleanup must not be escalated"))
+
+        self.assertTrue(any(event.get("input_kind") == "quit" for event in events))
+        self.assertGreater(clock.now, 2.0)
+        self.assertLess(clock.now, benchmark._PRODUCTION_NORMAL_QUIT_TIMEOUT_SECONDS)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["exit_after_q"], 0)
+        self.assertIsNone(result["sigterm_ns"])
+        self.assertIsNone(result["sigkill_ns"])
+        self.assertTrue(process.reaped)
+        self.assertEqual(result["parent_actions"][-1]["action"], "process-reaped")
+        self.assertEqual(result["parent_actions"][-1]["elapsed_after_q_ms"], 4250.0)
+        self.assertEqual(len(sampled), 17)
+
+    def test_hung_quit_process_is_escalated_and_reaped(self):
+        clock = SimpleNamespace(now=0.0)
+        signals = []
+
+        class Process:
+            pid = 456
+            returncode = None
+            reaped = False
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                if timeout is not None:
+                    raise benchmark.subprocess.TimeoutExpired("fake-fleet", timeout)
+                self.reaped = True
+                return self.returncode
+
+        process = Process()
+
+        def killpg(_pid, sig):
+            signals.append(sig)
+            if sig == benchmark.signal.SIGKILL:
+                process.returncode = -benchmark.signal.SIGKILL
+
+        result = benchmark._production_closeout(
+            process, 0, lambda _timeout: setattr(clock, "now", clock.now + 0.5),
+            lambda: None, monotonic=lambda: clock.now,
+            monotonic_ns=lambda: int(clock.now * 1_000_000_000), killpg=killpg)
+
+        self.assertEqual(signals, [benchmark.signal.SIGTERM, benchmark.signal.SIGKILL])
+        self.assertIsNone(result["exit_after_q"])
+        self.assertIsNotNone(result["sigterm_ns"])
+        self.assertIsNotNone(result["sigkill_ns"])
+        self.assertEqual(result["exit_code"], -benchmark.signal.SIGKILL)
+        self.assertTrue(process.reaped)
+        self.assertEqual([item["action"] for item in result["parent_actions"]],
+                         ["sigterm", "sigkill", "process-reaped"])
+        status, _error = benchmark._production_status(
+            result["exit_code"], agent_home_matches_tree=True)
+        self.assertEqual(status, "nonzero-exit")
+
     def test_post_exit_drain_keeps_trailing_telemetry_and_nonzero_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
