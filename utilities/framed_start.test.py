@@ -1088,8 +1088,9 @@ class LegPlanTest(StartBase):
         self.assertIn("Verify: run the abort tests and compare the median", owner)
         self.assertNotIn("items.json", owner)
         test_node = next(n["id"] for n in route["nodes"] if str(n.get("unit") or "").startswith("qa/"))
-        verifier = WB.plan_leg_prompt(route, test_node)
-        self.assertIn("`<artifact>.items.json`", verifier)
+        primary = str(self.root / "test-report.md")
+        verifier = WB.plan_leg_prompt(route, test_node, primary)
+        self.assertIn(f"`{primary}.items.json`", verifier)
         self.assertIn('"route_id": "' + route["route_id"] + '"', verifier)
         self.assertEqual(WB.plan_leg_prompt({**route, "route_plan": None}, test_node), "")
 

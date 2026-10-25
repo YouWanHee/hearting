@@ -5561,6 +5561,7 @@ def finalize(
     force_abandon_ignoring_lease: bool = False,
     support_locators: Sequence[str] = (),
     expected_binding: Optional[Mapping[str, Any]] = None,
+    jobs: Optional[Path] = None,
     lock_timeout: Optional[float] = None,
     exclude_symlinks: bool = False,
     _admission_lock_fd: Optional[int] = None,
@@ -5577,6 +5578,8 @@ def finalize(
     `excluded_symlinks` on the result and the cycle record (`exclude_symlinks`
     is accepted for old callers and changes nothing)."""
     root = Path(root).resolve()
+    jobs = Path(jobs) if jobs is not None else (
+        Path(os.environ["AGENT_DISPATCH_JOBS"]) if os.environ.get("AGENT_DISPATCH_JOBS") else None)
     if _recovery_scope != "exact":
         dispatch_terminal_commit.require_current_cleanup("producer-finalize")
     _authorize_active_cleanup(root, "finalize-forward-recovery", root, cycle_id)
@@ -5692,7 +5695,7 @@ def finalize(
                     refreshed = _refresh_cycle_locked(root, record, now=now, allocator=alloc,
                                                       crash_after_manifest=crash_after_manifest,
                                                       prescan=prescan, last_try=_last_try,
-                                                      expected_binding=expected_binding)
+                                                      expected_binding=expected_binding, jobs=jobs)
                     latest = read_cycle_record(root, cycle_id)
                     completed_state = _published_cycle_state(root, latest) if latest else None
                     if completed_state != "completed":
@@ -5714,7 +5717,7 @@ def finalize(
                     # A route continuing this closed cycle finishes it again (§45 D-127): the
                     # document gets that route's own terminal record before it is proved.
                     _refresh_cycle_locked(root, record, now=now, allocator=alloc, prescan=prescan,
-                                          last_try=_last_try, expected_binding=expected_binding)
+                                          last_try=_last_try, expected_binding=expected_binding, jobs=jobs)
                     record = read_cycle_record(root, cycle_id)
                 verified = _verify_sealed_cycle_locked(root, record, expected_binding)
                 return _finish({**verified, "storage_state": "sealed", "cycle_state": published})
@@ -5725,7 +5728,7 @@ def finalize(
                 refreshed = _refresh_cycle_locked(root, record, now=now, allocator=alloc,
                                                   crash_after_manifest=crash_after_manifest,
                                                   prescan=prescan, last_try=_last_try,
-                                                  expected_binding=expected_binding)
+                                                  expected_binding=expected_binding, jobs=jobs)
                 return _finish({**refreshed, "storage_state": "sealed", "cycle_state": published})
             return _finish({"status": "already-sealed", "cycle_id": cycle_id,
                     "manifest_digest": record.get("manifest_digest"),
@@ -5999,7 +6002,8 @@ def finalize(
         allow_open_route=allow_open_route, allocator=alloc, now=now, crash_after_manifest=crash_after_manifest,
         exclude_hidden=exclude_hidden, adopt_root_outputs=adopt_root_outputs, abandon_reason=abandon_reason,
         force_abandon_ignoring_lease=force_abandon_ignoring_lease, support_locators=support_locators,
-        expected_binding=expected_binding, lock_timeout=lock_timeout, exclude_symlinks=exclude_symlinks,
+        expected_binding=expected_binding, jobs=jobs, lock_timeout=lock_timeout,
+        exclude_symlinks=exclude_symlinks,
         _recovery_scope=_recovery_scope, _last_try=True, _scan_budget=_scan_budget,
         _prescan=_prescan_cycle(root, cycle_id, unless_recorded=expected_binding,
                                 include_open=True, exclude_hidden=exclude_hidden,
@@ -6522,7 +6526,8 @@ def _leaf_terminal_additions(root: Path, record: Mapping[str, Any], document: Ma
 
 
 def _provisional_completion_context(root: Path, record: Mapping[str, Any],
-                                    expected_root_id: Optional[str]) -> Optional[Tuple[Any, Dict[str, Any]]]:
+                                    expected_root_id: Optional[str], *,
+                                    jobs: Optional[Path] = None) -> Optional[Tuple[Any, Dict[str, Any]]]:
     """The live conditions under which a provisional active cycle may become completed.
 
     Route, lease, closed/admitted route, exact proven non-abandoned outcome: the one place both
@@ -6537,6 +6542,8 @@ def _provisional_completion_context(root: Path, record: Mapping[str, Any],
             or not route_is_closed(root, route)
             or not cycle_route_admission(root, record, route, finalize=True).allow):
         return None
+    jobs_path = Path(jobs) if jobs is not None else (
+        Path(os.environ["AGENT_DISPATCH_JOBS"]) if os.environ.get("AGENT_DISPATCH_JOBS") else None)
     try:
         binding, sealed_route = artifact_lifecycle.bind_existing_runtime_route(
             root, route_lineage.canonical_route_path(root, route["route_id"]),
@@ -6545,11 +6552,11 @@ def _provisional_completion_context(root: Path, record: Mapping[str, Any],
         outcome = json.loads(outcome_raw.decode("utf-8"))
         route_module = artifact_lifecycle._load_capability_route()
         gates = route_module.terminal_gate_observation(
-            sealed_route, exact_terminal=outcome.get("terminal_commit_id") is not None)
+            sealed_route, jobs=jobs_path, exact_terminal=outcome.get("terminal_commit_id") is not None)
         from workflow_state import WorkflowLedger
         workflow = WorkflowLedger(
             sealed_route["route_id"], sealed_route["route_hash"],
-            jobs=os.environ.get("AGENT_DISPATCH_JOBS") or None).read_only_state()
+            jobs=jobs_path).read_only_state()
         if workflow["workflow_state"] == "CANCELLED" or workflow["journal_unreadable"]:
             return None
     except (artifact_lifecycle.LifecycleError, OSError, ValueError, UnicodeError):
@@ -6567,9 +6574,46 @@ def _provisional_completion_context(root: Path, record: Mapping[str, Any],
     return binding, sealed_route, outcome
 
 
+def _manifest_terminal_source_digest(root: Path, record: Mapping[str, Any],
+                                     document: Mapping[str, Any]) -> Optional[str]:
+    """Resolve snapshot artifact facts through the producer's original scan algorithm."""
+    manifest_path = _record_cycle_manifest_path(root, record)
+    current = _read_json(manifest_path)
+    if (not isinstance(current, Mapping)
+            or artifact_manifest.canonical_bytes(current) != artifact_manifest.canonical_bytes(document)):
+        return None
+    directory = manifest_path.parent
+    known: Dict[str, List[Any]] = {}
+    snapshot_facts: List[Tuple[str, str, int]] = []
+    for row in document.get("artifact_revisions", []) or []:
+        if not isinstance(row, Mapping):
+            return None
+        locator = row.get("locator")
+        rel = locator.get("path") if isinstance(locator, Mapping) else None
+        digest, size = row.get("content_digest"), row.get("byte_size")
+        if (not isinstance(rel, str) or not isinstance(digest, str)
+                or not isinstance(size, int) or isinstance(size, bool)):
+            return None
+        snapshot_facts.append((rel, digest, size))
+        try:
+            observed = os.lstat(str(directory / rel))
+            if stat.S_ISREG(observed.st_mode):
+                known[rel] = [*_fingerprint(observed), digest]
+        except OSError:
+            pass
+    try:
+        facts = _scan_cycle_facts(directory, excluded=[], excluded_symlinks=[], known=known)
+    except (OSError, ProducerError, ValueError, TypeError):
+        return None
+    if sorted(facts) != sorted(snapshot_facts):
+        return None
+    return _digest(_canonical([[rel, digest] for rel, digest, _size in facts]))
+
+
 def _historical_handoff_completion_context(root: Path, record: Mapping[str, Any],
                                           document: Mapping[str, Any],
-                                          expected_binding: Optional[Mapping[str, Any]]):
+                                          expected_binding: Optional[Mapping[str, Any]], *,
+                                          jobs: Optional[Path] = None):
     """Prove the sole historical abandoned shape that exact finish may complete.
 
     Every owner-pin edge, the abandoned manifest snapshot, the current producer
@@ -6581,6 +6625,10 @@ def _historical_handoff_completion_context(root: Path, record: Mapping[str, Any]
         import dispatch_terminal_commit as DTC
         import route_parent_close
 
+        jobs_path = Path(jobs) if jobs is not None else (
+            Path(os.environ["AGENT_DISPATCH_JOBS"]) if os.environ.get("AGENT_DISPATCH_JOBS") else None)
+        if jobs_path is None:
+            return None
         if not isinstance(expected_binding, Mapping) or expected_binding.get("contract") != DTC.CONTRACT:
             return None
         cycle_id = record.get("cycle_id")
@@ -6660,7 +6708,7 @@ def _historical_handoff_completion_context(root: Path, record: Mapping[str, Any]
         if not admission.allow:
             return None
         for predecessor, successor in zip(forward, forward[1:]):
-            proof = route_parent_close.verified_owner_pin_handoff_close(predecessor)
+            proof = route_parent_close.verified_owner_pin_handoff_close(predecessor, jobs=jobs_path)
             prepared = (proof or {}).get("successor")
             if (not proof or not isinstance(prepared, Mapping)
                     or prepared.get("route_id") != successor.get("route_id")
@@ -6668,13 +6716,75 @@ def _historical_handoff_completion_context(root: Path, record: Mapping[str, Any]
                 return None
 
         old_routes = document.get("routes") or []
-        if (len(old_routes) != 1 or not isinstance(old_routes[0], Mapping)
-                or old_routes[0].get("artifact_root_id") != identity.artifact_root_id
-                or old_routes[0].get("route_id") != forward[-2].get("route_id")
-                or old_routes[0].get("route_hash") != forward[-2].get("route_hash")
-                or old_routes[0].get("terminal_marker") != "pending"
-                or old_routes[0].get("terminal_evidence_id") != ""):
+        if (not isinstance(old_routes, list) or len(old_routes) not in (1, 2)
+                or not all(isinstance(row, Mapping) for row in old_routes)):
             return None
+        predecessor_row = old_routes[0]
+        if (predecessor_row.get("artifact_root_id") != identity.artifact_root_id
+                or predecessor_row.get("route_id") != forward[-2].get("route_id")
+                or predecessor_row.get("route_hash") != forward[-2].get("route_hash")
+                or predecessor_row.get("terminal_marker") != "pending"
+                or predecessor_row.get("terminal_evidence_id") != ""):
+            return None
+        historical_leaf_row = None
+        historical_terminal_event = None
+        all_terminal_events = [event for event in document.get("events", []) or []
+                               if isinstance(event, Mapping)
+                               and event.get("event_type") == "route.terminal.recorded"]
+        terminal_events = [event for event in all_terminal_events if event.get("target_id") == cycle_id]
+        if len(old_routes) == 1:
+            if all_terminal_events:
+                return None
+        else:
+            historical_leaf_row = old_routes[1]
+            if (historical_leaf_row.get("artifact_root_id") != identity.artifact_root_id
+                    or historical_leaf_row.get("route_id") != forward[-1].get("route_id")
+                    or historical_leaf_row.get("route_hash") != forward[-1].get("route_hash")
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}",
+                                        str(historical_leaf_row.get("terminal_marker") or ""))
+                    or not historical_leaf_row.get("terminal_evidence_id")
+                    or len(terminal_events) != 1 or len(all_terminal_events) != 1
+                    or terminal_events[0].get("event_id") != historical_leaf_row.get("terminal_evidence_id")
+                    or terminal_events[0].get("provenance", {}).get("source_manifest_id")
+                        != document.get("manifest_id")
+                    or terminal_events[0].get("provenance", {}).get("source_revision_id")
+                        != document.get("manifest_revision_id")
+                    or terminal_events[0].get("provenance", {}).get("producer_route_id") != route_id
+                    or terminal_events[0].get("provenance", {}).get("algorithm_version") != ALGORITHM_VERSION
+                    or terminal_events[0].get("provenance", {}).get("schema_version") != 1
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(
+                        terminal_events[0].get("provenance", {}).get("source_digest") or ""))
+                    or terminal_events[0].get("payload", {}).get("artifact_root_id") != identity.artifact_root_id
+                    or terminal_events[0].get("payload", {}).get("route_id") != route_id
+                    or terminal_events[0].get("payload", {}).get("route_hash") != route_hash
+                    or terminal_events[0].get("payload", {}).get("terminal_marker_digest")
+                        != historical_leaf_row.get("terminal_marker")
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(
+                        terminal_events[0].get("payload", {}).get("outcome_digest") or ""))):
+                return None
+            historical_terminal_event = terminal_events[0]
+            try:
+                source_snapshot = artifact_lifecycle.find_manifest_snapshot(
+                    root, cycle_id,
+                    manifest_revision_id=historical_terminal_event["provenance"]["source_revision_id"])
+                source_digest = (_manifest_terminal_source_digest(root, record, source_snapshot)
+                                 if isinstance(source_snapshot, Mapping)
+                                 and artifact_manifest.validate(source_snapshot).ok
+                                 and artifact_manifest.manifest_digest(source_snapshot)
+                                     == artifact_manifest.manifest_digest(document)
+                                 and artifact_manifest.canonical_bytes(source_snapshot)
+                                     == artifact_manifest.canonical_bytes(document)
+                                 else None)
+            except (KeyError, TypeError, ValueError, UnicodeError):
+                return None
+            if (not isinstance(source_snapshot, Mapping)
+                    or source_snapshot.get("manifest_id") != historical_terminal_event[
+                        "provenance"].get("source_manifest_id")
+                    or source_snapshot.get("manifest_revision_id") != historical_terminal_event[
+                        "provenance"].get("source_revision_id")
+                    or source_digest != historical_terminal_event[
+                        "provenance"].get("source_digest")):
+                return None
         abandoned = [event for event in document.get("events", []) or []
                      if isinstance(event, Mapping) and event.get("event_type") == "cycle.abandoned"
                      and event.get("target_id") == cycle_id]
@@ -6694,23 +6804,19 @@ def _historical_handoff_completion_context(root: Path, record: Mapping[str, Any]
         if (not stat.S_ISREG(binding_stat.st_mode) or binding_result.path.is_symlink()
                 or binding_result.path.resolve() != binding_result.path):
             return None
-        jobs_value = os.environ.get("AGENT_DISPATCH_JOBS")
-        if not jobs_value:
-            return None
-        jobs = Path(jobs_value)
         owner_binding = DTC.validate_owner_route(
-            jobs=jobs, route_file=route_path, owner_attempt_id=owner_attempt)
+            jobs=jobs_path, route_file=route_path, owner_attempt_id=owner_attempt)
         if (owner_binding.route_id != route_id or owner_binding.route_hash != route_hash
                 or owner_binding.route_file != str(route_path) or not route_is_closed(root, route)
                 or _live_review_lease(root, cycle_id) is not None):
             return None
 
         route_module = artifact_lifecycle._load_capability_route()
-        gates = route_module.terminal_gate_observation(route, jobs=jobs, exact_terminal=True)
+        gates = route_module.terminal_gate_observation(route, jobs=jobs_path, exact_terminal=True)
         if route_module.terminal_gate_proven(gates) is not True:
             return None
         from workflow_state import WorkflowLedger
-        workflow = WorkflowLedger(route_id, route_hash, jobs=jobs).read_only_state()
+        workflow = WorkflowLedger(route_id, route_hash, jobs=jobs_path).read_only_state()
         if workflow.get("journal_unreadable") or workflow.get("workflow_state") == "CANCELLED":
             return None
         binding, sealed_route = artifact_lifecycle.bind_existing_runtime_route(
@@ -6738,6 +6844,23 @@ def _historical_handoff_completion_context(root: Path, record: Mapping[str, Any]
             return None
         terminal_state = json.loads(terminal_state_path.read_text(encoding="utf-8"))
         marker_digest = DTC.terminal_marker_digest(list(gates.values()))
+        if historical_leaf_row is not None:
+            try:
+                expected_evidence = artifact_lifecycle._derive_terminal_evidence(
+                    document, binding, sealed_route, recorded_gates=gates)
+            except (artifact_lifecycle.LifecycleError, OSError, ValueError):
+                return None
+            expected_leaf = artifact_lifecycle.manifest_route_row(
+                expected_evidence, route_id=route_id)
+            expected_event = next((event for event in expected_evidence.get("events", [])
+                                   if event.get("event_id") == historical_leaf_row.get("terminal_evidence_id")), None)
+            if (not isinstance(expected_leaf, Mapping)
+                    or dict(expected_leaf) != dict(historical_leaf_row)
+                    or not isinstance(expected_event, Mapping)
+                    or expected_event.get("payload") != historical_terminal_event.get("payload")
+                    or historical_terminal_event.get("payload", {}).get("outcome_digest")
+                        != _digest(outcome_raw)):
+                return None
         commit_id = DTC.terminal_commit_id(route_id=route_id, route_hash=route_hash,
             owner_attempt_id=owner_attempt, marker_digest=marker_digest,
             producer_digest=binding_result.digest)
@@ -6751,7 +6874,7 @@ def _historical_handoff_completion_context(root: Path, record: Mapping[str, Any]
                 or outcome.get("terminal_marker_digest") != marker_digest
                 or outcome.get("terminal_commit_id") != commit_id):
             return None
-        claim = dispatch_contract.terminal_claim_observation(jobs, route_id, owner_attempt)
+        claim = dispatch_contract.terminal_claim_observation(jobs_path, route_id, owner_attempt)
         claim_proof = (claim or {}).get("proof")
         if (not isinstance(claim_proof, Mapping)
                 or claim.get("route_id") != route_id
@@ -6761,7 +6884,7 @@ def _historical_handoff_completion_context(root: Path, record: Mapping[str, Any]
                 or claim_proof.get("producer_binding_digest") != binding_result.digest):
             return None
         request = DTC.TerminalCommitRequest(route_file=route_path, owner_attempt_id=owner_attempt,
-                                            jobs=jobs, artifact_root=root)
+                                            jobs=jobs_path, artifact_root=root)
         children = DTC._prove_route_children(request, route, gates)
         if children.status != "proved":
             return None
@@ -6790,7 +6913,8 @@ def _evaluate_provisional_completion(root: Path, record: Mapping[str, Any], cand
 
 
 def _provisional_completion_holds(root: Path, record: Mapping[str, Any], candidate: Mapping[str, Any],
-                                  expected_binding: Optional[Mapping[str, Any]] = None) -> bool:
+                                  expected_binding: Optional[Mapping[str, Any]] = None, *,
+                                  jobs: Optional[Path] = None) -> bool:
     """Re-ask, at publication, what the candidate was built on (called under the admission lock)."""
     manifest_path = _record_cycle_manifest_path(root, record)
     previous = _read_json(manifest_path)
@@ -6798,13 +6922,15 @@ def _provisional_completion_holds(root: Path, record: Mapping[str, Any], candida
         return False
     state = (previous.get("cycle") or {}).get("state")
     if state == "abandoned":
-        context = _historical_handoff_completion_context(root, record, previous, expected_binding)
+        context = _historical_handoff_completion_context(
+            root, record, previous, expected_binding, jobs=jobs)
         if context is None:
             return False
         binding, _sealed_route, outcome, preserved, _gates = context
         return _evaluate_provisional_completion(root, record, candidate, binding, outcome,
                                                 preserved=preserved, first_completion=True)
-    context = _provisional_completion_context(root, record, candidate.get("artifact_root_id"))
+    context = _provisional_completion_context(
+        root, record, candidate.get("artifact_root_id"), jobs=jobs)
     if context is None:
         return False
     binding, _sealed_route, outcome = context
@@ -6816,21 +6942,25 @@ def _provisional_completion_projection(root: Path, record: Mapping[str, Any], do
                                        allocator: artifact_identity.IdAllocator,
                                        now: Optional[float],
                                        expected_binding: Optional[Mapping[str, Any]] = None,
-                                       previous_document: Optional[Mapping[str, Any]] = None) -> Optional[Dict[str, Any]]:
+                                       previous_document: Optional[Mapping[str, Any]] = None,
+                                       jobs: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     """Bind exact late terminal proof to an active or verified handoff revision."""
     if not isinstance(document.get("cycle"), Mapping):
         return None
     document_state = document["cycle"].get("state")
     if document_state == "abandoned":
         history_source = previous_document or document
-        context = _historical_handoff_completion_context(root, record, history_source, expected_binding)
+        context = _historical_handoff_completion_context(
+            root, record, history_source, expected_binding, jobs=jobs)
         if context is None:
             return None
         binding, sealed_route, outcome, preserved, gates = context
-        additions = _leaf_terminal_additions(root, record, document, facts,
-            allocator=allocator, revision_id=revision_id, now=now)
-        if additions is None or additions["binding"].route_id != binding.route_id:
-            return None
+        additions = None
+        if len(document.get("routes", []) or []) == 1:
+            additions = _leaf_terminal_additions(root, record, document, facts,
+                allocator=allocator, revision_id=revision_id, now=now)
+            if additions is None or additions["binding"].route_id != binding.route_id:
+                return None
         candidate = json.loads(json.dumps(document))
         candidate["manifest_revision_id"] = revision_id
         candidate["cycle"]["state"] = "completed"
@@ -6845,13 +6975,15 @@ def _provisional_completion_projection(root: Path, record: Mapping[str, Any], do
                        "actor": {"kind": "producer", "id": record["producer_id"]},
                        "recorded_at": _rfc3339(now), "provenance": provenance,
                        "evidence_ids": [], "payload": {}}
-        candidate["routes"] = list(candidate.get("routes", [])) + [additions["row"]]
-        candidate["events"] = list(candidate.get("events", [])) + [cycle_event, additions["event"]]
-        try:
-            candidate = artifact_lifecycle._derive_terminal_evidence(
-                candidate, additions["binding"], additions["route"], recorded_gates=gates)
-        except (artifact_lifecycle.LifecycleError, OSError, ValueError) as exc:
-            return None
+        candidate["events"] = list(candidate.get("events", [])) + [cycle_event]
+        if additions is not None:
+            candidate["routes"] = list(candidate.get("routes", [])) + [additions["row"]]
+            candidate["events"].append(additions["event"])
+            try:
+                candidate = artifact_lifecycle._derive_terminal_evidence(
+                    candidate, additions["binding"], additions["route"], recorded_gates=gates)
+            except (artifact_lifecycle.LifecycleError, OSError, ValueError):
+                return None
         completion_history = list(preserved)
         if not _evaluate_provisional_completion(root, record, candidate, binding, outcome,
                                                preserved=completion_history, first_completion=True):
@@ -6859,7 +6991,8 @@ def _provisional_completion_projection(root: Path, record: Mapping[str, Any], do
         return candidate
     if document_state != "active":
         return None
-    context = _provisional_completion_context(root, record, document.get("artifact_root_id"))
+    context = _provisional_completion_context(
+        root, record, document.get("artifact_root_id"), jobs=jobs)
     if context is None:
         return None
     binding, sealed_route, outcome = context
@@ -7233,6 +7366,7 @@ def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optiona
                           crash_after_manifest: bool = False,
                           prescan: Optional[_Prescan] = None, last_try: bool = True,
                           expected_binding: Optional[Mapping[str, Any]] = None,
+                          jobs: Optional[Path] = None,
                           trigger: str = "finalize") -> Dict[str, Any]:
     """Re-finalize a closed cycle: publish its next manifest document if any file changed.
 
@@ -7294,7 +7428,7 @@ def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optiona
     provisional = _provisional_completion_projection(root, record, refreshed or document, facts,
                                                      revision_id=revision_id, allocator=alloc, now=now,
                                                      expected_binding=expected_binding,
-                                                     previous_document=document)
+                                                     previous_document=document, jobs=jobs)
     if provisional is not None:
         refreshed = provisional
         additions = None
@@ -7972,6 +8106,7 @@ def refresh_cycle(
     budget: Optional[RefreshBudget] = None,
     allocator: Optional[artifact_identity.IdAllocator] = None,
     observe: bool = False, crash_after_manifest: bool = False,
+    jobs: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Observe one closed cycle (§45 D-124): publish its next manifest document if a file changed.
 
@@ -7995,7 +8130,8 @@ def refresh_cycle(
     try:
         return _refresh_cycle_observed(root, cycle_id, trigger=trigger, clock=clock, budget=budget,
                                        allocator=allocator, observe=observe,
-                                       crash_after_manifest=crash_after_manifest, base=base, skipped=skipped)
+                                       crash_after_manifest=crash_after_manifest, base=base, skipped=skipped,
+                                       jobs=jobs)
     except (artifact_admission.AdmissionBusy, dispatch_lock_order.LockOrderError) as exc:
         return skipped("busy", detail=str(exc))
     except ProducerError as exc:
@@ -8006,7 +8142,8 @@ def refresh_cycle(
 
 def _refresh_cycle_observed(root: Path, cycle_id: str, *, trigger: str, clock: float, budget: RefreshBudget,
                             allocator: Optional[artifact_identity.IdAllocator], observe: bool,
-                            crash_after_manifest: bool, base: Mapping[str, Any], skipped) -> Dict[str, Any]:
+                            crash_after_manifest: bool, base: Mapping[str, Any], skipped,
+                            jobs: Optional[Path] = None) -> Dict[str, Any]:
     record = read_cycle_record(root, cycle_id)
     if record is None:
         return skipped("cycle-unknown")
@@ -8044,7 +8181,8 @@ def _refresh_cycle_observed(root: Path, cycle_id: str, *, trigger: str, clock: f
     if scan.complete:
         revision_id = refreshed["manifest_revision_id"] if refreshed is not None else alloc.allocate("manifest_revision")
         provisional = _provisional_completion_projection(root, record, refreshed or document, facts,
-                                                         revision_id=revision_id, allocator=alloc, now=clock)
+                                                         revision_id=revision_id, allocator=alloc, now=clock,
+                                                         jobs=jobs)
         if provisional is not None:
             refreshed = provisional
     result = {"status": "unchanged", **base, "changes": changes, "complete": scan.complete,
@@ -8068,7 +8206,7 @@ def _refresh_cycle_observed(root: Path, cycle_id: str, *, trigger: str, clock: f
     with _refresh_lock(root, cycle_id, timeout=0.0):
         outcome = _publish_refresh(
             root, cycle_id, manifest_path, raw, digest, refreshed, new_digest, scan, changes, lines,
-            now=clock, crash_after_manifest=crash_after_manifest)
+            now=clock, crash_after_manifest=crash_after_manifest, jobs=jobs)
     if outcome is not None:
         return skipped(outcome)
     _remember_scan(root, cycle_id, scan, state, published=True, observe=observe, clock=clock)
@@ -8086,7 +8224,8 @@ def _publish_refresh(root: Path, cycle_id: str, manifest_path: Path, raw: bytes,
                      refreshed: Mapping[str, Any], new_digest: str, scan: _RefreshScan,
                      changes: Mapping[str, Sequence[str]], lines: Sequence[Mapping[str, Any]], *,
                      now: float, crash_after_manifest: bool,
-                     expected_binding: Optional[Mapping[str, Any]] = None) -> Optional[str]:
+                     expected_binding: Optional[Mapping[str, Any]] = None,
+                     jobs: Optional[Path] = None) -> Optional[str]:
     """Publish a prepared next document; `None` on success, else why this run skipped.
 
     The refresh lock is held and the admission lock is not.  The files are re-checked with
@@ -8112,7 +8251,7 @@ def _publish_refresh(root: Path, cycle_id: str, manifest_path: Path, raw: bytes,
         previous_state = (json.loads(raw.decode("utf-8")).get("cycle") or {}).get("state")
         if ((refreshed.get("cycle") or {}).get("state") == "completed"
                 and previous_state in {"active", "abandoned"}
-                and not _provisional_completion_holds(root, record, refreshed, expected_binding)):
+                and not _provisional_completion_holds(root, record, refreshed, expected_binding, jobs=jobs)):
             return "superseded"
         index = artifact_admission.load_index(root)  # the one read of this locked section
         row = index.manifests.get(cycle_id)

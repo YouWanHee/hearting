@@ -1151,6 +1151,8 @@ class TestUpdateDocument(unittest.TestCase):
         marker = _sha(7)
         cycle_id = after["cycle"]["cycle_id"]
         provenance = copy.deepcopy(after["events"][0]["provenance"])
+        provenance["source_manifest_id"] = before["manifest_id"]
+        provenance["source_revision_id"] = after["manifest_revision_id"]
         provenance["producer_route_id"] = route_id
         cycle_event = {
             "event_id": allocator.allocate("event"), "stream_id": allocator.allocate("stream"),
@@ -1280,6 +1282,64 @@ class TestUpdateDocument(unittest.TestCase):
         wrong_event["events"][-1]["payload"]["route_hash"] = _sha(10)
         self.assertIn("update-historical-completion-event-invalid",
                       _codes(m.validate_update(wrong_event, preserved=[before], previous=before)))
+
+    def test_historical_handoff_completion_reuses_an_exact_terminal_prefix(self):
+        before, completed_a = self._historical_handoff_pair()
+        allocator = idm.IdAllocator()
+        terminal_event = copy.deepcopy(completed_a["events"][-1])
+        terminal_route = copy.deepcopy(completed_a["routes"][-1])
+
+        prefix = copy.deepcopy(before)
+        prefix["manifest_revision_id"] = allocator.allocate("manifest_revision")
+        terminal_event["provenance"]["source_revision_id"] = prefix["manifest_revision_id"]
+        prefix["routes"].append(terminal_route)
+        prefix["events"].append(terminal_event)
+
+        completed_b = copy.deepcopy(prefix)
+        completed_b["manifest_revision_id"] = allocator.allocate("manifest_revision")
+        completed_b["cycle"]["state"] = "completed"
+        cycle_provenance = copy.deepcopy(terminal_event["provenance"])
+        cycle_provenance["source_revision_id"] = completed_b["manifest_revision_id"]
+        completed_b["events"].append({
+            "event_id": allocator.allocate("event"),
+            "stream_id": allocator.allocate("stream"),
+            "stream_sequence": 1,
+            "event_type": "cycle.completed",
+            "target_id": completed_b["cycle"]["cycle_id"],
+            "actor": {"kind": "producer", "id": completed_b["producer"]["producer_id"]},
+            "recorded_at": "2026-08-11T00:03:00Z",
+            "provenance": cycle_provenance,
+            "evidence_ids": [],
+            "payload": {},
+        })
+        self.assertTrue(m.validate_update(
+            completed_b, preserved=[prefix], previous=prefix).ok)
+
+        changed_route = copy.deepcopy(completed_b)
+        changed_route["routes"][-1]["terminal_marker"] = _sha(11)
+        self.assertIn("update-earlier-routes-changed",
+                      _codes(m.validate_update(changed_route, preserved=[prefix], previous=prefix)))
+
+        changed_event = copy.deepcopy(completed_b)
+        changed_event["events"][len(prefix["events"]) - 1]["payload"]["route_hash"] = _sha(12)
+        self.assertIn("update-earlier-events-changed",
+                      _codes(m.validate_update(changed_event, preserved=[prefix], previous=prefix)))
+
+        stray_terminal = copy.deepcopy(completed_b)
+        duplicate_terminal = copy.deepcopy(terminal_event)
+        duplicate_terminal["event_id"] = allocator.allocate("event")
+        duplicate_terminal["stream_id"] = allocator.allocate("stream")
+        stray_terminal["events"].append(duplicate_terminal)
+        self.assertIn("update-historical-completion-shape-invalid",
+                      _codes(m.validate_update(stray_terminal, preserved=[prefix], previous=prefix)))
+
+        duplicate_completion = copy.deepcopy(completed_b)
+        duplicate_cycle_event = copy.deepcopy(completed_b["events"][-1])
+        duplicate_cycle_event["event_id"] = allocator.allocate("event")
+        duplicate_cycle_event["stream_id"] = allocator.allocate("stream")
+        duplicate_completion["events"].append(duplicate_cycle_event)
+        self.assertIn("update-historical-completion-shape-invalid",
+                      _codes(m.validate_update(duplicate_completion, preserved=[prefix], previous=prefix)))
 
 
 class CampaignSupersededFoldTest(unittest.TestCase):

@@ -1547,7 +1547,7 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
                 raise RuntimeError("crash-after-close")
         if state.get("state") == "route-closed":
             if binding_value is not None:
-                finalize_args = {"expected_binding": binding_value}
+                finalize_args = {"expected_binding": binding_value, "jobs": request.jobs}
                 primary = binding_value.get("primary")
                 if isinstance(primary, str):
                     try:

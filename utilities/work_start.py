@@ -570,6 +570,16 @@ def _slot(route, node, rows, jobs=None):
                     and route["route_id"] in {meta.get("owner_route_id"), meta.get("route_id")})
                    or (node != "owner" and meta.get("route_id") == route["route_id"]
                        and meta.get("route_node") == node and meta.get("worker_type") == "frame"))]
+    adopted = {}
+    owner = route.get("owner_attempt_id")
+    if node == "owner" and not matches and jobs is not None and owner in rows:
+        from owner_route_binding import resolve_owner_route_lifecycle
+        if rows[owner][1].get("worker_type") == "owner":
+            binding, _ = resolve_owner_route_lifecycle(jobs, owner_attempt_id=owner)
+            if binding is not None and (binding.route_id, binding.route_hash) == (
+                    route["route_id"], route["route_hash"]):
+                matches = [owner]
+                adopted[owner] = binding
     aid = matches[-1] if matches else attempt_id(route, node)
     if aid in rows:
         if not matches:
@@ -596,6 +606,8 @@ def _slot(route, node, rows, jobs=None):
             if not _owns(meta, parent, jobs):
                 raise DispatchContractError("work-parent-recovery-required", aid)
         digest = (meta.get("owner_route_hash") or meta.get("route_hash")) if node == "owner" else meta.get("route_hash")
+        if aid in adopted:
+            digest = adopted[aid].route_hash
         if digest != route["route_hash"]:
             raise DispatchContractError("work-attempt-identity-conflict", aid)
     return aid

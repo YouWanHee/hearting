@@ -9,6 +9,9 @@
   For a bound artifact-only node, the effective list names its in-scope outputs
   from the phase brief; declared worktree files are read-only inputs, and brief
   output paths are relative to the cycle output directory.
+  When the sealed QA plan requires `done_when` records, the exact primary
+  report's `.items.json` sidecar follows that report through the same fence,
+  ledger, and any continuation derived from it.
   Known approved test files belong in the initial `fixed_files`; a later simple
   omission returns as a bounded patch plus the exact-path handoff under the same
   approved owner — no new approval, no new owner, no separate repair, and no
