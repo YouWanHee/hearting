@@ -89,7 +89,7 @@ def _capture_pair(reference, vm, state, width, rows, outdir, label):
     if ref_scope and ref_scope.startswith("session:"):
         ref_scope = ref_scope.split(":", 1)[1]
     ref_module = load_isolated(reference)
-    inject_live(ref_module, vm.to_mapping())
+    injection = inject_live(ref_module, vm.to_mapping())
     ref_row = capture(reference, width, renderer=ref_module, scrub=False, view=state.view,
                       scope=ref_scope, uopen=state.usage_open)
     fleet_frame = draw(vm, state, width, rows, beat=1)
@@ -100,6 +100,7 @@ def _capture_pair(reference, vm, state, width, rows, outdir, label):
                   f"{label} {width}x{rows} - {len(diffs)} differences", target)
     return {"state": _slug(label), "width": width, "rows": rows, "equal": not diffs,
             "difference_count": len(diffs), "png": str(target),
+            "reference_copy_limitations": injection.get("reference_copy_limitations", []),
             "reference_rows": ["".join(cell[0] for cell in row) for row in reference_frame.cells],
             "reference_edge": [bool(row and (row[-1][0].strip() or (row[-1][0] == "" and len(row) > 1 and row[-2][0].strip())))
                                for row in reference_frame.cells],
@@ -188,6 +189,16 @@ def compare_vm(vm, reference, out_dir, widths=WIDTHS, rows=45, only=None):
         for width in widths:
             records.append(_capture_pair(Path(reference), vm, _nav(scope, view), width, rows, out_dir, label))
     return records
+
+
+def _unique_reference_copy_limitations(records):
+    """Keep narrow reference-cell limits visible without classifying them as parity exemptions."""
+    unique = {}
+    for record in records:
+        for item in record.get("reference_copy_limitations", ()):
+            key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            unique[key] = item
+    return [unique[key] for key in sorted(unique)]
 
 
 def _bands(record):
@@ -534,14 +545,17 @@ def run_capture(out, reference, approved=None, source_bundle=None, from_capture=
         vm, now = build_live_vm(capture_dir)
     side_dir = Path(out) / "evidence/parity/side-by-side/today"
     records = compare_vm(vm, reference, side_dir)
+    copy_limitations = _unique_reference_copy_limitations(records)
     summary = [{key: row[key] for key in ("state", "width", "rows", "equal", "difference_count", "png")}
                for row in records]
     (side_dir / "manifest.json").write_text(json.dumps({"schema": "fleet-side-by-side-v1",
         "source": f"today host capture {capture_dir.name}: one live view model injected into the copy and drawn by fleet2",
+        "reference_copy_limitations": copy_limitations,
         "captures": summary}, ensure_ascii=False, indent=2) + "\n")
     (capture_dir / "diff.json").write_text(json.dumps({"schema": "fleet-today-diff-v1", "captured_at": now,
-        "captures": summary}, ensure_ascii=False, indent=2) + "\n")
+        "reference_copy_limitations": copy_limitations, "captures": summary}, ensure_ascii=False, indent=2) + "\n")
     document = classify(records)
+    document["reference_copy_limitations"] = copy_limitations
     write_classified(document, capture_dir, capture_dir.name)
     if approved:
         _capture_2253(Path(out), Path(approved), Path(reference), capture_dir, now)
@@ -657,7 +671,8 @@ def main(argv=None):
                                        args.from_capture)
     write_index(args.out)
     print(json.dumps({"capture_dir": str(capture_dir), "capture_count": len(records),
-                      "differences": sum(row["difference_count"] for row in records)}))
+                      "differences": sum(row["difference_count"] for row in records),
+                      "reference_copy_limitations": _unique_reference_copy_limitations(records)}))
     return 0
 
 

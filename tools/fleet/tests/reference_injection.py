@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import re
 import sys
+import textwrap
 from pathlib import Path
 
 _SOURCE_MODULE = re.compile(r"mock\d+$")
@@ -127,6 +129,81 @@ def _jsonable(value, *, raw_keys=False):
         items = [_jsonable(item, raw_keys=raw_keys) for item in value if not callable(item)]
         return items
     return None
+
+
+def _patch_reference_function(draw, replacements, label):
+    if not callable(draw):
+        raise RuntimeError("reference %s renderer is unavailable; unknown GPU metrics cannot be compared safely" % label)
+    source = textwrap.dedent(inspect.getsource(draw))
+    for old, new in replacements:
+        if source.count(old) != 1:
+            raise RuntimeError("reference %s renderer changed; cannot preserve unknown GPU cells safely" % label)
+        source = source.replace(old, new, 1)
+    namespace = draw.__globals__
+    exec(compile(source, draw.__code__.co_filename, "exec"), namespace)
+    adapted = namespace.get(draw.__name__)
+    if not callable(adapted):
+        raise RuntimeError("reference %s compatibility renderer did not load" % label)
+    return adapted
+
+
+def _adapt_unknown_compute_cells(renderer, compute):
+    """Let the isolated r14 renderers display unknown GPU metrics without inventing values.
+
+    The frozen reference's fixed COMPUTE block and COMPUTE view divide VRAM used by total
+    unconditionally. Their drawing source predates Fleet's explicit unknown values, so guard
+    only those display cells in the in-memory renderers loaded for this comparison. The live
+    VM and reference files remain untouched; known values still use the original expressions.
+    """
+    limitations = []
+    for host in compute or ():
+        if not isinstance(host, (list, tuple)) or len(host) < 6:
+            continue
+        for gpu in host[5] or ():
+            if not isinstance(gpu, (list, tuple)) or len(gpu) < 7:
+                continue
+            cells = []
+            if gpu[4] is None:
+                cells.append("UTIL")
+            if gpu[5] is None or gpu[6] is None:
+                cells.extend(("COMPUTE block VRAM percent", "VRAM gauge", "VRAM used/total"))
+            if cells:
+                limitations.append({"reference_file": "mock13.py", "host": host[0],
+                                    "gpu": gpu[0], "unknown_cells": cells})
+    if not limitations:
+        return []
+
+    block_replacements = (
+        ('            p = round(used / total * 100)',
+         '            p = round(used / total * 100) if used is not None and total is not None else None'),
+        ('            g.put(right - 3, y, "%3d%%" % p, pct_key(p) if p else "dim")',
+         '            g.put(right - 3, y, "%3d%%" % p if p is not None else "  ·", '
+         'pct_key(p) if p else "dim")'),
+    )
+    block = getattr(getattr(renderer, "mock12", None), "compute_block", None)
+    adapted_block = _patch_reference_function(block, block_replacements, "fixed COMPUTE block")
+    renderer.mock12.compute_block = adapted_block
+    if hasattr(renderer, "mock6") and hasattr(renderer.mock6, "COMPUTE_BLOCK"):
+        renderer.mock6.COMPUTE_BLOCK = adapted_block
+
+    view_replacements = (
+        ('            g.put(X + 31, y, "%3d%%" % util, "soft" if st == "working" else "dim")',
+         '            g.put(X + 31, y, "%3d%%" % util if util is not None else "  ·", '
+         '"soft" if st == "working" else "dim")'),
+        ('            g.segs(X + 38, y, gauge(round(total / 4), used / total * 100))',
+         '            if used is None or total is None:\n'
+         '                g.put(X + 38, y, "·", "dim")\n'
+         '            else:\n'
+         '                g.segs(X + 38, y, gauge(round(total / 4), used / total * 100))'),
+        ('            g.put(X + 51, y, ("%g/%g GB" % (used, total)).rjust(10), "dim")',
+         '            if used is None or total is None:\n'
+         '                g.put(X + 51, y, "·", "dim")\n'
+         '            else:\n'
+         '                g.put(X + 51, y, ("%g/%g GB" % (used, total)).rjust(10), "dim")'),
+    )
+    draw = (getattr(renderer, "ROOT_FN", {}) or {}).get("COMPUTE")
+    renderer.ROOT_FN["COMPUTE"] = _patch_reference_function(draw, view_replacements, "COMPUTE view")
+    return limitations
 
 
 def inject_model_catalog(renderer, catalog):
@@ -302,7 +379,9 @@ def inject_live(renderer, vm):
     _inject_history(renderer, vm)
     _inject_models(renderer, vm.get("models"))
     renderer.ROOT_STATUS.update(_status(renderer, vm, 0))
-    return {"injected": sorted(renderer.mock2.LIVE), "unresolved": []}
+    limitations = _adapt_unknown_compute_cells(renderer, vm.get("compute"))
+    return {"injected": sorted(renderer.mock2.LIVE), "unresolved": [],
+            "reference_copy_limitations": limitations}
 
 
 def _deep(value):

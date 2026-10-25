@@ -3,9 +3,11 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 from tools.fleet.tests.parity_compare import diff_frames
-from tools.fleet.tests.parity_today import _frame_from_reference, _jsonable, classify
+from tools.fleet.tests.parity_today import (_frame_from_reference, _jsonable, _unique_reference_copy_limitations,
+                                            classify)
 
 
 class TodayParityPlumbingTests(unittest.TestCase):
@@ -93,6 +95,77 @@ class ClassificationTests(unittest.TestCase):
 
 
 class InjectionPieces(unittest.TestCase):
+    def test_unknown_compute_metrics_remain_none_and_render_as_unknown_cells(self):
+        from types import SimpleNamespace
+        from tools.fleet.tests.reference_injection import _adapt_unknown_compute_cells
+
+        class Grid:
+            def __init__(self):
+                self.cells = {}
+
+            def put(self, x, y, value, _style):
+                self.cells[(x, y)] = value
+
+            def segs(self, x, y, value):
+                self.cells[(x, y)] = value
+
+        def compute_renderer(g, X, use, y, util, used, total):
+            for _host in (None,):
+                for _gpu in (0,):
+                    st = "working"
+                    g.put(X + 31, y, "%3d%%" % util, "soft" if st == "working" else "dim")
+                    g.segs(X + 38, y, gauge(round(total / 4), used / total * 100))
+                    g.put(X + 51, y, ("%g/%g GB" % (used, total)).rjust(10), "dim")
+
+        def compute_block(g, EW, y1, used, total):
+            for _host in (None,):
+                for right, lab in [(23, "gpu0")]:
+                    for _gpu in (0,):
+                        y, gl, gk2 = y1, "●", "dim"
+                        p = round(used / total * 100)
+                        g.put(right - 5, y, gl, gk2)
+                        g.put(right - 3, y, "%3d%%" % p, pct_key(p) if p else "dim")
+
+        renderer = SimpleNamespace(ROOT_FN={"COMPUTE": compute_renderer},
+                                   mock12=SimpleNamespace(compute_block=compute_block),
+                                   mock6=SimpleNamespace(COMPUTE_BLOCK=compute_block))
+        compute = [["moving4", True, [1, 2], [1, 2], [0, 1],
+                    [[0, "idle", "GPU", "gpu_test", None, None, None, []]]]]
+        with mock.patch.dict(globals(), {"gauge": lambda track, percent: (track, percent),
+                                         "pct_key": lambda _percent: "known"}):
+            limitations = _adapt_unknown_compute_cells(renderer, compute)
+            # Keep the captured values as None; only the isolated renderer's cell formatting adapts.
+            self.assertEqual(compute[0][5][0][4:7], [None, None, None])
+            self.assertEqual(limitations, [{"reference_file": "mock13.py", "host": "moving4", "gpu": 0,
+                                            "unknown_cells": ["UTIL", "COMPUTE block VRAM percent",
+                                                              "VRAM gauge", "VRAM used/total"]}])
+
+            unknown = Grid()
+            renderer.ROOT_FN["COMPUTE"](unknown, 0, 60, 5, None, None, None)
+            self.assertEqual(unknown.cells, {(31, 5): "  ·", (38, 5): "·", (51, 5): "·"})
+
+            unknown_block = Grid()
+            renderer.mock12.compute_block(unknown_block, 32, 7, None, None)
+            self.assertEqual(unknown_block.cells, {(18, 7): "●", (20, 7): "  ·"})
+
+            known = Grid()
+            renderer.ROOT_FN["COMPUTE"](known, 0, 60, 6, 75, 12, 24)
+            self.assertEqual(known.cells, {(31, 6): " 75%", (38, 6): (6, 50.0),
+                                           (51, 6): "  12/24 GB"})
+
+            known_block = Grid()
+            renderer.mock12.compute_block(known_block, 32, 8, 12, 24)
+            self.assertEqual(known_block.cells, {(18, 8): "●", (20, 8): " 50%"})
+
+    def test_reference_copy_limitations_are_reported_without_exempting_differences(self):
+        limitation = {"reference_file": "mock13.py", "host": "moving4", "gpu": 0,
+                      "unknown_cells": ["VRAM gauge", "VRAM used/total"]}
+        records = [_record(cells=[(10, 50, "x", "dim", "y", "dim")]) for _ in range(2)]
+        for record in records:
+            record["reference_copy_limitations"] = [limitation]
+        self.assertEqual(_unique_reference_copy_limitations(records), [limitation])
+        self.assertEqual(classify(records[:1])["summary"]["unexplained"], 1)
+
     def test_a_state_outside_the_five_the_copy_knows_draws_as_an_idle_dot(self):
         from tools.fleet.tests.reference_injection import _session_row
         row = _session_row({"tag": "aa", "harness": "claude", "state": "stale", "context": None, "window": None})
