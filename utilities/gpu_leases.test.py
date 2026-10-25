@@ -23,11 +23,58 @@ OBS = {"reachable": True, "gpus": [
     {"index": 1, "uuid": "GPU-one", "free_mib": 23000, "utilization_gpu_pct": 0, "processes": []}]}
 
 
+class ComputePayloadReceiptTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def payload_namespace(self):
+        namespace = {}
+        exec(compile(G.serialized_payload_source(), "serialized-payload", "exec"), namespace)
+        namespace["identity"] = lambda _pid: {
+            "pid": 123, "starttime": "456", "process_group": 123,
+            "pid_namespace": "pid:[fixture]", "boot_id": "boot-fixture", "state": "S"}
+        namespace["bind"] = lambda *_args: None
+        namespace["release"] = mock.Mock()
+        return namespace
+
+    def test_payload_keeps_running_and_records_receipt_even_when_receipt_io_fails(self):
+        namespace = self.payload_namespace()
+        namespace["write_receipt"] = mock.Mock(side_effect=OSError("receipt storage unavailable"))
+        with mock.patch.object(namespace["subprocess"], "call", return_value=0):
+            result = namespace["payload"]("/unused/state.json", None, "true",
+                                           str(self.root / "run" / "launch-receipt.json"), "run-1")
+        self.assertEqual(result, 0)
+        namespace["release"].assert_called_once_with("/unused/state.json", None)
+        self.assertEqual(namespace["write_receipt"].call_count, 2)
+
+    def test_payload_receipt_records_exact_wrapper_identity_and_terminal_exit(self):
+        namespace = self.payload_namespace()
+        receipt_path = self.root / "run" / "launch-receipt.json"
+        receipt_path.parent.mkdir()
+        with mock.patch.object(namespace["subprocess"], "call", return_value=0):
+            self.assertEqual(namespace["payload"]("/unused/state.json", None, "true",
+                                                   str(receipt_path), "run-2"), 0)
+        receipt = json.loads(receipt_path.read_text())
+        self.assertEqual(receipt["run_id"], "run-2")
+        self.assertEqual(receipt["identity"]["process_group"], 123)
+        self.assertEqual(receipt["identity"]["boot_id"], "boot-fixture")
+        self.assertEqual((receipt["state"], receipt["exit_code"]), ("finished", 0))
+
+
 class LeasesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        # The outer verification environment pins CUDA_VISIBLE_DEVICES empty.
+        # This suite exercises admission with synthetic OBS and mocked observer
+        # boundaries, so remove that explicit CPU choice for its auto-select fixtures.
+        self._cuda_env = mock.patch.dict(os.environ)
+        self._cuda_env.start()
+        self.addCleanup(self._cuda_env.stop)
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         self.state = self.root / "dispatch" / "gpu-leases.json"
         self.no_tmux_bin = self.root / "no-tmux-bin"
         self.no_tmux_bin.mkdir()
@@ -35,6 +82,11 @@ class LeasesTest(unittest.TestCase):
                              ("id", "/usr/bin/id"), ("sh", "/bin/sh"),
                              ("tr", "/usr/bin/tr"), ("env", "/usr/bin/env")):
             (self.no_tmux_bin / name).symlink_to(target)
+        tmux = next((Path(directory) / "tmux" for directory in os.get_exec_path()
+                     if (Path(directory) / "tmux").is_file()
+                     and os.access(Path(directory) / "tmux", os.X_OK)), None)
+        if tmux is not None:
+            (self.no_tmux_bin / "tmux").symlink_to(tmux)
 
     def acquire(self, **kwargs):
         return G.acquire(self.state, OBS, **kwargs)
@@ -692,6 +744,13 @@ class LeasesTest(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("_gpu_end_to_end_compute", Path(G.__file__).with_name("compute-hosts.py"))
         tool = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(tool)
+        tmux = self.no_tmux_bin / "tmux"
+        if not tmux.is_file():
+            tmux = None
+        if tmux is not None:
+            launch_server = G.tmux_server_name(self.state)
+            self.addCleanup(subprocess.run, [str(tmux), "-L", launch_server, "kill-server"],
+                            capture_output=True, timeout=5)
         finish = self.root / "finish"
         code = ("import os,time; from pathlib import Path; print(os.environ['CUDA_VISIBLE_DEVICES'],flush=True); "
                 "end=time.monotonic()+10; p=Path(%r); "
@@ -890,7 +949,9 @@ class PathNamespaceSerializationTest(unittest.TestCase):
                                                   "/target/runs/fixture-run")), events)
                     self.assertIn(("enter", ({"/target": "/lab"}, "/target/runs", "/work",
                                                "/target/runs/fixture-run")), events)
-                    self.assertIn(("payload", (str(state_path), lease, "echo inner")), events)
+                    self.assertIn(("payload", (str(state_path), lease, "echo inner",
+                                                 "/target/runs/fixture-run/launch-receipt.json",
+                                                 "fixture-run")), events)
                 else:
                     self.assertEqual(result.exception.code, 125)
                     self.assertEqual([event for event in events if event[0] == "payload"], [])

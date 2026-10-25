@@ -55,6 +55,192 @@ class BatchLogDirAdmissionTest(unittest.TestCase):
             self.assertFalse(outside.exists())
 
 
+class PairModelProposalTest(unittest.TestCase):
+    def test_same_harness_pair_proposes_next_declared_model_without_changing_seals(self):
+        nodes = [
+            ({"id": "plan-a", "model_profile": "deep", "parallel_leg_index": 0}, "claude", "same", 1),
+            ({"id": "plan-b", "model_profile": "balanced-deep", "parallel_leg_index": 1}, "claude", "same", 1),
+        ]
+        profiles, diagnostic = BATCH._pair_model_proposals(nodes)
+        self.assertEqual(profiles, {"plan-b": "balanced"})
+        self.assertEqual(diagnostic["reason"], "proposed")
+        self.assertEqual([row[0]["model_profile"] for row in nodes], ["deep", "balanced-deep"])
+
+    def test_batch_proposal_flows_through_shared_wrapper_to_realized_rotation_receipt(self):
+        from model_config import resolve_config
+        from model_profile import resolve_profile_demand, resolve_profile_values, selection_receipt
+        import dispatch_wrapper_common as COMMON
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            config, _ = resolve_config("claude", source_root=ROOT)
+            nodes = [
+                ({"id": "plan", "model_profile": "deep", "parallel_leg_index": 0}, "claude", "same", 1),
+                ({"id": "plan-alternative", "model_profile": "balanced-deep", "parallel_leg_index": 1}, "claude", "same", 1),
+            ]
+            proposals, diagnostic = BATCH._pair_model_proposals(nodes)
+            self.assertEqual(proposals, {"plan-alternative": "balanced"})
+            route = {"route_id": "rt-batch-wrapper", "route_hash": "sha256:batch-wrapper",
+                     "profile_selection_contract_version": 1,
+                     "nodes": [{"id": name, "parallel_group": "plan", "model_profile": profile,
+                                "profile_demand": None,
+                                "profile_selection": resolve_profile_demand(None, explicit_profile=profile)}
+                               for name, profile in (("plan", "deep"), ("plan-alternative", "balanced-deep"))]}
+            route_path = base / "route.json"
+            route_path.write_text(json.dumps(route))
+            manifest = {"members": [
+                {"route_node": "plan", "model_profile": "deep", "harness": "claude"},
+                {"route_node": "plan-alternative", "model_profile": "balanced-deep", "harness": "claude"},
+            ]}
+            jobs = base / "jobs.log"
+            jobs.write_text("")
+            args = SimpleNamespace(
+                model_profile="balanced-deep", pair_model_profile=proposals["plan-alternative"],
+                route_file=str(route_path), owner_route_binding=None, route_node="plan-alternative",
+                action="start", attempt_id="att-alternative", parent_attempt_id="att-parent",
+                fallback_hop="same-harness-headless", fallback_ordinal=1, artifact_root=str(base),
+                agent_home=str(ROOT), jobs=str(jobs), worker_type="stage", model=None,
+                registered_worker=1, dispatch_depth=2, inherit_model_settings=False,
+                model_role="deep maker", effort=None, capacity_retry=0,
+            )
+            with mock.patch.dict(os.environ, {"AGENT_MODEL_GOVERNOR_RESERVATION_TOKEN": "token-fixture"}), \
+                 mock.patch("dispatch_contract.replica_batch_expectation", return_value={}), \
+                 mock.patch("dispatch_contract.resolve_model_governor_root", return_value=base / "governor"), \
+                 mock.patch("dispatch_contract._governor_json", return_value={"state": "unclaimed", "batch_manifest": manifest}), \
+                 mock.patch("route_authority.require_batch_reservation"), \
+                 mock.patch("replica_batch_contract.verify_manifest", return_value=(manifest, "digest", {})), \
+                 mock.patch("dispatch_capacity_evidence.usage_states", return_value={"claude": "ok"}):
+                context = COMMON.prepare_pair_model_rotation(args, harness="claude")
+                wrapper = importlib.util.spec_from_file_location(
+                    "claude_pair_batch_wrapper", ROOT / "adapters/claude/bin/dispatch-headless.py")
+                module = importlib.util.module_from_spec(wrapper)
+                wrapper.loader.exec_module(module)
+                rotated = module.resolve_model_settings(args)
+                args.resolved_model_settings = rotated
+                receipt = selection_receipt(args)
+            baseline = resolve_profile_values("claude", config, "deep")
+            results = [
+                {"attempt_id": "att-anchor", "node": "plan", "launch_state": "started",
+                 "model_profile": "deep", "model": baseline["model"], "model_source": "profile",
+                 "model_diversity": "distinct"},
+                {"attempt_id": "att-alternative", "node": "plan-alternative", "launch_state": "started",
+                 "model_profile": rotated["profile"], "model": rotated["model"],
+                 "model_source": receipt.get("model_source", "profile"),
+                 "model_diversity": receipt["model_diversity"]},
+            ]
+            batch_receipt, _success = BATCH.batch_receipt(
+                args=SimpleNamespace(parallel_group="plan"), lifecycle="detached", independence="persona",
+                required_axes=["model"], realized_axes=[], degradation_reason="",
+                legs=[{"attempt_id": row["attempt_id"]} for row in results], results=results, admitted=2,
+                selection_diagnostics={"model_diversity_proposal": diagnostic})
+        self.assertEqual(context["status"], "rotated")
+        self.assertEqual(args.model_profile, "balanced-deep")
+        self.assertEqual(rotated["profile"], "balanced")
+        self.assertNotEqual(rotated["model"], baseline["model"])
+        realized = batch_receipt["selection_diagnostics"]["model_diversity_realized"]["plan-alternative"]
+        self.assertEqual(realized["model_diversity"], "rotated")
+        self.assertEqual(realized["model_source"], "profile+diversity")
+
+    def test_distinct_harness_pair_is_outside_model_rotation(self):
+        nodes = [
+            ({"id": "plan-a", "model_profile": "deep"}, "claude", "same", 1),
+            ({"id": "plan-b", "model_profile": "deep"}, "codex", "same", 1),
+        ]
+        profiles, diagnostic = BATCH._pair_model_proposals(nodes)
+        self.assertEqual(profiles, {})
+        self.assertEqual(diagnostic["reason"], "distinct-harness")
+
+    def test_concrete_model_pin_is_preserved_but_profile_only_selection_can_rotate(self):
+        from model_config import resolve_config
+        from model_profile import resolve_profile_values
+        config, _ = resolve_config("claude", source_root=ROOT)
+        pinned_model = resolve_profile_values("claude", config, "balanced-deep")["model"]
+        nodes = [
+            ({"id": "plan-a", "model_profile": "deep", "parallel_leg_index": 0}, "claude", "same", 1),
+            ({"id": "plan-b", "model_profile": "balanced-deep", "parallel_leg_index": 1}, "claude", "same", 1),
+        ]
+        profiles, diagnostic = BATCH._pair_model_proposals(nodes, route={
+            "selection_pins": {"contract_version": 1,
+                               "worker": {"harness": "claude", "model": pinned_model, "effort": None}}
+        })
+        self.assertEqual(profiles, {})
+        self.assertEqual(diagnostic["reason"], "explicit-model")
+        profiles, _ = BATCH._pair_model_proposals(nodes, route={
+            "explicit_profiles": {"plan-b": "balanced-deep"}
+        })
+        self.assertEqual(profiles, {"plan-b": "balanced"})
+
+    def test_limited_target_keeps_both_sealed_profiles(self):
+        nodes = [
+            ({"id": "plan-a", "model_profile": "deep", "parallel_leg_index": 0}, "claude", "same", 1),
+            ({"id": "plan-b", "model_profile": "balanced-deep", "parallel_leg_index": 1}, "claude", "same", 1),
+        ]
+        with mock.patch("dispatch_capacity_evidence.usage_states",
+                        return_value={"claude": "limited(model-quota)"}):
+            profiles, diagnostic = BATCH._pair_model_proposals(nodes, jobs=Path("/tmp/jobs.log"))
+        self.assertEqual(profiles, {})
+        self.assertEqual(diagnostic["reason"], "target-limited")
+
+    def test_no_different_declared_model_records_unavailable(self):
+        from model_config import resolve_config
+        config, receipt = resolve_config("claude", source_root=ROOT)
+        config = dict(config)
+        for profile in ("balanced-deep", "balanced", "light"):
+            config["CFG_MODEL_PROFILE_" + profile.upper().replace("-", "_")] = "deep:medium"
+        nodes = [
+            ({"id": "plan-a", "model_profile": "deep", "parallel_leg_index": 0}, "claude", "same", 1),
+            ({"id": "plan-b", "model_profile": "balanced-deep", "parallel_leg_index": 1}, "claude", "same", 1),
+        ]
+        with mock.patch("model_config.resolve_config", return_value=(config, receipt)):
+            profiles, diagnostic = BATCH._pair_model_proposals(nodes)
+        self.assertEqual(profiles, {})
+        self.assertEqual(diagnostic["reason"], "unavailable")
+
+    def _receipt(self, models):
+        args = SimpleNamespace(parallel_group="plan")
+        legs = [{"attempt_id": "att-a"}, {"attempt_id": "att-b"}]
+        results = [{"attempt_id": "att-a", "launch_state": "started", "registered": "1",
+                    "started": "1", "child_spawned": "1", "model": models[0], "node": "a"},
+                   {"attempt_id": "att-b", "launch_state": "started", "registered": "1",
+                    "started": "1", "child_spawned": "1", "model": models[1], "node": "b"}]
+        axes = []
+        receipt, _ = BATCH.batch_receipt(
+            args=args, lifecycle="detached", independence="persona", required_axes=["model"],
+            realized_axes=axes, degradation_reason="", legs=legs, results=results, admitted=2)
+        return receipt
+
+    def test_realized_model_axis_uses_actual_receipt_models(self):
+        receipt = self._receipt(("opus", "sonnet"))
+        self.assertIn("model", receipt["realized_independence_axes"])
+
+    def test_proposal_diagnostics_are_separate_from_realized_row_fields(self):
+        args = SimpleNamespace(parallel_group="plan")
+        legs = [{"attempt_id": "att-a"}, {"attempt_id": "att-b"}]
+        results = [
+            {"attempt_id": "att-a", "launch_state": "started", "model_profile": "deep",
+             "model": "opus", "model_source": "profile", "model_diversity": "distinct",
+             "model_diversity_from": "deep"},
+            {"attempt_id": "att-b", "launch_state": "started", "model_profile": "balanced",
+             "model": "sonnet", "model_source": "profile+diversity", "model_diversity": "rotated",
+             "model_diversity_from": "balanced-deep/opus"},
+        ]
+        diagnostics = {"model_diversity_proposal": {"reason": "proposed", "profile": "balanced"}}
+        receipt, _ = BATCH.batch_receipt(
+            args=args, lifecycle="detached", independence="persona", required_axes=["model"],
+            realized_axes=[], degradation_reason="", legs=legs, results=results, admitted=2,
+            selection_diagnostics=diagnostics)
+        self.assertIn("model_diversity_proposal", receipt["selection_diagnostics"])
+        self.assertNotIn("model_diversity", receipt["selection_diagnostics"])
+        realized = receipt["selection_diagnostics"]["model_diversity_realized"]
+        rotated = next(row for row in realized.values() if row["model"] == "sonnet")
+        self.assertEqual(rotated["model_diversity"], "rotated")
+        self.assertEqual(rotated["model_profile"], "balanced")
+        self.assertEqual(rotated["model_source"], "profile+diversity")
+
+    def test_effort_or_variant_does_not_create_model_axis(self):
+        receipt = self._receipt(("opus", "opus"))
+        self.assertNotIn("model", receipt["realized_independence_axes"])
+
+
 def candidate(adapter: str, hop: str, ordinal: int) -> dict[str, object]:
     return {
         "fallback_hop": hop,
@@ -4725,7 +4911,8 @@ class NodeLaunchCommandTest(unittest.TestCase):
 
     def command(self, qa):
         leg = {"node": "retrieval", "adapter": "codex", "slug": "s", "attempt_id": "att-x",
-               "hop": "same-harness-headless", "ordinal": 0}
+               "hop": "same-harness-headless", "ordinal": 0,
+               "pair_model_profile": "balanced"}
         return BATCH.node_launch_command(
             route_path=Path("/r.json"), leg=leg, parent="owner", prompt_text="p",
             reviewed_evidence=None, jobs=Path("/jobs.log"), parent_attempt="att-parent",
@@ -4741,6 +4928,13 @@ class NodeLaunchCommandTest(unittest.TestCase):
 
     def test_unset_qa_is_omitted(self):
         self.assertNotIn("--qa", self.command(None))
+
+    def test_pair_profile_hint_is_dispatch_node_owned_before_separator(self):
+        command = self.command(None)
+        cut = command.index("--")
+        self.assertIn("--pair-model-profile", command[:cut])
+        self.assertEqual(command[command.index("--pair-model-profile") + 1], "balanced")
+        self.assertNotIn("--pair-model-profile", command[cut:])
 
 
 class SlicesOneCommandTest(unittest.TestCase):
@@ -4851,6 +5045,18 @@ class SlicesOneCommandTest(unittest.TestCase):
                 rc, out = self.run_slices(self.plan(self.GOOD), extra=extra, env={"AGENT_DISPATCH_ATTEMPT_ID": None})
                 self.assert_single_session(rc, out, "parent-attempt-id-absent", ledger=False)
 
+    def test_non_object_slice_entries_keep_the_typed_fallback(self):
+        for invalid in (None, 42, "not-a-slice"):
+            with self.subTest(invalid=invalid):
+                slices = [invalid, json.loads(self.GOOD)[1]]
+                try:
+                    rc, out = self.run_slices(self.plan(json.dumps(slices)))
+                except AttributeError as exc:
+                    self.fail(f"malformed slice escaped the typed fallback: {exc}")
+                receipt = self.assert_single_session(
+                    rc, out, "subdivision-disjointness-unproven", ledger=True)
+                self.assertIn("plan-slice-invalid:1", receipt["detail"])
+
     def test_slices_gates_on_linked_worktree_falls_back_to_single_session(self):
         linked = self.base / "linked"
         self.git("worktree", "add", "-q", "-b", "linked-s", str(linked), cwd=self.primary)
@@ -4888,6 +5094,116 @@ class SlicesOneCommandTest(unittest.TestCase):
         self.assertIn("capability-route.py complete --route", receipt["next_command"])
         self.assertIn(f"--subsession-manifest {manifest_path}", receipt["next_command"])
         self.assertIn("--node execute", receipt["next_command"])
+
+    def test_replacement_owner_same_slices_registers_new_attempt(self):
+        plan = self.plan(self.GOOD)
+        admitted = SimpleNamespace(reservation_identity="r" * 8, sessions=[{}, {}])
+        started = [{"started": 1, "registered": 1}, {"started": 1, "registered": 1}]
+        rc_a, out_a = self.run_slices(
+            plan, action="start", env={"AGENT_DISPATCH_ATTEMPT_ID": "att-owner-a",
+                                        "AGENT_DISPATCH_CURRENT_HARNESS": "claude"},
+            admit=lambda **_kw: admitted, start=lambda *a, **_kw: started)
+        self.assertEqual(rc_a, 0, out_a)
+        manifest_a = json.loads(out_a)["chain_manifest"]
+        bytes_a = Path(manifest_a).read_bytes()
+
+        rc_b, out_b = self.run_slices(
+            plan, action="start", env={"AGENT_DISPATCH_ATTEMPT_ID": "att-owner-b",
+                                        "AGENT_DISPATCH_CURRENT_HARNESS": "codex"},
+            admit=lambda **_kw: admitted, start=lambda *a, **_kw: started)
+        self.assertEqual(rc_b, 0, out_b)
+        manifest_b = json.loads(out_b)["chain_manifest"]
+        bytes_b = Path(manifest_b).read_bytes()
+        manifest_a_doc = json.loads(bytes_a)
+        manifest_b_doc = json.loads(bytes_b)
+        slice_ids_a = [row["attempt_id"] for row in manifest_a_doc["sessions"]]
+        slice_ids_b = [row["attempt_id"] for row in manifest_b_doc["sessions"]]
+
+        # The planned manifests are produced by the real slice planner above.
+        # Exercise the existing seal and registry writers against their rows;
+        # only native worker execution is represented by a short local process.
+        import dispatch_contract as DC
+        import dispatch_replacement as replacement
+        import hashlib
+
+        def register_manifest(manifest, owner, harness, parent_session, sandbox, *, launch_first=False):
+            registered = []
+            process = None
+            for index, session in enumerate(manifest["sessions"]):
+                args = SimpleNamespace(
+                    attempt_id=session["attempt_id"], jobs_path=str(self.jobs), worktree=str(self.primary),
+                    replacement_input_argv=["--route", str(self.route_path), "--node", session["node"]],
+                    route_id=self.route["route_id"], route_node=session["node"],
+                    parent_session_id=parent_session, parent_attempt_id=owner,
+                    parent_harness=harness, parent_transport="headless", parent_sandbox=sandbox,
+                )
+                sealed = replacement.seal_launch_input(args, harness, "Execute the sealed slice brief")
+                metadata = {
+                    "attempt_schema_version": "2", "dispatch_depth": "2", "transport": "headless",
+                    "execution_surface": "registered-headless", "registered_worker": "1",
+                    "fallback_hop": "same-harness-headless", "attempt_id": session["attempt_id"],
+                    "route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+                    "route_node": session["node"], "worker_type": "stage", "harness": harness,
+                    "parent_attempt_id": owner, "parent_session_id": parent_session,
+                    "parent_harness": harness, "parent_transport": "headless", "parent_sandbox": sandbox,
+                    "subsession_id": session["subsession_id"], "subsession_index": str(index + 1),
+                    "subsession_count": str(len(manifest["sessions"])), "subsession_mode": "parallel",
+                    "session_chain_id": manifest["chain_id"], "stage_authority": "0",
+                    "subsession_purpose": "planned", "phase_brief": session["phase_brief"],
+                    "phase_brief_sha256": hashlib.sha256(Path(session["phase_brief"]).read_bytes()).hexdigest(),
+                    "state_ledger": str(self.base / f"{session['attempt_id']}.ledger"),
+                    "fixed_files_sha256": hashlib.sha256(json.dumps(session["fixed_files"], separators=(",", ":")).encode()).hexdigest(),
+                    "narrow_verify_sha256": hashlib.sha256(session["narrow_verify"].encode()).hexdigest(),
+                    "expected_round_trips": str(session["expected_round_trips"]), "parallel_group": "execute",
+                    "launch_fence": "registry-v1",
+                }
+                metadata.update(DC.parse_registry_metadata(sealed))
+                if launch_first and index == 0:
+                    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"],
+                                               start_new_session=True)
+                    metadata.update(DC.process_launch_identity(process.pid))
+                line = (f"2026-10-24T00:00:00Z\topen\t{self.primary}\t{self.primary}\t{session['slug']}\t"
+                        + ",".join(f"{key}={value}" for key, value in metadata.items()))
+                if not DC.claim_attempt_row(self.jobs, session["attempt_id"], line, launch=False):
+                    raise AssertionError(f"slice registration refused: {session['attempt_id']}")
+                registered.append((session, metadata, line))
+                if process is not None:
+                    self.assertTrue(DC.claim_attempt_row(self.jobs, session["attempt_id"], line, launch=True))
+                    DC.mark_attempt_launch_started(self.jobs, session["attempt_id"], process.pid)
+                    process.wait(timeout=5)
+                    process = None
+                    self.assertTrue(DC.close_attempt_row(self.jobs, session["attempt_id"], "dead-worker-blocked"))
+            if process is not None:
+                process.terminate()
+                process.wait(timeout=5)
+
+        register_manifest(manifest_a_doc, "att-owner-a", "claude", "parent-session-a", "sandbox-a",
+                          launch_first=True)
+        # A fresh Codex parent tuple gets its own slice IDs, manifest, sealed
+        # inputs, and real launch=False registrations.
+        try:
+            register_manifest(manifest_b_doc, "att-owner-b", "codex", "parent-session-b", "sandbox-b")
+        except DC.DispatchContractError as exc:
+            registration_status = ("refused", exc.reason)
+        else:
+            registration_status = ("registered", None)
+        self.assertEqual(registration_status, ("registered", None),
+                         "the replacement owner must register its same-file slice attempts")
+        self.assertNotEqual(manifest_a, manifest_b)
+        self.assertEqual(Path(manifest_a).read_bytes(), bytes_a)
+        self.assertTrue(set(slice_ids_a).isdisjoint(slice_ids_b))
+        registry = {}
+        for line in self.jobs.read_text(encoding="utf-8").splitlines():
+            fields = line.split("\t")
+            if len(fields) == 6:
+                registry.update({DC.parse_registry_metadata(fields[5])["attempt_id"]: (fields, DC.parse_registry_metadata(fields[5]))})
+        self.assertEqual(registry[slice_ids_a[0]][0][1], "done")
+        self.assertEqual(registry[slice_ids_a[0]][1]["launch_started"], "1")
+        self.assertEqual(registry[slice_ids_a[0]][1]["parent_sandbox"], "sandbox-a")
+        for attempt_id in slice_ids_b:
+            self.assertEqual(registry[attempt_id][0][1], "open")
+            self.assertEqual(registry[attempt_id][1]["parent_attempt_id"], "att-owner-b")
+            self.assertEqual(registry[attempt_id][1]["parent_sandbox"], "sandbox-b")
 
     def test_next_literal_paths_reach_batch_admission_and_true_globs_do_not(self):
         names = ["app/trips/[id]/page.tsx", "app/[...slug]/page.tsx", "app/(group)/page.tsx"]

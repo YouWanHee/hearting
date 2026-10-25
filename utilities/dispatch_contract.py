@@ -3029,6 +3029,7 @@ ROUTE_STATE_REFUSAL_REASONS = (
     "review-round-budget-exhausted",
     "review-verdictless-bound",
     "round-unsettled",
+    "resource-owner-stage-admission-blocked",
 )
 
 # Receipts and the ledger carry the same bounded facts, never a clipped copy
@@ -3154,6 +3155,9 @@ def route_state_next_action(reason: str, detail: str, route_file: str | None,
         return "route the round through the sealed fallback chain's remaining unregistered hop (native-subagent, then owner-inline)"
     if reason == "round-unsettled":
         return "wait for the live round to settle before starting the next one"
+    if reason == "resource-owner-stage-admission-blocked":
+        return ("inspect the typed resource route-state reason and next_action; "
+                "use the current route owner's existing start/correct path")
     return "-"
 
 

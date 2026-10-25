@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import datetime
 import fcntl
 import hashlib
 import json
@@ -79,7 +80,8 @@ CARD_BODY_MAX_BYTES = 8 * 1024
 COMPACT_SUMMARY_MAX_BYTES = 256 * 1024
 COMPACT_RECENT_MAX_BYTES = 8 * 1024
 COMPACT_METADATA_MAX_BYTES = 1024
-COMPACT_CARD_BODY_MAX_BYTES = COMPACT_SUMMARY_MAX_BYTES + COMPACT_RECENT_MAX_BYTES + COMPACT_METADATA_MAX_BYTES
+COMPACT_CARD_BODY_MAX_BYTES = (COMPACT_SUMMARY_MAX_BYTES + COMPACT_RECENT_MAX_BYTES
+                               + COMPACT_METADATA_MAX_BYTES + 3072)
 INJECTION_MAX_BYTES = 2400
 MEMORY_REFS_MAX = 8                 # "참고할 기억" (card layer B): records listed
 MEMORY_REFS_BYTES = 1200            # ... and the bytes their lines may take
@@ -117,6 +119,10 @@ COMPACT_CARD_INSTRUCTIONS = (
     "original identifier; preserve document/revision and checkpoint references when they "
     "affect meaning. Keep failed, interrupted and unfinished states with their next action, "
     "and leave unexplained identifiers unresolved."
+    " Some recent turns may remain verbatim after compaction, depending on the runtime. "
+    "Do not infer that an omitted request or reply was undelivered. When known, say which "
+    "last turn this summary covers; note when the preserved transcript needs checking. "
+    "Do not assume a later turn is visible or available."
 )
 
 
@@ -1560,29 +1566,60 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
 def _compact_body(compact: dict) -> str:
     summary_text = str(compact.get("summary") or "")
     recent = str(compact.get("recent") or "")
+    preserved = str(compact.get("recent_preserved") or "")
+    post_recent = str(compact.get("recent_post", recent) or "")
     source = _cut_bytes(_normalize_body(str(compact.get("source") or compact.get("transcript") or "")),
                         COMPACT_METADATA_MAX_BYTES)[0]
     partial_note = "\n[최근 대화의 일부만 보존됨; 원본 기록을 확인하세요.]" if compact.get("recent_partial") else ""
-    footer = ("\n\n[압축 뒤 이어진 대화]" + partial_note + "\n" + recent) if recent \
+    footer = ("\n\n[압축 뒤 이어진 대화]" + partial_note + "\n" + post_recent) if post_recent \
         else ("\n\n" + partial_note.strip()) if partial_note else ""
+    preserved_footer = ("\n\n[요약 뒤 그대로 남은 대화]\n" + preserved) if preserved else ""
+    reply = compact.get("last_reply") if isinstance(compact.get("last_reply"), dict) else {}
+    reply_line = ""
+    if reply.get("first_line"):
+        timestamp = str(reply.get("timestamp") or "")
+        try:
+            instant = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if instant.tzinfo is None:
+                instant = instant.replace(tzinfo=datetime.timezone.utc)
+            utc = instant.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            kst = instant.astimezone(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S KST")
+            when = f"{utc} / {kst}"
+        except (ValueError, OverflowError):
+            when = timestamp or "시각 미상"
+        reply_line = f"압축 직전 마지막 답 ({when}): {str(reply['first_line'])[:1024]}\n\n"
     caution = "\n\n이 요약이 보지 못한 최근 대화가 있을 수 있습니다. 이어서 진행하기 전에 확인하세요."
     path = f"\n원본 대화 기록: {source}" if source else "\n원본 대화 기록 경로를 확인할 수 없습니다."
-    result = summary_text + caution + path + footer
+    reply_priority = ("위 마지막 답과 요약 뒤 그대로 남은 대화를 요약의 미전달·미완료 "
+                      "서술보다 우선하세요.\n\n") if reply_line else ""
+    result = reply_line + reply_priority + summary_text + caution + path + preserved_footer + footer
     if len(result.encode("utf-8")) > COMPACT_CARD_BODY_MAX_BYTES:
         raise ValueError("compact card exceeds bounded size")
     return result
 
 
 def update_compact_card_locked(seat: Seat, generation: int, identity: str, *, recent: str,
-                               source: str = "", recent_partial: bool = False) -> bool:
+                               source: str = "", recent_partial: bool = False,
+                               recent_preserved: str = "", last_reply: Optional[dict] = None) -> bool:
     """Idempotently add a bounded transcript tail without changing card identity."""
     card = read_latest_card(seat)
     compact = (card or {}).get("compact")
     if (not card or int(card.get("generation", 0)) != int(generation)
             or not isinstance(compact, dict) or compact.get("identity") != identity):
         return False
-    compact["recent"] = _cut_bytes(_normalize_body(recent), COMPACT_RECENT_MAX_BYTES)[0]
-    compact["recent_partial"] = bool(recent_partial)
+    compact["recent"], recent_cut = _cut_bytes(_normalize_body(recent), COMPACT_RECENT_MAX_BYTES)
+    compact["recent_post"] = compact["recent"]
+    # Preserve the original total tail budget, prioritizing the newest dialogue.
+    remaining = COMPACT_RECENT_MAX_BYTES - len(compact["recent"].encode("utf-8"))
+    compact["recent_preserved"], preserved_cut = _cut_bytes(_normalize_body(recent_preserved), remaining)
+    if isinstance(last_reply, dict) and last_reply.get("first_line"):
+        compact["last_reply"] = {
+            "uuid": str(last_reply.get("uuid") or "")[:96],
+            "byte_offset": max(0, int(last_reply.get("byte_offset", 0) or 0)),
+            "timestamp": str(last_reply.get("timestamp") or "")[:64],
+            "first_line": _cut_bytes(_normalize_body(str(last_reply["first_line"])), 1024)[0],
+        }
+    compact["recent_partial"] = bool(recent_partial or recent_cut or preserved_cut)
     if source:
         compact["source"] = _cut_bytes(_normalize_body(source), COMPACT_METADATA_MAX_BYTES)[0]
     card["body"] = _compact_body(compact)
@@ -1962,6 +1999,40 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             session_tidy_runner.reconcile_queued(seat, harness, sid)
             if event == "start":
                 session_tidy_runner.reconcile_reservation_queue(seat)
+    answer_wait_lines = []
+    if event in ("start", "prompt"):
+        with contextlib.suppress(BaseException):
+            utilities = str(Path(__file__).resolve().parent)
+            if utilities not in sys.path:
+                sys.path.insert(0, utilities)
+            import human_wait_state
+            projected = human_wait_state.cached_view(now=now)
+            projected = projected or {"items": [], "by_session": {}}
+            # The caller's own S4 is exact and cheap; replace its possibly older
+            # producer copy so a just-closed prompt cannot be resurrected.
+            own = human_wait_state._read(human_wait_state._path(seat.key))
+            projected["items"] = [item for item in projected["items"]
+                                   if not (item.get("source") == "S4"
+                                           and (item.get("owner") or {}).get("seat_key") == seat.key)]
+            if own:
+                projected["items"].append(
+                    {"id": own["id"], "source": "S4", "question": own.get("question"),
+                     "since": own.get("since"), "stale": False,
+                     "owner": {"harness": harness, "session_id": sid, "seat_key": seat.key}})
+            ids = set(projected.get("by_session", {}).get((harness, sid), ()))
+            for item in projected.get("items", ()):
+                owner = item.get("owner") or {}
+                if item.get("stale"):
+                    continue
+                if item.get("id") not in ids and owner.get("seat_key") != seat.key:
+                    continue
+                if (event == "prompt" and item.get("source") == "S4"
+                        and owner.get("seat_key") == seat.key):
+                    continue
+                question = item.get("question") or "사용자 답 대기"
+                answer_wait_lines.append("[답변 필요] " + str(question)[:160])
+                if len(answer_wait_lines) == 3:
+                    break
     with seat_lock(seat.key):
         if reread:
             saved = read_json(_reread_path(harness, sid))
@@ -1976,6 +2047,12 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             request_origin = _current_request_origin(prompt_text, harness, sid)
             if request_origin:
                 record_prompt_origin(seat, harness, sid, sequence, request_origin)
+            else:
+                # A physical user prompt closes this exact seat's marked wait.
+                # Transfer/automatic prompts are not answers from the user.
+                with contextlib.suppress(BaseException):
+                    import human_wait_state
+                    human_wait_state.close_signal(seat.key, sequence=sequence)
             with contextlib.suppress(BaseException):
                 import session_tidy_clear as clear
                 if not clear.observe_prompt_locked(seat, harness, sid, prompt_text, now, sequence):
@@ -2098,6 +2175,7 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             resume_text = handover.resume_line(seat, harness, sid)
             if resume_text:
                 parts.append(resume_text)
+        parts.extend(answer_wait_lines)
         text = "\n".join(parts)
         if event == "start" and emit_human:
             with contextlib.suppress(BaseException):
@@ -2610,9 +2688,11 @@ def tidy_report_line(booked: str, *, handoff: bool = False, origin: str = "", ha
     fields = str(booked or "").split()
     outcome = next((field for field in fields if field.startswith("clear=")), "")
     if outcome == "clear=scheduled":
+        # The clear waits for this turn to end with an empty input box; typing first keeps the window.
         if handoff or origin == "idle" or "continue=off" in fields:
-            return "곧 이 창이 자동으로 비워집니다."
-        return "곧 이 창이 자동으로 비워지고, 새 세션이 카드를 받아 이어서 진행합니다."
+            return "입력창이 비어 있으면 곧 이 창을 비웁니다. 그 전에 입력하시면 비우지 않습니다."
+        return ("입력창이 비어 있으면 곧 이 창을 비우고, 새 세션이 카드를 받아 이어서 진행합니다. "
+                "그 전에 입력하시면 비우지 않습니다.")
     command = "/new" if harness == "opencode" else "/clear"
     if outcome == "clear=off":
         return f"이 창은 그대로 둡니다. 이제 {command} 하거나 닫아도 됩니다."

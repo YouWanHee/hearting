@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -4020,8 +4021,579 @@ class SeatHandoverRewakeTest(unittest.TestCase):
         self.assertFalse(rewake._handed_away(launch))
 
 
+class BatchWakeCarrierTest(unittest.TestCase):
+    """A ready sibling success batch wakes the parent once through this carrier;
+    a held batch wakes nobody and leaves every record pending; failures and
+    already-received members never ride the batch."""
+
+    RECIPIENT = "session-1"
+    SIZE = 24
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.jobs = self.root / "jobs.log"
+        self.jobs.write_text("", encoding="utf-8")
+        self.pd = rewake.pending_delivery
+        for name, value in (("AGENT_HOME", str(MODULE_PATH.parents[1])),
+                            ("AGENT_CLAUDE_REWAKE_INTERVAL_SECONDS", "1"),
+                            ("AGENT_CLAUDE_REWAKE_MAX_SECONDS", "1")):
+            self.enterContext(mock.patch.dict(os.environ, {name: value}))
+        self.ids = [(f"att-{i:032x}", f"delivery-{i:032x}") for i in range(self.SIZE)]
+        for attempt_id, delivery_id in self.ids:
+            self._create(attempt_id, delivery_id, success=True)
+        self.batch_ids = tuple(sorted(d for _, d in self.ids))
+        self.held = False
+        self.retired: set[str] = set()
+        self.enterContext(mock.patch.object(
+            self.pd, "claim_ready_batch", wraps=self.pd.claim_ready_batch))
+        self.enterContext(mock.patch("dispatch_notice_state.resolve_delivery_batch", side_effect=self._resolve))
+        self.enterContext(mock.patch("dispatch_notice_state.keep_claim", side_effect=self._keep))
+
+    def _create(self, attempt_id, delivery_id, *, success):
+        receipt = {
+            "schema_version": 2, "state": "ready", "parent_attempt_id": "att-parent",
+            "job_registry": str(self.jobs),
+            "children": [{"attempt_id": attempt_id, "status": "done", "readiness": "ready",
+                          "reason": "terminal-complete" if success else "terminal-failure-or-unclosed",
+                          "required_action": "advance-completed" if success else "inspect-done-failure",
+                          "harness": "claude",
+                          "delivery_classification": "success" if success else "attention"}],
+            "delivery_classification": "success" if success else "attention",
+        }
+        self.pd.create(
+            self.root, recipient_kind="claude-parent-runtime", recipient_key=self.RECIPIENT,
+            delivery_id=delivery_id, session_generation="", session_generation_supported="0",
+            attempt_ids=[attempt_id], parent_attempt_id="att-parent", route_id="rt-batch",
+            route_node="frame", receipt=receipt, receipt_digest=self.pd._canonical_receipt_digest(receipt),
+            row_revisions={attempt_id: "rev"})
+
+    def _resolve(self, jobs, record, **_options):
+        if record["delivery_id"] not in self.batch_ids:
+            return None
+        return {"delivery_ids": self.batch_ids, "held": self.held}
+
+    def _keep(self, root, recipient, delivery_id, record, claim_owner, *, jobs=None):
+        if delivery_id in self.retired:
+            self.pd.reject_claimed(root, recipient, delivery_id, claim_owner=claim_owner,
+                                   reason="notice-obligation-resolved")
+            return False
+        return True
+
+    def _wake(self, attempt_id, delivery_id):
+        """One sibling's carrier from the ready wait to its exit; returns (code, stdout, stderr)."""
+        launch = rewake.Launch(attempt_id=attempt_id, jobs=self.jobs, session_id=self.RECIPIENT, armed="registry")
+        owing = {"delivery_id": delivery_id, "parent_sid": self.RECIPIENT}
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(rewake.sys, "stdout", stdout), mock.patch.object(rewake.sys, "stderr", stderr), \
+                mock.patch.object(rewake, "wait_for_attempt", return_value=("ready", "terminal-quiescent")), \
+                mock.patch.object(rewake, "follow_replacement", return_value=None), \
+                mock.patch.object(rewake, "_owner_status", return_value="done"), \
+                mock.patch.object(rewake, "classified_receipt", side_effect=lambda l, st, r, root: (
+                    "success", f"RECEIPT {l.attempt_id} state=success status=done")), \
+                mock.patch.object(rewake, "_delivery_owing_row", return_value=owing), \
+                mock.patch.object(rewake, "_incarnation_binding_matches", return_value=True), \
+                mock.patch.object(rewake, "_holds_arm", return_value=True), \
+                mock.patch.object(rewake, "_handed_away", return_value=False), \
+                mock.patch.object(rewake, "_open_gate_pending", return_value=False), \
+                mock.patch.object(rewake, "_gate_notices", return_value=[]), \
+                mock.patch.object(rewake, "settle_arm", return_value=True), \
+                mock.patch.object(rewake.time, "sleep"):
+            code = rewake._run_carrier(launch, mock.sentinel.arm, {}, {}, {"claim": mock.sentinel.arm})
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def _states(self):
+        return {d: self.pd.read(self.root, self.RECIPIENT, d)["state"] for _, d in self.ids}
+
+    def test_ready_batch_of_24_wakes_once_with_every_receipt_and_marker(self):
+        results = [self._wake(a, d) for a, d in self.ids]
+        emissions = [r for r in results if r[0] == 2]
+        self.assertEqual(len(emissions), 1)
+        self.assertTrue(all(r == (0, "", "") for r in results if r[0] != 2))
+        text = emissions[0][2]
+        self.assertEqual(text.count("HEARTING_RECEIPT_V1 "), self.SIZE)
+        for attempt_id, delivery_id in self.ids:
+            self.assertIn(f"RECEIPT {attempt_id} ", text)
+            self.assertIn(f"HEARTING_RECEIPT_V1 {delivery_id} ", text)
+        self.assertEqual(set(self._states().values()), {"sent-ambiguous"})
+        print(f"batch24 emissions={len(emissions)} wakes={len(emissions)} chars={len(text)}")
+
+    def test_held_batch_emits_nothing_and_keeps_every_record_pending(self):
+        self.held = True
+        for attempt_id, delivery_id in self.ids[:3]:
+            self.assertEqual(self._wake(attempt_id, delivery_id), (0, "", ""))
+        self.assertEqual(set(self._states().values()), {"pending"})
+        for _, delivery_id in self.ids:
+            self.assertEqual(self.pd.read(self.root, self.RECIPIENT, delivery_id)["attempts"], 0)
+        self.held = False
+        code, _out, text = self._wake(*self.ids[0])
+        self.assertEqual((code, text.count("HEARTING_RECEIPT_V1 ")), (2, self.SIZE))
+
+    def test_a_failure_record_is_delivered_immediately_on_its_own(self):
+        self.held = True
+        failed = ("att-" + "f" * 32, "delivery-" + "f" * 32)
+        self._create(*failed, success=False)
+        code, _out, text = self._wake(*failed)
+        self.assertEqual((code, text.count("HEARTING_RECEIPT_V1 ")), (2, 1))
+        self.assertIn(f"HEARTING_RECEIPT_V1 {failed[1]} ", text)
+        self.assertEqual(self.pd.read(self.root, self.RECIPIENT, failed[1])["state"], "sent-ambiguous")
+        self.assertEqual(set(self._states().values()), {"pending"})
+
+    def test_an_already_received_member_is_not_emitted_again(self):
+        received = self.ids[5][1]
+        self.pd.claim(self.root, self.RECIPIENT, received, claim_owner="earlier", lease_seconds=30)
+        self.pd.ack(self.root, self.RECIPIENT, received, acked_by="earlier")
+        self.retired.add(received)
+        results = [self._wake(a, d) for a, d in self.ids]
+        emissions = [r for r in results if r[0] == 2]
+        self.assertEqual(len(emissions), 1)
+        text = emissions[0][2]
+        self.assertEqual(text.count("HEARTING_RECEIPT_V1 "), self.SIZE - 1)
+        self.assertNotIn(received, text)
+        self.assertEqual(self.pd.read(self.root, self.RECIPIENT, received)["state"], "acked")
+
+
 def replace_session(launch, session):
     return rewake.Launch(attempt_id=launch.attempt_id, jobs=launch.jobs, session_id=session, armed=launch.armed)
+
+
+class SeatGateChainTest(unittest.TestCase):
+    """Real session-tidy seat lineage and delivery records across A → B → C."""
+
+    def setUp(self) -> None:
+        GateCarrierTest.setUp(self)
+        self.pane = "test:seat-gate-chain-" + self.root.name
+        self.agent_home = self.root / "agent-home"
+        (self.agent_home / "core").mkdir(parents=True)
+        (self.agent_home / "core" / "CORE.md").write_text("isolated hook fixture\n", encoding="utf-8")
+        readiness = self.agent_home / "utilities" / "dispatch-attempt-ready.py"
+        readiness.parent.mkdir(parents=True)
+        self.probe = self.root / "readiness-probed"
+        readiness.write_text(
+            "#!/usr/bin/env python3\nfrom pathlib import Path\n"
+            f"Path({str(self.probe)!r}).touch()\nraise SystemExit(2)\n", encoding="utf-8")
+        self.env_patch = mock.patch.dict(os.environ, {
+            "AGENT_HOME": str(self.agent_home),
+            "AGENT_DISPATCH_JOBS": str(self.jobs),
+            "HARNESS_STATE_ROOT": str(self.state),
+            "HERDR_PANE_ID": self.pane,
+            "AGENT_CLAUDE_REWAKE_INTERVAL_SECONDS": "1",
+            "AGENT_CLAUDE_REWAKE_MAX_SECONDS": "8",
+        }, clear=False)
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+        import pane_ownership
+        import dispatch_seat_handover
+        import session_tidy
+        self.tidy = session_tidy
+        self.handover = dispatch_seat_handover
+        # Match TidyCase's fixture for the platform pane-verification boundary;
+        # snapshot, adoption, effective_parent and storage lookup remain real.
+        self.pane_proof = mock.patch.object(
+            pane_ownership, "verified_pane", side_effect=lambda pane, *args, **kwargs: pane or "")
+        self.pane_proof.start()
+        self.addCleanup(self.pane_proof.stop)
+        self._prepare_owner_route()
+
+    def _prepare_owner_route(self):
+        from route_identity import route_hash
+        route = {"route_id": "rt-gate", "nodes": [{"id": "frame", "continuation": {
+            "kind": "human-gate", "gate": "frame-review"}}]}
+        route["route_hash"] = route_hash(route)
+        route_path = self.root / "rt-gate.json"
+        route_path.write_text(json.dumps(route), encoding="utf-8")
+        fields = self.jobs.read_text(encoding="utf-8").strip().split("\t")
+        metadata = dict(part.split("=", 1) for part in fields[5].split(",") if "=" in part)
+        metadata.update(route_hash=route["route_hash"], route_file=str(route_path))
+        fields[5] = ",".join(f"{key}={value}" for key, value in metadata.items())
+        self.jobs.write_text("\t".join(fields) + "\n", encoding="utf-8")
+
+    def _create_gate(self):
+        self.delivery_id = GateCarrierTest._gate_record(self, state=None)
+
+    def _snapshot(self, sid):
+        seat = self.tidy.resolve_seat("claude", str(self.root), os.environ)
+        with self.tidy.seat_lock(seat.key):
+            self.tidy.record_event(seat, "claude", sid, "start", cwd=str(self.root))
+            self.assertEqual(self.handover.write_snapshot_locked(
+                seat, "claude", sid, jobs=self.jobs), 1)
+
+    def _clear_to(self, sid):
+        self.tidy.run_hook("claude", "start", sid, source="clear", cwd=str(self.root),
+                           env=os.environ, emit=lambda _text: None)
+
+    def _adopt_b(self):
+        self._snapshot("session-gate")
+        self._clear_to("session-B")
+        owner = rewake._row_metadata(self.jobs, "att-gate-owner")
+        self.assertEqual(rewake.seat_handover.effective_parent(owner, self.jobs), "session-B",
+                         rewake.seat_handover.handover_rows(
+                             self.tidy.resolve_seat("claude", str(self.root), {"HERDR_PANE_ID": self.pane})))
+
+    def _adopt_c(self):
+        self._snapshot("session-B")
+        self._clear_to("session-C")
+        owner = rewake._row_metadata(self.jobs, "att-gate-owner")
+        self.assertEqual(rewake.seat_handover.effective_parent(owner, self.jobs), "session-C",
+                         rewake.seat_handover.handover_rows(
+                             self.tidy.resolve_seat("claude", str(self.root), {"HERDR_PANE_ID": self.pane})))
+
+    def _carrier(self, session, claim):
+        launch = rewake.Launch("att-gate-owner", self.jobs, session, armed="registry")
+        payload = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "session_id": session,
+                   "tool_input": {"command": "python3 utilities/workflow-supervisor.py"},
+                   "tool_response": {"stdout": "", "stderr": ""}}
+        observation = {}
+        holder = {"claim": claim}
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = rewake._run_carrier(launch, claim, payload, observation, holder)
+        return code, out.getvalue(), err.getvalue(), observation
+
+    def _start_live_b_carrier(self):
+        helper = self.root / "live-b-carrier.py"
+        helper.write_text("""
+import contextlib, importlib.util, io, json, os, sys, time
+from pathlib import Path
+module_path = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location('live_b_rewake', module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+jobs = Path(os.environ['AGENT_DISPATCH_JOBS'])
+claim = module.claim_arm(jobs, 'att-gate-owner', 'session-B', fresh=True)
+ready = Path(sys.argv[2])
+if not isinstance(claim, module.ArmClaim):
+    ready.write_text(json.dumps({'error': getattr(claim, 'reason', 'claim-refused')}))
+    raise SystemExit(1)
+ready.write_text(json.dumps({'holder': list(claim.holder), 'session_id': claim.session_id}))
+release = Path(sys.argv[3])
+deadline = time.monotonic() + 10
+while not release.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+if not release.exists():
+    raise SystemExit(2)
+payload = {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash', 'session_id': 'session-B',
+           'tool_input': {'command': 'python3 utilities/workflow-supervisor.py'},
+           'tool_response': {'stdout': '', 'stderr': ''}}
+out, err = io.StringIO(), io.StringIO()
+with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    code = module._run_carrier(module.Launch('att-gate-owner', jobs, 'session-B', armed='registry'),
+                               claim, payload, {}, {'claim': claim})
+print(json.dumps({'code': code, 'stdout': out.getvalue(), 'stderr': err.getvalue()}), flush=True)
+""", encoding="utf-8")
+        ready = self.root / "b-claimed.json"
+        release = self.root / "release-b"
+        process = subprocess.Popen(
+            [sys.executable, str(helper), str(MODULE_PATH), str(ready), str(release)],
+            cwd=str(self.root), env=dict(os.environ), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            time.sleep(0.01)
+        self.assertTrue(ready.exists(), "B carrier did not publish its real arm claim")
+        claim = json.loads(ready.read_text(encoding="utf-8"))
+        self.assertNotIn("error", claim, claim)
+        self.addCleanup(self._stop_b_carrier, process, release)
+        return process, release, claim
+
+    @staticmethod
+    def _stop_b_carrier(process, release):
+        if process.poll() is None:
+            release.touch(exist_ok=True)
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                process.communicate(timeout=2)
+
+    def test_handed_away_gate_carrier_is_silent_and_c_can_wake(self):
+        self._adopt_b()
+        process, release, b_claim = self._start_live_b_carrier()
+        release.touch()
+        deadline = time.monotonic() + 5
+        while not self.probe.exists() and time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            time.sleep(0.01)
+        self.assertTrue(self.probe.exists(), "B carrier did not begin its real readiness wait")
+        self._snapshot("session-B")
+        self._adopt_c()
+        self._create_gate()
+        c_claim = rewake.claim_arm(self.jobs, "att-gate-owner", "session-C", fresh=True)
+        self.assertIsInstance(c_claim, rewake.ArmClaim)
+
+        output, error = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, error)
+        stale = json.loads(output)
+        self.assertEqual((stale["code"], stale["stdout"], stale["stderr"]), (0, "", ""))
+        record = rewake.pending_delivery.read(self.state, "session-gate", self.delivery_id)
+        self.assertEqual(record["state"], "pending")
+        self.assertEqual(rewake._read_arm(rewake.arm_path(self.jobs, "att-gate-owner"))["session_id"],
+                         "session-C")
+        arm = rewake._read_arm(rewake.arm_path(self.jobs, "att-gate-owner"))
+        self.assertEqual((arm["state"], arm["session_id"], arm["holder"]),
+                         ("waiting", "session-C", list(c_claim.holder)))
+
+        code, stdout, stderr, _observation = self._carrier("session-C", c_claim)
+        self.assertEqual(code, 2)
+        self.assertIn("human-gate:frame-review", stdout + stderr)
+        self.assertEqual(rewake.pending_delivery.read(self.state, "session-gate", self.delivery_id)["state"],
+                         "sent-ambiguous")
+        self.assertEqual(rewake._read_arm(rewake.arm_path(self.jobs, "att-gate-owner"))["state"],
+                         "gate-wake-sent")
+
+    def test_first_c_prompt_surfaces_gate_written_while_b_owned_the_seat(self):
+        self._adopt_b()
+        b_claim = rewake.claim_arm(self.jobs, "att-gate-owner", "session-B", fresh=True)
+        self.assertIsInstance(b_claim, rewake.ArmClaim)
+        self._create_gate()
+        code, stdout, stderr, _observation = self._carrier("session-B", b_claim)
+        self.assertEqual(code, 2)
+        self.assertIn("human-gate:frame-review", stdout + stderr)
+        record = rewake.pending_delivery.read(self.state, "session-gate", self.delivery_id)
+        self.assertEqual(record["state"], "sent-ambiguous")
+
+        # Advance only this isolated record's real delivery lease as the short
+        # transport fixture; the following operation is the actual prompt hook.
+        rewake.pending_delivery.reclaim(
+            self.state, "session-gate", self.delivery_id, now_ns=time.monotonic_ns() + 60_000_000_000)
+        self._adopt_c()
+        sweep_payload = {"hook_event_name": "UserPromptSubmit", "session_id": "session-C",
+                         "cwd": str(self.root), "prompt": ""}
+        sweep_spec = importlib.util.spec_from_file_location(
+            "dispatch_session_sweep_hook", ROOT / "hooks" / "dispatch-session-sweep.py")
+        dispatch_session_sweep = importlib.util.module_from_spec(sweep_spec)
+        sweep_spec.loader.exec_module(dispatch_session_sweep)
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "session-C",
+                                          "CODEX_THREAD_ID": "", "OPENCODE_SESSION_ID": ""},
+                             clear=False), contextlib.redirect_stdout(output):
+            result = dispatch_session_sweep._process_session(sweep_payload, "session-C")
+        self.assertEqual(result, 0)
+        context = json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(self.delivery_id, context)
+        self.assertIn("human-gate:frame-review", context)
+        self.assertEqual(rewake.pending_delivery.read(
+            self.state, "session-gate", self.delivery_id)["state"], "acked")
+
+        resumed = rewake.registry_launch({
+            "hook_event_name": "PostToolUse", "tool_name": "Bash", "session_id": "session-C",
+            "tool_input": {"command": "git status"}, "tool_response": {"stdout": "", "stderr": ""},
+        })
+        self.assertIsInstance(resumed, tuple, resumed)
+        self.assertEqual(resumed[0].session_id, "session-C")
+        self.assertEqual(resumed[1].arms, 2)
+
+    def test_first_cross_pane_retire_preserves_gate_for_successor(self):
+        self._create_gate()
+        owner = rewake._row_metadata(self.jobs, "att-gate-owner")
+        source_seat = self.tidy.resolve_seat(
+            "claude", str(self.root), {"HERDR_PANE_ID": self.pane})
+        self.assertIsNone(self.handover.read_snapshot(source_seat.key))
+        a_claim = rewake.claim_arm(self.jobs, "att-gate-owner", "session-gate", fresh=True)
+        self.assertIsInstance(a_claim, rewake.ArmClaim)
+
+        target_seat = self.tidy.resolve_seat(
+            "claude", str(self.root), {**os.environ,
+                                       "HERDR_PANE_ID": "fixture:retire-successor-" + self.root.name})
+        self.assertIsNone(self.handover.read_snapshot(target_seat.key))
+        row = self.handover.record_retire_handover(
+            "session-gate", "claude", "session-C", "claude",
+            jobs=self.jobs, successor_seat=target_seat)
+        self.assertIsNotNone(row)
+        self.assertEqual(self.handover.effective_parent(owner, self.jobs), "session-C")
+
+        with mock.patch.object(rewake, "wait_for_attempt",
+                               return_value=("gate", "human-gate-open")):
+            code, stdout, stderr, _ = self._carrier("session-gate", a_claim)
+        self.assertEqual((code, stdout, stderr), (0, "", ""))
+        self.assertEqual(rewake.pending_delivery.read(
+            self.state, "session-gate", self.delivery_id)["state"], "pending")
+        arm = rewake._read_arm(rewake.arm_path(self.jobs, "att-gate-owner"))
+        self.assertEqual((arm["session_id"], arm["state"]),
+                         ("session-gate", "waiting"))
+
+        c_claim = rewake.claim_arm(self.jobs, "att-gate-owner", "session-C", fresh=True)
+        self.assertIsInstance(c_claim, rewake.ArmClaim)
+        with mock.patch.object(rewake, "wait_for_attempt",
+                               return_value=("gate", "human-gate-open")):
+            code, stdout, stderr, _ = self._carrier("session-C", c_claim)
+        self.assertEqual(code, 2)
+        self.assertIn("human-gate:frame-review", stdout + stderr)
+        self.assertEqual(rewake.pending_delivery.read(
+            self.state, "session-gate", self.delivery_id)["state"], "sent-ambiguous")
+        self.assertEqual(rewake._read_arm(
+            rewake.arm_path(self.jobs, "att-gate-owner"))["state"], "gate-wake-sent")
+
+
+class GateCheckEffectRaceTest(unittest.TestCase):
+    """A real C adoption commits after B's final pre-effect ownership read."""
+
+    def setUp(self):
+        self.fixture = SeatGateChainTest("runTest")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+
+    def test_adoption_invalidates_b_before_gate_claim_and_emission(self):
+        f = self.fixture
+        f._adopt_b()
+        f._create_gate()
+        helper = f.root / "controlled-b-gate.py"
+        signal_path, release_path = f.root / "b-read-owner", f.root / "continue-b"
+        helper.write_text("""
+import contextlib, importlib.util, io, json, os, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('controlled_rewake', Path(sys.argv[1]))
+module = importlib.util.module_from_spec(spec); sys.modules[spec.name] = module; spec.loader.exec_module(module)
+jobs = Path(os.environ['AGENT_DISPATCH_JOBS'])
+claim = module.claim_arm(jobs, 'att-gate-owner', 'session-B', fresh=True)
+if not isinstance(claim, module.ArmClaim): raise SystemExit(10)
+signal_path, release_path = Path(sys.argv[2]), Path(sys.argv[3])
+real_parent = module.seat_handover.effective_parent
+def gate_wait(*args, **kwargs): return ('gate', 'human-gate-open')
+def paused_parent(meta, registry, **kwargs):
+    current = real_parent(meta, registry, **kwargs)
+    if current == 'session-B' and not signal_path.exists():
+        signal_path.touch()
+        deadline = time.monotonic() + 5
+        while not release_path.exists() and time.monotonic() < deadline: time.sleep(0.01)
+        if not release_path.exists(): raise SystemExit(11)
+    return current
+module.wait_for_attempt = gate_wait
+module.seat_handover.effective_parent = paused_parent
+launch = module.Launch('att-gate-owner', jobs, 'session-B', armed='registry')
+payload = {'hook_event_name':'PostToolUse','tool_name':'Bash','session_id':'session-B',
+ 'tool_input':{'command':'python3 utilities/workflow-supervisor.py'},'tool_response':{'stdout':'','stderr':''}}
+out, err = io.StringIO(), io.StringIO()
+with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+ code = module._run_carrier(launch, claim, payload, {}, {'claim':claim})
+print(json.dumps({'code':code,'stdout':out.getvalue(),'stderr':err.getvalue()}), flush=True)
+""", encoding="utf-8")
+        process = subprocess.Popen(
+            [sys.executable, str(helper), str(MODULE_PATH), str(signal_path), str(release_path)],
+            cwd=str(f.root), env=dict(os.environ), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not signal_path.exists() and time.monotonic() < deadline:
+                if process.poll() is not None:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(signal_path.exists(), "B did not reach the ownership/effect seam")
+            f._adopt_c()
+            c_claim = rewake.claim_arm(f.jobs, "att-gate-owner", "session-C", fresh=True)
+            self.assertIsInstance(c_claim, rewake.ArmClaim)
+            release_path.touch()
+            output, error = process.communicate(timeout=8)
+            self.assertEqual(process.returncode, 0, error)
+            stale = json.loads(output)
+            self.assertEqual((stale["code"], stale["stdout"], stale["stderr"]), (0, "", ""))
+            record = rewake.pending_delivery.read(f.state, "session-gate", f.delivery_id)
+            self.assertEqual(record["state"], "pending")
+            arm = rewake._read_arm(rewake.arm_path(f.jobs, "att-gate-owner"))
+            self.assertEqual((arm["state"], arm["session_id"]), ("waiting", "session-C"))
+            code, stdout, stderr, _ = f._carrier("session-C", c_claim)
+            self.assertEqual(code, 2)
+            self.assertIn("human-gate:frame-review", stdout + stderr)
+            self.assertEqual(rewake.pending_delivery.read(
+                f.state, "session-gate", f.delivery_id)["state"], "sent-ambiguous")
+        finally:
+            if process.poll() is None:
+                release_path.touch(exist_ok=True)
+                process.communicate(timeout=5)
+
+    def test_first_cross_pane_binding_waits_behind_gate_effect(self):
+        import threading
+        f = self.fixture
+        f._create_gate()
+        owner = rewake._row_metadata(f.jobs, "att-gate-owner")
+        source = f.tidy.resolve_seat("claude", str(f.root), os.environ)
+        self.assertIsNone(f.handover.read_snapshot(source.key))
+        claim = rewake.claim_arm(f.jobs, "att-gate-owner", "session-gate", fresh=True)
+        self.assertIsInstance(claim, rewake.ArmClaim)
+        successor = "session-retired-first-binding"
+        target = f.tidy.resolve_seat("claude", str(f.root), {
+            **os.environ, "HERDR_PANE_ID": "fixture:retire-race-" + f.root.name,
+        })
+        self.assertIsNone(f.handover.read_snapshot(target.key))
+        order = []
+        writer_lock_attempt = threading.Event()
+        adopted = threading.Event()
+        local = threading.local()
+        effect_thread = threading.get_ident()
+        real_lock = f.tidy.seat_lock
+        real_parent = f.handover.effective_parent
+        reads = {"count": 0}
+
+        def retire():
+            self.assertIsNotNone(f.handover.record_retire_handover(
+                "session-gate", "claude", successor, "claude",
+                jobs=f.jobs, successor_seat=target))
+            order.append("adopted")
+            adopted.set()
+
+        @contextlib.contextmanager
+        def observed_lock(key, *, wait=None):
+            if (key.startswith("lineage-binding-")
+                    and threading.get_ident() != effect_thread):
+                writer_lock_attempt.set()
+            with real_lock(key, wait=wait):
+                previous = getattr(local, "binding", False)
+                if key.startswith("lineage-binding-"):
+                    local.binding = True
+                try:
+                    yield
+                finally:
+                    local.binding = previous
+
+        def synchronized_real_read(meta, registry, **kwargs):
+            current = real_parent(meta, registry, **kwargs)
+            if meta.get("attempt_id") == "att-gate-owner" and current == "session-gate":
+                reads["count"] += 1
+                if reads["count"] == 2:
+                    # The first read is the pre-wait ownership check. The
+                    # second is immediately before gate claim/output. A stable
+                    # binding transaction makes the real retire writer wait;
+                    # the old snapshot-selected lock has no key yet.
+                    if getattr(local, "binding", False):
+                        def writer():
+                            retire()
+                        threading.Thread(target=writer, daemon=True).start()
+                        self.assertTrue(writer_lock_attempt.wait(2),
+                                        "retire writer did not reach the real binding lock")
+                    else:
+                        retire()
+            return current
+
+        real_settle = rewake.settle_arm
+
+        def mark_gate_settlement(current_claim, state, **kwargs):
+            result = real_settle(current_claim, state, **kwargs)
+            if state == "gate-wake-sent":
+                order.append("gate-effect")
+            return result
+
+        with mock.patch.object(f.tidy, "seat_lock", side_effect=observed_lock), \
+             mock.patch.object(f.handover, "effective_parent",
+                               side_effect=synchronized_real_read), \
+             mock.patch.object(rewake, "wait_for_attempt",
+                               return_value=("gate", "human-gate-open")), \
+             mock.patch.object(rewake, "settle_arm", side_effect=mark_gate_settlement):
+            code, stdout, stderr, _ = f._carrier("session-gate", claim)
+        self.assertEqual(code, 2)
+        self.assertIn("human-gate:frame-review", stdout + stderr)
+        self.assertTrue(adopted.wait(3), "retire did not commit after the gate effect released its mutex")
+        self.assertLess(order.index("gate-effect"), order.index("adopted"), order)
+        self.assertEqual(f.handover.effective_parent(owner, f.jobs), successor)
+        record = rewake.pending_delivery.read(f.state, "session-gate", f.delivery_id)
+        self.assertEqual(record["state"], "sent-ambiguous")
+        self.assertEqual(rewake._read_arm(
+            rewake.arm_path(f.jobs, "att-gate-owner"))["state"], "gate-wake-sent")
 
 
 if __name__ == "__main__":

@@ -118,11 +118,20 @@ class ProducerTestBase(unittest.TestCase):
         self.root.mkdir(parents=True, exist_ok=True)
         self.jobs = Path(self._tmp.name) / "jobs.log"
         self.jobs.write_text("", encoding="utf-8")
+        home = Path(self._tmp.name) / "home"
+        config = Path(self._tmp.name) / "config"
+        state = Path(self._tmp.name) / "state"
+        for path in (home, config, state):
+            path.mkdir(parents=True, exist_ok=True)
         home = Path(self._tmp.name) / "agent-home"
         (home / "core").mkdir(parents=True, exist_ok=True)
         (home / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
-        self._env = {k: v for k, v in os.environ.items() if k == "AGENT_HOME" or k.startswith((
-            "AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_ARTIFACT_"))}
+        self._env = {k: os.environ.get(k) for k in ("AGENT_HOME", "HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME")}
+        self._env.update({k: v for k, v in os.environ.items() if k.startswith((
+            "AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_ARTIFACT_"))})
+        os.environ["HOME"] = str(Path(self._tmp.name) / "home")
+        os.environ["XDG_CONFIG_HOME"] = str(config)
+        os.environ["XDG_STATE_HOME"] = str(state)
         os.environ["AGENT_HOME"] = str(home)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
         for key in tuple(os.environ):
@@ -1751,6 +1760,7 @@ class SelfExclusionPayloadTest(ProducerTestBase):
             self.assertTrue(artifact_payload.self_excluded_directory(checkout, payload_root=root))
             env = root / "conda-env"
             (env / "conda-meta").mkdir(parents=True)
+            self.assertFalse((env / "conda-meta" / "history").exists())
             self.assertTrue(artifact_payload.self_excluded_directory(env, payload_root=root))
             packages = root / "node_modules"
             packages.mkdir()
@@ -1896,6 +1906,7 @@ class SelfExclusionPayloadTest(ProducerTestBase):
         self.assertNotIn("artifacts/cache/bad|locator.txt", paths)
         self.assertIn("artifacts/cache/", sealed["excluded_hidden"])
         self.assertEqual(marker.read_bytes(), marker_bytes)
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, cycle), ())
 
     def test_first_finalize_never_descends_into_nested_checkout_and_keeps_weight_pointers(self):
         self.activate()
@@ -1974,6 +1985,7 @@ class SelfExclusionPayloadTest(ProducerTestBase):
             self.assertEqual(event["before"]["value"], {"kind": "runtime"})
             self.assertEqual(event["after"]["value"], {"kind": "runtime"})
         self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, cycle), ())
+
 
     def test_marker_below_raw_results_prevents_bundle_bypass_but_keeps_sibling_leaf(self):
         cycle = self.root / "cycle"
@@ -5280,10 +5292,24 @@ class TerminalTransactionIntegrationTest(ProducerTestBase):
                     with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(jobs),"AGENT_ARTIFACT_ROOT":str(fixture.root)}):
                         gates=R.terminal_gate_observation(route,jobs=jobs,exact_terminal=True)
                         self.assertTrue(gates["prd-transaction"]["passed"],gates)
+                        cycle_dir = Path(cycle["cycle_dir"])
+                        conda = cycle_dir / "artifacts" / "evidence" / "results"
+                        conda.mkdir(parents=True)
+                        bad_locator = cycle_dir / "artifacts" / "evidence" / "results" / "bad|name.txt"
+                        bad_locator.write_bytes(b"invalid locator")
+                        violations = P._enumerate_output(cycle_dir)[1]
+                        self.assertEqual(violations, ["locator-invalid-component:artifacts/evidence/results/bad|name.txt"])
+                        terminal._record_attempt(request, "output-invalid", ";".join(violations))
                         snapshot={str(p):p.read_bytes() for p in fixture.root.rglob("*") if p.is_file()}
                         diagnosis=terminal.inspect_owner_completion(jobs,"done",meta)
                         self.assertEqual((diagnosis["state"],diagnosis["checkpoint"]),("closure-pending","not-claimed"))
+                        self.assertEqual(diagnosis["last_refusal_reason"], "output-invalid")
+                        self.assertEqual(diagnosis["last_refusal"]["detail"],
+                                         "locator-invalid-component:artifacts/evidence/results/bad|name.txt")
+                        self.assertTrue(diagnosis["last_refusal"]["record_path"].endswith(".json"))
+                        self.assertIn("Correct the reported locator", diagnosis["last_refusal"]["remediation"])
                         self.assertEqual(snapshot,{str(p):p.read_bytes() for p in fixture.root.rglob("*") if p.is_file()})
+                        bad_locator.unlink()
                         marker=R.completion_dir(route["route_id"],jobs=jobs)/"prd-transaction.json"
                         marker.write_text("{}")
                         self.assertFalse(R.terminal_gate_observation(route,jobs=jobs)["prd-transaction"]["passed"])

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import hashlib
 import importlib.util
 import json
 import os
@@ -19,6 +20,7 @@ from execution_access import (
     AccessContext,
     ExecutionAccessError,
     ParentGrant,
+    adapter_default_roots,
     bind_request,
     build_grant,
     load_request,
@@ -223,8 +225,9 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         self.assertNotIn("--add-dir", command)
 
     def test_runtime_directory_appears_in_each_adapter_write_projection(self) -> None:
-        runtime = self.artifact.parent / ".agent_runtime"
-        runtime.mkdir()
+        digest = hashlib.sha256(str(self.artifact.resolve()).encode("utf-8")).hexdigest()
+        runtime = self.state / "project-runtimes" / digest
+        runtime.mkdir(parents=True)
         prompt, log = self.root / "prompt.txt", self.root / "launch.log"
         for delivery in ("one-shot", "session-resume-supervised"):
             args = self.claude_args(delivery)
@@ -255,6 +258,13 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         for raw in config_builds:
             config = json.loads(raw)
             self.assertEqual("allow", config["permission"]["external_directory"][str(runtime)])
+            self.assertNotIn(str(self.state), config["permission"]["external_directory"])
+
+        defaults = adapter_default_roots(argparse.Namespace(
+            worktree=str(self.worktree), artifact_root=str(self.artifact),
+            report_bundle_root=None, runtime_dir=str(runtime)))
+        self.assertIn(runtime.resolve(), defaults)
+        self.assertNotIn(self.state.resolve(), defaults)
 
     def test_lab_inventory_and_explicit_data_reach_both_codex_execution_builders(self) -> None:
         run_root = self.root / "inventory-runs"
