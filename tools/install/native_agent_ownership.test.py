@@ -731,6 +731,313 @@ class NativeAgentOwnershipTest(unittest.TestCase):
         activation.refresh("codex")
         self.assertFalse(self.dest().exists() or self.dest().is_symlink())
 
+    def test_refresh_preserves_valid_prior_release_repointed_after_trust(self):
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        previous = self.release_fixture()
+        config = self.home / "agent-config/models.conf"
+        shipped = (ROOT / "adapters/codex/config/models.conf").read_text()
+        config.write_text(re.sub(r'^CFG_TIER_DEEP_MODEL=.*$',
+                                 'CFG_TIER_DEEP_MODEL=fixture-user-deep', shipped, flags=re.M))
+        original = activation._trusted_owned
+        fired = False
+
+        def repoint(*args, **kwargs):
+            nonlocal fired
+            result = original(*args, **kwargs)
+            if not fired:
+                fired = True
+                dest.unlink()
+                dest.symlink_to(previous)
+            return result
+
+        with mock.patch.object(activation, "_trusted_owned", side_effect=repoint):
+            report = activation.refresh("codex")
+        self.assertTrue(fired)
+        self.assertEqual(os.readlink(dest), str(previous))
+        self.assertEqual(previous.read_bytes(), self.source().read_bytes())
+        self.assertIn(str(dest), report["preserved"])
+        self.assertIn(str(dest), report["user_changed"])
+        self.assertEqual(self.driver()["status"], "preserved")
+        self.assertEqual(os.readlink(dest), str(previous))
+
+    def test_refresh_preserves_successors_after_initial_trust(self):
+        shipped = (ROOT / "adapters/codex/config/models.conf").read_text()
+        for change, kind in (("render", "foreign"), ("shipped", "dangling"),
+                             ("withheld", "owned"), ("render", "regular")):
+            with self.subTest(change=change, kind=kind):
+                if activation._state_path("codex").exists():
+                    activation.deactivate("codex")
+                dest = self.dest()
+                if dest.exists() or dest.is_symlink():
+                    dest.unlink()
+                config = self.home / "agent-config/models.conf"
+                config.parent.mkdir(parents=True, exist_ok=True)
+                config.write_text(shipped)
+                activation.activate("codex", "linked", str(ROOT))
+                if change == "render":
+                    config.write_text(re.sub(r'^CFG_TIER_DEEP_MODEL=.*$',
+                                             'CFG_TIER_DEEP_MODEL=fixture-user-deep',
+                                             shipped, flags=re.M))
+                elif change == "withheld":
+                    config.write_text(shipped.replace(
+                        "CFG_TIER_DEEP_MODEL=", "CFG_TIER_DEEP_MODEL=fixture-user-deep"))
+                    state = activation._load_json(activation._state_path("codex"))
+                    planned = activation._desired_entries(
+                        "codex", "linked", ROOT, ROOT, state["active_revision"], "global")
+                    rendered = next(item for item in planned if item["dest"] == str(dest))
+                    selected = re.search(r'^model = "([^"]+)"', rendered["content"], re.M).group(1)
+                    restricted = " ".join([*self._shipped_models(), selected])
+                    config.write_text(re.sub(r'^CFG_MAIN_SESSION_ONLY_MODELS=.*$',
+                                             f'CFG_MAIN_SESSION_ONLY_MODELS="{restricted}"',
+                                             config.read_text(), flags=re.M))
+                else:
+                    config.write_text(shipped)
+                successor = self.root / f"{change}-{kind}.toml"
+                if kind == "foreign":
+                    successor.write_bytes(b"USER DATA\n")
+                elif kind == "owned":
+                    successor = self.release_fixture()
+                original = activation._trusted_owned
+                fired = False
+
+                def replace(*args, **kwargs):
+                    nonlocal fired
+                    result = original(*args, **kwargs)
+                    if not fired:
+                        fired = True
+                        dest.unlink()
+                        if kind == "regular":
+                            dest.write_bytes(b"USER DATA\n")
+                        else:
+                            dest.symlink_to(successor)
+                    return result
+
+                with mock.patch.object(activation, "_trusted_owned", side_effect=replace):
+                    report = activation.refresh("codex")
+                self.assertTrue(fired)
+                self.assertIn(str(dest), report["preserved"])
+                self.assertIn(str(dest), report["user_changed"])
+                if kind == "regular":
+                    self.assertEqual(dest.read_bytes(), b"USER DATA\n")
+                else:
+                    self.assertEqual(os.readlink(dest), str(successor))
+                if kind == "foreign":
+                    self.assertEqual(successor.read_bytes(), b"USER DATA\n")
+
+    def test_refresh_preserves_edited_render_and_changed_legacy_payload(self):
+        shipped = (ROOT / "adapters/codex/config/models.conf").read_text()
+        config = self.home / "agent-config/models.conf"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(re.sub(r'^CFG_TIER_DEEP_MODEL=.*$',
+                                 'CFG_TIER_DEEP_MODEL=fixture-user-deep', shipped, flags=re.M))
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        original = activation._trusted_owned
+        fired = False
+
+        def edit(*args, **kwargs):
+            nonlocal fired
+            result = original(*args, **kwargs)
+            if not fired:
+                fired = True
+                dest.write_bytes(b"USER RENDER EDIT\n")
+            return result
+
+        with mock.patch.object(activation, "_trusted_owned", side_effect=edit):
+            report = activation.refresh("codex")
+        self.assertEqual(dest.read_bytes(), b"USER RENDER EDIT\n")
+        self.assertIn(str(dest), report["preserved"])
+
+        # A prior receipt can legitimately refer to a legacy payload. Its
+        # unchanged link text must not hide changed payload bytes.
+        dest.unlink()
+        old = self.old_payload()
+        dest.symlink_to(old)
+        state_path = activation._state_path("codex")
+        state = json.loads(state_path.read_text())
+        next(item for item in state["owned_paths"] if item["dest"] == str(dest))["source"] = str(old)
+        state_path.write_text(json.dumps(state))
+        fired = False
+
+        def change_payload(*args, **kwargs):
+            nonlocal fired
+            result = original(*args, **kwargs)
+            if not fired:
+                fired = True
+                old.write_bytes(b"USER PAYLOAD EDIT\n")
+            return result
+
+        with mock.patch.object(activation, "_trusted_owned", side_effect=change_payload):
+            report = activation.refresh("codex")
+        self.assertEqual(os.readlink(dest), str(old))
+        self.assertEqual(old.read_bytes(), b"USER PAYLOAD EDIT\n")
+        self.assertIn(str(dest), report["preserved"])
+
+    def _late_refresh_successor(self, change, operation):
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        old = self.release_fixture()
+        config = self.home / "agent-config/models.conf"
+        shipped = (ROOT / "adapters/codex/config/models.conf").read_text()
+        if change == "render":
+            config.write_text(re.sub(r'^CFG_TIER_DEEP_MODEL=.*$',
+                                     'CFG_TIER_DEEP_MODEL=fixture-user-deep', shipped, flags=re.M))
+        elif change == "withheld":
+            config.write_text(shipped.replace(
+                "CFG_TIER_DEEP_MODEL=", "CFG_TIER_DEEP_MODEL=fixture-user-deep"))
+            state = activation._load_json(activation._state_path("codex"))
+            planned = activation._desired_entries(
+                "codex", "linked", ROOT, ROOT, state["active_revision"], "global")
+            rendered = next(item for item in planned if item["dest"] == str(dest))
+            selected = re.search(r'^model = "([^"]+)"', rendered["content"], re.M).group(1)
+            restricted = " ".join([*self._shipped_models(), selected])
+            config.write_text(re.sub(r'^CFG_MAIN_SESSION_ONLY_MODELS=.*$',
+                                     f'CFG_MAIN_SESSION_ONLY_MODELS="{restricted}"',
+                                     config.read_text(), flags=re.M))
+        original = getattr(activation.safe_fs, operation)
+        fired = False
+
+        def late(auth, *args, **kwargs):
+            nonlocal fired
+            if auth.target == dest and not fired:
+                fired = True
+                dest.unlink()
+                dest.symlink_to(old)
+            return original(auth, *args, **kwargs)
+
+        with mock.patch.object(activation.safe_fs, operation, side_effect=late):
+            with self.assertRaises(activation.ActivationError):
+                activation.refresh("codex")
+        self.assertTrue(fired)
+        self.assertEqual(os.readlink(dest), str(old))
+        self.assertEqual(old.read_bytes(), self.source().read_bytes())
+        state = json.loads(activation._state_path("codex").read_text())
+        row = next(item for item in state["owned_paths"] if item["dest"] == str(dest))
+        self.assertEqual(row["source"], str(self.source()))
+        self.assertEqual(self.driver()["status"], "preserved")
+        self.assertEqual(os.readlink(dest), str(old))
+
+    def test_render_refresh_preserves_successor_after_final_recheck(self):
+        self._late_refresh_successor("render", "atomic_write_bytes")
+
+    def test_shipped_refresh_preserves_successor_after_final_recheck(self):
+        self._late_refresh_successor("shipped", "atomic_write_symlink")
+
+    def test_withheld_refresh_preserves_successor_after_final_recheck(self):
+        self._late_refresh_successor("withheld", "remove_exact")
+
+    def test_refresh_restores_missing_agent_but_refuses_new_successor(self):
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        dest.unlink()
+        report = activation.refresh("codex")
+        self.assertEqual(report["freshness"], "fresh")
+        self.assertEqual(os.readlink(dest), str(self.source()))
+
+        dest.unlink()
+        old = self.release_fixture()
+        original = activation._trusted_owned
+        fired = False
+
+        def insert(*args, **kwargs):
+            nonlocal fired
+            result = original(*args, **kwargs)
+            if not fired:
+                fired = True
+                dest.symlink_to(old)
+            return result
+
+        with mock.patch.object(activation, "_trusted_owned", side_effect=insert):
+            report = activation.refresh("codex")
+        self.assertTrue(fired)
+        self.assertEqual(os.readlink(dest), str(old))
+        self.assertIn(str(dest), report["preserved"])
+        self.assertEqual(self.driver()["status"], "preserved")
+
+    def test_refresh_refuses_successor_on_initially_absent_unrecorded_leaf(self):
+        config = self.home / "agent-config/models.conf"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        shipped = (ROOT / "adapters/codex/config/models.conf").read_text()
+        config.write_text(re.sub(r'^CFG_NATIVE_AGENT_CATALOG=.*$',
+                                 'CFG_NATIVE_AGENT_CATALOG="light:light balanced:balanced"',
+                                 shipped, flags=re.M))
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        self.assertFalse(dest.exists() or dest.is_symlink())
+        old = self.release_fixture()
+        config.write_text(shipped)
+        original = activation._trusted_owned
+        fired = False
+
+        def insert(*args, **kwargs):
+            nonlocal fired
+            result = original(*args, **kwargs)
+            if not fired:
+                fired = True
+                dest.symlink_to(old)
+            return result
+
+        with mock.patch.object(activation, "_trusted_owned", side_effect=insert):
+            with self.assertRaisesRegex(activation.ActivationError,
+                                        "expected-state-mismatch"):
+                activation.refresh("codex")
+        self.assertTrue(fired)
+        self.assertEqual(os.readlink(dest), str(old))
+        self.assertEqual(old.read_bytes(), self.source().read_bytes())
+
+    def test_rendered_refresh_preserves_edit_after_final_recheck(self):
+        shipped = (ROOT / "adapters/codex/config/models.conf").read_text()
+        config = self.home / "agent-config/models.conf"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(shipped.replace(
+            "CFG_TIER_DEEP_MODEL=", "CFG_TIER_DEEP_MODEL=fixture-user-deep"))
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        self.assertTrue(dest.is_file() and not dest.is_symlink())
+        config.write_text(config.read_text().replace(
+            "fixture-user-deep", "fixture-user-deep-2"))
+        original = activation.safe_fs.atomic_write_bytes
+        fired = False
+
+        def edit(auth, *args, **kwargs):
+            nonlocal fired
+            if auth.target == dest and not fired:
+                fired = True
+                dest.write_bytes(b"USER LATE RENDER EDIT\n")
+            return original(auth, *args, **kwargs)
+
+        with mock.patch.object(activation.safe_fs, "atomic_write_bytes", side_effect=edit):
+            with self.assertRaises(activation.ActivationError):
+                activation.refresh("codex")
+        self.assertTrue(fired)
+        self.assertEqual(dest.read_bytes(), b"USER LATE RENDER EDIT\n")
+        self.assertEqual(self.driver()["status"], "preserved")
+
+    def test_native_render_transaction_rollback_restores_prior_bytes_and_receipt(self):
+        shipped = (ROOT / "adapters/codex/config/models.conf").read_text()
+        config = self.home / "agent-config/models.conf"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(shipped.replace(
+            "CFG_TIER_DEEP_MODEL=", "CFG_TIER_DEEP_MODEL=fixture-user-deep"))
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        prior_bytes = dest.read_bytes()
+        state_path = activation._state_path("codex")
+        prior_receipt = state_path.read_bytes()
+        config.write_text(config.read_text().replace(
+            "fixture-user-deep", "fixture-user-deep-2"))
+        state = activation._load_json(state_path)
+        desired = activation._desired_entries(
+            "codex", "linked", ROOT, ROOT, state["active_revision"], "global")
+        deep = next(item for item in desired if item["dest"] == str(dest))
+        with mock.patch.dict(os.environ, {"HARNESS_RUNTIME_FAIL_AFTER": "1"}):
+            with self.assertRaisesRegex(activation.ActivationError, "injected failure"):
+                activation._apply_transaction(
+                    "codex", [deep], state, "linked", "global", source_roots=(ROOT,))
+        self.assertEqual(dest.read_bytes(), prior_bytes)
+        self.assertEqual(state_path.read_bytes(), prior_receipt)
+
     def test_old_payload_withheld_and_recorded_receipt_integrity(self):
         old = self.old_payload()
         dest = self.dest()

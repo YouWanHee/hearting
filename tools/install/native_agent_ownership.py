@@ -169,6 +169,29 @@ def owned_link(home: Path, dest: Path) -> bool:
         return False
 
 
+def _activation_receipt_changed(home: Path, dest: Path,
+                                state: safe_fs.PathState) -> bool:
+    """Do not let a later installer adopt an activation-preserved successor."""
+    receipt = home / ".harness" / "activation.json"
+    if receipt.is_symlink() or not receipt.is_file():
+        return False
+    try:
+        data = json.loads(receipt.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("runtime") != "codex":
+            return False
+        for item in data.get("owned_paths", []):
+            if not isinstance(item, dict) or item.get("dest") != str(dest):
+                continue
+            if state.kind == "symlink":
+                return item.get("kind") != "symlink" or item.get("source") != state.link_target
+            if state.kind == "file":
+                return item.get("kind") != "render" or item.get("content_sha256") != state.digest
+            return False
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return True
+    return False
+
+
 def classify(home: Path, source_root: Path, dest: Path, source: Path) -> str:
     """Return absent, unchanged-owned, replaceable-owned, or preserved."""
     if (not agent_leaf(home, dest) or source.name != dest.name
@@ -179,6 +202,8 @@ def classify(home: Path, source_root: Path, dest: Path, source: Path) -> str:
     state = safe_fs.capture_state(dest)
     if state.kind == "missing":
         return "absent"
+    if _activation_receipt_changed(home, dest, state):
+        return "preserved"
     if state.kind != "symlink" or not owned_link(home, dest):
         return "preserved"
     return "unchanged-owned" if state.link_target == str(source) else "replaceable-owned"

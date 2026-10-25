@@ -2714,13 +2714,14 @@ def _preservable_user_changes(
     return {value: dict(prior) for value, prior in user_changed.items()}
 
 
-def _snapshot_record(dest: Path, backup_root: Path, index: int) -> dict:
+def _snapshot_record(dest: Path, backup_root: Path, index: int,
+                     expected: Optional[safe_fs.PathState] = None) -> dict:
     record = {
         "dest": str(dest),
         "state": "missing",
         "backup": None,
         "target": None,
-        "preimage": safe_fs.capture_state(dest).public(),
+        "preimage": (expected or safe_fs.capture_state(dest)).public(),
     }
     if dest.is_symlink():
         record.update(state="symlink", target=os.readlink(dest))
@@ -2807,6 +2808,21 @@ def _restore(records: List[dict]) -> None:
         if state == "moved" and not Path(record["backup"]).exists():
             # Journal was flushed before the move and the process died between
             # those two operations.  The original destination is still intact.
+            continue
+        if record.get("native_agent") and state in {"missing", "copied"}:
+            try:
+                auth = safe_fs.authority(
+                    dest, owner="runtime-activation:codex-native-agent-rollback",
+                    allowed_paths=(dest,), expected=current)
+                if state == "missing":
+                    safe_fs.remove_exact(auth, expected=current)
+                else:
+                    safe_fs.atomic_write_bytes(
+                        auth, Path(record["backup"]).read_bytes(),
+                        preimage.mode if preimage.mode is not None else 0o644,
+                        expected=current, create_parents=True)
+            except safe_fs.SafetyError as exc:
+                raise ActivationError(str(exc)) from exc
             continue
         preserve_in_place = state == "copied" and preserve_names and dest.is_dir()
         if not preserve_in_place and state not in {"symlink", "symlink-copy"}:
@@ -3067,6 +3083,44 @@ def _trusted_owned(
     return trusted, user_changed
 
 
+def _native_agent_states(runtime: str, scope: str, previous: Optional[dict],
+                         desired: List[dict]) -> dict[str, safe_fs.PathState]:
+    """Observe every native leaf before ownership classification can authorize it."""
+    if runtime != "codex":
+        return {}
+    home = paths.runtime_home(runtime, scope)
+    agents = home / "agents"
+    candidates = {
+        Path(item["dest"]) for item in (previous or {}).get("owned_paths", [])
+        if item.get("dest") and native_agent_ownership.agent_leaf(home, Path(item["dest"]))
+    }
+    candidates.update(Path(item["dest"]) for item in desired
+                      if native_agent_ownership.agent_leaf(home, Path(item["dest"])))
+    if agents.is_dir() and not agents.is_symlink():
+        candidates.update(path for path in agents.glob("*.toml") if path.is_symlink())
+    return {str(dest): safe_fs.capture_state(dest) for dest in candidates}
+
+
+def _native_agent_current(home: Path, dest: Path, expected: safe_fs.PathState,
+                          recorded: Optional[dict]) -> Optional[safe_fs.PathState]:
+    """Require the original leaf and its current ownership or render receipt."""
+    current = safe_fs.capture_state(dest)
+    if current != expected:
+        return None
+    if current.kind == "missing":
+        return current
+    if current.kind == "symlink":
+        if recorded is not None and (recorded.get("kind") != "symlink"
+                                     or recorded.get("source") != current.link_target):
+            return None
+        return current if native_agent_ownership.owned_link(home, dest) else None
+    if (current.kind == "file" and recorded is not None
+            and recorded.get("kind") == "render"
+            and recorded.get("content_sha256") == current.digest):
+        return current
+    return None
+
+
 # destructive-ok: reason=discard the active runtime transaction after commit or exact rollback; boundary=one UUID transaction root created below runtime harness state
 def _apply_transaction(
     runtime: str,
@@ -3081,7 +3135,12 @@ def _apply_transaction(
     state_dir = paths.harness_state_dir(runtime, scope)
     tx_root = state_dir / "transactions" / uuid.uuid4().hex
     backup_root = tx_root / "backup"
+    native_states = _native_agent_states(runtime, scope, previous, desired)
     owned, user_changed = _trusted_owned(runtime, previous, desired, scope)
+    previous_native = {
+        item["dest"]: item for item in (previous or {}).get("owned_paths", [])
+        if item.get("dest") in native_states
+    }
     desired_by_dest = {entry["dest"]: entry for entry in desired}
     removal = [Path(item) for item in owned if item not in desired_by_dest]
     removal.extend(Path(item) for item in user_changed if item not in desired_by_dest)
@@ -3100,21 +3159,21 @@ def _apply_transaction(
     operation_count = 0
     journal_path = tx_root / "journal.json"
 
-    def recheck_native_agent(dest: Path) -> None:
-        if runtime != "codex" or not native_agent_ownership.agent_leaf(
-                paths.runtime_home(runtime, scope), dest):
-            return
+    def recheck_native_agent(dest: Path) -> Optional[safe_fs.PathState]:
+        if str(dest) not in native_states:
+            return None
         record = next((item for item in snapshots if item["dest"] == str(dest)), None)
         if record is None:
             raise ActivationError(f"native agent has no transaction snapshot: {dest}")
-        current = safe_fs.capture_state(dest)
         expected = (safe_fs.PathState("missing") if record["state"] == "moved"
                     else safe_fs.PathState.from_public(record["preimage"]))
+        current = safe_fs.capture_state(dest)
         if current != expected:
             raise ActivationError(f"expected-state-mismatch: native agent changed: {dest}")
         if current.kind == "symlink" and not native_agent_ownership.owned_link(
                 paths.runtime_home(runtime, scope), dest):
             raise ActivationError(f"ownership-unproved: native agent changed: {dest}")
+        return expected
     tx_root.mkdir(parents=True, exist_ok=True)
     _write_journal(journal_path, runtime, "preparing", snapshots)
 
@@ -3140,6 +3199,29 @@ def _apply_transaction(
                 # can treat it as a new, unowned destination.
                 preserved.append(dict(prior))
                 continue
+            native_state = native_states.get(key)
+            if native_state is not None:
+                with safe_fs.TargetLock(dest):
+                    current = _native_agent_current(
+                        paths.runtime_home(runtime, scope), dest,
+                        native_state, previous_native.get(key))
+                    if current is None:
+                        prior = previous_native.get(key)
+                        if prior is not None:
+                            if (prior.get("kind") == "render"
+                                    and desired_by_dest.get(key, {}).get("kind") == "symlink"
+                                    and safe_fs.capture_state(dest).kind == "file"):
+                                raise ActivationError(
+                                    f"destination collision; refusing to overwrite: {dest}")
+                            preserved.append(dict(prior))
+                            continue
+                        if (safe_fs.capture_state(dest) == native_state
+                                and native_state.kind == "symlink"
+                                and not native_agent_ownership.owned_link(
+                                    paths.runtime_home(runtime, scope), dest)):
+                            raise ActivationError(f"foreign native agent symlink collision: {dest}")
+                        raise ActivationError(
+                            f"expected-state-mismatch: native agent changed: {dest}")
             kind = desired_by_dest.get(key, {}).get("kind", "remove")
             source = desired_by_dest.get(key, {}).get("source")
             if (runtime == "codex" and native_agent_ownership.agent_leaf(
@@ -3149,7 +3231,19 @@ def _apply_transaction(
                 raise ActivationError(f"foreign native agent symlink collision: {dest}")
             _safe_existing_dest(dest, kind, owned, allowed_link_roots,
                                 Path(source) if source else None)
-            record = _snapshot_record(dest, backup_root, len(snapshots))
+            # Native regular renders stay in place until their checked atomic
+            # replacement. Moving one would create an unprotected rename gap.
+            record = (_copy_snapshot(dest, backup_root, len(snapshots))
+                      if native_state is not None and native_state.kind == "file"
+                      else _snapshot_record(dest, backup_root, len(snapshots), native_state))
+            if native_state is not None:
+                if (safe_fs.capture_state(dest) != native_state
+                        or (native_state.kind == "file" and
+                            hashlib.sha256(Path(record["backup"]).read_bytes()).hexdigest()
+                            != native_state.digest)):
+                    raise ActivationError(
+                        f"expected-state-mismatch: native agent changed during snapshot: {dest}")
+                record["native_agent"] = True
             record["postimage"] = (
                 safe_fs.PathState("missing").public()
                 if record["state"] == "moved"
@@ -3166,13 +3260,19 @@ def _apply_transaction(
         for dest in removal:
             if any(entry.get("dest") == str(dest) for entry in preserved):
                 continue
-            recheck_native_agent(dest)
+            native_expected = recheck_native_agent(dest)
             for record in snapshots:
                 if record["dest"] == str(dest):
                     record["postimage"] = safe_fs.PathState("missing").public()
                     break
             _write_journal(journal_path, runtime, "applying", snapshots)
-            _remove_path(dest)
+            if native_expected is None:
+                _remove_path(dest)
+            else:
+                auth = safe_fs.authority(
+                    dest, owner="runtime-activation:codex-native-agent",
+                    allowed_paths=(dest,), expected=native_expected)
+                safe_fs.remove_exact(auth, expected=native_expected)
             for record in snapshots:
                 if record["dest"] == str(dest):
                     record["postimage"] = safe_fs.capture_state(dest).public()
@@ -3187,7 +3287,7 @@ def _apply_transaction(
             dest = Path(item["dest"])
             if any(entry.get("dest") == str(dest) for entry in preserved):
                 continue
-            recheck_native_agent(dest)
+            native_expected = recheck_native_agent(dest)
             for record in snapshots:
                 if record["dest"] == str(dest):
                     record["postimage"] = safe_fs.PathState("missing").public()
@@ -3200,7 +3300,7 @@ def _apply_transaction(
             elif item["kind"] == "render":
                 # Rendered bytes replace a shipped link (the link itself, never
                 # its target) or an earlier render of this activation.
-                current = safe_fs.capture_state(dest)
+                current = native_expected or safe_fs.capture_state(dest)
                 try:
                     auth = safe_fs.authority(
                         dest,
@@ -3215,7 +3315,7 @@ def _apply_transaction(
                 except (OSError, safe_fs.SafetyError) as exc:
                     raise ActivationError(str(exc)) from exc
             elif item["kind"] == "copy":
-                current = safe_fs.capture_state(dest)
+                current = native_expected or safe_fs.capture_state(dest)
                 try:
                     auth = safe_fs.authority(
                         dest,
@@ -3230,7 +3330,7 @@ def _apply_transaction(
                 except (OSError, safe_fs.SafetyError) as exc:
                     raise ActivationError(str(exc)) from exc
             else:
-                current = safe_fs.capture_state(dest)
+                current = native_expected or safe_fs.capture_state(dest)
                 try:
                     auth = safe_fs.authority(
                         dest,
@@ -4259,24 +4359,9 @@ def deactivate(runtime: str, scope: str = "global", dry_run: bool = False) -> di
         )
     except ActivationError:
         desired = []
-    native_states = {}
+    native_states = _native_agent_states(runtime, scope, state, desired)
     if runtime == "codex":
         home = paths.runtime_home(runtime, scope)
-        agents = home / "agents"
-        candidates = {
-            Path(item["dest"]) for item in state.get("owned_paths", [])
-            if item.get("dest") and native_agent_ownership.agent_leaf(home, Path(item["dest"]))
-        }
-        if agents.is_dir() and not agents.is_symlink():
-            candidates.update(path for path in agents.glob("*.toml") if path.is_symlink())
-        # This is the leaf as it stood before ownership classification.  A
-        # concurrent successor must not inherit that classification, even if
-        # it is another otherwise valid harness link.
-        for dest in candidates:
-            try:
-                native_states[str(dest)] = safe_fs.capture_state(dest)
-            except (OSError, safe_fs.SafetyError):
-                pass
     trusted, user_changed_items = _trusted_owned(runtime, state, desired, scope)
     preserved = sorted(user_changed_items)
     desired_by_dest = {item["dest"]: item for item in desired}
@@ -4288,18 +4373,12 @@ def deactivate(runtime: str, scope: str = "global", dry_run: bool = False) -> di
         if runtime == "codex" and native_agent_ownership.agent_leaf(home, dest):
             try:
                 with safe_fs.TargetLock(dest):
-                    current = safe_fs.capture_state(dest)
                     recorded = next((item for item in state.get("owned_paths", [])
                                      if item.get("dest") == value), None)
-                    if current != native_states.get(value) or not (
-                        (current.kind == "symlink"
-                         and (recorded is None or (recorded.get("kind") == "symlink"
-                              and recorded.get("source") == current.link_target))
-                         and native_agent_ownership.owned_link(home, dest))
-                        or (current.kind == "file" and recorded is not None
-                            and recorded.get("kind") == "render"
-                            and recorded.get("content_sha256") == current.digest)
-                    ):
+                    initial = native_states.get(value)
+                    current = (_native_agent_current(home, dest, initial, recorded)
+                               if initial is not None else None)
+                    if current is None or current.kind == "missing":
                         preserved.append(value)
                         continue
 
