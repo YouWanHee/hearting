@@ -1418,6 +1418,8 @@ class SweepBatchBoundaryTest(IsolatedRootMixin, unittest.TestCase):
 
     def sweep(self, observer=None, *, session=None, continuation=None):
         with mock.patch("dispatch_notice_state.keep_claim", return_value=True), \
+             mock.patch("dispatch_seat_handover.pane_seat", return_value=SimpleNamespace(
+                 kind="pane", key="fixture-boundary-seat")), \
              mock.patch("dispatch_supervision.continue_for_parent", side_effect=continuation or (
                  lambda *_a, **_k: None)):
             return SWEEP.sweep_deliver(self.root, self.KIND, session or self.SID,
@@ -1463,7 +1465,7 @@ class SweepBatchBoundaryTest(IsolatedRootMixin, unittest.TestCase):
                 self.assert_original()
 
     def test_native_observation_cannot_leave_any_group_position_stale(self):
-        for size, target, trigger in ((2, 0, 1), (2, 1, 0), (4, 0, 3), (4, 2, 3)):
+        for size, target, trigger in ((1, 0, 0), (2, 0, 1), (2, 1, 0), (4, 0, 3), (4, 2, 3)):
             with self.subTest(size=size, target=target, trigger=trigger):
                 ids = self.seed_batch(size)
                 observe, observed, acted = self.later_observer(
@@ -1546,6 +1548,57 @@ class SweepBatchBoundaryTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(self.read(ids[0]), successor[0])
         self.assertEqual([self.read(d)["state"] for d in ids[1:]], ["pending", "pending"])
         self.assert_original()
+
+    def test_historical_receipt_survives_late_claim_or_recipient_change(self):
+        import dispatch_recipient_receipt as receipt
+        for changed in ("recipient", "claim-owner", "lease"):
+            with self.subTest(changed=changed):
+                ids = self.seed_batch(3)
+                evidence = [None]
+                def received():
+                    current = self.read(ids[0])
+                    if changed == "recipient":
+                        self.move([0])
+                    elif changed == "claim-owner":
+                        PD.reclaim(self.root, self.SID, ids[0], now_ns=current["claim_deadline_ns"] + 1)
+                        PD.claim(self.root, self.SID, ids[0], claim_owner="other-carrier",
+                                 lease_seconds=120, require_generation_proof=False)
+                    else:
+                        path = PD.record_path(self.root, self.SID, ids[0])
+                        value = json.loads(path.read_text())
+                        value["claim_deadline_ns"] = 0
+                        path.write_text(json.dumps(value))
+                    evidence[0] = receipt.claude_feedback_evidence([{
+                        "type": "user", "sessionId": self.SID, "summary": "Stop hook feedback",
+                        "message": {"content": receipt.receipt_marker(current, self.SID)},
+                    }], self.SID)
+                observe, _observed, acted = self.later_observer(received, evidence=lambda: evidence[0])
+                self.assertEqual(self.sweep(observe)[0], [])
+                self.assertTrue(acted)
+                self.assertEqual([self.read(d)["state"] for d in ids], ["acked", "pending", "pending"])
+                self.assert_original()
+
+    def test_later_observation_cannot_discard_an_already_observed_exact_receipt(self):
+        import dispatch_recipient_receipt as receipt
+        for later in ("unavailable", "empty", "foreign"):
+            with self.subTest(later=later):
+                ids = self.seed_batch(4)
+                observed = []
+                def observe(_root, _storage, record):
+                    observed.append(record["delivery_id"])
+                    if record["delivery_id"] == ids[2]:
+                        return receipt.claude_feedback_evidence([{
+                            "type": "user", "sessionId": self.SID, "summary": "Stop hook feedback",
+                            "message": {"content": receipt.receipt_marker(self.read(ids[0]), self.SID)},
+                        }], self.SID)
+                    if record["delivery_id"] == ids[3] and later != "unavailable":
+                        return receipt.claude_feedback_evidence([], "foreign-session" if later == "foreign" else self.SID)
+                    return None
+                self.assertEqual(self.sweep(observe)[0], [])
+                self.assertIn(ids[2], observed)
+                self.assertIn(ids[3], observed)
+                self.assertEqual([self.read(d)["state"] for d in ids], ["acked", "pending", "pending", "pending"])
+                self.assert_original()
 
     def test_expired_or_invalid_late_lease_never_reaches_output(self):
         for deadline in (0, None, True, "future"):

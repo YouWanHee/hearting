@@ -349,7 +349,7 @@ def sweep_deliver(
                "opencode" if recipient_kind.startswith("opencode") else "")
     legacy_bindings_by_evidence: dict[int, tuple[dict, dict]] = {}
     visited_batch_ids: set[str] = set()
-    latest_evidence = native_evidence
+    observed_evidence: dict[int, dict] = {}
 
     def currently_addressed(record, storage_key):
         from dispatch_seat_handover import record_for_session, storage_recipients
@@ -359,14 +359,14 @@ def sweep_deliver(
             storage_key=storage_key)
 
     def settle_observed(record):
-        nonlocal latest_evidence
         evidence = native_evidence
         if receipt_observer is not None:
             try:
                 evidence = receipt_observer(root, record.get(STORAGE_KEY) or session_id, record)
             except Exception:
                 evidence = None
-        latest_evidence = evidence
+        if isinstance(evidence, dict):
+            observed_evidence[id(evidence)] = evidence
         return settle_evidence(record, evidence)
 
     def settle_evidence(record, evidence):
@@ -427,6 +427,7 @@ def sweep_deliver(
             break
         storage_key = current[STORAGE_KEY]
         delivery_id = current["delivery_id"]
+        observed_evidence.clear()
         if settle_observed(current)["received"]:
             continue
         if not currently_addressed(current, storage_key):
@@ -514,7 +515,8 @@ def sweep_deliver(
                                  **({CONTINUED_KEY: continued} if continued else {})})
         # A later native snapshot can contain an earlier member's exact receipt,
         # even when its claim/recipient changed or the ACK write must be retried.
-        # Reuse that observation without starting another native read mid-check.
+        # Reuse this group's observations without starting another native read
+        # mid-check. A later unavailable/empty snapshot cannot undo exact proof.
         for member in group_claims:
             member_id = member["delivery_id"]
             try:
@@ -523,7 +525,8 @@ def sweep_deliver(
                         fresh, storage_key, member_id) != group_identities[member_id]):
                     group_ok = False
                     continue
-                if settle_evidence({**fresh, STORAGE_KEY: storage_key}, latest_evidence)["received"]:
+                if any(settle_evidence({**fresh, STORAGE_KEY: storage_key}, evidence)["received"]
+                       for evidence in observed_evidence.values()):
                     group_ok = False
             except (OSError, pending_delivery.PendingDeliveryError):
                 group_ok = False
