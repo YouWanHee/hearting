@@ -893,6 +893,111 @@ class GovernorTest(unittest.TestCase):
                 self.assertEqual(receipt["batch_peer_set"][0]["state"], "completed")
                 self.assertTrue(receipt["batch_peer_set"][0]["legacy_owner_closure"])
                 ancestry.assert_called_once()
+                # Exercise the real reservation reader and its route-authority
+                # consumer before launching, then validate the actual claim.
+                manifest = batch["manifest"]
+                selected = manifest["members"][0]
+                expected = {
+                    "reservation_kind": "parallel-batch",
+                    "batch_declared_size": manifest["declared_size"],
+                    "batch_group": manifest["parallel_group"],
+                    "batch_route_id": manifest["route_id"],
+                    "batch_parent_attempt_id": manifest["parent_attempt_id"],
+                    "batch_attempt_id": selected["attempt_id"],
+                    "batch_route_node": selected["route_node"],
+                    "batch_harness": selected["harness"],
+                    "batch_fallback_hop": selected["fallback_hop"],
+                    "batch_fallback_ordinal": selected["fallback_ordinal"],
+                    "batch_model_profile": selected["model_profile"],
+                    "batch_perspective": selected["perspective"],
+                    "batch_parallel_leg_index": selected["parallel_leg_index"],
+                    "batch_assignment_sha256": selected["assignment_sha256"],
+                    "_batch_route_nodes": sorted(m["route_node"] for m in manifest["members"]),
+                    "_batch_allowed_members": {
+                        m["route_node"]: [{k: m[k] for k in
+                            ("harness", "fallback_hop", "fallback_ordinal")}]
+                        for m in manifest["members"]},
+                }
+                token, validated = contract.reserve_governor_token(
+                    PATH, root, "dispatch", provided_token=tokens[0],
+                    expected_reservation=expected)
+                self.assertEqual(validated["batch_peer_set"], receipt["batch_peer_set"])
+                import copy
+                # Correctly rehashed malformed extensions must still refuse;
+                # digest validation alone cannot distinguish a valid wire form.
+                faults = {
+                    "unknown": lambda p: p.update(extra="unrecognized"),
+                    "partial": lambda p: p.pop("source_peer_leg_sha256"),
+                    "false-closure": lambda p: p.update(legacy_owner_closure=False),
+                    "numeric-closure": lambda p: p.update(legacy_owner_closure=1),
+                    "active-closure": lambda p: p.update(state="active"),
+                    "bad-source": lambda p: p.update(source_manifest_sha256="sha256:bad"),
+                    "same-source": lambda p: p.update(source_manifest_sha256=p["manifest_sha256"]),
+                    "bad-leg": lambda p: p.update(source_peer_leg_sha256="sha256:bad"),
+                    "empty-selected": lambda p: p.update(source_selected_attempt_id=""),
+                    "peer-selected": lambda p: p.update(source_selected_attempt_id=p["attempt_id"]),
+                    "current-manifest": lambda p: p.update(manifest_sha256="sha256:" + "0" * 64),
+                    "peer-membership": lambda p: p.update(attempt_id="att-other-peer"),
+                    "relative-path": lambda p: p.update(jobs="relative/jobs.log"),
+                    "empty-reason": lambda p: p.update(reason=""),
+                }
+                for fault, mutate in faults.items():
+                    with self.subTest(fault=fault):
+                        broken = copy.deepcopy(receipt)
+                        mutate(broken["batch_peer_set"][0])
+                        broken["batch_peer_set_sha256"] = "sha256:" + hashlib.sha256(
+                            json.dumps(broken["batch_peer_set"], separators=(",", ":"),
+                                       sort_keys=True).encode()).hexdigest()
+                        with self.assertRaises(contract.DispatchContractError) as refused:
+                            contract._validate_replica_reservation(broken, expected)
+                        self.assertEqual(refused.exception.reason, "parallel-group-reservation-mismatch")
+                broken = copy.deepcopy(receipt)
+                broken["batch_peer_set"][0]["source_peer_leg_sha256"] = "sha256:" + "0" * 64
+                with self.assertRaises(contract.DispatchContractError):
+                    contract._validate_replica_reservation(broken, expected)
+                spawned, finish = root / "spawned.json", root / "finish"
+                child_code = (
+                    "import json,os,sys,time\nfrom pathlib import Path\n"
+                    "Path(sys.argv[1]).write_text(json.dumps({'pid':os.getpid(),"
+                    "'attempt':os.environ['AGENT_DISPATCH_ATTEMPT_ID'],"
+                    f"'token_present':{GOVERNOR.RESERVATION_ENV!r} in os.environ}}))\n"
+                    "deadline=time.monotonic()+15\n"
+                    "while not Path(sys.argv[2]).exists() and time.monotonic()<deadline: time.sleep(.01)\n"
+                )
+                proc = subprocess.Popen([
+                    sys.executable, str(PATH), "--root", str(root), "run",
+                    "--class", "dispatch", "--", sys.executable, "-c",
+                    child_code, str(spawned), str(finish)],
+                    env={**os.environ, GOVERNOR.RESERVATION_ENV: token,
+                         "AGENT_DISPATCH_ATTEMPT_ID": selected["attempt_id"]},
+                    start_new_session=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True)
+                try:
+                    claimed = contract.wait_governor_reservation_claim(
+                        PATH, root, token, proc, timeout=10,
+                        expected_reservation=expected)
+                    self.assertEqual(claimed["batch_peer_set"], receipt["batch_peer_set"])
+                    deadline = time.monotonic() + 5
+                    while not spawned.exists() and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertTrue(spawned.exists(), "governed child did not spawn")
+                    child = json.loads(spawned.read_text())
+                    self.assertEqual(child["attempt"], selected["attempt_id"])
+                    self.assertFalse(child["token_present"])
+                finally:
+                    finish.touch()
+                    try:
+                        output, error = proc.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        import signal
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.communicate()
+                        raise
+                self.assertEqual(proc.returncode, 0, output + error)
+                state = json.loads((root / "state.json").read_text())
+                self.assertEqual(len(state["starts"]), 1)
+                self.assertEqual(state["reservations"], {})
+                self.assertEqual(state["leases"], {})
                 self.assertEqual(jobs.read_bytes(), before)
                 self.assertEqual(marker.read_bytes(), closure)
 
