@@ -509,21 +509,21 @@ class OpenPaneTmuxTest(_IsolatedMixin, unittest.TestCase):
         return subprocess.run(["tmux", "-S", str(self.socket), *args], capture_output=True, text=True,
                               env=self.env, timeout=10, check=False)
 
-    def test_split_uses_percentage_syntax_supported_by_legacy_and_current_tmux(self):
+    def test_split_uses_tmux_default_equal_size_without_size_option(self):
         calls = []
         def run(argv):
             calls.append(argv)
             return subprocess.CompletedProcess(argv, 0, stdout="%2\n", stderr="")
         surface = ts.TmuxSurface(run, "/private/socket")
         self.assertEqual(surface.split("%1", "right", str(self.root)), "%2")
-        self.assertEqual(calls[0][3:], ["split-window", "-d", "-t", "%1", "-h", "-p", "50",
+        self.assertEqual(calls[0][3:], ["split-window", "-d", "-t", "%1", "-h",
                                          "-c", str(self.root), "-P", "-F", "#{pane_id}"])
 
-    def start_server(self, border=None):
+    def start_server(self, border=None, width=200, height=60):
         self.socket = self.root / f"tmux-{border or 'default'}.sock"
         self.env = {key: value for key, value in os.environ.items() if key not in _SURFACE_ENV}
         self.env["SHELL"] = "/bin/sh"
-        started = self.tmux("-f", "/dev/null", "new-session", "-d", "-s", "d1", "-x", "200", "-y", "60",
+        started = self.tmux("-f", "/dev/null", "new-session", "-d", "-s", "d1", "-x", str(width), "-y", str(height),
                             "sleep 600")
         if started.returncode:
             self.fail(f"isolated tmux server did not start: {started.stderr.strip()}")
@@ -596,6 +596,21 @@ class OpenPaneTmuxTest(_IsolatedMixin, unittest.TestCase):
         self.assertEqual(reused.placement, "reuse")
         self.assertIn(reused.pane, panes)
         self.assertEqual(self.windows(), [4])
+
+    def test_default_split_divides_odd_terminal_geometry_in_both_directions(self):
+        near = self.start_server(width=201, height=61)
+        for direction, dimension in (("right", 0), ("down", 1)):
+            with self.subTest(direction=direction):
+                before = self.focus()
+                created = near.surface.split(self.reference, direction, str(self.root))
+                self.assertIsNotNone(created)
+                self.assertTrue(near.surface.run(created, "sleep 300"))
+                self.settle(created)
+                format_string = "#{pane_width} #{pane_height}"
+                sizes = [self.tmux("display-message", "-p", "-t", pane, format_string).stdout.split()
+                         for pane in (self.reference, created)]
+                self.assertLessEqual(abs(int(sizes[0][dimension]) - int(sizes[1][dimension])), 1, sizes)
+                self.assertEqual(self.focus(), before)
 
 
 if __name__ == "__main__":

@@ -356,7 +356,7 @@ class TmuxSurface:
 
     def split(self, pane, direction, cwd=None):
         return self._created(self._tmux(
-            "split-window", "-d", "-t", pane, "-h" if direction == "right" else "-v", "-p", "50",
+            "split-window", "-d", "-t", pane, "-h" if direction == "right" else "-v",
             *(["-c", cwd] if cwd else []), "-P", "-F", "#{pane_id}"), pane)
 
     def new_tab(self, session, cwd=None):
