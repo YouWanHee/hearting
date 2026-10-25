@@ -114,7 +114,7 @@ def _failure_fd(argv: list[str] | None) -> int | None:
         return None
 
 
-def _save_failure(argv: list[str] | None, exc: OSError | ValueError) -> None:
+def _save_failure(argv: list[str] | None, exc: Exception) -> None:
     values = sys.argv[1:] if argv is None else argv
     values = values[:values.index("--")] if "--" in values else values
     # Existing fence arguments identify the log; no new caller input is needed.
@@ -159,6 +159,9 @@ def cli(argv: list[str] | None = None) -> int:
         _write_failure(_failure_fd(argv), exc)
         print(f"launch-fence: {exc}", file=sys.stderr)
         return 70
+    except Exception as exc:
+        _save_failure(argv, exc)
+        raise  # Preserve the unhandled exception's original exit and traceback.
 
 
 if __name__ == "__main__":

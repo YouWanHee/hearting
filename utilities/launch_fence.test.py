@@ -271,6 +271,22 @@ class LaunchFenceTest(unittest.TestCase):
                         os.close(gate_write)
                     os.close(failure_read)
 
+    def test_unexpected_fence_exception_is_saved_and_reraised_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td, "jobs.log")
+            log = Path(td, "logs", "worker.att-unexpected.codex.jsonl")
+            jobs.write_text(f"now\topen\t/repo\t/wt\tworker\t"
+                            f"attempt_id=att-unexpected,harness=codex,log_file={log}\n")
+            error = RuntimeError("unexpected fence failure " + "한" * 100000 + "END")
+            with mock.patch.object(L, "main", side_effect=error), \
+                 self.assertRaises(RuntimeError) as caught:
+                L.cli(["--jobs", str(jobs), "--attempt-id", "att-unexpected"])
+            self.assertIs(caught.exception, error)
+            saved = log.with_suffix(".launch-fence.txt").read_text()
+            self.assertLessEqual(len(saved.encode()), 65536)
+            self.assertTrue(saved.endswith("END\n"))
+            self.assertFalse(log.exists())
+
     def test_unwritable_diagnostics_do_not_change_fence_failure_channel(self):
         import dispatch_launch_evidence as evidence
         with tempfile.TemporaryDirectory() as td:
