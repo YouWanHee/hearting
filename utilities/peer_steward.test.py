@@ -11567,6 +11567,213 @@ class SessionNoticeTerminalIdentityTest(_TmpRootMixin, unittest.TestCase):
                     self.assertEqual(self.store.get(duty["id"]), settled[0])
 
 
+class SessionNoticeProgressRaceTest(_TmpRootMixin, unittest.TestCase):
+    """Notice progress never replaces a duty settled by another store writer."""
+    notice = SessionNoticeTerminalIdentityTest.notice
+    replace_record = SessionNoticeTerminalIdentityTest.replace_record
+    resume = SessionNoticeTerminalIdentityTest.resume
+    transport = SessionNoticeTerminalIdentityTest.transport
+    edge = SessionNoticeIntegrationCorrectionTest.edge
+
+    def setUp(self):
+        import dispatch_contract
+        for module, name, value in (
+                (peer_steward.peer_obligations, "_proc_start_for_store", "100001"),
+                (peer_steward.peer_obligations, "request_dispatch_reconciliation", False),
+                (dispatch_contract, "process_start_ticks", "100001"),
+                (dispatch_contract, "process_identity_disposition", "live")):
+            patch = mock.patch.object(module, name, return_value=value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        super().setUp()
+        self.store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+
+    def settle(self, duty, terminal):
+        other = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        record = other.update(duty["id"], state=terminal,
+            delivery="already-settled" if terminal else "peer-courier",
+            cleanup="complete" if terminal else "pending",
+            observation={"phase": "settled" if terminal else "waiting", "transfer_ref": "f" * 32,
+                "recipient_sid": "latest-recipient",
+                "transfer_bindings": {"f" * 32: {"checkpoint": "latest"}},
+                "exact_receiver_receipt": {"checkpoint": "terminal"}})
+        path = other._record_path(duty["id"])
+        return record, path.read_bytes(), path.stat().st_mtime_ns
+
+    def assert_preserved(self, duty, snapshots):
+        self.assertEqual(len(snapshots), 1)
+        record, raw, mtime = snapshots[0]
+        self.assertEqual(self.store.get(duty["id"]), record)
+        path = self.store._record_path(duty["id"])
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), (raw, mtime))
+
+    @contextlib.contextmanager
+    def settle_before_lock(self, duty, terminal, predicate):
+        cls = peer_steward.peer_obligations.ObligationStore
+        update = cls.update
+        snapshots = []
+        active = False
+        def progress(store, duty_id, **kwargs):
+            nonlocal active
+            if active or duty_id != duty["id"] or snapshots or not predicate(kwargs):
+                return update(store, duty_id, **kwargs)
+            original_lock = store._lock
+            def lock(key):
+                # Use the real second store and existing lock before letting the
+                # paused progress writer acquire that same duty lock.
+                snapshots.append(self.settle(duty, terminal))
+                return original_lock(key)
+            active = True
+            try:
+                with mock.patch.object(store, "_lock", side_effect=lock):
+                    return update(store, duty_id, **kwargs)
+            finally:
+                active = False
+        with mock.patch.object(cls, "update", progress):
+            yield snapshots
+
+    def test_exact_receipt_preserves_terminal_bytes_and_still_acks_original_record(self):
+        import dispatch_pending_delivery as pending
+        for kind in ("run-notice", "session-notice"):
+            for terminal in ("complete", "cancelled"):
+                with self.subTest(kind=kind, terminal=terminal):
+                    record, duty = self.notice(kind, "receipt-" + kind + terminal)
+                    with self.transport("terminal-A"):
+                        self.resume([duty])
+                    current = self.store.get(duty["id"])
+                    ref = current["observation"]["transfer_ref"]
+                    transfer = peer_steward.peer_message._read_pending(ref)
+                    with self.settle_before_lock(duty, terminal,
+                            lambda kw: kw.get("delivery") == "acknowledged") as snapshots:
+                        self.assertEqual(peer_steward.peer_message.receive_peer_message(
+                            transfer["text"], {"harness": "claude", "session_id": "terminal-A"}), 0)
+                    self.assert_preserved(duty, snapshots)
+                    acked = pending.read(self.tmp_root, "terminal-A", record["delivery_id"])
+                    self.assertEqual(acked["state"], "acked")
+                    self.assertEqual(pending.received_ack_identity(acked, "terminal-A", record["delivery_id"]),
+                                     pending.received_ack_identity(record, "terminal-A", record["delivery_id"]))
+                    with mock.patch.object(peer_steward, "cmd_prompt") as send:
+                        self.resume([current])
+                    send.assert_not_called()
+                    self.assert_preserved(duty, snapshots)
+
+    def test_observation_only_preparation_and_finalizer_preserve_terminal_bytes(self):
+        for kind in ("run-notice", "session-notice"):
+            for terminal in ("complete", "cancelled"):
+                for boundary in ("prepared", "finalizer"):
+                    with self.subTest(kind=kind, terminal=terminal, boundary=boundary):
+                        _record, duty = self.notice(kind, boundary + kind + terminal)
+                        predicate = (lambda kw: "transfer_ref" in (kw.get("observation") or {})) if boundary == "prepared" else (
+                            lambda kw: kw.get("delivery") == "peer-courier")
+                        with self.settle_before_lock(duty, terminal, predicate) as snapshots, \
+                             self.transport("terminal-A"):
+                            self.resume([duty])
+                        self.assert_preserved(duty, snapshots)
+
+    def test_native_callback_completion_and_cancellation_survive_finalizer(self):
+        for kind in ("run-notice", "session-notice"):
+            for terminal in ("complete", "cancelled"):
+                with self.subTest(kind=kind, terminal=terminal):
+                    _record, duty = self.notice(kind, "native-" + kind + terminal)
+                    snapshots = []
+                    def submit(*args, **kwargs):
+                        snapshots.append(self.settle(duty, terminal))
+                        return 0, {}
+                    with self.transport("terminal-A"), \
+                         mock.patch.object(peer_steward, "_herdr_prompt", side_effect=submit) as native:
+                        self.resume([duty])
+                    native.assert_called_once()
+                    self.assert_preserved(duty, snapshots)
+
+    def test_unavailable_lineage_progress_preserves_terminal_bytes(self):
+        notices = [(kind, terminal, *self.notice(kind, "lineage-" + kind + terminal))
+                   for kind in ("run-notice", "session-notice")
+                   for terminal in ("complete", "cancelled")]
+        # Legacy retention needs an addressable original. The lineage becomes
+        # ambiguous after retention, before this courier pass observes it.
+        self.edge("claude", "terminal-A", "fork-B")
+        self.edge("claude", "terminal-A", "fork-C")
+        for kind, terminal, record, duty in notices:
+            with self.subTest(kind=kind, terminal=terminal):
+                from dispatch_seat_handover import record_recipient_binding
+                self.assertIsNone(record_recipient_binding(record, "terminal-A", harness="claude",
+                                                          jobs=self.jobs_path))
+                with self.settle_before_lock(duty, terminal, lambda kw:
+                        (kw.get("observation") or {}).get("reason") == "recipient-lineage-unavailable") as snapshots, \
+                     mock.patch.object(peer_steward, "cmd_prompt") as send:
+                    self.resume([duty])
+                send.assert_not_called()
+                self.assert_preserved(duty, snapshots)
+
+    def test_native_opencode_owned_progress_preserves_terminal_bytes(self):
+        for terminal in ("complete", "cancelled"):
+            with self.subTest(terminal=terminal):
+                _record, duty = self.notice("run-notice", "opencode-" + terminal, harness="opencode")
+                with self.settle_before_lock(duty, terminal, lambda kw:
+                        (kw.get("observation") or {}).get("reason") == "native-opencode-carrier-owns-notice") as snapshots, \
+                     mock.patch.object(peer_steward, "cmd_prompt") as send:
+                    self.resume([duty])
+                send.assert_not_called()
+                self.assert_preserved(duty, snapshots)
+        _record, duty = self.notice("run-notice", "opencode-pending", harness="opencode")
+        with mock.patch.object(peer_steward, "cmd_prompt") as send:
+            self.resume([duty])
+        send.assert_not_called()
+        current = self.store.get(duty["id"])
+        self.assertEqual(current["state"], "pending")
+        self.assertEqual(current["observation"]["reason"], "native-opencode-carrier-owns-notice")
+
+    def test_unbound_received_history_progress_preserves_terminal_bytes(self):
+        import dispatch_pending_delivery as pending
+        for kind in ("run-notice", "session-notice"):
+            for terminal in ("complete", "cancelled"):
+                with self.subTest(kind=kind, terminal=terminal):
+                    foreign, foreign_duty = self.notice(kind, "foreign-history-" + kind + terminal)
+                    with self.transport("terminal-A"):
+                        self.resume([foreign_duty])
+                    ref = self.store.get(foreign_duty["id"])["observation"]["transfer_ref"]
+                    peer = peer_steward.peer_message
+                    self.assertEqual(peer.receive_peer_message(peer._read_pending(ref)["text"],
+                        {"harness": "claude", "session_id": "terminal-A"}), 0)
+                    receipt = {**foreign["receipt"], "text": "replacement history"}
+                    self.replace_record(foreign, receipt=receipt,
+                        receipt_digest=pending._canonical_receipt_digest(receipt))
+                    self.assertFalse(peer_steward.peer_obligations.acknowledge_session_notice_delivery(
+                        peer._read_pending(ref), roots=[self.tmp_root]))
+                    _record, duty = self.notice(kind, "unbound-" + kind + terminal)
+                    duty = self.store.update(duty["id"], observation={"transfer_ref": ref})
+                    with self.settle_before_lock(duty, terminal, lambda kw:
+                            (kw.get("observation") or {}).get("reason") == "received-notice-history-unbound") as snapshots, \
+                         mock.patch.object(peer_steward, "cmd_prompt") as send:
+                        self.resume([duty])
+                    send.assert_not_called()
+                    self.assert_preserved(duty, snapshots)
+
+    def test_availability_observations_keep_terminal_and_latest_pending_checkpoint(self):
+        for kind in ("run-notice", "session-notice"):
+            for terminal in ("complete", "cancelled", None):
+                for pane in ("absent", "-"):
+                    with self.subTest(kind=kind, terminal=terminal, pane=pane):
+                        _record, duty = self.notice(kind, "availability-" + kind + str(terminal) + pane)
+                        agents = [] if pane == "absent" else [{"agent": "claude",
+                            "agent_session": {"value": "terminal-A"}, "pane_id": pane}]
+                        boundary = self.settle_before_lock(duty, terminal,
+                            lambda kw: kw.get("observer_error") == "recipient-unavailable")
+                        with boundary as snapshots, mock.patch.object(peer_steward.subprocess, "run",
+                                return_value=SimpleNamespace(returncode=0, stdout=json.dumps(
+                                    {"result": {"agents": agents}}))):
+                            self.resume([duty])
+                        if terminal:
+                            self.assert_preserved(duty, snapshots)
+                        else:
+                            self.assertEqual(len(snapshots), 1)
+                            current = self.store.get(duty["id"])
+                            self.assertEqual((current["state"], current["delivery"], current["cleanup"]),
+                                             ("pending", "peer-courier", "pending"))
+                            self.assertEqual(current["observation"],
+                                {**snapshots[0][0]["observation"], "reason": "recipient-unavailable"})
+
+
 class ExplicitHolderAuthorityTest(_TmpRootMixin, unittest.TestCase):
     edge = SessionNoticeIntegrationCorrectionTest.edge
 

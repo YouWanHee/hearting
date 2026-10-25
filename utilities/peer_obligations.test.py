@@ -2952,6 +2952,41 @@ class CanonicalNoticeJoinTest(unittest.TestCase):
                     self.assertEqual(peer._transfer_path(ref).read_bytes(), seal)
                     bad.unlink()  # This test's private malformed ledger only.
 
+    def test_retained_single_notice_receipt_preserves_concurrent_terminal_duty(self):
+        import dispatch_pending_delivery as pending
+        peer = peer_steward.peer_message
+        for terminal in ("complete", "cancelled"):
+            with self.subTest(terminal=terminal):
+                sid = "single-terminal-" + terminal
+                ref, recipient, records, duties = self.transfer(sid=sid, old_schema=True)
+                duty, = duties
+                cls = obligations.ObligationStore
+                original_lock = cls._lock
+                snapshots = []
+                active = False
+                def lock(store, duty_id):
+                    nonlocal active
+                    if duty_id == duty["id"] and not snapshots and not active:
+                        active = True
+                        try:
+                            other = cls(self.root)
+                            terminal_duty = other.update(duty_id, state=terminal,
+                                delivery="already-settled", cleanup="complete",
+                                observation={"phase": "settled", "transfer_ref": "f" * 32,
+                                             "checkpoint": "concurrent"})
+                            path = other._record_path(duty_id)
+                            snapshots.append((terminal_duty, path.read_bytes(), path.stat().st_mtime_ns))
+                        finally:
+                            active = False
+                    return original_lock(store, duty_id)
+                with mock.patch.object(cls, "_lock", lock):
+                    self.assertEqual(peer.receive_peer_message(peer._read_pending(ref)["text"], recipient), 0)
+                self.assertEqual(len(snapshots), 1)
+                self.assertEqual(self.store.get(duty["id"]), snapshots[0][0])
+                path = self.store._record_path(duty["id"])
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), snapshots[0][1:])
+                self.assertEqual(pending.read(self.root, sid, records[0]["delivery_id"])["state"], "acked")
+
     def test_same_digest_replacement_is_not_adopted_at_group_or_single_receipt(self):
         import dispatch_pending_delivery as pending
         peer = peer_steward.peer_message

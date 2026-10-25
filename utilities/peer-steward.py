@@ -8346,12 +8346,14 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
                         continue
                 store.update(duty["id"], state="pending", observation={
                     **(duty.get("observation") or {}), "reason": "recipient-lineage-unavailable"},
+                    expected_phases={(duty.get("observation") or {}).get("phase", "waiting")},
                     skip_unchanged=True)
                 continue
             harness, recipient_sid = pair
             if intent.get("kind") == "run-notice" and pair == ("opencode", storage_sid):
                 store.update(duty["id"], state="pending", observation={
                     **(duty.get("observation") or {}), "reason": "native-opencode-carrier-owns-notice"},
+                    expected_phases={(duty.get("observation") or {}).get("phase", "waiting")},
                     skip_unchanged=True)
                 continue
             candidates.append((duty, harness, storage_sid, recipient_sid, record))
@@ -8399,7 +8401,8 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
                 matched = peer_obligations.acknowledge_session_notice_delivery(message, roots=[root])
                 if not matched:
                     store.update(item[0]["id"], state="unknown", observation={**obs,
-                        "reason": "received-notice-history-unbound"}, skip_unchanged=True)
+                        "reason": "received-notice-history-unbound"},
+                        expected_phases={obs.get("phase", "waiting")}, skip_unchanged=True)
                 return
             # Accepted and ambiguous transfers are never redirected or resent.
             if message and message.get("state") in {"queued", "unverified"}:
@@ -8540,7 +8543,8 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
                 store.update(item_duty["id"], observation={**previous, "transfer_ref": ref,
                     "transfer_bindings": bindings,
                     "storage_sid": storage_sid, "delivery_id": delivery_id,
-                    "recipient_sid": recipient_sid, "producer_binding": producer})
+                    "recipient_sid": recipient_sid, "producer_binding": producer},
+                    expected_phases={previous.get("phase", "waiting")})
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body_file:
             body_file.write(body)
             body_file.flush()
@@ -8567,7 +8571,8 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
                 if prepared or submitted:
                     pending.mark_sent_ambiguous(root, storage_sid, delivery_id, claim_owner=owner,
                         expected_identity=pending.received_ack_identity(stored, storage_sid, delivery_id))
-                    store.update(item_duty["id"], state="pending", delivery="peer-courier", cleanup="pending")
+                    store.update(item_duty["id"], state="pending", delivery="peer-courier", cleanup="pending",
+                        expected_phases={(item_duty.get("observation") or {}).get("phase", "waiting")})
                 else:
                     release_unsubmitted_claim(root, storage_sid, stored, owner, recipient_sid)
             except (OSError, ValueError, RuntimeError):

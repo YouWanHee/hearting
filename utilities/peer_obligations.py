@@ -1144,7 +1144,8 @@ def acknowledge_ordinary_notice_delivery(message, *, roots=None):
             try:
                 store.update(duty["id"], state="complete", delivery="acknowledged",
                              cleanup="complete", observation={**(duty.get("observation") or {}),
-                                                                "receipt_ref": message["ref"]})
+                                                                "receipt_ref": message["ref"]},
+                             expected_phases={(duty.get("observation") or {}).get("phase", "waiting")})
             except (OSError, ValueError, RuntimeError):
                 pass
     return matched
@@ -1593,7 +1594,8 @@ def acknowledge_session_notice_delivery(message, *, roots=None):
         if record.get("state") == "acked" and duty.get("state") not in {"complete", "cancelled"}:
             try:
                 store.update(duty["id"], state="complete", delivery="acknowledged",
-                             cleanup="complete")
+                             cleanup="complete",
+                             expected_phases={(duty.get("observation") or {}).get("phase", "waiting")})
             except (OSError, ValueError, RuntimeError):
                 pass
     return matched
