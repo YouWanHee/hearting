@@ -196,24 +196,82 @@ class SectionShapes(unittest.TestCase):
 
 
 class CensusHeaderTests(unittest.TestCase):
-    def test_narrow_census_only_header_keeps_spinner_and_full_freshness(self):
-        from tools.fleet.explorer.chrome import draw_chrome
-        from tools.fleet.explorer.grid import CellGrid
+    def test_exact_fit_census_header_keeps_saved_spacing_and_full_freshness(self):
+        from tools.fleet.explorer.frame import draw
         from tools.fleet.explorer.state import NavState
         from tools.fleet.explorer.view_model import ExplorerViewModel
 
         census = {"parts": [("⠏ 0", "spin"), (" working", "dim"), ("  ● 0", "idle"),
                              (" idle", "dim"), ("  ● 0", "blocked"), (" answer needed", "dim"),
                              ("   ", "branch_s")]}
-        vm = ExplorerViewModel(census=census, system={"install": {"version": "v3.50.3-20-gad247e2b6"},
-                                                      "usage_api": {"freshness": "02:38"}})
-        grid = CellGrid(80, 45)
+        version, freshness = "v3.50.3-20-gad247e2b6", "02:38"
+        vm = ExplorerViewModel(census=census, system={"install": {"version": version},
+                                                      "usage_api": {"freshness": freshness}})
+        frame, trace = ef.trace_draw(draw, vm, NavState(view="OVERVIEW", scope="-"), 80, 45)
+        expected = ("⠏ 0 working  ● 0 idle  ● 0 answer needed   hearting "
+                    "v3.50.3-20-gad247e2b6  02:38")
 
-        row = "".join(cell[0] for cell in draw_chrome(grid, vm, NavState(view="OVERVIEW", scope="-" )).cells[0])
+        row = frame.text_rows()[0]
 
+        self.assertEqual(row, expected)
         self.assertTrue(row.startswith("⠏ 0 working"), row)
-        self.assertIn("v3.50.3-20-gad247e2b6", row)
-        self.assertTrue(row.endswith("02:38"), row)
+        self.assertIn(version, row)
+        self.assertTrue(row.endswith(freshness), row)
+        self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
+
+    def test_overlong_demo_census_keeps_counts_version_and_full_clock(self):
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.state import NavState
+
+        vm = ef.demo_model()
+        frame, trace = ef.trace_draw(draw, vm, NavState(view="OVERVIEW", scope="-"), 80, 45)
+        row = frame.text_rows()[0]
+        freshness = vm.system["usage_api"]["freshness"]
+        version = vm.system["install"]["version"]
+
+        self.assertTrue(row.startswith("⠏ 3 working ● 5 idle ● 2 answer needed hearting "), row)
+        self.assertIn("hearting " + version, row)
+        self.assertTrue(row.rstrip().endswith(freshness), row)
+        self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
+
+    def test_overlong_multi_digit_counts_keep_all_census_information(self):
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.state import NavState
+        from tools.fleet.explorer.view_model import ExplorerViewModel
+
+        census = {"parts": [("⠏ 12", "spin"), (" working", "dim"), ("  ● 34", "idle"),
+                             (" idle", "dim"), ("  ● 56", "blocked"), (" answer needed", "dim"),
+                             ("   ", "branch_s")]}
+        version, freshness = "v3.50.3-20-gad247e2b6", "02:38"
+        vm = ExplorerViewModel(census=census, system={"install": {"version": version},
+                                                      "usage_api": {"freshness": freshness}})
+        frame, trace = ef.trace_draw(draw, vm, NavState(view="OVERVIEW", scope="-"), 80, 45)
+        row = frame.text_rows()[0]
+
+        self.assertTrue(row.startswith("⠏ 12 working ● 34 idle ● 56 answer needed hearting "), row)
+        self.assertIn(version, row)
+        self.assertTrue(row.rstrip().endswith(freshness), row)
+        self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
+
+    def test_wide_version_cell_at_the_right_boundary_keeps_the_full_clock(self):
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.grid import cell_width
+        from tools.fleet.explorer.state import NavState
+        from tools.fleet.explorer.view_model import ExplorerViewModel
+
+        census = {"parts": [("⠏ 0", "spin"), (" working", "dim"), ("  ● 0", "idle"),
+                             (" idle", "dim"), ("  ● 0", "blocked"), (" answer needed", "dim"),
+                             ("   ", "branch_s")]}
+        version, freshness = "v3.50.3-20-gad247e2界6", "02:38"
+        vm = ExplorerViewModel(census=census, system={"install": {"version": version},
+                                                      "usage_api": {"freshness": freshness}})
+        frame, trace = ef.trace_draw(draw, vm, NavState(view="OVERVIEW", scope="-"), 80, 45)
+        row = frame.text_rows()[0]
+
+        self.assertIn(version, row)
+        self.assertTrue(row.rstrip().endswith(freshness), row)
+        self.assertEqual(cell_width(row), 80)
+        self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
 
 
 if __name__ == "__main__":

@@ -16,6 +16,21 @@ def _clip(text, width):
     return clip(str(text), max(0, int(width)))
 
 
+def _compact_spaces(text):
+    """Collapse repeated padding without changing the words carried by a header fragment."""
+    out = []
+    in_spaces = False
+    for char in str(text):
+        if char == " ":
+            if not in_spaces:
+                out.append(char)
+            in_spaces = True
+        else:
+            out.append(char)
+            in_spaces = False
+    return "".join(out)
+
+
 def draw_chrome(grid: CellGrid, vm, state, beat=1):
     width, height = grid.cols, grid.rows
     hosts = tuple(vm.hosts or ())
@@ -42,7 +57,12 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
                              (" " + str(install.get("version", "")), "ver")])
     if freshness:
         census_parts.append(("  " + str(freshness), "dim"))
-    census_width = sum(len(part[0]) for part in census_parts)
+    census_width = sum(cell_width(part[0]) for part in census_parts)
+    if census_width > width:
+        compacted = [(_compact_spaces(text), key) for text, key in census_parts]
+        compact_width = sum(cell_width(text) for text, _key in compacted)
+        if compact_width < census_width:
+            census_parts, census_width = compacted, compact_width
     census_x = max(1, width - 1 - census_width)
     parts = [("hosts ", "label")]
     for host in hosts:
@@ -149,7 +169,6 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
         grid.put(NAV_WIDTH + 2, title_y, " { ", "dim")
         title_text = str(state.title or state.view)
         grid.put(NAV_WIDTH + 5, title_y, title_text, "head", limit=width - 1)
-        from .grid import cell_width
         title_end = NAV_WIDTH + 5 + cell_width(title_text)
         grid.put(title_end, title_y, " ", "dim", limit=width - 1)
         grid.put(title_end + 1, title_y, "} ", "dim", limit=width - 1)
