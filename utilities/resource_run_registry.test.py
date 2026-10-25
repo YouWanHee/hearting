@@ -393,6 +393,41 @@ class ResourceRegistryTest(unittest.TestCase):
             self.assertEqual({row["cwd"] for row in rows}, {"/projects/a", "/projects/b"})
             self.assertTrue(any(d["kind"] == "malformed-registry" for d in diagnostics))
 
+    def test_registry_view_uses_exact_route_config_and_public_record(self):
+        import hashlib
+        import resource_progress
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            artifact = root / "artifacts"
+            artifact.mkdir()
+            project = root / "project"
+            (project / "configs").mkdir(parents=True)
+            output = project / "results"
+            output.mkdir()
+            (output / "logs").mkdir()
+            (output / "logs" / "epochs.jsonl").write_text(
+                '{"epoch":1,"split":"valid","losses":{"L_se":-8.77}}\n')
+            config = project / "configs" / "run.json"
+            config.write_text(json.dumps({"output_dir": "results"}))
+            route = artifact / "route.json"
+            route.write_text(json.dumps({"route_id": "route-fixture",
+                                         "artifact_root": str(artifact)}))
+            state_path = root / "runtime" / "state.json"
+            state_path.parent.mkdir()
+            identity = {"pid": 77, "starttime": "9", "command_hash": "a" * 64,
+                        "process_group": 77}
+            row = {**identity, "cwd": str(project), "status": "running",
+                   "started_at": 0, "route": str(route), "route_id": "route-fixture",
+                   "command": ["python", "train.py", "--config", "configs/run.json"],
+                   "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest()}
+            with mock.patch.object(resource_progress, "_observation_state_path", return_value=state_path):
+                view = registry.normalize_run("run-view", row, root / "resource-runs.json",
+                    identity_reader=lambda _pid: identity, now=7200)
+            self.assertEqual(view["liveness"], "working")
+            self.assertEqual(view["experiment_run_record"]["route_id"], "route-fixture")
+            self.assertEqual(view["experiment_run_record"]["output_dir"], str(output))
+            self.assertEqual(view["experiment_run_record"]["metric_summary"]["latest"]["value"], -8.77)
+
 
 if __name__ == "__main__":
     unittest.main()

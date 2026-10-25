@@ -448,7 +448,8 @@ def sweep_deliver(
 
 NOTICE_DELIVERY_HEADER = (
     "Hearting notice about work you started (a paused route resumed, a remote run ended). "
-    "Tell the user in one line; act only where a line's required_action asks for it. "
+    "Report observed metrics, trend, and elapsed or ETA against the criteria and plan; state when unavailable. "
+    "Act only where a line's required_action asks for it. "
     "Do not start Monitor, dispatch-wait, or a polling loop."
 )
 

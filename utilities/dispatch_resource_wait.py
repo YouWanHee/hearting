@@ -18,6 +18,71 @@ import dispatch_completion_join as JOIN
 import resource_resume as RESUME
 
 
+def _experiment_result_note(row):
+    row = row if isinstance(row, dict) else {}
+    run_id = row.get("run_id")
+    artifact_root = row.get("artifact_root")
+    path = None
+    record = None
+    if artifact_root and run_id:
+        try:
+            import resource_progress
+            path = resource_progress.public_record_path(artifact_root, run_id)
+            record = resource_progress.read_public_run_record(artifact_root, run_id)
+        except (OSError, ValueError, TypeError):
+            record = None
+    if not isinstance(record, dict):
+        return (f"\nExperiment result: run_id={run_id or 'unknown'}; metrics unavailable; "
+                f"public run record={path or 'unavailable'}; ETA/planned time unavailable.")
+    rows = record.get("rows") if isinstance(record.get("rows"), list) else []
+    row = max((item for item in rows if isinstance(item, dict)),
+              key=lambda item: ((item.get("last_checkpoint") or {}).get("at") or 0),
+              default={})
+    summary = row.get("metric_summary") if isinstance(row.get("metric_summary"), dict) \
+        else record.get("metric_summary") if isinstance(record.get("metric_summary"), dict) else {}
+    key = summary.get("metric")
+    def points(field, fallback):
+        values = summary.get(field) if isinstance(summary.get(field), dict) else {}
+        names = list(values)
+        if key in names:
+            names.remove(key)
+            names.insert(0, key)
+        parts = []
+        for name in names[:3]:
+            value = values.get(name)
+            if not isinstance(value, dict):
+                continue
+            number = "NaN/Inf" if value.get("nonfinite") else value.get("value")
+            parts.append(f"{name}={number}@{value.get('epoch')}")
+        if parts:
+            return ",".join(parts)
+        if not isinstance(fallback, dict) or not key:
+            return "지표 없음"
+        number = "NaN/Inf" if fallback.get("nonfinite") else fallback.get("value")
+        return f"{key}={number}@{fallback.get('epoch')}"
+    start, end = record.get("started_at"), record.get("ended_at")
+    actual = row.get("elapsed_seconds")
+    if not isinstance(actual, (int, float)) and isinstance(start, (int, float)) and isinstance(end, (int, float)):
+        actual = max(0, int(end - start))
+    elif (not isinstance(actual, (int, float)) and isinstance(start, str)
+            and isinstance(end, str)):
+        try:
+            from datetime import datetime
+            actual = max(0, int((datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds()))
+        except ValueError:
+            pass
+    def duration(value):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return "미상"
+        hours, remainder = divmod(max(0, int(value)), 3600)
+        return f"{hours}h{remainder // 60:02d}m" if hours else f"{remainder // 60}m"
+    return (f"\nExperiment result: run_id={run_id}; row={row.get('row_id') or 'run'}; "
+            f"last={points('latest_metrics', summary.get('latest'))}; "
+            f"best={points('best_metrics', summary.get('best'))}; trend={summary.get('trend') or '판정 불가'}; "
+            f"actual={duration(actual)} vs plan={duration(row.get('planned_seconds', record.get('planned_seconds')))}; "
+            f"public run record={path}.")
+
+
 @lru_cache(maxsize=1)
 def supervisor():
     spec = importlib.util.spec_from_file_location("owner_resource_supervisor", Path(__file__).with_name("workflow-supervisor.py"))
@@ -73,7 +138,8 @@ def start_binding(route, route_file, args, environ):
         JOIN._write_supervisor_state_unlocked(state_path, attempt, set(state.delivered_attempt_ids),
             phase=state.phase, outbox=state.outbox, resource=resource)
     args.jobs, args.parent_attempt_id = str(jobs), attempt
-    return {"parent_attempt_id": attempt, "session_id": session, "route_id": route["route_id"],
+    return {"parent_attempt_id": attempt, "session_id": session,
+        "harness": row.metadata.get("harness"), "route_id": route["route_id"],
         "route_hash": route["route_hash"], "jobs": str(jobs),
         "owner_pid": parent.pid, "owner_start": parent.pid_start,
         **({"launch_scope": "codex-owner-controller"} if row.metadata.get("harness") == "codex" else {})}
@@ -338,6 +404,7 @@ def pending_prompt(path, parent, args=None, control=None):
         "Continue only the already authorized next work; do not restart the resource.")
     return ("Runtime resource receipt (not a model child or verification PASS): "
         + json.dumps(box["receipt"], sort_keys=True, separators=(",", ":"))
+        + _experiment_result_note(row)
         + "\nUse pending user corrections first. " + next_work + " Exit is not workflow completion.")
 
 

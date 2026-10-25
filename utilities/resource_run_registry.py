@@ -24,6 +24,7 @@ INDEX_SCHEMA = 1
 REGISTRY_SCHEMA = 1
 IDENTITY_KEYS = ("pid", "starttime", "command_hash")
 _LEGACY_RESOURCE_IDENTITY_CACHE: dict[str, tuple[tuple[str, int, int], dict[str, list[dict]]]] = {}
+_EXPERIMENT_OBSERVATION_POLL_CACHE: dict[tuple, tuple[float, str, bool]] = {}
 
 
 def agent_home() -> Path:
@@ -678,6 +679,62 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         local_placement = observe_placement({**run, "run_id": str(run_id)})
         training_progress = collect_progress(run, registry, now)
         remote_training = remote_candidates(run, registry, now)
+    experiment_observation = None
+    artifact_root = run.get("artifact_root")
+    if not artifact_root and isinstance(run.get("route"), str):
+        try:
+            route_path = Path(run["route"])
+            if route_path.is_absolute() and not route_path.is_symlink():
+                route_doc = json.loads(route_path.read_text(encoding="utf-8"))
+                if (not run.get("route_id") or route_doc.get("route_id") == run.get("route_id")):
+                    artifact_root = route_doc.get("artifact_root")
+        except (OSError, ValueError, TypeError):
+            pass
+    if artifact_root or run.get("output_dir") or (training_progress and training_progress.get("directory")):
+        from resource_progress import observe_experiment, read_public_run_record
+        observation_rows = []
+        if training_progress and training_progress.get("directory"):
+            observation_rows.append((training_progress.get("directory"),
+                training_progress.get("arm") or training_progress.get("pid"),
+                training_progress.get("row_started_at") or started_at))
+        for candidate in remote_training:
+            if candidate.get("directory"):
+                observation_rows.append((candidate["directory"],
+                    candidate.get("arm") or candidate.get("compute_run_id") or candidate.get("pid"),
+                    candidate.get("row_started_at") or started_at))
+        if not observation_rows and run.get("output_dir"):
+            observation_rows.append((run["output_dir"], run.get("row_id") or "run", started_at))
+        if not observation_rows and liveness == "working":
+            observation_rows.append((None, run.get("row_id") or "run", started_at))
+        for metric_root, row_key, row_start in observation_rows:
+            row_progress = progress if len(observation_rows) == 1 else None
+            candidate_run = {**run, "run_id": str(run_id),
+                             "artifact_root": artifact_root,
+                             "started_at": row_start or started_at}
+            result = observe_experiment(candidate_run, registry, now,
+                root=metric_root, row_key=str(row_key), started_at=row_start or started_at,
+                planned_seconds=run.get("planned_seconds"),
+                progress=({"completed": row_progress.get("completed"),
+                           "total": row_progress.get("total"), "unit": row_progress.get("unit"),
+                           "updated_at": row_progress.get("updated_at"),
+                           "age_s": row_progress.get("age_s")}
+                          if row_progress else None),
+                final=liveness != "working",
+                status=(run.get("status") if run.get("status") not in {None, "running"}
+                        else liveness))
+            if result.get("available"):
+                experiment_observation = result
+    public_observation = None
+    if artifact_root:
+        from resource_progress import read_public_run_record
+        public_observation = read_public_run_record(artifact_root, str(run_id))
+        if public_observation is not None and liveness != "working":
+            from resource_progress import write_public_run_record
+            public_observation = {**public_observation,
+                "status": (run.get("status") if run.get("status") not in {None, "running", "launching"}
+                           else liveness),
+                "ended_at": run.get("ended_at") if isinstance(run.get("ended_at"), (int, float)) else public_observation.get("ended_at")}
+            write_public_run_record(artifact_root, str(run_id), public_observation)
     return {
         "job_type": "resource", "resource_class": "lab", "run_id": str(run_id),
         "cwd": cwd, "elapsed_min": elapsed_min, "liveness": liveness,
@@ -703,6 +760,8 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         "source_commit": run.get("source_commit"), "source_dirty": run.get("source_dirty"),
         "source_git_state": run.get("source_git_state"), "started_at": started_at,
         "training_progress": training_progress,
+        "experiment_observation": experiment_observation,
+        "experiment_run_record": public_observation,
         "progress_file": run.get("progress_file"), "progress": progress,
         "remote_training": remote_training,
         "local_placement": local_placement,
@@ -716,6 +775,24 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         "sentinel": run.get("sentinel"),
         "state_evidence": {"reason": reason, "current_identity": current},
     }
+
+
+def observe_run_if_due(run_id: str, run: dict, registry: Path, *, now=None,
+                       interval_seconds=60.0):
+    """Use the existing supervisor poll for bounded resource observation."""
+    now = time.time() if now is None else float(now)
+    identity = tuple(str(run.get(key) or "") for key in ("pid", "starttime", "command_hash"))
+    key = (str(Path(registry).resolve(strict=False)), str(run_id), identity)
+    raw_status = str(run.get("status") or "")
+    previous = _EXPERIMENT_OBSERVATION_POLL_CACHE.get(key)
+    if previous:
+        last_at, last_status, terminal = previous
+        if raw_status == last_status and (terminal or now - last_at < max(1.0, interval_seconds)):
+            return None
+    view = normalize_run(run_id, run, Path(registry), now=now)
+    terminal = view.get("liveness") != "working"
+    _EXPERIMENT_OBSERVATION_POLL_CACHE[key] = (now, raw_status, terminal)
+    return view
 
 
 def scan(index_path=None, identity_reader=proc_identity, now=None,

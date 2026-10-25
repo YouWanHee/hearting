@@ -306,6 +306,10 @@ class IsolatedRootMixin:
             "AGENT_DISPATCH_CHILD": "",
             "AGENT_DISPATCH_DEPTH": "",
         }
+        if self._testMethodName == "test_real_clear_handover_delivers_late_and_aggregate_records_from_the_original_store":
+            self._env_patch.update({"CODEX_THREAD_ID": "", "CODEX_SESSION_ID": "",
+                                    "AGENT_DISPATCH_CURRENT_HARNESS": "",
+                                    "AGENT_DISPATCH_CALLER_HARNESS": ""})
         self._saved_env = {k: os.environ.get(k) for k in self._env_patch}
         os.environ.update(self._env_patch)
         _log_fixture_env(
