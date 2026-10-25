@@ -466,6 +466,25 @@ class RegistryRegistrationTest(unittest.TestCase):
     def recipe(self, registry):
         return next(r for r in registry["recipes"] if r["capability"] == "route-frame")
 
+    def _assert_code_authoring_delta_and_restore_historical_scopes(self, recipes):
+        # Code-route PRD authoring intentionally changes these exact fields.
+        # Keep the historical baseline literals for every remaining field;
+        # capability_topology.test.py also pins the full current code recipe.
+        codes = [r for r in recipes if r["capability"] == "autopilot-code"]
+        self.assertEqual(len(codes), 1)
+        code = codes[0]
+        self.assertEqual(code["quick"]["write_scope"],
+                         ["source-scoped", "plans/<cycle>/**", "spec/**"])
+        self.assertEqual(code["quick"]["guard_preconditions"], ["artifact-order-prechecked"])
+        execute = next(n for n in code["standard_plus"]["nodes"] if n["id"] == "execute")
+        self.assertEqual(execute["write_scope"],
+                         ["source/**", "spec/**", "checklist.md", "dev_logs/**", "evidence/**"])
+        self.assertEqual(execute["guard_preconditions"], ["artifact-order-prechecked"])
+        code["quick"]["write_scope"].remove("spec/**")
+        del code["quick"]["guard_preconditions"]
+        execute["write_scope"].remove("spec/**")
+        del execute["guard_preconditions"]
+
     def test_the_internal_recipe_is_registered_with_the_smallest_surface(self):
         registry = self.registry()
         summary = CT.validate_registry(registry)
@@ -523,6 +542,7 @@ class RegistryRegistrationTest(unittest.TestCase):
         # No global table was added either: the only other keys are the two per-name tables.
         self.assertEqual(set(after) - set(FROZEN_GLOBAL_TABLE_DIGESTS), {"recipes", "completion_gate_contracts"})
         recipes = copy.deepcopy(after["recipes"][:FROZEN_RECIPE_COUNT])
+        self._assert_code_authoring_delta_and_restore_historical_scopes(recipes)
         for recipe in recipes:
             if recipe["capability"] == "autopilot-lab" and "setup" in recipe["modes"]:
                 self.assertEqual(recipe["promotion_signals"].count("gpu"), 1)
@@ -537,6 +557,7 @@ class RegistryRegistrationTest(unittest.TestCase):
 
     def test_other_capabilities_keep_their_registry_digest(self):
         registry = self.before_design_layout()
+        self._assert_code_authoring_delta_and_restore_historical_scopes(registry["recipes"])
         for recipe in registry["recipes"]:
             if recipe["capability"] == "autopilot-lab" and "setup" in recipe["modes"]:
                 self.assertEqual(recipe["promotion_signals"].count("gpu"), 1)
