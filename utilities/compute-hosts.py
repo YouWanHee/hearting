@@ -3086,7 +3086,6 @@ def cmd_run(args):
     return 0
 
 
-COMPLETION_WATCH_SECONDS = 14 * 24 * 3600
 COMPLETION_POLL_SECONDS = 60
 
 
@@ -3242,6 +3241,13 @@ def _spawn_completion_watch(run_dir, meta, *, environ=None, spawn=subprocess.Pop
 
 
 def cmd_watch_run(args, *, sleep=time.sleep, now=time.time):
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        if exc.status != "missing" and exc.status != "template":
+            raise
+    else:
+        _refuse_namespace_self(config, "watch-run")
     if not Path(args.run_dir).is_dir():
         return 0
     spec = importlib.util.spec_from_file_location(
@@ -3256,20 +3262,18 @@ def cmd_watch_run(args, *, sleep=time.sleep, now=time.time):
 
 def _watch_run(args, *, sleep=time.sleep, now=time.time):
     """Internal: observe the existing run and report once its exit is recorded."""
-    try:
-        config = load_config()
-    except ConfigError as exc:
-        if exc.status != "missing" and exc.status != "template":
-            raise
-    else:
-        _refuse_namespace_self(config, "watch-run")
     run_dir = Path(args.run_dir)
-    deadline = now() + COMPLETION_WATCH_SECONDS
     exit_path = run_dir / "exit_code"
     last_observation = None
-    while not exit_path.is_file():
-        if now() >= deadline or not run_dir.is_dir():
+    while True:
+        if not run_dir.is_dir():
             return 0
+        try:
+            code = int(exit_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            code = None
+        if code is not None:
+            break
         try:
             meta_live = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
             last_observation = _observe_compute_experiment(meta_live, run_dir, now()) or last_observation
@@ -3278,7 +3282,6 @@ def _watch_run(args, *, sleep=time.sleep, now=time.time):
         sleep(COMPLETION_POLL_SECONDS)
     try:
         meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
-        code = exit_path.read_text(encoding="utf-8").strip()
     except (OSError, ValueError):
         return 0
     if ((meta.get("provenance") or {}).get("resource") is not None):

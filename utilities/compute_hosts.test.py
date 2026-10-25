@@ -2970,6 +2970,22 @@ class CompletionWatchTest(unittest.TestCase):
             self.root / "artifacts", "here-1")
         self.assertEqual(record["status"], "finished")
 
+    def test_watch_outlives_old_deadline_and_waits_for_a_valid_exit_code(self):
+        module = load_module()
+        clock, calls, notices = [0.0], [], []
+        exit_file = self.run_dir / 'exit_code'
+        exit_file.write_text('')
+        def sleep(_seconds):
+            calls.append(True)
+            clock[0] += 8 * 86400
+            exit_file.write_text('partial' if len(calls) < 3 else '7\n')
+        with mock.patch('session_notice.notify', side_effect=lambda *a, **kw: notices.append(kw)):
+            module.cmd_watch_run(SimpleNamespace(run_dir=str(self.run_dir)), sleep=sleep, now=lambda: clock[0])
+        self.assertEqual(len(calls), 3)
+        completion = [notice for notice in notices if notice.get('subject') == 'compute run']
+        self.assertEqual(len(completion), 1)
+        self.assertIn('ended with exit 7', completion[0]['text'])
+
     def test_remote_observation_uses_only_declared_namespace_reverse_mapping(self):
         module = load_module()
         import resource_progress
