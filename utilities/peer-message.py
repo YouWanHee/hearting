@@ -1403,6 +1403,10 @@ def begin_pending_write(row, *, recipient=None, receipt=None, claimant=None):
                     and not _pending_target_matches(current, recipient))
                 or _registered_delivery_settled(current)):
             return None
+        if (current.get("producer_binding") or {}).get("schema") == _SESSION_NOTICE_PRODUCER_SCHEMA:
+            from peer_obligations import session_notice_delivery_current
+            if not session_notice_delivery_current(current):
+                return None
         updated = dict(current, state="unverified", receipt=receipt or claim.get("receipt")
                        or "delivery-inflight")
         _save_pending(updated)
@@ -1520,6 +1524,10 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             current = _read_pending(ref)
             if not current or current["state"] == "received" or (current.get("rpc_claim") or {}).get("token") != token:
                 raise QueueDeliveryError("peer-claim-changed-before-add")
+            if (current.get("producer_binding") or {}).get("schema") == _SESSION_NOTICE_PRODUCER_SCHEMA:
+                from peer_obligations import session_notice_delivery_current
+                if not session_notice_delivery_current(current):
+                    raise QueueDeliveryError("peer-notice-recipient-changed-before-add")
             _save_pending(dict(current, state="unverified", receipt="native-queue-inflight"))
 
     error = None

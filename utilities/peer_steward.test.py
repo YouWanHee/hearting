@@ -10513,6 +10513,100 @@ class SessionNoticeIntegrationCorrectionTest(_TmpRootMixin, unittest.TestCase):
                 peer_steward.peer_message.prepare_peer_message("notice", sender, recipient, defer=True,
                     refs=selected_refs, producer_binding=binding)
 
+    def test_last_native_guard_rechecks_notice_before_the_first_write(self):
+        import dispatch_pending_delivery as pending
+        n = self.notice()
+        self.edge("claude", "A", "B")
+        guards = []
+        def guard(*args, **kwargs):
+            guards.append(True)
+            if len(guards) == 2:
+                self.edge("claude", "B", "C")
+            return None, {}
+        with self.transport() as native, \
+             mock.patch.object(peer_steward, "_claude_idle_prompt_guard", side_effect=guard):
+            peer_steward._resume_session_notice_obligations(self.duties(), self.store())
+        self.assertEqual(len(guards), 2)
+        native.assert_not_called()
+        # Preparation already happened: retain the frozen transfer and never
+        # turn the refused first write into authority for a replacement send.
+        ref = self.duties()[0]["observation"]["transfer_ref"]
+        transfer = peer_steward.peer_message._read_pending(ref)
+        self.assertEqual((transfer["state"], transfer["to"]["session_id"]), ("pending", "B"))
+        self.assertEqual(pending.read(self.tmp_root, "A", n["delivery_id"])["state"], "sent-ambiguous")
+
+    def prepared_notice(self, harness, old, current, key):
+        import dispatch_pending_delivery as pending
+        n = self.notice(harness, old, key)
+        self.edge(harness, old, current)
+        duty = next(d for d in self.duties() if d["intent"]["identity"]["storage_sid"] == old)
+        owner = "retained-rewake:" + duty["id"]
+        pending.claim(self.tmp_root, old, n["delivery_id"], claim_owner=owner,
+                      lease_seconds=1, require_generation_proof=False, jobs=self.jobs_path)
+        recipient = {"harness": harness, "session_id": current}
+        producer = {"schema": "session-notice-runtime-v1", "duty_id": duty["id"],
+            "jobs": str(self.jobs_path), "records": [{"duty_id": duty["id"], "storage_sid": old,
+                "delivery_id": n["delivery_id"], "receipt_digest": n["receipt_digest"]}],
+            "recipient": recipient}
+        text, ref = peer_steward.peer_message.prepare_peer_message("frozen notice",
+            {"harness": "runtime", "session_id": None, "name": "Hearting runtime"}, recipient,
+            defer=True, refs=[duty["id"], n["delivery_id"]], producer_binding=producer)
+        pending.mark_sent_ambiguous(self.tmp_root, old, n["delivery_id"], claim_owner=owner)
+        self.store().update(duty["id"], observation={"transfer_ref": ref})
+        return n, ref, recipient
+
+    def test_deferred_claude_and_opencode_notice_writes_recheck_current_authority(self):
+        import dispatch_pending_delivery as pending
+        for harness in ("claude", "opencode"):
+            for move in (False, True):
+                with self.subTest(harness=harness, move=move):
+                    old, current, end = (harness + "-A-" + str(move), harness + "-B-" + str(move),
+                                         harness + "-C-" + str(move))
+                    n, ref, recipient = self.prepared_notice(harness, old, current, old)
+                    record = pending.read(self.tmp_root, old, n["delivery_id"])
+                    with mock.patch.object(pending.time, "monotonic_ns",
+                                           return_value=record["claim_deadline_ns"] + 1):
+                        reserved = peer_steward.peer_message.reserve_pending_herdr(ref, recipient)
+                        self.assertIsNotNone(reserved)
+                        if move:
+                            self.edge(harness, current, end)
+                        writing = peer_steward.peer_message.begin_pending_write(reserved, recipient=recipient)
+                    self.assertEqual(writing is None, move)
+                    if move:
+                        peer_steward.peer_message.release_pending_herdr_claim(reserved)
+                        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "pending")
+                    else:
+                        self.assertEqual(writing["state"], "unverified")
+                        self.assertIsNone(peer_steward.peer_message.begin_pending_write(
+                            reserved, recipient=recipient), "an unverified first write is never repeated")
+                    self.assertEqual(pending.read(self.tmp_root, old, n["delivery_id"]), record)
+
+    def test_peer_codex_before_add_rechecks_lineage_after_native_observation(self):
+        import codex_queue_delivery
+        import codex_queue_dispatch
+        import dispatch_pending_delivery as pending
+        for move in (False, True):
+            with self.subTest(move=move):
+                old, current, end = "queue-A-" + str(move), "queue-B-" + str(move), "queue-C-" + str(move)
+                n, ref, recipient = self.prepared_notice("codex", old, current, old)
+                added = []
+                def send(*args, **kwargs):
+                    if kwargs["allow_add"]:
+                        if move:
+                            self.edge("codex", current, end)
+                        kwargs["before_add"]()
+                        added.append(kwargs["thread_id"])
+                    return {"status": "queued"}
+                with mock.patch.object(codex_queue_dispatch, "resolve_queue_socket",
+                                       return_value=Path("/tmp/unused-fake-queue.sock")), \
+                     mock.patch.object(codex_queue_delivery, "send_at_least_once", side_effect=send):
+                    result = peer_steward.peer_message.deliver_pending_codex(ref)
+                    if not move:
+                        peer_steward.peer_message.deliver_pending_codex(ref)
+                self.assertEqual(added, [] if move else [current])
+                self.assertEqual(result["status"], "unverified" if move else "queued")
+                self.assertEqual(pending.read(self.tmp_root, old, n["delivery_id"])["state"], "sent-ambiguous")
+
     def test_route_free_missing_registry_delivers_receives_and_acks_original_identity(self):
         import dispatch_pending_delivery as pending
         self.jobs_path.unlink()  # This fixture's empty registry only.

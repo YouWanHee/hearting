@@ -1112,22 +1112,32 @@ def _session_notice_delivery_bindings(message, roots=None, *, received_only=Fals
         return
 
 
-def session_notice_submission_current(message):
-    """Fresh authority for a new notice transfer, using its existing duty binding.
-
-    Historical prepared transfers and receipts use the immutable binding reader
-    directly; a later lineage change cannot erase their receipt evidence.
-    """
+def _current_session_notice_bindings(message):
+    """Current authority for a new write; historical receipts use the immutable reader."""
+    import dispatch_pending_delivery as pending
     from dispatch_seat_handover import record_recipient
     binding = message.get("producer_binding") or {}
     recipient = message.get("to") or {}
     matches = list(_session_notice_delivery_bindings(message))
-    if not matches or len(matches) != len(binding.get("records") or ()):
-        return False
-    return all(record.get("state") == "claimed"
+    if (not matches or len(matches) != len(binding.get("records") or ())
+            or any(record.get("state") not in pending.OPEN_STATES
+                   or record_recipient(record, storage, harness=recipient.get("harness"))
+                      != recipient.get("session_id")
+                   for _store, _duty, record, _root, storage, _delivery in matches)):
+        return []
+    return matches
+
+
+def session_notice_delivery_current(message):
+    """Recheck a prepared notice immediately before its existing transport's first write."""
+    return bool(_current_session_notice_bindings(message))
+
+
+def session_notice_submission_current(message):
+    """A new transfer additionally requires the existing courier's current claim."""
+    matches = _current_session_notice_bindings(message)
+    return bool(matches) and all(record.get("state") == "claimed"
                and record.get("claim_owner") == "retained-rewake:" + duty["id"]
-               and record_recipient(record, storage, harness=recipient.get("harness"))
-                   == recipient.get("session_id")
                for _store, duty, record, _root, storage, _delivery in matches)
 
 
