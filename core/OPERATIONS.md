@@ -2063,6 +2063,10 @@ row uses the existing stalled-age warning rather than forcing fresh-age or
 basis explanations onto it. Original phase/metric names are preserved, and
 combined arm totals, ETA, speed and epoch-mean loss are not inferred.
 
+Detached training, CPU scoring, and inference receive declaration-free checkpoints
+from fixed metric paths: first min(10% plan, 2h), then 25/50/75% or 12h; without a
+plan, 2h then 12h. Missing data is explicit; exit, sentinel, and approval stay unchanged.
+
 `run` and GPU `resource-runner start` automatically reserve their devices in
 one host-local `gpu-leases.json` beside the canonical dispatch registry. All
 launchers targeting that host share the same locked selection and publication;
@@ -2763,9 +2767,9 @@ directly); `SendMessage` is secondary.
 `state=armed` line carrying the next-action field `parent_next` (§5.10a).
 The exact server/pane/session obligation remains stored when a bounded observer
 times out, loses herdr, or exits; the existing startup/reconnect path replaces
-only that observer and continues the same watch id. `join`/`status`/`ack` report
-the stored obligation and its current observation; a fulfilled duty may be
-followed by an explicit new watch. A tab is a location hint, not identity.
+only that observer under its existing claim, publishing its identity and generation
+before reporting reattachment. `join`/`status`/`ack` report the stored duty and
+observation; a fulfilled duty allows a new watch. A tab is a location hint, not identity.
 The existing obligation runner may share a narrow, target-bound readiness
 observation across watchers after their native results arrive. Each watcher
 retains its own native result, deadline, receipt, and ack; the shared observation

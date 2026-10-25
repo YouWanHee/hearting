@@ -629,7 +629,10 @@ def append_job(jobs: Path, args: argparse.Namespace, *, harness: str, runtime_sa
     pipe += workflow_completion_receipt(args)
     settings = args.resolved_model_settings
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
-        pipe += f",{key}={value}"
+        # The resolved selection below owns model_source. A diversity receipt
+        # also describes it, but appending both poisons later registry writes.
+        if key != "model_source":
+            pipe += f",{key}={value}"
     pipe += (
         f",model_source={settings['source']},model_role={settings['role']}"
         f",model_profile={settings['profile']},model_tier={settings['tier']}"

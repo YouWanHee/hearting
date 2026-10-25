@@ -11321,6 +11321,24 @@ def _updated_attempt_metadata(
     return ",".join(retained)
 
 
+def _settlement_metadata_pipe(pipe: str, values: dict[str, str]) -> str:
+    """Retire the known duplicated provenance without repairing authority seals."""
+    parts = pipe.split(",")
+    sources = [part for part in parts if part.startswith("model_source=")]
+    if (values.get("note", "").startswith("dead-")
+            and len(sources) > 1 and len(set(sources)) == 1):
+        seen = False
+        retained = []
+        for part in parts:
+            if part.startswith("model_source="):
+                if seen:
+                    continue
+                seen = True
+            retained.append(part)
+        pipe = ",".join(retained)
+    return pipe
+
+
 def close_attempt_row(
     jobs: Path,
     attempt_id: str,
@@ -11359,7 +11377,7 @@ def close_attempt_row(
             values.update(_delivery_intent_values(fields, {**metadata, **values}))
             try:
                 fields[5] = _updated_attempt_metadata(
-                    fields[5], values, terminal=True
+                    _settlement_metadata_pipe(fields[5], values), values, terminal=True
                 )
             except DispatchContractError:
                 return False
@@ -11764,6 +11782,7 @@ def close_attempt_row_if(
     *,
     evidence: dict[str, str] | None = None,
     teardown_claim: str | None = None,
+    write_error: dict[str, str] | None = None,
 ) -> bool:
     """Revalidate and close one exact attempt inside the SD-49 lock.
 
@@ -11771,8 +11790,11 @@ def close_attempt_row_if(
     heartbeat evidence.  A read-then-``close_attempt_row`` sequence leaves a
     race between the decision and mutation.  This primitive re-reads the row
     and invokes the caller's safety predicate while the canonical registry is
-    locked; a changed or newly-live row is therefore left untouched.
+    locked; a changed or newly-live row is therefore left untouched. An optional
+    write_error distinguishes terminal metadata failures from a safety veto.
     """
+    if write_error is not None:
+        write_error.clear()
     if not attempt_id or not note:
         raise DispatchContractError("attempt-close-invalid", "attempt_id and note are required")
     ensure_global_registry_writable(jobs)
@@ -11822,9 +11844,11 @@ def close_attempt_row_if(
         values.update(_delivery_intent_values(fields, {**metadata, **values}))
         try:
             fields[5] = _updated_attempt_metadata(
-                fields[5], values, terminal=True
+                _settlement_metadata_pipe(fields[5], values), values, terminal=True
             )
-        except DispatchContractError:
+        except DispatchContractError as exc:
+            if write_error is not None:
+                write_error.update(reason=exc.reason, detail=exc.detail)
             return False
         lines[index] = "\t".join(fields)
         _atomic_registry_replace(jobs, lines)
