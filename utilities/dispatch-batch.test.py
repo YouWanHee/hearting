@@ -487,7 +487,7 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual(error.exception.reason, 'replacement-batch-source-drift')
         path.write_text(json.dumps(payload))
 
-    def test_sd160_capacity_ratios_choose_healthy_same_harness_personas(self):
+    def test_capacity_ratios_choose_distinct_healthy_personas(self):
         for strategy in ("balanced", "capacity-aware"):
             for headroom in (71, 77):
                 with self.subTest(strategy=strategy, headroom=headroom):
@@ -870,6 +870,222 @@ class DispatchBatchTest(unittest.TestCase):
             retry_prompt="Continue the authorized gap.", sealed=True,
             parent_attempt="att-corrected-owner",
         )
+
+    def _write_unstarted(self, leg, all_legs):
+        """A terminal row with the strict never-started proof (no claim, pid or start)."""
+        self.write_existing(leg, status="done", claimed="0", all_legs=all_legs,
+                            note="dead-opencode-context-limit-unavailable")
+        self.jobs.write_text(self.jobs.read_text(encoding="utf-8").replace(
+            "note=dead-opencode-context-limit-unavailable\n",
+            "launch_outcome=never-launched,note=dead-opencode-context-limit-unavailable\n"),
+            encoding="utf-8")
+
+    def test_conflicted_no_start_is_not_discovered_as_a_replacement_gap(self):
+        import base64
+        from dispatch_replacement_batch import seal_launch_input
+        legs = self.legs()
+        manifest, _continuation, partial = self.partial_continuation(legs)
+        _checked, digest, _leg_digests = BATCH.verify_manifest(manifest)
+        args = SimpleNamespace(continuation=None, route=self.route_path, parallel_group="plan",
+            slug_prefix="fixture", parent="owner", prompt_text=BATCH.DEFAULT_PROMPT,
+            qa=None, log_dir=None, allow_degraded_independence=False)
+        seal_launch_input(self.jobs, args, self.route, manifest, digest)
+        peer, gap = legs
+        self.write_existing(peer, status="done", note="completed-marker", all_legs=legs)
+        self._write_unstarted(gap, legs)
+        original = self.jobs.read_text()
+        for reviewed in (False, True):
+            history = {"late-result": {"note": "completed-marker", "failure_class": "pass"}}
+            if reviewed:
+                history["late-result"]["review_sha256"] = "f" * 64
+            encoded = base64.b64encode(json.dumps(history).encode()).decode()
+            lines = []
+            for line in original.splitlines():
+                if f"attempt_id={gap['attempt_id']}" in line:
+                    line += f",terminal_conflict=1,terminal_conflicts_b64={encoded}"
+                lines.append(line)
+            self.jobs.write_text("\n".join(lines) + "\n")
+            before = self.jobs.read_bytes()
+            with mock.patch.object(BATCH.ROUTE_MODULE, "partial_group_continuation",
+                                   return_value=partial) as create:
+                self.assertEqual(BATCH.discover_unstarted_partial_group(
+                    self.jobs, self.route, self.route["nodes"], "plan"), (None, None))
+            create.assert_not_called()
+            self.assertEqual(self.jobs.read_bytes(), before)
+
+    def _unstarted_successor_fixture(self, successors=1):
+        """Peer PASS + gap G0 never started + `successors` sealed successors that never started."""
+        for node in self.route["nodes"]:
+            node["fallback_hops"] = [*node["fallback_hops"],
+                                     candidate("opencode", "cross-harness-headless", 3)]
+        source_legs = self.legs()
+        source_manifest, continuation, partial = self.partial_continuation(source_legs)
+        partial = dict(partial, continuation_id=continuation["continuation_id"])
+        peer, gap = source_legs
+        self.write_existing(peer, status="done", note="completed-marker", all_legs=source_legs)
+        self._write_unstarted(gap, source_legs)
+        source, digest, leg_digests = BATCH.verify_manifest(source_manifest)
+        seal = BATCH.prepare_partial_replacement(
+            self.jobs, self.route, partial, source, digest, leg_digests, apply=True)
+        self._write_unstarted(dict(gap, attempt_id=seal["replacement_attempt_id"]),
+                              [peer, dict(gap, attempt_id=seal["replacement_attempt_id"])])
+        placements = [("opencode", "cross-harness-headless", 3), ("codex", "same-harness-headless", 1)]
+        for placement in placements[:successors - 1]:
+            lineage = BATCH.partial_gap_lineage(self.jobs, partial)
+            later = BATCH.prepare_partial_replacement(
+                self.jobs, self.route, partial, source, digest, leg_digests, apply=True,
+                lineage=lineage, gap_assignment=placement)
+            moved = dict(gap, attempt_id=later["replacement_attempt_id"], adapter=placement[0],
+                         hop=placement[1], ordinal=placement[2])
+            if placement[0] != peer["adapter"]:
+                self._write_unstarted(moved, [peer, moved])
+                continue
+            # Same family as the peer: only the never-started row shape matters
+            # to the lineage, so record it without a cross-harness manifest.
+            with self.jobs.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"2026-07-24T00:00:00Z\tdone\t{self.base}\t{self.base}\t{moved['slug']}\t"
+                    f"attempt_schema_version=2,route_id={self.route['route_id']},"
+                    f"route_node={moved['node']},harness={moved['adapter']},"
+                    f"batch_harness={moved['adapter']},attempt_id={moved['attempt_id']},"
+                    "launch_claimed=0,launch_fence=registry-v1,launch_outcome=never-launched,"
+                    "note=dead-opencode-context-limit-unavailable\n")
+        return source_manifest, continuation, partial, seal
+
+    def _run_partial_main(self, continuation, partial, parent_attempt="att-parent-fixture"):
+        argv = self.argv() + ["--continuation", str(self.base / "continuation.json")]
+        output = io.StringIO()
+        created = []
+
+        class FakeProcess:
+            returncode = 0
+            pid = 10001
+
+            def __init__(self, command, **kwargs):
+                self.command = command
+                created.append(self)
+
+            def communicate(self):
+                return success_receipt(self.command), ""
+
+        real_assign = BATCH.assign_harnesses
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(BATCH, "load_route", return_value=self.route))
+            stack.enter_context(mock.patch.object(
+                BATCH, "load_partial_continuation", return_value=(continuation, partial)))
+            stack.enter_context(mock.patch.object(
+                BATCH, "revalidate_partial_peers", return_value=partial["realized_peer_set"]))
+            stack.enter_context(mock.patch.object(
+                BATCH.DISPATCH_NODE, "resolve_checked_tuple", side_effect=resolve_side_effect))
+            assign = stack.enter_context(mock.patch.object(
+                BATCH, "assign_harnesses", side_effect=real_assign))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_agent_home", return_value=self.base))
+            stack.enter_context(mock.patch.object(
+                BATCH, "resolve_global_registry", return_value=SimpleNamespace(path=self.jobs)))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_live_parent_attempt"))
+            stack.enter_context(mock.patch.object(BATCH, "completion_marker_gate"))
+            stack.enter_context(mock.patch.object(
+                BATCH.subprocess, "check_output", return_value=str(self.base)))
+            reserve = stack.enter_context(mock.patch.object(
+                BATCH, "reserve_batch", return_value=["b" * 32]))
+            stack.enter_context(mock.patch.object(BATCH, "cancel_unclaimed"))
+            popen = stack.enter_context(mock.patch.object(
+                BATCH.subprocess, "Popen", side_effect=FakeProcess))
+            stack.enter_context(mock.patch.dict(os.environ, {
+                "AGENT_DISPATCH_SELF_SLUG": "owner",
+                "AGENT_DISPATCH_ATTEMPT_ID": parent_attempt,
+                "AGENT_DISPATCH_CURRENT_HARNESS": "codex",
+                "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
+                "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write",
+            }))
+            with mock.patch("dispatch_capacity_evidence.active_limits", return_value={}), \
+                    contextlib.redirect_stdout(output):
+                rc = BATCH.main(argv)
+        return rc, json.loads(output.getvalue()), reserve, popen, assign
+
+    def test_unstarted_successor_moves_only_the_gap_to_another_harness(self):
+        _manifest, continuation, partial, seal = self._unstarted_successor_fixture()
+        peer_row = self.jobs.read_text(encoding="utf-8").splitlines()[0]
+        rc, receipt, reserve, popen, assign = self._run_partial_main(continuation, partial)
+        self.assertEqual(rc, 0, receipt)
+        expected = BATCH.partial_successor_attempt_id(partial, seal["replacement_attempt_id"], 2)
+        pending = reserve.call_args.args[2]
+        self.assertEqual([(leg["node"], leg["adapter"], leg["attempt_id"]) for leg in pending],
+                         [(partial["gap_leg_id"], "opencode", expected)])
+        self.assertEqual(assign.call_args.kwargs["excluded"], {partial["gap_leg_id"]: {"claude"}})
+        self.assertEqual(assign.call_args.kwargs["fixed"],
+                         {"plan": ("codex", "same-harness-headless", 1)})
+        step = json.loads(BATCH._partial_seal_path(self.jobs, partial, 2).read_text())
+        self.assertEqual((step["replacement_attempt_id"], step["replacement_harness"],
+                          step["predecessor_attempt_id"], step["excluded_harnesses"]),
+                         (expected, "opencode", seal["replacement_attempt_id"], ["claude"]))
+        self.assertEqual(receipt["legs"][0]["reason"], "reused-successful-peer")
+        self.assertIn(peer_row, self.jobs.read_text(encoding="utf-8").splitlines())
+        # A repeated start by a replacement owner reuses the sealed placement
+        # and identity instead of placing the gap again.
+        rc, receipt, reserve, popen, assign = self._run_partial_main(
+            continuation, partial, parent_attempt="att-replacement-owner")
+        self.assertEqual(rc, 0, receipt)
+        assign.assert_not_called()
+        self.assertEqual([(leg["adapter"], leg["attempt_id"]) for leg in reserve.call_args.args[2]],
+                         [("opencode", expected)])
+
+    def test_unstarted_successor_with_no_remaining_harness_is_refused(self):
+        _manifest, continuation, partial, _seal = self._unstarted_successor_fixture(successors=3)
+        rc, receipt, reserve, popen, _assign = self._run_partial_main(continuation, partial)
+        self.assertNotEqual(rc, 0, receipt)
+        self.assertEqual(receipt["reason"], "parallel-headless-unavailable", receipt)
+        reserve.assert_not_called(); popen.assert_not_called()
+        self.assertFalse(BATCH._partial_seal_path(self.jobs, partial, 4).exists())
+
+    def test_partial_gap_lineage_stops_at_a_successor_that_launched(self):
+        _manifest, _continuation, partial, seal = self._unstarted_successor_fixture()
+        self.assertEqual(BATCH.partial_gap_lineage(self.jobs, partial)["step"], 2)
+        self.jobs.write_text(self.jobs.read_text(encoding="utf-8").replace(
+            f"attempt_id={seal['replacement_attempt_id']},launch_claimed=0",
+            f"attempt_id={seal['replacement_attempt_id']},launch_claimed=1"), encoding="utf-8")
+        lineage = BATCH.partial_gap_lineage(self.jobs, partial)
+        self.assertEqual((lineage["step"], lineage["seal"]["replacement_attempt_id"]),
+                         (1, seal["replacement_attempt_id"]))
+
+    def test_governor_accepts_only_a_sealed_successor_placement(self):
+        governor_spec = importlib.util.spec_from_file_location(
+            "_lineage_governor", ROOT / "utilities" / "model-worker-governor.py")
+        governor = importlib.util.module_from_spec(governor_spec)
+        governor_spec.loader.exec_module(governor)
+        source_manifest, continuation, partial, seal = self._unstarted_successor_fixture()
+        source, digest, leg_digests = BATCH.verify_manifest(source_manifest)
+        placement = ("opencode", "cross-harness-headless", 3)
+        step = BATCH.prepare_partial_replacement(
+            self.jobs, self.route, partial, source, digest, leg_digests, apply=True,
+            lineage=BATCH.partial_gap_lineage(self.jobs, partial), gap_assignment=placement)
+
+        def replacement(harness, hop, ordinal, attempt):
+            members = [dict(member) for member in source["members"]]
+            gap = next(m for m in members if m["route_node"] == partial["gap_leg_id"])
+            gap.update(attempt_id=attempt, harness=harness, fallback_hop=hop,
+                       fallback_ordinal=ordinal)
+            manifest, manifest_digest, _ = BATCH.build_manifest(
+                parallel_group="plan", route_id=self.route["route_id"],
+                parent_attempt_id="att-parent-fixture", independence="cross-harness",
+                members=members,
+                required_independence_axes=source["required_independence_axes"],
+                realized_independence_axes=source["realized_independence_axes"])
+            return manifest, manifest_digest
+
+        peers = [{"jobs": str(self.jobs)}]
+        manifest, manifest_digest = replacement(*placement, step["replacement_attempt_id"])
+        governor._validate_partial_replacement(
+            manifest, manifest_digest, source_manifest, continuation, step, peers)
+        excluded, excluded_digest = replacement(
+            "claude", "cross-harness-headless", 2, step["replacement_attempt_id"])
+        with self.assertRaisesRegex(ValueError, "successor placement invalid"):
+            governor._validate_partial_replacement(
+                excluded, excluded_digest, source_manifest, continuation, step, peers)
+        # Without a sealed successor step the old shape rule still holds.
+        with self.assertRaisesRegex(ValueError, "member drift"):
+            governor._validate_partial_replacement(
+                manifest, manifest_digest, source_manifest, continuation, seal, peers)
 
     def _partial_continuation_launch(self, *, retry_prompt=None, sealed=False,
                                     parent_attempt="att-parent-fixture", original_prompt=None):
@@ -1286,7 +1502,7 @@ class DispatchBatchTest(unittest.TestCase):
                 BATCH.replica_nodes(altered, "plan")
             self.assertEqual(ctx.exception.reason, reason)
 
-    def test_assignment_honors_declared_affinity_without_diversity_override(self):
+    def test_assignment_honors_declared_affinity_with_distinct_harnesses(self):
         with mock.patch.object(
             BATCH.DISPATCH_NODE, "resolve_checked_tuple", side_effect=resolve_side_effect
         ):
@@ -1297,7 +1513,7 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual([row[1] for row in rows], ["codex", "claude"])
         self.assertEqual(diagnostics["degradation_cause"], "")
 
-    def test_assignment_uses_recent_counts_to_share_parallel_legs_across_three(self):
+    def test_assignment_uses_distinct_families_when_multiple_are_eligible(self):
         route = json.loads(json.dumps(self.route))
         route["dispatch_allocation"] = {
             "strategy": "least-recent-attempts",
@@ -1325,7 +1541,8 @@ class DispatchBatchTest(unittest.TestCase):
                 route, route["nodes"], allow_degraded=False, jobs=self.jobs
             )
         self.assertEqual(independence, "persona")
-        self.assertEqual({row[1] for row in rows}, {"claude"})
+        self.assertEqual(len({row[1] for row in rows}), 2)
+        self.assertEqual(diagnostics["independence_axes"], ["persona", "harness"])
 
     def test_capacity_aware_batch_preserves_primary_quality_band(self):
         route = json.loads(json.dumps(self.route))
@@ -1354,7 +1571,7 @@ class DispatchBatchTest(unittest.TestCase):
                 route, route["nodes"], allow_degraded=False, jobs=self.jobs
             )
         self.assertEqual(independence, "persona")
-        self.assertEqual({row[1] for row in rows}, {"codex"})
+        self.assertEqual({row[1] for row in rows}, {"claude", "codex"})
 
     def _depth_affinity_route(self, strategy, *, weight=1.0, same_band=False,
                               affinity=True):
@@ -1410,7 +1627,7 @@ class DispatchBatchTest(unittest.TestCase):
             route, {"claude": 70.0, "codex": 80.0, "opencode": 60.0}
         )
         self.assertEqual(independence, "persona")
-        self.assertEqual({row[1] for row in rows}, {"codex"})
+        self.assertEqual({row[1] for row in rows}, {"claude", "codex"})
         # codex is now gated (headroom 10 <= 100-90); an ungated combination exists.
         rows, independence, _diag = self._assign(
             route, {"claude": 70.0, "codex": 10.0, "opencode": 60.0}
@@ -1437,9 +1654,9 @@ class DispatchBatchTest(unittest.TestCase):
                     self._depth_affinity_route(strategy, weight=0.65, same_band=True),
                     scores,
                 )
-                self.assertEqual({row[1] for row in without}, {"claude"})
+                self.assertEqual({row[1] for row in without}, {"claude", "opencode"})
                 self.assertEqual({row[1] for row in with_affinity},
-                                 {"codex"} if strategy == "balanced" else {"claude", "codex"})
+                                 {"claude", "codex"})
 
     def test_capacity_aware_depth_affinity_stops_outside_the_margin(self):
         """Weight 0.65 is a 30-point margin. codex trails the best gauge by 15
@@ -1454,13 +1671,13 @@ class DispatchBatchTest(unittest.TestCase):
         outside, _i, _d = self._assign(
             route, {"claude": 95.0, "codex": 55.0, "opencode": 60.0}
         )
-        self.assertEqual({row[1] for row in outside}, {"claude"})
+        self.assertEqual({row[1] for row in outside}, {"claude", "opencode"})
         # An unknown gauge is excluded by capacity-aware and cannot be hoisted
         # by a preference either -- the same rule, one oracle.
         unknown, _i, _d = self._assign(
             route, {"claude": 70.0, "codex": None, "opencode": 60.0}
         )
-        self.assertEqual({row[1] for row in unknown}, {"claude"})
+        self.assertEqual({row[1] for row in unknown}, {"claude", "opencode"})
 
     def test_balanced_batch_avoids_a_usage_gated_harness(self):
         # 2026-08-20 artifact-knowledge-index gen-1/gen-2: under balanced
@@ -1490,7 +1707,7 @@ class DispatchBatchTest(unittest.TestCase):
                 route, route["nodes"], allow_degraded=False, jobs=self.jobs
             )
         self.assertEqual(independence, "persona")
-        self.assertEqual({row[1] for row in rows}, {"claude"})
+        self.assertEqual({row[1] for row in rows}, {"claude", "opencode"})
 
     def test_balanced_batch_gate_outranks_the_quality_band(self):
         # B-1 framing's parallel falsifier: the gate must outrank aggregate
@@ -1863,7 +2080,7 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual(diagnostics["degradation_cause"], "")
         self.assertEqual(set(diagnostics["usable_families"]), {"codex", "claude"})
 
-    def test_single_usable_family_keeps_exclusion_diagnostics_without_degradation(self):
+    def test_single_usable_family_records_degradation_with_exclusion_diagnostics(self):
         # assign_harnesses is side-effect free (G2): it never writes the
         # ledger itself. Persistence is exercised separately by
         # test_persist_degradation_forwards_route_and_reason_fields and
@@ -1882,8 +2099,8 @@ class DispatchBatchTest(unittest.TestCase):
             "codex": ["dispatch-evidence-candidate-unsupported"],
             "opencode": ["dispatch-evidence-no-eligible-fallback"],
         })
-        self.assertEqual(diagnostics["degradation_cause"], "")
-        self.assertNotIn("degradation_detail", diagnostics)
+        self.assertEqual(diagnostics["degradation_cause"], "single-usable-family")
+        self.assertIn("degradation_detail", diagnostics)
 
     def test_single_usable_family_without_the_flag_is_normal(self):
         nodes = [single_family_node("plan"), single_family_node("plan-replica")]
@@ -1894,7 +2111,7 @@ class DispatchBatchTest(unittest.TestCase):
             rows, independence, diagnostics = BATCH.assign_harnesses(route, nodes, allow_degraded=False)
         self.assertEqual(independence, "persona")
         self.assertEqual({row[1] for row in rows}, {"claude"})
-        self.assertEqual(diagnostics["degradation_cause"], "")
+        self.assertEqual(diagnostics["degradation_cause"], "single-usable-family")
         self.assertEqual(diagnostics["family_exclusions"]["codex"],
                          ["dispatch-evidence-candidate-unsupported"])
 
@@ -3312,6 +3529,14 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertTrue(stderr.rstrip().endswith("ERR"))
 
     def _subdivision_route_and_manifest(self, sessions):
+        # The admission baseline and aggregate audit model a sealed Git route;
+        # give this fixture a real HEAD so strict Git-observation failures stay
+        # distinct from an empty/non-Git test folder.
+        subprocess.run(["git", "-C", str(self.base), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(self.base), "config", "user.email", "fixture@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.base), "config", "user.name", "Fixture"], check=True)
+        subprocess.run(["git", "-C", str(self.base), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.base), "commit", "-q", "--allow-empty", "-m", "fixture"], check=True)
         node = dict(replica_node("plan", "codex"))
         node["completion_gate"] = "code-plan-check"
         node["subdivision"] = {
@@ -3321,6 +3546,8 @@ class DispatchBatchTest(unittest.TestCase):
         node2 = dict(replica_node("plan-replica", "claude"))
         node2["completion_gate"] = "code-plan-check"
         route = dict(self.route)
+        route["source_commit"] = subprocess.check_output(
+            ["git", "-C", str(self.base), "rev-parse", "HEAD"], text=True).strip()
         route["nodes"] = [node, node2]
         for session in sessions:
             Path(session["phase_brief"]).write_text("slice brief\n", encoding="utf-8")
@@ -3519,6 +3746,70 @@ class DispatchBatchTest(unittest.TestCase):
         rc, out = self._subdivision_dry_run(route, manifest_path)
         self.assertNotEqual(rc, 0)
         self.assertIn("subdivision-manifest-session-count-mismatch", out)
+
+
+class CompiledStrongGroupPlacementTest(unittest.TestCase):
+    def test_compiled_strong_width_two_groups_choose_distinct_harnesses(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            repo = base / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "fixture@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
+            (repo / "README.md").write_text("compiled strong route\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+
+            artifact_root = base / ".agent_reports"
+            artifact_root.mkdir()
+            jobs = base / "jobs.log"
+            evidence_path = base / "dispatch-evidence.json"
+            evidence_path.write_text(json.dumps({
+                "tuples": [
+                    {
+                        "parent_harness": "codex", "parent_transport": "headless",
+                        "parent_sandbox": "workspace-write", "child_harness": child,
+                        "launch_authority": "conductor", "status": "supported",
+                        "probe_source": "integration-fixture", "probe_time": "2026-07-24T00:00:00Z",
+                        "failure_class": "", "checked_worktree": str(repo.resolve()),
+                        "failure_scope": "none",
+                        "codex_command": "ok" if child == "codex" else "not-applicable",
+                        "retry_on_isolated_worktree": 0,
+                    }
+                    for child in ("codex", "claude", "opencode")
+                ],
+                "native_subagent": [],
+            }, sort_keys=True), encoding="utf-8")
+            env = {
+                **{key: value for key, value in os.environ.items()
+                   if not key.startswith(("AGENT_DISPATCH_", "AGENT_OWNER_ROUTE_", "AGENT_ROUTE_", "AGENT_ARTIFACT_"))},
+                "AGENT_HOME": str(ROOT), "AGENT_DISPATCH_JOBS": str(jobs),
+            }
+            compiled = subprocess.run([
+                sys.executable, str(ROOT / "utilities" / "capability-route.py"),
+                "compile", "--slug", "strong-placement", "--capability", "autopilot-code",
+                "--capability-mode", "dev", "--intensity", "strong", "--cwd", str(repo),
+                "--artifact-root", str(artifact_root), "--signal", "shared-contract",
+                "--transport", "headless", "--tracking", "tracked",
+                "--dispatch-evidence", str(evidence_path), "--spec-read", "integration-fixture",
+                "--drift-verdict", "within-spec", "--workflow-mode", "tracked",
+                "--artifact-guard", "integration-fixture",
+            ], text=True, capture_output=True, check=False, env=env)
+            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+            route = json.loads(compiled.stdout)
+            parent = {
+                "parent_harness": "codex", "parent_transport": "headless",
+                "parent_sandbox": "workspace-write",
+            }
+            for group in ("plan", "plan-check", "impl-review"):
+                nodes = [node for node in route["nodes"]
+                         if (node.get("parallel_group") or node.get("replica_group")) == group]
+                self.assertEqual(len(nodes), 2, group)
+                assignments, _independence, _diagnostics = BATCH.assign_harnesses(
+                    route, nodes, allow_degraded=False, parent_identity=parent,
+                )
+                self.assertEqual(len({row[1] for row in assignments}), 2, group)
 
 
 class DispatchBatchIntegrationTest(unittest.TestCase):

@@ -48,6 +48,23 @@ def load(harness: str):
 
 
 class WrapperCommonTest(unittest.TestCase):
+    def test_runtime_root_preparation_is_optional_and_marker_is_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            artifact = base / "project" / ".agent_reports"
+            artifact.mkdir(parents=True)
+            runtime = base / "dedicated-runtime"
+            prepared = C.prepare_runtime_root(str(artifact), {"AGENT_RUNTIME_DIR": str(runtime)})
+            self.assertEqual(prepared, str(runtime))
+            self.assertEqual((runtime / ".gitignore").read_bytes(), b"*\n")
+            self.assertFalse((runtime / "CACHEDIR.TAG").exists())
+            conflict = base / "conflict"
+            conflict.mkdir()
+            (conflict / ".gitignore").write_text("leave alone\n")
+            self.assertEqual(C.prepare_runtime_root(str(artifact), {"AGENT_RUNTIME_DIR": str(conflict)}), "")
+            self.assertEqual((conflict / ".gitignore").read_text(), "leave alone\n")
+            self.assertEqual(C.prepare_runtime_root(str(artifact), {"AGENT_RUNTIME_DIR": "relative"}), "")
+
     def make_release(self, root: Path):
         root.mkdir(parents=True)
         (root / ".hearting-release.json").write_text(
@@ -821,7 +838,7 @@ class SameRowTest(unittest.TestCase):
                     "granularity": "legacy", "model": "m", "effort": "high", "reasoning": "high",
                     "variant": "high"}
         return argparse.Namespace(
-            worktree=str(tmp), capability="autopilot-code", capability_mode="dev", qa="standard",
+            worktree=str(tmp), repository_identity="/repo", capability="autopilot-code", capability_mode="dev", qa="standard",
             intensity="standard", dispatch_depth=1, execution_surface="registered-headless",
             registered_worker=1, fallback_hop="same-harness-headless", parent_slug=None,
             parent_binding=None, parent_session_id=None, worker_role=None, worker_mode=None,
@@ -842,7 +859,7 @@ class SameRowTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.tmp = self._tmp.name
 
-    def row(self, harness, **kwargs):
+    def row(self, harness, repository_kind=None, **kwargs):
         from unittest import mock
         claimed = []
         tmp = self.tmp
@@ -857,6 +874,8 @@ class SameRowTest(unittest.TestCase):
              mock.patch("dispatch_replacement.seal_launch_input", return_value=""):
             secrets_.token_hex.return_value = "nonce"
             args = self.args(Path(tmp))
+            if repository_kind is not None:
+                args.repository_kind = repository_kind
             C.append_job(Path(tmp) / "jobs.log", args, harness=harness,
                          claim=lambda jobs, attempt, row, **kw: claimed.append((row, kw)) or True,
                          marker_gate=None, **kwargs)
@@ -864,6 +883,11 @@ class SameRowTest(unittest.TestCase):
         self.assertIn("mutation_precheck", kw)
         fields = dict(part.split("=", 1) for part in row.split("\t")[5].split(","))
         return fields
+
+    def test_repository_marker_is_only_added_for_non_git_rows(self):
+        non_git_fields = self.row("codex", repository_kind="non-git",
+                                  runtime_sandbox="workspace-write", effort_key="reasoning")
+        self.assertEqual(non_git_fields["repository"], "non-git")
 
     def test_only_the_declared_translation_differs(self):
         rows = {
@@ -887,6 +911,7 @@ class SameRowTest(unittest.TestCase):
         with mock.patch.object(C, "_retention_main_identity",
                                return_value=("codex", "431", "900", "pid:[4026531836]")):
             fields = self.row("codex", runtime_sandbox="workspace-write", effort_key="reasoning")
+        self.assertNotIn("repository", fields)
         self.assertEqual((fields["main_runtime_harness"], fields["main_runtime_pid"],
                           fields["main_runtime_pid_start"], fields["main_runtime_ns"]),
                          ("codex", "431", "900", "pid:[4026531836]"))

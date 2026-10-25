@@ -30,6 +30,7 @@ import resource_resume as RESOURCE_RESUME
 from dispatch_continuation_budget import (COMPATIBILITY_FLOOR, TERMINAL_RESERVE_DEFAULT,
                                           derive_workload_ordinary)
 from dispatch_contract import (
+    diagnose_repository_start,
     row_is_subsession,
     CANONICAL_PARENT_TRANSPORTS,
     DispatchContractError,
@@ -57,11 +58,14 @@ from dispatch_contract import (
     completion_marker_is_current,
     completion_attempt_readiness,
     attempt_row_withdrawn_before_launch,
+    attempt_row_terminal_never_started,
     completion_conflict_attempt,
     owner_closure_shape,
     _diff_attribution_execute_launch_head,
     evidence_digest,
     evidence_change_history,
+    evidence_change_history_path,
+    _evidence_mtime_text,
     evidence_currency,
     note_evidence_change,
     gate_currency,
@@ -2010,13 +2014,17 @@ def _fallback_chain(
         expected_worktree=expected_worktree, require_scope=require_scope,
     )
     tuples=evidence["tuples"]
-    if any(
-        row.get("status") == "unsupported"
+    reprobes = sorted((row for row in tuples
+        if row.get("status") == "unsupported"
         and row.get("failure_scope") == "exact-worktree"
-        and row.get("retry_on_isolated_worktree") == 1
-        for row in tuples
-    ):
-        raise ValueError("dispatch-evidence-exact-worktree-reprobe-required")
+        and row.get("retry_on_isolated_worktree") == 1),
+        key=lambda row: (str(row.get("child_harness", "")), str(row.get("checked_worktree", ""))))
+    if reprobes:
+        detail = "; ".join(
+            f"{row.get('child_harness')}:{row.get('reason') or row.get('failure_class') or 'unknown'}"
+            + (f" worktree={row.get('checked_worktree')}" if row.get("checked_worktree") else "")
+            for row in reprobes)
+        raise ValueError("dispatch-evidence-exact-worktree-reprobe-required: " + detail)
     same=[row for row in tuples if row["child_harness"]==row["parent_harness"]]
     cross=[row for row in tuples if row["child_harness"]!=row["parent_harness"]]
     if contract_version==DISPATCH_CONTRACT_VERSION:
@@ -3017,6 +3025,22 @@ def _complete_compose_group_consumers(registry, base, graph, find_input, **kwarg
     return recipe
 
 
+def _kept_dependencies(order, declared, kept):
+    """`declared` with each stage left out of the graph replaced by the kept stages it waited on,
+    transitively, so dropping a stage never makes its follower concurrent with its producer."""
+    found, seen, pending = [], set(), list(declared)
+    while pending:
+        dep = pending.pop(0)
+        if dep in seen:
+            continue
+        seen.add(dep)
+        if dep in kept:
+            found.append(dep)
+        else:
+            pending.extend(order.get(dep, {}).get("depends_on") or [])
+    return found
+
+
 def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, *, preserve_base_dependencies=False,
                             extra_stages=None, group_intensity=None, complete_group_consumers=False):
     """Cut the caller's stage subgraph out of the capability's own recipe.
@@ -3187,7 +3211,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
                 node["depends_on"] = [borrowed_ids[dep] for dep in declared_dependencies if dep in borrowed_ids]
             else:
                 declared_dependencies = order.get(node_id, {}).get("depends_on") or []
-                node["depends_on"] = [dep for dep in declared_dependencies if dep in ids]
+                node["depends_on"] = _kept_dependencies(order, declared_dependencies, set(ids))
         else:
             node["depends_on"] = [previous["id"]] if previous else []
         if not preserve_base_dependencies and previous and gate_group(previous["id"]):
@@ -3392,6 +3416,13 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
         if set(row.get("after") or []) <= kept_ids
         and {ref.get("node") for ref in row.get("source_outputs") or []} <= kept_ids
     ]
+    # A kept group anchor or an appended owner close can follow the node an extension
+    # names, so the extension runs after what now ends the route.
+    terminals = sorted({node["id"] for node in nodes}
+                       - {dep for node in nodes for dep in node.get("depends_on") or []})
+    for row in extensions:
+        if not set(row.get("after") or []) <= set(terminals):
+            row["after"] = terminals
     recipe = {
         "capability": base_recipe["capability"],
         "modes": list(base_recipe["modes"]),
@@ -3514,8 +3545,8 @@ def _compose_readiness(cwd, jobs, parent_harness, children, *, gpu_route=None,
             worktree=Path(cwd), jobs=Path(jobs),
             owner_harnesses=list(owner_harnesses) if owner_harnesses is not None else [parent_harness],
             child_harnesses=list(children),
-            **({"codex_execution_selection": GPU_SANDBOX.select(gpu_route)}
-               if gpu_route and GPU_SANDBOX.gpu_resource_nodes(gpu_route) else {}),
+            **({"codex_execution_selection": GPU_SANDBOX.select_fresh(gpu_route)}
+               if gpu_route and GPU_SANDBOX.fresh_gpu_resource_nodes(gpu_route) else {}),
         )
     except module.ReadinessError as exc:
         raise ValueError(f"compose-readiness-unavailable:{exc}") from exc
@@ -3984,7 +4015,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                   transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None,
                   campaign_key=None, parent_cycle_id=None, profile=None, work_request=None, unassigned=False,
                   selection_pins=None, route_plan=None, frameless=False, execution_scope=None,
-                  extra_stages=None, selection_only=False):
+                  extra_stages=None, selection_only=False, capability_source=None):
     """Resolve every default, then compile through the ordinary sealer.
 
     `route_plan` (a binding read by `route_plan.read_route_plan`) seals `{decision, digest, index}`
@@ -4005,6 +4036,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     if shape not in COMPOSE_SHAPES:
         raise ValueError(f"compose-shape-invalid:{shape}")
     routing_hints = None
+    frame_leg_choice = None
     if shape == "framed":
         # The shape itself picks the compiler-internal capability. Whatever was typed for the
         # ordinary shapes is only a hint for the work request: recorded, never sealed as the
@@ -4015,10 +4047,10 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         capability, capability_mode, graph, profile = ROUTE_FRAME_CAPABILITY, "default", None, None
         if intensity is not None and intensity not in ORDER:
             raise ValueError("invalid intensity")
-        # One frame leg for ordinary work; both top legs when the session marks the work uncertain
-        # or hard to reverse with a higher intensity (user decision 2026-10-07). The framed route
-        # itself is always sealed at `standard`.
-        frame_legs = 2 if intensity is not None and ORDER[intensity] > ORDER["standard"] else 1
+        # The framed route stays standard; its declared frame width is sealed separately.
+        request_text = work_request.get("text", "") if isinstance(work_request, dict) else ""
+        frame_leg_choice = RP.frame_leg_decision(intensity, request_text, routing_hints)
+        frame_legs = frame_leg_choice[0]
         intensity = None
     resume_graph = (shape in ("direct", "solo") and RESOURCE_RESUME.selected(
         capability, capability_mode or "setup", graph.split(",") if graph else None))
@@ -4135,14 +4167,20 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             if node.get("model_profile") and node["id"] not in explicit_profiles:
                 explicit_profiles[node["id"]] = node["model_profile"]
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
-    gpu_route = {"capability": capability, "nodes": selected_recipe["standard_plus"]["nodes"],
+    gpu_intensity = max(("standard" if requested == "auto" else requested,
+                        "standard" if signals else "quick"), key=ORDER.get)
+    gpu_nodes = _expand_parallel_groups(
+        json.loads(json.dumps(selected_recipe["standard_plus"]["nodes"])),
+        selected_recipe["standard_plus"].get("parallel_groups"), gpu_intensity, capability,
+        auxiliary_check_units=registry.get("auxiliary_check_units"))
+    gpu_route = {"capability": capability, "nodes": gpu_nodes,
                  "selection": {"promotion_signals": [{"signal": s} for s in signals]}}
     if (shape == "staged" and not owner_only and dispatch_evidence is not None
-            and GPU_SANDBOX.gpu_resource_nodes(gpu_route)):
+            and GPU_SANDBOX.fresh_gpu_resource_nodes(gpu_route)):
         dispatch_evidence = _validate_dispatch_evidence(
             dispatch_evidence, DISPATCH_CONTRACT_VERSION,
             expected_worktree=cwd, require_scope=True)
-        choice = GPU_SANDBOX.select(gpu_route)
+        choice = GPU_SANDBOX.select_fresh(gpu_route)
         codex_rows = [row for row in dispatch_evidence.get("tuples", [])
                       if row.get("parent_harness") == "codex"]
         if any(row.get("parent_sandbox") != choice["sandbox"] for row in codex_rows):
@@ -4206,9 +4244,14 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         {"axis": "compose-intensity", "signal": given_intensity or SHAPE_INTENSITY[shape],
          "source": "explicit" if given_intensity is not None else "shape-default"},
         {"axis": "compose-capability", "signal": given_capability or route["capability"],
-         "source": "frame-shape" if shape == "framed" else
-                   "explicit" if given_capability is not None else "compose-default"},
+         "source": ("frame-shape" if shape == "framed" else capability_source or
+                   ("explicit" if given_capability is not None else "compose-default"))},
     ])
+    if shape == "framed":
+        route["selection"]["selection_basis"].append({
+            "axis": "frame-legs", "signal": str(frame_leg_choice[0]),
+            "source": frame_leg_choice[1], "reason": frame_leg_choice[2],
+        })
     if work_request is not None:
         from work_start import capture_request_context
         if routing_hints:
@@ -4411,6 +4454,11 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
         work_request = {**work_request, "owner_harness": owner or work_request.get("owner_harness")}
     selection = compose_route(**kwargs, work_request=work_request, route_plan=binding,
                               parent_harness=owner or "claude", selection_only=True)
+    diagnosis = _compose_git_diagnosis(kwargs["cwd"])
+    if (diagnosis.get("state") == "non-git" and selection.get("shape") != "direct"
+            and _isolates_worktree(selection)):
+        raise ValueError("git 저장소 아님: source-mutating worker route; git init 후 다시 시작하거나, "
+                         "이 세션에서 --shape direct로 진행")
     frame_preparation = frame_route.get("framed_worktree") or {}
     inherit_frame_allocation = _inherits_frame_worktree(frame_route, leg, index, kwargs["cwd"])
     if _isolates_worktree(selection) and not inherit_frame_allocation:
@@ -4847,8 +4895,10 @@ def compose_omission_lines(route):
     return lines
 
 
-def compose_decision_lines(route):
+def compose_decision_lines(route, non_git_decision=None):
     """Read only the sealed selection/nodes; same display for every harness."""
+    import route_plan as RP
+
     basis = {row.get("axis"): row for row in
              (route.get("selection") or {}).get("selection_basis", [])}
     intensity = basis.get("compose-intensity", {})
@@ -4858,13 +4908,17 @@ def compose_decision_lines(route):
     if requested and requested != route["effective_intensity"]:
         detail += f", requested={requested}"
     lines = [f"  intensity={route['effective_intensity']} (source={source}{detail})"]
-    if source == "shape-default":
-        lines.append("  강도 안내: 판정·원인 분석이면 --intensity strong 검토")
     shape = (route.get("selection") or {}).get("shape") or shape_for_intensity(route["effective_intensity"])
+    if source == "shape-default" and shape != "framed":
+        lines.append("  강도 안내: 판정·원인 분석이면 --intensity strong 검토")
     capability = basis.get("compose-capability", {})
     if capability.get("source") == "compose-default":
         lines.append(f"  capability={route['capability']} (source=compose-default, --capability 지정 안 됨; "
                      "고정 기본값, 과제 문장 분류 없음; 결과 분석·평가·비교는 autopilot-lab/eval 검토)")
+    elif capability.get("source") == "non-git-unresolved":
+        lines.append(f"  capability={route['capability']} (source=non-git-unresolved; 작업 종류 미분류)")
+    elif capability.get("source") == "non-git-task-classification":
+        lines.append(f"  capability={route['capability']} (source=non-git-task-classification)")
     elif capability.get("source") == "frame-shape":
         lines.append("  capability=frame 결정 대기 (source=frame-shape)")
     elif not capability:
@@ -4883,8 +4937,30 @@ def compose_decision_lines(route):
     workers = sum(n.get("dispatch_depth") == 2 or _frame_node(n) for n in nodes)
     owners = int(shape != "framed" and route["effective_intensity"] != "direct")
     resources = [n["id"] for n in nodes if n.get("kind") == "resource-runner"]
-    lines.append(f"  규모: nodes={len(nodes)} worker_dispatches={workers} owner_dispatches={owners} "
-                 f"resource(측정)={','.join(resources) or '없음'} (초기 실행 예상, 재시도·후속 route 제외)")
+    size = f"  규모: nodes={len(nodes)} worker_dispatches={workers} owner_dispatches={owners} " \
+           f"resource(측정)={','.join(resources) or '없음'} (초기 실행 예상, 재시도·후속 route 제외)"
+    if shape == "framed":
+        frame_basis = basis.get("frame-legs")
+        if frame_basis:
+            count = frame_basis.get("signal")
+            source = frame_basis.get("source")
+            reason = frame_basis.get("reason")
+            label = "기본" if source == "default" else reason
+            size_word = "한" if str(count) == "1" else "두"
+            size += f"; frame {size_word} 갈래({label})"
+        else:
+            count = len(RP.frame_legs(route))
+            size_word = "한" if count == 1 else "두"
+            size += f"; frame {size_word} 갈래(이전 규칙으로 만든 경로)"
+        tuples = ((route.get("dispatch_evidence") or {}).get("tuples") or [])
+        supported = {row.get("child_harness") for row in tuples
+                     if row.get("status") == "supported" and row.get("child_harness")}
+        pin = (((route.get("selection_pins") or {}).get("frame") or {}).get("harness"))
+        if len(supported) == 1:
+            size += f" · 같은 하네스(쓸 수 있는 하네스가 {next(iter(supported))} 하나)"
+        elif pin and pin in supported:
+            size += f" · 같은 하네스(frame 지정 {pin})"
+    lines.append(size)
     for row in ((route.get("composed_recipe") or {}).get("compose") or {}).get("auto_completed_nodes", []):
         purpose = "owner closing summary" if row["reason"] == "terminal-anchor" else "registry consumer"
         lines.append(f"  {row['intensity']} group {','.join(row['anchors'])}: "
@@ -4893,12 +4969,12 @@ def compose_decision_lines(route):
 
 
 def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, route_plan_unreadable=False,
-                 campaign_selection=None, include_decisions=True):
+                 campaign_selection=None, include_decisions=True, non_git_decision=None):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     ids = [node["id"] for node in route["nodes"]]
     framed = shape == "framed"
-    graph = "→".join(ids) if route.get("composed") or framed else (ids[0] if ids else "-")
+    graph = "→".join(ids) if ids else "-"
     gates = ",".join(sorted({row["gate"] for row in route.get("human_gate_bindings") or []})) or "없음"
     card = (
         f"[경로] {route['capability']} · {shape}({route['effective_intensity']}) {graph}"
@@ -4909,7 +4985,11 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
     )
     observed = compose_observations(route)
     if include_decisions:
-        card += "\n" + "\n".join(compose_decision_lines(route))
+        card += "\n" + "\n".join(compose_decision_lines(route, non_git_decision))
+    if non_git_decision and non_git_decision.get("kind") == "direct":
+        card += "\n  git 아닌 폴더 — 이 세션이 직접 진행. 작업자가 필요하면 --shape 없이 다시 시작(원본 수정은 git init 필요)"
+        if non_git_decision.get("capability_unresolved"):
+            card += "\n  작업 종류 미정 — `--capability`로 지정"
     card += f"\n  확인 방식 {observed['confirmation']['method']} · 출처 {observed['confirmation']['origin']}"
     for answer in observed["pre_execution_answers"]:
         card += f"\n  {answer['question']}. {answer['name']}: {answer['answer']}"
@@ -5259,8 +5339,8 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
                          "terminal_commit_contract":RUNTIME_SUPPORT.TERMINAL_COMMIT_CONTRACT,
                          "terminal_handoff_contract":RUNTIME_SUPPORT.TERMINAL_HANDOFF_CONTRACT,
                          "producer_binding_contract":RUNTIME_SUPPORT.PRODUCER_BINDING_CONTRACT}}
-    if GPU_SANDBOX.gpu_resource_nodes(payload):
-        payload["codex_execution_sandbox"] = GPU_SANDBOX.select(payload)
+    if GPU_SANDBOX.fresh_gpu_resource_nodes(payload):
+        payload["codex_execution_sandbox"] = GPU_SANDBOX.select_fresh(payload)
     payload.update(slug_fields)
     for key, value in (("campaign_key", campaign_key), ("parent_cycle_id", parent_cycle_id)):
         if value is not None:
@@ -6734,7 +6814,9 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
              "route_file":str(Path(route_file).resolve()),"cwd":route["cwd"],
              "capability":route["capability"],"effective_intensity":route["effective_intensity"],
              "closed_at":datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
-             "head_commit":commit or _head_commit(route["cwd"]),"summary":summary,
+             "head_commit":(None if inline_finish_id is not None and
+                            not _COMMIT_SHA.fullmatch(str(route.get("source_commit") or ""))
+                            else commit or _head_commit(route["cwd"])),"summary":summary,
              "registry_current":route.get("_registry_current",True),
              "route_location":classify_route_location(route_file,route["artifact_root"]),
              "terminal_gate_proven":terminal_gate_proven(gates),"terminal_gates":gates}
@@ -8082,6 +8164,143 @@ def _downstream_node_ids(route, node_id):
     return result
 
 
+def _revision_consumers(route, upstream_id, revision, *, directory, registry, restoring=None):
+    """Prove registered downstream attempts started after the upstream observed N."""
+    try:
+        route_id = route["route_id"]
+        upstream = next(n for n in route.get("nodes", []) if n.get("id") == upstream_id)
+        p = revision["of_sequence"]
+        old_sha, new_sha = revision["of_evidence_sha256"], revision["evidence_sha256"]
+        history_path = evidence_change_history_path(Path(directory) / f"{upstream_id}.json", upstream_id)
+        history = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines()
+                   if line.strip()]
+        if any(not isinstance(row, dict) for row in history):
+            return {}
+        changes = [row for row in history if row.get("marker_sequence") == p
+                   and row.get("route_id") == route_id and row.get("node_id") == upstream_id]
+        if not changes or changes[0].get("previous_sha256") != old_sha:
+            return {}
+        previous = old_sha
+        for row in changes:
+            if row.get("previous_sha256") != previous or row.get("evidence_path") != revision["evidence_path"]:
+                return {}
+            previous = row.get("sha256")
+        if changes[-1].get("change_kind") != "edited" or previous != new_sha:
+            return {}
+        # The start is tied to the first observation in the final consecutive N run.
+        start = len(changes) - 1
+        while (start > 0 and changes[start - 1].get("sha256") == new_sha
+               and changes[start - 1].get("change_kind") == "edited"):
+            start -= 1
+        observed = changes[start].get("observed_at")
+        try:
+            observed_dt = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
+            evidence_path = Path(str(revision["evidence_path"]))
+            if not evidence_path.is_file() or _evidence_mtime_text(evidence_path) != changes[-1].get("evidence_changed_at"):
+                return {}
+        except (OSError, ValueError, TypeError):
+            return {}
+        if registry is None:
+            registry = _continuation_source_jobs(route)
+        lines = Path(registry).read_text(encoding="utf-8").splitlines()
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, StopIteration, DispatchContractError):
+        return {}
+
+    downstream = _downstream_node_ids(route, upstream_id)
+    nodes = {str(n.get("id")): n for n in route.get("nodes", [])}
+    parsed = []
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        try:
+            meta = parse_registry_metadata(fields[5])
+        except (ValueError, TypeError):
+            continue
+        parsed.append((fields, meta))
+    memo = {}
+    active = set()
+
+    def prove(node_id):
+        if node_id == upstream_id:
+            return {"upstream": upstream_id, "upstream_sequence": revision.get("upstream_sequence", p),
+                    "history_sha256": new_sha, "history_observed_at": observed,
+                    "attempt_id": None, "launched_at": observed}
+        if node_id in memo:
+            return memo[node_id]
+        if node_id in active or node_id not in downstream or node_id not in nodes:
+            return None
+        active.add(node_id)
+        node = nodes[node_id]
+        canonical_path = Path(directory) / f"{node_id}.json"
+        try:
+            marker = json.loads(canonical_path.read_text(encoding="utf-8"))
+            restored_revision = marker.get("revision") if isinstance(marker.get("revision"), dict) else {}
+            consumed = restored_revision.get("consumed") if isinstance(restored_revision.get("consumed"), dict) else {}
+            if (restoring is not None and marker.get("stage_authority") == "revision"
+                    and restored_revision.get("basis") == "upstream-revision-consumed"
+                    and consumed.get("upstream") == restoring.get("node")
+                    and consumed.get("upstream_sequence") == restoring.get("sequence")
+                    and gate_currency(route, node, canonical_path, marker, observe=True,
+                                      jobs=registry).state == "current"):
+                proof = consumed
+                memo[node_id] = proof
+                return proof
+            if (marker.get("registered_worker") is not True or marker.get("stage_authority") is not None):
+                return None
+            is_restore_tombstone = marker.get("state") == "superseded-by-upstream-revision"
+            if is_restore_tombstone:
+                if restoring is None or marker.get("superseded_by") != restoring:
+                    return None
+            elif marker.get("state") is not None:
+                return None
+            attempt_id = marker.get("attempt_id")
+            matching = [(fields, meta) for fields, meta in parsed if meta.get("attempt_id") == attempt_id]
+            if len(matching) != 1:
+                return None
+            fields, meta = matching[0]
+            if ROUTE_IDENTITY.registered_node_identity(meta, node) != (route_id, route.get("route_hash"), node_id):
+                return None
+            launched = datetime.fromisoformat(fields[0].replace("Z", "+00:00"))
+            if launched < observed_dt or _registered_marker_fence(route, node, marker, lines) is not None:
+                return None
+            if is_restore_tombstone:
+                currency = gate_currency(route, node, canonical_path, marker, observe=True, jobs=registry)
+                if currency.state != "superseded":
+                    return None
+                # A tombstone copies its predecessor. Read that original marker's
+                # evidence and source half through the one shared reader rather
+                # than recomputing its digest here (A-SD154-8).
+                from dispatch_contract import _superseded_marker_predecessor
+                prior_path, prior = _superseded_marker_predecessor(route, node, canonical_path, marker)
+                if evidence_currency(route, node, prior_path, prior, observe=True,
+                                     jobs=registry).state != "current":
+                    return None
+            elif gate_currency(route, node, canonical_path, marker, observe=True, jobs=registry).state != "current":
+                return None
+            for parent in node.get("depends_on") or ():
+                if parent in downstream and parent != upstream_id and prove(str(parent)) is None:
+                    return None
+            proof = {"upstream": upstream_id, "upstream_sequence": revision.get("upstream_sequence", p),
+                     "history_sha256": new_sha, "history_observed_at": observed,
+                     "attempt_id": attempt_id, "launched_at": fields[0]}
+            memo[node_id] = proof
+            return proof
+        except (OSError, ValueError, KeyError, TypeError, DispatchContractError, AttributeError):
+            return None
+        finally:
+            active.discard(node_id)
+
+    result = {}
+    for candidate in route.get("nodes", []):
+        candidate_id = str(candidate.get("id"))
+        if candidate_id in downstream:
+            proof = prove(candidate_id)
+            if proof is not None:
+                result[candidate_id] = proof
+    return result
+
+
 def revision_basis_verdict(route, node, basis, answers, *, jobs=None, direction=None, reason=None):
     """SD-154 rule 2: prove a revision's closed basis, or raise
     `ValueError("revision-basis-unverified")` (or an invalid-basis error).
@@ -8090,26 +8309,27 @@ def revision_basis_verdict(route, node, basis, answers, *, jobs=None, direction=
     row (13.59.2 classification) of a node downstream (`depends_on` transitive
     closure) of `node`, in the route's own registry -- SD-134 "직함이 아니라
     배정을 본다" read onto revision provenance. `user-direction` requires a
-    non-empty `direction` (a gate release id or a readable memo path).
     `owner-correction` requires a non-empty `reason` string.
     """
     if basis == "user-direction":
         if not direction:
-            raise ValueError("revision-basis-unverified")
+            raise ValueError("revision-basis-unverified:user-direction needs --direction <gate-release-id|memo-path>")
         return {"basis": basis, "direction": direction}
     if basis == "owner-correction":
         if not reason:
-            raise ValueError("revision-basis-unverified")
+            raise ValueError("revision-basis-unverified:owner-correction needs --reason <text>")
         return {"basis": basis, "reason": reason}
     if basis != "review-findings":
         raise ValueError(f"revision-basis-invalid:{basis}")
     answers = tuple(answers)
-    if not answers or not jobs:
-        raise ValueError("revision-basis-unverified")
+    if not jobs:
+        raise ValueError("revision-basis-unverified:review-findings needs a readable registry (--jobs <jobs.log>)")
+    if not answers:
+        raise ValueError("revision-basis-unverified:review-findings needs --answers <downstream review/test verdict attempt ids>")
     try:
         lines = Path(jobs).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        raise ValueError("revision-basis-unverified")
+        raise ValueError("revision-basis-unverified:review-findings needs a readable registry (--jobs <jobs.log>)")
     downstream = _downstream_node_ids(route, node["id"])
     verified = set()
     for candidate in route.get("nodes", []):
@@ -8131,7 +8351,8 @@ def revision_basis_verdict(route, node, basis, answers, *, jobs=None, direction=
             if kind == "verdict":
                 verified.add(attempt)
     if set(answers) - verified:
-        raise ValueError("revision-basis-unverified")
+        raise ValueError("revision-basis-unverified:review-findings answers are not downstream verdicts: " +
+                         ",".join(sorted(set(answers) - verified)))
     return {"basis": basis, "answers": list(answers)}
 
 
@@ -8354,7 +8575,13 @@ def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), dire
         raise ValueError(f"{exc.code}: {exc.detail}") from exc
     # Basis verification runs (and can raise `revision-basis-unverified`)
     # before any write -- a refused revision must publish nothing.
-    revision_basis_verdict(route, node, basis, answers, jobs=jobs, direction=direction, reason=reason)
+    registry = jobs
+    if registry is None:
+        try:
+            registry = _continuation_source_jobs(route)
+        except ValueError:
+            registry = None
+    revision_basis_verdict(route, node, basis, answers, jobs=registry, direction=direction, reason=reason)
     sequence = marker.get("sequence")
     history_path = directory / f"{node_id}.{sequence}.json"
     try:
@@ -8426,6 +8653,24 @@ def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), dire
         if census:
             new_marker["round_census"] = census
     tombstones = {}
+    kept = {}
+    if not source_changed:
+        prior_evidence_path = str((marker.get("evidence") or {}).get("path") or "")
+        try:
+            same_evidence_path = Path(evidence_path).resolve() == Path(prior_evidence_path).resolve()
+        except (OSError, ValueError):
+            same_evidence_path = False
+        if same_evidence_path:
+            consumers = _revision_consumers(route, node_id, {
+                "of_sequence": sequence,
+                "of_evidence_sha256": (marker.get("evidence") or {}).get("sha256"),
+                "evidence_sha256": evidence_sha,
+                "evidence_path": prior_evidence_path,
+            }, directory=directory, registry=registry)
+        else:
+            consumers = {}
+    else:
+        consumers = {}
     for downstream_id in sorted(_downstream_node_ids(route, node_id)):
         downstream_canonical = directory / f"{downstream_id}.json"
         if not downstream_canonical.is_file():
@@ -8435,6 +8680,9 @@ def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), dire
         except (OSError, ValueError):
             continue
         if downstream_marker.get("state") == "superseded-by-upstream-revision":
+            continue
+        if downstream_id in consumers:
+            kept[downstream_id] = consumers[downstream_id]
             continue
         if source_changed and revised_subject is not None:
             downstream_node = next((candidate for candidate in route.get("nodes", [])
@@ -8455,7 +8703,141 @@ def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), dire
         tombstone_marker["state"] = "superseded-by-upstream-revision"
         tombstone_marker["superseded_by"] = {"node": node_id, "sequence": new_sequence}
         tombstones[downstream_id] = tombstone_marker
-    return new_marker, tombstones
+    return new_marker, tombstones, kept
+
+
+def restore_consumed_tombstones(route, *, jobs):
+    """Restore legacy tombstones only when recorded evidence proves prior consumption."""
+    directory = completion_dir(route["route_id"], jobs=jobs)
+    candidates = []
+    for node in route.get("nodes", []):
+        node_id = str(node.get("id"))
+        path = directory / f"{node_id}.json"
+        try:
+            marker = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if marker.get("state") == "superseded-by-upstream-revision":
+            superseded = marker.get("superseded_by") or {}
+            candidates.append((node, path, marker, str(superseded.get("node") or ""), superseded.get("sequence")))
+    if not candidates:
+        return {"restored": [], "errors": []}
+    groups = {}
+    for item in candidates:
+        groups.setdefault((item[3], item[4]), []).append(item)
+    restored, errors = [], []
+    for (upstream_id, upstream_sequence), group in groups.items():
+        try:
+            upstream_node = next(n for n in route.get("nodes", []) if n.get("id") == upstream_id)
+            upstream_path = directory / f"{upstream_id}.json"
+            upstream_marker = json.loads(upstream_path.read_text(encoding="utf-8"))
+            if (upstream_marker.get("sequence") != upstream_sequence
+                    or upstream_marker.get("stage_authority") != "revision"):
+                for _node, _path, tombstone, _u, _s in group:
+                    node_id = str(_node.get("id"))
+                    if _next_marker_sequence(directory, node_id) - 1 > int(tombstone.get("sequence", 0)):
+                        errors.append(f"pending-restore-unproven:{node_id}")
+                continue
+            upstream_currency = gate_currency(route, upstream_node, upstream_path, upstream_marker,
+                                              observe=True, jobs=jobs)
+            if upstream_currency.state not in {"current", "revised-unrecorded"}:
+                for _node, _path, tombstone, _u, _s in group:
+                    node_id = str(_node.get("id"))
+                    if _next_marker_sequence(directory, node_id) - 1 > int(tombstone.get("sequence", 0)):
+                        errors.append(f"pending-restore-unproven:{node_id}")
+                continue
+            revision = dict(upstream_marker.get("revision") or {})
+            revision["upstream_sequence"] = upstream_sequence
+            revision["evidence_path"] = (upstream_marker.get("evidence") or {}).get("path")
+            lock_nodes = sorted({upstream_id} | _downstream_node_ids(route, upstream_id))
+            with contextlib.ExitStack() as locks:
+                for affected in lock_nodes:
+                    locks.enter_context(_exclusive_lock(directory / f".{affected}.completion.lock"))
+                if jobs is not None:
+                    locks.enter_context(_exclusive_lock(Path(f"{jobs}.lock")))
+                upstream_marker = json.loads(upstream_path.read_text(encoding="utf-8"))
+                if upstream_marker.get("sequence") != upstream_sequence:
+                    continue
+                upstream_currency = gate_currency(route, upstream_node, upstream_path, upstream_marker,
+                                                  observe=True, jobs=jobs)
+                if upstream_currency.state not in {"current", "revised-unrecorded"}:
+                    continue
+                consumers = _revision_consumers(
+                    route, upstream_id, revision, directory=directory, registry=jobs,
+                    restoring={"node": upstream_id, "sequence": upstream_sequence},
+                )
+                for node, canonical_path, tombstone, _u, _s in group:
+                    node_id = str(node["id"])
+                    latest_number = _next_marker_sequence(directory, node_id) - 1
+                    if node_id not in consumers:
+                        if latest_number > int(tombstone.get("sequence", 0)):
+                            errors.append(f"pending-restore-unproven:{node_id}")
+                        continue
+                    history_path = directory / f"{node_id}.{tombstone.get('sequence')}.json"
+                    orphan_path = directory / f"{node_id}.{latest_number}.json"
+                    resumed = False
+                    if latest_number > int(tombstone.get("sequence", 0)):
+                        try:
+                            orphan = json.loads(orphan_path.read_text(encoding="utf-8"))
+                            prior_sha = hashlib.sha256(history_path.read_bytes()).hexdigest()
+                            stripped = {k: v for k, v in orphan.items() if k not in {
+                                "state", "superseded_by", "stage_authority", "sequence", "revision"}}
+                            old_stripped = {k: v for k, v in tombstone.items() if k not in {
+                                "state", "superseded_by", "stage_authority", "sequence", "revision"}}
+                            identity_ok = all(orphan.get(k) == tombstone.get(k) for k in (
+                                "route_id", "route_hash", "node_id", "attempt_id", "schema_version"))
+                            import dispatch_contract as DC
+                            schema_ok, _ = DC._marker_schema_identity_ok(route, node, orphan, orphan_path, observe=True)
+                            currency = gate_currency(route, node, orphan_path, orphan, observe=True, jobs=jobs)
+                            if (orphan_path.name != f"{node_id}.{latest_number}.json"
+                                    or orphan.get("sequence") != latest_number or not identity_ok or not schema_ok
+                                    or currency.state != "current" or not stripped == old_stripped
+                                    or orphan.get("stage_authority") != "revision"
+                                    or (orphan.get("revision") or {}).get("basis") != "upstream-revision-consumed"
+                                    or (orphan.get("revision") or {}).get("of_sequence") != tombstone.get("sequence")
+                                    or (orphan.get("revision") or {}).get("of_marker_sha256") != prior_sha
+                                    or (orphan.get("revision") or {}).get("consumed", {}).get("upstream") != upstream_id
+                                    or (orphan.get("revision") or {}).get("consumed", {}).get("upstream_sequence") != upstream_sequence):
+                                errors.append(f"pending-restore-invalid:{node_id}:orphan-identity-or-provenance")
+                                continue
+                            atomic_write(canonical_path, orphan)
+                            restored.append({"node": node_id, "upstream": upstream_id,
+                                             "upstream_sequence": upstream_sequence, "resumed": True})
+                            resumed = True
+                        except (OSError, ValueError, KeyError, TypeError, DispatchContractError) as exc:
+                            errors.append(f"pending-restore-invalid:{node_id}:{type(exc).__name__}:{exc}")
+                            continue
+                    if resumed:
+                        continue
+                    if latest_number > int(tombstone.get("sequence", 0)):
+                        errors.append(f"pending-restore-unproven:{node_id}")
+                        continue
+                    ev = tombstone.get("evidence") or {}
+                    new = dict(tombstone)
+                    new.pop("state", None)
+                    new.pop("superseded_by", None)
+                    sequence = _next_marker_sequence(directory, node_id)
+                    proof = consumers[node_id]
+                    new["stage_authority"] = "revision"
+                    new["sequence"] = sequence
+                    new["revision"] = {
+                        "of_sequence": tombstone.get("sequence"),
+                        "of_marker_sha256": hashlib.sha256(history_path.read_bytes()).hexdigest(),
+                        "of_evidence_sha256": ev.get("sha256"), "evidence_sha256": ev.get("sha256"),
+                        "basis": "upstream-revision-consumed", "answers": [], "direction": None,
+                        "reason": f"{upstream_id}@{upstream_sequence} evidence was observed before {proof.get('attempt_id')} started",
+                        "author_attempt_id": os.environ.get("AGENT_DISPATCH_ATTEMPT_ID"),
+                        "recorded_by": "runtime-auto",
+                        "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "consumed": proof,
+                    }
+                    write_once(directory / f"{node_id}.{sequence}.json", new)
+                    atomic_write(canonical_path, new)
+                    restored.append({"node": node_id, "upstream": upstream_id,
+                                     "upstream_sequence": upstream_sequence, "resumed": False})
+        except (OSError, ValueError, KeyError, TypeError, StopIteration, DispatchContractError) as exc:
+            errors.append(f"{upstream_id}@{upstream_sequence}:{type(exc).__name__}:{exc}")
+    return {"restored": restored, "errors": errors}
 
 
 def preview_revision(route, node_id, evidence, *, basis, answers=(), direction=None,
@@ -8463,15 +8845,16 @@ def preview_revision(route, node_id, evidence, *, basis, answers=(), direction=N
     """The complete writer proof, without lock creation or marker publication."""
     _, input_only = _revision_target(route, node_id, basis)
     if input_only:
-        return preview_review_input_revision(
+        result = preview_review_input_revision(
             route, node_id, evidence, answers=answers, author_attempt_id=author_attempt_id,
             recorded_by=recorded_by, jobs=jobs,
         )
-    marker, tombstones = _producer_revision_plan(
+        return {**result, "kept": []}
+    marker, tombstones, kept = _producer_revision_plan(
         route, node_id, evidence, basis=basis, answers=answers, direction=direction,
         reason=reason, author_attempt_id=author_attempt_id, recorded_by=recorded_by, jobs=jobs,
     )
-    return {"marker": marker, "tombstoned": list(tombstones)}
+    return {"marker": marker, "tombstoned": list(tombstones), "kept": list(kept)}
 
 
 def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), direction=None,
@@ -8479,10 +8862,11 @@ def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), dire
     """Publish the shared producer proof and downstream tombstones under one lock."""
     _, input_only = _revision_target(route, node_id, basis)
     if input_only:
-        return publish_review_input_revision(
+        result = publish_review_input_revision(
             route, node_id, evidence, answers=answers, author_attempt_id=author_attempt_id,
             recorded_by=recorded_by, jobs=jobs,
         )
+        return {**result, "kept": []}
     directory = completion_dir(route["route_id"], jobs=jobs)
     # Every affected completion lock precedes jobs, in one sorted order.
     # Disposition holds its same node lock through the final head check/replace.
@@ -8491,7 +8875,7 @@ def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), dire
             locks.enter_context(_exclusive_lock(directory / f".{affected}.completion.lock"))
         if jobs:
             locks.enter_context(_exclusive_lock(Path(f"{jobs}.lock")))
-        marker, tombstones = _producer_revision_plan(
+        marker, tombstones, kept = _producer_revision_plan(
             route, node_id, evidence, basis=basis, answers=answers, direction=direction,
             reason=reason, author_attempt_id=author_attempt_id, recorded_by=recorded_by, jobs=jobs,
         )
@@ -8500,7 +8884,7 @@ def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), dire
         for downstream_id, tombstone in tombstones.items():
             write_once(directory / f"{downstream_id}.{tombstone['sequence']}.json", tombstone)
             atomic_write(directory / f"{downstream_id}.json", tombstone)
-    return {"marker": marker, "tombstoned": list(tombstones)}
+    return {"marker": marker, "tombstoned": list(tombstones), "kept": list(kept)}
 
 
 def _route_revisions(route, *, jobs=None):
@@ -9105,7 +9489,8 @@ def review_round_records(lines, route_ids, node_id, *, jobs=None):
     return REVIEW_ROUND_CAP.logical_round_records(rows,jobs=jobs)
 
 def _review_round_rows(lines, route_id, node_id, *, jobs=None):
-    return [(fields[1], meta) for fields, meta in review_round_records(lines, {route_id}, node_id,jobs=jobs)]
+    return [(fields[1], meta) for fields, meta in review_round_records(lines, {route_id}, node_id,jobs=jobs)
+            if not attempt_row_terminal_never_started(fields)]
 
 def _node_revision_records(route, node_id, jobs=None):
     """Every SD-154 `revision` record in one node's own completion-dir
@@ -10004,8 +10389,10 @@ def _complete_node_locked(
                    if owner_closure is not None else {}),
             }
 
-def _git_changed_files(worktree):
+def _git_changed_files(worktree, *, route=None):
     """Return the worktree's git-visible changed file paths (AC 28 audit)."""
+    if route is not None and route.get("source_commit") == "unversioned":
+        raise ValueError("git-change-observation-not-applicable:unversioned-route")
     try:
         result = subprocess.run(
             # `-uall`: the default collapses an untracked directory to one
@@ -10028,6 +10415,41 @@ def _git_changed_files(worktree):
         if path:
             changed.add((Path(worktree) / path).resolve(strict=False))
     return changed
+
+
+def _artifact_output_snapshot(directory):
+    """Digest regular files in one cycle output tree; never follow symlinks."""
+    lexical_root = Path(directory).expanduser()
+    if lexical_root.is_symlink():
+        raise ValueError("artifact-snapshot-root-is-symlink")
+    root = lexical_root.resolve(strict=False)
+    snapshot = {}
+    if not root.is_dir():
+        return snapshot
+    def walk_error(exc):
+        raise ValueError(f"artifact-snapshot-unreadable:{exc}") from exc
+    for base, dirs, files in os.walk(root, topdown=True, followlinks=False, onerror=walk_error):
+        dirs[:] = sorted(name for name in dirs if not (Path(base) / name).is_symlink())
+        for name in sorted(files):
+            path = Path(base) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            resolved = path.resolve(strict=True)
+            if root not in resolved.parents:
+                continue
+            try:
+                snapshot[str(resolved)] = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise ValueError(f"artifact-snapshot-unreadable:{resolved}:{exc}") from exc
+    return snapshot
+
+
+def _artifact_delta(baseline, directory):
+    before = _baseline_content_map(baseline)
+    after = {Path(path).resolve(strict=False): digest
+             for path, digest in _artifact_output_snapshot(directory).items()}
+    return {path for path in (set(before) | set(after))
+            if before.get(path) != after.get(path)}
 
 
 def _content_digest(path):
@@ -10120,12 +10542,12 @@ def _git_committed_files(worktree, ancestor, head):
     try:
         probe = subprocess.run(
             ["git", "-C", str(worktree), "diff", "--name-only", str(ancestor), str(head)],
-            text=True, capture_output=True, check=False,
+            text=True, capture_output=True, check=False, timeout=60,
         )
-    except (OSError, ValueError):
-        return set()
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"git-commit-observation-failed:{exc}") from exc
     if probe.returncode != 0:
-        return set()
+        raise ValueError("git-commit-observation-failed:" + (probe.stderr or f"exit={probe.returncode}"))
     return {
         (Path(worktree) / line.strip()).resolve(strict=False)
         for line in probe.stdout.splitlines()
@@ -10192,9 +10614,12 @@ def record_subdivision_baseline(route, node_id, manifest, *, jobs=None):
             raise ValueError(f"subdivision-baseline-identity-conflict:{node_id}")
         return existing
     from datetime import datetime, timezone
+    unversioned = route.get("source_commit") == "unversioned"
+    artifact_output = (os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR")
+                       or str(route.get("artifact_root") or ""))
     record = {
         **identity,
-        "head_commit": _head_commit(worktree),
+        "head_commit": None if unversioned else _head_commit(worktree),
         # anchor M3 / B5: path -> content digest, not a path list. A path list
         # is a permanent exemption: a file dirty at admission became invisible
         # to the audit for the whole subdivision, and those are exactly the
@@ -10202,10 +10627,11 @@ def record_subdivision_baseline(route, node_id, manifest, *, jobs=None):
         # checklist), so in practice they are always dirty. Digests make the
         # subtraction a real delta -- unchanged since admission stays exempt,
         # changed again does not.
-        "changed_files": {
+        "artifact_output_dir": artifact_output if unversioned else None,
+        "changed_files": (_artifact_output_snapshot(artifact_output) if unversioned else {
             str(item): _content_digest(item)
-            for item in sorted(_git_changed_files(worktree))
-        },
+            for item in sorted(_git_changed_files(worktree, route=route))
+        }),
         "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     try:
@@ -10389,7 +10815,8 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
     # is refused outright, and a lineage-clean descent is a slice commit only
     # when it actually carries a slice's `fixed_files`.
     committed = set()
-    if baseline is not None:
+    unversioned = route.get("source_commit") == "unversioned"
+    if baseline is not None and not unversioned:
         head = _head_commit(worktree)
         baseline_head = baseline.get("head_commit")
         if head != baseline_head:
@@ -10419,7 +10846,13 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
     # A lineage-clean commit moves its files out of `git status` and into
     # history, so the audit has to add them back or accepting the commit would
     # silently blind the very measurement it just passed.
-    changed = _git_changed_files(worktree) | committed
+    if unversioned:
+        output_dir = (baseline or {}).get("artifact_output_dir") or os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR")
+        if not output_dir:
+            _refuse("subdivision-baseline-missing", "unversioned artifact output directory unavailable")
+        changed = _artifact_delta(baseline, output_dir)
+    else:
+        changed = _git_changed_files(worktree, route=route) | committed
     outside = changed - declared_union - preexisting
     if outside:
         _refuse(
@@ -10502,6 +10935,66 @@ def _git(cwd, *args):
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _compose_git_diagnosis(cwd):
+    """Keep an explicit start-time distinction between a non-repository and Git failure."""
+    return diagnose_repository_start(cwd)
+
+
+def _decide_non_git_compose(cwd_diagnosis, requested_shape,
+                            dispatch_depth, registered_attempt, capability_hint):
+    """The single compose-start decision for Git, non-Git direct, and non-Git refusal.
+
+    `requested_shape` is the shape the start will run: a readable route-plan leg's own
+    shape, else `--shape`. Only an explicit direct shape runs without a worker; an omitted
+    shape follows the Git default (framed), so the frame decides as in a Git folder."""
+    common = {"cwd": str(cwd_diagnosis.get("cwd") or ""),
+              "capability_hint": capability_hint}
+    state = cwd_diagnosis.get("state")
+    if state == "git":
+        return {**common, "kind": "git"}
+    if state != "non-git":
+        detail = cwd_diagnosis.get("detail") or "git diagnosis unavailable"
+        return {**common, "kind": "error", "detail": f"{common['cwd']}: {detail}"}
+    cause = f"git 저장소 아님: {common['cwd']}"
+    if requested_shape != "direct":
+        return {**common, "kind": "worker-candidate", "cause": cause,
+                "next": "git init 후 다시 시작하거나, 이 세션에서 --shape direct로 진행"}
+    if dispatch_depth > 0 or registered_attempt:
+        return {**common, "kind": "refuse", "cause": cause,
+                "next": "git init 후 다시 시작하거나, depth-0 부모에서 같은 compose를 --shape 없이 또는 --shape direct로 실행"}
+    return {**common, "kind": "direct", "cause": cause}
+
+
+def _classify_non_git_task(text):
+    """Conservative pure task-purpose classifier; called only for non-Git starts."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if re.search(r"(?:\b(?:not|don't|do not|without|instead of)\b|아니|않|말고|제외)", text, re.I):
+        return None
+    if any(mark in text for mark in ('"', "'", "“", "”", "‘", "’", "`")):
+        return None
+    if re.search(r"\b(?:research)\b|연구|조사", text, re.I):
+        if not re.search(r"문헌 검토|논문 조사|literature review|paper research|academic research|시장 조사|시장 분석|market research|market survey|기술 동향|기술 조사|technology research|technical research|technology survey", text, re.I):
+            return None
+    patterns = {
+        ("autopilot-research", "academic"): r"문헌 검토|논문 조사|literature review|paper research|academic research",
+        ("autopilot-research", "market"): r"시장 조사|시장 분석|market research|market survey",
+        ("autopilot-research", "technology"): r"기술 동향|기술 조사|technology research|technical research|technology survey",
+        ("autopilot-lab", "eval"): r"고정 (?:metric|metrics|결과)|모델 비교|결과 비교|재평가|compare (?:the )?(?:model|results)|fixed (?:metric|results)|reevaluate|re-evaluate|experiment conclusions",
+        ("autopilot-code", "dev"): r"재사용 (?:프로그램|도구|driver)|구현(?:해|한다|하기|$)|함수 버그 수정|implement a reusable|fix (?:the )?(?:function|path) bug",
+        ("autopilot-refine", "default"): r"오탈자|문장만 수정|fix only typos?|typos? only|fix only the wording|correct only",
+        ("autopilot-draft", "presentation"): r"독립 (?:새 )?발표|새 발표문|new independent presentation|write an independent presentation",
+        ("autopilot-draft", "paper"): r"독립 (?:새 )?논문|새 논문 작성|new independent paper|write an independent paper",
+        ("analyze-project", "code"): r"기존 코드.*(?:구조|분석)|inspect existing (?:project )?code|analyze (?:the )?existing codebase",
+        ("analyze-project", "doc"): r"기존 문서.*(?:구조|분석)|inspect existing documents|analyze existing documentation",
+        ("analyze-project", "paper"): r"기존 논문.*(?:구조|분석)|inspect existing papers?|analyze existing paper structure",
+        ("autopilot-ship", "package"): r"주어진 결과.*zip|결과.*패키징|package existing results|make (?:a )?zip from (?:the )?existing",
+    }
+    matches = [(capability, mode) for (capability, mode), pattern in patterns.items()
+               if re.search(pattern, text, re.I)]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _git_common_dir(cwd):
@@ -11654,12 +12147,12 @@ def main():
     cp.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
     cp.add_argument("--profile", choices=sorted(PROFILE.PORTABLE_PROFILES),
                     help="explicit model budget for owner and model nodes; node-specific --explicit-profiles takes precedence")
-    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered owner) | staged (capability recipe, optionally narrowed by --graph) | framed (two top frame legs propose the route; --capability, --capability-mode, --graph and --profile are recorded as hints only); default: framed; use --shape direct for inline work; --graph without --shape is a frame routing hint")
+    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered owner) | staged (capability recipe, optionally narrowed by --graph) | framed (two top frame legs propose the route by default; explicit quick/direct may use one deep leg for unprotected work; --capability, --capability-mode, --graph and --profile are recorded as hints only); default: framed; use --shape direct for inline work; --graph without --shape is a frame routing hint")
     cp.add_argument("--graph",default=None,help="optional staged subgraph in your order (see `capability-route.py stages --capability <cap>` for valid ids); incompatible inherited parallel presets are omitted; optional :unit override, e.g. execute,test,report")
     cp.add_argument("--execution-scope", choices=("complete", "report"), default=None,
                     help="optional scope already selected in the existing start confirmation; it is not approval evidence")
     cp.add_argument("--capability",default=None,help=f"default {COMPOSE_DEFAULT_CAPABILITY}; a hint only with --shape framed"); cp.add_argument("--capability-mode",default=None)
-    cp.add_argument("--intensity",default=None,help="default by shape: direct/quick/standard; staged accepts strong+")
+    cp.add_argument("--intensity",default=None,help="default by shape: direct/quick/standard; framed defaults to two frame legs, while explicit quick/direct may use one for unprotected work; staged accepts strong+")
     cp.add_argument("--cwd",default=None,help="default: current directory"); cp.add_argument("--artifact-root",default=None,help="default: utilities/artifact-root.sh for cwd")
     cp.add_argument("--signal",action="append",default=[],
                     help="promotion signal (repeatable), e.g. shared-contract: promotes shared spec/contract "
@@ -11856,6 +12349,57 @@ def main():
             if a.cwd is None:
                 context=route_plan_binding["record"]["decision"]["first_leg_compose"]["context"]
                 cwd=RP.leg_cwd(route_plan_binding["leg"],cwd,base_cwd=context["cwd"])
+        non_git_decision = None
+        capability_source = None
+        capability_unresolved = False
+        if a.start and not a.explain:
+            diagnosis = {**_compose_git_diagnosis(cwd), "cwd": str(Path(cwd).resolve())}
+            try:
+                dispatch_depth = int(os.environ.get("AGENT_DISPATCH_DEPTH") or 0)
+            except (TypeError, ValueError):
+                dispatch_depth = -1
+            if dispatch_depth < 0:
+                diagnosis = {"state": "error", "cwd": str(Path(cwd).resolve()),
+                             "detail": "invalid AGENT_DISPATCH_DEPTH"}
+            requested_shape = (route_plan_binding["leg"].get("shape")
+                               if route_plan_binding is not None else a.shape)
+            non_git_decision = _decide_non_git_compose(
+                diagnosis, requested_shape, dispatch_depth,
+                bool(os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
+                     or os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER", "").lower() in {"1", "true"}),
+                a.capability)
+            if non_git_decision["kind"] == "error":
+                raise ValueError("compose-start-git-diagnosis: " + str(non_git_decision.get("detail")))
+            if non_git_decision["kind"] == "refuse":
+                raise ValueError(f"{non_git_decision['cause']}; {non_git_decision['next']}")
+            if non_git_decision["kind"] == "direct":
+                shape = "direct"
+                capability = a.capability
+                capability_mode = a.capability_mode
+                original_mode_hint = a.capability_mode
+                if a.capability is not None:
+                    capability_source = "explicit"
+                else:
+                    classified = _classify_non_git_task(a.prompt_file.read_text())
+                    if classified is None:
+                        capability = COMPOSE_DEFAULT_CAPABILITY
+                        capability_mode = None
+                        capability_source = "non-git-unresolved"
+                        capability_unresolved = True
+                    else:
+                        capability, inferred_mode = classified
+                        capability_mode = a.capability_mode or inferred_mode
+                        capability_source = "non-git-task-classification"
+                a.capability = capability if a.capability is None else a.capability
+                a.capability_mode = capability_mode
+                a.intensity = "direct"
+                a.graph, a.signal = None, []
+                a.profile_demands = a.explicit_profiles = a.profile = None
+                a.dispatch_evidence = a.registered_headless_evidence = None
+                a.children = None
+                pins = {}
+                a._non_git_mode_hint = (original_mode_hint if capability_unresolved else None)
+                non_git_decision["capability_unresolved"] = capability_unresolved
         pins,pin_warnings=_filter_top_pins(pins)
         owner_pin=(pins.get("owner") or {}).get("harness")
         compose_args=dict(
@@ -11877,11 +12421,19 @@ def main():
             work_request={"text":a.prompt_file.read_text(),"owner_harness":owner_pin} if a.prompt_file else None,
             selection_pins=pins or None,route_plan=route_plan_binding,
             execution_scope=a.execution_scope,
+            capability_source=capability_source,
         )
+        if capability_unresolved and a._non_git_mode_hint:
+            compose_args["work_request"]["routing_hints"] = {"capability_mode": a._non_git_mode_hint}
         worktree=None
         if a.start and not a.explain:
             selection = compose_route(**compose_args, selection_only=True)
             is_framed = selection.get("shape") == "framed"
+            non_git_worker = bool(a.start and not a.explain
+                                  and non_git_decision.get("kind") == "worker-candidate")
+            if non_git_worker and _isolates_worktree(selection):
+                raise ValueError(f"{non_git_decision['cause']}; source-mutating worker route; "
+                                 f"{non_git_decision['next']}")
             if _isolates_worktree(selection) or is_framed:
                 approved_leg_cwd = bool((route_plan_binding or {}).get("leg", {}).get("cwd"))
                 prep_key = _compose_preparation_key(compose_args, route_plan_binding, a.prompt_file)
@@ -11892,7 +12444,10 @@ def main():
                 }
                 if is_framed:
                     prepare_kwargs["framed_start"] = True
-                worktree = prepare_isolated_worktree(**prepare_kwargs)
+                if non_git_worker:
+                    worktree = {"state": "skipped", "reason": "non-git-artifact-only"}
+                else:
+                    worktree = prepare_isolated_worktree(**prepare_kwargs)
                 if not (is_framed and worktree.get("state") == "failed"):
                     print("worktree_prepared=" + worktree["state"] + "".join(
                         f" {key}={worktree[key]}" for key in ("path", "branch", "base", "reason")
@@ -11947,7 +12502,7 @@ def main():
             from work_start import start_work
             jobs=Path(a.jobs or _compose_default_jobs())
             access_change=_record_access_change(route,jobs)
-            print("\n".join(compose_decision_lines(route)), file=sys.stderr, flush=True)
+            print("\n".join(compose_decision_lines(route, non_git_decision)), file=sys.stderr, flush=True)
             started=start_work(route,path,jobs)
             if access_change is not None:
                 started={**started,"access_change":access_change}
@@ -11959,7 +12514,8 @@ def main():
         _route_autoclose(artifact_root,"compose",route)
         print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin,
                            route_plan_unreadable=route_plan_unreadable,
-                           campaign_selection=_campaign_for_card, include_decisions=not a.start),file=sys.stderr)
+                           campaign_selection=_campaign_for_card, include_decisions=not a.start,
+                           non_git_decision=non_git_decision),file=sys.stderr)
         return 0
     if a.command=="correct":
         from dispatch_owner_input import submit, inspect, InputError
@@ -12212,6 +12768,8 @@ def main():
             if not getattr(a, "route", None) or not getattr(a, "evidence", None):
                 print("capability-route: complete requires --route and --evidence (omit only with --inline)", file=sys.stderr)
                 raise SystemExit(2)
+        if a.command == "revise":
+            a.route = resolve_route_argument(a.route, a.jobs)
         route=verify_route(
             json.loads(Path(a.route).read_text()), getattr(a,"cwd",None),
             allow_stale_registry=a.command=="close",
@@ -12272,6 +12830,7 @@ def main():
             if a.output: atomic_write(a.output, marker)
             print(json.dumps(marker,sort_keys=True))
             print(f"tombstoned={','.join(result['tombstoned']) or '-'}",file=sys.stderr)
+            print(f"kept={','.join(result.get('kept') or []) or '-'}",file=sys.stderr)
         elif a.command=="close":
             # An unproven terminal gate is recorded and warned about below, never refused:
             # the refusal was bypassed almost every time it fired.

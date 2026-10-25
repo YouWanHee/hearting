@@ -20,7 +20,6 @@ inventory. It is adapter-owned output, not a legacy runtime mode copy.
 ## Use
 
 - Use Codex file, terminal, approval, sandbox, hook, and skill surfaces.
-- Run `adapters/codex/bin/preflight.sh write <file> [session-id]` before edits.
 - For `tool-contract` modes, run the named contract check before claiming the tool-backed result.
 - If a required local provider or executable is unavailable, report the unavailable contract instead of silently downgrading.
 - Treat `adapters/codex/modes/plan/frame.md` as the adapter-owned mode guide for this runtime.
@@ -90,6 +89,10 @@ anything commits.
    alternative was rejected. If the honest verdict is "insufficient evidence to
    choose", say so explicitly and name the single missing fact — do not emit a
    survey without a verdict.
+   Extending the closest existing implementation or verification asset of the
+   same function is the default. A new module or code path beside it explains
+   why extension does not fit and compares rough files/changed lines and time
+   for both options.
 5. **Write the direction brief** to the exact output path given in the prompt,
    using the schema below. Under producer cutover, a relative shard path is
    rooted at `AGENT_ARTIFACT_OUTPUT_DIR` (the open cycle's `artifacts/`), not
@@ -159,6 +162,8 @@ created: {YYYY-MM-DD}
    invalid has no proposal; it never blocks the brief.
 
 ## Constraints
+
+For GPU measurements or training in a code route, place the work in a borrowed compute part such as `autopilot-lab:smoke` or `autopilot-lab:full-run`.
 
 - **Produce the direction brief only** — no plan steps, no implementation, no
   source edits. Section 8 names which parts run in which order, not what each

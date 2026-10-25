@@ -624,6 +624,12 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                     raise _contract_error("owner-closure-intensity-unknown", "owner-closure-intensity-unknown:" + route["effective_intensity"])
                 raise
         worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
+        # Strict terminal no-start rows remain in the physical registry and in
+        # dispatch-node's lineage view, but are not launched rounds. Derive the
+        # exclusion from the same launch-fence proof used by retry admission.
+        from dispatch_contract import terminal_attempt_never_started
+        rows = [(status, meta) for status, meta in rows
+                if not terminal_attempt_never_started(status, meta)]
         kinds = [_ROUND.classify_round_row(s, m, worker_type=m.get("worker_type") or worker_type) for s, m in rows]
         source_digest = facts.get("source_subject_digest")
         source_aware = False
@@ -2540,10 +2546,8 @@ def bind_launch_access(args, *, runtime: str, default_roots, network_available: 
             # Prospective probes without an access request need no live owner.
             # A requested grant, including in dry-run, uses start's exact lookup.
             try:
-                repo = subprocess.check_output(
-                    ["git", "-C", str(args.worktree), "rev-parse", "--show-toplevel"],
-                    text=True, stderr=subprocess.DEVNULL,
-                ).strip()
+                from dispatch_contract import work_root_identity
+                repo = work_root_identity(args.worktree, route=route)
                 args.parent_binding = resolve_live_parent_attempt(
                     args.jobs_path, parent_slug=getattr(args, "parent_slug", None) or "",
                     repo=repo,
@@ -2652,13 +2656,12 @@ def _admit_supervised_owner_resource_start(args, agent_home, jobs):
         raise _contract_error("resource-owner-start-requires-live-parent", str(route_node))
     from dispatch_contract import (
         DispatchContractError, parent_lookup_worktree, resolve_live_parent_attempt,
+        work_root_identity,
     )
     import dispatch_owner_input as INPUT
     import subprocess
     try:
-        repo = subprocess.check_output(
-            ["git", "-C", args.worktree, "rev-parse", "--show-toplevel"], text=True,
-        ).strip()
+        repo = work_root_identity(args.worktree, route=route)
         owner = resolve_live_parent_attempt(
             Path(jobs),
             parent_slug=getattr(args, "parent_slug", None) or "",

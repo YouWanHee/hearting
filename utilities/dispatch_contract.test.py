@@ -219,7 +219,13 @@ class FrameLaunchGateTest(unittest.TestCase):
    records=[json.loads(line) for line in (base/"degradations"/"rt-launch-ledger.jsonl").read_text().splitlines()]
    self.assertEqual(len(records),1)
    self.assertEqual(records[0]["writer"],"dispatch_contract.py")
+   self.assertEqual(records[0]["reason"],"frame-single-available-harness")
    self.assertEqual(records[0]["prior_attempt_ids"],["att-capacity"])
+   D.record_frame_launch_degradation(route,jobs,[],"att-first","codex",
+       reason="frame-other-harness-unusable",detail='{"codex":"limited"}')
+   records=[json.loads(line) for line in (base/"degradations"/"rt-launch-ledger.jsonl").read_text().splitlines()]
+   self.assertEqual(records[-1]["reason"],"frame-other-harness-unusable")
+   self.assertEqual(records[-1]["detail"],"[detail omitted]")
    with mock.patch("dispatch_degradation.record_degradation",return_value=None):
     self.assertIsNone(D.record_frame_launch_degradation(route,jobs,["att-capacity"],"att-first","codex"))
 
@@ -369,6 +375,20 @@ class FrameLaunchGateTest(unittest.TestCase):
 
 
 class DispatchContractTest(unittest.TestCase):
+ def test_repository_diagnosis_keeps_git_non_git_and_broken_git_distinct(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td);repo=root/"repo";repo.mkdir()
+   subprocess.run(["git","init","-q",str(repo)],check=True)
+   child=repo/"nested";child.mkdir()
+   self.assertEqual(D.diagnose_repository_start(child)["state"],"git")
+   self.assertEqual(D.work_root_identity(child),str(repo.resolve()))
+   plain=root/"plain";plain.mkdir()
+   self.assertEqual(D.diagnose_repository_start(plain)["state"],"non-git")
+   with self.assertRaisesRegex(D.DispatchContractError,"non-git-route-identity-unbound"):
+    D.work_root_identity(plain)
+   broken=root/"broken";broken.mkdir();(broken/".git").mkdir()
+   self.assertEqual(D.diagnose_repository_start(broken)["state"],"error")
+
  def test_access_observation_exempts_exiting_and_vanished_processes_only(self):
   entry=Path("/proc/4242")
   stat_tail=lambda state,flags: "4242 (fixture) %s 1 2 3 4 5 %d 7 8 9 10 11 12 13 14 15 16 17 18 99" % (state,flags)
@@ -2192,6 +2212,68 @@ class DispatchContractTest(unittest.TestCase):
   for fields in negatives:
    with self.subTest(fields=fields):
     self.assertFalse(D.attempt_row_withdrawn_before_launch(fields))
+
+ def test_terminal_never_started_is_shared_and_rejects_conflicting_evidence(self):
+  base={"route_id":"rt-no-start","route_node":"plan-check","attempt_id":"att-no-start",
+        "launch_claimed":"0","launch_outcome":"never-launched"}
+  for status in ("done","cancelled","killed"):
+   fields=attempt_row(base,status=status).split("\t")
+   self.assertTrue(D.attempt_row_terminal_never_started(fields))
+   self.assertTrue(D.terminal_attempt_never_started(status,D.parse_registry_metadata(fields[5])))
+  negatives=(
+   ("open",base), ("running",base), ("done",{k:v for k,v in base.items() if k!="launch_claimed"}),
+   ("done",{**base,"launch_claimed":"1"}), ("done",{**base,"pid":"123"}),
+   ("done",{**base,"launch_started":"1"}), ("done",{**base,"launch_outcome":"started"}),
+   ("done",{**base,"note":"completed-marker"}),
+  )
+  for status,metadata in negatives:
+   with self.subTest(status=status,metadata=metadata):
+    self.assertFalse(D.attempt_row_terminal_never_started(attempt_row(metadata,status=status).split("\t")))
+
+ def test_no_start_rejects_every_persisted_child_identity_but_ignores_parent_lineage(self):
+  base={"route_id":"rt-no-start","route_node":"plan-check","attempt_id":"att-no-start",
+        "launch_claimed":"0","launch_outcome":"never-launched"}
+  identities={"pid":"41","pid_start":"900","pid_scope":"namespace-local",
+              "pid_host":"1041","pid_host_start":"900","pid_ns":"pid:[12]",
+              "pid_observer_ns":"pid:[12]","pgid":"41","pgid_host":"1041"}
+  for key,value in identities.items():
+   metadata={**base,key:value}
+   with self.subTest(identity=key):
+    self.assertFalse(D.attempt_row_never_started(
+     attempt_row(metadata,status="open").split("\t")))
+    fields=attempt_row(metadata,status="done").split("\t")
+    self.assertFalse(D.attempt_row_terminal_never_started(fields))
+    self.assertFalse(D.terminal_attempt_never_started(
+     "done",D.parse_registry_metadata(fields[5])))
+
+  lineage={**base,"parent_attempt_id":"att-parent","parent_pid":"41",
+           "parent_pid_start":"900","dispatch_depth":"2",
+           "worker_type":"stage","registered_worker":"1"}
+  fields=attempt_row(lineage,status="done").split("\t")
+  self.assertTrue(D.attempt_row_terminal_never_started(fields))
+  self.assertTrue(D.terminal_attempt_never_started(
+   "done",D.parse_registry_metadata(fields[5])))
+
+ def test_terminal_no_start_keeps_pending_and_reviewed_conflicting_results(self):
+  import base64
+  base={"launch_claimed":"0","launch_outcome":"never-launched",
+        "note":"dead-capacity","failure_class":"capacity"}
+  history={"late-result":{"note":"completed-marker","failure_class":"pass"}}
+  for reviewed in (False,True):
+   if reviewed: history["late-result"]["review_sha256"]="f"*64
+   encoded=base64.b64encode(json.dumps(history).encode()).decode()
+   metadata={**base,"terminal_conflict":"1","terminal_conflicts_b64":encoded}
+   self.assertEqual(D.terminal_conflict_pending(metadata),not reviewed)
+   self.assertFalse(D.terminal_attempt_never_started("done",metadata))
+   self.assertFalse(D.attempt_row_terminal_never_started(
+    attempt_row(metadata,status="done").split("\t")))
+  for extra in ({"terminal_conflict":"1"},{"terminal_conflicts_b64":encoded},
+                {"terminal_conflicts_b64":"unreadable-history"},
+                {"conflicting_terminal_note":"completed-review-blocking"},
+                {"conflicting_failure_class":"fail"}):
+   with self.subTest(extra=extra):
+    self.assertFalse(D.terminal_attempt_never_started("done",{**base,**extra}))
+  self.assertTrue(D.terminal_attempt_never_started("done",base))
 
  def test_claimed_spawn_rechecks_parent_and_publishes_identity_under_lock(self):
   with tempfile.TemporaryDirectory() as td:

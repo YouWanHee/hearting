@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import errno
 import fcntl
+import functools
 import hashlib
 import json
 import math
@@ -1275,10 +1276,19 @@ def resolve_parent_extinction(
     return ParentExtinctionEvidence("unproven", "parent-extinction-unproven:" + process.reason, parent_id)
 
 
-def parse_registry_metadata(pipe: str) -> dict[str, str]:
-    """Parse the stable six-column registry's comma-delimited metadata."""
+@functools.lru_cache(maxsize=8192)
+def _registry_metadata_items(pipe: str) -> tuple[tuple[str, str], ...]:
+    return tuple(dict(part.split("=", 1) for part in pipe.split(",") if "=" in part).items())
 
-    return dict(part.split("=", 1) for part in pipe.split(",") if "=" in part)
+
+def parse_registry_metadata(pipe: str) -> dict[str, str]:
+    """Parse the stable six-column registry's comma-delimited metadata.
+
+    One prompt-hook sweep reads the same rows many times; the parse is cached by
+    the row text and every caller still gets its own dict.
+    """
+
+    return dict(_registry_metadata_items(pipe))
 
 
 # SD-156: attempt registration's source-lineage fields. One name per fact, so
@@ -1904,6 +1914,122 @@ def canonical_repository_identity(path: str | Path) -> str:
     if not common.is_absolute():
         common = candidate / common
     return str(common.resolve(strict=False))
+
+
+def diagnose_repository_start(path: str | Path) -> dict[str, str]:
+    """Distinguish a normal non-Git folder from a broken/unavailable Git probe."""
+    candidate = Path(path).expanduser().resolve(strict=False)
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    env.pop("LANGUAGE", None)
+    try:
+        result = subprocess.run(["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+                                text=True, capture_output=True, timeout=60, env=env)
+        if result.returncode == 0:
+            bare = subprocess.run(["git", "-C", str(candidate), "rev-parse", "--is-bare-repository"],
+                                  text=True, capture_output=True, timeout=60, env=env)
+            if bare.returncode or bare.stdout.strip() == "true":
+                return {"state": "error", "detail": (bare.stderr or "bare Git repository").strip()}
+            return {"state": "git", "root": result.stdout.strip()}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"state": "error", "detail": f"{type(exc).__name__}: {exc}"}
+    stderr = result.stderr or ""
+    if ("not a git repository (or any" in stderr.lower()
+            and not os.path.lexists(candidate / ".git")):
+        return {"state": "non-git", "detail": stderr}
+    return {"state": "error", "detail": stderr or f"git exited {result.returncode}"}
+
+
+def validated_unversioned_route(path: str | Path, *, environ=None) -> dict | None:
+    """Return a currently valid bound unversioned route, otherwise no authority."""
+    if diagnose_repository_start(path).get("state") != "non-git":
+        return None
+    env = os.environ if environ is None else environ
+    route_file = env.get("AGENT_ROUTE_FILE") or env.get("AGENT_OWNER_ROUTE_FILE")
+    if not route_file:
+        return None
+    try:
+        route_path = Path(route_file).expanduser().resolve(strict=True)
+        route = json.loads(route_path.read_text(encoding="utf-8"))
+        sealed = _route_module().verify_route(route, expected_cwd=str(path))
+        if sealed.get("source_commit") != "unversioned":
+            return None
+        expected_id = env.get("AGENT_ROUTE_ID") or env.get("AGENT_OWNER_ROUTE_ID")
+        expected_hash = env.get("AGENT_ROUTE_HASH") or env.get("AGENT_OWNER_ROUTE_HASH")
+        if expected_id and expected_id != sealed.get("route_id"):
+            return None
+        if expected_hash and expected_hash != sealed.get("route_hash"):
+            return None
+        return sealed
+    except (OSError, ValueError, TypeError, DispatchContractError, json.JSONDecodeError):
+        return None
+
+
+def work_root_identity(path: str | Path, *, route: dict | None = None,
+                       route_file: str | Path | None = None,
+                       allow_sealed_repo_fallback: bool = False) -> str:
+    """Git toplevel identity, or canonical cwd for a validated unversioned route."""
+    candidate = Path(path).expanduser().resolve(strict=False)
+    if route_file:
+        return launch_repository_identity(candidate, route_file)[0]
+    if isinstance(route, dict) and route.get("source_commit") == "unversioned":
+        try:
+            sealed = _route_module().verify_route(route, expected_cwd=str(candidate))
+        except (ValueError, TypeError) as exc:
+            raise DispatchContractError("non-git-route-identity-unbound", str(exc)) from exc
+        if sealed.get("source_commit") == "unversioned":
+            return str(candidate)
+        raise DispatchContractError("non-git-route-identity-unbound")
+    if isinstance(route, dict):
+        try:
+            result = subprocess.check_output(
+                ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+                text=True, stderr=subprocess.DEVNULL,
+            ).strip()
+            if result:
+                return str(Path(result).resolve(strict=False))
+        except (OSError, subprocess.SubprocessError) as exc:
+            if allow_sealed_repo_fallback and route.get("repo"):
+                diagnosis = diagnose_repository_start(candidate)
+                if diagnosis.get("state") in {"error", "non-git"}:
+                    return str(Path(route["repo"]).expanduser().resolve(strict=False))
+            raise DispatchContractError("repository-identity-unavailable", str(exc)) from exc
+        raise DispatchContractError("repository-identity-unavailable", "empty Git toplevel")
+    diagnosis = diagnose_repository_start(candidate)
+    if diagnosis["state"] == "git":
+        return str(Path(diagnosis["root"]).resolve(strict=False))
+    if diagnosis["state"] != "non-git":
+        raise DispatchContractError("repository-identity-unavailable", diagnosis.get("detail", ""))
+    sealed = validated_unversioned_route(candidate)
+    if not isinstance(sealed, dict) or sealed.get("source_commit") != "unversioned":
+        raise DispatchContractError("non-git-route-identity-unbound")
+    return str(candidate)
+
+
+def launch_repository_identity(path: str | Path, route_file: str | Path | None) -> tuple[str, str]:
+    """Resolve launch identity while admitting only a validated artifact-only non-Git route."""
+    candidate = Path(path).expanduser().resolve(strict=False)
+    diagnosis = diagnose_repository_start(candidate)
+    if diagnosis["state"] == "git":
+        return str(Path(diagnosis["root"]).resolve(strict=False)), "git"
+    if diagnosis["state"] != "non-git" or not route_file:
+        raise DispatchContractError("not-a-git-worktree", diagnosis.get("detail", ""))
+    try:
+        route = json.loads(Path(route_file).expanduser().read_text(encoding="utf-8"))
+        sealed = _route_module().verify_route(route, expected_cwd=str(candidate))
+        if sealed.get("source_commit") != "unversioned":
+            raise ValueError("route is not sealed unversioned")
+        if _route_module()._isolates_worktree(sealed):
+            raise ValueError("source-mutating route")
+        expected_id = os.environ.get("AGENT_ROUTE_ID") or os.environ.get("AGENT_OWNER_ROUTE_ID")
+        expected_hash = os.environ.get("AGENT_ROUTE_HASH") or os.environ.get("AGENT_OWNER_ROUTE_HASH")
+        if expected_id and expected_id != sealed.get("route_id"):
+            raise ValueError("route id binding mismatch")
+        if expected_hash and expected_hash != sealed.get("route_hash"):
+            raise ValueError("route hash binding mismatch")
+    except (OSError, ValueError, TypeError, DispatchContractError, json.JSONDecodeError) as exc:
+        raise DispatchContractError("non-git-route-invalid", str(exc)) from exc
+    return str(candidate), "non-git"
 
 
 def process_start_ticks(pid: int) -> str | None:
@@ -3005,7 +3131,10 @@ def route_state_next_action(reason: str, detail: str, route_file: str | None,
         return (
             f"capability-route.py revise {route_arg} --node {target} "
             f"--evidence {evidence_arg} "
-            "--basis review-findings|user-direction|owner-correction"
+            "--basis <review-findings|user-direction|owner-correction> "
+            "[--answers <downstream review/test verdict attempt ids>] "
+            "[--direction <gate-release-id|memo-path>] [--reason <text>] "
+            "--author-attempt-id <attempt that made the change>"
         )
     if reason == "completion-marker-missing":
         return (
@@ -7323,7 +7452,9 @@ def frame_harness_admission(route: dict, jobs: Path, lines: list[str],
 
 
 def record_frame_launch_degradation(route: dict, jobs: Path, proof_ids: list[str],
-                                    first_attempt: str, harness: str) -> None:
+                                    first_attempt: str, harness: str,
+                                    reason: str = "frame-single-available-harness",
+                                    detail: str | None = None) -> None:
     """Record launch-time frame degradation through the existing contract writer.
 
     SD-93d makes this observation best effort; admission remains authoritative.
@@ -7332,9 +7463,9 @@ def record_frame_launch_degradation(route: dict, jobs: Path, proof_ids: list[str
     record_degradation(route_id=route["route_id"], route_hash=route["route_hash"],
         route_node="frame-alternative", dispatch_depth=1, writer="dispatch_contract.py",
         jobs=jobs, fallback_hop="same-harness-headless",
-        execution_surface="registered-headless", reason="frame-single-available-harness",
+        execution_surface="registered-headless", reason=reason,
         prior_attempt_ids=proof_ids, attempt_trace=[first_attempt], harness=harness,
-        detail=json.dumps({"proof_ids": proof_ids}))
+        detail=detail or json.dumps({"proof_ids": proof_ids}))
 
 
 def _frame_pair_attempt_gate(route: dict, node: dict, markers: dict,
@@ -8572,14 +8703,7 @@ def record_evidence_change(
                     and previous.get("marker_sequence") == marker.get("sequence")
                     and previous.get("change_kind", "edited") == change_kind):
                 return
-            changed_at = None
-            evidence_path = Path(str(evidence.get("path") or ""))
-            try:
-                changed_at = datetime.fromtimestamp(
-                    evidence_path.stat().st_mtime, tz=timezone.utc,
-                ).isoformat().replace("+00:00", "Z")
-            except (OSError, ValueError):
-                pass
+            changed_at = _evidence_mtime_text(Path(str(evidence.get("path") or "")))
             command = [Path(sys.argv[0]).name] if sys.argv and sys.argv[0] else []
             command += [arg for arg in sys.argv[1:] if not arg.startswith("-")][:1]
             record = {
@@ -8635,6 +8759,21 @@ def note_evidence_change(
     elif (currency.state == "current" and currency.evidence_digest
           and currency.evidence_digest != evidence.get("sha256")):
         record_evidence_change(route, node, marker_path, marker, currency.evidence_digest)
+    elif (currency.state == "current" and currency.evidence_digest
+          and currency.evidence_digest == evidence.get("sha256")):
+        history = evidence_change_history(marker_path, str(node.get("id")))
+        if (history and history[-1].get("marker_sequence") == marker.get("sequence")
+                and history[-1].get("sha256") != evidence.get("sha256")):
+            record_evidence_change(route, node, marker_path, marker, str(evidence.get("sha256")),
+                                   change_kind="reverted")
+
+
+def _evidence_mtime_text(path: Path) -> str | None:
+    """Return evidence mtime in the exact UTC format used by evidence history."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    except (OSError, ValueError):
+        return None
 
 
 def evidence_change_history(marker_path: Path, node_id: str) -> list[dict[str, object]]:
@@ -11654,30 +11793,92 @@ class RefusedChainClose:
     unclosed_delivery: tuple[str, ...]
 
 
+_NO_START_PROCESS_IDENTITY_KEYS = (
+    "pid",
+    "pid_start",
+    "pid_scope",
+    "pid_host",
+    "pid_host_start",
+    "pid_host_ns",
+    "pid_host_proof",
+    "pid_ns",
+    "pid_observer_ns",
+    "pgid",
+    "pgid_host",
+    "launch_cgroup_b64",
+    "launch_cgroup_ns",
+    "group_reap_proof",
+    "group_reap_pgid",
+    "attempt_descendant_proof",
+    "attempt_descendant_observer_ns",
+    "attempt_descendant_residue",
+    "attempt_descendant_residue_count",
+    "attempt_descendant_residue_basis",
+    "attempt_descendant_residue_at",
+    "reap_watch",
+    "reap_watch_pid",
+    "post_exit_receipt_substitute",
+)
+
+
+def _has_persisted_process_identity(metadata: Mapping[str, str]) -> bool:
+    """Any child identity or descendant/reap evidence contradicts no-start."""
+    return any(metadata.get(key) for key in _NO_START_PROCESS_IDENTITY_KEYS)
+
+
 def attempt_row_never_started(fields: list[str]) -> bool:
     """Prove that a row has never crossed the durable launch fence."""
 
     if len(fields) != 6:
         return False
     metadata = parse_registry_metadata(fields[5])
-    # A claimed row, a row carrying a PID, and a reaped-before-publish row all
-    # remain supervisor-reconciliation evidence. Only an untouched open row or
-    # an explicitly adapter-closed never-launched row with no claim/identity
-    # can be proven never started here.
+    # A claimed row, any persisted child identity, and a reaped-before-publish
+    # row remain supervisor-reconciliation evidence. Parent lineage and
+    # registration metadata are deliberately not execution identity.
     return (
         metadata.get("launch_started") != "1"
         and metadata.get("launch_claimed") == "0"
-        and not metadata.get("pid")
+        and not _has_persisted_process_identity(metadata)
         and metadata.get("launch_outcome", "") in {"", "never-launched"}
     )
+
+
+def attempt_row_terminal_never_started(fields: list[str]) -> bool:
+    """True only for a terminal row carrying strict never-started fence proof."""
+    if len(fields) != 6 or fields[1] not in {"done", "cancelled", "killed"}:
+        return False
+    return terminal_attempt_never_started(fields[1], parse_registry_metadata(fields[5]))
+
+
+def terminal_attempt_never_started(status: str, metadata: Mapping[str, str]) -> bool:
+    """Metadata form of the same terminal no-start proof for semantic censuses."""
+    if status not in {"done", "cancelled", "killed"}:
+        return False
+    if metadata.get("launch_outcome") != "never-launched":
+        return False
+    if (metadata.get("launch_started") == "1" or metadata.get("launch_claimed") != "0"
+            or _has_persisted_process_identity(metadata)):
+        return False
+    # Reviewing a terminal conflict records its inspection, not which outcome
+    # was correct. Retained contradictory results still preclude strict proof.
+    if (metadata.get("terminal_conflict") == "1"
+            or any(metadata.get(key) for key in (
+                "terminal_conflicts_b64", "conflicting_terminal_note", "conflicting_failure_class"))):
+        return False
+    # A committed work result contradicts a never-launched disposition.
+    if (metadata.get("note") in SUCCESS_NOTES
+            or metadata.get("note") in {"completed-review-blocking", "dead-worker-fail"}
+            or metadata.get("failure_class") in {"pass", "success", "fail", "blocked"}):
+        return False
+    return True
 
 
 def attempt_row_withdrawn_before_launch(fields: list[str]) -> bool:
     """Identify a never-started registration withdrawn under the jobs lock.
 
-    An unclaimed open row may still be launched. Only a terminal row explicitly
-    closed as cancelled has lost that launch authority and can leave the round
-    census without hiding a real pre-launch failure.
+    An unclaimed open row may still be launched. This helper names only the
+    cancellation-specific subset; `attempt_row_terminal_never_started` is the
+    broader strict predicate used by round census and retry.
     """
 
     if len(fields) != 6 or not attempt_row_never_started(fields):
