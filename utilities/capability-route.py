@@ -779,19 +779,26 @@ def _continuation_reused_evidence(route, node):
         raise ValueError(
             f"continuation-source-node-unverified:{node_id}:attempt-link"
         )
-    attempt_id=marker.get("attempt_id")
-    if not isinstance(attempt_id,str) or not attempt_id:
-        raise ValueError(
-            f"continuation-source-node-unverified:{node_id}:terminal-attempt"
-        )
-    link_path=_attempt_completion_path(route,node_id,attempt_id,jobs=jobs)
+    from dispatch_contract import resource_completion_reuse_proof
     try:
-        link_bytes=link_path.read_bytes()
-        link=json.loads(link_bytes)
-    except (OSError,ValueError) as exc:
-        raise ValueError(
-            f"continuation-source-node-unverified:{node_id}:attempt-sidecar"
-        ) from exc
+        resource_proof = resource_completion_reuse_proof(route, node, marker_path, marker, jobs)
+    except DispatchContractError as exc:
+        raise ValueError(f"continuation-source-node-unverified:{node_id}:{exc.reason}") from exc
+    attempt_id=marker.get("attempt_id")
+    link={}; link_bytes=b""
+    if resource_proof is None:
+        if not isinstance(attempt_id,str) or not attempt_id:
+            raise ValueError(
+                f"continuation-source-node-unverified:{node_id}:terminal-attempt"
+            )
+        link_path=_attempt_completion_path(route,node_id,attempt_id,jobs=jobs)
+        try:
+            link_bytes=link_path.read_bytes()
+            link=json.loads(link_bytes)
+        except (OSError,ValueError) as exc:
+            raise ValueError(
+                f"continuation-source-node-unverified:{node_id}:attempt-sidecar"
+            ) from exc
     verdict=str(link.get("verdict") or marker.get("verdict") or "PASS").upper()
     if verdict != "PASS":
         raise ValueError(
@@ -804,7 +811,7 @@ def _continuation_reused_evidence(route, node):
         raise ValueError(
             f"continuation-source-node-unverified:{node_id}:marker-history"
         ) from exc
-    quiescence_digest=(
+    quiescence_digest=(_sha256_record({"resource":resource_proof,"marker_history_digest":history_digest}) if resource_proof is not None else (
         link.get("quiescence_proof_digest")
         or marker.get("quiescence_proof_digest")
         or _sha256_record({
@@ -813,7 +820,7 @@ def _continuation_reused_evidence(route, node):
             "marker_history_digest":history_digest,
             "terminal_marker_current":True,
         })
-    )
+    ))
     if not isinstance(quiescence_digest,str) or not quiescence_digest:
         raise ValueError(
             f"continuation-source-node-unverified:{node_id}:quiescence-proof"
@@ -833,6 +840,8 @@ def _continuation_reused_evidence(route, node):
         "output_evidence_digest":str(evidence.get("sha256")),
         "contract_hash":_continuation_contract_hash(node),
         "new_attempt_count":0,
+        **({key: resource_proof[key] for key in ("resource_execution_identity", "resource_sha256")}
+           if resource_proof is not None else {}),
     }
     last_turn_id=(
         link.get("last_turn_id") or link.get("lastTurnId")
@@ -9918,6 +9927,9 @@ def _continuation_node_projection(parent_node, reused_nodes):
                 "contract_hash": reused_by_id[dependency].get("contract_hash"),
                 "marker_digest": reused_by_id[dependency].get("marker_digest"),
                 "terminal_attempt_id": reused_by_id[dependency].get("terminal_attempt_id"),
+                **{key: reused_by_id[dependency][key]
+                   for key in ("resource_execution_identity", "resource_sha256")
+                   if key in reused_by_id[dependency]},
             }
             for dependency in satisfied
         ]

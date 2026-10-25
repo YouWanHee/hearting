@@ -1384,7 +1384,7 @@ def validate_dispatch_modes(args: argparse.Namespace) -> int:
 
 def validate_route_record(args: argparse.Namespace) -> int:
     return WRAPPER_COMMON.validate_route_record(
-        args, marker_gate=completion_marker_gate,
+        args, marker_gate=completion_marker_gate, runtime_harness="claude",
     )
 
 
@@ -2025,12 +2025,17 @@ def main(argv: list[str]) -> int:
             grant_route_id = args.owner_route_binding.route_id
             grant_route_hash = args.owner_route_binding.route_hash
         if grant_route_id and grant_route_hash:
+            from verification_runtime import effective_scope
+            local_verification = effective_scope(args, [*default_roots,
+                *(args.execution_access_grant.writable_roots if args.execution_access_grant else ())],
+                "claude", env)
             effective_path, effective_sha256 = publish_effective_grant(
                 jobs=jobs, attempt_id=args.attempt_id, route_id=grant_route_id,
                 route_hash=grant_route_hash,
                 runtime=("claude-supervisor" if args.resolved_completion_delivery == "session-resume-supervised" else "claude-cli"),
                 sandbox="adapter-default", grant=args.execution_access_grant,
                 default_writable_roots=default_roots,
+                verification_scope=local_verification,
                 network_allowed=bool(getattr(args, "task_publish_scope", None)),
             )
             launch_metadata["execution_access_effective_file"] = str(effective_path)

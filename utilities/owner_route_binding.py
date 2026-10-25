@@ -1342,8 +1342,9 @@ def validate_runtime_requirements(
     )
     if node is None:
         raise OwnerRouteBindingError("route-node-unknown")
-    requirements = node.get("runtime_requirements") or []
-    unsupported = set(requirements).difference(supported or set())
+    from verification_runtime import runtime_requirements
+    requirements = runtime_requirements(route, node_id)
+    unsupported = requirements.difference(supported or set())
     if "loopback-listen" in unsupported:
         raise OwnerRouteBindingError("loopback-only-unsupported")
     if unsupported:

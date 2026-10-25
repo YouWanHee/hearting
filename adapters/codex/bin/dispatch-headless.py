@@ -1022,8 +1022,13 @@ def resolve_completion_delivery(args: argparse.Namespace) -> str:
                 "supervised completion is scoped to registered dispatch-depth-1 owners",
             )
         if getattr(args, "worker_type", None) in {"stage", "review"}:
+            available = codex_app_server_available()
+            if not available:
+                from verification_runtime import bound_lab_context
+                if bound_lab_context(args) is not None:
+                    raise DispatchContractError("loopback-only-unsupported", "local verification needs the checked App Server transport")
             args.resolved_stage_telemetry_transport = (
-                "app-server-one-turn" if codex_app_server_available() else "raw-exec"
+                "app-server-one-turn" if available else "raw-exec"
             )
         return "one-shot"
     standard_plus = _completion_owner(args)
@@ -1145,6 +1150,11 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             " ".join(shlex.quote(x) for x in [*writer, *command])
             + f" < {shlex.quote(str(prompt_path))}"
         )
+    from verification_runtime import bound_lab_context
+    if bound_lab_context(args) is not None:
+        # A legacy exec config can override a named profile with sandbox_mode.
+        # This requirement uses the negotiated App Server profile selector.
+        raise DispatchContractError("loopback-only-unsupported", "local verification needs the checked App Server transport")
     cmd = [
         "codex",
         "exec",
@@ -1514,7 +1524,7 @@ def bind_internal_eligibility_probe(args: argparse.Namespace) -> None:
 
 def validate_route_record(args: argparse.Namespace) -> int:
     return WRAPPER_COMMON.validate_route_record(
-        args, marker_gate=completion_marker_gate,
+        args, marker_gate=completion_marker_gate, runtime_harness="codex",
     )
 
 
@@ -2236,12 +2246,17 @@ def main(argv: list[str]) -> int:
             grant_route_id = args.owner_route_binding.route_id
             grant_route_hash = args.owner_route_binding.route_hash
         if grant_route_id and grant_route_hash:
+            from verification_runtime import effective_scope
+            local_verification = effective_scope(args, [*default_roots,
+                *(args.execution_access_grant.writable_roots if args.execution_access_grant else ())],
+                "codex", dispatch_env)
             effective_path, effective_sha256 = publish_effective_grant(
                 jobs=jobs, attempt_id=args.attempt_id, route_id=grant_route_id,
                 route_hash=grant_route_hash,
                 runtime=("codex-app-server" if args.resolved_completion_delivery == "app-server-supervised" else "codex-exec"),
                 sandbox=effective_runtime_sandbox(args), grant=args.execution_access_grant,
                 default_writable_roots=default_roots,
+                verification_scope=local_verification,
                 network_allowed=args.nested_headless_network,
                 execution_selection=args.gpu_execution_selection,
             )

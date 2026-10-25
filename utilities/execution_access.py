@@ -147,6 +147,7 @@ class ParentGrant:
     sandbox: str = ""
     file_enforcement: str = "none"
     network_enforcement: str = "none"
+    verification_scope: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -1820,6 +1821,7 @@ def publish_effective_grant(
     default_writable_roots: Iterable[str | Path],
     network_allowed: bool,
     execution_selection: Mapping[str, object] | None = None,
+    verification_scope: Mapping[str, object] | None = None,
 ) -> tuple[Path, str]:
     """Publish the exact filesystem/network effect used by one attempt."""
 
@@ -1871,6 +1873,13 @@ def publish_effective_grant(
         if _os_sandboxed(runtime) and sandbox == "danger-full-access":
             record.update({"boundary": "logical-request" if grant else "logical-defaults",
                            "os_filesystem_enforced": False, "os_network_enforced": False})
+    if verification_scope is not None:
+        record["verification_scope"] = dict(verification_scope)
+        if verification_scope.get("projection") == "native-profile":
+            record.update(writable_roots=list(verification_scope["write_roots"]),
+                          read_roots=list(verification_scope["read_roots"]),
+                          network_allowed=False, file_enforcement="os-sandbox",
+                          network_enforcement="os-sandbox")
     raw = _canonical_json_bytes(record)
     digest = hashlib.sha256(raw).hexdigest()
     path = state_root / "execution-access" / "attempts" / attempt_id / "effective.json"
@@ -1974,6 +1983,13 @@ def load_parent_effective_grant(
             raise ExecutionAccessError("execution-access-parent-request-changed", "request digest changed")
     elif request_digest is not None:
         raise ExecutionAccessError("execution-access-parent-record-invalid", "request digest has no request path")
+    verification_scope = record.get("verification_scope")
+    if verification_scope is not None and (
+            not isinstance(verification_scope, dict)
+            or verification_scope.get("network") != "loopback-only"
+            or verification_scope.get("projection") not in {"native-profile", "verification-command"}
+            or not isinstance(verification_scope.get("route_node"), str)):
+        raise ExecutionAccessError("execution-access-parent-record-invalid", "invalid verification scope")
     return ParentGrant(
         writable_roots=tuple(Path(root) for root in record["writable_roots"]),
         read_roots=tuple(Path(root) for root in record["read_roots"]),
@@ -1983,6 +1999,7 @@ def load_parent_effective_grant(
         sandbox=record["sandbox"],
         file_enforcement=record.get("file_enforcement", "none"),
         network_enforcement=record.get("network_enforcement", "none"),
+        verification_scope=verification_scope,
     )
 
 

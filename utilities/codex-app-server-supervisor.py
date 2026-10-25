@@ -10,6 +10,8 @@ from codex_permission_profile import (
     OWNER_OBSERVE_PROFILE_NAME,
     PROFILE_NAME,
     RECORDISH_PROFILE_NAME,
+    LOCAL_VERIFICATION_PROFILE_NAME,
+    verification_profile_config,
     commit_profile_config,
     config_arguments,
     owner_turn_profile_config,
@@ -777,6 +779,21 @@ def configure_permission_profiles(args: argparse.Namespace, command: list[str]) 
     """Prepare owner profiles; enable turn selection only on known-capable runtimes."""
     args.turn_permissions_supported = False
     args.owner_turn_permission_profiles = None
+    args.verification_profile_active = False
+    from verification_runtime import bound_lab_context
+    verification = bound_lab_context(args)
+    if verification is not None:
+        from verification_runtime import review_scope, prepare_review_directories
+        scope = review_scope(verification["route"], verification["node_id"], args.route_file)
+        prepare_review_directories(scope)
+        profile = verification_profile_config(
+            args.worktree, list(args.writable_root), args.route_file, verification["node_id"])
+        if profile is None or not turn_permissions_available(command):
+            raise SupervisorError("loopback-only-unsupported")
+        args.native_permission_profile = profile
+        args.verification_profile_active = True
+        args.turn_permissions_supported = True
+        return
     if getattr(args, "route_file", None):
         from dispatch_contract import diagnose_repository_start
         if diagnose_repository_start(args.worktree).get("state") == "non-git":
@@ -885,7 +902,9 @@ def run_turn(
     owner_projection = getattr(args, "owner_runtime_permission_state", None)
     selected_profile = None
     profiles = getattr(args, "owner_turn_permission_profiles", None)
-    if owner_projection is not None and getattr(args, "turn_permissions_supported", False) and profiles:
+    if getattr(args, "verification_profile_active", False):
+        selected_profile = LOCAL_VERIFICATION_PROFILE_NAME
+    elif owner_projection is not None and getattr(args, "turn_permissions_supported", False) and profiles:
         if owner_projection.get("observation_only"):
             selected_profile = profiles["observation"]
         elif owner_projection.get("may_commit") and args.sandbox == "workspace-write":
@@ -1192,7 +1211,9 @@ def run_one_turn(args: argparse.Namespace) -> int:
     completed_thread: str | None = None
     result_code = 70
     try:
-        server = AppServer(command, args.worktree, dict(os.environ))
+        from verification_runtime import scratch_environment
+        environment = scratch_environment() if args.verification_profile_active else dict(os.environ)
+        server = AppServer(command, args.worktree, environment)
         server.request(
             "initialize",
             {"clientInfo": {"name": "hearting-dispatch-stage",
@@ -1202,7 +1223,9 @@ def run_one_turn(args: argparse.Namespace) -> int:
         )
         server.notification("initialized")
         thread_params: dict[str, Any] = {"cwd": args.worktree, "ephemeral": True}
-        if args.native_permission_profile is None:
+        if getattr(args, "verification_profile_active", False):
+            thread_params["permissions"] = LOCAL_VERIFICATION_PROFILE_NAME
+        elif args.native_permission_profile is None:
             thread_params["sandbox"] = args.sandbox
         if args.approval != "inherit":
             thread_params["approvalPolicy"] = args.approval
@@ -1361,7 +1384,9 @@ def main(argv: list[str] | None = None) -> int:
             "cwd": args.worktree,
             "ephemeral": not RESOURCE_WAIT.durable_native_session(args),
         }
-        if args.native_permission_profile is None:
+        if getattr(args, "verification_profile_active", False):
+            thread_params["permissions"] = LOCAL_VERIFICATION_PROFILE_NAME
+        elif args.native_permission_profile is None:
             thread_params["sandbox"] = args.sandbox
         if args.approval != "inherit":
             thread_params["approvalPolicy"] = args.approval
