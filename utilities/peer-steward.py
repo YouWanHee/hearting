@@ -8134,14 +8134,14 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
                    and (agent.get("agent_session") or {}).get("value") == recipient_sid]
         if len(matches) != 1:
             for item in batch:
-                store.update(item[0]["id"], observation={"reason": "recipient-unavailable",
-                    "recipient_sid": recipient_sid})
+                store.update(item[0]["id"], observer_error="recipient-unavailable",
+                             observation={"recipient_sid": recipient_sid})
             return
         pane = matches[0].get("pane_id")
         if not isinstance(pane, str) or not pane or pane == "-":
             for item in batch:
-                store.update(item[0]["id"], observation={"reason": "recipient-unavailable",
-                    "recipient_sid": recipient_sid})
+                store.update(item[0]["id"], observer_error="recipient-unavailable",
+                             observation={"recipient_sid": recipient_sid})
             return
         if _resolve_target(pane)[:2] != (harness, recipient_sid):
             return

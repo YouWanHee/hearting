@@ -1616,7 +1616,8 @@ class NativeQueueDeliveryTest(unittest.TestCase):
         item = {"id": "queue-item-1", "clientUserMessageId": client_id}
         row = SimpleNamespace(
             attempt_id="att-one", raw="terminal-row",
-            metadata={"delivery_id": delivery_id,
+            metadata={"parent_sid": SESSION, "parent_harness": "codex",
+                      "delivery_id": delivery_id,
                       "delivery_recipient_kind": "codex-native-queue",
                       "delivery_row_revision": "revision",
                       "delivery_receipt_digest": receipt_digest},
@@ -1733,7 +1734,7 @@ class NativeQueueDeliveryTest(unittest.TestCase):
             # RA-2: a successor on another harness has no Codex queue; it reads the stored record.
             with mock.patch.object(handover, "effective_parent", return_value="claude-successor"), \
                  mock.patch.object(handover, "effective_parent_harness", return_value="claude"):
-                self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), SESSION)
+                self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), "")
             with mock.patch.object(handover, "effective_parent", side_effect=OSError("boom")):
                 self.assertEqual(module.queue_target(jobs, {"att-one"}, SESSION), SESSION)
 
@@ -1814,7 +1815,8 @@ class NativeQueueDeliveryTest(unittest.TestCase):
         item = {"id": "queue-item-1", "clientUserMessageId": client_id}
         row = SimpleNamespace(
             attempt_id="att-one", raw="terminal-row",
-            metadata={"delivery_id": delivery_id,
+            metadata={"parent_sid": SESSION, "parent_harness": "codex",
+                      "delivery_id": delivery_id,
                       "delivery_recipient_kind": "codex-native-queue",
                       "delivery_row_revision": "revision",
                       "delivery_receipt_digest": receipt_digest},
@@ -1885,7 +1887,8 @@ class NativeQueueDeliveryTest(unittest.TestCase):
         item = {"id": "queue-item-1", "clientUserMessageId": client_id}
         row = SimpleNamespace(
             attempt_id="att-one", raw="terminal-row",
-            metadata={"delivery_id": delivery_id,
+            metadata={"parent_sid": SESSION, "parent_harness": "codex",
+                      "delivery_id": delivery_id,
                       "delivery_recipient_kind": "codex-native-queue",
                       "delivery_row_revision": "revision",
                       "delivery_receipt_digest": receipt_digest},
@@ -1927,7 +1930,8 @@ class NativeQueueDeliveryTest(unittest.TestCase):
         client_id = "delivery-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
         rows = [SimpleNamespace(
             attempt_id=f"att-{index}", raw=f"row-{index}",
-            metadata={"delivery_id": delivery_id,
+            metadata={"parent_sid": SESSION, "parent_harness": "codex",
+                      "delivery_id": delivery_id,
                       "delivery_recipient_kind": "codex-native-queue",
                       "delivery_row_revision": "revision",
                       "delivery_receipt_digest": f"digest-{index}"},

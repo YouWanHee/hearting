@@ -1060,13 +1060,15 @@ def _row_binds_key(row: dict, key: tuple) -> bool:
 
 
 def _lineage_holder(rows_by_seat: dict, key: tuple, registered: str, harness: str,
-                    *, read_context=None) -> tuple[str, str]:
+                    *, read_context=None) -> tuple[str, str, str]:
     """Who answers for one logical job (jobs, route, hash, node) now.
 
     The latest row that binds the job names its holder (a later hand-off wins).  From there the
     job follows that seat's later same-seat clear rows out of the holder even when a row does
     not repeat the binding; a cross-pane ``retire`` row moves it only when it binds it.  The
-    queried session therefore answers only while it is the end of that chain."""
+    queried session therefore answers only while it is the end of that chain.
+    Keep the selected holder's disposition: an unresolved explicit handoff
+    cannot restore the registered parent or authorize the ambiguous holder."""
     graph = lineage_graph(read_context=read_context)
     latest = graph.binding_rows.get(key)
     holder = registered
@@ -1101,7 +1103,7 @@ def _lineage_holder(rows_by_seat: dict, key: tuple, registered: str, harness: st
                 harness = str(later.get("harness") or harness)
                 seen.add(sid)
     end, state = _chain_end(graph, harness, holder)
-    return (registered if state == "unresolved" else end), harness
+    return end, harness, state
 
 
 def _effective(meta: dict, jobs=None, *, read_context=None, extra_seats=()) -> tuple[str, str]:
@@ -1115,8 +1117,9 @@ def _effective(meta: dict, jobs=None, *, read_context=None, extra_seats=()) -> t
         return registered, harness
     try:
         key = (_jobs_key(jobs), *route_identity(meta))
-        return _lineage_holder({}, key,
-                               registered, harness, read_context=read_context)
+        holder, holder_harness, state = _lineage_holder(
+            {}, key, registered, harness, read_context=read_context)
+        return ("" if state == "unresolved" else holder), holder_harness
     except Exception:  # noqa: BLE001 - the registered answer is always safe
         return registered, _registered_parent_harness(meta)
 
@@ -1144,7 +1147,8 @@ def _registered_parent_harness(meta: dict) -> str:
 
 def effective_parent(meta: dict, jobs=None, *, read_context=None) -> str:
     """The session that answers for ``meta``'s attempt now: the registered ``parent_sid``, or
-    the end of its A -> B (-> C) handover lineage.  Any failure answers the registered parent."""
+    the end of its handover lineage. An observed unresolved lineage has no authority;
+    unreadable handover state retains the legacy registered-parent fallback."""
     return _effective(meta, jobs, read_context=read_context)[0]
 
 
@@ -1175,9 +1179,6 @@ def record_recipient(record: dict, storage_key: str, *, harness: str,
     ids = record.get("attempt_ids")
     if not isinstance(ids, list) or not ids or any(not isinstance(item, str) for item in ids):
         return None
-    _end, lineage_state = chain_end(harness, storage_key, read_context=read_context)
-    if lineage_state == "unresolved":
-        return None
     jobs = Path(jobs) if jobs is not None else _default_jobs()
     if jobs is None:
         return None
@@ -1191,19 +1192,23 @@ def record_recipient(record: dict, storage_key: str, *, harness: str,
         if str(meta.get("parent_sid") or "") != storage_key:
             return None
         if not eligible_row(meta):
-            targets.add(storage_key)
+            if chain_end(harness, storage_key, read_context=read_context)[1] == "unresolved":
+                return None
+            targets.add((storage_key, _registered_parent_harness(meta) or harness))
             continue
         registered = storage_key
         row_harness = _registered_parent_harness(meta) or harness
         try:
             key = (_jobs_key(jobs), *route_identity(meta))
-            target, target_harness = _lineage_holder(
+            target, target_harness, state = _lineage_holder(
                 {}, key, registered, row_harness,
                 read_context=read_context)
         except Exception:  # noqa: BLE001 - unreadable/ambiguous lineage remains pending
             return None
-        targets.add(target)
-    return next(iter(targets)) if len(targets) == 1 else None
+        if state == "unresolved":
+            return None
+        targets.add((target, target_harness))
+    return next(iter(targets))[0] if len(targets) == 1 else None
 
 
 _OWN_SEATS: dict = {}
@@ -1295,8 +1300,10 @@ def storage_recipients(session: str, env=None, harness: Optional[str] = None) ->
                     parent = str(binding.get("parent") or row.get("from") or "")
                     if not parent:
                         continue
-                    if _lineage_holder(rows_by_seat, key, parent,
-                                       str(row.get("harness") or current_harness or ""))[0] != session:
+                    holder, _holder_harness, state = _lineage_holder(
+                        rows_by_seat, key, parent,
+                        str(row.get("harness") or current_harness or ""))
+                    if state == "unresolved" or holder != session:
                         continue
                     owed.setdefault(parent, set()).add(binding["attempt"])
         for key, attempts in owed.items():

@@ -994,7 +994,7 @@ def queue_target(jobs: Path, attempts: set[str], registered: str, *,
                       for attempt in record_attempts if attempt in rows}
             if len(owners) == 1:
                 owner, harness = owners.pop()
-                return (owner or storage_key) if harness == "codex" and (owner or storage_key) == recipient else ""
+                return owner if harness == "codex" and owner == recipient else ""
             return ""
         except Exception:  # noqa: BLE001 - an unknown target must remain pending
             return ""
@@ -1006,7 +1006,9 @@ def queue_target(jobs: Path, attempts: set[str], registered: str, *,
                   for a in attempts if a in rows}
         if len(owners) == 1:
             owner, harness = owners.pop()
-            return (owner or registered) if harness == "codex" else registered
+            return owner if harness == "codex" or (not harness and owner == registered) else ""
+        if owners:
+            return ""
     except Exception:  # noqa: BLE001 - the registered parent remains a valid target
         pass
     return registered
@@ -1021,7 +1023,9 @@ def _queue_target_from_rows(jobs: Path, rows, registered: str, *, read_context=N
                   for row in rows}
         if len(owners) == 1:
             owner, harness = owners.pop()
-            return (owner or registered) if harness == "codex" else registered
+            return owner if harness == "codex" or (not harness and owner == registered) else ""
+        if owners:
+            return ""
     except Exception:  # noqa: BLE001 - the registered parent remains a safe target
         pass
     return registered
@@ -1051,6 +1055,8 @@ def _native_queue_delivery_once(
                                       read_context=PeerReadContext()))
     if delivery_target is not None and target != delivery_target:
         raise CompletionError("native-queue-target-changed")
+    if not target:
+        raise CompletionError("notice-recipient-unavailable")
     transport = {"session": session} if session is not None else {}
     thread = codex_queue_delivery._rpc(
         path, "thread/read", {"threadId": target}, timeout=5.0, **transport
@@ -1350,6 +1356,8 @@ def deliver_to_native_queue(args, receipt, attempts, *, stop_check=None):
                                             CODEX_QUEUE_PARENT_DELIVERY)
             target = _queue_target_from_rows(args.jobs, rows, args.thread_id,
                                              read_context=PeerReadContext())
+            if not target:
+                raise CompletionError("notice-recipient-unavailable")
             session = codex_queue_delivery.DeliverySession(path, timeout=5.0)
             result = _native_queue_delivery_once(
                 args, receipt, attempts, allow_enqueue=not submitted,

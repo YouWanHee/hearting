@@ -4170,7 +4170,7 @@ class SeatHandoverTest(TidyCase):
             for sid in ("sid-A", "sid-B", "sid-C", "sid-D"):
                 self.assertEqual(self.handover.chain_end("claude", sid)[1], "unresolved")
                 self.assertEqual(self.handover._lineage_successor({}, sid, "claude"), sid)
-            self.assertEqual(self.handover.effective_parent(owner, self.jobs), "sid-A")
+            self.assertEqual(self.handover.effective_parent(owner, self.jobs), "")
             self.assertFalse(self.handover.owns(owner, "sid-B", self.jobs))
         self.assertIsInstance(graph.unresolved, frozenset)
         self.assertIsInstance(graph.ledger_keys, type(__import__("types").MappingProxyType({})))

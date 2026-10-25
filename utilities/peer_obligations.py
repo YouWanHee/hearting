@@ -2269,8 +2269,13 @@ class ObligationStore:
                 # a fulfilled duty. Merge the checkpoint under the same lock.
                 if record.get("state") in {"complete", "cancelled"}:
                     return record
-                state = "unknown"
-                observation = {**(record.get("observation") or {}),
+                # A plain observer failure marks the duty unknown. A supplied
+                # availability observation leaves its current state intact.
+                state = "unknown" if observation is None else state
+                # Availability facts supplement the freshest checkpoint. They
+                # must not replace a transfer/receipt (or its recipient) written
+                # by another courier after this observer read the duty.
+                observation = {**(observation or {}), **(record.get("observation") or {}),
                                "reason": observer_error}
             if observation is not None:
                 current_observation = record.get("observation") or {}
