@@ -165,7 +165,8 @@ const session = {
   messages: async () => {
     histories++
     boundary(`history:${histories}`)
-    if (cfg.receipt === 'unknown') return {error: {name: 'unavailable'}}
+    if (cfg.receipt === 'unknown' || (cfg.receipt === 'final-unknown' && histories >= 2))
+      return {error: {name: 'unavailable'}}
     let text = cfg.history || ''
     if (handed && ['before', 'partial'].includes(cfg.receipt) && histories >= 2) text = handed.text
     if (handed && cfg.receipt === 'after' && writes) text = handed.text
@@ -284,6 +285,7 @@ try {
                      dict(historical=True, writes=0, state="acked"),
                      dict(acceptance="ambiguous", writes=1),
                      dict(receipt="unknown", writes=0),
+                     dict(receipt="final-unknown", writes=0),
                      dict(count=2, receipt="partial", writes=1),
                      dict(count=2, receipt="before", writes=0, state="acked")):
             with self.subTest(case=case):

@@ -216,7 +216,7 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
         self.assertEqual(handover.effective_parent(meta, self.jobs_path), "legacy-receipt-Y")
         messages = [{"info": {"sessionID": "legacy-receipt-Z", "role": "user"},
                      "parts": [{"type": "text", "text": text}]}]
-        evidence = sweep.opencode_messages_evidence(messages, "legacy-receipt-Z",
+        evidence = dispatch_recipient_receipt.opencode_messages_evidence(messages, "legacy-receipt-Z",
             [sweep._opencode_expected_message(text, [(stored["delivery_id"], identity)])])
         result = dispatch_recipient_receipt.settle_native_receipt(self.tmp_root, "legacy-receipt-A",
             "opencode", "legacy-receipt-Z", claimed, evidence, acked_by="fixture-exact-native")

@@ -1492,6 +1492,35 @@ for (let i = 0; i < 100 && !prompts.length; i++) await new Promise(r => setTimeo
                      ROOT / "adapters" / "codex" / "hooks" / "userprompt-lifecycle.py"):
             self.assertIn("delivery_context", hook.read_text(encoding="utf-8"))
 
+    def native_node(self):
+        native_bin = self.root / "native-node"
+        native_bin.mkdir(exist_ok=True)
+        native_node = native_bin / "opencode"
+        if not native_node.exists():
+            native_node.symlink_to(shutil.which("node"))
+        return str(native_node)
+
+    def admitted_plugin_script(self, script):
+        # A private Node process with a synthetic process-bound TUI selection
+        # and native SDK responses. The production plugin/root reader is exact.
+        prelude = r'''
+import * as carrierFs from "node:fs";
+const ownStat = carrierFs.readFileSync("/proc/self/stat", "utf8");
+const ownStart = ownStat.slice(ownStat.lastIndexOf(") ") + 2).trim().split(/\s+/)[19];
+const selection = `${process.env.XDG_STATE_HOME}/hearting/tui-identity`;
+carrierFs.mkdirSync(selection, {recursive: true});
+carrierFs.writeFileSync(`${selection}/${process.pid}-${ownStart}.json`, JSON.stringify({
+  schema: "hearting-tui-selection-v1", sessionID: "ses-oc-parent", pid: process.pid, start: ownStart,
+}));
+'''
+        api = '''
+  get: async () => ({data: {id: "ses-oc-parent", projectID: "fixture", directory: process.cwd(),
+    slug: "fixture", title: "fixture", version: "1", time: {created: 1, updated: 1}},
+    response: {ok: true, status: 200}}),
+  status: async () => ({data: {}, response: {ok: true, status: 200}}),
+'''
+        return prelude + script.replace("const session = {", "const session = {" + api, 1)
+
     def run_plugin(self, body, *, prompt_async="accept", restored_selector=False,
                    extra_env=None, native_messages=None, claim_change=False, claim_expire=False,
                    claim_receipt=False, late_native_text=None):
@@ -1506,27 +1535,14 @@ for (let i = 0; i < 100 && !prompts.length; i++) await new Promise(r => setTimeo
             plugin = fixture
         js = r'''
 import { pathToFileURL } from "node:url";
-import { writeFileSync, readFileSync, mkdirSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import childProcess from "node:child_process";
-// This is a private Node executable named opencode, with a process-bound
-// synthetic TUI selection. The production plugin/root reader stays unchanged.
-const ownStat = readFileSync("/proc/self/stat", "utf8");
-const ownStart = ownStat.slice(ownStat.lastIndexOf(") ") + 2).trim().split(/\s+/)[19];
-const selection = `${process.env.XDG_STATE_HOME}/hearting/tui-identity`;
-mkdirSync(selection, {recursive: true});
-writeFileSync(`${selection}/${process.pid}-${ownStart}.json`, JSON.stringify({
-  schema: "hearting-tui-selection-v1", sessionID: "ses-oc-parent", pid: process.pid, start: ownStart,
-}));
 const { AgentHarnessGuards } = await import(pathToFileURL(PLUGIN));
 const prompts = [];
 const logs = [];
 const nativeMessages = NATIVE_MESSAGES;
 let nativeReads = 0;
 const session = {
-  get: async () => ({data: {id: "ses-oc-parent", projectID: "fixture", directory: process.cwd(),
-    slug: "fixture", title: "fixture", version: "1", time: {created: 1, updated: 1}},
-    response: {ok: true, status: 200}}),
-  status: async () => ({data: {}, response: {ok: true, status: 200}}),
   messages: async () => {
     nativeReads++;
     const claimMutation = process.env.CLAIM_CHANGE_PY || process.env.CLAIM_EXPIRE_PY;
@@ -1599,12 +1615,8 @@ console.log(JSON.stringify({prompts, logs}));
                 "p.received_ack_identity(after,sid,did)==identity")
         if extra_env:
             env.update(extra_env)
-        native_bin = self.root / "native-node"
-        native_bin.mkdir(exist_ok=True)
-        native_node = native_bin / "opencode"
-        if not native_node.exists():
-            native_node.symlink_to(shutil.which("node"))
-        run = subprocess.run([str(native_node), "--input-type=module", "-e", js], env=env, cwd=str(self.root),
+        run = subprocess.run([self.native_node(), "--input-type=module", "-e", self.admitted_plugin_script(js)],
+                             env=env, cwd=str(self.root),
                              capture_output=True, text=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(run.stdout.strip().splitlines()[-1])
@@ -2245,7 +2257,7 @@ await new Promise(r => setTimeout(r, 1000));
 hooks.dispose();
 console.log(JSON.stringify({prompts, logs}));
 '''.replace("WAIT", "5500" if cached_roots else "0")
-                node = subprocess.Popen(["node", "--input-type=module", "-e", script],
+                node = subprocess.Popen([self.native_node(), "--input-type=module", "-e", self.admitted_plugin_script(script)],
                                         env=env, cwd=self.root, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True)
                 try:
@@ -2295,7 +2307,8 @@ console.log(JSON.stringify({prompts}));
 process.exit(0);
 '''
         self.env()
-        node = subprocess.Popen(["node", "--input-type=module", "-e", js], env=self.env(), cwd=str(self.root),
+        node = subprocess.Popen([self.native_node(), "--input-type=module", "-e", self.admitted_plugin_script(js)],
+                                env=self.env(), cwd=str(self.root),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             self.assertEqual(node.stdout.readline().strip(), "idle")

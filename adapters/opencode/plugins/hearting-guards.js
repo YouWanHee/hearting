@@ -1570,6 +1570,7 @@ function createCompletionCarrier(ctx) {
       // The shared courier checks native user-message evidence before claim.
       // This read is scoped to the one session and its bounded recent history.
       const beforeMessages = await compactMessages(ctx, sid)
+      if (!Array.isArray(beforeMessages)) { log("skip", sid, "native-history-unavailable"); return }
       const claimed = await command("deliver", sid, { messages: beforeMessages })
       if (!claimed?.text || !Array.isArray(claimed.records) || !claimed.records.length) {
         log("skip", sid, claimed === null ? "claim-unavailable" : "nothing-claimed"); return
@@ -1581,8 +1582,9 @@ function createCompletionCarrier(ctx) {
       // and never submit this copy to promptAsync. Keep this claim/receipt
       // recheck after the native admission awaits, including when admission
       // failed: historical exact receipts still settle without a new send.
+      const finalMessages = await compactMessages(ctx, sid)
       const beforeSend = await command("settle", sid, {
-        records: claimed.records, messages: await compactMessages(ctx, sid), text: claimed.text,
+        records: claimed.records, messages: finalMessages, text: claimed.text,
       })
       if (!beforeSend) {
         await command("release", sid, { records: claimed.records })
@@ -1609,7 +1611,7 @@ function createCompletionCarrier(ctx) {
       }
       // No await between this last local/identity check and promptAsync.
       // Only the remaining claims validated by settle may be released here.
-      if (!canSend || !current()) {
+      if (!canSend || !Array.isArray(finalMessages) || !current()) {
         await command("release", sid, { records: beforeSend.records })
         log("skip", sid, "final-admission-withheld-released")
         return
