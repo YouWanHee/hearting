@@ -76,6 +76,157 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
     def snapshot(self, path):
         return path.read_bytes(), path.stat().st_mtime_ns
 
+    def legacy_handoff(self, tag, harness="claude", holder_harness=None):
+        meta, record, seat = self.handoff(tag, harness, holder_harness)
+        path = tidy._ledger_path(seat)
+        row = json.loads(path.read_text())
+        del row["source"]
+        path.write_text(json.dumps(row) + "\n")
+        return meta, record, seat, row
+
+    def test_legacy_exact_binding_crosses_harness_without_parent_harness_and_reuses_context(self):
+        from harness_capabilities import parent_completion
+        for harness, target in (("claude", "claude"), ("codex", "codex"),
+                                ("opencode", "opencode"), ("codex", "claude")):
+            with self.subTest(harness=harness, target=target):
+                tag = "legacy-" + harness + target
+                meta, record, seat, row = self.legacy_handoff(tag, harness, target)
+                del meta["parent_harness"]
+                meta["parent_completion_delivery"] = parent_completion(harness)["carrier"]
+                with self.jobs_path.open("a") as stream:
+                    stream.write("now\trunning\t/w\t/w\ttask\t" +
+                                 ",".join(k + "=" + v for k, v in meta.items()) + "\n")
+                before = self.snapshot(tidy._ledger_path(seat))
+                registry = self.snapshot(self.jobs_path)
+                context = PeerReadContext()
+                for _ in range(2):
+                    self.assertEqual(handover.record_recipient_binding(record, tag + "-A",
+                        harness=harness, jobs=self.jobs_path, read_context=context), (target, tag + "-Z"))
+                    self.assertEqual(handover.effective_parent(meta, self.jobs_path,
+                                                              read_context=context), tag + "-Z")
+                    self.assertEqual(handover.effective_parent_harness(meta, self.jobs_path,
+                                                                      read_context=context), target)
+                    self.assertFalse(handover.owns(meta, tag + "-A", self.jobs_path, read_context=context))
+                self.assertIsNone(tidy.tidy_lineage_edge(row))
+                self.assertEqual(self.snapshot(self.jobs_path), registry)
+                self.assertEqual(self.snapshot(tidy._ledger_path(seat)), before)
+
+    def test_legacy_binding_has_no_unbound_edge_and_does_not_poison_unrelated_lineage(self):
+        meta, record, seat, row = self.legacy_handoff("legacy-only")
+        notice = self.notice(sid="legacy-only-A", key="legacy-only")
+        healthy = self.notice(sid="healthy-A", key="healthy")
+        self.edge("claude", "healthy-A", "healthy-B")
+        context = PeerReadContext()
+        self.assertEqual(handover.record_recipient(record, "legacy-only-A", harness="claude",
+                                                   read_context=context), "legacy-only-Z")
+        self.assertEqual(handover.record_recipient(notice, "legacy-only-A", harness="claude",
+                                                   read_context=context), "legacy-only-B")
+        self.assertEqual(handover.record_recipient(healthy, "healthy-A", harness="claude",
+                                                   read_context=context), "healthy-B")
+        # A chronological start/manual clear supplies no source-qualified edge.
+        tidy._append_ledger_entry(seat, dict(event="start", harness="claude", sid="manual-next", ts=3))
+        tidy._append_ledger_entry(seat, dict(event="handover", source="manual-clear",
+            harness="claude", sid="manual-next", **{"from": "legacy-only-Z"}, ts=4))
+        # A later exact legacy binding for another logical job cannot move this job.
+        foreign = dict(row, sid="foreign-holder", ts=5,
+                       **{"from": "legacy-only-Z", "bindings": [dict(row["bindings"][0], node="other-node")]})
+        tidy._append_ledger_entry(seat, foreign)
+        self.assertEqual(handover.record_recipient(record, "legacy-only-A", harness="claude",
+                                                   read_context=context), "legacy-only-Z")
+        self.assertEqual(handover.chain_end("claude", "legacy-only-Z", read_context=context),
+                         ("legacy-only-Z", "self"))
+
+    def test_legacy_holder_follows_only_confirmed_same_harness_successor_and_denies_fork(self):
+        import route_authority
+        meta, record, seat, row = self.legacy_handoff("legacy-next", "codex", "claude")
+        context = PeerReadContext()
+        self.assertEqual(handover.effective_parent(meta, self.jobs_path, read_context=context), "legacy-next-Z")
+        tidy._append_ledger_entry(seat, dict(event="handover", source="clear", harness="claude",
+            sid="legacy-next-Y", **{"from": "legacy-next-Z"}, ts=3))
+        self.assertEqual(handover.record_recipient_binding(record, "legacy-next-A", harness="codex",
+            read_context=context), ("claude", "legacy-next-Y"))
+        self.assertFalse(handover.owns(meta, "legacy-next-Z", self.jobs_path, read_context=context))
+        self.assertTrue(handover.owns(meta, "legacy-next-Y", self.jobs_path, read_context=context))
+        tidy._append_ledger_entry(seat, dict(event="handover", source="clear", harness="claude",
+            sid="legacy-next-X", **{"from": "legacy-next-Z"}, ts=4))
+        self.assertIsNone(handover.record_recipient(record, "legacy-next-A", harness="codex",
+                                                   read_context=context))
+        for actor in ("legacy-next-A", "legacy-next-B", "legacy-next-Z", "legacy-next-Y", "legacy-next-X"):
+            self.assertFalse(handover.owns(meta, actor, self.jobs_path, read_context=context))
+            self.assertFalse(route_authority.decide_continuation(action="handover", jobs=self.jobs_path,
+                metadata=meta, status="running", facts={"eligible": True, "actor": actor}).allowed)
+
+    def test_malformed_legacy_bindings_remain_uncached_and_same_bytes_recover(self):
+        meta, record, seat, row = self.legacy_handoff("legacy-malformed")
+        path = tidy._ledger_path(seat)
+        before = self.snapshot(path)
+        malformed = [dict(row, bindings=value) for value in (None, [], {}, "bad", [None])]
+        for key in ("jobs", "route", "hash", "node"):
+            binding = dict(row["bindings"][0])
+            del binding[key]
+            malformed.append(dict(row, bindings=[binding]))
+            malformed.append(dict(row, bindings=[dict(row["bindings"][0], **{key: None})]))
+        malformed += [dict(row, source=None), dict(row, schema=2), dict(row, **{"from": ""}),
+                      dict(row, harness=None), dict(row, sid=None)]
+        real_read = tidy.read_bytes
+        for bad in malformed:
+            context = PeerReadContext()
+            handover._LINEAGE_GRAPH_CACHE.clear()
+            with self.subTest(row=bad), mock.patch.object(tidy, "read_bytes", side_effect=lambda candidate:
+                    (json.dumps(bad) + "\n").encode() if candidate == path else real_read(candidate)):
+                self.assertIsNone(handover.record_recipient(record, "legacy-malformed-A", harness="claude",
+                                                            read_context=context))
+                self.assertEqual(handover.effective_parent(meta, self.jobs_path, read_context=context), "")
+                self.assertEqual(handover._LINEAGE_GRAPH_CACHE, {})
+                self.assertEqual(context._lineage_graphs, {})
+            self.assertEqual(handover.record_recipient(record, "legacy-malformed-A", harness="claude",
+                                                       read_context=context), "legacy-malformed-Z")
+            self.assertEqual(self.snapshot(path), before)
+
+    def test_legacy_binding_exact_jobs_route_hash_node_never_grants_foreign_authority(self):
+        meta, record, seat, row = self.legacy_handoff("legacy-exact")
+        for key in ("jobs", "route", "hash", "node"):
+            with self.subTest(key=key):
+                foreign = dict(row, bindings=[dict(row["bindings"][0], **{key: "foreign-" + key})])
+                tidy._ledger_path(seat).write_text(json.dumps(foreign) + "\n")
+                self.assertEqual(handover.record_recipient(record, "legacy-exact-A", harness="claude"),
+                                 "legacy-exact-B")
+                self.assertFalse(handover.owns(meta, "legacy-exact-Z", self.jobs_path))
+
+    def test_legacy_binding_historical_exact_receipt_settles_original_key_after_explicit_away(self):
+        import dispatch_recipient_receipt
+        meta, record, seat, row = self.legacy_handoff("legacy-receipt")
+        receipt = {"schema_version": 2, "state": "delivered", "parent_attempt_id": "att-" + "b" * 32,
+            "job_registry": str(self.jobs_path), "children": [{"attempt_id": meta["attempt_id"],
+                "status": "done", "readiness": "ready", "required_action": "inspect-done-failure",
+                "reason": "terminal-failure-or-unclosed", "harness": "claude"}]}
+        stored = pending.create(root=self.tmp_root, recipient_kind="opencode-turn",
+            recipient_key="legacy-receipt-A", delivery_id="delivery-" + "a" * 32,
+            session_generation="", session_generation_supported="0", attempt_ids=record["attempt_ids"],
+            parent_attempt_id=receipt["parent_attempt_id"], route_id=meta["route_id"], route_node="execute",
+            receipt=receipt, receipt_digest=pending._canonical_receipt_digest(receipt),
+            row_revisions={meta["attempt_id"]: "original"})
+        identity = pending.received_ack_identity(stored, "legacy-receipt-A", stored["delivery_id"])
+        claimed = pending.claim(self.tmp_root, "legacy-receipt-A", stored["delivery_id"],
+            claim_owner="old-native-carrier", lease_seconds=30, require_generation_proof=False)
+        text = sweep.delivery_context([(self.tmp_root, [{**claimed, sweep.STORAGE_KEY: "legacy-receipt-A"}])])
+        # The receipt belongs to the exact old receiver, independently of new send authority.
+        tidy._append_ledger_entry(seat, dict(row, sid="legacy-receipt-Y", ts=4,
+                                           **{"from": "legacy-receipt-Z"}))
+        self.assertEqual(handover.effective_parent(meta, self.jobs_path), "legacy-receipt-Y")
+        messages = [{"info": {"sessionID": "legacy-receipt-Z", "role": "user"},
+                     "parts": [{"type": "text", "text": text}]}]
+        evidence = sweep.opencode_messages_evidence(messages, "legacy-receipt-Z",
+            [sweep._opencode_expected_message(text, [(stored["delivery_id"], identity)])])
+        result = dispatch_recipient_receipt.settle_native_receipt(self.tmp_root, "legacy-receipt-A",
+            "opencode", "legacy-receipt-Z", claimed, evidence, acked_by="fixture-exact-native")
+        self.assertTrue(result["received"])
+        self.assertTrue(result["settled"])
+        final = pending.read(self.tmp_root, "legacy-receipt-A", stored["delivery_id"])
+        self.assertEqual(final["state"], "acked")
+        self.assertEqual(pending.received_ack_identity(final, "legacy-receipt-A", stored["delivery_id"]), identity)
+        self.assertIsNone(pending.read(self.tmp_root, "legacy-receipt-Y", stored["delivery_id"]))
+
     def test_failed_one_of_two_ledgers_is_not_cached_and_same_context_recovers(self):
         notice = self.notice()
         path = tidy._ledger_path(self.edge("claude", "A", "B"))

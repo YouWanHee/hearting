@@ -1068,18 +1068,13 @@ def _lineage_successor(rows_by_seat: dict, sid: str, harness: str) -> str:
     return sid if state == "unresolved" else end
 
 
-def _row_binds_key(row: dict, key: tuple) -> bool:
-    return any(isinstance(b, dict) and (b.get("jobs"), b.get("route"), b.get("hash"), b.get("node")) == key
-               for b in row.get("bindings") or ())
-
-
 def _lineage_holder(rows_by_seat: dict, key: tuple, registered: str, harness: str,
                     *, read_context=None) -> tuple[str, str, str]:
     """Who answers for one logical job (jobs, route, hash, node) now.
 
     The latest row that binds the job names its holder (a later hand-off wins).  From there the
-    job follows that seat's later same-seat clear rows out of the holder even when a row does
-    not repeat the binding; a cross-pane ``retire`` row moves it only when it binds it.  The
+    job follows the holder's confirmed same-harness graph even without another
+    binding; a cross-pane ``retire`` row moves it only when it binds it. The
     queried session therefore answers only while it is the end of that chain.
     Keep the selected holder's disposition: an unresolved explicit handoff
     cannot restore the registered parent or authorize the ambiguous holder."""
@@ -1091,31 +1086,10 @@ def _lineage_holder(rows_by_seat: dict, key: tuple, registered: str, harness: st
         holder = str(row.get("sid") or registered)
         harness = str(row.get("harness") or harness)
     # Explicit bindings are authority independent of the row's source (in
-    # particular, ``retire`` records can bind a cross-harness handover). Follow
-    # subsequent same-seat handovers from that holder, except retire rows which
-    # describe the already-accounted-for pane departure. Tidy succession remains
-    # the final same-harness edge for unbound clear history.
-    if latest is not None:
-        latest_match = None
-        for ledger_key, ledger_rows in graph.ledger_rows.items():
-            for index, item in enumerate(ledger_rows):
-                if item.get("sid") and _row_binds_key(item, key):
-                    order = (float(item.get("ts", 0) or 0), index, ledger_key)
-                    if latest_match is None or order > latest_match[0]:
-                        latest_match = (order, ledger_rows)
-        ledger_rows = latest_match[1] if latest_match is not None else ()
-        latest_order = latest_match[0][:2] if latest_match is not None else (
-            float(row.get("ts", 0) or 0), -1)
-        seen = {registered, holder}
-        for index, later in enumerate(ledger_rows):
-            if (float(later.get("ts", 0) or 0), index) <= latest_order:
-                continue
-            sid = str(later.get("sid") or "")
-            if (later.get("event") == "handover" and later.get("from") == holder
-                    and sid and sid not in seen and later.get("source") != "retire"):
-                holder = sid
-                harness = str(later.get("harness") or harness)
-                seen.add(sid)
+    # particular, legacy schema-1 and cross-harness retire handovers). Only
+    # the shared source-qualified graph can advance that exact holder without
+    # another binding. A later legacy binding for a different job is not an
+    # unbound edge, nor can chronological rows bypass a fork.
     end, state = _chain_end(graph, harness, holder)
     return end, harness, state
 

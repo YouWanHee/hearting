@@ -1506,14 +1506,27 @@ for (let i = 0; i < 100 && !prompts.length; i++) await new Promise(r => setTimeo
             plugin = fixture
         js = r'''
 import { pathToFileURL } from "node:url";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, readFileSync, mkdirSync } from "node:fs";
 import childProcess from "node:child_process";
+// This is a private Node executable named opencode, with a process-bound
+// synthetic TUI selection. The production plugin/root reader stays unchanged.
+const ownStat = readFileSync("/proc/self/stat", "utf8");
+const ownStart = ownStat.slice(ownStat.lastIndexOf(") ") + 2).trim().split(/\s+/)[19];
+const selection = `${process.env.XDG_STATE_HOME}/hearting/tui-identity`;
+mkdirSync(selection, {recursive: true});
+writeFileSync(`${selection}/${process.pid}-${ownStart}.json`, JSON.stringify({
+  schema: "hearting-tui-selection-v1", sessionID: "ses-oc-parent", pid: process.pid, start: ownStart,
+}));
 const { AgentHarnessGuards } = await import(pathToFileURL(PLUGIN));
 const prompts = [];
 const logs = [];
 const nativeMessages = NATIVE_MESSAGES;
 let nativeReads = 0;
 const session = {
+  get: async () => ({data: {id: "ses-oc-parent", projectID: "fixture", directory: process.cwd(),
+    slug: "fixture", title: "fixture", version: "1", time: {created: 1, updated: 1}},
+    response: {ok: true, status: 200}}),
+  status: async () => ({data: {}, response: {ok: true, status: 200}}),
   messages: async () => {
     nativeReads++;
     const claimMutation = process.env.CLAIM_CHANGE_PY || process.env.CLAIM_EXPIRE_PY;
@@ -1586,7 +1599,12 @@ console.log(JSON.stringify({prompts, logs}));
                 "p.received_ack_identity(after,sid,did)==identity")
         if extra_env:
             env.update(extra_env)
-        run = subprocess.run(["node", "--input-type=module", "-e", js], env=env, cwd=str(self.root),
+        native_bin = self.root / "native-node"
+        native_bin.mkdir(exist_ok=True)
+        native_node = native_bin / "opencode"
+        if not native_node.exists():
+            native_node.symlink_to(shutil.which("node"))
+        run = subprocess.run([str(native_node), "--input-type=module", "-e", js], env=env, cwd=str(self.root),
                              capture_output=True, text=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(run.stdout.strip().splitlines()[-1])

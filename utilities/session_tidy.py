@@ -624,6 +624,27 @@ def _read_ledger_lines(seat: Seat) -> list[dict]:
             entries.usable = False
             continue
         event, source = item.get("event"), item.get("source")
+        # Schema-1 handovers predate source annotations. Their exact logical
+        # bindings remain authority, but tidy_lineage_edge deliberately gives
+        # these rows no unbound succession edge.
+        if event == "handover" and "source" not in item:
+            bindings = item.get("bindings")
+            origin = item.get("from")
+            if isinstance(origin, dict):
+                origin = origin.get("sid") if origin.get("harness") in HARNESSES else None
+            if (type(item.get("schema", 1)) is not int or item.get("schema", 1) != 1
+                    or not all(isinstance(value, str) and value
+                               for value in (item.get("harness"), item.get("sid"), origin))
+                    or item.get("harness") not in HARNESSES
+                    or not isinstance(bindings, list) or not bindings
+                    or not all(isinstance(binding, dict)
+                               and all(isinstance(binding.get(key), str) and binding[key]
+                                       for key in ("jobs", "route", "hash"))
+                               and isinstance(binding.get("node"), str) for binding in bindings)):
+                entries.usable = False
+            if item.get("sid"):
+                entries.append(item)
+            continue
         if event in ("handover", "succession") and not isinstance(source, str):
             entries.usable = False
         relation = (event == "succession" and (source is None or source == "tidy-clear")

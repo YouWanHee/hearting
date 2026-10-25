@@ -1532,13 +1532,41 @@ function createCompletionCarrier(ctx) {
     if (!sid) return
     if (busy.has(sid)) { log("skip", sid, "delivery-in-flight"); return }
     if (!available()) { log("skip", sid, isWorkerSession() ? "worker-session" : "promptAsync-unavailable"); return }
-    if (status.get(sid) === "busy" || status.get(sid) === "retry") {
+    const paused = () => ["busy", "retry", "blocked", "working"].includes(status.get(sid))
+      || ["busy", "retry", "blocked", "working"].includes(pendingPeerStatus.get(sid))
+    if (paused()) {
       log("skip", sid, `session-${status.get(sid)}`); return
+    }
+    const origin = paneNativeOrigin
+    const client = prompter()
+    const current = () => available() && sessions.has(sid) && !paused()
+      && prompter() === client && paneNativeOrigin === origin && pendingPeerRoot(ctx, sid)
+    // Use the peer carrier's exact root and native status interpretation. An
+    // empty complete status map is idle; unavailable or malformed is unknown.
+    const nativeIdle = async () => {
+      if (!current() || typeof client?.get !== "function" || typeof client?.status !== "function") return false
+      let nativeTimeout
+      const bounded = async call => {
+        try {
+          return await Promise.race([call, new Promise((_, reject) => {
+            nativeTimeout = setTimeout(() => reject(new Error("carrier-context-timeout")), 1000)
+          })])
+        } finally { clearTimeout(nativeTimeout) }
+      }
+      try {
+        const info = pendingPeerSdkData(await bounded(client.get({
+          path: { id: sid }, query: { directory: origin.directory },
+        })))
+        if (!current() || !pendingPeerIsNativeRoot(info, sid, origin)) return false
+        const result = await bounded(client.status({ query: { directory: origin.directory } }))
+        return current() && pendingPeerNativeStatusType(pendingPeerSdkData(result), sid) === "idle"
+      } catch { return false }
     }
     busy.add(sid)
     let timeout
     try {
       if (look && !(await owed(sid))) { log("skip", sid, "no-owed-record"); return }
+      if (!(await nativeIdle()) || !current()) { log("skip", sid, "native-admission-withheld"); return }
       // The shared courier checks native user-message evidence before claim.
       // This read is scoped to the one session and its bounded recent history.
       const beforeMessages = await compactMessages(ctx, sid)
@@ -1547,9 +1575,12 @@ function createCompletionCarrier(ctx) {
         log("skip", sid, claimed === null ? "claim-unavailable" : "nothing-claimed"); return
       }
       log("claim", sid, "claimed", { deliveries: claimed.records.map(record => record.delivery_id) })
+      const canSend = await nativeIdle()
       // A second native read is the final output/send recheck. If another
       // carrier's exact receipt appeared after our first read, settle it here
-      // and never submit this copy to promptAsync.
+      // and never submit this copy to promptAsync. Keep this claim/receipt
+      // recheck after the native admission awaits, including when admission
+      // failed: historical exact receipts still settle without a new send.
       const beforeSend = await command("settle", sid, {
         records: claimed.records, messages: await compactMessages(ctx, sid), text: claimed.text,
       })
@@ -1574,6 +1605,13 @@ function createCompletionCarrier(ctx) {
       if (!beforeSend.text) {
         await command("release", sid, { records: beforeSend.records })
         log("settle", sid, "empty-context-released")
+        return
+      }
+      // No await between this last local/identity check and promptAsync.
+      // Only the remaining claims validated by settle may be released here.
+      if (!canSend || !current()) {
+        await command("release", sid, { records: beforeSend.records })
+        log("skip", sid, "final-admission-withheld-released")
         return
       }
       let taken = false
