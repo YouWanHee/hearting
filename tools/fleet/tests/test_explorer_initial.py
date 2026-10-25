@@ -171,12 +171,15 @@ class LoadingGate(unittest.TestCase):
         self.render._EXPLORER_MODEL = cached
         self.render._EXPLORER_REPLAY_ACTIVE = True
         self.render._EXPLORER_READINESS = {"ready": False, "pending": ("basic",)}
+        self.render._EXPLORER_STATE = None
         screen = _Screen()
         with patch.object(self.render, "_explorer_compose",
                           side_effect=AssertionError("replay must not compose live data")):
             self.render._draw(screen, self.snapshot.sessions, self.snapshot.jobs, "all", 0,
                               loading=True, snapshot=self.snapshot)
         self.assertNotIn("불러오는 중", screen.text())
+        self.assertIsNotNone(self.render._EXPLORER_STATE)
+        self.assertEqual(self.render._EXPLORER_STATE.view, "OVERVIEW")
 
     def test_working_marks_turn_at_draw_time_and_the_frame_keeps_the_still_glyph(self):
         from unittest import mock

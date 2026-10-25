@@ -10815,7 +10815,7 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
     global _HIT_SNAPSHOT_ID, _CURRENT_BODY_H, _CURRENT_BODY_TOP, _CURRENT_BODY_COUNT
     global _LAYOUT_META, _EXPLORER_SHOWN
     global _EXPLORER_MODEL, _EXPLORER_PUBLISHED_MODEL, _EXPLORER_REPLAY_ACTIVE
-    global _EXPLORER_DETAIL_CONTINUATION
+    global _EXPLORER_DETAIL_CONTINUATION, _EXPLORER_STATE
 
     _TOGGLE_ROWS, _TOGGLE_SPANS = {}, {}
     _CLICK_ROWS, _CLICK_SPANS = {}, {}
@@ -10829,6 +10829,7 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
     if _EXPLORER_ENABLED:
         current = snapshot or LiveSnapshot(sessions=sessions, jobs=jobs)
         state = _explorer_state_for(_EXPLORER_STATE, w)
+        _EXPLORER_STATE = state
         runtime = _explorer_runtime()
         # Generation zero has no live rows to compose. Paint a persisted VM (or
         # the loading frame) directly; later generations still compose first so
