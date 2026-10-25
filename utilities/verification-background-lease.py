@@ -437,15 +437,9 @@ def main(argv: list[str] | None = None) -> int:
             lease_path, value = lease
             identity = process_launch_identity(process.pid)
             if identity.get("pid_start") and identity.get("pgid") == str(process.pid):
-                value.update(
-                    {
-                        "pid": process.pid,
-                        "pid_start": identity["pid_start"],
-                        "pgid": process.pid,
-                        "memory_budget_bytes": budget,
-                        "memory_budget_source": source,
-                    }
-                )
+                value.update({"pid": process.pid, "pid_start": identity["pid_start"],
+                              "pgid": process.pid, "memory_budget_bytes": budget,
+                              "memory_budget_source": source})
                 if args.memory_budget is not None:
                     value["memory_budget_option"] = args.memory_budget
                 atomic_json(lease_path, value)
