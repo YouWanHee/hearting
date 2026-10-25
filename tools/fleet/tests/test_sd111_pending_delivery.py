@@ -11,8 +11,8 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest import mock
 from pathlib import Path
 from unittest import mock
 
@@ -196,7 +196,9 @@ class PendingDeliveryCountsTest(unittest.TestCase):
         # last_route_nodes -- no return-signature change, never a gate.
         pending_delivery.create(**_record(root=self.state_root))
         try:
-            with mock.patch.object(dispatch, "_scan_processes", return_value=[]):
+            with mock.patch.object(dispatch, "_scan_processes", return_value=[]), \
+                 mock.patch.object(dispatch, "_live_attempt_ids", return_value=set()), \
+                 mock.patch.object(dispatch, "process_table_scan_scope", side_effect=nullcontext):
                 dispatch.collect(jobs_path=str(self.jobs_path))
             self.assertEqual(
                 dispatch.collect.last_pending_delivery,
@@ -204,6 +206,22 @@ class PendingDeliveryCountsTest(unittest.TestCase):
                  "no_recipient": None}
             )
         finally:
+            dispatch.collect.last_pending_delivery = None
+
+    def test_collect_passes_private_complete_census_to_intent_accounting(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, _, _, holder = self._intent_fixture("collect-intent")
+            for live, expected in ((set(), 1), ({holder}, 0)):
+                observation = collectors._session_census_observation(
+                    procscan._CensusRows([SimpleNamespace(harness=h, session_id=s)
+                                         for h, s in live], complete=True), {"complete": True})
+                with mock.patch.object(dispatch, "_scan_processes", return_value=[]), \
+                     mock.patch.object(dispatch, "_live_attempt_ids", return_value=set()), \
+                     mock.patch.object(dispatch, "process_table_scan_scope", side_effect=nullcontext), \
+                     mock.patch.object(dispatch, "_scan_jobs_log", return_value=([], 0)):
+                    dispatch.collect(jobs_path=str(jobs), session_observation=observation)
+                self.assertEqual(dispatch.collect.last_pending_delivery["pending"], 1)
+                self.assertEqual(dispatch.collect.last_pending_delivery["no_recipient"], expected)
             dispatch.collect.last_pending_delivery = None
 
     def _count_with_graph(self, storage_sid, recipient_sid, live=(), duplicate_paths=False,
@@ -512,6 +530,314 @@ class PendingDeliveryCountsTest(unittest.TestCase):
         self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns)
                           for path in self.state_root.rglob("*") if path.is_file()}, before)
         return counts
+
+    def _intent_fixture(self, suffix, *, filename="original-jobs.tsv", **kwargs):
+        jobs, record, sid, holder = self._registered_registry_fixture(
+            self.state_root / suffix, filename, suffix, **kwargs)
+        pending_delivery.record_path(jobs.parent, sid, record["delivery_id"]).unlink()
+        return jobs, record, sid, holder
+
+    def _replace_registry_meta(self, jobs, **changes):
+        fields = jobs.read_text().splitlines()[-1].split("\t")
+        meta = dict(part.split("=", 1) for part in fields[5].split(",") if "=" in part)
+        for key, value in changes.items():
+            if value is None:
+                meta.pop(key, None)
+            else:
+                meta[key] = value
+        fields[5] = ",".join(key + "=" + value for key, value in meta.items())
+        jobs.write_text("\t".join(fields) + "\n")
+        return meta
+
+    def test_intent_only_original_registries_and_defaults_resolve_current_holder(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            first = self._intent_fixture("intent-one")
+            second = self._intent_fixture("intent-two", filename="another-registry.txt")
+            default = self.state_root / "default.log"
+            for data in (b"", first[0].read_bytes()):
+                default.write_bytes(data)
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(default)}):
+                    alias = first[0].parent / ".." / first[0].parent.name / first[0].name
+                    for paths in ([first[0], second[0]], [second[0], alias, first[0]]):
+                        with self.subTest(default=data, paths=paths):
+                            dead = self._observed_registry_count(paths,
+                                {("claude", first[2]), ("claude", second[2])})
+                            self.assertEqual(dead, dict(pending=2, expired=0,
+                                retained_batch_duties=0, no_recipient=2))
+                            live = self._observed_registry_count(paths, {first[3], second[3]})
+                            self.assertEqual(live["no_recipient"], 0)
+                            self.assertEqual(live["pending"], 2)
+
+    def test_intent_cross_harness_same_sid_then_qualified_successor(self):
+        import session_tidy as tidy
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, _, sid, holder = self._intent_fixture("intent-pair", target="codex", same_sid=True)
+            self.assertEqual(self._observed_registry_count([jobs], {("claude", sid)})["no_recipient"], 1)
+            self.assertEqual(self._observed_registry_count([jobs], {holder})["no_recipient"], 0)
+            seat = tidy.Seat("pane", "intent-successor")
+            tidy._append_ledger_entry(seat, dict(event="succession", source="tidy-clear",
+                harness="codex", sid="successor", **{"from": {"harness": "codex", "sid": sid}}, ts=3))
+            self.assertEqual(self._observed_registry_count([jobs], {holder})["no_recipient"], 1)
+            self.assertEqual(self._observed_registry_count([jobs], {("codex", "successor")})["no_recipient"], 0)
+
+    def test_intent_missing_identity_and_route_stay_unknown_beside_live_parent(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            good = self._intent_fixture("intent-good")
+            for field in ("attempt_id", "parent_sid", "delivery_id", "parent_harness", "route_id", "route_hash"):
+                bad = self._intent_fixture("intent-missing-" + field)
+                changes = {field: None}
+                if field == "parent_harness":
+                    changes.update(parent_completion_delivery=None, main_runtime_harness=None, harness="codex")
+                self._replace_registry_meta(bad[0], **changes)
+                with self.subTest(field=field):
+                    counts = self._observed_registry_count([good[0], bad[0]], {good[3], bad[3]})
+                    self.assertIsNone(counts["no_recipient"])
+                    self.assertEqual(counts["pending"], 2)
+
+    def test_intent_legacy_parent_carrier_and_latest_row_are_used(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, _, sid, holder = self._intent_fixture("intent-legacy")
+            meta = self._replace_registry_meta(jobs, parent_harness=None, harness="codex",
+                                               attempt_schema_version=None, registered_worker=None)
+            self.assertEqual(self._observed_registry_count([jobs], {holder})["no_recipient"], 0)
+            self.assertEqual(self._observed_registry_count([jobs], {("claude", sid)})["no_recipient"], 1)
+            original = jobs.read_bytes()
+            meta["parent_harness"] = "codex"
+            stale = "now\tdone\t/r\t/w\ts\t" + ",".join(k + "=" + v for k, v in meta.items()) + "\n"
+            jobs.write_bytes(stale.encode() + original)
+            self.assertEqual(self._observed_registry_count([jobs], {holder})["no_recipient"], 0)
+
+    def test_intent_registry_gaps_and_recovery_do_not_hide_behind_live_holder(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            good = self._intent_fixture("registry-good")
+            bad = self._intent_fixture("registry-bad")
+            original = bad[0].read_bytes()
+            for extra in (b"partial", b"broken\n", b"\xff\n", b"now\tdone\t/r\t/w\ts\tdelivery_intent=1"):
+                bad[0].write_bytes(original + extra)
+                with self.subTest(extra=extra):
+                    self.assertIsNone(self._observed_registry_count([good[0], bad[0]],
+                                                                   {good[3], bad[3]})["no_recipient"])
+                bad[0].write_bytes(original)
+                self.assertEqual(self._observed_registry_count([good[0], bad[0]],
+                                                               {good[3], bad[3]})["no_recipient"], 0)
+            real_view = dispatch._dispatch_registry_cache.registry_view
+            for error in (PermissionError("private registry unreadable"), FileNotFoundError("private registry missing")):
+                with mock.patch.object(dispatch._dispatch_registry_cache, "registry_view",
+                        side_effect=lambda path, **kw: (_ for _ in ()).throw(error)
+                        if Path(path) == bad[0] else real_view(path, **kw)):
+                    self.assertIsNone(self._observed_registry_count([good[0], bad[0]],
+                                                                   {good[3], bad[3]})["no_recipient"])
+                self.assertEqual(self._observed_registry_count([good[0], bad[0]],
+                                                               {good[3], bad[3]})["no_recipient"], 0)
+
+    def test_intent_lineage_gaps_and_recovery_leave_inputs_unchanged(self):
+        import session_tidy as tidy
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, _, _, holder = self._intent_fixture("lineage-intent")
+            ledger = tidy._ledger_path(tidy.Seat("pane", "registry-lineage-intent"))
+            original = ledger.read_bytes()
+            for extra in (b'{"event":"succession",', b'[]\n', b'\xff\n'):
+                ledger.write_bytes(original + extra)
+                self.assertIsNone(self._observed_registry_count([jobs], {holder})["no_recipient"])
+                ledger.write_bytes(original)
+                self.assertEqual(self._observed_registry_count([jobs], {holder})["no_recipient"], 0)
+            real_read = tidy.read_bytes
+            with mock.patch.object(tidy, "read_bytes", side_effect=lambda p: None if p == ledger else real_read(p)):
+                import dispatch_seat_handover as handover
+                handover._LINEAGE_GRAPH_CACHE.clear()
+                self.assertIsNone(self._observed_registry_count([jobs], {holder})["no_recipient"])
+            self.assertEqual(self._observed_registry_count([jobs], {holder})["no_recipient"], 0)
+
+    def test_intent_incomplete_census_remains_unknown(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, _, _, holder = self._intent_fixture("census-intent")
+            complete = dict(complete=True, herdr_complete=True, process_complete=True,
+                            native_sid_complete=True, live={holder})
+            for field in ("complete", "herdr_complete", "process_complete", "native_sid_complete"):
+                for value in (None, False):
+                    with self.subTest(field=field, value=value):
+                        self.assertIsNone(dispatch._pending_delivery_counts([jobs],
+                            session_observation={**complete, field: value})["no_recipient"])
+            self.assertIsNone(dispatch._pending_delivery_counts([jobs])["no_recipient"])
+            self.assertEqual(self._observed_registry_count([jobs], {holder})["no_recipient"], 0)
+
+    def test_intent_dedup_checks_every_root_authority_in_both_orders(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, record, sid, holder = self._intent_fixture("intent-original")
+            other = self.state_root / "intent-copy"; other.mkdir()
+            copied = other / "copied.tsv"; copied.write_bytes(jobs.read_bytes())
+            for paths in ([jobs, copied], [copied, jobs]):
+                with self.subTest(paths=paths):
+                    counts = self._observed_registry_count(paths, {holder, ("claude", sid)})
+                    self.assertEqual(counts["pending"], 1)
+                    self.assertIsNone(counts["no_recipient"])
+            # Identical authority with no handover: two roots, one delivery.
+            self._replace_registry_meta(jobs, route_id="rt-untidied")
+            copied.write_bytes(jobs.read_bytes())
+            for paths in ([jobs, copied], [copied, jobs], [jobs, jobs]):
+                counts = self._observed_registry_count(paths, set())
+                self.assertEqual(counts["pending"], 1)
+                self.assertEqual(counts["no_recipient"], 1)
+            self._replace_registry_meta(copied, parent_harness=None, parent_completion_delivery=None)
+            for paths in ([jobs, copied], [copied, jobs]):
+                self.assertIsNone(self._observed_registry_count(paths, {("claude", sid)})["no_recipient"])
+
+    def test_intent_and_materialized_duplicates_preserve_unknown_bodies(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, record, sid, holder = self._registered_registry_fixture(
+                self.state_root / "materialized-intent", "named.tsv", "mixed")
+            path = pending_delivery.record_path(jobs.parent, sid, record["delivery_id"])
+            original = path.read_bytes()
+            self.assertEqual(self._observed_registry_count([jobs, jobs], set())["pending"], 1)
+            self.assertEqual(self._observed_registry_count([jobs], set())["no_recipient"], 1)
+            self.assertEqual(self._observed_registry_count([jobs], {holder})["no_recipient"], 0)
+
+            for data in (b"not json", json.dumps({**record, "attempt_ids": ["att-unknown"]}).encode()):
+                path.write_bytes(data)
+                self.assertIsNone(self._observed_registry_count([jobs], {holder})["no_recipient"])
+            path.write_bytes(original)
+            self.assertEqual(self._observed_registry_count([jobs], {holder})["no_recipient"], 0)
+
+    def test_invalid_pending_receipt_beside_live_intent_remains_unknown(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            good = self._intent_fixture("live-with-corruption")
+            jobs, record, sid, holder = self._registered_registry_fixture(
+                self.state_root / "corrupt-body", "jobs.tsv", "corrupt-body")
+            path = pending_delivery.record_path(jobs.parent, sid, record["delivery_id"])
+            for receipt in ([], ["malformed"], True, "invalid"):
+                path.write_text(json.dumps({**record, "receipt": receipt}))
+                with self.subTest(receipt=receipt):
+                    self.assertIsNone(self._observed_registry_count([good[0], jobs],
+                                                                   {good[3], holder})["no_recipient"])
+
+    def test_duplicate_legacy_bodies_are_resolved_before_absence_dedup(self):
+        import session_tidy as tidy
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            sid = "legacy-duplicate"
+            tidy._append_ledger_entry(tidy.Seat("pane", "legacy-duplicate"),
+                                     dict(event="start", harness="claude", sid=sid, ts=1))
+            receipt = _record()["receipt"]
+            receipt = {**receipt, "job_registry": ""}
+            jobs_paths, records = [], []
+            for name in ("first-legacy", "second-legacy"):
+                root = self.state_root / name; root.mkdir()
+                jobs = root / "named.tsv"
+                jobs.write_text("now\tdone\t/r\t/w\ts\tattempt_id=" + receipt["children"][0]["attempt_id"] +
+                                ",parent_sid=" + sid + ",parent_harness=claude\n")
+                record = pending_delivery.create(**_record(root=root, recipient_key=sid, receipt=receipt,
+                    receipt_digest=pending_delivery._canonical_receipt_digest(receipt)))
+                jobs_paths.append(jobs)
+                records.append(pending_delivery.record_path(root, sid, record["delivery_id"]))
+            for paths in (jobs_paths, jobs_paths[::-1]):
+                counts = self._observed_registry_count(paths, set())
+                self.assertEqual(counts["no_recipient"], 1)
+                self.assertEqual(counts["pending"], 2)  # Existing physical pending count.
+                self.assertEqual(self._observed_registry_count(paths, {("claude", sid)})["no_recipient"], 0)
+            changed = json.loads(records[1].read_text()); changed["route_id"] = "rt-other"
+            records[1].write_text(json.dumps(changed))
+            for paths in (jobs_paths, jobs_paths[::-1]):
+                self.assertIsNone(self._observed_registry_count(paths, {("claude", sid)})["no_recipient"])
+
+    def test_intent_duplicate_metadata_conflict_is_unknown_even_with_same_live_holder(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, _, sid, _ = self._intent_fixture("same-holder-conflict")
+            self._replace_registry_meta(jobs, route_id="rt-unbound")
+            root = self.state_root / "same-holder-copy"; root.mkdir()
+            copied = root / "other.tsv"; copied.write_bytes(jobs.read_bytes())
+            self._replace_registry_meta(copied, delivery_row_revision="different-revision")
+            for paths in ([jobs, copied], [copied, jobs]):
+                counts = self._observed_registry_count(paths, {("claude", sid)})
+                self.assertEqual(counts["pending"], 1)
+                self.assertIsNone(counts["no_recipient"])
+
+    def test_intent_cycle_is_unknown_and_expired_and_retained_counts_are_preserved(self):
+        import session_tidy as tidy
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, record, sid, holder = self._intent_fixture("cycle-intent")
+            seat = tidy.Seat("pane", "cycle-intent")
+            for origin, target in ((holder[1], "B"), ("B", holder[1])):
+                tidy._append_ledger_entry(seat, dict(event="succession", source="tidy-clear",
+                    harness=holder[0], sid=target, **{"from": {"harness": holder[0], "sid": origin}}, ts=3))
+            self.assertIsNone(self._observed_registry_count([jobs], {holder})["no_recipient"])
+            # Terminal records suppress their matching intent; retained duties
+            # and expired records remain independent of the absence census.
+            record = pending_delivery.create(**_record(root=self.state_root, recipient_key="expired",
+                                                       delivery_id="delivery-expired"))
+            pending_delivery.expire_if_due(self.state_root, "expired", record["delivery_id"],
+                actor="dispatch-reconcile", reason="recipient-session-gone", liveness="known")
+            duty = self.state_root / "supervisor-state/obligations/batch-fixture.json"
+            duty.parent.mkdir(parents=True)
+            duty.write_text(json.dumps(dict(schema_version=1, id="batch-fixture", state="observing")))
+            counts = self._observed_registry_count([jobs, self.jobs_path], {holder})
+            self.assertEqual((counts["pending"], counts["expired"], counts["retained_batch_duties"]), (1, 1, 1))
+            self.assertIsNone(counts["no_recipient"])
+
+    def test_observed_intent_survives_later_metadata_and_partial_tail(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, _, _, holder = self._intent_fixture("historical-intent")
+            original = jobs.read_bytes()
+            self._replace_registry_meta(jobs, delivery_intent=None)
+            latest = jobs.read_bytes()
+            jobs.write_bytes(original + latest)
+            counts = self._observed_registry_count([jobs], {holder})
+            self.assertEqual(counts["pending"], 1)
+            self.assertEqual(counts["no_recipient"], 0)
+            jobs.write_bytes(original.rstrip(b"\n"))
+            counts = self._observed_registry_count([jobs], {holder})
+            self.assertEqual(counts["pending"], 1)
+            self.assertIsNone(counts["no_recipient"])
+
+    def test_unreadable_pending_body_does_not_become_known_from_live_intent(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, record, sid, holder = self._registered_registry_fixture(
+                self.state_root / "unreadable-pending", "jobs.tsv", "unreadable-pending")
+            path = pending_delivery.record_path(jobs.parent, sid, record["delivery_id"])
+            read_text = Path.read_text
+            def unreadable(candidate, *args, **kwargs):
+                if candidate == path:
+                    raise PermissionError("private pending body unavailable")
+                return read_text(candidate, *args, **kwargs)
+            with mock.patch.object(Path, "read_text", new=unreadable):
+                self.assertIsNone(self._observed_registry_count([jobs], {holder})["no_recipient"])
+            self.assertEqual(self._observed_registry_count([jobs], {holder})["no_recipient"], 0)
+
+    def test_intent_fork_cycle_and_manual_rows_use_common_lineage_policy(self):
+        import session_tidy as tidy
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, _, _, holder = self._intent_fixture("ambiguous-intent")
+            seat = tidy.Seat("pane", "ambiguous-intent")
+            for target in ("B", "C"):
+                tidy._append_ledger_entry(seat, dict(event="succession", source="tidy-clear",
+                    harness=holder[0], sid=target, **{"from": {"harness": holder[0], "sid": holder[1]}}, ts=3))
+            self.assertIsNone(self._observed_registry_count([jobs], {holder})["no_recipient"])
+            manual = self._intent_fixture("manual-intent")
+            tidy._append_ledger_entry(tidy.Seat("pane", "manual-intent"), dict(event="handover",
+                source="manual-clear", harness="claude", sid="unqualified",
+                **{"from": {"harness": manual[3][0], "sid": manual[3][1]}}, ts=5))
+            self.assertEqual(self._observed_registry_count([manual[0]], {("claude", "unqualified")})["no_recipient"], 1)
+            self.assertEqual(self._observed_registry_count([manual[0]], {manual[3]})["no_recipient"], 0)
+
+    def test_collected_intent_counts_reach_existing_render_projections(self):
+        from fleet import render
+        from fleet.explorer.live import build_view_model
+        from fleet.explorer.grid import CellGrid
+        from fleet.explorer.resources import draw_system
+        from fleet.explorer.chrome import draw_chrome
+        from fleet.explorer.state import NavState
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, _, _, holder = self._intent_fixture("render-intent")
+            for counts in (self._observed_registry_count([jobs], set()),
+                           self._observed_registry_count([jobs], {holder}),
+                           dispatch._pending_delivery_counts([jobs])):
+                vm = build_view_model({"sessions": [], "pending_delivery": counts}, now=0)
+                grid = CellGrid(168, 44); draw_system(grid, vm)
+                body = "\n".join(grid.rows_text())
+                draw_chrome(grid, vm, NavState(view="SYSTEM"))
+                for text in (body, grid.rows_text()[-1], str(render._delivery_pending_rows(counts))):
+                    if counts["no_recipient"] is None:
+                        self.assertNotIn("받을 세션 없음", text)
+                    else:
+                        self.assertIn(f"받을 세션 없음 {counts['no_recipient']}", text)
 
     def test_original_named_registries_override_empty_and_copied_defaults_read_only(self):
         with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
