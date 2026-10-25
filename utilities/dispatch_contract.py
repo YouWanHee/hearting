@@ -11231,11 +11231,28 @@ def _updated_attempt_metadata(
         key for key in keys
         if keys.count(key) > 1 and key not in ATTEMPT_MUTABLE_METADATA
     }
-    if immutable_duplicates:
+    conflicting = {
+        key for key in immutable_duplicates
+        if len({part.split("=", 1)[1] for part in raw_parts
+                if part.split("=", 1)[0] == key}) > 1
+    }
+    if immutable_duplicates and (not terminal or conflicting):
         raise DispatchContractError(
             "attempt-immutable-metadata-duplicate",
-            ",".join(sorted(immutable_duplicates)),
+            ",".join(sorted(conflicting or immutable_duplicates)),
         )
+    if immutable_duplicates:
+        # A terminal write can settle a legacy row whose repeated immutable
+        # values agree. Keep its meaning; conflicting identities still refuse.
+        seen = set()
+        retained = []
+        for part in raw_parts:
+            key = part.split("=", 1)[0]
+            if key in immutable_duplicates and key in seen:
+                continue
+            seen.add(key)
+            retained.append(part)
+        raw_parts = retained
     metadata = parse_registry_metadata(pipe)
     allowed_new = ATTEMPT_TERMINAL_EVIDENCE_KEYS if terminal else set()
     replace: dict[str, str] = {}
@@ -11721,6 +11738,7 @@ def close_attempt_row_if(
     *,
     evidence: dict[str, str] | None = None,
     teardown_claim: str | None = None,
+    write_error: dict[str, str] | None = None,
 ) -> bool:
     """Revalidate and close one exact attempt inside the SD-49 lock.
 
@@ -11728,8 +11746,11 @@ def close_attempt_row_if(
     heartbeat evidence.  A read-then-``close_attempt_row`` sequence leaves a
     race between the decision and mutation.  This primitive re-reads the row
     and invokes the caller's safety predicate while the canonical registry is
-    locked; a changed or newly-live row is therefore left untouched.
+    locked; a changed or newly-live row is therefore left untouched. An optional
+    write_error distinguishes terminal metadata failures from a safety veto.
     """
+    if write_error is not None:
+        write_error.clear()
     if not attempt_id or not note:
         raise DispatchContractError("attempt-close-invalid", "attempt_id and note are required")
     ensure_global_registry_writable(jobs)
@@ -11781,7 +11802,9 @@ def close_attempt_row_if(
             fields[5] = _updated_attempt_metadata(
                 fields[5], values, terminal=True
             )
-        except DispatchContractError:
+        except DispatchContractError as exc:
+            if write_error is not None:
+                write_error.update(reason=exc.reason, detail=exc.detail)
             return False
         lines[index] = "\t".join(fields)
         _atomic_registry_replace(jobs, lines)

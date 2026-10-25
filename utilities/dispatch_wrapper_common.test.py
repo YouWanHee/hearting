@@ -1147,6 +1147,49 @@ class SameRowTest(unittest.TestCase):
         fields = dict(part.split("=", 1) for part in row.split("\t")[5].split(","))
         return fields
 
+    def test_diversity_registration_has_one_source_and_real_launch_writer_accepts_it(self):
+        import dispatch_contract as D
+        for harness, effort in (("claude", "effort"), ("codex", "reasoning"), ("opencode", "variant")):
+            with self.subTest(harness=harness):
+                jobs = Path(self.tmp) / (harness + ".log")
+                args = self.args(Path(self.tmp))
+                args.attempt_id = "att-diversity-" + harness
+                args.parent_attempt_id = None
+                args.resolved_completion_delivery = "poll-fallback"
+                args.resolved_model_settings["source"] = "profile+diversity"
+                args.profile_selection_receipt = {
+                    "model_source": "profile+diversity", "model_diversity": "rotated"}
+                with mock.patch.object(C, "sealed_launch_home", return_value=str(ROOT)), \
+                     mock.patch.object(C, "workflow_completion_receipt", return_value=""), \
+                     mock.patch.object(C, "stage_session_metadata", return_value=""), \
+                     mock.patch.object(C, "route_node_leg_fields", return_value=("-", "-")), \
+                     mock.patch("review_input.registration_fragment", return_value=""), \
+                     mock.patch("dispatch_replacement.seal_launch_input", return_value=""):
+                    self.assertTrue(C.append_job(jobs, args, harness=harness,
+                        runtime_sandbox="workspace-write", effort_key=effort,
+                        claim=D.claim_attempt_row, marker_gate=None))
+                raw = jobs.read_text().split("\t", 5)[5].split(",")
+                children = []
+                def spawn(fd):
+                    child = subprocess.Popen([sys.executable, "-c",
+                        "import os,sys,time; os.read(int(sys.argv[1]),16); time.sleep(30)", str(fd)],
+                        pass_fds=(fd,), start_new_session=True)
+                    children.append(child)
+                    return child
+                try:
+                    child, _identity = D.spawn_claimed_attempt(
+                        jobs, args.attempt_id, parent_binding=None, spawn=spawn)
+                    D.mark_attempt_launch_started(jobs, args.attempt_id, child.pid)
+                    self.assertIn("launch_started=1", jobs.read_text())
+                    self.assertEqual([part for part in raw if part.startswith("model_source=")],
+                                     ["model_source=profile+diversity"])
+                finally:
+                    for child in children:
+                        if child.poll() is None:
+                            child.terminate()
+                        child.wait(timeout=5)
+                self.assertTrue(D.close_attempt_row(jobs, args.attempt_id, "dead-exact-pid"))
+
     def test_repository_marker_is_only_added_for_non_git_rows(self):
         non_git_fields = self.row("codex", repository_kind="non-git",
                                   runtime_sandbox="workspace-write", effort_key="reasoning")

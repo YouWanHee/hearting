@@ -1666,6 +1666,7 @@ def reconcile(rows, args):
         cascade = []
         summary_owner = {"state": "not-applied", "reason": "dry-run"}
         revalidated = None
+        write_error = {}
         if (args.apply and note and row["meta"].get("attempt_id")
                 and (not only_exact_dead or category == "exact-dead")):
             fresh_decision = {}
@@ -1714,9 +1715,9 @@ def reconcile(rows, args):
                 reconcile_evidence["failure_class"] = "invalid-envelope"
             closed = close_attempt_row_if(
                 args.jobs, row["meta"]["attempt_id"], note, still_safe,
-                evidence=reconcile_evidence,
+                evidence=reconcile_evidence, write_error=write_error,
             )
-            revalidated = bool(closed)
+            revalidated = bool(closed or write_error)
             if closed:
                 if category == "exact-dead":
                     # Reuse the existing automatic cleanup writer. Otherwise
@@ -1726,7 +1727,9 @@ def reconcile(rows, args):
                         args.jobs, row["meta"]["attempt_id"], apply=True,
                     )
                 materialize_after_terminal_close(args.jobs, row["meta"]["attempt_id"])
-            if not closed and fresh_decision:
+            if write_error:
+                reason = write_error["reason"]
+            elif not closed and fresh_decision:
                 reason = f"revalidation-veto:{fresh_decision.get('category')}:{fresh_decision.get('reason')}"
             if closed and note == "dead-parent-orphaned":
                 route_id, _, _ = resolve_owner_route(row, rows, args.jobs)
@@ -1741,6 +1744,7 @@ def reconcile(rows, args):
                           "revalidated": revalidated, "closed": closed,
                           "cascade": cascade, "summary_owner": summary_owner,
                           "cleanup": terminal_cleanup,
+                          **({"detail": write_error["detail"]} if write_error else {}),
                           **({"residue": {"state": residue["state"], "live_pids": residue["live_pids"]}}
                              if residue is not None else {})})
     record = {"at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

@@ -2,6 +2,13 @@
 
 Portable model roles and profiles describe work quality and budget; each adapter maps them to its runtime. The shipped `adapters/<harness>/config/models.conf` is copied once to `<runtime-home>/agent-config/models.conf`. That copy is user-owned. A consumer selects a valid complete user file as one unit, or the shipped file as one unit. It never merges the files. When only the optional balanced profile is absent, consumers derive it in memory from that user's light operating point. They do not write the derived value back. Native runtime settings remain separate.
 
+Registry model provenance has one writer: resolved model settings supply the
+single `model_source` field, including diversity selection, while profile
+receipts supply their selection observations. Terminal settlement can collapse
+identical repeated immutable fields in legacy rows without changing their
+meaning. Conflicting values retain their refusal. Reconciliation reports
+terminal metadata write failures separately from process revalidation.
+
 ## Common context operating budget
 
 `CFG_MODEL_CONTEXT_WINDOW` is an optional scalar shared by every model profile, role, and explicit model choice. If it is absent, Hearting resolves it in memory as `800000`; the accepted decimal range is `100000` through `1000000` inclusive. Older complete user files remain selected as a whole when they omit this key. The shipped files declare the default, while seed-once installation leaves existing user files byte-for-byte unchanged.
