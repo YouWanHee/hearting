@@ -2079,28 +2079,19 @@ combined arm totals, ETA, speed and epoch-mean loss are not inferred.
 
 Detached training, CPU scoring, and inference receive declaration-free checkpoints
 from fixed metric paths: first min(10% plan, 2h), then 25/50/75% or 12h; without a
-plan, 2h then 12h. Missing data is explicit; exit, sentinel, and approval stay unchanged.
+plan, 2h then 12h. Missing workload/admission evidence and ETA stay explicit;
+optional observation cannot interrupt a run or alter its payload, exit, sentinel,
+verification, or approval. Notices retain their run id, stable public record path,
+recipient, outbox, and receipt identities.
 
-Optional admission evidence is independent of workload progress. An observer may
-read bounded records through exact run and registry provenance even when an output
-root is absent; record contents must bind the same run and, where applicable, row.
-Ambiguous or foreign evidence remains unknown. Public observations may report
-valid, denied and unknown sample counts, the denied/valid sample ratio (null when
-there are no valid samples), freshness, and bounded reasons. Snapshot gaps and
-sample ratios do not measure wait duration or compute time, and admission alone
-does not prove progress.
-
-Stagnation follows strict increases in a comparable counter or metric stream.
-A fresh equal sample updates freshness without moving the last actual increase.
-With no comparable progress signal, progress, stagnation and ETA remain unknown.
-The existing two-hour advisory may describe no observed increase from the last
-strict increase, or from the first comparable observation when no increase has
-yet occurred. Run, row or source-generation changes reset that comparison. Never
-subtract admission time from elapsed time or derive rate/ETA from admission
-samples. Optional read failures cannot alter the payload, exit, sentinel,
-verification or approval state. Notices and public records use the same optional
-semantics and stable episode identity while preserving existing recipient,
-outbox and receipt identities.
+Admission is optional and independent of workload progress; exact run and
+row-scoped decision binding, including ambiguity semantics, are detailed in
+[autopilot-lab](../capabilities/autopilot-lab.md). Counts and ratios describe
+samples, not elapsed or compute time;
+wait duration requires measured boundaries. Stagnation uses the same comparable
+counter or metric stream: only a strict increase moves the last actual increase
+anchor; equal fresh samples update freshness, not that anchor. Without a progress
+signal, stagnation and ETA remain unknown.
 
 `run` and GPU `resource-runner start` automatically reserve their devices in
 one host-local `gpu-leases.json` beside the canonical dispatch registry. All
