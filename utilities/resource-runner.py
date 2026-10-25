@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Detached process runner with PID reuse-safe reattachment."""
-import argparse, contextlib, fcntl, hashlib, json, os, re, select, signal, stat, subprocess, sys, time
+import argparse, contextlib, fcntl, hashlib, importlib.util, json, os, re, select, signal, stat, subprocess, sys, time
 from pathlib import Path
 import resource_resume as RESOURCE_RESUME
 import resource_run_evidence as RUN_EVIDENCE
@@ -1159,9 +1159,126 @@ def main(argv=None, *, controller=None):
         raise
 
 
+def observation_runtime():
+    spec = importlib.util.spec_from_file_location("resource_observers", Path(__file__).with_name("resource-observers.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def start_observer(registry, args, route, route_file, command):
+    """Register an auxiliary process without arming or replacing a route stage."""
+    import dispatch_resource_wait as OWNER_RESOURCE
+    from dispatch_resource_wait import resource_evidence_paths_conflict
+    sup = OWNER_RESOURCE.supervisor()
+    snapshot = json.loads(Path(registry).read_text())
+    recorded_jobs = {row['jobs'] for row in snapshot.get('runs', {}).values()
+                     if row.get('route') == str(route_file) and row.get('node') == args.node
+                     and row.get('jobs')}
+    inherited_jobs = os.environ.get('AGENT_DISPATCH_JOBS')
+    jobs = args.jobs or inherited_jobs or (next(iter(recorded_jobs)) if len(recorded_jobs) == 1 else None)
+    selected = Path(jobs).resolve() if jobs else None
+    if ((inherited_jobs and selected != Path(inherited_jobs).resolve())
+            or any(selected != Path(value).resolve() for value in recorded_jobs)):
+        fail('resource-dispatch-jobs-conflict')
+    ledger = sup.ledger_for(route, jobs)
+    log = Path(args.log).resolve()
+    observer = {"run_id": args.run_id, "route": str(route_file), "node": args.node,
+                "route_id": route["route_id"], "cwd": str(Path(args.cwd).resolve()),
+                "log": str(log), "sentinel": str(log) + ".exit",
+                "progress_file": str(log) + ".progress.json", "command": command,
+                "resource_policy": "observer", "artifact_root": route["artifact_root"]}
+    if not SAFE_RUN_ID.fullmatch(args.run_id):
+        fail("invalid --run-id")
+    with ledger.lock():
+        if sup.resource_continuation_cancelled(route, ledger):
+            fail("resource-parent-close-requested")
+        def reserve(data):
+            rows = data.get("runs", {})
+            previous = rows.get(args.run_id)
+            if previous is not None:
+                if any(previous.get(key) != value for key, value in observer.items()):
+                    raise ValueError("resource-route-body-conflict")
+                return False, previous
+            armed = sup.read_armed(ledger).get(args.node)
+            primaries = [row for row in rows.values() if row.get("route") == str(route_file)
+                         and row.get("node") == args.node and row.get("resource_policy") != "observer"
+                         and (not armed or row.get("run_id") == armed.get("predecessor_id"))
+                         and classify_identity(row)[0] == "working"]
+            if len(primaries) != 1:
+                raise ValueError("resource-observer-requires-live-resource")
+            primary = primaries[0]
+            if primary.get('jobs') and Path(primary['jobs']).resolve() != selected:
+                raise ValueError('resource-dispatch-jobs-conflict')
+            for row in rows.values():
+                if resource_evidence_paths_conflict(row, observer):
+                    raise ValueError("resource-route-body-conflict")
+            if any(Path(value).exists() or Path(value).is_symlink()
+                   for value in (str(log), observer['sentinel'], observer['progress_file'],
+                                 observer['sentinel'] + '.partial')):
+                raise ValueError("resource-observer-evidence-exists")
+            row = {**observer, "observer_of": primary["run_id"], "status": "launching",
+                   "workflow_state": "RUNNING", "started_at": time.time(),
+                   **{key: primary[key] for key in ("session", "notify", "supervisor_session", "owner_wait",
+                        "parent_attempt_id", "campaign_id", "cycle_id", "jobs") if key in primary}}
+            rows[args.run_id] = row
+            return True, row
+        created, row = locked_update(registry, reserve)
+        if not created:
+            observation_runtime().ensure_resource(registry, args.run_id)
+            print(json.dumps({**row, "replayed": True, "payload_spawned": False}))
+            return
+        proc, release, output = None, None, None
+        try:
+            register_registry(registry)
+            log.parent.mkdir(parents=True, exist_ok=True)
+            output = log.open('xb', buffering=0)
+            wait_read, release = os.pipe()
+            environment = {**os.environ, **progress_environment(row),
+                "AGENT_RESOURCE_SENTINEL": row['sentinel'], "AGENT_RESOURCE_LAUNCH_FD": str(wait_read),
+                "HEARTING_RESOURCE_RUN_ID": args.run_id, "HEARTING_RESOURCE_REGISTRY": str(registry),
+                "HEARTING_GPU_LEASE_RELEASE": "", "CUDA_VISIBLE_DEVICES": ""}
+            try:
+                proc = subprocess.Popen(["/bin/bash", "-p", "-c",
+                    'IFS= read -r launch <&"$AGENT_RESOURCE_LAUNCH_FD" || exit 125; ' + SENTINEL_SCRIPT,
+                    "resource-observer", *command], cwd=row['cwd'], env=environment,
+                    pass_fds=(wait_read,), stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            finally:
+                os.close(wait_read)
+            identity = launched_identity(proc)
+            if not identity:
+                raise ValueError("resource-observer-identity-unconfirmed")
+            running = {**row, **identity, "pid_namespace": os.readlink('/proc/self/ns/pid'),
+                       "process_group": os.getpgid(proc.pid), "status": "running"}
+            def publish(data):
+                if data['runs'].get(args.run_id) != row:
+                    raise ValueError("resource-reservation-changed")
+                data['runs'][args.run_id] = running
+            locked_update(registry, publish)
+            observation_runtime().ensure_resource(registry, args.run_id)
+            os.write(release, b'start\n')
+            print(json.dumps(running))
+        except Exception:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+            def failed(data):
+                current = data['runs'].get(args.run_id)
+                if current and current.get('observer_of') == row['observer_of']:
+                    current.update(status='failed', workflow_state='FAILED_RETRYABLE',
+                                   failure_class='observer-launch-failed', ended_at=time.time())
+            locked_update(registry, failed)
+            raise
+        finally:
+            if release is not None:
+                os.close(release)
+            if output is not None:
+                output.close()
+
+
 def _main(argv=None, *, controller=None):
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if raw_argv and raw_argv[0] == "start":
+    if raw_argv and raw_argv[0] in {"start", "observe"}:
         import artifact_context
         context = artifact_context.resolve_context(environ=os.environ)
         if context.route and context.node:
@@ -1208,11 +1325,12 @@ def _main(argv=None, *, controller=None):
                     raw_argv[divider:divider] = [flag, value]
                     divider += 2
     p=argparse.ArgumentParser(); p.add_argument("--registry"); s=p.add_subparsers(dest="cmd",required=True)
-    a=s.add_parser("start"); a.add_argument("--run-id"); a.add_argument("--cwd"); a.add_argument("--log"); a.add_argument("--route",required=True); a.add_argument("--node"); a.add_argument("--compute-run"); a.add_argument("--smoke-attestation"); a.add_argument("--config-manifest")
-    a.add_argument("--parent-attempt-id",help="registered headless attempt that owns this resource child")
-    a.add_argument("--jobs", help="canonical dispatch registry for the existing continuation")
-    a.add_argument("--share", action="store_true", help="Allow intentional GPU sharing")
-    a.add_argument("command",nargs=argparse.REMAINDER)
+    for command_name in ("start", "observe"):
+        a=s.add_parser(command_name); a.add_argument("--run-id"); a.add_argument("--cwd"); a.add_argument("--log"); a.add_argument("--route",required=True); a.add_argument("--node"); a.add_argument("--compute-run"); a.add_argument("--smoke-attestation"); a.add_argument("--config-manifest")
+        a.add_argument("--parent-attempt-id",help="registered headless attempt that owns this resource child")
+        a.add_argument("--jobs", help="canonical dispatch registry for the existing continuation")
+        a.add_argument("--share", action="store_true", help="Allow intentional GPU sharing")
+        a.add_argument("command",nargs=argparse.REMAINDER)
     for name in ("status","stop","tail","reap"):
         x=s.add_parser(name); x.add_argument("--run-id",required=True)
     observation_cmd=s.add_parser("observation", help="read a run's stable public observation record")
@@ -1228,7 +1346,9 @@ def _main(argv=None, *, controller=None):
         return
     if not args.registry: fail("--registry is required")
     registry=Path(args.registry).resolve()
-    if args.cmd=="start":
+    if args.cmd in {"start", "observe"}:
+        if args.cmd == "observe" and args.compute_run:
+            fail("observer cannot adopt a compute execution")
         command=args.command[1:] if args.command[:1]==["--"] else args.command
         route_file=Path(args.route)
         if route_file.is_symlink():
@@ -1261,6 +1381,9 @@ def _main(argv=None, *, controller=None):
         node=next((n for n in route["nodes"] if isinstance(n,dict) and n.get("id")==args.node),None)
         if not node or node.get("kind")!="resource-runner" or node.get("resource_transport")!="detached-process":
             fail("route node is not detached resource-runner")
+        if args.cmd == "observe":
+            start_observer(registry, args, route, route_file, command)
+            return
         resume = RESOURCE_RESUME.route_selected(route) and node.get("resource_policy") == "verified-resume"
         if resume and not SAFE_RUN_ID.fullmatch(args.run_id): fail("invalid --run-id")
         if not args.smoke_attestation and not resume: fail("hash-bound smoke attestation required")

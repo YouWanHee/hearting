@@ -1807,6 +1807,10 @@ def require_resource_predecessors(rows, candidate, *, observations=None):
     from dispatch_resource_wait import resource_evidence_paths_conflict
     observations = observations or {}
     for row in rows:
+        if row.get("resource_policy") == "observer":
+            if resource_evidence_paths_conflict(row, candidate):
+                raise ValueError("resource-route-body-conflict")
+            continue
         execution = row.get("execution") if isinstance(row, dict) else None
         if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
             captured = observations.get(row.get("run_id"))

@@ -3052,6 +3052,8 @@ def cmd_run(args):
     meta = {"run_id": run_id, "host": name, "command": command,
             "cwd": workdir, "env": env, "gpus": admission["gpus"],
             "artifact_root": os.environ.get("AGENT_ARTIFACT_ROOT") or None,
+            "campaign_id": os.environ.get("AGENT_ARTIFACT_CAMPAIGN_ID") or None,
+            "cycle_id": os.environ.get("AGENT_ARTIFACT_CYCLE_ID") or None,
             "run_root": str(config["run_root"]), "host_is_local": is_self(host),
             "path_namespace": host.get("path_namespace"),
             "gpu_lease": admission.get("gpu_lease"), "share": share,
@@ -3084,7 +3086,6 @@ def cmd_run(args):
     return 0
 
 
-COMPLETION_WATCH_SECONDS = 14 * 24 * 3600
 COMPLETION_POLL_SECONDS = 60
 
 
@@ -3101,8 +3102,14 @@ def _observe_compute_experiment(meta, run_dir, now, *, final=False):
     except (OSError, ValueError, TypeError):
         pass
     artifact_root = (resource.get("artifact_root") or route_doc.get("artifact_root")
-                     or meta.get("artifact_root")
-                     or os.environ.get("AGENT_ARTIFACT_ROOT"))
+                     or meta.get("artifact_root"))
+    if not artifact_root and isinstance(meta.get("cwd"), str) and Path(meta["cwd"]).is_absolute():
+        try:
+            artifact_root = subprocess.check_output(
+                [str(Path(__file__).with_name("artifact-root.sh")), meta["cwd"]],
+                text=True, timeout=5, stderr=subprocess.DEVNULL).strip() or None
+        except (OSError, subprocess.SubprocessError):
+            pass
     output_dir = meta.get("output_dir") or resource.get("output_dir")
     mapping = meta.get("path_namespace")
     if isinstance(output_dir, str) and isinstance(mapping, dict):
@@ -3129,12 +3136,12 @@ def _observe_compute_experiment(meta, run_dir, now, *, final=False):
         started = None
     record = {
         "run_id": meta.get("run_id") or Path(run_dir).name,
-        "campaign_id": resource.get("campaign_id") or os.environ.get("AGENT_ARTIFACT_CAMPAIGN_ID"),
-        "cycle_id": resource.get("cycle_id") or os.environ.get("AGENT_ARTIFACT_CYCLE_ID"),
+        "campaign_id": resource.get("campaign_id") or meta.get("campaign_id"),
+        "cycle_id": resource.get("cycle_id") or meta.get("cycle_id"),
         "route_id": route.get("route_id") or route_doc.get("route_id"),
         "node": resource.get("node"), "host": meta.get("host"),
         "output_dir": output_dir, "artifact_root": artifact_root,
-        "route": route_file, "jobs": resource.get("jobs") or os.environ.get("AGENT_DISPATCH_JOBS"),
+        "route": route_file, "jobs": resource.get("jobs"),
         "command": meta.get("command"), "cwd": meta.get("cwd"),
         "config_sha256": ((resource.get("contract") or {}).get("sealed") or {}).get("config_sha256"),
         "run_root": meta.get("run_root"), "path_namespace": meta.get("path_namespace"),
@@ -3210,7 +3217,7 @@ def _spawn_completion_watch(run_dir, meta, *, environ=None, spawn=subprocess.Pop
         session = provenance.get("notify")
         if not session and not records_outputs:
             return False
-    if (not records_outputs and (not isinstance(session, dict)
+    if (not records_outputs and not provenance.get("route") and (not isinstance(session, dict)
             or session.get("harness") not in {"claude", "codex", "opencode"}
             or not isinstance(session.get("id"), str) or not session.get("id"))):
         return False
@@ -3221,17 +3228,19 @@ def _spawn_completion_watch(run_dir, meta, *, environ=None, spawn=subprocess.Pop
         except OSError:
             return False
     try:
-        with open(os.devnull, "rb") as stdin, open(os.devnull, "ab") as out:
-            spawn([sys.executable, str(Path(__file__).resolve()), "watch-run", str(run_dir)],
-                  stdin=stdin, stdout=out, stderr=out, env=dict(env),
-                  start_new_session=True, close_fds=True)
+        spec = importlib.util.spec_from_file_location("resource_observers", Path(__file__).with_name("resource-observers.py"))
+        observers = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(observers)
+        result = observers.ensure_watch(
+            [sys.executable, str(Path(__file__).resolve()), "watch-run", str(run_dir)],
+            Path(run_dir) / ".observation-watch.lock", environ=env, spawn=spawn)
+        return bool(result.get("started") or result.get("reused"))
     except OSError:
         return False
     return True
 
 
 def cmd_watch_run(args, *, sleep=time.sleep, now=time.time):
-    """Internal: observe the existing run and report once its exit is recorded."""
     try:
         config = load_config()
     except ConfigError as exc:
@@ -3239,13 +3248,32 @@ def cmd_watch_run(args, *, sleep=time.sleep, now=time.time):
             raise
     else:
         _refuse_namespace_self(config, "watch-run")
+    if not Path(args.run_dir).is_dir():
+        return 0
+    spec = importlib.util.spec_from_file_location(
+        "resource_observers", Path(__file__).with_name("resource-observers.py"))
+    observers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(observers)
+    with observers.watch_lock(Path(args.run_dir) / ".observation-watch.lock") as acquired:
+        if not acquired:
+            return 0
+        return _watch_run(args, sleep=sleep, now=now)
+
+
+def _watch_run(args, *, sleep=time.sleep, now=time.time):
+    """Internal: observe the existing run and report once its exit is recorded."""
     run_dir = Path(args.run_dir)
-    deadline = now() + COMPLETION_WATCH_SECONDS
     exit_path = run_dir / "exit_code"
     last_observation = None
-    while not exit_path.is_file():
-        if now() >= deadline or not run_dir.is_dir():
+    while True:
+        if not run_dir.is_dir():
             return 0
+        try:
+            code = int(exit_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            code = None
+        if code is not None:
+            break
         try:
             meta_live = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
             last_observation = _observe_compute_experiment(meta_live, run_dir, now()) or last_observation
@@ -3254,7 +3282,6 @@ def cmd_watch_run(args, *, sleep=time.sleep, now=time.time):
         sleep(COMPLETION_POLL_SECONDS)
     try:
         meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
-        code = exit_path.read_text(encoding="utf-8").strip()
     except (OSError, ValueError):
         return 0
     if ((meta.get("provenance") or {}).get("resource") is not None):
