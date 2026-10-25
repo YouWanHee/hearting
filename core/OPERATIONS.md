@@ -2766,9 +2766,9 @@ directly); `SendMessage` is secondary.
 `state=armed` line carrying the next-action field `parent_next` (§5.10a).
 The exact server/pane/session obligation remains stored when a bounded observer
 times out, loses herdr, or exits; the existing startup/reconnect path replaces
-only that observer and continues the same watch id. `join`/`status`/`ack` report
-the stored obligation and its current observation; a fulfilled duty may be
-followed by an explicit new watch. A tab is a location hint, not identity.
+only that observer under its existing claim, publishing its identity and generation
+before reporting reattachment. `join`/`status`/`ack` report the stored duty and
+observation; a fulfilled duty allows a new watch. A tab is a location hint, not identity.
 The existing obligation runner may share a narrow, target-bound readiness
 observation across watchers after their native results arrive. Each watcher
 retains its own native result, deadline, receipt, and ack; the shared observation

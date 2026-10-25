@@ -3974,7 +3974,9 @@ def cmd_watch(args):
         if existing_match is not None:
             existing_id, existing_arm, existing_paths = existing_match
             if not _watcher_present(existing_arm):
-                _spawn_watch_observer(existing_id, existing_arm)
+                _spawn_watch_observer(existing_id, existing_arm, claim_held=(
+                    _watch_claim_path_for_arm(existing_paths, existing_arm, server)
+                    in {logical_claim, claim}))
                 existing_arm = _read_json(existing_paths.arm) or existing_arm
             _write_watch_claim(logical_fd, existing_id)
             _write_watch_claim(claim_fd, existing_id)
@@ -5061,13 +5063,38 @@ def _watch_observer_duty_argv(watch_id, arm, *, rearm_generation, lock_fd=None,
 
 
 def _spawn_watch_observer(watch_id, arm, *, service_current=None,
-                          recipient_census=None):
-    """Reattach the observer to accepted intent without changing its identity."""
+                          recipient_census=None, claim_held=False):
+    """Reattach and publish under the same short-lived claim as admission."""
     if not isinstance(arm, dict) or arm.get("watch_id") != watch_id:
         return False
     paths = _watch_paths(watch_id)
     if paths.receipt.exists():
         return True
+    if not claim_held:
+        claim = _watch_claim_path_for_arm(paths, arm, arm.get("server") or "default")
+        if claim is not None:
+            claim_fd = None
+            try:
+                claim_fd = _open_lock(claim)
+                if not _acquire_bounded(claim_fd, _CLAIM_TIMEOUT_MS):
+                    return False
+                return _spawn_watch_observer(
+                    watch_id, arm, service_current=service_current,
+                    recipient_census=recipient_census, claim_held=True)
+            except (OSError, TypeError, ValueError):
+                return False
+            finally:
+                if claim_fd is not None:
+                    os.close(claim_fd)
+        # Older accepted arms may have no steward/claim identity. Retain their
+        # lifetime-lock recovery without inventing a claim or reporting a
+        # contended lock as proof of a published observer.
+    current_arm = _read_json(paths.arm)
+    if (not isinstance(current_arm, dict) or current_arm.get("watch_id") != watch_id
+            or (current_arm.get("steward") or {}).get("session_id") !=
+                (arm.get("steward") or {}).get("session_id")):
+        return False
+    arm = current_arm
     if recipient_census is None:
         from recipient_lifetime import RecipientCensus
         recipient_census = RecipientCensus()
@@ -5103,7 +5130,9 @@ def _spawn_watch_observer(watch_id, arm, *, service_current=None,
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return True
+            # A held lifetime lock can precede publication of a replacement.
+            # It proves attachment only with a receipt or a recorded live PID.
+            return paths.receipt.exists() or _watcher_present(_read_json(paths.arm))
         current_arm = _read_json(paths.arm)
         if (not isinstance(current_arm, dict) or current_arm.get("watch_id") != watch_id
                 or (current_arm.get("steward") or {}).get("session_id") !=

@@ -3839,6 +3839,71 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         self._release()
 
 
+    def test_rearm_waits_for_a_concurrent_observer_to_publish_its_generation(self):
+        dead = self._arm(target="peer-dead", mode="held")
+        self._wait_for_wait_calls(1)
+        paths = peer_steward._watch_paths(dead["watch_id"], self.watch_root)
+        arm = peer_steward._read_json(paths.arm)
+        os.kill(int(dead["pid"]), signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while (peer_steward._pid_identity_ok(int(dead["pid"]), dead["pid_start"])
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+        self.assertFalse(peer_steward._watcher_present(arm))
+
+        ctx = multiprocessing.get_context("fork")
+        spawned, publish = ctx.Event(), ctx.Event()
+        real_popen = peer_steward.subprocess.Popen
+
+        def restart():
+            def delayed_publication(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                spawned.set()
+                if not publish.wait(15):
+                    raise RuntimeError("fixture did not release observer publication")
+                return process
+
+            with mock.patch.dict(os.environ, self._env("held")), \
+                 mock.patch.object(peer_steward.subprocess, "Popen",
+                                   side_effect=delayed_publication):
+                if not peer_steward._spawn_watch_observer(dead["watch_id"], arm):
+                    raise RuntimeError("fixture observer restart failed")
+
+        contender = ctx.Process(target=restart)
+        contender.start()
+        finished = threading.Event()
+        release = threading.Thread(target=lambda: (finished.wait(1), publish.set()))
+        try:
+            self.assertTrue(spawned.wait(10), "first observer was not spawned")
+            self.assertEqual(peer_steward._read_json(paths.arm)["observer_generation"], 1)
+            release.start()
+            try:
+                with mock.patch.dict(os.environ, self._env("held")), \
+                     mock.patch("builtins.print") as output:
+                    result = peer_steward.cmd_rearm(SimpleNamespace(watch_id=dead["watch_id"]))
+                observed = peer_steward._read_json(paths.arm)
+            finally:
+                finished.set()
+            self.assertEqual(result, 0)
+            self.assertEqual(observed["observer_generation"], 2)
+            self.assertNotEqual(observed["watcher"]["pid"], int(dead["pid"]))
+            self.assertTrue(peer_steward._watcher_present(observed))
+            self.assertIn("state=rearmed", output.call_args_list[0].args[0])
+            self.assertEqual(len(self._wait_calls()), 1,
+                             "both restart callers retain the one native wait")
+        finally:
+            publish.set()
+            finished.set()
+            if release.ident is not None:
+                release.join(3)
+            contender.join(10)
+            if contender.is_alive():
+                contender.kill()
+                contender.join(3)
+        self.assertEqual(contender.exitcode, 0)
+        self._release()
+
+
 class WatchMessageTransportSettlementTest(_WatchMixin, unittest.TestCase):
     def _watch(self, target):
         import session_tidy
