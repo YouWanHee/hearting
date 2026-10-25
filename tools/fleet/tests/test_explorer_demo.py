@@ -258,7 +258,8 @@ class OnceCommand(unittest.TestCase):
                 self.assertTrue(all(len(line) <= cols for line in lines))
                 self.assertIn("hearting ›", lines[-1])
                 if cols == 80:
-                    self.assertIn("hearting " + snapshot.hearting["version"], lines[0])
+                    self.assertTrue(lines[0].startswith("⌂ base +2"), lines[0])
+                    self.assertIn(snapshot.hearting["version"], lines[0])
                     self.assertRegex(lines[0].rstrip(), r"\d{2}:\d{2}$")
         finally:
             render.set_explorer_mode(False)

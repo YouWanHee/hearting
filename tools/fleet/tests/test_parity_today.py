@@ -1,4 +1,5 @@
 """Hermetic coverage for today's parity capture primitives."""
+import copy
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -7,7 +8,7 @@ from unittest import mock
 
 from tools.fleet.tests.parity_compare import diff_frames
 from tools.fleet.tests.parity_today import (REFERENCE_MASK_VERSION, R14_GENERIC_OVERFLOW_CASES,
-                                            R14_REFERENCE_PROFILE,
+                                            R14_HEADER_IDENTITY_PRD_SHA256, R14_REFERENCE_PROFILE,
                                             R14_RESIDUAL_CELL_PAIRS, _frame_from_reference, _jsonable,
                                             _unique_reference_copy_limitations, _wide_continuation_pair_is_complete,
                                             build_live_vm, classify, main)
@@ -92,6 +93,48 @@ def _rows_record(width, state, rows, *, start=0, hits=None, profile=None, fleet_
     if profile:
         record["reference_profile"] = profile
         record["reference_overflow_mask"] = {"version": "r14-v87-explicit-cell-mask-v1", "profile": profile, "cells": []}
+    return record
+
+
+def _r14_narrow_header_record(working=0, idle=0, blocked=0, version="v3.50.3-20-gad247e2b6", clock="02:38"):
+    host = "⌂ moving4 +4"
+    reference_census = (f" {working} working  ● {idle} idle  ● {blocked} answer needed   hearting "
+                        f"{version}  {clock}")
+    reference = reference_census.ljust(79) + "⠏"
+    census = (f"⠏ {working} working● {idle} idle● {blocked} answer needed {version} {clock}")
+    gap = 80 - len(host) - len(census)
+    if gap < 0:
+        raise ValueError("fixture header exceeds 80 cells")
+    candidate = host + " " * gap + census
+    record = _rows_record(80, "OVERVIEW", {0: (reference, candidate)}, profile=R14_REFERENCE_PROFILE)
+    record["reference_edge"][0] = True
+    record["reference_overflow_mask"]["version"] = REFERENCE_MASK_VERSION
+    record["reference_overflow_mask"]["profile"] = R14_REFERENCE_PROFILE
+
+    def style_text(cells, start, text, style):
+        for offset, glyph in enumerate(text):
+            column = start + offset
+            cells[0][column] = (glyph, style, None)
+
+    candidate_cells = record["fleet2_cells"]
+    style_text(candidate_cells, 0, "⌂ ", "g_work")
+    style_text(candidate_cells, 2, "moving4", "g_work")
+    style_text(candidate_cells, 9, " +4", "dim")
+    position = 80 - len(census)
+    for column in range(len(host), position):
+        candidate_cells[0][column] = (" ", None, None)
+    for text, style in ((f"⠏ {working}", "g_spin"), (" working", "dim"),
+                        (f"● {idle}", "g_work_off"), (" idle", "dim"),
+                        (f"● {blocked}", "g_blocked"), (" answer needed", "dim"),
+                        (f" {version}", "version_release"), (f" {clock}", "dim")):
+        style_text(candidate_cells, position, text, style)
+        position += len(text)
+    record["fleet2_rows"][0] = "".join(cell[0] for cell in candidate_cells[0])
+    record["differences"] = []
+    for column, (expected, actual) in enumerate(zip(record["reference_cells"][0], candidate_cells[0])):
+        if expected != actual:
+            record["differences"].append({"kind": "cell", "row": 0, "column": column,
+                                          "expected": list(expected), "actual": list(actual)})
     return record
 
 
@@ -433,6 +476,56 @@ class ClassificationTests(unittest.TestCase):
                 entries = classify([record])["entries"]
                 self.assertTrue(entries)
                 self.assertEqual(entries[0]["class"], "unexplained")
+
+    def test_r14_narrow_host_identity_difference_is_exact_and_prd_bound(self):
+        record = _r14_narrow_header_record()
+        entry = classify([record])["entries"][0]
+        self.assertEqual((entry["class"], entry["rule"], entry["rows"]),
+                         ("intended", "prd-narrow-host-identity", [0, 0]))
+        self.assertIn(R14_HEADER_IDENTITY_PRD_SHA256, entry["reason"])
+
+        candidates = []
+        for column, actual in (
+                (0, ("◇", "g_work", None)),               # wrong host mark
+                (7, ("X", "g_work", None)),               # wrong host name
+                (11, ("3", "dim", None)),                 # wrong host count
+                (13, ("X", None, None)),                   # adjacent cell outside host prefix
+                (record["fleet2_rows"][0].index("⠏ 0") + 2, ("1", "g_spin", None)),  # wrong status count
+                (record["fleet2_rows"][0].index("gad247"), ("b", "version_release", None)),
+                (79, ("9", "dim", None)),                 # wrong freshness digit
+                (record["fleet2_rows"][0].index("⠏"), ("⠙", "g_spin", None)),  # wrong spinner glyph
+                (0, ("⌂", "dim", None)),                   # wrong host style
+                (record["fleet2_rows"][0].index("⠏ 0") + 2, ("0", "dim", None)),
+                (record["fleet2_rows"][0].index("gad247"), ("g", "dim", None)),
+        ):
+            altered = copy.deepcopy(record)
+            _change_candidate_cell(altered, 0, column, actual)
+            candidates.append(altered)
+        altered_prefix = copy.deepcopy(record)
+        _change_candidate_cell(altered_prefix, 0, 0, ("h", "g_work", None))
+        candidates.append(altered_prefix)
+        altered_prefix_space = copy.deepcopy(record)
+        _change_candidate_cell(altered_prefix_space, 0, 1, ("X", "g_work", None))
+        candidates.append(altered_prefix_space)
+        altered_reference = copy.deepcopy(record)
+        altered_reference["reference_profile"] = "unregistered-copy"
+        candidates.append(altered_reference)
+        altered_trace = copy.deepcopy(record)
+        altered_trace["reference_overflow_mask"]["version"] = "unregistered-trace"
+        candidates.append(altered_trace)
+        changed_hits = copy.deepcopy(record)
+        changed_hits["differences"].append({"kind": "hits", "expected": [], "actual": [[0, 0, 1, ["ui"]]]})
+        candidates.append(changed_hits)
+
+        for altered in candidates:
+            with self.subTest(row=altered["fleet2_rows"][0][:20], differences=len(altered["differences"])):
+                result = classify([altered])
+                self.assertGreater(result["summary"]["unexplained"], 0)
+        hit_result = classify([changed_hits])
+        self.assertIn(("prd-narrow-host-identity", "intended"),
+                      [(entry["rule"], entry["class"]) for entry in hit_result["entries"]])
+        self.assertIn(("hits", "unexplained", "unexplained"),
+                      [(entry["kind"], entry["class"], entry["rule"]) for entry in hit_result["entries"]])
 
     def test_empty_answered_repo_placeholder_does_not_claim_an_aggregate_count_defect(self):
         record = _record(width=140, cells=[(7, 40, "0", "dim", "·", "dim")])

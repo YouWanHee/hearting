@@ -834,6 +834,92 @@ def _spinner_row_order(record, band):
             [cell for i, cell in enumerate(fleet2) if i != live_positions[0]])
 
 
+_NARROW_HEADER_SEMANTICS = re.compile(
+    r"^\s*(?P<working>\d+) working\s*●\s*(?P<idle>\d+) idle\s*●\s*"
+    r"(?P<blocked>\d+) answer needed\s+(?:hearting\s+)?(?P<version>\S+)\s+"
+    r"(?P<clock>\d{2}:\d{2})\s*$")
+R14_HEADER_IDENTITY_PRD_SHA256 = "5391e658c94fc575fb39ffbc85b6cff76a742c47dec1132cedaa1aa6cde42386"
+
+
+def _r14_narrow_host_identity(record, band):
+    """Allow only the PRD-required moving4 header added to the pinned R14 narrow census."""
+    trace = record.get("reference_overflow_mask") or {}
+    if (record.get("width") != 80 or record.get("rows") != 45 or record.get("state") not in VIEWS or
+            band.get("pane") != "frame" or band.get("rows") != [0] or
+            record.get("reference_profile") != R14_REFERENCE_PROFILE or
+            trace.get("profile") != R14_REFERENCE_PROFILE or trace.get("version") != REFERENCE_MASK_VERSION or
+            any(diff.get("kind") != "cell" or diff.get("row") != 0 for diff in band.get("diffs", ()))):
+        return False
+    references, candidates = record.get("reference_cells") or (), record.get("fleet2_cells") or ()
+    if not references or not candidates or not references[0] or not candidates[0]:
+        return False
+
+    def row_text(cells):
+        if any(not isinstance(cell, (list, tuple)) or len(cell) < 3 or len(str(cell[0] or "")) > 1
+               for cell in cells):
+            return None
+        return "".join(str(cell[0] or "") for cell in cells)
+
+    reference, candidate = row_text(references[0]), row_text(candidates[0])
+    if (reference is None or candidate is None or len(reference) != 80 or len(candidate) != 80 or
+            not record.get("reference_edge", [False])[0] or reference[-1] not in _SPINNER_GLYPHS or
+            "moving4" in reference):
+        return False
+    host_prefix = "⌂ moving4 +4"
+    if not candidate.startswith(host_prefix):
+        return False
+    reference_spinner = [index for index, char in enumerate(reference) if char in _SPINNER_GLYPHS]
+    candidate_spinner = [index for index, char in enumerate(candidate) if char in _SPINNER_GLYPHS]
+    if (len(reference_spinner) != 1 or len(candidate_spinner) != 1 or
+            reference[reference_spinner[0]] != candidate[candidate_spinner[0]]):
+        return False
+    reference_census = reference[:reference_spinner[0]] + reference[reference_spinner[0] + 1:]
+    candidate_tail = candidate[len(host_prefix):]
+    candidate_census = candidate_tail[:candidate_spinner[0] - len(host_prefix)] + \
+        candidate_tail[candidate_spinner[0] - len(host_prefix) + 1:]
+    reference_match = _NARROW_HEADER_SEMANTICS.fullmatch(reference_census)
+    candidate_match = _NARROW_HEADER_SEMANTICS.fullmatch(candidate_census)
+    if not reference_match or not candidate_match:
+        return False
+    names = ("working", "idle", "blocked", "version", "clock")
+    if any(reference_match.group(name) != candidate_match.group(name) for name in names):
+        return False
+
+    spinner = candidate[candidate_spinner[0]]
+    values = {name: reference_match.group(name) for name in names}
+    census = (f"{spinner} {values['working']} working● {values['idle']} idle● "
+              f"{values['blocked']} answer needed {values['version']} {values['clock']}")
+    gap = 80 - len(host_prefix) - len(census)
+    if gap < 0 or candidate != host_prefix + (" " * gap) + census:
+        return False
+
+    # Exact safe tuples: the compact approved host mark/name/+N; an unstyled separator gap;
+    # then the existing census keys with only its redundant product label and padding removed.
+    expected_host = [("⌂", "g_work"), (" ", "g_work")] + [(char, "g_work") for char in "moving4"] + [
+        (" ", "dim"), ("+", "dim"), ("4", "dim")]
+    for column, (glyph, style) in enumerate(expected_host):
+        if tuple(candidates[0][column][:3]) != (glyph, style, None):
+            return False
+    census_start = 80 - len(census)
+    if census_start < len(expected_host) or any(
+            tuple(candidates[0][column][:3]) != (" ", None, None)
+            for column in range(len(expected_host), census_start)):
+        return False
+    census_parts = [
+        (f"{spinner} {values['working']}", "g_spin"), (" working", "dim"),
+        (f"● {values['idle']}", "g_work_off"), (" idle", "dim"),
+        (f"● {values['blocked']}", "g_blocked"), (" answer needed", "dim"),
+        (f" {values['version']}", "version_release"), (f" {values['clock']}", "dim"),
+    ]
+    column = census_start
+    for text, style in census_parts:
+        for glyph in text:
+            if column >= 80 or tuple(candidates[0][column][:3]) != (glyph, style, None):
+                return False
+            column += 1
+    return column == 80
+
+
 def _unknown_compute_track(record, band):
     unknown_cells = frozenset({"UTIL", "COMPUTE block VRAM percent", "VRAM gauge", "VRAM used/total"})
     limitations = {(item.get("gpu"), frozenset(item.get("unknown_cells") or ()))
@@ -986,6 +1072,11 @@ RULES = [
     ("blank-cell-key", "intended", None,
      "only blank cells differ, and only in their foreground key: a space has no glyph and no background, so nothing visible differs",
      _blank_cell_key),
+    ("prd-narrow-host-identity", "intended", None,
+     "at 80 columns the pinned R14 header omits the connected host identity; PRD v87 requires the host name on the first line "
+     "and host resources in the first screen (SHA256 " + R14_HEADER_IDENTITY_PRD_SHA256 + "). Only the exact moving4/+4 "
+     "prefix, unchanged reference counts/version/clock, approved styles, and bounded row-0 tuples are accepted",
+     _r14_narrow_host_identity),
     ("prd-census-spinner-order", "intended", None,
      "the current PRD moves only the spinner; census, version, clock and every other styled cell match after its position is normalized",
      _spinner_row_order),

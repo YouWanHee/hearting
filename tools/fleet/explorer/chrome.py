@@ -16,19 +16,42 @@ def _clip(text, width):
     return clip(str(text), max(0, int(width)))
 
 
-def _compact_spaces(text):
-    """Collapse repeated padding without changing the words carried by a header fragment."""
-    out = []
-    in_spaces = False
-    for char in str(text):
-        if char == " ":
-            if not in_spaces:
-                out.append(char)
-            in_spaces = True
+def _compact_census_parts(parts, *, drop_brand=True):
+    """Normalize only fragment separators and dedicated padding fragments."""
+    compacted = []
+    for text, key in parts:
+        text = str(text)
+        if not text.strip(" ") or (drop_brand and text == "hearting" and key == "hearting"):
+            continue
+        text = text.lstrip(" ")
+        separator = " " if compacted and not text.startswith("●") else ""
+        compacted.append((separator + text, key))
+    return compacted
+
+
+def _host_parts(hosts, *, compact=False):
+    if not hosts:
+        return []
+    selected = hosts[:1] if compact else hosts
+    parts = [] if compact else [("hosts ", "label")]
+    for host in selected:
+        if isinstance(host, Mapping):
+            mark, name = host.get("mark", "◇"), host.get("name", "·")
         else:
-            out.append(char)
-            in_spaces = False
-    return "".join(out)
+            mark, name = (tuple(host) + ("◇", "·"))[:2]
+        parts += [(f"{mark} ", "dim" if mark == "◇" else "work"),
+                  (str(name), "soft" if mark == "◇" else "work")]
+        if not compact:
+            parts.append(("  ", "branch_s"))
+    if compact and len(hosts) > 1:
+        parts.append((f" +{len(hosts) - 1}", "dim"))
+    elif not compact:
+        parts[-1] = (f" {len(hosts)}/{len(hosts)}", "dim")
+    return parts
+
+
+def _parts_width(parts):
+    return sum(cell_width(text) for text, _key in parts)
 
 
 def draw_chrome(grid: CellGrid, vm, state, beat=1):
@@ -57,41 +80,54 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
                              (" " + str(install.get("version", "")), "ver")])
     if freshness:
         census_parts.append(("  " + str(freshness), "dim"))
-    census_width = sum(cell_width(part[0]) for part in census_parts)
-    if census_width > width:
-        compacted = [(_compact_spaces(text), key) for text, key in census_parts]
-        compact_width = sum(cell_width(text) for text, _key in compacted)
-        if compact_width < census_width:
-            census_parts, census_width = compacted, compact_width
+    census_width = _parts_width(census_parts)
+    if not hosts and census_width > width:
+        census_parts = _compact_census_parts(census_parts, drop_brand=False)
+        census_width = _parts_width(census_parts)
+        if census_width > width:
+            census_parts = _compact_census_parts(census_parts)
+            census_width = _parts_width(census_parts)
+        if census_width > width:
+            raise ValueError(f"required Fleet census fields do not fit in {width} terminal cells")
     census_x = max(1, width - 1 - census_width)
-    parts = [("hosts ", "label")]
-    for host in hosts:
-        if isinstance(host, Mapping):
-            mark, name = host.get("mark", "◇"), host.get("name", "·")
-            key = host.get("key", "base_host")
-        else:
-            mark, name, key = (tuple(host) + ("base_host",))[:3]
-        parts += [(f"{mark} ", "dim" if mark == "◇" else "work"),
-                  (str(name), "soft" if mark == "◇" else "work"), ("  ", "branch_s")]
-    if hosts:
-        parts[-1] = (f" {len(hosts)}/{len(hosts)}", "dim")
-    if 1 + sum(len(text) for text, _key in parts) > census_x - 2 and hosts:
+    parts = _host_parts(hosts)
+    host_limit = census_x - 2
+    if hosts and 1 + _parts_width(parts) > host_limit:
         first = hosts[0]
-        mark, name = ((first.get("mark", "◇"), first.get("name", "·")) if isinstance(first, Mapping)
-                      else (tuple(first) + ("◇", "·"))[:2])
+        if isinstance(first, Mapping):
+            mark, name = first.get("mark", "◇"), first.get("name", "·")
+        else:
+            mark, name = (tuple(first) + ("◇", "·"))[:2]
         parts = [("hosts ", "label"), (f"{mark} ", "dim" if mark == "◇" else "work"),
                  (str(name), "soft" if mark == "◇" else "work"),
                  (f" +{len(hosts) - 1} · {len(hosts)}/{len(hosts)}", "dim")]
-    x = 1
-    for text, key in parts:
-        x = grid.put(x, 0, text, key, limit=census_x - 2)
-    census_only = census_x == 1 and x == 1
-    cx = 0 if census_only else max(x + 1, width - 1 - census_width)
-    census_limit = width if census_only else width - 1
-    for text, key in census_parts:
-        if cx >= census_limit:
-            break
-        cx = grid.put(cx, 0, text, key, limit=census_limit)
+    identity_fits_existing_layout = (not hosts or
+                                     1 + _parts_width(parts[:3]) <= host_limit)
+    if hosts and not identity_fits_existing_layout:
+        compact_hosts = _host_parts(hosts, compact=True)
+        compact_census = _compact_census_parts(census_parts)
+        compact_census_width = _parts_width(compact_census)
+        compact_census_x = width - compact_census_width
+        host_width = _parts_width(compact_hosts)
+        if compact_census_width > width or host_width > compact_census_x:
+            raise ValueError(f"required Fleet header fields do not fit in {width} terminal cells")
+        x = 0
+        for text, key in compact_hosts:
+            x = grid.put(x, 0, text, key, limit=compact_census_x)
+        cx = compact_census_x
+        for text, key in compact_census:
+            cx = grid.put(cx, 0, text, key, limit=width)
+    else:
+        x = 1
+        for text, key in parts:
+            x = grid.put(x, 0, text, key, limit=census_x - 2)
+        census_only = census_x == 1 and x == 1
+        cx = 0 if census_only else max(x + 1, width - 1 - census_width)
+        census_limit = width if census_only else width - 1
+        for text, key in census_parts:
+            if cx >= census_limit:
+                break
+            cx = grid.put(cx, 0, text, key, limit=census_limit)
     usage = tuple(vm.usage or ())
     if not state.usage_open:
         more_x = width - 9
