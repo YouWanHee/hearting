@@ -1,5 +1,6 @@
 """Hermetic coverage for today's parity capture primitives."""
 import copy
+import json
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -10,8 +11,8 @@ from tools.fleet.tests.parity_compare import diff_frames
 from tools.fleet.tests.parity_today import (REFERENCE_MASK_VERSION, R14_GENERIC_OVERFLOW_CASES,
                                             R14_HEADER_IDENTITY_PRD_SHA256, R14_REFERENCE_PROFILE,
                                             R14_RESIDUAL_CELL_PAIRS, _frame_from_reference, _jsonable,
-                                            _unique_reference_copy_limitations, _wide_continuation_pair_is_complete,
-                                            build_live_vm, classify, main)
+                                            _unique_reference_copy_limitations, _validated_header_identity,
+                                            _wide_continuation_pair_is_complete, build_live_vm, classify, main)
 
 
 class TodayParityPlumbingTests(unittest.TestCase):
@@ -28,6 +29,19 @@ class TodayParityPlumbingTests(unittest.TestCase):
             hidden: object
         value = Value(3, object())
         self.assertEqual(_jsonable(value), {"count": 3, "hidden": None})
+
+    def test_header_oracle_reads_the_captured_validated_fleet_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            capture = Path(temp)
+            source = capture / "fleet-json.json"
+            source.write_text(json.dumps({"hearting": {
+                "version": "v3.50.3-20-gad247e2b6", "install_method": "managed/stable"}}),
+                encoding="utf-8")
+            self.assertEqual(_validated_header_identity(capture), {
+                "version": "v3.50.3-20-gad247e2b6", "install_method": "managed/stable"})
+            source.write_text("{}", encoding="utf-8")
+            self.assertEqual(_validated_header_identity(capture), {
+                "version": "unknown", "install_method": "unmanaged"})
 
     def test_cli_returns_failure_for_unexplained_strict_residue(self):
         residue = _record(cells=[(20, 50, "a", "dim", "b", "dim")])
@@ -101,12 +115,13 @@ def _r14_narrow_header_record(working=0, idle=0, blocked=0, version="v3.50.3-20-
     reference_census = (f" {working} working  ● {idle} idle  ● {blocked} answer needed   hearting "
                         f"{version}  {clock}")
     reference = reference_census.ljust(79) + "⠏"
-    census = (f"⠏ {working} working● {idle} idle● {blocked} answer needed {version} {clock}")
+    census = (f"⠏ {working} ● {idle} ● {blocked} hearting {version} · unmanaged  {clock}")
     gap = 80 - len(host) - len(census)
     if gap < 0:
         raise ValueError("fixture header exceeds 80 cells")
     candidate = host + " " * gap + census
     record = _rows_record(80, "OVERVIEW", {0: (reference, candidate)}, profile=R14_REFERENCE_PROFILE)
+    record["validated_header_identity"] = {"version": version, "install_method": "unmanaged"}
     record["reference_edge"][0] = True
     record["reference_overflow_mask"]["version"] = REFERENCE_MASK_VERSION
     record["reference_overflow_mask"]["profile"] = R14_REFERENCE_PROFILE
@@ -123,10 +138,12 @@ def _r14_narrow_header_record(working=0, idle=0, blocked=0, version="v3.50.3-20-
     position = 80 - len(census)
     for column in range(len(host), position):
         candidate_cells[0][column] = (" ", None, None)
-    for text, style in ((f"⠏ {working}", "g_spin"), (" working", "dim"),
-                        (f"● {idle}", "g_work_off"), (" idle", "dim"),
-                        (f"● {blocked}", "g_blocked"), (" answer needed", "dim"),
-                        (f" {version}", "version_release"), (f" {clock}", "dim")):
+    for text, style in (("⠏", "g_spin"), (f" {working}", "g_spin"), (" ", None),
+                        ("●", "g_work_off"), (f" {idle}", "g_work_off"), (" ", None),
+                        ("●", "g_blocked"), (f" {blocked}", "g_blocked"), (" ", None),
+                        ("hearting", "hearting_name"), (" " + version, "version_release"),
+                        (" · ", "dim"),
+                        ("unmanaged", "version_method"), (f"  {clock}", "dim")):
         style_text(candidate_cells, position, text, style)
         position += len(text)
     record["fleet2_rows"][0] = "".join(cell[0] for cell in candidate_cells[0])
@@ -491,7 +508,12 @@ class ClassificationTests(unittest.TestCase):
                 (11, ("3", "dim", None)),                 # wrong host count
                 (13, ("X", None, None)),                   # adjacent cell outside host prefix
                 (record["fleet2_rows"][0].index("⠏ 0") + 2, ("1", "g_spin", None)),  # wrong status count
+                (record["fleet2_rows"][0].index("● 0", record["fleet2_rows"][0].index("●") + 1) + 2,
+                 ("1", "g_blocked", None)),               # wrong blocked count
                 (record["fleet2_rows"][0].index("gad247"), ("b", "version_release", None)),
+                (record["fleet2_rows"][0].index("hearting"), ("x", "hearting_name", None)),
+                (record["fleet2_rows"][0].index("unmanaged"), ("l", "version_method", None)),
+                (record["fleet2_rows"][0].index("unmanaged"), (" ", None, None)),
                 (79, ("9", "dim", None)),                 # wrong freshness digit
                 (record["fleet2_rows"][0].index("⠏"), ("⠙", "g_spin", None)),  # wrong spinner glyph
                 (0, ("⌂", "dim", None)),                   # wrong host style
@@ -507,6 +529,23 @@ class ClassificationTests(unittest.TestCase):
         altered_prefix_space = copy.deepcopy(record)
         _change_candidate_cell(altered_prefix_space, 0, 1, ("X", "g_work", None))
         candidates.append(altered_prefix_space)
+        altered_source_method = copy.deepcopy(record)
+        altered_source_method["validated_header_identity"]["install_method"] = "linked"
+        candidates.append(altered_source_method)
+        altered_source_version = copy.deepcopy(record)
+        altered_source_version["validated_header_identity"]["version"] = "v9.9.9"
+        candidates.append(altered_source_version)
+        altered_brandless = copy.deepcopy(record)
+        brand = altered_brandless["fleet2_rows"][0].index("hearting")
+        _change_candidate_cell(altered_brandless, 0, brand, (" ", None, None))
+        candidates.append(altered_brandless)
+        altered_wide = copy.deepcopy(record)
+        wide_column = altered_wide["fleet2_rows"][0].index("gad247")
+        _change_candidate_cells(altered_wide, 0, {
+            wide_column: ("界", "version_release", None),
+            wide_column + 1: ("", "version_release", None),
+        })
+        candidates.append(altered_wide)
         altered_reference = copy.deepcopy(record)
         altered_reference["reference_profile"] = "unregistered-copy"
         candidates.append(altered_reference)

@@ -2,6 +2,7 @@
 import json
 import os
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 
 from tools.fleet.explorer.frame import draw
@@ -16,6 +17,60 @@ EVIDENCE = os.environ.get("FLEET_EXPLORER_EVIDENCE_DIR")
 def expand_rows(rows):
     return [[cell for glyph, colour, tint, count in row
              for cell in [[glyph, colour, tint]] * count] for row in rows]
+
+
+def _fixture_header_identity(vm):
+    source = vm.hearting if isinstance(vm.hearting, Mapping) else {}
+    install = vm.system.get("install", {}) if isinstance(vm.system, Mapping) else {}
+    version = source.get("version") or install.get("version") or "unknown"
+    method = source.get("install_method") or "unmanaged"
+    return str(version), str(method)
+
+
+def normalize_f70_method_delta(actual_cells, expected_cells, *, version, method):
+    """Normalize only the added F70 method, then require every frozen tuple to match."""
+    width = len(expected_cells[0]) if expected_cells else 0
+    if width not in (140, 168) or len(actual_cells) != len(expected_cells) or not actual_cells:
+        return actual_cells
+    row = actual_cells[0]
+    if len(row) != width or any(len(cell) < 3 or len(str(cell[0] or "")) != 1 for cell in row):
+        raise AssertionError("F70 oracle row must contain only single-cell header tuples")
+    text = "".join(str(cell[0] or "") for cell in row)
+    identity = f"hearting {version} · {method}"
+    if text.count(identity) != 1:
+        raise AssertionError("candidate header must contain its exact F70 product/version/method identity")
+    start = text.index("hearting")
+    version_start = start + len("hearting ")
+    method_start = version_start + len(version)
+    method_text = " · " + method
+    method_end = method_start + len(method_text)
+    if text[version_start:method_start] != version or text[method_start:method_end] != method_text:
+        raise AssertionError("candidate F70 field boundaries do not match the validated identity")
+    expected_styles = (
+        (start, len("hearting"), "hearting_name"),
+        (version_start, len(version), "version_release"),
+        (method_start, len(" · "), "dim"),
+        (method_start + len(" · "), len(method), "version_method"),
+    )
+    for begin, count, style in expected_styles:
+        if any(tuple(row[index][1:3]) != (style, None) for index in range(begin, begin + count)):
+            raise AssertionError(f"candidate F70 field has an unexpected style: {style}")
+    if row[start + len("hearting")][1] != "version_release":
+        raise AssertionError("brand/version separator must keep its existing version style")
+    spinners = [index for index, cell in enumerate(row)
+                if str(cell[0] or "") in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠯⠷⠻"]
+    if len(spinners) != 1 or not 0 < spinners[0] < method_start:
+        raise AssertionError("header must retain its single existing census spinner")
+
+    # Right-alignment moves only the pre-method census group left by the inserted method width.
+    inserted = len(method_text)
+    normalized_row = (row[:spinners[0]] + [[" ", None, None]] * inserted +
+                      row[spinners[0]:method_start] + row[method_end:])
+    if len(normalized_row) != width:
+        raise AssertionError("F70 normalization changed the physical header width")
+    normalized = [list(cells) for cells in actual_cells]
+    normalized[0] = normalized_row
+    return normalized
 
 
 class CoreReference(unittest.TestCase):
@@ -39,11 +94,13 @@ class CoreReference(unittest.TestCase):
                 actual = draw(vm, NavState(), cols, 45, beat=1)
                 cells = [[list(cell) for cell in row] for row in actual.cells]
                 hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits]
-                if cells != expected["cells"]:
-                    first = next((f"row={y} col={x} expected={expected['cells'][y][x]!r} actual={cells[y][x]!r}"
-                                  for y in range(min(len(cells), len(expected["cells"])))
-                                  for x in range(min(len(cells[y]), len(expected["cells"][y])))
-                                  if cells[y][x] != expected["cells"][y][x]), "dimensions differ")
+                version, method = _fixture_header_identity(vm)
+                compared = normalize_f70_method_delta(cells, expected["cells"], version=version, method=method)
+                if compared != expected["cells"]:
+                    first = next((f"row={y} col={x} expected={expected['cells'][y][x]!r} actual={compared[y][x]!r}"
+                                  for y in range(min(len(compared), len(expected["cells"])))
+                                  for x in range(min(len(compared[y]), len(expected["cells"][y])))
+                                  if compared[y][x] != expected["cells"][y][x]), "dimensions differ")
                     self.fail(f"first cell mismatch at {cols} columns: {first}")
                 self.assertEqual(hits, expected["hits"], f"ordered hit mismatch at {cols} columns")
 
@@ -59,7 +116,10 @@ class ListReference(unittest.TestCase):
                     actual = draw(vm, NavState(view=view, title=view), cols, 45, beat=1)
                     cells = [[list(cell) for cell in row] for row in actual.cells]
                     hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits]
-                    self.assertEqual(cells, expand_rows(expected["cells"]), f"{view} cells at {cols}")
+                    expected_cells = expand_rows(expected["cells"])
+                    version, method = _fixture_header_identity(vm)
+                    cells = normalize_f70_method_delta(cells, expected_cells, version=version, method=method)
+                    self.assertEqual(cells, expected_cells, f"{view} cells at {cols}")
                     self.assertEqual(hits, expected["hits"], f"{view} ordered hits at {cols}")
 
     def test_repo_session_route_pages_and_unfolded_route_match_reference(self):
@@ -81,7 +141,10 @@ class ListReference(unittest.TestCase):
                     actual = draw(vm, state, cols, 45, beat=1)
                     cells = [[list(cell) for cell in row] for row in actual.cells]
                     hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits]
-                    self.assertEqual(cells, expand_rows(expected["cells"]), f"{case} cells at {cols}")
+                    expected_cells = expand_rows(expected["cells"])
+                    version, method = _fixture_header_identity(vm)
+                    cells = normalize_f70_method_delta(cells, expected_cells, version=version, method=method)
+                    self.assertEqual(cells, expected_cells, f"{case} cells at {cols}")
                     self.assertEqual(hits, expected["hits"], f"{case} ordered hits at {cols}")
 
     def test_peers_and_filtered_links_match_exact_reference(self):
@@ -99,7 +162,10 @@ class ListReference(unittest.TestCase):
                     actual = draw(vm, state, cols, 45, beat=1)
                     cells = [[list(cell) for cell in row] for row in actual.cells]
                     hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits]
-                    self.assertEqual(cells, expand_rows(expected["cells"]), f"{name} cells at {cols}")
+                    expected_cells = expand_rows(expected["cells"])
+                    version, method = _fixture_header_identity(vm)
+                    cells = normalize_f70_method_delta(cells, expected_cells, version=version, method=method)
+                    self.assertEqual(cells, expected_cells, f"{name} cells at {cols}")
                     self.assertEqual(hits, expected["hits"], f"{name} ordered hits at {cols}")
 
 
@@ -114,7 +180,10 @@ class QuietReference(unittest.TestCase):
                     actual = draw(vm, NavState(view=view, title=view), cols, 45, beat=1)
                     cells = [[list(cell) for cell in row] for row in actual.cells]
                     hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits]
-                    self.assertEqual(cells, expand_rows(expected["cells"]), f"{view} cells at {cols}")
+                    expected_cells = expand_rows(expected["cells"])
+                    version, method = _fixture_header_identity(vm)
+                    cells = normalize_f70_method_delta(cells, expected_cells, version=version, method=method)
+                    self.assertEqual(cells, expected_cells, f"{view} cells at {cols}")
                     self.assertEqual(hits, expected["hits"], f"{view} ordered hits at {cols}")
 
     def test_folded_question_and_history_generation_timeline_match_reference(self):
@@ -125,7 +194,11 @@ class QuietReference(unittest.TestCase):
                                       folds=(("qshut:QUESTIONS", "bb"),))
             actual = draw(vm, question_state, cols, 45, beat=1)
             expected = expected_file["list_states"]["QUESTIONS-fold-bb"]
-            self.assertEqual([[list(cell) for cell in row] for row in actual.cells], expand_rows(expected["cells"]))
+            actual_cells = [[list(cell) for cell in row] for row in actual.cells]
+            expected_cells = expand_rows(expected["cells"])
+            version, method = _fixture_header_identity(vm)
+            actual_cells = normalize_f70_method_delta(actual_cells, expected_cells, version=version, method=method)
+            self.assertEqual(actual_cells, expected_cells)
             self.assertEqual([[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits], expected["hits"])
 
             history_state = NavState(view="HISTORY", title="HISTORY",
@@ -135,8 +208,12 @@ class QuietReference(unittest.TestCase):
             # P2 owns the seat and generation timeline through generation rows;
             # card and conversation content below it belongs to P4.
             expected_cells = expand_rows(expected["cells"])
-            self.assertEqual(actual.cells[:11], tuple(tuple(tuple(cell) for cell in row)
-                                                      for row in expected_cells[:11]))
+            actual_cells = [[list(cell) for cell in row] for row in actual.cells]
+            version, method = _fixture_header_identity(vm)
+            actual_cells = normalize_f70_method_delta(actual_cells, expected_cells,
+                                                      version=version, method=method)
+            self.assertEqual(tuple(tuple(tuple(cell) for cell in row) for row in actual_cells[:11]),
+                             tuple(tuple(tuple(cell) for cell in row) for row in expected_cells[:11]))
             actual_hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits if 0 <= hit.y <= 10]
             expected_hits = [hit for hit in expected["hits"] if 0 <= hit[0] <= 10]
             self.assertEqual(actual_hits, expected_hits)
@@ -145,8 +222,11 @@ class QuietReference(unittest.TestCase):
                                   folds=(("hopen:HISTORY", "0c"),))
             actual = draw(vm, card_state, cols, 45, beat=1)
             expected = expected_file["list_states"]["HISTORY-open-0c-card"]
-            self.assertEqual([[list(cell) for cell in row] for row in actual.cells],
-                             expand_rows(expected["cells"]), f"HISTORY card/dialogue cells at {cols}")
+            actual_cells = [[list(cell) for cell in row] for row in actual.cells]
+            expected_cells = expand_rows(expected["cells"])
+            version, method = _fixture_header_identity(vm)
+            actual_cells = normalize_f70_method_delta(actual_cells, expected_cells, version=version, method=method)
+            self.assertEqual(actual_cells, expected_cells, f"HISTORY card/dialogue cells at {cols}")
             self.assertEqual([[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits],
                              expected["hits"], f"HISTORY card/dialogue ordered hits at {cols}")
 
@@ -155,7 +235,10 @@ class QuietReference(unittest.TestCase):
                                            ("ui:gen:f5", "0")))
             actual = draw(vm, picked_state, cols, 45, beat=1)
             expected = expected_file["list_states"]["HISTORY-open-0c-picked-generation"]
-            self.assertEqual([[list(cell) for cell in row] for row in actual.cells],
-                             expand_rows(expected["cells"]), f"HISTORY picked-generation cells at {cols}")
+            actual_cells = [[list(cell) for cell in row] for row in actual.cells]
+            expected_cells = expand_rows(expected["cells"])
+            version, method = _fixture_header_identity(vm)
+            actual_cells = normalize_f70_method_delta(actual_cells, expected_cells, version=version, method=method)
+            self.assertEqual(actual_cells, expected_cells, f"HISTORY picked-generation cells at {cols}")
             self.assertEqual([[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits],
                              expected["hits"], f"HISTORY picked-generation ordered hits at {cols}")

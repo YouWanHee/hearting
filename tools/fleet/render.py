@@ -7013,8 +7013,17 @@ def _explorer_compose(snapshot, cols, rows, state=None, focus_result=None, last_
 
 
 def _explorer_frame_from_model(model, state, cols, rows, *, beat=1):
-    """Redraw a frozen VM at the current geometry without consulting live sources."""
+    """Redraw a frozen VM at current geometry with this process's validated install identity."""
     from .explorer import frame as explorer_frame
+    from dataclasses import replace as _replace_model
+    install = _HEARTING if isinstance(_HEARTING, dict) else {}
+    identity = {
+        "version": install.get("version") if isinstance(install.get("version"), str)
+        and install.get("version") else "unknown",
+        "install_method": install.get("install_method") if isinstance(install.get("install_method"), str)
+        and install.get("install_method") else "unmanaged",
+    }
+    model = _replace_model(model, hearting=identity)
     return explorer_frame.draw(model, _explorer_state_for(state, cols), cols, rows, beat=beat)
 
 

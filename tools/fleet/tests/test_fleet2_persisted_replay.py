@@ -37,7 +37,9 @@ def display_vm(**session_overrides):
     }
     session.update(session_overrides)
     return ExplorerViewModel.from_mapping({
-        "identity": "internal-generation-id", "clock": 1700000000,
+        "identity": "internal-generation-id", "hearting": {
+            "version": "v3.50.3-20-gad247e2b6", "install_method": "managed/stable"},
+        "clock": 1700000000,
         "hosts": [{"mark": "⌂", "name": "moving4", "key": "base_host"}],
         "usage": [{"harness": "codex", "text": "5h 72%", "key": "usage_codex",
                     "windows": [["5h", 72, 28]]}],
@@ -91,6 +93,8 @@ class PersistedReplayTests(unittest.TestCase):
                          b"RAW_ATTEMPT_SENTINEL", b"RAW_NODE_SENTINEL",
                          b"RAW_ACTIVITY_SENTINEL", b"/home/person/private-worktree"):
             self.assertNotIn(sentinel, raw)
+        self.assertNotIn(b"v3.50.3-20-gad247e2b6", raw)
+        self.assertNotIn(b"managed/stable", raw)
         cached = self.runtime.load_last_complete({"codex"})
         self.assertIsNotNone(cached)
         session = cached.sessions[0]
@@ -99,6 +103,7 @@ class PersistedReplayTests(unittest.TestCase):
         self.assertNotIn("sid", session)
         self.assertNotIn("pane", session)
         self.assertEqual(cached.clock, 1700000000)
+        self.assertIsNone(cached.hearting)
         self.assertEqual(cached.compute[0][2], (12.0, 16))
         with self.assertRaises(TypeError):
             session["state"] = "dead"
@@ -157,10 +162,14 @@ class PersistedReplayTests(unittest.TestCase):
 
     def test_replay_redraw_uses_current_geometry_and_freezes_dim_spinner(self):
         cached = self.runtime.prepare_replay(display_vm())
-        small = render._explorer_frame_from_model(cached, None, 80, 24, beat=1)
-        wide = render._explorer_frame_from_model(cached, None, 140, 45, beat=1)
+        with patch.object(render, "_HEARTING", {
+                "version": "v3.50.3-20-gad247e2b6", "install_method": "managed/stable"}):
+            small = render._explorer_frame_from_model(cached, None, 80, 24, beat=1)
+            wide = render._explorer_frame_from_model(cached, None, 140, 45, beat=1)
         self.assertEqual((small.cols, small.rows), (80, 24))
         self.assertEqual((wide.cols, wide.rows), (140, 45))
+        self.assertIn("hearting", small.text_rows()[0])
+        self.assertIn("managed/stable", small.text_rows()[0])
 
         class Screen:
             def __init__(self):
@@ -183,6 +192,35 @@ class PersistedReplayTests(unittest.TestCase):
                 self.assertTrue(screen.writes[0][1] & render.curses.A_DIM)
             render._draw_explorer_frame(screen, frame, object(), stale=False)
             self.assertEqual(screen.writes[0][0], "b")
+
+    def test_overbudget_identity_redraws_from_cache_at_resized_widths(self):
+        from tools.fleet.explorer.grid import cell_width
+
+        source = display_vm()
+        values = source.to_mapping()
+        host_name = "trainer-west-gpu-node-01"
+        version = "v" + "x" * 100
+        values["hosts"] = [{"mark": "⌂", "name": host_name, "key": "base_host"}]
+        values["hearting"] = {"version": "stale-other-root", "install_method": "packaged"}
+        self.save(ExplorerViewModel.from_mapping(values))
+        cached = self.runtime.load_last_complete({"codex"})
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached.hosts[0]["name"], host_name)
+        self.assertIsNone(cached.hearting)
+
+        with patch.object(render, "_HEARTING", {"version": version, "install_method": "unmanaged"}):
+            for width, height in ((80, 24), (100, 30), (140, 45)):
+                with self.subTest(width=width):
+                    frame = render._explorer_frame_from_model(cached, None, width, height, beat=1)
+                    row = frame.text_rows()[0]
+                    self.assertEqual((frame.cols, frame.rows), (width, height))
+                    self.assertLessEqual(cell_width(row), width)
+                    self.assertIn("hearting", row)
+                    self.assertIn("unmanaged", row)
+                    self.assertNotIn("packaged", row)
+                    self.assertRegex(row.rstrip(), r"\d{2}:\d{2}$")
+                    if width == 80:
+                        self.assertIn("…", row)
 
 
 if __name__ == "__main__":

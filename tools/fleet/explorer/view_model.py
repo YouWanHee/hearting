@@ -232,6 +232,7 @@ class ExplorerViewModel:
     """Typed, deeply immutable projection; absent fields stay absent/unknown."""
 
     identity: object = None
+    hearting: object = None
     clock: object = None
     hosts: tuple = ()
     usage: tuple = ()

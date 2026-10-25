@@ -318,7 +318,8 @@ def _slug(label):
     return label.replace("/", "_").replace(":", "-")
 
 
-def _capture_pair(reference, vm, state, width, rows, outdir, label, reference_profile=None):
+def _capture_pair(reference, vm, state, width, rows, outdir, label, reference_profile=None,
+                  validated_header_identity=None):
     """Draw one state at one width from the copy (fed this view model) and from fleet2."""
     from tools.fleet.explorer.frame import draw
     from tools.fleet.tests.parity_compare import diff_frames
@@ -344,6 +345,7 @@ def _capture_pair(reference, vm, state, width, rows, outdir, label, reference_pr
             "reference_edge": [bool(row and (row[-1][0].strip() or (row[-1][0] == "" and len(row) > 1 and row[-2][0].strip())))
                                for row in reference_frame.cells],
             "fleet2_rows": ["".join(cell[0] for cell in row) for row in fleet_frame.cells],
+            "validated_header_identity": dict(validated_header_identity or {}),
             "differences": diffs}
 
 
@@ -415,7 +417,8 @@ def build_live_vm(capture_dir):
     return build_view_model(snapshot, accepted_detail=detail, now=now), now
 
 
-def compare_vm(vm, reference, out_dir, widths=WIDTHS, rows=45, only=None):
+def compare_vm(vm, reference, out_dir, widths=WIDTHS, rows=45, only=None,
+               validated_header_identity=None):
     """Every root view plus one repo, session and route page at every width."""
     out_dir.mkdir(parents=True, exist_ok=True)
     states = [(view, "-", view) for view in VIEWS]
@@ -431,8 +434,23 @@ def compare_vm(vm, reference, out_dir, widths=WIDTHS, rows=45, only=None):
             continue
         for width in widths:
             records.append(_capture_pair(Path(reference), vm, _nav(scope, view), width, rows, out_dir, label,
-                                         reference_profile=reference_profile))
+                                         reference_profile=reference_profile,
+                                         validated_header_identity=validated_header_identity))
     return records
+
+
+def _validated_header_identity(capture_dir):
+    """Read the canonical identity straight from captured Fleet JSON, outside the render helper."""
+    payload = json.loads((Path(capture_dir) / "fleet-json.json").read_text(encoding="utf-8"))
+    source = payload.get("hearting") if isinstance(payload, dict) else None
+    if not isinstance(source, dict):
+        source = {}
+    version = source.get("version")
+    method = source.get("install_method")
+    return {
+        "version": version if isinstance(version, str) and version else "unknown",
+        "install_method": method if isinstance(method, str) and method else "unmanaged",
+    }
 
 
 def _unique_reference_copy_limitations(records):
@@ -834,15 +852,21 @@ def _spinner_row_order(record, band):
             [cell for i, cell in enumerate(fleet2) if i != live_positions[0]])
 
 
-_NARROW_HEADER_SEMANTICS = re.compile(
-    r"^\s*(?P<working>\d+) working\s*●\s*(?P<idle>\d+) idle\s*●\s*"
-    r"(?P<blocked>\d+) answer needed\s+(?:hearting\s+)?(?P<version>\S+)\s+"
+_REFERENCE_NARROW_HEADER = re.compile(
+    r"^\s*(?P<working>\d+)\s+working\s*●\s*(?P<idle>\d+)\s+idle\s*●\s*"
+    r"(?P<blocked>\d+)\s+answer needed\s+(?:hearting\s+)?(?P<version>\S+)\s+"
     r"(?P<clock>\d{2}:\d{2})\s*$")
+_CANDIDATE_NARROW_HEADER = re.compile(
+    r"^\s*(?P<working>\d+)\s+●\s*(?P<idle>\d+)\s+●\s*(?P<blocked>\d+)\s+"
+    r"hearting\s+(?P<version>\S+)\s+·\s+(?P<method>\S+)\s+"
+    r"(?P<clock>\d{2}:\d{2})\s*$")
+_F70_METHODS = frozenset({"managed/stable", "managed/pinned", "linked", "packaged",
+                          "mixed", "unmanaged", "unknown"})
 R14_HEADER_IDENTITY_PRD_SHA256 = "5391e658c94fc575fb39ffbc85b6cff76a742c47dec1132cedaa1aa6cde42386"
 
 
 def _r14_narrow_host_identity(record, band):
-    """Allow only the PRD-required moving4 header added to the pinned R14 narrow census."""
+    """Allow only the validated F70 identity and host/census tuple required by PRD v87."""
     trace = record.get("reference_overflow_mask") or {}
     if (record.get("width") != 80 or record.get("rows") != 45 or record.get("state") not in VIEWS or
             band.get("pane") != "frame" or band.get("rows") != [0] or
@@ -855,8 +879,8 @@ def _r14_narrow_host_identity(record, band):
         return False
 
     def row_text(cells):
-        if any(not isinstance(cell, (list, tuple)) or len(cell) < 3 or len(str(cell[0] or "")) > 1
-               for cell in cells):
+        if len(cells) != 80 or any(not isinstance(cell, (list, tuple)) or len(cell) < 3 or
+                                   len(str(cell[0] or "")) != 1 for cell in cells):
             return None
         return "".join(str(cell[0] or "") for cell in cells)
 
@@ -874,44 +898,44 @@ def _r14_narrow_host_identity(record, band):
             reference[reference_spinner[0]] != candidate[candidate_spinner[0]]):
         return False
     reference_census = reference[:reference_spinner[0]] + reference[reference_spinner[0] + 1:]
-    candidate_tail = candidate[len(host_prefix):]
-    candidate_census = candidate_tail[:candidate_spinner[0] - len(host_prefix)] + \
-        candidate_tail[candidate_spinner[0] - len(host_prefix) + 1:]
-    reference_match = _NARROW_HEADER_SEMANTICS.fullmatch(reference_census)
-    candidate_match = _NARROW_HEADER_SEMANTICS.fullmatch(candidate_census)
+    candidate_census = candidate[candidate_spinner[0] + 1:]
+    reference_match = _REFERENCE_NARROW_HEADER.fullmatch(reference_census)
+    candidate_match = _CANDIDATE_NARROW_HEADER.fullmatch(candidate_census)
     if not reference_match or not candidate_match:
         return False
+    identity = record.get("validated_header_identity")
+    if not isinstance(identity, dict):
+        return False
+    expected_version, expected_method = identity.get("version"), identity.get("install_method")
+    if (not isinstance(expected_version, str) or not expected_version or
+            expected_method not in _F70_METHODS or candidate_match.group("method") != expected_method):
+        return False
     names = ("working", "idle", "blocked", "version", "clock")
-    if any(reference_match.group(name) != candidate_match.group(name) for name in names):
+    if (any(reference_match.group(name) != candidate_match.group(name) for name in names) or
+            candidate_match.group("version") != expected_version):
         return False
 
-    spinner = candidate[candidate_spinner[0]]
-    values = {name: reference_match.group(name) for name in names}
-    census = (f"{spinner} {values['working']} working● {values['idle']} idle● "
-              f"{values['blocked']} answer needed {values['version']} {values['clock']}")
-    gap = 80 - len(host_prefix) - len(census)
-    if gap < 0 or candidate != host_prefix + (" " * gap) + census:
-        return False
-
-    # Exact safe tuples: the compact approved host mark/name/+N; an unstyled separator gap;
-    # then the existing census keys with only its redundant product label and padding removed.
+    # The actual Fleet JSON identity is an independent oracle; the candidate cannot bless itself.
+    # Exact tuples admit the approved host, existing colored glyph/count census, F70 fields and clock.
     expected_host = [("⌂", "g_work"), (" ", "g_work")] + [(char, "g_work") for char in "moving4"] + [
         (" ", "dim"), ("+", "dim"), ("4", "dim")]
     for column, (glyph, style) in enumerate(expected_host):
         if tuple(candidates[0][column][:3]) != (glyph, style, None):
             return False
-    census_start = 80 - len(census)
-    if census_start < len(expected_host) or any(
+    spinner = candidate_spinner[0]
+    if spinner < len(expected_host) or any(
             tuple(candidates[0][column][:3]) != (" ", None, None)
-            for column in range(len(expected_host), census_start)):
+            for column in range(len(expected_host), spinner)):
         return False
     census_parts = [
-        (f"{spinner} {values['working']}", "g_spin"), (" working", "dim"),
-        (f"● {values['idle']}", "g_work_off"), (" idle", "dim"),
-        (f"● {values['blocked']}", "g_blocked"), (" answer needed", "dim"),
-        (f" {values['version']}", "version_release"), (f" {values['clock']}", "dim"),
+        ("⠏", "g_spin"), (" " + candidate_match.group("working"), "g_spin"), (" ", None),
+        ("●", "g_work_off"), (" " + candidate_match.group("idle"), "g_work_off"), (" ", None),
+        ("●", "g_blocked"), (" " + candidate_match.group("blocked"), "g_blocked"), (" ", None),
+        ("hearting", "hearting_name"), (" " + expected_version, "version_release"),
+        (" · ", "dim"),
+        (expected_method, "version_method"), ("  " + candidate_match.group("clock"), "dim"),
     ]
-    column = census_start
+    column = spinner
     for text, style in census_parts:
         for glyph in text:
             if column >= 80 or tuple(candidates[0][column][:3]) != (glyph, style, None):
@@ -1074,8 +1098,9 @@ RULES = [
      _blank_cell_key),
     ("prd-narrow-host-identity", "intended", None,
      "at 80 columns the pinned R14 header omits the connected host identity; PRD v87 requires the host name on the first line "
-     "and host resources in the first screen (SHA256 " + R14_HEADER_IDENTITY_PRD_SHA256 + "). Only the exact moving4/+4 "
-     "prefix, unchanged reference counts/version/clock, approved styles, and bounded row-0 tuples are accepted",
+     "and F70 requires `hearting <version> · <install-method>` (SHA256 " + R14_HEADER_IDENTITY_PRD_SHA256 + "). The candidate "
+     "must match the independently captured Fleet JSON version/method, exact moving4/+4 prefix, reference counts/clock, "
+     "approved styles, and bounded row-0 tuples",
      _r14_narrow_host_identity),
     ("prd-census-spinner-order", "intended", None,
      "the current PRD moves only the spinner; census, version, clock and every other styled cell match after its position is normalized",
@@ -1327,7 +1352,8 @@ def run_capture(out, reference, approved=None, source_bundle=None, from_capture=
         augment_capture(capture_dir)
         vm, now = build_live_vm(capture_dir)
     side_dir = Path(out) / "evidence/parity/side-by-side/today"
-    records = compare_vm(vm, reference, side_dir)
+    header_identity = _validated_header_identity(capture_dir)
+    records = compare_vm(vm, reference, side_dir, validated_header_identity=header_identity)
     copy_limitations = _unique_reference_copy_limitations(records)
     summary = [{key: row[key] for key in ("state", "width", "rows", "equal", "difference_count", "png")}
                for row in records]

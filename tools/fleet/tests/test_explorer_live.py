@@ -190,6 +190,8 @@ class RealDataFidelity(unittest.TestCase):
                         hearting={"version": "v3.42.0-2-gdc406c55a-dirty", "install_method": "unmanaged"},
                         usage_snapshots=usage)
         self.assertEqual(vm.system["install"]["version"], "v3.42.0-2-gdc406c55a-dirty")
+        self.assertEqual(vm.hearting, {"version": "v3.42.0-2-gdc406c55a-dirty",
+                                       "install_method": "unmanaged"})
         self.assertRegex(vm.system["usage_api"]["freshness"], r"^\d\d:\d\d$")
 
     def test_route_uses_recorded_result_name_and_default_version_helper_keeps_build(self):
@@ -274,10 +276,25 @@ class SourceBackedRecords(unittest.TestCase):
     def test_install_flags_and_runtimes_come_from_the_install_record(self):
         vm = self.vm(hearting={"version": "v3.41.1", "install_method": "managed/pinned",
                                "source": "distribution", "runtimes": ["claude", "codex"]})
+        self.assertEqual(vm.hearting, {"version": "v3.41.1", "install_method": "managed/pinned"})
         self.assertEqual(vm.system["install"]["managed"], True)
         self.assertEqual(vm.system["install"]["pinned"], True)
         self.assertEqual(vm.system["install"]["distribution"], True)
         self.assertEqual(tuple(vm.system["runtimes"]), ("claude", "codex"))
+
+    def test_unbounded_configured_host_stays_full_in_compute_projection(self):
+        host_name = "trainer-west-gpu-node-01"
+        host = {"host": host_name, "self": True, "reachable": True, "cpu_count": 4,
+                "cpu_utilization_pct": 25, "memory_total_mib": 8192,
+                "memory_used_mib": 4096, "gpus": []}
+        vm = self.vm(hearting={"version": "v3.50.3-20-gad247e2b6",
+                               "install_method": "managed/stable"},
+                     compute_hosts={"hosts": [host]})
+
+        self.assertEqual(vm.hosts[0]["name"], host_name)
+        self.assertEqual(vm.compute[0][0], host_name)
+        self.assertEqual(vm.hearting, {"version": "v3.50.3-20-gad247e2b6",
+                                       "install_method": "managed/stable"})
 
     def test_memory_rows_drop_bookkeeping_and_the_provenance_header(self):
         memory = {"by_repo": {"demo-app": [

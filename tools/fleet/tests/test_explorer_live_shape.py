@@ -202,10 +202,12 @@ class CensusHeaderTests(unittest.TestCase):
 
         return ExplorerViewModel(
             sessions=[{"state": state} for state in session_states], hosts=hosts,
+            hearting={"version": version, "install_method": "unmanaged"},
             system={"install": {"version": version}, "usage_api": {"freshness": freshness}})
 
     def test_exact_fit_census_header_keeps_saved_spacing_and_full_freshness(self):
         from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.grid import cell_width
         from tools.fleet.explorer.state import NavState
         from tools.fleet.explorer.view_model import ExplorerViewModel
 
@@ -215,17 +217,18 @@ class CensusHeaderTests(unittest.TestCase):
         version, freshness = "v3.50.3-20-gad247e2b6", "02:38"
         vm = ExplorerViewModel(census=census, system={"install": {"version": version},
                                                       "usage_api": {"freshness": freshness}})
-        frame, trace = ef.trace_draw(draw, vm, NavState(view="OVERVIEW", scope="-"), 80, 45)
         expected = ("⠏ 0 working  ● 0 idle  ● 0 answer needed   hearting "
-                    "v3.50.3-20-gad247e2b6  02:38")
+                    "v3.50.3-20-gad247e2b6 · unmanaged  02:38")
+        width = cell_width(expected) + 1
+        frame, trace = ef.trace_draw(draw, vm, NavState(view="OVERVIEW", scope="-"), width, 45)
 
         row = frame.text_rows()[0]
 
-        self.assertEqual(row, expected)
+        self.assertEqual(row.rstrip(), expected)
         self.assertTrue(row.startswith("⠏ 0 working"), row)
         self.assertIn(version, row)
-        self.assertTrue(row.endswith(freshness), row)
-        self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
+        self.assertTrue(row.rstrip().endswith(freshness), row)
+        self.assertEqual(ef.frame_violations(frame, trace, width, 45), [])
 
     def test_exact_fit_header_keeps_host_identity_and_existing_census_spacing(self):
         from tools.fleet.explorer.frame import draw
@@ -243,9 +246,9 @@ class CensusHeaderTests(unittest.TestCase):
         row = frame.text_rows()[0]
 
         self.assertTrue(row.startswith(" hosts ⌂ moving4 1/1"), row)
-        census_start = 120 - 1 - 80
-        self.assertEqual(row[census_start:].rstrip(),
-                         "⠏ 0 working  ● 0 idle  ● 0 answer needed   hearting " + version + "  " + freshness)
+        self.assertTrue(row.rstrip().endswith(
+            "⠏ 0 working  ● 0 idle  ● 0 answer needed   hearting " + version +
+            " · unmanaged  " + freshness), row)
         self.assertEqual(ef.frame_violations(frame, trace, 120, 45), [])
 
     def test_overlong_demo_census_keeps_counts_version_and_full_clock(self):
@@ -259,8 +262,9 @@ class CensusHeaderTests(unittest.TestCase):
         version = vm.system["install"]["version"]
 
         self.assertTrue(row.startswith("⌂ base +2"), row)
-        self.assertIn("⠏ 3 working● 5 idle● 2 answer needed", row)
+        self.assertIn("⠏ 3 ● 5 ● 2", row)
         self.assertIn(version, row)
+        self.assertIn("hearting " + version + " · unmanaged", row)
         self.assertTrue(row.rstrip().endswith(freshness), row)
         self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
 
@@ -280,11 +284,10 @@ class CensusHeaderTests(unittest.TestCase):
 
         self.assertEqual(len(states), 18)
         self.assertTrue(row.startswith("⌂ moving4 +4"), row)
-        for fragment in ("⠏ 15 working", "● 2 idle", "● 1 answer needed", version, freshness):
+        for fragment in ("⠏ 15", "● 2", "● 1", version, "hearting " + version + " · unmanaged", freshness):
             self.assertIn(fragment, row)
         self.assertTrue(row.rstrip().endswith(freshness), row)
         self.assertEqual(cell_width(row), 80)
-        self.assertNotIn("hearting", row)
         self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
         self.assertFalse([item for item in trace if item[0] == "clip" and item[2] == 0])
 
@@ -304,24 +307,96 @@ class CensusHeaderTests(unittest.TestCase):
         self.assertTrue(row.rstrip().endswith(freshness), row)
         self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
 
-    def test_unrepresentable_required_values_fail_before_any_header_clip(self):
-        from tools.fleet.explorer.chrome import draw_chrome
-        from tools.fleet.explorer.grid import CellGrid
+    def test_overlong_version_is_visibly_bounded_and_does_not_escape_drawing(self):
         from tools.fleet.explorer.state import NavState
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.grid import cell_width
 
+        version = "v" + "x" * 100
         vm = self._header_vm(session_states=["working"] * 15 + ["idle"] * 2 + ["blocked"],
                              hosts=[{"mark": "⌂", "name": "moving4"}],
-                             version="v" + "x" * 100, freshness="02:38")
-        grid, trace = CellGrid(80, 45), []
-        CellGrid.default_trace = trace
-        try:
-            with self.assertRaisesRegex(ValueError, "required Fleet header fields do not fit"):
-                draw_chrome(grid, vm, NavState(view="OVERVIEW", scope="-"))
-        finally:
-            CellGrid.default_trace = None
+                             version=version, freshness="02:38")
+        frame, trace = ef.trace_draw(draw, vm, NavState(view="OVERVIEW", scope="-"), 80, 45)
+        row = frame.text_rows()[0]
 
-        self.assertTrue(all(cell[0] == " " for cell in grid.cells[0]))
-        self.assertFalse(any(item[0] == "clip" and item[2] == 0 for item in trace))
+        self.assertIn("⌂ moving4", row)
+        self.assertIn("hearting", row)
+        self.assertIn("unmanaged", row)
+        self.assertIn("…", row)
+        self.assertTrue(row.rstrip().endswith("02:38"), row)
+        self.assertEqual(vm.hearting["version"], version)
+        self.assertEqual(cell_width(row), 80)
+        self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
+        self.assertFalse([item for item in trace if item[0] == "clip" and item[2] == 0])
+
+    def test_valid_overbudget_host_gets_a_bounded_header_token(self):
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.grid import cell_width
+        from tools.fleet.explorer.state import NavState
+
+        host_name = "trainer-west-gpu-node-01"
+        hosts = [{"mark": "⌂", "name": host_name}, {"mark": "◇", "name": "cnn"},
+                 {"mark": "◇", "name": "xavier"}, {"mark": "◇", "name": "larynx"},
+                 {"mark": "◇", "name": "mpwav"}]
+        version, freshness = "v3.50.3-20-gad247e2b6", "02:38"
+        vm = self._header_vm(session_states=["working"] * 15 + ["idle"] * 2 + ["blocked"],
+                             hosts=hosts, version=version, freshness=freshness)
+        frame, trace = ef.trace_draw(draw, vm, NavState(view="OVERVIEW", scope="-"), 80, 45)
+        row = frame.text_rows()[0]
+
+        self.assertTrue(row.startswith("⌂ trainer"), row)
+        self.assertIn("…", row)
+        self.assertIn("+4", row)
+        self.assertIn("⠏ 15", row)
+        self.assertIn("● 2", row)
+        self.assertIn("● 1", row)
+        self.assertIn("hearting " + version + " · unmanaged", row)
+        self.assertTrue(row.rstrip().endswith(freshness), row)
+        self.assertEqual(vm.hosts[0]["name"], host_name)
+        self.assertEqual(cell_width(row), 80)
+        self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
+
+    def test_nohost_overlong_census_and_version_still_draw_a_bounded_header(self):
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.grid import cell_width
+        from tools.fleet.explorer.state import NavState
+        from tools.fleet.explorer.view_model import ExplorerViewModel
+
+        census_count = "12345678901234567890"
+        census = {"parts": [("⠏ " + census_count, "spin"), (" working", "dim"),
+                             ("  ● 234567890", "idle"), (" idle", "dim"),
+                             ("  ● 345678901", "blocked"), (" answer needed", "dim")]}
+        version, freshness = "v" + "x" * 100, "02:38"
+        vm = ExplorerViewModel(census=census, hearting={"version": version,
+                                                       "install_method": "unmanaged"},
+                               system={"usage_api": {"freshness": freshness}})
+        frame, trace = ef.trace_draw(draw, vm, NavState(view="OVERVIEW", scope="-"), 80, 45)
+        row = frame.text_rows()[0]
+
+        self.assertIn("⠏", row)
+        self.assertIn("●", row)
+        self.assertIn("hearting", row)
+        self.assertIn("unmanaged", row)
+        self.assertIn("…", row)
+        self.assertTrue(row.rstrip().endswith(freshness), row)
+        self.assertEqual(vm.census["parts"][0][0], "⠏ " + census_count)
+        self.assertEqual(vm.hearting["version"], version)
+        self.assertLessEqual(cell_width(row), 80)
+        self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
+
+    def test_missing_install_metadata_uses_existing_unknown_unmanaged_fallbacks(self):
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.state import NavState
+        from tools.fleet.explorer.view_model import ExplorerViewModel
+
+        vm = ExplorerViewModel(sessions=[{"state": "idle"}],
+                               system={"usage_api": {"freshness": "02:38"}})
+        frame, trace = ef.trace_draw(draw, vm, NavState(view="OVERVIEW", scope="-"), 120, 45)
+        row = frame.text_rows()[0]
+
+        self.assertIn("hearting unknown · unmanaged", row)
+        self.assertTrue(row.rstrip().endswith("02:38"), row)
+        self.assertEqual(ef.frame_violations(frame, trace, 120, 45), [])
 
     def test_overlong_multi_digit_counts_keep_all_census_information(self):
         from tools.fleet.explorer.frame import draw
@@ -337,8 +412,9 @@ class CensusHeaderTests(unittest.TestCase):
         frame, trace = ef.trace_draw(draw, vm, NavState(view="OVERVIEW", scope="-"), 80, 45)
         row = frame.text_rows()[0]
 
-        self.assertIn("⠏ 12 working● 34 idle● 56 answer needed hearting ", row)
+        self.assertIn("⠏ 12 ● 34 ● 56", row)
         self.assertIn(version, row)
+        self.assertIn("hearting " + version + " · unmanaged", row)
         self.assertTrue(row.rstrip().endswith(freshness), row)
         self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
 
