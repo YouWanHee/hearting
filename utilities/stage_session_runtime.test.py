@@ -121,7 +121,6 @@ class StageSessionStateDirTests(unittest.TestCase):
         self.assertEqual(args.fixed_file, [str(self.fixed)])
         self.assertNotIn(args.report_file, args.fixed_file)
         self.assertIn(args.report_file, args.effective_fixed_files)
-        self.assertIn(str(self.fixed), args.effective_fixed_files)
         self.assertEqual(args.fixed_files_sha256, runtime._sha_files([str(self.fixed)]))
         ledger = Path(args.state_ledger).read_text(encoding="utf-8")
         meta = json.loads(ledger.splitlines()[0].removeprefix("<!-- worker-state-ledger:v1 ").removesuffix(" -->"))
@@ -129,6 +128,48 @@ class StageSessionStateDirTests(unittest.TestCase):
         fragment = runtime.prompt_fragment(args)
         self.assertIn(f"artifact report: {args.report_file}", fragment)
         self.assertIn(f"fixed files", fragment)
+
+    def test_required_qa_items_sidecar_follows_only_its_primary_report(self):
+        import route_plan
+        args, route, cycle, output_dir = self._artifact_args(
+            brief_text="report: evidence/voter/report.md\n",
+            scope=["evidence/**"],
+            outputs=["evidence/voter/report.md"],
+        )
+        scope = mock.Mock(output_dir=str(output_dir), write_scope=("evidence/**",))
+        with mock.patch.object(route_plan, "leg_plan", return_value={"leg": {
+                "done_when": [{"id": "d1", "text": "the focused check passes"}]}}), \
+             mock.patch("worker_bootstrap._linked_slice_source_worktree", return_value=self.worktree), \
+             mock.patch("worker_bootstrap._child_scope_environment", return_value={}), \
+             mock.patch("worker_bootstrap.resolve_node_scope", return_value=scope), \
+             mock.patch.object(artifact_producer, "check_write", return_value={"verdict": "allow"}):
+            self._bind_artifact(args, route, cycle, output_dir, action="start")
+        primary = str(output_dir / "evidence/voter/report.md")
+        sidecar = primary + ".items.json"
+        self.assertEqual(args.report_file, primary)
+        self.assertIn(primary, args.effective_fixed_files)
+        self.assertIn(sidecar, args.effective_fixed_files)
+        self.assertNotIn(sidecar + ".extra", args.effective_fixed_files)
+        def ledger_check(candidate):
+            return subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("worker-state-ledger.py")),
+                 "check", "--path", args.state_ledger, "--attempt-id", args.attempt_id,
+                 "--file", candidate], text=True, capture_output=True)
+        self.assertEqual(ledger_check(sidecar).returncode, 0)
+        self.assertEqual(ledger_check(sidecar + ".extra").returncode, 65)
+        self.assertEqual(ledger_check(str(output_dir / "evidence/foreign/report.md.items.json")).returncode, 65)
+
+    def test_done_when_sidecar_prompt_names_the_primary_scoped_path(self):
+        import route_plan
+        import worker_bootstrap
+        args, route, _cycle, output_dir = self._artifact_args(
+            brief_text="report: evidence/voter/report.md\n")
+        args.report_file = str(output_dir / "evidence/voter/report.md")
+        with mock.patch.object(route_plan, "leg_plan", return_value={"leg": {
+                "done_when": [{"id": "d1", "text": "the focused check passes"}]}}):
+            prompt = worker_bootstrap.plan_leg_prompt(route, "voter", args.report_file)
+        self.assertIn(args.report_file + ".items.json", prompt)
+        self.assertIn('"schema": "leg_items_v1"', prompt)
 
     def test_nodes_without_evidence_scope_do_not_require_report_or_cycle(self):
         route_file = self._route_file(write_scope=("source/**",))

@@ -110,7 +110,7 @@ class StageSessionChainStartTest(unittest.TestCase):
             route = {
                 "route_id": "rt-fixture", "route_hash": "sha256:fixture",
                 "cwd": str(worktree),
-                "nodes": [{"id": "execute", "completion_gate": "code-execute",
+                "nodes": [{"id": "execute", "unit": "qa/test", "completion_gate": "code-execute",
                            "write_scope": ["source/**", "evidence/**"]}],
             }
             route_path = base / "route.json"
@@ -153,6 +153,16 @@ class StageSessionChainStartTest(unittest.TestCase):
                 source_report,
             )
             self.assertEqual(continued_session["report_path"], source_report)
+            import route_plan
+            import worker_bootstrap
+            with mock.patch.object(route_plan, "leg_plan", return_value={"leg": {
+                    "done_when": [{"id": "d1", "text": "the report is verified"}]}}):
+                source_sidecar = worker_bootstrap.qa_primary_items_sidecar(
+                    route, "execute", str(base / source_report))
+                continued_sidecar = worker_bootstrap.qa_primary_items_sidecar(
+                    route, "execute", str(base / continued_session["report_path"]))
+            self.assertEqual(source_sidecar, str(base / source_report) + ".items.json")
+            self.assertEqual(continued_sidecar, source_sidecar)
 
     def _manifest(self, base: Path, session_count: int = 3) -> dict:
         sessions = [
