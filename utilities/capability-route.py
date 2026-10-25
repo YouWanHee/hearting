@@ -752,6 +752,15 @@ def _continuation_reused_evidence(route, node):
         marker=json.loads(marker_bytes)
     except (OSError,ValueError) as exc:
         raise ValueError(f"continuation-source-node-unverified:{node_id}:marker") from exc
+    import review_input
+    if (review_input.is_review_node(node)
+            and not isinstance(marker.get("source_subject"), dict)
+            and marker.get("review_gate_closure") != "owner-closure"):
+        # Historical marker validity does not prove a continuation's reviewed
+        # input. Reuse needs the recorded subject; do not infer it from today.
+        raise ValueError(
+            f"continuation-source-node-unverified:{node_id}:completion-review-subject-unknown"
+        )
     if not completion_marker_is_current(route,node,marker_path,marker,jobs=jobs):
         raise ValueError(
             f"continuation-source-node-unverified:{node_id}:attempt-link"
