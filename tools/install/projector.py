@@ -274,6 +274,8 @@ def _expand(table, runtime, scope):
                             "source": str(match),
                             "dest": str(dest_path),
                             "source_present": True,
+                            **({"native_agent": True} if runtime == "codex" and
+                               item["dest_subdir"] == "agents" else {}),
                         }
                     )
                 else:

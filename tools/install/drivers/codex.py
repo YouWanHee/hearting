@@ -18,6 +18,7 @@ import manifest
 import verifier
 import user_model_config
 import safe_fs
+import native_agent_ownership
 import claude_settings_config
 import codex_launcher
 import herdr_integration
@@ -135,6 +136,16 @@ def install(scope="global", plugin=False, dry_run=False):
         if action == "symlink":
             source = Path(entry["source"])
             dest = Path(entry["dest"])
+
+            if entry.get("native_agent"):
+                try:
+                    actions.append(native_agent_ownership.write_link(
+                        runtime_home if scope != "project" else dest.parent.parent,
+                        paths.agent_home(), dest, source, dry_run=dry_run))
+                except (OSError, safe_fs.SafetyError) as exc:
+                    actions.append({"action": "symlink", "source": str(source),
+                                    "dest": str(dest), "status": "blocked", "detail": str(exc)})
+                continue
 
             if dry_run:
                 actions.append(

@@ -42,6 +42,7 @@ import user_config
 import host_probes
 import node_runtime
 import safe_fs
+import native_agent_ownership
 import model_settings
 from drivers import get_driver, RUNTIMES
 
@@ -1028,6 +1029,14 @@ def cmd_uninstall(args):
 
             entries = projector.plan([rt], scope=args.scope)[rt]
             symlink_entries = [e for e in entries if e["action"] == "symlink"]
+            if rt == "codex":
+                known = {e["dest"] for e in symlink_entries}
+                for candidate in (runtime_home / "agents").glob("*.toml"):
+                    if str(candidate) not in known and native_agent_ownership.owned_link(
+                            runtime_home, candidate):
+                        symlink_entries.append({"action": "symlink", "dest": str(candidate),
+                                                "source": os.readlink(candidate),
+                                                "native_agent": True})
             symlink_dests = [Path(e["dest"]) for e in symlink_entries]
 
             if args.dry_run:
@@ -1053,7 +1062,11 @@ def cmd_uninstall(args):
                         raw_target if raw_target is None or raw_target.is_absolute()
                         else d.parent / raw_target
                     )
-                    if current.kind != "symlink" or resolved.resolve(strict=False) != Path(entry["source"]).resolve(strict=False):
+                    owned = (native_agent_ownership.owned_link(runtime_home, d)
+                             if rt == "codex" and native_agent_ownership.agent_leaf(runtime_home, d)
+                             else current.kind == "symlink" and
+                             resolved.resolve(strict=False) == Path(entry["source"]).resolve(strict=False))
+                    if not owned:
                         preserve(rt, d)
                     else:
                         would_remove_symlinks += 1
@@ -1089,7 +1102,9 @@ def cmd_uninstall(args):
                         raw_target if raw_target.is_absolute() else d.parent / raw_target
                     ).resolve(strict=False)
                     expected_target = Path(entry["source"]).resolve(strict=False)
-                    if resolved != expected_target:
+                    if (not native_agent_ownership.owned_link(runtime_home, d)
+                            if rt == "codex" and native_agent_ownership.agent_leaf(runtime_home, d)
+                            else resolved != expected_target):
                         preserve(rt, d)
                         continue
                     symlink_states.append((d, current))
@@ -1120,6 +1135,10 @@ def cmd_uninstall(args):
 
                 # 1) Remove only exact, still-owned symlink projections.
                 for d, current in symlink_states:
+                    if (rt == "codex" and native_agent_ownership.agent_leaf(runtime_home, d)
+                            and not native_agent_ownership.owned_link(runtime_home, d)):
+                        raise safe_fs.SafetyError("expected-state-mismatch", d,
+                                                  "native agent ownership changed")
                     auth = safe_fs.authority(
                         d,
                         owner=f"installer-manifest:{rt}:symlink",

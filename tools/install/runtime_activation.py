@@ -39,6 +39,7 @@ import model_config
 import projector
 import retired_memory_state
 import safe_fs
+import native_agent_ownership
 import user_model_config
 import codex_tui_config
 import herdr_integration
@@ -1148,6 +1149,8 @@ def _native_present(runtime: str, scope: str = "global") -> bool:
 
 def _native_harness_target(runtime: str, candidate: Path) -> bool:
     """Recognize only a canonical harness projection, never a path substring."""
+    if runtime == "codex" and candidate.parent.name == "agents" and candidate.suffix == ".toml":
+        return native_agent_ownership.owned_link(candidate.parent.parent, candidate)
     try:
         target = candidate.resolve(strict=False)
     except RuntimeError:
@@ -3007,8 +3010,13 @@ def _trusted_owned(
         if item.get("kind") == "symlink" and dest.is_symlink():
             try:
                 current_target = os.readlink(dest)
+                native_agent = runtime == "codex" and native_agent_ownership.agent_leaf(
+                    paths.runtime_home(runtime, scope), dest)
                 matches = current_target == item.get("source")
-                if not matches and _journal_dest_allowed(runtime, dest, scope):
+                if native_agent:
+                    matches = matches and native_agent_ownership.owned_link(
+                        paths.runtime_home(runtime, scope), dest)
+                if not matches and not native_agent and _journal_dest_allowed(runtime, dest, scope):
                     raw_target = Path(current_target)
                     target = raw_target if raw_target.is_absolute() else dest.parent / raw_target
                     resolved_target = target.resolve(strict=False)
@@ -3091,6 +3099,22 @@ def _apply_transaction(
     fail_after = int(os.environ.get("HARNESS_RUNTIME_FAIL_AFTER", "0") or "0")
     operation_count = 0
     journal_path = tx_root / "journal.json"
+
+    def recheck_native_agent(dest: Path) -> None:
+        if runtime != "codex" or not native_agent_ownership.agent_leaf(
+                paths.runtime_home(runtime, scope), dest):
+            return
+        record = next((item for item in snapshots if item["dest"] == str(dest)), None)
+        if record is None:
+            raise ActivationError(f"native agent has no transaction snapshot: {dest}")
+        current = safe_fs.capture_state(dest)
+        expected = (safe_fs.PathState("missing") if record["state"] == "moved"
+                    else safe_fs.PathState.from_public(record["preimage"]))
+        if current != expected:
+            raise ActivationError(f"expected-state-mismatch: native agent changed: {dest}")
+        if current.kind == "symlink" and not native_agent_ownership.owned_link(
+                paths.runtime_home(runtime, scope), dest):
+            raise ActivationError(f"ownership-unproved: native agent changed: {dest}")
     tx_root.mkdir(parents=True, exist_ok=True)
     _write_journal(journal_path, runtime, "preparing", snapshots)
 
@@ -3118,6 +3142,11 @@ def _apply_transaction(
                 continue
             kind = desired_by_dest.get(key, {}).get("kind", "remove")
             source = desired_by_dest.get(key, {}).get("source")
+            if (runtime == "codex" and native_agent_ownership.agent_leaf(
+                    paths.runtime_home(runtime, scope), dest) and dest.is_symlink()
+                    and not native_agent_ownership.owned_link(
+                        paths.runtime_home(runtime, scope), dest)):
+                raise ActivationError(f"foreign native agent symlink collision: {dest}")
             _safe_existing_dest(dest, kind, owned, allowed_link_roots,
                                 Path(source) if source else None)
             record = _snapshot_record(dest, backup_root, len(snapshots))
@@ -3137,6 +3166,7 @@ def _apply_transaction(
         for dest in removal:
             if any(entry.get("dest") == str(dest) for entry in preserved):
                 continue
+            recheck_native_agent(dest)
             for record in snapshots:
                 if record["dest"] == str(dest):
                     record["postimage"] = safe_fs.PathState("missing").public()
@@ -3157,6 +3187,7 @@ def _apply_transaction(
             dest = Path(item["dest"])
             if any(entry.get("dest") == str(dest) for entry in preserved):
                 continue
+            recheck_native_agent(dest)
             for record in snapshots:
                 if record["dest"] == str(dest):
                     record["postimage"] = safe_fs.PathState("missing").public()

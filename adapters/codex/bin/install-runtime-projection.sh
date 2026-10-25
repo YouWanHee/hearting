@@ -199,8 +199,13 @@ agents_linked=0
 mkdir -p "$CODEX_HOME/agents"
 for f in "$S/codex-agents"/*.toml; do
   [ -f "$f" ] || continue
-  ln -sfn "$f" "$CODEX_HOME/agents/$(basename "$f")"
-  agents_linked=$((agents_linked + 1))
+  agent_status=$(python3 "$AGENT_HOME/tools/install/native_agent_ownership.py" \
+    --home "$CODEX_HOME" --source-root "$AGENT_HOME" --source "$f") || exit 1
+  case "$agent_status" in
+    created|updated|unchanged) agents_linked=$((agents_linked + 1)) ;;
+    preserved) printf 'agent_preserved=%s\n' "$CODEX_HOME/agents/$(basename "$f")" ;;
+    *) echo "install-runtime-projection: invalid agent status: $agent_status" >&2; exit 1 ;;
+  esac
 done
 printf 'agents_linked=%s\n' "$agents_linked"
 
