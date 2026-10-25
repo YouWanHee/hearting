@@ -8138,7 +8138,10 @@ def _discover_session_notice_duties(store):
                 if record_recipient(record, storage_sid, harness=harness) is None:
                     observed = False
                     continue
-                peer_obligations.retain_session_notice(jobs, harness, storage_sid, record)
+                if not peer_obligations.retain_session_notice(jobs, harness, storage_sid, record):
+                    # Its fresh authority/read/write check did not hand this
+                    # recoverable notice to a duty. Keep the same waiting owner.
+                    observed = False
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 observed = False
     return observed

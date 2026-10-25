@@ -97,6 +97,7 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
         handover._LINEAGE_GRAPH_CACHE.clear()  # Cold graph; writer retention used the healthy generation.
         unavailable = True
         ordinary_passes, discoveries, messages, delays, workers, contexts = [], [], [], [], [], []
+        prepared_messages = []
         watch_calls, batch_calls, external_passes, read_contexts = [], [], [], []
         started = threading.Event()
         real_read, real_stat, real_lstat, real_iterdir = tidy.read_bytes, Path.stat, Path.lstat, Path.iterdir
@@ -105,6 +106,8 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
         real_begin = steward.peer_obligations.ObligationStore.begin_read_pass
         real_discovery, real_readiness = steward._discover_session_notice_duties, steward._runner_readiness_loop
         real_reconcile = steward._reconcile_obligations
+        real_resume_message = steward._resume_message_obligation
+        real_create = steward.peer_obligations.ObligationStore.create
         context_type = steward.dispatch_batch_obligations.OwnerSettlementReadContext
         main_thread = threading.current_thread()
         lock_path = store.root / steward.peer_obligations.RUNNER_LOCK_NAME
@@ -152,6 +155,11 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
                 return None
             return real_recipient(record, storage_sid, **kwargs)
 
+        def create(current, *args, **kwargs):
+            if unavailable and failure == "pending-retention" and args[1] == "session-notice":
+                raise OSError("fixture duty retention unavailable")
+            return real_create(current, *args, **kwargs)
+
         def begin(current):
             real_begin(current)
             if threading.current_thread() is main_thread:
@@ -174,6 +182,18 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
             return context
 
         def resume_message(row, current, **kwargs):
+            if row["id"] != message["id"]:
+                # A prepared transfer can schedule its existing message duty.
+                # Observe it through the real consumer, with native identity
+                # still unknown; never fake its completion or submit it again.
+                self.assertEqual(no_resend, "pending")
+                prepared_messages.append(row["id"])
+                ident = {"harness": "claude", "session_id": "B", "pane": "w1:pLive"}
+                with mock.patch.object(steward, "_retire_target", return_value=("idle", ident, 0, "")), \
+                     mock.patch.object(steward, "_prompt_current_candidate", return_value=(None, "fixture-native-unknown")):
+                    real_resume_message(row, current, **kwargs)
+                self.assertEqual(current.get(row["id"])["state"], "unknown")
+                return
             messages.append(row["id"])
             current.update(row["id"], state="complete", cleanup="complete")
 
@@ -247,6 +267,7 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
                     mock.patch.object(Path, "iterdir", new=iterdir),
                     mock.patch.object(Path, "read_text", new=read_text),
                     mock.patch.object(handover, "record_recipient", side_effect=recipient),
+                    mock.patch.object(steward.peer_obligations.ObligationStore, "create", new=create),
                     mock.patch.object(steward.peer_obligations.ObligationStore, "begin_read_pass", new=begin),
                     mock.patch.object(steward, "_discover_session_notice_duties", side_effect=discover),
                     mock.patch.object(steward, "_reconcile_obligations", side_effect=reconcile),
@@ -283,8 +304,12 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
                 thread.join(3)
         self.assertEqual(messages, [message["id"]])
         self.assertEqual(discoveries[:1 if replace_lock else 2], [False] * (1 if replace_lock else 2))
-        expected_delays = [1.0] if replace_lock else [1.0, 1.0 if historical else 1.7]
+        message_progress = inventory and no_resend == "pending"
+        expected_delays = [1.0] if replace_lock else [1.0, 1.0 if historical or message_progress else 1.7]
         self.assertEqual(delays[:len(expected_delays)], expected_delays)
+        if message_progress:
+            self.assertTrue(prepared_messages)
+            self.assertEqual(steward.peer_message._read_pending(ref)["state"], "pending")
         self.assertEqual(len(ordinary_passes), len(discoveries))
         self.assertEqual(len({id(context) for context in ordinary_passes}), len(discoveries))
         self.assertEqual(len({id(context) for context in read_contexts}), len(discoveries))
@@ -306,7 +331,10 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
         self.assertEqual(pending.received_ack_identity(final, "A", notice["delivery_id"]), identity)
         if replace_lock or no_resend:
             self.assertEqual(final, notice_before)
-            self.assertTrue(self.duties(), "replacement never settles the retained notice")
+            if legacy:
+                self.assertFalse(self.duties(), "legacy record is preserved before duty recovery")
+            else:
+                self.assertTrue(self.duties(), "replacement never settles the retained notice")
         else:
             self.assertEqual(final["state"], "acked")
             self.assertFalse(self.duties())
@@ -397,6 +425,9 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
     def test_unresolved_legacy_recipient_keeps_existing_wait_and_authority(self):
         self.exercise("pending-unresolved", legacy=True)
 
+    def test_failed_legacy_retention_keeps_existing_owner_until_recovery(self):
+        self.exercise("pending-retention", legacy=True)
+
     def test_partial_inventory_service_replacement_closes_worker_and_context(self):
         self.exercise("pending-read", service=True)
 
@@ -483,7 +514,8 @@ class ScannerInventoryObservationTest(peer._TmpRootMixin, unittest.TestCase):
         real_read = Path.read_text
         cases = [dict(record, receipt=body) for body in ({}, {"kind": "completion"}, {"result": "PASS"})]
         cases += [dict(record, state="acked", receipt=None, claim_authority="deliverer-unproven")]
-        cases += [{k: v for k, v in dict(record, receipt={}).items() if k != "claim_authority"}]
+        cases += [{k: dict(record, receipt={})[k] for k in pending.REQUIRED_FIELDS
+                   if k != "claim_authority"}]
         # The current pending format permits these claim fields. Discovery does
         # not invent a stricter schema or use them as native-send authority.
         cases += [dict(record, claim_owner=[], claim_deadline_ns={})]
@@ -547,6 +579,83 @@ class ScannerInventoryObservationTest(peer._TmpRootMixin, unittest.TestCase):
         self.edge("claude", "A", "B")
         self.jobs_path.unlink()
         self.assertTrue(steward._discover_session_notice_duties(self.store()))
+        self.assertEqual(len(self.duties()), 1)
+
+    def test_real_unresolved_lineage_is_distinct_from_absent_notice(self):
+        record = self.legacy_notice()
+        self.edge("claude", "A", "B")
+        self.edge("claude", "A", "C")
+        self.assertEqual(handover.chain_end("claude", "A")[1], "unresolved")
+        path = pending.record_path(self.tmp_root, "A", record["delivery_id"])
+        before = self.snapshot([path, self.jobs_path])
+        self.assertFalse(steward._discover_session_notice_duties(self.store()))
+        self.assertFalse(self.duties())
+        self.assertEqual(before, self.snapshot([path, self.jobs_path]))
+
+    def test_retention_recheck_cannot_drop_newly_unresolved_authority(self):
+        record = self.legacy_notice()
+        self.edge("claude", "A", "B")
+        path = pending.record_path(self.tmp_root, "A", record["delivery_id"])
+        before = self.snapshot([path, self.jobs_path])
+        real_chain_end = handover.chain_end
+        calls = []
+        def chain_end(harness, sid, **kwargs):
+            calls.append(sid)
+            return real_chain_end(harness, sid, **kwargs) if len(calls) == 1 else (sid, "unresolved")
+        with mock.patch.object(handover, "chain_end", side_effect=chain_end):
+            self.assertFalse(steward._discover_session_notice_duties(self.store()))
+        self.assertEqual(calls, ["A", "A"])
+        self.assertFalse(self.duties())
+        self.assertEqual(before, self.snapshot([path, self.jobs_path]))
+        self.assertTrue(steward._discover_session_notice_duties(self.store()))
+        self.assertEqual(len(self.duties()), 1)
+
+    def test_registry_read_failure_still_retains_route_free_candidates(self):
+        import dispatch_registry_cache as cache
+        self.legacy_notice()
+        self.edge("claude", "A", "B")
+        cache.clear_cache()
+        with mock.patch.object(cache, "_stable_read", side_effect=OSError("fixture registry read")):
+            self.assertFalse(steward._discover_session_notice_duties(self.store()))
+        self.assertEqual(len(self.duties()), 1)
+        self.assertTrue(steward._discover_session_notice_duties(self.store()))
+
+    def test_missing_record_during_stat_or_read_is_ordinary_absence(self):
+        record = self.legacy_notice()
+        self.edge("claude", "A", "B")
+        path = pending.record_path(self.tmp_root, "A", record["delivery_id"])
+        before = self.snapshot([path, self.jobs_path])
+        real_stat, real_read = Path.stat, Path.read_text
+        for operation, original in (("stat", real_stat), ("read_text", real_read)):
+            with self.subTest(operation=operation):
+                def missing(p, *a, **kw):
+                    if p == path:
+                        raise FileNotFoundError("fixture concurrent removal")
+                    return original(p, *a, **kw)
+                with mock.patch.object(Path, operation, new=missing):
+                    self.assertTrue(steward._discover_session_notice_duties(self.store()))
+                self.assertFalse(self.duties())
+        self.assertEqual(before, self.snapshot([path, self.jobs_path]))
+        self.assertTrue(steward._discover_session_notice_duties(self.store()))
+        self.assertEqual(len(self.duties()), 1)
+
+    def test_nonfiles_and_empty_record_are_partial_without_losing_valid_notice(self):
+        record = self.legacy_notice()
+        self.edge("claude", "A", "B")
+        path = pending.record_path(self.tmp_root, "A", record["delivery_id"])
+        bad = path.parent/"delivery-000.json"
+        bad.mkdir()
+        self.assertFalse(steward._discover_session_notice_duties(self.store()))
+        self.assertEqual(len(self.duties()), 1)
+        bad.rmdir()
+        bad.touch()  # Empty JSON is unavailable, whereas an empty directory is healthy.
+        self.assertFalse(steward._discover_session_notice_duties(self.store()))
+        self.assertEqual(len(self.duties()), 1)
+        bad.unlink()
+        tidy._append_ledger_entry(tidy.Seat("pane", "not-directory"),
+                                 dict(event="start", harness="claude", sid="not-directory"))
+        pending.record_directory(self.tmp_root, "not-directory").touch()
+        self.assertFalse(steward._discover_session_notice_duties(self.store()))
         self.assertEqual(len(self.duties()), 1)
 
     def test_healthy_missing_and_empty_pending_inventory_normally_exit(self):
