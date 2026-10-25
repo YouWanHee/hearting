@@ -6655,6 +6655,7 @@ _EXPLORER_EARLIER = False    # the output pane was scrolled past its first row: 
 _EXPLORER_RUNTIME = None
 _EXPLORER_GENERATION = 0
 _EXPLORER_READINESS = {"ready": True}
+_EXPLORER_SHOWN = False      # a complete frame was drawn: later pending sources never blank the screen again
 
 
 def set_explorer_mode(enabled=True):
@@ -7050,17 +7051,24 @@ def _draw_explorer(stdscr, snapshot, frame=None):
     _draw_explorer_frame(stdscr, frame, snapshot)
 
 
+_EXPLORER_SPIN_KEYS = frozenset(("spin", "g_spin", "g_spin_dim"))
+
+
 def _draw_explorer_frame(stdscr, frame, snapshot):
     global _EXPLORER_FRAME
     _EXPLORER_FRAME = frame
     h, w = stdscr.getmaxyx()
     stdscr.erase()
+    # The composed frame keeps the approved still glyph; working marks turn here, like Fleet's.
+    spin = _SPIN[int(time.time() * 10) % len(_SPIN)]
     if frame.cells:
         for y, row in enumerate(frame.cells[:h]):
             for x, cell in enumerate(row[:w]):
                 glyph, colour_key, tint = cell
                 if glyph == "":
                     continue
+                if glyph == "⠏" and colour_key in _EXPLORER_SPIN_KEYS:
+                    glyph = spin
                 try:
                     stdscr.addstr(y, x, glyph, _key_attr(colour_key, tint))
                 except Exception:
@@ -10721,7 +10729,7 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
     global _PROMPT_HITS, _CURSOR_ID, _RELOAD_FRAME, _RELOAD_LAYOUT
     global _RELOAD_FRAME_AT, _RELOAD_FRAME_COMPUTE_AT, _HIT_VALID, _HIT_SIZE
     global _HIT_SNAPSHOT_ID, _CURRENT_BODY_H, _CURRENT_BODY_TOP, _CURRENT_BODY_COUNT
-    global _LAYOUT_META
+    global _LAYOUT_META, _EXPLORER_SHOWN
 
     _TOGGLE_ROWS, _TOGGLE_SPANS = {}, {}
     _CLICK_ROWS, _CLICK_SPANS = {}, {}
@@ -10739,10 +10747,15 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
         readiness = _EXPLORER_READINESS
         ready = (readiness.get("ready", True) if isinstance(readiness, Mapping)
                  else getattr(readiness, "ready", True))
-        if not ready:
-            loading = _explorer_runtime().loading_frame(w, h)
-            if loading is not None:
-                frame = loading
+        # ``loading`` is the caller's "no collection yet": the placeholder snapshot is empty,
+        # not a fleet with zero sessions. Once a complete frame is up, a source that is
+        # pending again (a usage refresh in flight) keeps the last frame instead.
+        if not _EXPLORER_SHOWN and (loading or not ready):
+            placeholder = _explorer_runtime().loading_frame(w, h)
+            if placeholder is not None:
+                frame = placeholder
+        elif not loading:
+            _EXPLORER_SHOWN = True
         _draw_explorer(stdscr, current, frame=frame)
         return
     stdscr.erase()
