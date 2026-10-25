@@ -18,7 +18,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
-from replica_batch_contract import ReplicaBatchContractError, verify_manifest
+from replica_batch_contract import (
+    ReplicaBatchContractError, verify_manifest, verify_peer_proof,
+)
 from governor_identity import capture_local_identity, create_witness, close_witness, observe_witness, prove_witness_unheld, IdentityCaptureError, retained_witness_is_held
 
 
@@ -1271,6 +1273,8 @@ def _validate_batch_peer(
         "route": str(paths["route"]),
         "state": peer_state,
     }
+    verify_peer_proof(proof, parallel_group=str(
+        manifest.get("parallel_group") or manifest.get("replica_group") or ""))
     encoded = json.dumps(proof, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return {
         "batch_peer_attempt_id": attempt_id,
@@ -1467,6 +1471,7 @@ def _validate_legacy_visual_closure_peer(
         "source_selected_attempt_id": str(source_selected["attempt_id"]),
         "source_peer_leg_sha256": source_leg_digests[str(peer["attempt_id"])],
     })
+    verify_peer_proof(peer_proof, parallel_group=group)
     encoded = json.dumps(peer_proof, separators=(",", ":"), sort_keys=True).encode("utf-8")
     proof["batch_peer_proof_sha256"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
     return proof
