@@ -24,6 +24,8 @@ S = importlib.util.spec_from_file_location("topology", P); T = importlib.util.mo
 # `balanced-deep`; group digests and every other node field are unchanged.
 # 2026-10-02 entry approvals: only refine review's declared preview output changes;
 # all other node fields and parallel group digests remain at their pinned values.
+# 2026-10-25 route-local spec authoring: only the code execute node's spec/**
+# scope and artifact-order-prechecked declaration change its node census.
 PRESERVED_FULL_FIELD_DIGESTS = {
     # Added with the compiler-internal framed recipe (v3.0 part 3): two `top` frame legs and the
     # model-less runtime terminal. No other entry moves.
@@ -48,7 +50,7 @@ PRESERVED_FULL_FIELD_DIGESTS = {
         "a9b802f929cb1efdf839e4bae6f9f7c03bad3466d6193b9ff23d22a4ba9faaa9",
     ),
     ("autopilot-code", ('audit', 'debug', 'dev')): (
-        "2a5544328e29101bdb53dc3c649ff74adff685375e86999938189628a274ed1a",
+        "f2860df23ae5f7d983d261d8dbdd8367df32499c428421bdf869f28a466c632e",
         "c04f23733b6f6ad650d53b8997143b735c771631b5eaa8fb8679bb2f38555cbc",
     ),
     ("autopilot-design", ('default',)): (
@@ -148,9 +150,20 @@ class TestTopology(unittest.TestCase):
         r=copy.deepcopy(self.r); code=next(x for x in r["recipes"] if x["capability"]=="autopilot-code")
         execute=next(n for n in code["standard_plus"]["nodes"] if n["id"]=="execute")
         execute["write_scope"]=["spec/**","checklist.md","dev_logs/**"]
+        execute.pop("guard_preconditions",None)
         self.assertRaisesRegex(T.TopologyError,"spec write scope requires",T.validate_registry,r)
         execute["guard_preconditions"]=["artifact-order-prechecked"]
         T.validate_registry(r)
+    def test_code_authoring_scope_is_limited_to_quick_and_execute(self):
+        code=next(x for x in self.r["recipes"] if x["capability"]=="autopilot-code")
+        self.assertIn("spec/**",code["quick"]["write_scope"])
+        self.assertEqual(code["quick"]["guard_preconditions"],["artifact-order-prechecked"])
+        nodes=code["standard_plus"]["nodes"]
+        execute=next(n for n in nodes if n["id"]=="execute")
+        self.assertIn("spec/**",execute["write_scope"])
+        self.assertEqual(execute["guard_preconditions"],["artifact-order-prechecked"])
+        self.assertEqual([n["id"] for n in nodes if any(
+            scope=="spec" or scope.startswith("spec/") for scope in n["write_scope"])], ["execute"])
     def test_tracking_and_rollout_schema_fail_closed(self):
         r=copy.deepcopy(self.r); r["tracking_values"]=["tracked"]
         self.assertRaisesRegex(T.TopologyError,"tracking_values",T.validate_registry,r)

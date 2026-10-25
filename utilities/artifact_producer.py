@@ -1827,7 +1827,33 @@ def status(root: Path) -> Dict[str, Any]:
     klass = classify_root(root)
     fallback = legacy_fallback_state(root, classification=klass)
     specs = [r for r in records if r.get("capability") == "autopilot-spec" and r.get("state") == "sealed"]
-    references = list_references(root, "spec") if specs else []
+    code_specs = []
+    resolved_references: Optional[Dict[str, Dict[str, Any]]] = None
+    unresolved_code_references = False
+    for record in records:
+        if record.get("capability") != "autopilot-code" or record.get("state") != "sealed":
+            continue
+        decision = _code_cycle_publication_decision(
+            root, record, list(resolved_references.values()) if resolved_references is not None else None)
+        rows = decision.get("references")
+        if rows is not None:
+            if resolved_references is None:
+                resolved_references = {}
+            for reference in rows:
+                reference_id = reference.get("shared_reference_id")
+                if isinstance(reference_id, str):
+                    resolved_references[reference_id] = reference
+        if decision["obligation"]:
+            code_specs.append(record)
+            if rows is None:
+                unresolved_code_references = True
+    publication_cycles = [*specs, *code_specs]
+    if not publication_cycles:
+        references = []
+    elif specs or unresolved_code_references or resolved_references is None:
+        references = list_references(root, "spec")
+    else:
+        references = list(resolved_references.values())
     # Read shared revision metadata once per status call, not once per cycle.
     # This is an in-call projection, never a cache or publication authority.
     lineage: Dict[str, Any] = {}
@@ -1842,7 +1868,7 @@ def status(root: Path) -> Dict[str, Any]:
                     lineage.setdefault(source_cycle, {}).setdefault(ref_id, []).append((revision_id, revision))
     publications = [completed_spec_publication(root, cycle_id=r["cycle_id"], references=references,
                                               known_publications=lineage.get(r["cycle_id"], {}))
-                    for r in specs]
+                    for r in publication_cycles]
     return {
         "artifact_root": str(root),
         "cutover": read_cutover(root),
@@ -9168,14 +9194,385 @@ def _finished_spec_publication(root: Path, reference: Mapping[str, Any], cycle_i
     return None, None
 
 
+def _spec_source_manifest_hints(root: Path, record: Mapping[str, Any], source_rel: str) -> Tuple[bool, bool]:
+    """Return whether a cycle manifest ever named this source and its seed receipt."""
+    documents = []
+    current = _read_json(_record_cycle_manifest_path(root, record))
+    if isinstance(current, dict):
+        documents.append(current)
+    try:
+        documents.extend(document for _raw, document in artifact_lifecycle.read_manifest_snapshots(
+            root, record["cycle_id"]) if isinstance(document, dict))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    prefix = source_rel.rstrip("/") + "/"
+    has_source = has_seed = False
+    for document in documents:
+        for row in document.get("artifact_revisions", []):
+            if not isinstance(row, Mapping):
+                continue
+            locator = row.get("locator")
+            path = locator.get("path") if isinstance(locator, Mapping) else None
+            if not isinstance(path, str):
+                continue
+            if path == source_rel or path.startswith(prefix):
+                has_source = True
+            if path == prefix + SPEC_BASE_RECEIPT:
+                has_seed = True
+    return has_source, has_seed
+
+
+def _code_cycle_snapshot_spec_hints(root: Path, record: Mapping[str, Any],
+                                    source_rel: str) -> Optional[Dict[str, Any]]:
+    """Read source/seed evidence from the exact sealed manifest history.
+
+    The cycle payload may be ordinarily removed after completion. Its immutable
+    manifest snapshot still distinguishes an unseeded code cycle from a cycle
+    with a real spec transaction. Unknown or damaged evidence stays visible to
+    the existing publication classifier.
+    """
+    cycle_id = record.get("cycle_id")
+    campaign_id = record.get("campaign_id")
+    digest = record.get("manifest_digest")
+    if (not isinstance(cycle_id, str) or not isinstance(campaign_id, str)
+            or not isinstance(digest, str)):
+        return None
+    try:
+        snapshots = artifact_lifecycle.read_manifest_snapshots(root, cycle_id)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    exact = [document for _raw, document in snapshots
+             if artifact_manifest.manifest_digest(document) == digest]
+    if len(exact) != 1:
+        return None
+    sealed = exact[0]
+    if not artifact_manifest.validate(sealed).ok:
+        return None
+    cycle = sealed.get("cycle")
+    producer = sealed.get("producer")
+    routes = sealed.get("routes")
+    if (not isinstance(cycle, Mapping) or cycle.get("cycle_id") != cycle_id
+            or cycle.get("campaign_id") != campaign_id
+            or cycle.get("state") != record.get("cycle_state")
+            or not isinstance(producer, Mapping)):
+        return None
+    revision = producer.get("source_revision")
+    parts = revision.split("/") if isinstance(revision, str) else []
+    if (len(parts) < 2 or parts[0] != record.get("capability")
+            or parts[1] != record.get("intensity") or not isinstance(routes, list)
+            or not any(isinstance(row, Mapping)
+                       and row.get("route_id") == record.get("route_id")
+                       and row.get("route_hash") == record.get("route_hash") for row in routes)):
+        return None
+
+    prefix = source_rel.rstrip("/") + "/"
+    has_source = has_seed = False
+    for _raw, document in snapshots:
+        if not artifact_manifest.validate(document).ok:
+            return None
+        snapshot_cycle = document.get("cycle")
+        snapshot_producer = document.get("producer")
+        snapshot_routes = document.get("routes")
+        if (not isinstance(snapshot_cycle, Mapping)
+                or snapshot_cycle.get("campaign_id") != campaign_id
+                or not isinstance(snapshot_producer, Mapping)
+                or snapshot_producer.get("source_revision") != revision
+                or not isinstance(snapshot_routes, list)
+                or not any(isinstance(row, Mapping)
+                           and row.get("route_id") == record.get("route_id")
+                           and row.get("route_hash") == record.get("route_hash") for row in snapshot_routes)):
+            return None
+        rows = document.get("artifact_revisions")
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            locator = row.get("locator") if isinstance(row, Mapping) else None
+            path = locator.get("path") if isinstance(locator, Mapping) else None
+            if not isinstance(path, str):
+                return None
+            if path == prefix + SPEC_BASE_RECEIPT:
+                has_seed = True
+    return {"has_seed": has_seed, "sealed": sealed}
+
+
+def _code_cycle_snapshot_spec_facts(document: Mapping[str, Any], source_rel: str
+                                    ) -> Optional[Dict[str, Tuple[str, int]]]:
+    """Project the sealed manifest's current file revisions for one spec tree."""
+    prefix = source_rel.rstrip("/") + "/"
+    artifacts = [row for row in document.get("artifacts", []) if isinstance(row, Mapping)]
+    active_ids = {row.get("artifact_id") for row in artifacts}
+    for artifact in artifacts:
+        if artifact.get("type") != "directory-bundle":
+            continue
+        title = artifact.get("title")
+        if not isinstance(title, str) or not title:
+            return None
+        tree_rel = "artifacts/" + title
+        if (tree_rel == source_rel or tree_rel.startswith(prefix)
+                or source_rel.startswith(tree_rel.rstrip("/") + "/")):
+            # The descriptor body is a payload, not part of immutable manifest
+            # history. Keep this case on the existing refusal path.
+            return None
+
+    latest: Dict[str, Mapping[str, Any]] = {}
+    for row in document.get("artifact_revisions", []):
+        if not isinstance(row, Mapping) or row.get("artifact_id") not in active_ids:
+            continue
+        artifact_id = row.get("artifact_id")
+        previous = latest.get(artifact_id)
+        if previous is None or row.get("revision_sequence", 0) > previous.get("revision_sequence", 0):
+            latest[artifact_id] = row
+
+    facts: Dict[str, Tuple[str, int]] = {}
+    for row in latest.values():
+        locator = row.get("locator")
+        path = locator.get("path") if isinstance(locator, Mapping) else None
+        if not isinstance(path, str):
+            return None
+        if path == source_rel:
+            return None
+        if not path.startswith(prefix):
+            continue
+        relative = path[len(prefix):]
+        digest = row.get("content_digest")
+        byte_size = row.get("byte_size")
+        if (not relative or not isinstance(digest, str) or not digest.startswith("sha256:")
+                or not isinstance(byte_size, int) or byte_size < 0 or relative in facts):
+            return None
+        facts[relative] = (digest, byte_size)
+    return facts
+
+
+def _code_cycle_snapshot_publication_obligation(
+    root: Path, record: Mapping[str, Any], source_rel: str,
+    hints: Mapping[str, Any], reference_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Resolve one seed base from immutable evidence when its payload was removed."""
+    document = hints.get("sealed")
+    if not isinstance(document, Mapping):
+        return {"obligation": True}
+    source_facts = _code_cycle_snapshot_spec_facts(document, source_rel)
+    if source_facts is None:
+        return {"obligation": True}
+    receipt_fact = source_facts.get(SPEC_BASE_RECEIPT)
+    if receipt_fact is None:
+        # A seed in an earlier manifest but absent from the exact sealed
+        # revision is a missing-seed case, not proof of an unused transaction.
+        return {"obligation": True}
+    receipt_digest, receipt_size = receipt_fact
+    source_components = tuple(sorted({path.split("/", 1)[0] for path in source_facts
+                                      if not path.startswith("_internal/")}))
+
+    def matches(reference_id: Optional[str], revision_id: Optional[str],
+                content_digest: Optional[str], components: Optional[Tuple[str, ...]]) -> bool:
+        raw = _json_bytes({
+            "schema_version": 1, "reference_id": reference_id,
+            "revision_id": revision_id, "content_digest": content_digest,
+            **({"components": list(components),
+               "component_seeds": {component: True for component in components}}
+              if components is not None else {}),
+            "seed_complete": True,
+        })
+        return len(raw) == receipt_size and _digest(raw) == receipt_digest
+
+    component_receipt = source_components or None
+    reference: Optional[Mapping[str, Any]] = None
+    reference_id: Optional[str] = None
+    revision_id: Optional[str] = None
+    components: Optional[Tuple[str, ...]] = None
+    if matches(None, None, None, None):
+        base_tree: Mapping[str, bytes] = {}
+    elif component_receipt is not None and matches(None, None, None, component_receipt):
+        components = component_receipt
+        base_tree = {}
+    else:
+        sealed_references = {
+            row.get("shared_reference_id"): row
+            for row in document.get("shared_references", [])
+            if isinstance(row, Mapping) and row.get("kind") == "shared-spec"
+            and isinstance(row.get("shared_reference_id"), str)
+        }
+        exact_matches: Dict[Tuple[str, str, Optional[Tuple[str, ...]]], str] = {}
+
+        def add_exact(candidate_id: Any, candidate_revision: Any, content: Any) -> None:
+            if (not isinstance(candidate_id, str) or candidate_id not in sealed_references
+                    or not isinstance(candidate_revision, str) or not isinstance(content, str)):
+                return
+            if matches(candidate_id, candidate_revision, content, None):
+                exact_matches[(candidate_id, candidate_revision, None)] = content
+            elif (component_receipt is not None
+                  and matches(candidate_id, candidate_revision, content, component_receipt)):
+                exact_matches[(candidate_id, candidate_revision, component_receipt)] = content
+
+        for row in document.get("shared_reference_revisions", []):
+            if isinstance(row, Mapping):
+                add_exact(row.get("shared_reference_id"),
+                          row.get("shared_reference_revision_id"), row.get("content_digest"))
+
+        if len(exact_matches) != 1:
+            if exact_matches or sealed_references:
+                return {"obligation": True}
+            # Pre-pin completed records remain an ordinary no-op when their
+            # campaign payload is gone. New seed operations retain their exact
+            # base through the existing shared-reference pin surface.
+            return {"obligation": False}
+
+        (reference_id, revision_id, components), expected_content_digest = next(iter(exact_matches.items()))
+        candidate = next((row for row in reference_rows or ()
+                          if isinstance(row, Mapping)
+                          and row.get("shared_reference_id") == reference_id), None)
+        reference = candidate if isinstance(candidate, Mapping) else _read_json(
+            _reference_path(root, "spec", reference_id))
+        if (not isinstance(reference, Mapping)
+                or reference.get("shared_reference_id") != reference_id
+                or revision_id not in reference.get("revisions", [])):
+            return {"obligation": True}
+        revision_record = _read_json(
+            root / "shared/spec" / reference_id / "revisions" / revision_id / REVISION_RECORD_NAME)
+        if (not isinstance(revision_record, Mapping)
+                or revision_record.get("shared_reference_id") != reference_id
+                or revision_record.get("shared_reference_revision_id") != revision_id
+                or revision_record.get("content_digest") != expected_content_digest):
+            return {"obligation": True}
+        try:
+            base_tree, _base_record = _verified_shared_spec(root, reference_id, revision_id)
+        except (ProducerError, OSError, ValueError, KeyError, TypeError):
+            return {"obligation": True}
+
+    exact_references = [dict(reference)] if isinstance(reference, Mapping) else []
+    if exact_references:
+        missing_source = root / ".runtime" / "missing-cycle-payload" / str(record.get("cycle_id")) / source_rel
+        published_id, published = _finished_spec_publication(
+            root, exact_references[0], str(record.get("cycle_id")), source_rel,
+            record, missing_source, None)
+        if published is not None:
+            return {"obligation": True, "references": exact_references,
+                    "finished": (exact_references[0], published_id, published)}
+
+    def authoring_facts(files: Mapping[str, Tuple[str, int]]) -> Optional[Dict[str, Tuple[str, int]]]:
+        selected: Dict[str, Tuple[str, int]] = {}
+        for path, facts in files.items():
+            if path == SPEC_BASE_RECEIPT or "/_internal/versions/" in "/" + path:
+                continue
+            if components is not None and path.split("/", 1)[0] not in components:
+                return None
+            selected[path] = facts
+        return selected
+
+    current_authoring = authoring_facts(source_facts)
+    base_facts = {path: (_digest(data), len(data)) for path, data in base_tree.items()}
+    base_authoring = authoring_facts(base_facts)
+    if current_authoring is None or base_authoring is None:
+        return {"obligation": True, "references": exact_references}
+    return {"obligation": current_authoring != base_authoring,
+            "references": exact_references}
+
+
+def _code_cycle_publication_decision(root: Path, record: Mapping[str, Any],
+                                     reference_rows: Optional[List[Dict[str, Any]]] = None
+                                     ) -> Dict[str, Any]:
+    """Decide the shared-spec duty from the code cycle's actual transaction evidence."""
+    source_rel = _placed_locator("artifacts/spec", _output_placements(root, record))
+    hints = _code_cycle_snapshot_spec_hints(root, record, source_rel)
+    try:
+        _published_cycle_state(root, record)
+    except ProducerError as exc:
+        if (exc.code == "sealed-cycle-state-unknown"
+                and f"{record.get('cycle_id')}: campaign-locator=missing" in exc.detail):
+            if hints is not None:
+                if not hints["has_seed"]:
+                    return {"obligation": False}
+                return _code_cycle_snapshot_publication_obligation(
+                    root, record, source_rel, hints, reference_rows)
+        return {"obligation": True}
+
+    try:
+        manifest_path = _record_cycle_manifest_path(root, record)
+        source_path = manifest_path.parent / source_rel
+        if _path_entry_present(source_path / SPEC_BASE_RECEIPT):
+            seed = _read_json(source_path / SPEC_BASE_RECEIPT)
+            if not isinstance(seed, Mapping):
+                return {"obligation": True}
+            if _code_spec_tree_changed(root, record, source_rel, source_path, seed):
+                return {"obligation": True}
+            reference_id = seed.get("reference_id")
+            if not isinstance(reference_id, str):
+                return {"obligation": True}
+            reference = _read_json(_reference_path(root, "spec", reference_id))
+            if not isinstance(reference, Mapping):
+                return {"obligation": True}
+            revision_id, finished = _finished_spec_publication(
+                root, reference, record["cycle_id"], source_rel, record, source_path, None)
+            if finished is not None:
+                return {"obligation": True, "finished": (reference, revision_id, finished)}
+            return {"obligation": False}
+        if source_path.is_symlink():
+            return {"obligation": True}
+        has_source, has_seed = _spec_source_manifest_hints(root, record, source_rel)
+        return {"obligation": has_seed}
+    except ProducerError as exc:
+        if (exc.code == "sealed-cycle-state-unknown"
+                and f"{record.get('cycle_id')}: campaign-locator=missing" in exc.detail):
+            hints = _code_cycle_snapshot_spec_hints(root, record, source_rel)
+            if hints is not None:
+                if not hints["has_seed"]:
+                    return {"obligation": False}
+                return _code_cycle_snapshot_publication_obligation(
+                    root, record, source_rel, hints, reference_rows)
+        return {"obligation": True}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"obligation": True}
+
+
+def _code_spec_tree_changed(root: Path, record: Mapping[str, Any], source_rel: str,
+                            source_path: Path, seed: Mapping[str, Any]) -> bool:
+    """Compare only seeded authoring content to its pinned base, not seed metadata/history."""
+    if seed.get("seed_complete") is not True:
+        raise ProducerError("shared-base-invalid", "incomplete seed")
+    directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
+    source_rows = _sealed_source_files(directory, record, source_rel, source_path)
+    source_tree = _spec_bytes(source_path)
+    if source_rows != [(row["path"], row["sha256"], row["byte_size"])
+                       for row in _spec_inventory(source_tree)]:
+        raise ProducerError("source-manifest-mismatch", source_rel)
+    components = _spec_seed_components(source_tree)
+    if components is None:
+        states = seed.get("component_seeds")
+        if (not isinstance(states, dict)
+                or any(not isinstance(name, str)
+                       or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", name)
+                       or value is not True for name, value in states.items())):
+            raise ProducerError("shared-base-invalid", "incomplete seed")
+    reference_id = seed.get("reference_id")
+    base_id = _spec_admission_base(root, source_path, reference_id, None)
+    base_tree: Mapping[str, bytes] = {}
+    if base_id is not None:
+        if not isinstance(reference_id, str):
+            raise ProducerError("shared-base-invalid", "reference identity")
+        base_tree, _base_record = _verified_shared_spec(root, reference_id, base_id)
+
+    def authoring(tree: Mapping[str, bytes]) -> Dict[str, bytes]:
+        selected = {}
+        for path, data in tree.items():
+            if path == SPEC_BASE_RECEIPT or "/_internal/versions/" in "/" + path:
+                continue
+            if components is not None and path.split("/", 1)[0] not in components:
+                continue
+            selected[path] = data
+        return selected
+
+    return authoring(source_tree) != authoring(base_tree)
+
+
 def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = False,
                                references: Optional[Sequence[Mapping[str, Any]]] = None,
                                known_publications: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Finish publication after the work is complete, without changing its outcome.
 
-    Status reads actual source lineage. Normal completion retries the existing
-    admission transaction, with its seed/base/CAS and immutable-revision recovery.
-    No extra completion gate, mutable completion flag, or model rerun is involved.
+    Spec routes keep their established primary-artifact contract. Code routes
+    become eligible only when a completed cycle contains the real spec seed
+    receipt and its sealed authoring files differ from that receipt's base.
+    Both use the same admission transaction, CAS and immutable-lineage retry.
     """
     root = Path(root).resolve()
     result = {"cycle_id": cycle_id, "status": "not-applicable"}
@@ -9183,28 +9580,74 @@ def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = Fals
         record = read_cycle_record(root, cycle_id)
         if record is None:
             return {**result, "status": "pending", "reason": "cycle-unknown"}
-        if record.get("capability") != "autopilot-spec":
+        capability = record.get("capability")
+        if capability not in {"autopilot-spec", "autopilot-code"}:
             return result
-        if record.get("state") != "sealed" or _published_cycle_state(root, record) != "completed":
+        if record.get("state") != "sealed":
             return {**result, "reason": "spec-work-not-completed"}
-        result.update(status="pending", reason="shared-publication-required")
+        code_decision = {"obligation": True}
+        if capability == "autopilot-code":
+            code_decision = _code_cycle_publication_decision(root, record, references)
+            if not code_decision["obligation"]:
+                return result
+            if code_decision.get("references") is not None and code_decision.get("finished") is not None:
+                reference, revision_id, revision = code_decision["finished"]
+                reference_id = reference["shared_reference_id"]
+                result.update(status="admitted", shared_reference_id=reference_id,
+                              shared_reference_revision_id=revision_id,
+                              content_digest=revision.get("content_digest"))
+                if settle:
+                    if "spec_merge" in revision:
+                        _verify_spec_publication(root, reference, revision, completed=True)
+                    else:
+                        _verify_exact_spec_publication(root, reference, revision, completed=True)
+                    admission = {
+                        "status": "reused", "kind": SHARED_KINDS["spec"],
+                        "shared_reference_id": reference_id,
+                        "shared_reference_revision_id": revision_id,
+                        "reference_created": False,
+                        "revision_dir": str(root / "shared/spec" / reference_id / "revisions" / revision_id),
+                        "content_digest": revision.get("content_digest"),
+                        "file_count": revision.get("file_count"),
+                        "promotion": revision.get("promotion"),
+                    }
+                    if "spec_merge" in revision:
+                        admission["spec_merge"] = revision["spec_merge"]
+                    result["admission"] = admission
+                    result["reason"] = None
+                return result
+        published_state = _published_cycle_state(root, record)
+        if published_state != "completed":
+            return {**result, "reason": "spec-work-not-completed"}
         directory = cycle_dir(root, record["campaign_id"], cycle_id, record)
         source_rel = _placed_locator("artifacts/spec", _output_placements(root, record))
         source_path = directory / source_rel
         seed_path = source_path / SPEC_BASE_RECEIPT
-        seed = _read_json(seed_path)
-        if _path_entry_present(seed_path) and seed is None:
-            raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
-        reference_id = seed.get("reference_id") if seed is not None else None
-        if reference_id is not None and not artifact_identity.is_well_formed(reference_id, "shared_reference"):
-            raise ProducerError("shared-base-invalid", "reference identity")
+        seed_present = _path_entry_present(seed_path)
+
+        if capability == "autopilot-code" and not seed_present:
+            has_source, has_seed = _spec_source_manifest_hints(root, record, source_rel)
+            if not has_source:
+                return result
+
+        seed = _read_json(seed_path) if seed_present or source_path.is_dir() else None
+        spec_reference_id = None
+        if capability == "autopilot-spec":
+            if seed_present and seed is None:
+                raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
+            spec_reference_id = seed.get("reference_id") if seed is not None else None
+            if (spec_reference_id is not None
+                    and not artifact_identity.is_well_formed(spec_reference_id, "shared_reference")):
+                raise ProducerError("shared-base-invalid", "reference identity")
         refs = list(references) if references is not None else list_references(root, "spec")
-        if reference_id is not None:
-            refs = [r for r in refs if r.get("shared_reference_id") == reference_id]
-            if len(refs) != 1:
-                raise ProducerError("reference-unknown", reference_id)
+        if capability == "autopilot-spec":
+            if spec_reference_id is not None:
+                refs = [r for r in refs if r.get("shared_reference_id") == spec_reference_id]
+                if len(refs) != 1:
+                    raise ProducerError("reference-unknown", spec_reference_id)
+
         # An already admitted source remains finished even after edits/deletion
-        # or a newer latest. Its original seed base never becomes today's base.
+        # or a newer latest. Check the exact historical manifest lineage first.
         finished = []
         for reference in refs:
             revision_id, revision = _finished_spec_publication(
@@ -9224,9 +9667,40 @@ def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = Fals
             result.pop("reason", None)
             if not settle:
                 return result
-        elif len(refs) > 1:
-            raise ProducerError("shared-reference-ambiguous", "spec completion lacks a unique seed/reference")
+            admission = admit_shared(root, cycle_id=cycle_id, kind="spec", source="spec",
+                                     reference_id=reference_id)
+            return {**result, "status": "admitted", "admission": admission,
+                    "shared_reference_id": admission["shared_reference_id"],
+                    "shared_reference_revision_id": admission["shared_reference_revision_id"],
+                    "content_digest": admission.get("content_digest"), "reason": None}
+
+        if capability == "autopilot-code" and not seed_present:
+            if source_path.is_symlink() or has_seed:
+                raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
+            return result
+        if capability == "autopilot-code":
+            if seed_present and seed is None:
+                raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
+            reference_id = seed.get("reference_id") if seed is not None else None
+            if (reference_id is not None
+                    and not artifact_identity.is_well_formed(reference_id, "shared_reference")):
+                raise ProducerError("shared-base-invalid", "reference identity")
+            if reference_id is not None:
+                refs = [r for r in refs if r.get("shared_reference_id") == reference_id]
+                if len(refs) != 1:
+                    raise ProducerError("reference-unknown", reference_id)
+            elif len(refs) > 1:
+                raise ProducerError("shared-reference-ambiguous", "spec completion lacks a unique seed/reference")
         else:
+            reference_id = spec_reference_id
+            if reference_id is None and len(refs) > 1:
+                raise ProducerError("shared-reference-ambiguous", "spec completion lacks a unique seed/reference")
+
+        if capability == "autopilot-code":
+            if seed is None or not _code_spec_tree_changed(root, record, source_rel, source_path, seed):
+                return result
+        result.update(status="pending", reason="shared-publication-required")
+        if capability == "autopilot-spec" and not refs:
             # Reuse the sealed manifest's canonical route admission, including
             # verified continuations of the cycle's original begin identity.
             document = _read_json(directory / "manifest.json") or {}
@@ -9235,8 +9709,8 @@ def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = Fals
             if primary is None:
                 return {**result, "reason": "official-spec-prd-missing"}
             result["primary_path"] = str(primary)
-            if not settle:
-                return result
+        if not settle:
+            return result
         admission = admit_shared(root, cycle_id=cycle_id, kind="spec", source="spec",
                                  reference_id=reference_id)
         # The existing API validates and commits, or reuses the exact earlier
@@ -9249,6 +9723,29 @@ def completed_spec_publication(root: Path, *, cycle_id: str, settle: bool = Fals
             OSError, ValueError, KeyError, TypeError) as exc:
         return {**result, "status": "pending", "reason": getattr(exc, "code", type(exc).__name__),
                 "detail": str(exc)}
+
+
+def completed_route_spec_publication(route: Mapping[str, Any], *, settle: bool = False) -> Dict[str, Any]:
+    """Resolve the route's completed-cycle publication without inventing a code obligation."""
+    result = {"status": "not-applicable"}
+    capability = route.get("capability")
+    if capability not in {"autopilot-spec", "autopilot-code"}:
+        return result
+    root_value = route.get("artifact_root")
+    if not isinstance(root_value, str) or not root_value.strip():
+        return ({**result, "status": "pending", "reason": "spec-artifact-root-unavailable"}
+                if capability == "autopilot-spec" else result)
+    try:
+        root = Path(root_value).resolve()
+        cycle = route_cycle_for(root, route)
+    except (ProducerError, OSError, ValueError, KeyError, TypeError) as exc:
+        return {**result, "status": "pending", "reason": getattr(exc, "code", type(exc).__name__),
+                "detail": str(exc)}
+    if cycle is None:
+        return ({**result, "status": "pending", "reason": "spec-cycle-unavailable"}
+                if capability == "autopilot-spec" else result)
+    publication = completed_spec_publication(root, cycle_id=cycle["cycle_id"], settle=settle)
+    return publication if publication.get("status") != "not-applicable" else result
 
 
 def admit_shared(
@@ -11852,10 +12349,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if result.get("warning"):
                 print(result["warning"], file=sys.stderr)
             record = read_cycle_record(root, args.cycle)
-            if record is not None and record.get("capability") == "autopilot-spec":
+            if record is not None and record.get("capability") in {"autopilot-spec", "autopilot-code"}:
                 # Legacy normal completion/recovery has no owner envelope.
                 # Finalize has released its lock before existing admission runs.
-                result["shared_publication"] = completed_spec_publication(root, cycle_id=args.cycle, settle=True)
+                publication = completed_spec_publication(root, cycle_id=args.cycle, settle=True)
+                if publication.get("status") != "not-applicable":
+                    result["shared_publication"] = publication
         elif args.command == "review-lease":
             if args.operation == "acquire":
                 if not args.attempt:

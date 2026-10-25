@@ -471,18 +471,21 @@ def _official_spec_primary(root, route, binding):
 
 
 def _publication_observation(request, route, binding):
-    if route.get("capability") != "autopilot-spec" or binding is None:
+    if binding is None:
         return None
     import artifact_producer
-    return artifact_producer.completed_spec_publication(request.artifact_root, cycle_id=binding["cycle_id"])
+    publication = artifact_producer.completed_spec_publication(
+        request.artifact_root, cycle_id=binding["cycle_id"])
+    return publication if publication.get("status") != "not-applicable" else None
 
 
 def _completed_result(request, services, route, binding, terminal_nodes, envelope, detail=None):
     publication = None
-    if route.get("capability") == "autopilot-spec" and binding is not None:
-        publication = getattr(services, "shared_publication", _default_shared_publication)(
+    if binding is not None:
+        observed = getattr(services, "shared_publication", _default_shared_publication)(
             request.artifact_root, cycle_id=binding["cycle_id"])
-        if getattr(services, "crash_after", None) == "admission-after":
+        publication = observed if observed.get("status") != "not-applicable" else None
+        if publication is not None and getattr(services, "crash_after", None) == "admission-after":
             raise RuntimeError("crash-after-admission")
     return TerminalCommitResult("completed", None, detail, terminal_nodes, envelope, publication)
 
