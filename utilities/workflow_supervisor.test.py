@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import fcntl
 import importlib.util
 import io
 import hashlib
@@ -21,6 +22,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -4156,6 +4158,346 @@ class TestHarnessResourceEvidence(WorkflowFixture):
         self.assertEqual(launch.call_count, 1)
         self.assertTrue(ledger.journal_path.read_bytes().startswith(original))
         self.assertEqual(ledger.state()["nodes"]["run"]["state"], "STAGE_SUCCEEDED")
+
+
+class TestComputePollObservationBoundary(WorkflowFixture):
+    def compute_fixture(self):
+        route, path = self.two_stage_route(route_id="rt-compute-poll-boundary")
+        route["registry_digest"] = "sha256:fixture-registry"
+        path.write_text(json.dumps(route), encoding="utf-8")
+        jobs = self.base / "dispatch" / "jobs.log"
+        jobs.parent.mkdir(parents=True)
+        jobs.write_text("", encoding="utf-8")
+        resource_id = "fixture-resource"
+        compute_id = "compute-fixture"
+        run_root = self.base / "compute"
+        run_dir = run_root / compute_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "log").write_text("synthetic completed output\n", encoding="utf-8")
+        (run_dir / "exit_code").write_text("0\n", encoding="utf-8")
+        (self.base / "run.json").write_text("{}\n", encoding="utf-8")
+        registry = self.base / "resource-runs.json"
+        row = {
+            "run_id": resource_id,
+            "resource_policy": "supervised-owner",
+            "route": str(path.resolve()),
+            "node": "run",
+            "jobs": str(jobs.resolve()),
+            "compute_run_id": compute_id,
+            "status": "succeeded",
+            "exit_code": 0,
+            "sentinel": str(run_dir / "exit_code"),
+            "log": str(run_dir / "log"),
+            "execution": {
+                "kind": "compute-hosts",
+                "run_id": compute_id,
+                "run_root": str(run_root),
+                "meta_sha256": "m" * 64,
+                "exit_sha256": "e" * 64,
+                "receipt_sha256": "r" * 64,
+                "outputs_sha256": "o" * 64,
+                "contract_sha256": "c" * 64,
+                "provenance": {
+                    "route_id": route["route_id"],
+                    "route_hash": route["route_hash"],
+                },
+            },
+        }
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {resource_id: row}}),
+                            encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            SUP.main([
+                "arm", "--route", str(path), "--node", "run",
+                "--predecessor-kind", "resource", "--predecessor-id", resource_id,
+                "--resource-registry", str(registry), "--jobs", str(jobs),
+                "--artifact-base", str(self.base), "--successor-external",
+            ])
+        ledger = SUP.ledger_for(route, str(jobs))
+        armed = SUP.read_armed(ledger)["run"]
+        return route, path, jobs, registry, ledger, armed
+
+    def owner_terminal_settled_compute_fixture(self):
+        import dispatch_resource_wait as OWNER_RESOURCE
+
+        route, path, jobs, registry, ledger, armed = self.compute_fixture()
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        row = data["runs"]["fixture-resource"]
+        owner_id, session_id = "att-fixture-owner", "session-fixture-owner"
+        row.update(parent_attempt_id=owner_id, owner_wait={
+            "parent_attempt_id": owner_id, "session_id": session_id,
+            "route_id": route["route_id"], "route_hash": route["route_hash"],
+            "jobs": str(jobs.resolve()),
+        })
+        registry.write_text(json.dumps(data), encoding="utf-8")
+        armed["resource_binding"] = OWNER_RESOURCE.resource_body_digest(row)
+        (ledger.root / "armed" / "run.json").write_text(json.dumps(armed), encoding="utf-8")
+
+        identity = SUP.RR.compute_execution_identity(row)
+        evidence = {
+            "terminal": True, "succeeded": True, "exit_code": 0,
+            "liveness": "exited", "quiescent": True, "sentinel_present": True,
+            "identity": identity, "resource_execution_identity": identity,
+            "resource_sha256": SUP.RESOURCE_RESUME.row_digest(row),
+            "owner_terminal_settlement": True, "owner_attempt_id": owner_id,
+            "artifacts": {"checked": True, "missing": []},
+        }
+        if ledger.state()["nodes"]["run"]["state"] != "RUNNING":
+            ledger.record("run", "RUNNING", evidence={"fixture": "owner-terminal-settlement"},
+                          actor="fixture")
+        ledger.record("run", "STAGE_SUCCEEDED", evidence=evidence, actor="completion-controller")
+        node = WS.route_node(route, "run")
+        os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
+        SUP.route_module().write_completion_marker(
+            route, node, "run", self.base / "run.json", jobs=jobs,
+            resource_execution_identity=identity,
+        )
+        return route, jobs, registry, ledger
+
+    def _assert_observer_outside_writer_locks(self, ledger, registry, calls):
+        def observe(_row):
+            held = []
+            for path in (ledger.lock_path, Path(str(registry) + ".lock")):
+                with Path(path).open("a+") as stream:
+                    try:
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        held.append(str(path))
+                    else:
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            calls.append({"held_writer_locks": held})
+            if held:
+                self.fail(f"compute observation ran under writer locks: {held}")
+            return {"state": "quiescent", "reason": "fixture-remote-empty"}
+        return observe
+
+    def test_new_compute_arm_after_empty_outer_snapshot_waits_without_observation(self):
+        route, _path, _jobs, registry, ledger, armed = self.compute_fixture()
+        before = ledger.journal_path.read_bytes()
+        observer_calls = []
+        with mock.patch.object(SUP, "read_armed", side_effect=[{}, {"run": armed}]), \
+             mock.patch("route_parent_close.ledger_intent", return_value=None), \
+             mock.patch("artifact_checkpoint_trigger.launch_for_route"), \
+             mock.patch.object(SUP.RR, "compute_execution_observation",
+                               side_effect=self._assert_observer_outside_writer_locks(
+                                   ledger, registry, observer_calls)):
+            result = SUP.poll_once(route, ledger)
+        self.assertEqual(result[0]["action"], "wait")
+        self.assertEqual(result[0]["evidence"]["reason"],
+                         "compute-resource-binding-changed")
+        self.assertEqual(observer_calls, [])
+        self.assertEqual(ledger.journal_path.read_bytes(), before)
+
+    def test_changed_captured_arm_waits_without_locked_reobservation_or_settlement(self):
+        route, _path, _jobs, registry, ledger, armed = self.compute_fixture()
+        changed_arm = {**armed, "armed_at": "later-binding"}
+        before = ledger.journal_path.read_bytes()
+        observer_calls = []
+        with mock.patch.object(SUP, "read_armed", side_effect=[{"run": armed},
+                                                                 {"run": changed_arm}]), \
+             mock.patch("route_parent_close.ledger_intent", return_value=None), \
+             mock.patch("artifact_checkpoint_trigger.launch_for_route"), \
+             mock.patch.object(SUP.RR, "compute_execution_observation",
+                               side_effect=self._assert_observer_outside_writer_locks(
+                                   ledger, registry, observer_calls)):
+            result = SUP.poll_once(route, ledger)
+        self.assertEqual(result[0]["action"], "wait")
+        self.assertEqual(result[0]["evidence"]["reason"],
+                         "compute-resource-binding-changed")
+        self.assertEqual(len(observer_calls), 1)
+        self.assertEqual(observer_calls[0]["held_writer_locks"], [])
+        self.assertEqual(ledger.journal_path.read_bytes(), before)
+
+    def test_changed_captured_row_and_digest_wait_without_settlement(self):
+        route, _path, _jobs, registry, ledger, armed = self.compute_fixture()
+        before = ledger.journal_path.read_bytes()
+        observer_calls = []
+        observe = self._assert_observer_outside_writer_locks(ledger, registry, observer_calls)
+
+        def mutate_after_observation(row):
+            observation = observe(row)
+            document = json.loads(registry.read_text(encoding="utf-8"))
+            document["runs"]["fixture-resource"]["execution"]["meta_sha256"] = "x" * 64
+            registry.write_text(json.dumps(document), encoding="utf-8")
+            return {"state": "quiescent", "reason": "fixture-remote-empty"}
+
+        with mock.patch("route_parent_close.ledger_intent", return_value=None), \
+             mock.patch("artifact_checkpoint_trigger.launch_for_route"), \
+             mock.patch.object(SUP.RR, "compute_execution_observation",
+                               side_effect=mutate_after_observation):
+            result = SUP.poll_once(route, ledger)
+        self.assertEqual(result[0]["action"], "wait")
+        self.assertEqual(result[0]["evidence"]["reason"],
+                         "compute-resource-binding-changed")
+        self.assertEqual(len(observer_calls), 1)
+        self.assertEqual(observer_calls[0]["held_writer_locks"], [])
+        self.assertEqual(ledger.journal_path.read_bytes(), before)
+
+    def test_preobserved_compute_result_is_consumed_on_the_locked_path(self):
+        route, _path, _jobs, registry, ledger, _armed = self.compute_fixture()
+        observer_calls = []
+        observer = self._assert_observer_outside_writer_locks(ledger, registry, observer_calls)
+        with mock.patch("route_parent_close.ledger_intent", return_value=None), \
+             mock.patch("artifact_checkpoint_trigger.launch_for_route"), \
+             mock.patch.object(SUP.RR, "compute_execution_observation", side_effect=observer), \
+             mock.patch.object(SUP, "resource_output_evidence", return_value={"runtime_only": True}), \
+             mock.patch.object(SUP, "artifact_evidence",
+                               return_value={"checked": True, "missing": []}):
+            result = SUP.poll_once(route, ledger)
+        self.assertEqual(result[0]["action"], "wait-next-resource")
+        self.assertEqual(len(observer_calls), 1)
+        self.assertEqual(observer_calls[0]["held_writer_locks"], [])
+        self.assertEqual(ledger.state()["nodes"]["run"]["state"], "RUNNING")
+        self.assertTrue(ledger.state()["nodes"]["run"]["evidence"]["awaiting_next_resource"])
+
+    def test_unsettled_compute_live_and_unknown_observations_remain_waiting(self):
+        route, _path, _jobs, registry, ledger, _armed = self.compute_fixture()
+        journal_before = ledger.journal_path.read_bytes()
+        observer_calls = []
+        boundary = self._assert_observer_outside_writer_locks(ledger, registry, observer_calls)
+        for observed_state in ("working", "unknown"):
+            with self.subTest(observed_state=observed_state), \
+                 mock.patch("route_parent_close.ledger_intent", return_value=None), \
+                 mock.patch("artifact_checkpoint_trigger.launch_for_route"), \
+                 mock.patch.object(SUP.RR, "compute_execution_observation",
+                                   side_effect=lambda row, state=observed_state: (
+                                       boundary(row) and {"state": state,
+                                                          "reason": f"fixture-{state}"})):
+                result = SUP.poll_once(route, ledger)
+            self.assertEqual(result[0]["action"], "wait")
+            self.assertEqual(result[0]["evidence"]["liveness"], observed_state)
+            self.assertEqual(ledger.state()["nodes"]["run"]["state"], "RUNNING")
+            self.assertEqual(ledger.claims(), {})
+            self.assertEqual(ledger.journal_path.read_bytes(), journal_before)
+        self.assertEqual([call["held_writer_locks"] for call in observer_calls], [[], []])
+
+    def test_exact_owner_terminal_settlement_poll_skips_compute_reobservation(self):
+        route, _jobs, _registry, ledger = self.owner_terminal_settled_compute_fixture()
+        journal_before = ledger.journal_path.read_bytes()
+        claims_before = ledger.claims()
+        marker_path = SUP.route_module().completion_dir(route["route_id"], jobs=_jobs) / "run.json"
+        marker_before = marker_path.read_bytes()
+        observer_calls = []
+        with mock.patch("route_parent_close.ledger_intent", return_value=None), \
+             mock.patch("artifact_checkpoint_trigger.launch_for_route"), \
+             mock.patch.object(SUP.RR, "compute_execution_observation",
+                               side_effect=lambda _row: (observer_calls.append(True) or {
+                                   "state": "unknown", "reason": "fixture-unknown"})):
+            result = SUP.poll_once(route, ledger)
+        self.assertEqual(result, [{"node": "run", "action": "settled", "state": "STAGE_SUCCEEDED"}])
+        self.assertEqual(observer_calls, [])
+        self.assertEqual(ledger.journal_path.read_bytes(), journal_before)
+        self.assertEqual(marker_path.read_bytes(), marker_before)
+        self.assertEqual(ledger.claims(), claims_before)
+
+    def test_changed_captured_settlement_row_waits_without_observation_or_write(self):
+        route, _jobs, registry, ledger = self.owner_terminal_settled_compute_fixture()
+        journal_before = ledger.journal_path.read_bytes()
+        observer_calls = []
+        read_armed = SUP.read_armed
+        reads = 0
+
+        def change_owner_after_capture(current_ledger):
+            nonlocal reads
+            rows = read_armed(current_ledger)
+            reads += 1
+            if reads == 2:
+                data = json.loads(registry.read_text(encoding="utf-8"))
+                data["runs"]["fixture-resource"]["owner_wait"]["session_id"] = "foreign-session"
+                registry.write_text(json.dumps(data), encoding="utf-8")
+            return rows
+
+        with mock.patch.object(SUP, "read_armed", side_effect=change_owner_after_capture), \
+             mock.patch("route_parent_close.ledger_intent", return_value=None), \
+             mock.patch("artifact_checkpoint_trigger.launch_for_route"), \
+             mock.patch.object(SUP.RR, "compute_execution_observation",
+                               side_effect=lambda _row: (observer_calls.append(True) or {
+                                   "state": "unknown", "reason": "fixture-unknown"})):
+            result = SUP.poll_once(route, ledger)
+        self.assertEqual(result[0]["action"], "wait")
+        self.assertEqual(result[0]["evidence"]["reason"], "compute-resource-binding-changed")
+        self.assertEqual(observer_calls, [])
+        self.assertEqual(ledger.journal_path.read_bytes(), journal_before)
+
+    def test_changed_captured_settlement_identity_waits_without_observation_or_write(self):
+        route, _jobs, registry, ledger = self.owner_terminal_settled_compute_fixture()
+        journal_before = ledger.journal_path.read_bytes()
+        observer_calls = []
+        read_armed = SUP.read_armed
+        reads = 0
+
+        def change_identity_after_capture(current_ledger):
+            nonlocal reads
+            rows = read_armed(current_ledger)
+            reads += 1
+            if reads == 2:
+                data = json.loads(registry.read_text(encoding="utf-8"))
+                data["runs"]["fixture-resource"]["execution"]["meta_sha256"] = "x" * 64
+                registry.write_text(json.dumps(data), encoding="utf-8")
+            return rows
+
+        with mock.patch.object(SUP, "read_armed", side_effect=change_identity_after_capture), \
+             mock.patch("route_parent_close.ledger_intent", return_value=None), \
+             mock.patch("artifact_checkpoint_trigger.launch_for_route"), \
+             mock.patch.object(SUP.RR, "compute_execution_observation",
+                               side_effect=lambda _row: (observer_calls.append(True) or {
+                                   "state": "unknown", "reason": "fixture-unknown"})):
+            result = SUP.poll_once(route, ledger)
+        self.assertEqual(result[0]["action"], "wait")
+        self.assertEqual(result[0]["evidence"]["reason"], "compute-resource-binding-changed")
+        self.assertEqual(observer_calls, [])
+        self.assertEqual(ledger.journal_path.read_bytes(), journal_before)
+
+    def test_changed_captured_settlement_arm_waits_without_observation_or_write(self):
+        route, _jobs, _registry, ledger = self.owner_terminal_settled_compute_fixture()
+        journal_before = ledger.journal_path.read_bytes()
+        observer_calls = []
+        read_armed = SUP.read_armed
+        reads = 0
+
+        def change_arm_after_capture(current_ledger):
+            nonlocal reads
+            rows = read_armed(current_ledger)
+            reads += 1
+            if reads == 2:
+                changed = {**rows["run"], "armed_at": "later-settlement-binding"}
+                (ledger.root / "armed" / "run.json").write_text(json.dumps(changed), encoding="utf-8")
+                rows = {"run": changed}
+            return rows
+
+        with mock.patch.object(SUP, "read_armed", side_effect=change_arm_after_capture), \
+             mock.patch("route_parent_close.ledger_intent", return_value=None), \
+             mock.patch("artifact_checkpoint_trigger.launch_for_route"), \
+             mock.patch.object(SUP.RR, "compute_execution_observation",
+                               side_effect=lambda _row: (observer_calls.append(True) or {
+                                   "state": "unknown", "reason": "fixture-unknown"})):
+            result = SUP.poll_once(route, ledger)
+        self.assertEqual(result[0]["action"], "wait")
+        self.assertEqual(result[0]["evidence"]["reason"], "compute-resource-binding-changed")
+        self.assertEqual(observer_calls, [])
+        self.assertEqual(ledger.journal_path.read_bytes(), journal_before)
+
+    def test_local_resource_calls_keep_omitted_observation_keywords(self):
+        route, _path = self.two_stage_route(route_id="rt-local-poll-compat")
+        registry = self.base / "local-resource-runs.json"
+        registry.write_text(json.dumps({"runs": {"local-run": {"run_id": "local-run"}}}),
+                            encoding="utf-8")
+        armed = {
+            "node": "run", "predecessor_kind": "resource",
+            "predecessor_id": "local-run", "resource_registry": str(registry),
+            "continuation_kind": "supervised",
+        }
+        ledger = SimpleNamespace(state=lambda: {
+            "workflow_state": "RUNNING", "nodes": {"run": {"state": "RUNNING"}},
+        })
+        with mock.patch.object(SUP, "read_armed", return_value={"run": armed}), \
+             mock.patch("route_parent_close.ledger_intent", return_value=None), \
+             mock.patch.object(SUP, "reopen_resource_output_failure", return_value=False) as reopen, \
+             mock.patch.object(SUP, "_evaluate") as evaluate:
+            SUP._poll_once_locked(route, ledger, compute_observations={})
+        self.assertEqual(reopen.call_args.args, (route, ledger, armed))
+        self.assertEqual(reopen.call_args.kwargs, {})
+        self.assertEqual(evaluate.call_args.args[:3], (route, ledger, armed))
+        self.assertEqual(evaluate.call_args.kwargs, {})
 
     def test_arm_announces_and_checks_paths_before_any_execution(self):
         route, path = self.two_stage_route()

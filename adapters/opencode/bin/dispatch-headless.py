@@ -544,81 +544,6 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
     return WRAPPER_COMMON.attach_context_window(selected, "opencode", error=ModelSelectionError)
 
 
-def prepare_nested_runtime(worktree: Path, attempt_id: str, environ=None,
-                           state_root: Path | str | None = None) -> dict[str, str]:
-    """Keep each attempt's OpenCode state beside the canonical dispatch registry.
-
-    OpenCode writes dependency state beside its config as well as under XDG
-    data/cache/state. User config and the existing auth are linked for reading;
-    no credentials or user configuration are copied or rewritten.
-    """
-    env = os.environ if environ is None else environ
-    if not re.fullmatch(r"att-[A-Za-z0-9_-]+", attempt_id):
-        raise DispatchContractError("nested-opencode-attempt-invalid")
-    if state_root is None:
-        jobs = env.get("AGENT_DISPATCH_JOBS")
-        if not jobs:
-            raise DispatchContractError("nested-opencode-state-root-unavailable")
-        state_root = Path(jobs).expanduser().resolve(strict=False).parent
-    state_root = Path(state_root).resolve()
-    runtime = state_root / "opencode-runtime" / attempt_id
-    if not runtime.resolve().is_relative_to(state_root):
-        raise DispatchContractError("nested-opencode-runtime-outside-state-root")
-    # Nested XDG isolation must retain the same user inventory as the typed
-    # worker home which is prepared from this environment afterwards.
-    config_root = Path(env.get("XDG_CONFIG_HOME") or Path(env.get("HOME") or Path.home()) / ".config")
-    inventory = env.get("COMPUTE_HOSTS_CONFIG") or config_root / "hearting/compute-hosts.yaml"
-    values = {"COMPUTE_HOSTS_CONFIG": str(Path(inventory).expanduser().absolute())}
-    try:
-        v2_runtime = opencode_runtime.is_v2()
-    except Exception:
-        v2_runtime = False
-    if v2_runtime:
-        # V2 owns credentials and sessions in its normal shared service. Let
-        # the CLI discover that service through the user's existing XDG
-        # service registration; never link/copy opencode.db into attempt state.
-        values.update(OPENCODE_DB=None, OPENCODE_AUTH=None, OPENCODE_DATA_DIR=None)
-        return values
-    for kind in ("data", "cache", "state", "config"):
-        directory = runtime / kind
-        if not directory.resolve().is_relative_to(state_root):
-            raise DispatchContractError("nested-opencode-runtime-outside-state-root")
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        directory.chmod(0o700)
-        values[f"XDG_{kind.upper()}_HOME"] = str(directory)
-    source_data = Path(env.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-    auth = source_data / "opencode" / "auth.json"
-    if auth.is_file():
-        destination = Path(values["XDG_DATA_HOME"]) / "opencode" / "auth.json"
-        destination.parent.mkdir(exist_ok=True, mode=0o700)
-        if destination.is_symlink() and destination.resolve() == auth.resolve():
-            pass
-        elif destination.exists() or destination.is_symlink():
-            raise DispatchContractError("nested-opencode-auth-link-conflict", str(destination))
-        else:
-            destination.symlink_to(auth.resolve())
-    source_config = Path(env.get("OPENCODE_CONFIG_DIR") or
-                         Path(env.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "opencode")
-    config = Path(values["XDG_CONFIG_HOME"]) / "opencode"
-    config.mkdir(exist_ok=True, mode=0o700)
-    # These files are dependency-manager outputs. Configuration and relative
-    # plugin/command/agent inputs remain links to the caller's original bytes.
-    generated = {".git", ".gitignore", "node_modules", "package.json", "package-lock.json", "bun.lock", "bun.lockb"}
-    if source_config.is_dir():
-        for source in source_config.iterdir():
-            if source.name in generated:
-                continue
-            link = config / source.name
-            if link.is_symlink() and link.resolve() == source.resolve():
-                continue
-            if link.exists() or link.is_symlink():
-                raise DispatchContractError("nested-opencode-config-link-conflict", str(link))
-            link.symlink_to(source.resolve(), target_is_directory=source.is_dir())
-    if env.get("OPENCODE_CONFIG_DIR"):
-        values["OPENCODE_CONFIG_DIR"] = str(config)
-    return values
-
-
 def qa_track(capability: str) -> str:
     if capability.startswith("code-") or capability == "autopilot-code":
         return "code"
@@ -674,6 +599,7 @@ def scoped_external_directory_config(
     selected_agent: str | None = None,
     task_publish_scope: dict[str, str] | None = None,
     merge_observation_only: bool = False,
+    recordish: bool = False,
 ) -> str:
     v2 = opencode_runtime.is_v2()
     raw = os.environ.get("OPENCODE_CONFIG_CONTENT", "").strip()
@@ -701,6 +627,28 @@ def scoped_external_directory_config(
         rules = opencode_runtime.opencode_permission_rules_for_action(
             subject, tool, default=default)
         return None if rules is None else dict(rules)
+
+    def install_recordish_edit_rules(subject, inherited):
+        if not recordish or not worktree:
+            return
+        cwd = str(Path(worktree).resolve(strict=False))
+        artifact = str(Path(artifact_root).resolve(strict=False))
+        for tool in ("edit", "write", "patch"):
+            current = effective_tool(subject, tool, "allow")
+            rules = {"*": current} if isinstance(current, str) else dict(current or {})
+            for pattern, action in ((cwd, "deny"), (f"{cwd}/**", "deny"),
+                                    (os.path.relpath(cwd, worktree), "deny"),
+                                    (f"{os.path.relpath(cwd, worktree)}/**", "deny"),
+                                    (artifact, "allow"), (f"{artifact}/**", "allow"),
+                                    (os.path.relpath(artifact, worktree), "allow"),
+                                    (f"{os.path.relpath(artifact, worktree)}/**", "allow")):
+                # A pre-existing exact deny remains authoritative for its path.
+                if action == "allow" and rules.get(pattern) == "deny":
+                    continue
+                rules.pop(pattern, None)
+                rules[pattern] = action
+            subject.pop(tool, None)
+            subject[tool] = rules
 
     def install_merge_observation_rules(subject, inherited):
         def has_deny(rules):
@@ -852,9 +800,10 @@ def scoped_external_directory_config(
         permission, publish_commands, resolve=effective_tool))
     if merge_observation_only:
         install_merge_observation_rules(permission, original_permission)
+    install_recordish_edit_rules(permission, original_permission)
     config["permission"] = permission
     if (contract_roots or read_deny_roots or publish_global_allowed
-            or merge_observation_only) and selected_agent:
+            or merge_observation_only or recordish) and selected_agent:
         # Native agent permissions merge after global permissions. Overlay only
         # the selected agent, without giving its other tools a new default.
         agents = config.get("agent", {})
@@ -873,6 +822,7 @@ def scoped_external_directory_config(
         else:
             raise ValueError("OpenCode agent permission must be a string or object")
         original_local = dict(local)
+        install_recordish_edit_rules(local, original_local)
         # Triples accumulate into one overlay per tool in listed order, so a
         # later triple wins on overlap (native last-match) without wiping an
         # earlier triple's unrelated patterns.
@@ -1036,7 +986,7 @@ def prompt(args: argparse.Namespace) -> tuple[str, str]:
         f"- owner_harness: {args.owner_harness or '-'}\n"
         f"- worktree: {args.worktree}\n"
         f"- artifact_root: {args.artifact_root}\n"
-        f"{artifact_context_prompt(os.environ)}"
+        f"{artifact_context_prompt({**os.environ, 'AGENT_RUNTIME_DIR': getattr(args, 'runtime_dir', '')})}"
         f"- route_state: {'consume the immutable record already validated by the wrapper' if args.route_file else 'validated dispatch metadata'}\n\n"
         "OpenCode realization:\n"
         "- The wrapper already validated capability mode, optional worker mode, QA, artifact-root access, and any route record. Use worker-route only for a safety recheck.\n"
@@ -1340,17 +1290,25 @@ def main(argv: list[str]) -> int:
     worktree = Path(args.worktree)
     if not worktree.is_dir():
         return fail("worktree-not-found", 66, worktree=args.worktree)
-    if subprocess.run(["git", "-C", args.worktree, "rev-parse", "--is-inside-work-tree"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
-        return fail("not-a-git-worktree", 65, worktree=args.worktree)
+    try:
+        from dispatch_contract import launch_repository_identity
+        args.repository_identity, args.repository_kind = launch_repository_identity(
+            args.worktree, args.route_file or os.environ.get("AGENT_OWNER_ROUTE_FILE"))
+    except DispatchContractError as exc:
+        return fail(exc.reason, 65, detail=exc.detail, worktree=args.worktree, child_spawned="0")
     try:
         args.artifact_root = resolve_artifact_root(args.worktree)
+        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(
+            args.artifact_root, repository_kind=args.repository_kind, source_root=args.worktree)
         args.report_bundle_root = resolve_report_bundle_root(args.route_file, args.route_node)
         args.opencode_config_content = scoped_external_directory_config(
             args.artifact_root,
             str(args.report_bundle_root) if args.report_bundle_root is not None else None,
+            execution_access_roots=((Path(args.runtime_dir),) if args.runtime_dir else ()),
             agent_home=args.agent_home,
             worktree=args.worktree,
             selected_agent=args.agent,
+            recordish=args.repository_kind == "non-git",
         )
     except ValueError as e:
         return fail("artifact-root-access-config-failed", 64, detail=str(e), worktree=args.worktree)
@@ -1464,6 +1422,33 @@ def main(argv: list[str]) -> int:
         validate_interactive_parent_launch(args)
     except DispatchContractError as exc:
         return fail(exc.reason, 69, detail=exc.detail, child_spawned="0")
+    if args.start:
+        if shutil.which("opencode") is None:
+            return fail("opencode-command-unavailable", 69, worktree=args.worktree,
+                        child_spawned="0")
+        try:
+            runtime_registry = resolve_global_registry(
+                args.agent_home, args.jobs, args.dispatch_depth, action)
+            runtime_state = dispatch_state_root(runtime_registry.path)
+            runtime_version = opencode_runtime.probe_launch_version(
+                binary="opencode", cwd=args.worktree, state_root=runtime_state,
+                environ=os.environ,
+            )
+        except opencode_runtime.OpenCodeRuntimeError:
+            if args.attempt_id and "runtime_registry" in locals():
+                close_job_row(Path(runtime_registry.path), args.slug, args.worktree,
+                              "opencode-runtime-version-unavailable", "", args.attempt_id)
+            return fail("opencode-runtime-version-unavailable", 69,
+                        child_spawned="0")
+        except (DispatchContractError, OSError) as exc:
+            if args.attempt_id and "runtime_registry" in locals():
+                close_job_row(Path(runtime_registry.path), args.slug, args.worktree,
+                              "opencode-runtime-version-unavailable", "", args.attempt_id)
+            return fail(getattr(exc, "reason", "opencode-runtime-version-unavailable"), 69,
+                        detail=getattr(exc, "detail", ""), child_spawned="0")
+        os.environ["OPENCODE_RUNTIME_VERSION"] = ".".join(
+            str(part) for part in runtime_version)
+        args.opencode_runtime_version = os.environ["OPENCODE_RUNTIME_VERSION"]
     try:
         args.resolved_model_settings = resolve_model_settings(args)
         from model_profile import selection_receipt, ModelProfileError
@@ -1517,10 +1502,7 @@ def main(argv: list[str]) -> int:
     args.parent_binding = None
     if args.dispatch_depth == 2 and action in ("register", "start"):
         try:
-            repo = subprocess.check_output(
-                ["git", "-C", args.worktree, "rev-parse", "--show-toplevel"],
-                text=True,
-            ).strip()
+            repo = args.repository_identity
             args.parent_binding = resolve_live_parent_attempt(
                 jobs,
                 parent_slug=args.parent_slug or "",
@@ -1570,7 +1552,8 @@ def main(argv: list[str]) -> int:
         args.opencode_config_content = scoped_external_directory_config(
             args.artifact_root,
             str(args.report_bundle_root) if args.report_bundle_root is not None else None,
-            grant.additional_writable_roots if grant is not None else (),
+            (*((Path(args.runtime_dir),) if args.runtime_dir else ()),
+             *(grant.additional_writable_roots if grant is not None else ())),
             grant.read_roots if grant is not None else (),
             agent_home=args.agent_home,
             contract_read_roots=args.contract_read_roots,
@@ -1578,6 +1561,7 @@ def main(argv: list[str]) -> int:
             selected_agent=args.agent,
             task_publish_scope=args.task_publish_scope,
             merge_observation_only=args.merge_observation_only,
+            recordish=args.repository_kind == "non-git",
         )
     except ExecutionAccessError as exc:
         return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")
@@ -1595,14 +1579,6 @@ def main(argv: list[str]) -> int:
     elif (args.worker_type == "owner" and args.merge_observation_only):
         args.opencode_config_content = deny_commands(
             args.opencode_config_content, commit_policy.MERGE_MUTATION_COMMANDS, args.agent)
-    args.nested_runtime_env = {}
-    if action == "start" and args.dispatch_depth == 2 and args.parent_harness == "codex":
-        try:
-            args.nested_runtime_env = prepare_nested_runtime(
-                Path(args.worktree), args.attempt_id, state_root=dispatch_state_root(args.jobs_path))
-        except (DispatchContractError, OSError) as exc:
-            return fail(getattr(exc, "reason", "nested-opencode-runtime-unavailable"), 73,
-                        detail=str(exc), child_spawned="0")
     log_dir = (
         Path(args.log_dir)
         if args.log_dir
@@ -1641,7 +1617,7 @@ def main(argv: list[str]) -> int:
     if action == "start":
         # V2 execution mode is selected at the existing command-construction
         # boundary. The later context probe must confirm this mode before spawn.
-        v2_execution = opencode_runtime.is_v2()
+        v2_execution = opencode_runtime.is_v2(environ=os.environ)
         args.resolved_model_settings["context_window_execution_mode"] = (
             "standalone" if v2_execution else "shared-service")
         args.resolved_model_settings["context_window_runtime_target"] = (
@@ -1762,6 +1738,7 @@ def main(argv: list[str]) -> int:
             # `campaigns/<camp>/cycles/<cyc>/artifacts/` and never issue a
             # second lineage.
             **artifact_cycle_environment(os.environ),
+            "AGENT_RUNTIME_DIR": getattr(args, "runtime_dir", ""),
             "REPORT_BUNDLE_ROOT": str(args.report_bundle_root or ""),
             "AGENT_ROUTE_FILE": (
                 args.route_file
@@ -1787,7 +1764,6 @@ def main(argv: list[str]) -> int:
                 "supervised" if _supervised_owner(args) else "poll"
             ),
             "OPENCODE_CONFIG_CONTENT": args.opencode_config_content,
-            **args.nested_runtime_env,
             # Headless liveness contract: the OpenCode runtime child exposes
             # the dispatch slug to the plugin, which records a plugin-load
             # marker at init and touches <log_dir>/<slug>.heartbeat on every
@@ -1898,8 +1874,9 @@ def main(argv: list[str]) -> int:
                                 if args.report_bundle_root is not None else None),
             execution_access_roots=[
                 str(value) for value in (
-                    args.execution_access_grant.additional_writable_roots
-                    if args.execution_access_grant is not None else ()
+                    (*((Path(args.runtime_dir),) if args.runtime_dir else ()),
+                     *(args.execution_access_grant.additional_writable_roots
+                       if args.execution_access_grant is not None else ()))
                 )
             ],
             execution_access_read_roots=[
@@ -2051,7 +2028,7 @@ def main(argv: list[str]) -> int:
         # Only an attempt-private runtime (V1 worker home or nested isolation) has
         # its own data home; a V2 worker uses the shared one, and readers fall back.
         if (args.worker_runtime_env.get("XDG_DATA_HOME")
-                or args.nested_runtime_env.get("XDG_DATA_HOME")):
+                or args.worker_runtime_env.get("XDG_DATA_HOME")):
             launch_metadata["opencode_runtime_dir"] = str(
                 Path(dispatch_env["XDG_DATA_HOME"]).parent)
         launch_metadata["runtime_home"] = dispatch_env.get("OPENCODE_CONFIG_DIR") or "shared-service"

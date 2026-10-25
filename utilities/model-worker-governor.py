@@ -889,16 +889,37 @@ def _validate_partial_replacement(
     gap = str(partial.get("gap_leg_id", ""))
     if set(source_by_node) != set(replacement_by_node) or gap not in source_by_node:
         raise ValueError("partial continuation replacement member census invalid")
+    # A later successor (step >= 2) follows a successor that never started; it
+    # may move the gap alone to another harness, sealed with the excluded ones.
+    step = replacement_seal.get("step", 1) if isinstance(replacement_seal, dict) else 1
+    if not isinstance(step, int) or isinstance(step, bool) or step < 1:
+        raise ValueError("partial continuation replacement step invalid")
+    placement_keys = {"harness", "fallback_hop", "fallback_ordinal"}
     for node_id, source_member in source_by_node.items():
         replacement_member = replacement_by_node[node_id]
-        source_shape = {key: value for key, value in source_member.items() if key != "attempt_id"}
+        ignored = {"attempt_id"} | (placement_keys if step > 1 and node_id == gap else set())
+        source_shape = {key: value for key, value in source_member.items() if key not in ignored}
         replacement_shape = {
-            key: value for key, value in replacement_member.items() if key != "attempt_id"
+            key: value for key, value in replacement_member.items() if key not in ignored
         }
         if source_shape != replacement_shape:
             raise ValueError("partial continuation replacement member drift")
         if node_id != gap and replacement_member["attempt_id"] != source_member["attempt_id"]:
             raise ValueError("partial continuation successful peer replacement forbidden")
+    if step > 1:
+        excluded = replacement_seal.get("excluded_harnesses")
+        gap_member = replacement_by_node[gap]
+        if (
+            not isinstance(excluded, list)
+            or source_by_node[gap].get("harness") not in excluded
+            or gap_member.get("harness") in excluded
+            or (gap_member.get("harness"), gap_member.get("fallback_hop"),
+                gap_member.get("fallback_ordinal"))
+            != (replacement_seal.get("replacement_harness"),
+                replacement_seal.get("replacement_fallback_hop"),
+                replacement_seal.get("replacement_fallback_ordinal"))
+        ):
+            raise ValueError("partial continuation successor placement invalid")
     source_attempt = str(source_by_node[gap]["attempt_id"])
     replacement_attempt = str(replacement_by_node[gap]["attempt_id"])
     if (
@@ -923,11 +944,27 @@ def _validate_partial_replacement(
         "replacement_attempt_id": replacement_attempt,
         "retry_claim_reused": replacement_seal.get("retry_claim_reused"),
     }
+    if step > 1:
+        predecessor = str(replacement_seal.get("predecessor_attempt_id", ""))
+        expected_seal.update({
+            key: replacement_seal.get(key) for key in (
+                "replacement_harness", "replacement_fallback_hop",
+                "replacement_fallback_ordinal", "excluded_harnesses")
+        })
+        expected_seal.update({"step": step, "predecessor_attempt_id": predecessor})
+        if replacement_seal.get("retry_claim_reused") is not False or replacement_attempt != (
+            "att-" + _record_digest({
+                "replacement_leg_identity": replacement_identity,
+                "predecessor_attempt_id": predecessor,
+                "step": step,
+            }).split(":", 1)[1][:48]
+        ):
+            raise ValueError("partial continuation successor attempt invalid")
     if replacement_seal != expected_seal or not isinstance(
         replacement_seal.get("retry_claim_reused"), bool
     ):
         raise ValueError("partial continuation replacement seal mismatch")
-    if not replacement_seal["retry_claim_reused"] and (
+    if step == 1 and not replacement_seal["retry_claim_reused"] and (
         replacement_attempt != partial.get("replacement_attempt_id")
     ):
         raise ValueError("partial continuation replacement attempt invalid")
@@ -985,6 +1022,28 @@ def _validate_partial_replacement(
             raise ValueError("partial continuation recovery claim mismatch")
     elif metadata.get("retry_attempt_id"):
         raise ValueError("partial continuation recovery claim ignored")
+    if step > 1:
+        # The predecessor is exactly the previous sealed successor, and it
+        # carries the strict never-started proof.
+        from dispatch_contract import attempt_row_terminal_never_started
+        identity = replacement_identity.split(":", 1)[1]
+        previous = jobs.parent / "recovery" / "partial-group" / (
+            f"{identity}.json" if step == 2 else f"{identity}.step-{step - 1}.json")
+        try:
+            previous_seal = json.loads(previous.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError("partial continuation predecessor seal missing") from exc
+        predecessor_rows = [
+            fields for fields in (line.split("\t") for line in lines)
+            if len(fields) == 6 and parse_registry_metadata(fields[5]).get("attempt_id")
+            == replacement_seal["predecessor_attempt_id"]
+        ]
+        if (
+            previous_seal.get("replacement_attempt_id") != replacement_seal["predecessor_attempt_id"]
+            or len(predecessor_rows) != 1
+            or not attempt_row_terminal_never_started(predecessor_rows[0])
+        ):
+            raise ValueError("partial continuation predecessor not proven unstarted")
     if replacement_manifest_digest == source_digest:
         raise ValueError("partial continuation manifest was not superseded")
     return source_manifest, source_digest, source_leg_digests, source_attempt
