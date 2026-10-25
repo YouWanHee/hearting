@@ -997,6 +997,7 @@ def cmd_uninstall(args):
             if deactivated is not None:
                 for path in deactivated.get("preserved", []):
                     preserve(rt, path)
+            preserved_native_agents = set(deactivated.get("preserved", [])) if deactivated else set()
             if deactivated is not None and deactivated["status"] != "not-active":
                 verb = "would remove" if args.dry_run else "removed"
                 lines.append(
@@ -1053,6 +1054,9 @@ def cmd_uninstall(args):
                         would_remove_copy_once += 1
                         lines.append(f"uninstall(dry-run): {rt} — remove copy-once file {d}")
                 for d in symlink_dests:
+                    if (rt == "codex" and str(d) in preserved_native_agents
+                            and native_agent_ownership.agent_leaf(runtime_home, d)):
+                        continue
                     entry = next(e for e in symlink_entries if Path(e["dest"]) == d)
                     current = safe_fs.capture_state(d)
                     if current.kind == "missing":
@@ -1091,6 +1095,9 @@ def cmd_uninstall(args):
                 symlink_states = []
                 for entry in symlink_entries:
                     d = Path(entry["dest"])
+                    if (rt == "codex" and str(d) in preserved_native_agents
+                            and native_agent_ownership.agent_leaf(runtime_home, d)):
+                        continue
                     current = safe_fs.capture_state(d)
                     if current.kind == "missing":
                         continue

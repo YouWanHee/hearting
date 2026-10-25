@@ -359,6 +359,277 @@ class NativeAgentOwnershipTest(unittest.TestCase):
         self.assertEqual(os.readlink(dest), str(foreign))
         self.assertEqual(foreign.read_bytes(), b"foreign")
 
+    def test_deactivate_preserves_native_link_repointed_after_trust(self):
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        self.assertTrue(dest.is_symlink())
+        foreign = self.root / "user-agent.toml"
+        foreign.write_bytes(b"USER DATA\n")
+        original = activation._trusted_owned
+
+        def repoint(*args, **kwargs):
+            result = original(*args, **kwargs)
+            dest.unlink()
+            dest.symlink_to(foreign)
+            return result
+
+        with mock.patch.object(activation, "_trusted_owned", side_effect=repoint):
+            result = activation.deactivate("codex")
+        self.assertEqual(os.readlink(dest), str(foreign))
+        self.assertEqual(foreign.read_bytes(), b"USER DATA\n")
+        self.assertIn(str(dest), result["preserved"])
+        self.assertNotIn(str(dest), result["removed"])
+        self.assertIn(f"preserved user-changed: {dest}", result["report_lines"])
+
+    def test_deactivate_reports_repointed_dangling_regular_and_owned_successors(self):
+        for kind in ("foreign", "dangling", "regular", "owned"):
+            with self.subTest(kind=kind):
+                dest = self.dest()
+                if dest.is_symlink() or dest.exists():
+                    dest.unlink()
+                activation.activate("codex", "linked", str(ROOT))
+                self.assertTrue(dest.is_symlink())
+                foreign = self.root / f"{kind}-user.toml"
+                if kind == "foreign":
+                    foreign.write_bytes(b"USER DATA\n")
+                elif kind == "owned":
+                    foreign = self.release_fixture()
+                original = activation._trusted_owned
+
+                def replace(*args, **kwargs):
+                    result = original(*args, **kwargs)
+                    dest.unlink()
+                    if kind == "regular":
+                        dest.write_bytes(b"USER DATA\n")
+                    else:
+                        dest.symlink_to(foreign)
+                    return result
+
+                with mock.patch.object(activation, "_trusted_owned", side_effect=replace):
+                    report = activation.deactivate("codex")
+                self.assertIn(str(dest), report["preserved"])
+                self.assertNotIn(str(dest), report["removed"])
+                self.assertNotIn(str(dest), report["restored_installer_links"])
+                self.assertIn(f"preserved user-changed: {dest}", report["report_lines"])
+                if kind == "regular":
+                    self.assertEqual(dest.read_bytes(), b"USER DATA\n")
+                else:
+                    self.assertEqual(os.readlink(dest), str(foreign))
+                if kind == "foreign":
+                    self.assertEqual(foreign.read_bytes(), b"USER DATA\n")
+
+    def test_deactivate_legacy_discovery_rechecks_payload_bytes_after_trust(self):
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest("obsolete.toml")
+        old = self.old_payload("obsolete.toml")
+        dest.symlink_to(old)
+        self.assertTrue(ownership.owned_link(self.home, dest))
+        original = activation._trusted_owned
+
+        def tamper(*args, **kwargs):
+            result = original(*args, **kwargs)
+            old.write_bytes(b"USER MODIFICATION\n")
+            return result
+
+        with mock.patch.object(activation, "_trusted_owned", side_effect=tamper):
+            actual = activation.deactivate("codex")
+        self.assertEqual(os.readlink(dest), str(old))
+        self.assertEqual(old.read_bytes(), b"USER MODIFICATION\n")
+        self.assertIn(str(dest), actual["preserved"])
+        self.assertNotIn(str(dest), actual["removed"])
+        self.assertIn(f"preserved user-changed: {dest}", actual["report_lines"])
+
+    def test_deactivate_preview_and_actual_remove_unchanged_legacy_and_render(self):
+        shipped = (ROOT / "adapters/codex/config/models.conf").read_text()
+        config = self.home / "agent-config/models.conf"
+        config.parent.mkdir(parents=True)
+        config.write_text(re.sub(r'^CFG_TIER_DEEP_MODEL=.*$',
+                                 'CFG_TIER_DEEP_MODEL=fixture-user-deep', shipped, flags=re.M))
+        activation.activate("codex", "linked", str(ROOT))
+        rendered = self.dest()
+        self.assertTrue(rendered.is_file() and not rendered.is_symlink())
+        rendered_bytes = rendered.read_bytes()
+        old = self.old_payload("obsolete.toml")
+        legacy = self.dest("obsolete.toml")
+        legacy.symlink_to(old)
+
+        preview = activation.deactivate("codex", dry_run=True)
+        self.assertEqual(preview["status"], "planned")
+        self.assertEqual(preview["preserved"], [])
+        self.assertIn(str(rendered), preview["removed"])
+        self.assertIn(str(legacy), preview["removed"])
+        self.assertEqual(rendered.read_bytes(), rendered_bytes)
+        self.assertEqual(os.readlink(legacy), str(old))
+
+        actual = activation.deactivate("codex")
+        self.assertEqual(actual["status"], "deactivated")
+        self.assertEqual(actual["preserved"], [])
+        self.assertEqual(actual["removed"], preview["removed"])
+        self.assertFalse(rendered.exists() or rendered.is_symlink())
+        self.assertFalse(legacy.exists() or legacy.is_symlink())
+        self.assertEqual(old.read_bytes(), b'model = "old-user-model"\n')
+
+    def test_deactivate_preserves_render_changed_after_trust(self):
+        shipped = (ROOT / "adapters/codex/config/models.conf").read_text()
+        config = self.home / "agent-config/models.conf"
+        config.parent.mkdir(parents=True)
+        config.write_text(re.sub(r'^CFG_TIER_DEEP_MODEL=.*$',
+                                 'CFG_TIER_DEEP_MODEL=fixture-user-deep', shipped, flags=re.M))
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        self.assertFalse(dest.is_symlink())
+        original = activation._trusted_owned
+
+        def edit(*args, **kwargs):
+            result = original(*args, **kwargs)
+            dest.write_bytes(b"USER MODIFICATION\n")
+            return result
+
+        with mock.patch.object(activation, "_trusted_owned", side_effect=edit):
+            result = activation.deactivate("codex")
+        self.assertEqual(dest.read_bytes(), b"USER MODIFICATION\n")
+        self.assertIn(str(dest), result["preserved"])
+        self.assertNotIn(str(dest), result["removed"])
+
+    def test_deactivate_preview_and_actual_preserve_user_modified_render(self):
+        shipped = (ROOT / "adapters/codex/config/models.conf").read_text()
+        config = self.home / "agent-config/models.conf"
+        config.parent.mkdir(parents=True)
+        config.write_text(re.sub(r'^CFG_TIER_DEEP_MODEL=.*$',
+                                 'CFG_TIER_DEEP_MODEL=fixture-user-deep', shipped, flags=re.M))
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        dest.write_bytes(b"USER MODIFICATION\n")
+
+        preview = activation.deactivate("codex", dry_run=True)
+        actual = activation.deactivate("codex")
+        for report in (preview, actual):
+            self.assertIn(str(dest), report["preserved"])
+            self.assertNotIn(str(dest), report["removed"])
+            self.assertIn(f"preserved user-changed: {dest}", report["report_lines"])
+        self.assertEqual(dest.read_bytes(), b"USER MODIFICATION\n")
+
+    def test_deactivate_restores_intact_installer_link_with_checked_replace(self):
+        old_agent = self.release_fixture()
+        dest = self.dest()
+        dest.symlink_to(old_agent)
+        activation.activate("codex", "linked", str(ROOT))
+        self.assertEqual(os.readlink(dest), str(self.source()))
+        state = activation._load_json(activation._state_path("codex"))
+        self.assertEqual(state["replaced_installer_symlink_targets"][str(dest)], str(old_agent))
+
+        preview = activation.deactivate("codex", dry_run=True)
+        self.assertIn(str(dest), preview["restored_installer_links"])
+        self.assertNotIn(str(dest), preview["removed"])
+        self.assertEqual(os.readlink(dest), str(self.source()))
+
+        actual = activation.deactivate("codex")
+        self.assertEqual(actual["restored_installer_links"], preview["restored_installer_links"])
+        self.assertEqual(actual["removed"], preview["removed"])
+        self.assertEqual(actual["preserved"], [])
+        self.assertEqual(os.readlink(dest), str(old_agent))
+        self.assertEqual(old_agent.read_bytes(), self.source().read_bytes())
+
+    def test_deactivate_exact_remove_preserves_late_successor(self):
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        foreign = self.root / "user-agent.toml"
+        foreign.write_bytes(b"USER DATA\n")
+        original = activation.safe_fs.remove_exact
+
+        def late_repoint(auth, **kwargs):
+            if auth.target == dest:
+                dest.unlink()
+                dest.symlink_to(foreign)
+            return original(auth, **kwargs)
+
+        with mock.patch.object(activation.safe_fs, "remove_exact", side_effect=late_repoint):
+            result = activation.deactivate("codex")
+        self.assertEqual(os.readlink(dest), str(foreign))
+        self.assertIn(str(dest), result["preserved"])
+        self.assertNotIn(str(dest), result["removed"])
+
+    def test_deactivate_exact_restore_preserves_late_successor(self):
+        old_agent = self.release_fixture()
+        dest = self.dest()
+        dest.symlink_to(old_agent)
+        activation.activate("codex", "linked", str(ROOT))
+        foreign = self.root / "user-agent.toml"
+        foreign.write_bytes(b"USER DATA\n")
+        original = activation.safe_fs.atomic_write_symlink
+
+        def late_repoint(auth, target, **kwargs):
+            if auth.target == dest:
+                dest.unlink()
+                dest.symlink_to(foreign)
+            return original(auth, target, **kwargs)
+
+        with mock.patch.object(activation.safe_fs, "atomic_write_symlink", side_effect=late_repoint):
+            result = activation.deactivate("codex")
+        self.assertEqual(os.readlink(dest), str(foreign))
+        self.assertIn(str(dest), result["preserved"])
+        self.assertNotIn(str(dest), result["restored_installer_links"])
+
+    def test_public_uninstall_preserves_owned_successor_after_receipt_trust(self):
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        old_agent = self.release_fixture()
+        registry = manifest._manifest_path("codex", "global")
+        manifest._write_manifest(registry, {"schema": 1, "runtime": "codex", "scope": "global",
+                                            "version": "old", "timestamp": "fixture", "files": {}})
+        args = Namespace(runtimes=["codex"], target="codex", scope="global", dry_run=True)
+        original = activation._trusted_owned
+
+        def repoint(*call_args, **kwargs):
+            result = original(*call_args, **kwargs)
+            dest.unlink()
+            dest.symlink_to(old_agent)
+            return result
+
+        with (mock.patch.object(installer.codex_launcher, "capture_snapshot", return_value=None),
+              mock.patch.object(installer.codex_launcher, "uninstall", return_value={"status": "unchanged"}),
+              mock.patch.object(activation, "_trusted_owned", side_effect=repoint)):
+            preview = installer.cmd_uninstall(args)
+        self.assertEqual(preview["exit"], 0, preview)
+        self.assertIn({"runtime": "codex", "path": str(dest)}, preview["preserved"])
+        self.assertIn(f"preserved user-changed: {dest}", preview["lines"])
+        self.assertFalse(any(f"remove symlink {dest}" in line for line in preview["lines"]))
+        self.assertEqual(os.readlink(dest), str(old_agent))
+
+        args.dry_run = False
+        with (mock.patch.object(installer.codex_launcher, "capture_snapshot", return_value=None),
+              mock.patch.object(installer.codex_launcher, "uninstall", return_value={"status": "unchanged"})):
+            actual = installer.cmd_uninstall(args)
+        self.assertEqual(actual["exit"], 0, actual)
+        self.assertIn({"runtime": "codex", "path": str(dest)}, actual["preserved"])
+        self.assertIn(f"preserved user-changed: {dest}", actual["lines"])
+        self.assertFalse(any(f"removed symlink {dest}" in line for line in actual["lines"]))
+        self.assertEqual(os.readlink(dest), str(old_agent))
+
+    def test_public_uninstall_actual_preserves_foreign_repoint_after_receipt_trust(self):
+        activation.activate("codex", "linked", str(ROOT))
+        dest = self.dest()
+        foreign = self.root / "user-agent.toml"
+        foreign.write_bytes(b"USER DATA\n")
+        original = activation._trusted_owned
+
+        def repoint(*call_args, **kwargs):
+            result = original(*call_args, **kwargs)
+            dest.unlink()
+            dest.symlink_to(foreign)
+            return result
+
+        args = Namespace(runtimes=["codex"], target="codex", scope="global", dry_run=False)
+        with (mock.patch.object(installer.codex_launcher, "capture_snapshot", return_value=None),
+              mock.patch.object(installer.codex_launcher, "uninstall", return_value={"status": "unchanged"}),
+              mock.patch.object(activation, "_trusted_owned", side_effect=repoint)):
+            actual = installer.cmd_uninstall(args)
+        self.assertEqual(actual["exit"], 0, actual)
+        self.assertIn({"runtime": "codex", "path": str(dest)}, actual["preserved"])
+        self.assertIn(f"preserved user-changed: {dest}", actual["lines"])
+        self.assertEqual(os.readlink(dest), str(foreign))
+        self.assertEqual(foreign.read_bytes(), b"USER DATA\n")
+
     def test_payload_path_escapes_and_false_identity_are_preserved(self):
         variants = ("symlink-root", "symlink-directory", "symlink-file", "wrong-digest",
                     "duplicate-key", "arbitrary-file")
@@ -546,9 +817,16 @@ class NativeAgentOwnershipTest(unittest.TestCase):
             preview = installer.cmd_uninstall(args)
             self.assertEqual(preview["exit"], 0, preview)
             self.assertTrue(self.dest().is_symlink())
+            self.assertTrue(any(f"remove symlink {self.dest()}" in line for line in preview["lines"]))
+            self.assertTrue(any(f"remove symlink {self.dest('obsolete.toml')}" in line
+                                for line in preview["lines"]))
+            self.assertIn({"runtime": "codex", "path": str(self.dest("light.toml"))},
+                          preview["preserved"])
             args.dry_run = False
             actual = installer.cmd_uninstall(args)
         self.assertEqual(actual["exit"], 0, actual)
+        self.assertIn({"runtime": "codex", "path": str(self.dest("light.toml"))},
+                      actual["preserved"])
         self.assertFalse(self.dest().is_symlink())
         self.assertFalse(self.dest("obsolete.toml").is_symlink())
         self.assertTrue(self.dest("light.toml").is_symlink())

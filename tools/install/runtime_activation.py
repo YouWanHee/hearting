@@ -4259,6 +4259,24 @@ def deactivate(runtime: str, scope: str = "global", dry_run: bool = False) -> di
         )
     except ActivationError:
         desired = []
+    native_states = {}
+    if runtime == "codex":
+        home = paths.runtime_home(runtime, scope)
+        agents = home / "agents"
+        candidates = {
+            Path(item["dest"]) for item in state.get("owned_paths", [])
+            if item.get("dest") and native_agent_ownership.agent_leaf(home, Path(item["dest"]))
+        }
+        if agents.is_dir() and not agents.is_symlink():
+            candidates.update(path for path in agents.glob("*.toml") if path.is_symlink())
+        # This is the leaf as it stood before ownership classification.  A
+        # concurrent successor must not inherit that classification, even if
+        # it is another otherwise valid harness link.
+        for dest in candidates:
+            try:
+                native_states[str(dest)] = safe_fs.capture_state(dest)
+            except (OSError, safe_fs.SafetyError):
+                pass
     trusted, user_changed_items = _trusted_owned(runtime, state, desired, scope)
     preserved = sorted(user_changed_items)
     desired_by_dest = {item["dest"]: item for item in desired}
@@ -4267,6 +4285,54 @@ def deactivate(runtime: str, scope: str = "global", dry_run: bool = False) -> di
     restored_installer_links = []
     for value in sorted(trusted):
         dest = Path(value)
+        if runtime == "codex" and native_agent_ownership.agent_leaf(home, dest):
+            try:
+                with safe_fs.TargetLock(dest):
+                    current = safe_fs.capture_state(dest)
+                    recorded = next((item for item in state.get("owned_paths", [])
+                                     if item.get("dest") == value), None)
+                    if current != native_states.get(value) or not (
+                        (current.kind == "symlink"
+                         and (recorded is None or (recorded.get("kind") == "symlink"
+                              and recorded.get("source") == current.link_target))
+                         and native_agent_ownership.owned_link(home, dest))
+                        or (current.kind == "file" and recorded is not None
+                            and recorded.get("kind") == "render"
+                            and recorded.get("content_sha256") == current.digest)
+                    ):
+                        preserved.append(value)
+                        continue
+
+                    original_target = replaced_installer_symlink_targets.get(value)
+                    desired_entry = desired_by_dest.get(value)
+                    restore_here = (
+                        original_target is not None and current.kind == "symlink"
+                        and desired_entry is not None
+                        and current.link_target == desired_entry["source"]
+                    )
+                    if not dry_run:
+                        # A payload can change while the link text stays fixed.
+                        # Recheck ownership at the mutation boundary as well.
+                        if current.kind == "symlink" and not native_agent_ownership.owned_link(home, dest):
+                            preserved.append(value)
+                            continue
+                        auth = safe_fs.authority(
+                            dest, owner="runtime-activation:codex-native-agent",
+                            allowed_paths=(dest,), expected=current,
+                        )
+                        if restore_here:
+                            safe_fs.atomic_write_symlink(auth, original_target, expected=current)
+                        else:
+                            safe_fs.remove_exact(auth, expected=current)
+                    if restore_here:
+                        restored_installer_links.append(value)
+                    else:
+                        removed.append(value)
+            except safe_fs.SafetyError as exc:
+                if exc.code != "expected-state-mismatch":
+                    raise ActivationError(str(exc)) from exc
+                preserved.append(value)
+            continue
         if not dest.is_symlink() and not dest.exists():
             continue
         original_target = replaced_installer_symlink_targets.get(value)
@@ -4297,6 +4363,7 @@ def deactivate(runtime: str, scope: str = "global", dry_run: bool = False) -> di
             restored_installer_links.append(value)
         else:
             removed.append(value)
+    preserved = sorted(set(preserved))
     restored = []
     if runtime == "claude":
         restored = _unmerge_claude_settings(state, scope, dry_run=dry_run)
