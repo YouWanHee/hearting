@@ -9,6 +9,7 @@ registry records, so the frozen tree reports its actual per-completion behavior.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import io
@@ -28,6 +29,31 @@ SIBLINGS = 24
 FAILURE_INDICES = (7, 18)
 PARENT = "att-measurement-parent"
 PARENT_SID = "ses-measurement-parent"
+
+
+@contextmanager
+def _fixture_obligation_runners():
+    """End only this measurement's runners before removing their state root."""
+    import peer_obligations
+
+    existing = set(getattr(peer_obligations, "_RUNNERS", ()))
+    try:
+        yield
+    finally:
+        owned = [process for process in getattr(peer_obligations, "_RUNNERS", ())
+                 if process not in existing]
+        for process in owned:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+        for process in owned:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 
 
 def _child(source_root: Path, output: Path) -> int:
@@ -477,7 +503,8 @@ def _measure_codex_queue(source_root: Path, variant: str) -> dict:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     recipient = "ses-measurement-parent"
-    with tempfile.TemporaryDirectory(prefix="delivery-codex-queue-fixture-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="delivery-codex-queue-fixture-") as temporary, \
+            _fixture_obligation_runners():
         root = Path(temporary)
         jobs, recipient, records, members = _carrier_scenario(
             root, variant, "codex-native-queue", "codex_native_queue")
