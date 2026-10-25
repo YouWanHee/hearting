@@ -14,6 +14,61 @@ import resource_run_registry as registry
 
 
 class ResourceRegistryTest(unittest.TestCase):
+    def test_compute_identity_requires_output_receipt_but_keeps_stable_format(self):
+        execution = {"kind": "compute-hosts", "run_id": "compute-1",
+                     "meta_sha256": "m" * 64, "exit_sha256": "e" * 64,
+                     "receipt_sha256": "r" * 64, "outputs_sha256": "o" * 64,
+                     "contract_sha256": "c" * 64}
+        identity = registry.compute_execution_identity({"execution": execution})
+        self.assertEqual(identity, "compute-hosts:compute-1:" + ":".join(
+            execution[key] for key in
+            ("meta_sha256", "exit_sha256", "receipt_sha256", "contract_sha256")))
+        self.assertEqual(registry.compute_execution_identity({"execution": {
+            **execution, "outputs_sha256": "x" * 64}}), identity)
+        self.assertIsNone(registry.compute_execution_identity({"execution": {
+            key: value for key, value in execution.items() if key != "outputs_sha256"}}))
+        self.assertIsNone(registry.compute_execution_identity({"execution": {
+            "kind": "local-resource", "outputs_sha256": "o" * 64}}))
+
+    def test_compute_identity_uses_recorded_receipt_without_remote_or_local_probe(self):
+        row = {"execution": {"kind": "compute-hosts", "run_id": "compute-1",
+                             "receipt_state": "finished"},
+               "pid": None, "starttime": None, "command_hash": None,
+               "resource_policy": "supervised-owner", "status": "succeeded"}
+        identity_reader = mock.Mock(side_effect=AssertionError("local PID probe"))
+        with mock.patch.object(registry, "compute_execution_observation",
+                               side_effect=AssertionError("remote observation")):
+            self.assertEqual(registry.classify_identity(row, identity_reader),
+                             ("stale", None, "compute-hosts-recorded-state-non-authoritative"))
+            self.assertFalse(registry.is_alive(row, identity_reader))
+            running = {**row, "status": "running", "execution": {**row["execution"],
+                                                                       "receipt_state": "running"}}
+            self.assertEqual(registry.classify_identity(running, identity_reader),
+                             ("working", None, "compute-hosts-recorded-running"))
+            self.assertTrue(registry.is_alive(running, identity_reader))
+            self.assertEqual(registry.normalize_run("resource-1", row, Path("/fixture/registry.json"))["liveness"],
+                             "exited")
+        identity_reader.assert_not_called()
+        with mock.patch.object(registry, "compute_execution_observation",
+                               return_value={"state": "populated"}) as observer:
+            self.assertFalse(registry.resource_process_group_quiescent(row))
+            observer.assert_called_once_with(row)
+        with mock.patch.object(registry, "compute_execution_observation",
+                               return_value={"state": "quiescent"}):
+            self.assertTrue(registry.resource_process_group_quiescent(row))
+
+    def test_compute_run_projection_does_not_probe_a_local_pid(self):
+        execution = {"kind": "compute-hosts", "run_id": "compute-1",
+                     "host": "gpu-a", "receipt_state": "finished"}
+        with mock.patch.object(registry, "proc_identity",
+                               side_effect=AssertionError("local PID probe")):
+            row = registry.normalize_run("resource-1", {"execution": execution},
+                                         Path("/fixture/registry.json"))
+        self.assertEqual(row["compute_run_id"], "compute-1")
+        self.assertEqual(row["compute_host"], "gpu-a")
+        self.assertEqual(row["liveness"], "exited")
+        self.assertIsNone(row["pid"])
+
     def test_never_started_without_identity_is_exited_but_partial_identity_stays_stale(self):
         row = {
             "resource_policy": "supervised-owner", "status": "failed",
@@ -215,12 +270,31 @@ class ResourceRegistryTest(unittest.TestCase):
         self.assertEqual(registry.classify_identity(
             unreadable, lambda _pid: None)[0], "stale")
 
+    def test_launched_identity_waits_out_the_empty_cmdline_after_exec(self):
+        child = mock.Mock(pid=4242)
+        child.poll.return_value = None
+        found = {"pid": 4242, "starttime": "7", "command_hash": "abc"}
+        with mock.patch.object(registry, "proc_identity", side_effect=[None, None, found]) as probe, \
+                mock.patch.object(registry.time, "sleep") as sleep:
+            self.assertEqual(registry.launched_identity(child), found)
+        self.assertEqual(probe.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_launched_identity_stops_once_the_child_has_exited(self):
+        child = mock.Mock(pid=4242)
+        child.poll.return_value = 0
+        with mock.patch.object(registry, "proc_identity", return_value=None) as probe, \
+                mock.patch.object(registry.time, "sleep") as sleep:
+            self.assertIsNone(registry.launched_identity(child))
+        self.assertEqual(probe.call_count, 1)
+        sleep.assert_not_called()
+
     def test_supervised_success_waits_for_its_recorded_process_group_to_drain(self):
         leader = subprocess.Popen(
             [sys.executable, "-c", "import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])"],
             start_new_session=True,
         )
-        identity = registry.proc_identity(leader.pid)
+        identity = registry.launched_identity(leader)
         self.assertIsNotNone(identity)
         namespace = os.readlink("/proc/self/ns/pid")
         leader.wait(timeout=5)

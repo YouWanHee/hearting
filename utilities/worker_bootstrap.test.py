@@ -28,6 +28,22 @@ _OPA_SPEC.loader.exec_module(OPA)
 
 
 class WorkerBootstrapTest(unittest.TestCase):
+    def test_stage_attempt_budget_prompt_and_legacy_rendering(self):
+        from datetime import datetime, timezone
+        args = SimpleNamespace(worker_type="stage", foreground_timeout=3600)
+        rendered = W.runtime_progress_prompt(
+            args, now=datetime(2026, 10, 22, 5, 0, tzinfo=timezone.utc))
+        self.assertIn("3600 seconds (60 minutes)", rendered)
+        self.assertIn("approximate deadline: 2026-10-22 06:00:00 UTC", rendered)
+        self.assertIn("waiting with sleep, use this budget", rendered)
+        self.assertIn("No per-tool heartbeat", W.runtime_progress_prompt())
+        self.assertNotIn("execution budget", W.runtime_progress_prompt(
+            SimpleNamespace(worker_type="owner", foreground_timeout=3600)))
+        short = W.runtime_progress_prompt(
+            SimpleNamespace(worker_type="stage", foreground_timeout=90),
+            now=datetime(2026, 10, 22, 5, 0, tzinfo=timezone.utc))
+        self.assertIn("90 seconds (1.5 minutes)", short)
+
     def test_stage_commit_policy_normalizes_sealed_and_legacy_inputs(self):
         args = SimpleNamespace(worker_type="stage", commit_expected=True,
                                subsession_id=None, stage_authority=1)
@@ -57,6 +73,51 @@ class WorkerBootstrapTest(unittest.TestCase):
         self.assertIn("/issued/cycle/artifacts", W.artifact_context_prompt(env))
         self.assertNotIn("AGENT_ARTIFACT_OUTPUT_DIR", env)
         self.assertEqual(W.artifact_context_prompt({}), "")
+
+    def test_runtime_candidate_and_best_effort_preparation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            project = base / "project"
+            artifacts = project / ".agent_reports"
+            artifacts.mkdir(parents=True)
+            primary = W.runtime_dir_candidate(artifacts, {})
+            self.assertEqual(primary, str(project / ".agent_runtime"))
+            self.assertEqual(W.runtime_dir_candidate(artifacts, {"AGENT_RUNTIME_DIR": primary}), primary)
+            explicit = base / "dedicated-runtime"
+            self.assertEqual(W.runtime_dir_candidate(artifacts, {"AGENT_RUNTIME_DIR": str(explicit)}),
+                             str(explicit))
+            self.assertEqual(W.runtime_dir_candidate(artifacts, {"AGENT_RUNTIME_DIR": "relative"}), "")
+            self.assertEqual(W.runtime_dir_candidate(artifacts, {"AGENT_RUNTIME_DIR": str(project / "cache")}), "")
+            home_override = Path.home() / "unsafe-runtime-override"
+            self.assertEqual(W.runtime_dir_candidate(artifacts, {"AGENT_RUNTIME_DIR": str(home_override)}), "")
+            prepared = W.prepare_runtime_dir(str(explicit))
+            self.assertEqual(prepared, str(explicit))
+            self.assertEqual((explicit / ".gitignore").read_bytes(), b"*\n")
+            self.assertFalse((explicit / "CACHEDIR.TAG").exists())
+            conflict = base / "conflict"
+            conflict.mkdir()
+            (conflict / ".gitignore").write_text("keep-me\n")
+            self.assertEqual(W.prepare_runtime_dir(str(conflict)), "")
+            self.assertEqual((conflict / ".gitignore").read_text(), "keep-me\n")
+            prompt = W.artifact_context_prompt({"AGENT_ARTIFACT_OUTPUT_DIR": "/out",
+                                               "AGENT_RUNTIME_DIR": str(explicit)})
+            self.assertIn(f"- runtime_dir: {explicit}", prompt)
+            self.assertIn("checkpoints under runtime_dir", prompt)
+
+    def test_nested_producer_environment_and_child_prompt_keep_default_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            artifact_root = project / ".agent_reports"
+            artifact_root.mkdir(parents=True)
+            runtime = project / ".agent_runtime"
+            record = {"campaign_id": "camp_test", "cycle_id": "cyc_test", "producer_id": "prod_test"}
+            with mock.patch.dict(os.environ, {"AGENT_RUNTIME_DIR": str(runtime)}, clear=False), \
+                    mock.patch.object(AP, "cycle_dir", return_value=project / "child-cycle"), \
+                    mock.patch("artifact_workflow_groups.group_for_cycle", return_value=None):
+                child_env = AP._env_for(artifact_root, record)
+            self.assertEqual(child_env["AGENT_RUNTIME_DIR"], str(runtime))
+            self.assertEqual(W.runtime_dir_candidate(artifact_root, child_env), str(runtime))
+            self.assertIn(f"- runtime_dir: {runtime}", W.artifact_context_prompt(child_env))
 
     def test_deterministic_fallback_types(self):
         self.assertEqual(W.resolve_worker_type(explicit=None, dispatch_depth=1), "owner")
@@ -301,6 +362,37 @@ class NodeScopeTest(unittest.TestCase):
                 prompt,
             )
             self.assertIn(str(cycle_dir / "artifacts" / "shards" / "research" / "notes.md"), prompt)
+
+    def test_completion_precedence_applies_without_route_or_done_when(self):
+        task = ("Original request: O1 record the first result; O2 calculate all group totals; "
+                "O3 inspect every file and report the findings. Execution scope: report.")
+        for worker_type in ("owner", "stage", "review", "support"):
+            with self.subTest(worker_type=worker_type):
+                prompt = W.assignment_prompt(SimpleNamespace(worker_type=worker_type), task, {})
+                self.assertTrue(prompt.startswith("Assignment:\n" + task + "\n\n"))
+                self.assertIn("Completion precedence:", prompt)
+                self.assertIn("within the approved endpoint and this node's assigned scope", prompt)
+                self.assertIn("Stop at an approved report endpoint", prompt)
+                self.assertIn("a bounded stage completes only its assigned portion", prompt)
+                self.assertIn("report it with the existing outcome semantics", prompt)
+                self.assertIn("presenting the whole request as complete", prompt)
+                self.assertNotIn("Done when (sealed ids", prompt)
+
+    def test_bounded_stage_keeps_its_scope_and_report_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            route_file = self._route(root)
+            task = "Original request: O1, O2, O3. Execution scope: report."
+            cycle_dir = root / "artifact_root" / "campaigns" / "camp1" / "cyc1"
+            prompt = W.assignment_prompt(
+                SimpleNamespace(worker_type="stage", route_file=str(route_file), route_node="research"),
+                task,
+                {"AGENT_ARTIFACT_CYCLE_ID": "cyc1", "AGENT_ARTIFACT_CYCLE_DIR": str(cycle_dir)},
+            )
+            self.assertTrue(prompt.startswith("Assignment:\n" + task + "\n\nCompletion precedence:"))
+            self.assertIn(str(cycle_dir / "artifacts" / "shards" / "research" / "notes.md"), prompt)
+            self.assertIn("approved report endpoint", prompt)
+            self.assertNotIn("Done when (sealed ids", prompt)
 
     def test_child_prompt_uses_child_node_and_preserves_exact_review_cycle_context(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -730,7 +822,8 @@ class OwnerInlineMarkerPromptTest(OPA.OwnerRefineBase):
         self.assertIn("first finish stage review", texts[0])
 
     def test_no_text_without_a_route_or_for_a_stage_worker(self):
-        self.assertEqual(W.assignment_prompt(SimpleNamespace(worker_type="owner"), "T", {}), "Assignment:\nT\n\n")
+        prompt = W.assignment_prompt(SimpleNamespace(worker_type="owner"), "T", {})
+        self.assertIn("Assignment:\nT\n\nCompletion precedence:", prompt)
         self.assertEqual(W.owner_inline_marker_prompt(SimpleNamespace(worker_type="stage", route_file="x")), "")
 
     def test_a_code_owner_gets_the_marker_line_and_no_gate_line(self):

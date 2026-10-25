@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -224,8 +225,9 @@ class OpencodeDryRunStartParity(unittest.TestCase):
         dry = _opencode_args(attempt_id=None, command_attempt_id=ATTEMPT)
         start = _opencode_args(attempt_id=ATTEMPT, command_attempt_id=ATTEMPT)
         prompt_path, log_path = Path("/tmp/p.txt"), Path("/tmp/l.log")
-        dry_cmd = OPENCODE.shell_command(dry, prompt_path, log_path)
-        start_cmd = OPENCODE.shell_command(start, prompt_path, log_path)
+        with mock.patch.object(OPENCODE.opencode_runtime, "is_v2", return_value=False):
+            dry_cmd = OPENCODE.shell_command(dry, prompt_path, log_path)
+            start_cmd = OPENCODE.shell_command(start, prompt_path, log_path)
         self.assertEqual(dry_cmd, start_cmd)
         self.assertNotIn(ATTEMPT, dry_cmd)
         self.assertNotIn(ATTEMPT, start_cmd)

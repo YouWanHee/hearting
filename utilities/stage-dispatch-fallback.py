@@ -59,6 +59,7 @@ from dispatch_contract import (  # noqa: E402
     ROUTE_STATE_REFUSAL_REASONS,
     DispatchContractError,
     attempt_row_never_started,
+    attempt_row_terminal_never_started,
     attempt_process_quiescence,
     close_attempt_row_if,
     parse_registry_metadata,
@@ -910,7 +911,8 @@ def registry_route_rows(jobs: Path, route_ids) -> list[dict[str, str]]:
             continue
         rows.append({**metadata, "_status": fields[1], "_slug": fields[4],
                      "_order": str(order),
-                     "_never_started": attempt_row_never_started(fields)})
+                     "_never_started": attempt_row_never_started(fields),
+                     "_terminal_never_started": attempt_row_terminal_never_started(fields)})
     return rows
 
 
@@ -1219,9 +1221,8 @@ def parent_runtime_failure(args, route: dict, row: dict, parent_identity) -> str
     if args.action != "dry-run" or not args.inherited_jobs:
         return ""
     try:
-        repo = subprocess.check_output(
-            ["git", "-C", str(route["cwd"]), "rev-parse", "--show-toplevel"], text=True
-        ).strip()
+        from dispatch_contract import work_root_identity
+        repo = work_root_identity(route["cwd"], route=route)
         resolve_live_parent_attempt(
             args.jobs,
             parent_slug=args.parent,
@@ -1297,11 +1298,11 @@ def retry_attempt_identity(failed_attempt_id: str) -> str:
 def retry_proven_unstarted_identity(
     jobs: Path, route_id: str, node_id: str, attempt_id: str
 ) -> str:
-    """Advance past exact terminal identities closed after a proven no-start timeout.
+    """Advance past exact terminal identities with strict no-start proof.
 
-    Open registrations remain reusable by register/start. Only the specific
-    lock-closed timeout outcome advances identity; real failures, parent
-    cancellations, and uncertain rows keep their existing retry policy.
+    Open registrations remain reusable by register/start. Terminal rows move
+    to their deterministic successor only when the common launch-fence proof
+    establishes that no child started.
     """
     current = attempt_id
     seen = set()
@@ -1312,10 +1313,7 @@ def retry_proven_unstarted_identity(
         if len(matches) != 1:
             return current
         row = matches[0]
-        if (row.get("_status") not in {"done", "killed", "cancelled"}
-                or row.get("_never_started") is not True
-                or row.get("note") != "never-launched"
-                or row.get("reconcile_reason") != DIRECT_TIMEOUT_UNSTARTED_REASON):
+        if row.get("_terminal_never_started") is not True:
             return current
         current = retry_attempt_identity(current)
     return current

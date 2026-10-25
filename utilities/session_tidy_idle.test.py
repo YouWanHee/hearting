@@ -165,6 +165,120 @@ class IdleObserverTests(unittest.TestCase):
                 self.assertEqual((accepted["idle_request"]["state"], accepted["queue_id"],
                                   accepted["followup_kind"]), ("accepted", queue["id"], "status-only"))
 
+    def _requested(self):
+        """Book an idle tidy for sid-A and deliver its exact request; return (seat, claim, text)."""
+        self.assertEqual(self.observe_claude(), "booking=scheduled")
+        seat = st.resolve_seat("claude", str(self.cwd), sid="sid-A")
+        path = clear.reservation_path(seat.key)
+        claim, reason = clear.claim_idle_card_request(path, clear.read_reservation(seat.key)["nonce"])
+        self.assertEqual(reason, "")
+        text = clear.idle_card_request_text(claim)
+        st.run_hook("claude", "prompt", "sid-A", cwd=str(self.cwd), prompt_text=text)
+        self.assertTrue(clear.finish_idle_card_request(claim, accepted=True))
+        return seat, claim, text
+
+    def _stop_with(self, reply):
+        payload = {"hook_event_name": "Stop", "session_id": "sid-A", "cwd": str(self.cwd),
+                   "transcript_path": self.transcript("sid-A", 200000), "turn_id": "turn-tidy",
+                   "last_assistant_message": reply}
+        return idle.observe_payload("claude", payload)
+
+    def test_stop_takes_a_marked_reply_as_the_card_and_queues_once(self):
+        import session_tidy_runner as runner
+        with self.iso.patched_environ(self.extra), mock.patch.object(clear, "herdr_command", return_value="fake"), \
+             mock.patch.object(clear, "_start_helper", return_value=12345), \
+             mock.patch.object(runner, "start_detached", return_value=None), \
+             mock.patch.object(st, "now_epoch", return_value=4241):
+            seat, claim, text = self._requested()
+            begin, end = st.reply_card_markers(claim["nonce"])
+            self.assertNotIn("\n", text)
+            self.assertIn(begin, text)
+            self._stop_with("카드 없이 끝난 답")
+            self.assertNotEqual(clear.read_reservation(seat.key)["idle_request"]["state"], "accepted")
+            self._stop_with(f"{begin}\n진행 중: 답으로 쓴 카드\n다음 할 일: 기다림\n{end}")
+            accepted = clear.read_reservation(seat.key)
+            self.assertEqual((accepted["idle_request"]["state"], accepted["followup_kind"]),
+                             ("accepted", "status-only"))
+            card = st.read_latest_card(seat)
+            self.assertEqual(card["body"], "진행 중: 답으로 쓴 카드\n다음 할 일: 기다림")
+            self.assertEqual(runner.read_item(accepted["queue_id"])["operation_id"], accepted["operation_id"])
+
+    def test_input_after_the_request_or_another_nonce_writes_no_card_and_books_no_clear(self):
+        import session_tidy_runner as runner
+        with self.iso.patched_environ(self.extra), mock.patch.object(clear, "herdr_command", return_value="fake"), \
+             mock.patch.object(clear, "_start_helper", return_value=12345), \
+             mock.patch.object(runner, "start_detached", return_value=None), \
+             mock.patch.object(st, "now_epoch", return_value=4241):
+            seat, claim, _text = self._requested()
+            other_begin, other_end = st.reply_card_markers("not-this-request")
+            self.assertEqual(st.accept_reply_card("claude", "sid-A", str(self.cwd),
+                                                  f"{other_begin}\n진행 중: x\n{other_end}"),
+                             "reply-card=none reason=unmarked")
+            st.run_hook("claude", "prompt", "sid-A", cwd=str(self.cwd), prompt_text="사용자가 그사이 입력")
+            begin, end = st.reply_card_markers(claim["nonce"])
+            self._stop_with(f"{begin}\n진행 중: 늦은 카드\n{end}")
+            self.assertIsNone(st.read_latest_card(seat))
+            self.assertNotEqual((clear.read_reservation(seat.key) or {}).get("status"), "accepted")
+            self.assertFalse(any(item.get("card_generation") for item in runner.list_items()))
+
+    def test_last_reply_reads_each_harness_without_guessing(self):
+        self.assertEqual(idle.last_reply("claude", {"last_assistant_message": "끝"}, "s"), "끝")
+        self.assertEqual(idle.last_reply("codex", {"last_assistant_message": None}, "s"), "")
+        database = self.iso.root / "opencode.db"
+        con = sqlite3.connect(database)
+        con.execute("CREATE TABLE message (id text, session_id text, time_created integer, time_updated integer, data text)")
+        con.execute("CREATE TABLE part (id text, message_id text, session_id text, time_created integer, time_updated integer, data text)")
+
+        def message(mid, created, **data):
+            con.execute("INSERT INTO message VALUES (?,?,?,?,?)",
+                        (mid, "oc-1", created, created, json.dumps({"role": "assistant", **data})))
+
+        def part(pid, mid, **data):
+            con.execute("INSERT INTO part VALUES (?,?,?,?,?,?)", (pid, mid, "oc-1", 0, 0, json.dumps(data)))
+
+        message("m1", 1, finish="stop", time={"created": 1, "completed": 2})
+        part("p1", "m1", type="reasoning", text="생각")
+        part("p2", "m1", type="text", text="첫 줄")
+        part("p3", "m1", type="text", text="둘째 줄")
+        part("p4", "m1", type="text", text="숨김", synthetic=True)
+        con.commit()
+        import tidy_transcripts
+        with mock.patch.object(tidy_transcripts, "opencode_db_path", return_value=str(database)):
+            self.assertEqual(idle.last_reply("opencode", {}, "oc-1"), "첫 줄\n둘째 줄")
+            message("m2", 3, finish="length", time={"created": 3, "completed": 4})       # cut off
+            part("p5", "m2", type="text", text="잘린 답")
+            con.commit()
+            self.assertEqual(idle.last_reply("opencode", {}, "oc-1"), "")
+            message("m3", 5, time={"created": 5})                                        # still running
+            con.commit()
+            self.assertEqual(idle.last_reply("opencode", {}, "oc-1"), "")
+        con.close()
+
+    def test_last_reply_reads_opencode_2_session_messages(self):
+        database = self.iso.root / "opencode2.db"
+        con = sqlite3.connect(database)
+        con.execute("CREATE TABLE session_message (id text, session_id text, type text, seq integer, "
+                    "time_created integer, time_updated integer, data text)")
+
+        def row(mid, kind, created, **data):
+            con.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                        (mid, "oc-2", kind, 1, created, created, json.dumps(data)))
+            con.commit()
+
+        row("u1", "user", 1, text="요청")
+        row("a1", "assistant", 2, finish="stop", time={"created": 2, "completed": 3},
+            content=[{"type": "reasoning", "text": "생각"}, {"type": "text", "text": "카드 답"}])
+        row("i1", "idle", 4, outcome="succeeded")
+        import tidy_transcripts
+        with mock.patch.object(tidy_transcripts, "opencode_db_path", return_value=str(database)):
+            self.assertEqual(idle.last_reply("opencode", {}, "oc-2"), "카드 답")
+            row("u2", "user", 5, text="그사이 입력")                     # a newer prompt: not this reply
+            self.assertEqual(idle.last_reply("opencode", {}, "oc-2"), "")
+            row("a2", "assistant", 6, finish="length", time={"created": 6, "completed": 7},
+                content=[{"type": "text", "text": "잘림"}])
+            self.assertEqual(idle.last_reply("opencode", {}, "oc-2"), "")
+        con.close()
+
     def test_fake_clock_runs_one_idle_cycle_and_rearms_only_after_user_input(self):
         import dispatch_seat_handover as handover
         import session_tidy_runner as runner

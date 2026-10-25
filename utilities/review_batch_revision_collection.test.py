@@ -26,6 +26,7 @@ EXPECTED = Counter({
     "test_mixed_pass_fail_revision_through_public_batch": 1,
     "test_mixed_one_sided_supersession_through_public_batch": 1,
     "test_one_sided_revision_uses_canonical_writer_and_reader": 1,
+    "test_terminal_no_start_reuses_group_start_for_the_exact_gap": 1,
 })
 
 
@@ -38,7 +39,7 @@ def _flatten(suite):
 
 
 class ReviewBatchRevisionCollectionTest(unittest.TestCase):
-    def test_original_thirteen_methods_are_collected_once_without_inheritance(self):
+    def test_split_methods_are_collected_once_without_inheritance(self):
         observed = Counter()
         for index, filename in enumerate(SUITES):
             path = ROOT / "utilities" / filename

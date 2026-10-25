@@ -39,6 +39,59 @@ _TMUX_SERVER_PIN_KEYS = {
     "HEARTING_RESOURCE_RUN_ID", "HEARTING_GPU_LEASE_RELEASE",
 } | set(_TMUX_SESSION_ENV_KEYS)
 
+_TMUX_LAUNCH_DEFAULT_KEYS = (
+    *_TMUX_SESSION_ENV_KEYS,
+    "AGENT_HOME", "AGENT_DISPATCH_ATTEMPT_ID",
+    "HEARTING_COMPUTE_RUN_ID", "HEARTING_COMPUTE_HOST",
+    "HEARTING_RESOURCE_RUN_ID", "HEARTING_GPU_LEASE_RELEASE",
+)
+
+
+def _validated_tmux_launch_environment(environment):
+    """Return a validated, default-complete per-launch environment."""
+    if not isinstance(environment, dict):
+        raise GPUUnavailable("invalid tmux launch environment")
+    result = dict(environment)
+    for key in _TMUX_LAUNCH_DEFAULT_KEYS:
+        result.setdefault(key, "")
+    for key, value in result.items():
+        if (not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                or not isinstance(value, str) or "\0" in value):
+            raise GPUUnavailable("invalid tmux launch environment")
+    return result
+
+
+def _tmux_launch_command(environment, command):
+    """Prefix one command with the exact validated environment for its wrapper."""
+    assignments = [shlex.quote("%s=%s" % (key, environment[key]))
+                   for key in sorted(environment)]
+    return "exec env " + " ".join(assignments) + " " + command
+
+
+def _run_tmux_launch(operation, argv, environment):
+    """Run a tmux client with bounded diagnostics and no argv disclosure."""
+    captures = []
+    try:
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            result = subprocess.run(argv, env=environment, cwd="/", stdout=stdout_file,
+                                    stderr=stderr_file, check=False)
+            for handle in (stdout_file, stderr_file):
+                handle.seek(0)
+                raw = handle.read(4097)
+                clipped = len(raw) > 4096
+                value = raw[:4096].decode("utf-8", "replace")
+                captures.append(value + (" …[truncated]" if clipped else ""))
+        if result.returncode != 0:
+            raise GPUUnavailable(json.dumps({
+                "operation": operation, "exit_code": result.returncode,
+                "stdout": captures[0], "stderr": captures[1],
+            }, ensure_ascii=False, sort_keys=True))
+    except OSError as exc:
+        raise GPUUnavailable(json.dumps({
+            "operation": operation, "exit_code": None,
+            "stdout": "", "stderr": str(exc)[:4096],
+        }, ensure_ascii=False, sort_keys=True)) from exc
+
 
 def tmux_server_name(state_file):
     """Stable private tmux namespace for this host-local Hearting state root."""
@@ -231,7 +284,10 @@ def identity(pid):
     try:
         fields = Path("/proc/%s/stat" % pid).read_text().rsplit(") ", 1)[1].split()
         return {"pid": int(pid), "starttime": fields[19],
-                "pid_namespace": os.readlink("/proc/self/ns/pid"), "state": fields[0]}
+                "process_group": int(fields[2]),
+                "pid_namespace": os.readlink("/proc/self/ns/pid"),
+                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                "state": fields[0]}
     except FileNotFoundError:
         return None
 
@@ -303,6 +359,19 @@ def snapshot(path):
 def serialized_payload_source():
     return _REMOTE_LEASE_CORE + '''
 import subprocess
+import time
+
+def write_receipt(path, receipt):
+    fd, temporary = tempfile.mkstemp(prefix=".launch-receipt.", dir=str(Path(path).parent))
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(receipt, handle, sort_keys=True)
+            handle.write("\\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError): os.unlink(temporary)
 
 def bind(path, lease, process):
     if not lease:
@@ -313,11 +382,28 @@ def bind(path, lease, process):
             raise GPUUnavailable("GPU reservation ended before payload launch")
         row.update(process)
 
-def payload(path, lease, inner):
-    bind(path, lease, identity(os.getpid()))
+def payload(path, lease, inner, receipt_path, run_id):
+    ident = identity(os.getpid())
+    bind(path, lease, ident)
+    receipt = {"schema_version": 1, "run_id": run_id,
+               "identity": ident, "host": socket.gethostname().lower().split(".")[0],
+               "started_at": time.time(), "state": "running"}
+    receipt_file = Path(receipt_path)
     try:
-        return subprocess.call(["bash", "-lc", inner])
+        write_receipt(receipt_file, receipt)
+    except OSError:
+        # Durable adoption evidence is advisory to ordinary compute launches.
+        # Missing receipt means the later handoff will fail closed.
+        pass
+    try:
+        code = subprocess.call(["bash", "-lc", inner])
+        return code
     finally:
+        receipt.update(state="finished", exit_code=locals().get("code"), ended_at=time.time())
+        try:
+            write_receipt(receipt_file, receipt)
+        except OSError:
+            pass
         release(path, lease)
 '''
 
@@ -510,30 +596,21 @@ def launch_compute(options, payload_source):
     devices = ",".join(lease["gpus"]) if lease else options.get("requested")
     inner = options["inner"].replace("__HEARTING_GPU_SETUP__",
         "export CUDA_VISIBLE_DEVICES=%s" % shlex.quote(devices) if devices is not None else ":")
-    script = payload_source + "\nraise SystemExit(payload(%r, %r, %r))\n" % (path, lease, inner)
-    command = "python3 -c " + shlex.quote(script)
     run_dir = Path(options["run_dir"])
+    receipt_path = str(run_dir / "launch-receipt.json")
+    script = payload_source + "\nraise SystemExit(payload(%r, %r, %r, %r, %r))\n" % (
+        path, lease, inner, receipt_path, options["run_id"])
+    command = "python3 -c " + shlex.quote(script)
     launch_cwd = options.get("cwd") or os.getcwd()
     if not isinstance(launch_cwd, str) or not os.path.isabs(launch_cwd):
         release(path, lease)
         raise GPUUnavailable("compute launch directory must be absolute")
-    tmux_environment = options.get("tmux_environment") or {}
-    if not isinstance(tmux_environment, dict):
+    try:
+        tmux_environment = _validated_tmux_launch_environment(
+            options.get("tmux_environment") or {})
+    except GPUUnavailable:
         release(path, lease)
-        raise GPUUnavailable("invalid tmux launch environment")
-    tmux_environment = dict(tmux_environment)
-    for key in (
-        *_TMUX_SESSION_ENV_KEYS,
-        "AGENT_HOME", "AGENT_DISPATCH_ATTEMPT_ID",
-        "HEARTING_COMPUTE_RUN_ID", "HEARTING_COMPUTE_HOST",
-        "HEARTING_RESOURCE_RUN_ID", "HEARTING_GPU_LEASE_RELEASE",
-    ):
-        tmux_environment.setdefault(key, "")
-    for key, value in tmux_environment.items():
-        if (not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
-                or not isinstance(value, str) or "\0" in value):
-            release(path, lease)
-            raise GPUUnavailable("invalid tmux launch environment")
+        raise
     server_env = dict(os.environ)
     for key in _TMUX_SERVER_PIN_KEYS | set(tmux_environment):
         server_env.pop(key, None)
@@ -548,17 +625,13 @@ def launch_compute(options, payload_source):
             # The first client owns server creation. Keep that long-lived
             # process outside the invoking release/session, then provide only
             # this launch's validated identity and cwd to its new session.
-            subprocess.check_call(
-                ["tmux", "-L", server_name, "start-server"],
-                env=server_env,
-                cwd="/",
-            )
+            _run_tmux_launch("start-server",
+                             ["tmux", "-L", server_name, "start-server"], server_env)
             tmux_command = ["tmux", "-L", server_name, "new-session", "-d",
                             "-s", options["run_id"]]
-            for key, value in sorted(tmux_environment.items()):
-                tmux_command.extend(["-e", f"{key}={value}"])
-            tmux_command.extend(["-c", launch_cwd, command])
-            subprocess.check_call(tmux_command, env=server_env, cwd="/")
+            tmux_command.extend(["-c", launch_cwd,
+                                 _tmux_launch_command(tmux_environment, command)])
+            _run_tmux_launch("new-session", tmux_command, server_env)
             tmux_transport = {"kind": "hearting-tmux-v1", "server": server_name}
         else:
             with open(os.devnull, "rb") as stdin, open(os.devnull, "ab") as output:
@@ -581,7 +654,8 @@ def launch_compute(options, payload_source):
         release(path, lease)
         raise
     return {"gpus": devices, "gpu_lease": lease,
-            "tmux_transport": tmux_transport}
+            "tmux_transport": tmux_transport,
+            "receipt": receipt_path}
 
 
 def requested_devices(command, default=None):
@@ -952,7 +1026,9 @@ def launch_compute_namespaced(options, payload_source):
             "    if safe_fd is not None: _ns_os.close(safe_fd)\n") % ({
                 "safe_run": (mapping, run_root, options["run_dir"]),
                 "enter": (mapping, run_root, options.get("cwd"), options["run_dir"]),
-                "payload": (path, lease, inner),
+                "payload": (path, lease, inner,
+                            str(Path(options["run_dir"]) / "launch-receipt.json"),
+                            options["run_id"]),
                 "release": (path, lease),
             }))
         fd = os.open(runner_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -966,25 +1042,15 @@ def launch_compute_namespaced(options, payload_source):
             raise
         command = "python3 " + shlex.quote(str(runner_path))
         env = dict(os.environ)
-        tmux_environment = dict(tmux_environment)
-        for key in (*_TMUX_SESSION_ENV_KEYS, "AGENT_HOME", "AGENT_DISPATCH_ATTEMPT_ID",
-                    "HEARTING_COMPUTE_RUN_ID", "HEARTING_COMPUTE_HOST",
-                    "HEARTING_RESOURCE_RUN_ID", "HEARTING_GPU_LEASE_RELEASE"):
-            tmux_environment.setdefault(key, "")
-        for key, value in tmux_environment.items():
-            if (not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
-                    or not isinstance(value, str) or "\0" in value):
-                raise GPUUnavailable("invalid tmux launch environment")
+        tmux_environment = _validated_tmux_launch_environment(tmux_environment)
         for key in _TMUX_SERVER_PIN_KEYS | set(tmux_environment):
             env.pop(key, None)
         server = tmux_server_name(path)
         if subprocess.call(["sh", "-c", "command -v tmux >/dev/null 2>&1"], env=env, cwd="/") == 0:
-            subprocess.check_call(["tmux", "-L", server, "start-server"], env=env, cwd="/")
+            _run_tmux_launch("start-server", ["tmux", "-L", server, "start-server"], env)
             cmd = ["tmux", "-L", server, "new-session", "-d", "-s", options["run_id"]]
-            for key, value in sorted(tmux_environment.items()):
-                cmd.extend(["-e", "%s=%s" % (key, value)])
-            cmd.extend(["-c", "/", command])
-            subprocess.check_call(cmd, env=env, cwd="/")
+            cmd.extend(["-c", "/", _tmux_launch_command(tmux_environment, command)])
+            _run_tmux_launch("new-session", cmd, env)
             transport = {"kind": "hearting-tmux-v1", "server": server}
         else:
             with open(os.devnull, "rb") as stdin, open(os.devnull, "ab") as output:
@@ -1001,7 +1067,8 @@ def launch_compute_namespaced(options, payload_source):
         else:
             if lease:
                 raise GPUUnavailable("GPU launch did not establish its wrapper")
-        return {"gpus": devices, "gpu_lease": lease, "tmux_transport": transport}
+        return {"gpus": devices, "gpu_lease": lease, "tmux_transport": transport,
+                "receipt": str(Path(options["run_dir"]) / "launch-receipt.json")}
     except Exception:
         if runner_created:
             with contextlib.suppress(FileNotFoundError):

@@ -986,6 +986,10 @@ def refresh_owner_runtime_permissions(args) -> None:
                 selected_agent=str(context["selected_agent"]),
                 task_publish_scope=state["task_publish_scope"],
                 merge_observation_only=bool(state["observation_only"]),
+                recordish=(state["git_state_known"] is True and
+                           __import__("dispatch_contract").diagnose_repository_start(
+                               context["worktree"]
+                           ).get("state") == "non-git"),
             )
         except (OSError, TypeError, ValueError) as exc:
             raise SupervisorError("owner-runtime-permission-projection-failed") from exc

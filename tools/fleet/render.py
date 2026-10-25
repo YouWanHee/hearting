@@ -41,7 +41,8 @@ from collections import Counter
 from .display import label as _user_label, project as _user_project, gpu_owner as _gpu_owner_label
 
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
-                    current_background_shell_jobs, session_parent_visible)
+                    current_background_shell_jobs, session_parent_visible,
+                    current_attempt_rank)
 from . import gitinfo, titles
 from .work_titles import readable as _readable_name, resource_name as _resource_name, resource_title_key, subject_command
 from .collectors import compute_hosts as _compute_hosts
@@ -6477,7 +6478,8 @@ def _compute_host_rows(term_width=None, sessions=None, resources=None, display_s
     if not isinstance(snapshot, dict):
         return []
     width = max(20, int(term_width or 200))
-    if not snapshot.get("configured"):
+    hosts = [row for row in (snapshot.get("hosts") or ()) if isinstance(row, dict)]
+    if not snapshot.get("configured") and not hosts:
         # Seeded-but-empty or absent inventory: one guidance line so an operator
         # learns where the file is instead of wondering why the panel is gone.
         status = _gpu_safe_text(snapshot.get("status") or "missing")
@@ -6488,10 +6490,11 @@ def _compute_host_rows(term_width=None, sessions=None, resources=None, display_s
                  (_clip_w(" — ".join(part for part in (hint, path) if part),
                           max(1, width - 22)), "dim")]]
         return [_clip_segs(row, width)[0] for row in rows]
-    hosts = [row for row in (snapshot.get("hosts") or ()) if isinstance(row, dict)]
     up = sum(row.get("reachable") is True for row in hosts)
-    rows = [[("  compute resources", "section_head"),
-             ("  %d/%d" % (up, len(hosts)), "dim")]]
+    title = [("  compute resources", "section_head"), ("  %d/%d" % (up, len(hosts)), "dim")]
+    if not snapshot.get("configured"):
+        title.append(("  " + _gpu_safe_text(snapshot.get("status") or "template"), "dim"))
+    rows = [title]
     if snapshot.get("error"):
         detail = _gpu_safe_text(snapshot["error"])
         rows.append([("    unavailable · ", "lvl_y"),
@@ -6500,6 +6503,13 @@ def _compute_host_rows(term_width=None, sessions=None, resources=None, display_s
     if not hosts:
         rows.append([("    no hosts", "dim")])
         return rows
+
+    if not snapshot.get("configured"):
+        path = _gpu_safe_text(snapshot.get("path") or "")
+        guidance = "remote hosts and detached runs require inventory configuration"
+        if path:
+            guidance += " · " + path
+        rows.append([("    ", None), (_clip_w(guidance, max(1, width - 4)), "dim")])
 
     max_host = max((_dw(_gpu_safe_text(row.get("host") or "?")) for row in hosts), default=1)
     host_width = min(max_host, 16 if width >= 100 else 10)
@@ -7699,13 +7709,7 @@ def _current_attempt_jobs(jobs):
         key = (getattr(job, "route_id", None), getattr(job, "route_node", None))
         if not all(key) or not getattr(job, "attempt_id", None):
             continue
-        rank = (
-            -(getattr(job, "registry_priority", None)
-              if getattr(job, "registry_priority", None) is not None else 0),
-            getattr(job, "registry_order", None) if getattr(job, "registry_order", None) is not None else -1,
-            -(getattr(job, "elapsed_min", None) if getattr(job, "elapsed_min", None) is not None else 10**9),
-            index,
-        )
+        rank = current_attempt_rank(job) + (index,)
         if key not in latest_attempt or rank > latest_attempt[key][0]:
             latest_attempt[key] = (rank, job)
     return [
@@ -7788,7 +7792,8 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
             if cur is None or (s.mtime or 0) > (cur[3] or 0):
                 rl[s.harness] = (s.rl_5h, s.rl_7d, s.rl_ms, s.mtime, s.rl_rs,
                                  getattr(s, "rl_windows", None), freshness,
-                                 getattr(s, "_usage_error", None), None, None)
+                                 getattr(s, "_usage_error", None), None,
+                                 getattr(s, "_usage_error_reason", None))
     # A quota snapshot is account-scoped.  It must remain visible when there is no current
     # process row for that harness (for example immediately after session cleanup).
     for harness, snapshot in (usage_snapshots or {}).items():
@@ -7796,14 +7801,15 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
             continue
         payload = snapshot.get("payload")
         if not isinstance(payload, dict):
-            if harness == "opencode" and snapshot.get("providers"):
+            if harness == "opencode" and (snapshot.get("providers") or snapshot.get("error_observation")):
                 payload = {}
             else:
                 continue
         r5 = payload.get("rl_5h")
         r7 = payload.get("rl_7d")
         rms = payload.get("rl_ms")
-        err = payload.get("error")
+        error_observation = snapshot.get("error_observation")
+        err = payload.get("error") or (error_observation or {}).get("error")
         rwins = payload.get("rl_windows")
         if rwins is None:
             rwins = payload.get("windows")
@@ -7814,7 +7820,8 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
         rl[harness] = (
             r5, r7, rms, observed_at,
             (payload.get("rs_5h"), payload.get("rs_7d")), rwins,
-            snapshot.get("freshness"), err, providers, payload.get("reason"),
+            snapshot.get("freshness"), err, providers,
+            payload.get("reason") or (error_observation or {}).get("reason"),
         )
     live = live_harnesses(sessions)
     if not rl and not live:
@@ -7839,9 +7846,19 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
             rows.append((row, None))
             continue
         r5, r7, rms, _mt, rrs, rwins, freshness, err, provider_rows, error_reason = rl[h]
-        if err in {"auth", "subscription-missing", "missing-credential", "unknown"}:
+        if (err in {"auth", "subscription-missing", "missing-credential", "unknown"}
+                or h == "opencode" and err):
             if h == "opencode":
-                row.append(("Go usage unavailable", "dim"))
+                reason = error_reason
+                clause = {
+                    "missing-credential": "Go credential not found",
+                    "credential-not-found": "Go credential not found",
+                    "credential-expired": "Go key expired",
+                    "authentication-rejected": "Go key rejected",
+                    "subscription-missing": "Go subscription missing",
+                    "credential-store-unavailable": "credential store unreadable",
+                }.get(reason, "usage unreadable")
+                row.append(("Go usage unavailable · " + clause, "dim"))
                 rows.append((row, None))
                 continue
             detail = _opencode_availability_text({"providers": provider_rows})

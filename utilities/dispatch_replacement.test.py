@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Proof, race and crash falsifiers for automatic replacement (no model calls)."""
 import concurrent.futures
+import contextlib
+import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -349,9 +352,35 @@ class ReplacementTest(unittest.TestCase):
 
     def test_owner_open_child_vetoes_even_if_process_seems_quiet(self):
         self.write({**self.meta,'worker_type':'owner'})
-        self.write({**self.meta,'attempt_id':'att-child','parent_attempt_id':'att-source'},'open',append=True)
+        self.write({**self.meta,'attempt_id':'att-child','parent_attempt_id':'att-source',
+                    'worker_type':'stage','subsession_id':'ss-chain-a','stage_authority':'0',
+                    'chain_id':'ssc-execute-a'},'open',append=True)
         with self.assertRaises(D.DispatchContractError) as caught:self.claim()
         self.assertEqual(caught.exception.reason,'replacement-owner-child-unsettled')
+
+    def test_owner_child_lineage_distinguishes_open_live_unknown_and_quiescent_slice_rows(self):
+        owner = {**self.meta, 'worker_type': 'owner'}
+        child = {**self.meta, 'attempt_id': 'att-slice', 'parent_attempt_id': 'att-source',
+                 'worker_type': 'stage', 'subsession_id': 'ss-chain-a', 'stage_authority': '0',
+                 'session_chain_id': 'ssc-execute-a', 'launch_started': '1'}
+        for status, state, blocked in (
+            ('open', 'quiescent', True),
+            ('done', 'live', True),
+            ('done', 'unverifiable', True),
+            ('done', 'quiescent', False),
+        ):
+            with self.subTest(status=status, process_state=state):
+                self.write(owner, status='done')
+                self.write(child, status=status, append=True)
+                rows = R._rows(self.jobs.read_text(encoding='utf-8').splitlines())
+                with mock.patch.object(D, 'attempt_process_quiescence',
+                                       return_value=SimpleNamespace(state=state, reason='fixture-state')):
+                    if blocked:
+                        with self.assertRaises(D.DispatchContractError) as caught:
+                            R._children_quiescent(rows, 'att-source')
+                        self.assertEqual(caught.exception.reason, 'replacement-owner-child-unsettled')
+                    else:
+                        self.assertIsNone(R._children_quiescent(rows, 'att-source'))
 
     def test_terminal_fence_vetoes_claim(self):
         with mock.patch.object(D,'ensure_terminal_claim_absent',side_effect=D.DispatchContractError('terminal-claim-pending')):
@@ -3219,6 +3248,138 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(sealed.read_bytes(), before_bytes)
 
 
+class StageRecoveryProgressTest(unittest.TestCase):
+    def test_timeout_and_no_progress_report_bounded_git_and_cycle_observations(self):
+        import artifact_context
+        from datetime import datetime, timedelta, timezone
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / 'repo'; repo.mkdir()
+            subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            subprocess.run(['git', '-C', str(repo), 'config', 'user.email', 'fixture@example.com'], check=True)
+            subprocess.run(['git', '-C', str(repo), 'config', 'user.name', 'Fixture'], check=True)
+            (repo / 'base.py').write_text('base\n')
+            subprocess.run(['git', '-C', str(repo), 'add', 'base.py'], check=True)
+            subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'launch base'], check=True)
+            launch_head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+            expected_commits = []
+            for name in ('first', 'second'):
+                (repo / f'{name}.py').write_text(name + '\n')
+                subprocess.run(['git', '-C', str(repo), 'add', f'{name}.py'], check=True)
+                subprocess.run(['git', '-C', str(repo), 'commit', '-qm', f'{name} commit'], check=True)
+                commit = subprocess.check_output(
+                    ['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+                expected_commits.append((commit, f'{name} commit'))
+            (repo / 'tests').mkdir()
+            (repo / 'tests' / 'original file.py').write_text('rename me\n')
+            subprocess.run(['git', '-C', str(repo), 'add', 'tests/original file.py'], check=True)
+            subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'add scoped path'], check=True)
+            commit = subprocess.check_output(
+                ['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+            expected_commits.append((commit, 'add scoped path'))
+            (repo / 'tests' / 'original file.py').rename(repo / 'tests' / 'renamed\npath.py')
+            subprocess.run(['git', '-C', str(repo), 'add', '-A'], check=True)
+            (repo / 'tests' / 'left uncommitted.py').write_text('pending\n')
+            (repo / '.agent_reports').mkdir()
+            (repo / '.agent_reports' / 'foreign.md').write_text('artifact shadow\n')
+
+            output = root / 'cycle' / 'artifacts'
+            (output / 'dev_logs').mkdir(parents=True)
+            (output / 'dev_logs' / 'changed.md').write_text('metadata only\n')
+            (output / 'other').mkdir()
+            (output / 'other' / 'unscoped.md').write_text('ignore\n')
+            route = {
+                'route_id': 'rt-progress-fixture', 'route_hash': 'fixture',
+                'artifact_root': str(root), 'cwd': str(repo),
+                'nodes': [{'id': 'execute', 'outputs': ['dev_logs/**'],
+                           'write_scope': ['source/**', 'tests/**', 'dev_logs/**']}],
+            }
+            route_path = root / 'route.json'; route_path.write_text(json.dumps(route))
+            fixed_now = datetime.now(timezone.utc)
+            start = (fixed_now - timedelta(minutes=5)).isoformat()
+            jobs = root / 'jobs.log'; jobs.write_text('')
+            with mock.patch.object(D._route_module(), 'verify_route'), \
+                 mock.patch.object(artifact_context, 'resolve_context',
+                                   return_value=SimpleNamespace(output_dir=output)):
+                for note in ('dead-timeout', 'dead-no-progress'):
+                    meta = {'worker_type': 'stage', 'route_node': 'execute',
+                            'route_file': str(route_path), 'note': note,
+                            'failure_class': 'runtime', 'launch_head': launch_head}
+                    block = R._stage_progress_block(
+                        jobs, 'att-stage-failed', [start, 'done', '', '', '', ''], meta, [])
+                    self.assertIn('Observed prior-attempt progress', block)
+                    self.assertIn('end unavailable; observed at', block)
+                    self.assertIn('interval since recorded start', block)
+                    self.assertIn('first commit', block)
+                    self.assertIn('second commit', block)
+                    for commit, subject in reversed(expected_commits):
+                        self.assertIn(f'  - {commit} {subject}', block)
+                    self.assertIn('tests/left uncommitted.py', block)
+                    self.assertIn('tests/original file.py', block)
+                    self.assertIn('tests/renamed\npath.py', block)
+                    self.assertNotIn('.agent_reports/foreign.md', block)
+                    self.assertIn('dev_logs/changed.md', block)
+                    self.assertNotIn('other/unscoped.md', block)
+                    self.assertIn('mtime is not authorship proof', block)
+                    jobs.write_text(
+                        f'{start}\tdone\t{repo}\t{repo}\tstage\t'
+                        + ','.join(f'{key}={value}' for key, value in {
+                            **meta, 'attempt_id': 'att-stage-failed',
+                            'route_id': route['route_id'],
+                        }.items()) + '\n')
+                    prompt_context = R.recovery_instructions(SimpleNamespace(
+                        automatic_retry_of='att-stage-failed', worker_type='stage',
+                        jobs_path=jobs, attempt_id='att-next-stage'))
+                    self.assertIn('Observed prior-attempt progress', prompt_context)
+                    self.assertIn('second commit', prompt_context)
+                self.assertEqual(R._stage_progress_block(
+                    jobs, 'att-stage-failed', ['now', 'done', '', '', '', ''],
+                    {'worker_type': 'stage', 'route_node': 'execute',
+                     'route_file': str(route_path), 'note': 'context-limit'}, []), '')
+                no_head = R._stage_progress_block(
+                    jobs, 'att-stage-failed', [start, 'done', '', '', '', ''],
+                    {'worker_type': 'stage', 'route_node': 'execute',
+                     'route_file': str(route_path), 'note': 'dead-timeout'}, [])
+                self.assertIn('launch_head unavailable; commit range not observed', no_head)
+                with mock.patch.object(R, '_git_readonly', return_value=None):
+                    unavailable = R._stage_progress_block(
+                        jobs, 'att-stage-failed', [start, 'done', '', '', '', ''],
+                        {'worker_type': 'stage', 'route_node': 'execute',
+                         'route_file': str(route_path), 'note': 'dead-timeout',
+                         'launch_head': launch_head}, [])
+                self.assertIn('current worktree HEAD unavailable', unavailable)
+                self.assertIn('scoped uncommitted paths unavailable', unavailable)
+
+
+class NonGitStageProgressTest(unittest.TestCase):
+    def test_unversioned_progress_skips_git_and_lists_cycle_outputs(self):
+        import artifact_context
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cwd = root / "documents"
+            cwd.mkdir()
+            output = root / "cycle" / "artifacts"
+            output.mkdir(parents=True)
+            result = output / "research.md"
+            result.write_text("observed output\n", encoding="utf-8")
+            route = {"route_id": "rt-non-git-progress", "route_hash": "fixture",
+                     "source_commit": "unversioned", "cwd": str(cwd),
+                     "artifact_root": str(root), "nodes": [{"id": "execute",
+                     "outputs": ["research.md"], "write_scope": ["artifacts/**"]}]}
+            route_path = root / "route.json"
+            route_path.write_text(json.dumps(route), encoding="utf-8")
+            meta = {"worker_type": "stage", "route_node": "execute",
+                    "route_file": str(route_path), "note": "dead-timeout"}
+            with mock.patch.object(D._route_module(), "verify_route"), \
+                 mock.patch.object(artifact_context, "resolve_context",
+                                   return_value=SimpleNamespace(output_dir=output)), \
+                 mock.patch.object(R, "_git_readonly", side_effect=AssertionError("Git must not be probed")):
+                block = R._stage_progress_block(
+                    root / "jobs.log", "att-stage", ["2000-01-01T00:00:00Z", "done", "", "", "", ""], meta, [])
+            self.assertIn("git 아닌 폴더 — 커밋·미커밋 관찰 해당 없음", block)
+            self.assertIn("research.md", block)
+
+
 class ReplacementReuseCurrencyTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -3317,8 +3478,9 @@ class ReplacementReuseCurrencyTest(unittest.TestCase):
         states = {node["id"]: ("current", "completion-marker-verified")
                   for node in self.route["nodes"]}
         states["impl-review"] = ("revised-unrecorded", "completion-evidence-revised-unrecorded")
-        with self.assertRaises(D.DispatchContractError) as revised:
-            self.snapshot(states)
+        with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}, clear=False):
+            with self.assertRaises(D.DispatchContractError) as revised:
+                self.snapshot(states)
         error = revised.exception
         self.assertEqual((error.reason, error.detail), ("replacement-completion-unproven", "impl-review"))
         self.assertEqual(error.completion, {
@@ -3328,6 +3490,8 @@ class ReplacementReuseCurrencyTest(unittest.TestCase):
         self.assertIn("capability-route.py revise --route rt-reuse --node impl-review "
                       f"--evidence {shlex.quote(evidence)} ", error.next_step)
         self.assertIn("cannot change that", error.next_step)
+        for argument in ("--reason", "--direction", "--answers", "--author-attempt-id"):
+            self.assertIn(argument, error.next_step)
         self.assertFalse(getattr(error, "retry_when", ""))
 
         states["impl-review"] = ("integrity-broken:history-conflict", "completion-marker-history-conflict")
@@ -3341,6 +3505,60 @@ class ReplacementReuseCurrencyTest(unittest.TestCase):
         with self.assertRaises(D.DispatchContractError) as unsettled:
             self.snapshot(states, readiness="unsettled")
         self.assertFalse(hasattr(unsettled.exception, "next_step"))
+
+    def test_gates_off_revised_unrecorded_evidence_is_reusable_but_gates_on_refuses(self):
+        states = {node["id"]: ("current", "completion-marker-verified")
+                  for node in self.route["nodes"]}
+        states["impl-review"] = ("revised-unrecorded", "completion-evidence-revised-unrecorded")
+        with mock.patch.dict(os.environ, {"HEARTING_GATES": "off"}, clear=False):
+            snapshot = self.snapshot(states)
+        self.assertIn("impl-review", {row["node"] for row in snapshot["completed"]})
+        self.assertNotIn("impl-review", {row["node"] for row in snapshot["invalidated"]})
+        with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}, clear=False):
+            with self.assertRaises(D.DispatchContractError) as refused:
+                self.snapshot(states)
+        self.assertEqual(refused.exception.reason, "replacement-completion-unproven")
+
+    def test_restored_tombstone_transition_preserves_claim_reuse(self):
+        tombstone_digest = "digest-of-prior-tombstone"
+        old = {"cycle_id": "cyc-reuse", "producer_id": "prod-reuse", "gates": [],
+               "completed": [], "invalidated": [{"node": "impl-review",
+                   "marker_digest": tombstone_digest, "attempt_id": "att-impl-review",
+                   "currency": "superseded", "currency_reason": "completion-evidence-superseded",
+                   "depends_on_invalid": []}], "pending": ["impl-review"]}
+        restored = {"cycle_id": "cyc-reuse", "producer_id": "prod-reuse", "gates": [],
+                    "completed": [{"node": "impl-review", "marker_digest": "restored-marker",
+                                   "attempt_id": "att-impl-review", "restored_from": tombstone_digest}],
+                    "invalidated": [], "pending": []}
+        self.assertTrue(R._reuse_preserved(old, restored))
+        unrelated = copy.deepcopy(restored)
+        unrelated["completed"][0]["restored_from"] = "different-tombstone"
+        self.assertFalse(R._reuse_preserved(old, unrelated))
+        changed_attempt = copy.deepcopy(restored)
+        changed_attempt["completed"][0]["attempt_id"] = "att-retried"
+        self.assertFalse(R._reuse_preserved(old, changed_attempt))
+
+    def test_restored_from_stays_with_its_own_node_in_a_mixed_route(self):
+        # plan is restored, impl-review is ordinary (restored first), and
+        # independent-verify is restored after the ordinary test/report rows.
+        for node_id in ("plan", "independent-verify"):
+            tombstone = dict(self.markers[node_id], state="superseded-by-upstream-revision",
+                             superseded_by={"node": "upstream", "sequence": 2})
+            (self.completion / f"{node_id}.1.json").write_text(json.dumps(tombstone), encoding="utf-8")
+            restored = dict(self.markers[node_id], sequence=2, stage_authority="revision",
+                            revision={"basis": "upstream-revision-consumed", "of_sequence": 1})
+            (self.completion / f"{node_id}.json").write_text(json.dumps(restored), encoding="utf-8")
+        states = {node["id"]: ("current", "completion-marker-verified")
+                  for node in self.route["nodes"]}
+        snapshot = self.snapshot(states)
+        rows = {row["node"]: row for row in snapshot["completed"]}
+        self.assertEqual(set(rows), {node["id"] for node in self.route["nodes"]})
+        for node_id in ("plan", "independent-verify"):
+            tombstone = json.loads((self.completion / f"{node_id}.1.json").read_text(encoding="utf-8"))
+            self.assertEqual(rows[node_id]["restored_from"], R._digest(tombstone))
+        self.assertNotEqual(rows["plan"]["restored_from"], rows["independent-verify"]["restored_from"])
+        for node_id in ("impl-review", "test", "report"):
+            self.assertNotIn("restored_from", rows[node_id])
 
     def test_merge_index_snapshot_is_pending_only_while_merge_is_observed(self):
         git = ["git", "-C", str(self.root)]
@@ -3585,11 +3803,26 @@ class FrameTopCapacityTest(unittest.TestCase):
 
     def test_advance_replaces_once_at_deep_and_a_second_capacity_death_needs_attention(self):
         commands=[]
+        order=[]
+        route_module=D._route_module()
+        original_claim=R.claim
+        def claim(*args,**kwargs):
+            order.append('claim')
+            return original_claim(*args,**kwargs)
+        def restore(*_args,**_kwargs):
+            order.append('restore')
+            raise OSError('fixture restore error')
         def run(command,**kw):commands.append(command);return SimpleNamespace(returncode=0)
         with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None),\
                 mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None) as hold,\
-                mock.patch.object(R,'_retry_model',return_value='m-deep') as retry:
-            result=R.advance(self.jobs,'att-source',run=run)
+                mock.patch.object(R,'_retry_model',return_value='m-deep') as retry,\
+                mock.patch.object(route_module,'restore_consumed_tombstones',side_effect=restore),\
+                mock.patch.object(R,'claim',side_effect=claim):
+            error_output=io.StringIO()
+            with contextlib.redirect_stderr(error_output):
+                result=R.advance(self.jobs,'att-source',run=run)
+        self.assertEqual(order[:2],['restore','claim'])
+        self.assertIn('restore-consumed-tombstones error=OSError:fixture restore error',error_output.getvalue())
         self.assertEqual(result['reason'],'replacement-launch-pending')  # the fake launcher registered nothing
         retry.assert_called_once_with(mock.ANY,R.FRAME_CAPACITY)
         self.assertEqual(len(commands),1)
