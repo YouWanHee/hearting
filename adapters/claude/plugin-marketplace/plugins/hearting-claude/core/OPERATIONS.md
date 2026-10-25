@@ -1282,7 +1282,9 @@ missing sentinel or stale PID alone grants no such admission.
 An owner that already ended `BLOCKED`, or with a readable FAIL a person answers with an
 approved fix, keeps the answer (`retained`), and `correct`
 continues its route in the same call through a replacement owner that receives it
-(see the SD-157 replacement rule in §5.10). A readable FAIL with no failed
+(see the SD-157 replacement rule in §5.10). Normal start finds an adopted
+continuation's existing owner through its verified current binding and carries
+the retained answer into its replacement. A readable FAIL with no failed
 round-capped check continues once for each exact approved answer;
 absence of a failed check does not refuse the kept correction. Unresolved failed checks
 retain their closure-check ceiling, including refusal when that ceiling is spent.
