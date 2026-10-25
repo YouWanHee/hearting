@@ -179,6 +179,7 @@ utility-deferred	dispatch_log_retention.py
 utility-deferred	dispatch_observation_log.py
 utility-deferred	dispatch_harvest.test.py
 utility-deferred	dispatch_launch_tuple.py
+utility-deferred	dispatch_launch_evidence.py
 utility-deferred	dispatch_lifecycle.py
 utility-deferred	foreground_activity.py
 utility-deferred	dispatch_lifecycle.test.py

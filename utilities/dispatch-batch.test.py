@@ -3052,6 +3052,13 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual(receipt["state"], "launched")
         self.assertEqual([leg["adapter"] for leg in receipt["legs"]], ["codex", "claude"])
         self.assertNotEqual(receipt["legs"][0]["attempt_id"], receipt["legs"][1]["attempt_id"])
+        for leg, proc in zip(receipt["legs"], created):
+            evidence = json.loads((self.base / "logs" /
+                f"{leg['slug']}.{leg['attempt_id']}.{leg['adapter']}.wrapper.json").read_text())
+            self.assertEqual(evidence["returncode"], 0)
+            self.assertEqual(evidence["stdout_tail"], success_receipt(proc.command))
+            self.assertEqual(evidence["stderr_tail"], "")
+            self.assertNotIn("wrapper_evidence", leg)
 
     def test_opencode_owner_batch_reserves_spawns_joins_and_receipts(self):
         route = json.loads(json.dumps(self.route))
@@ -3696,6 +3703,91 @@ class DispatchBatchTest(unittest.TestCase):
                 mock.call(202, BATCH.signal.SIGTERM),
             ],
         )
+
+    def _run_diagnostic_wrapper_batch(self, harness, script_for_leg):
+        # Exercise the public batch path with real subprocess pipes. Only the
+        # external model launch/admission is replaced by fixture-owned scripts.
+        import copy
+        route = copy.deepcopy(self.route)
+        jobs = Path(tempfile.mkdtemp(prefix="diagnostic-batch-", dir=self.base)) / "jobs.log"
+        log_dir = jobs.parent / "nested" / "logs"
+        for node in route["nodes"]:
+            node["fallback_hops"][1]["candidates"].append(
+                {"child_harness": "opencode", "status": "supported"})
+        peer = "codex" if harness == "claude" else "claude"
+        assignments = [(node, adapter,
+                        "same-harness-headless" if adapter == "codex" else "cross-harness-headless",
+                        1 if adapter == "codex" else 2)
+                       for node, adapter in zip(route["nodes"], (harness, peer))]
+        original_command = BATCH.node_launch_command
+        def fixture_command(**kwargs):
+            script = script_for_leg(kwargs["leg"], original_command(**kwargs))
+            return [sys.executable, "-c", script]
+        output, error = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(BATCH, "load_route", return_value=route))
+            stack.enter_context(mock.patch.object(BATCH, "assign_harnesses", return_value=(
+                assignments, "cross-harness", {"families_considered": [], "usable_families": [],
+                    "family_exclusions": {}, "capacity": {}, "degradation_cause": ""})))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_agent_home", return_value=self.base))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_global_registry",
+                                                  return_value=SimpleNamespace(path=jobs)))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_live_parent_attempt"))
+            stack.enter_context(mock.patch.object(BATCH, "completion_marker_gate"))
+            stack.enter_context(mock.patch.object(BATCH.subprocess, "check_output", return_value=str(self.base)))
+            stack.enter_context(mock.patch.object(BATCH, "reserve_batch", return_value=["a" * 32, "b" * 32]))
+            stack.enter_context(mock.patch.object(BATCH, "cancel_unclaimed"))
+            stack.enter_context(mock.patch.object(BATCH, "node_launch_command", side_effect=fixture_command))
+            stack.enter_context(mock.patch.dict(os.environ, {
+                "AGENT_DISPATCH_SELF_SLUG": "owner", "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture",
+                "AGENT_DISPATCH_CURRENT_HARNESS": "codex", "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
+                "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write",
+                "AGENT_DISPATCH_JOBS": str(jobs)}))
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+                argv = self.argv()
+                argv[argv.index("--jobs") + 1] = str(jobs)
+                rc = BATCH.main(argv + ["--log-dir", str(log_dir)])
+        self.assertFalse(jobs.exists())
+        return rc, output.getvalue(), error.getvalue(), log_dir
+
+    def test_exit_one_wrapper_saves_bounded_traceback_for_each_harness(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                rc, stdout, stderr, log_dir = self._run_diagnostic_wrapper_batch(harness, lambda *_args:
+                    "import sys; print('한'*100000+'OUT'); "
+                    "print('앞'*100000, file=sys.stderr); "
+                    "raise RuntimeError('wrapper exit-one fixture')")
+                self.assertEqual(rc, 70)
+                self.assertEqual(stderr, "")
+                receipt = json.loads(stdout)
+                leg = next(row for row in receipt["legs"] if row["adapter"] == harness)
+                record = json.loads((log_dir /
+                    f"{leg['slug']}.{leg['attempt_id']}.{harness}.wrapper.json").read_text())
+                self.assertEqual(record["returncode"], 1)
+                self.assertEqual(record["attempt_id"], leg["attempt_id"])
+                self.assertTrue(record["stdout_tail"].endswith("OUT\n"))
+                self.assertIn("Traceback (most recent call last)", record["stderr_tail"])
+                self.assertTrue(record["stderr_tail"].endswith(
+                    "RuntimeError: wrapper exit-one fixture\n"))
+                for stream in ("stdout", "stderr"):
+                    self.assertLessEqual(len(record[f"{stream}_tail"].encode()),
+                                         BATCH.OUTPUT_TAIL_BYTES)
+                self.assertEqual((leg["exit_code"], leg["reason"]), (1, "invalid-wrapper-receipt"))
+        self.assertFalse(self.jobs.exists())
+
+    def test_evidence_write_failure_preserves_collected_output_and_receipt(self):
+        import dispatch_launch_evidence as evidence
+        script = lambda _leg, command: f"print({success_receipt(command)!r}, end='')"
+        expected = self._run_diagnostic_wrapper_batch("codex", script)
+        with mock.patch.object(evidence, "_write", side_effect=PermissionError("read-only")):
+            observed = self._run_diagnostic_wrapper_batch("codex", script)
+        # Independent fixture registries differ only in their printed ledger root.
+        normalized = observed[1].replace(str(observed[3].parent.parent),
+                                          str(expected[3].parent.parent))
+        self.assertEqual((observed[0], normalized, observed[2]), expected[:3])
+        self.assertEqual(expected[0], 0)
+        self.assertEqual(expected[2], "")
+        self.assertEqual(json.loads(expected[1])["state"], "launched")
 
     def test_wrapper_output_tail_is_memory_bounded(self):
         proc = BATCH.subprocess.Popen(

@@ -486,6 +486,14 @@ work the observer cannot see; it is not a HOME retention interval. Commit
 background sweep closed unseen work and pending runtime settlement, so HOME
 reclamation does not shorten the route policy.
 
+**Dispatch launch diagnostics.** The shared batch leg collector saves each
+wrapper's return code and the last 64 KiB of stdout and stderr beside that
+attempt's existing log, as `<slug>.<attempt>.<harness>.wrapper.json`. A failed
+launch fence saves its original exception and traceback tail in the matching
+`.launch-fence.txt`, even before a worker transcript exists. These bounded,
+best-effort sidecars are diagnostic only: receipts, launch decisions, gates,
+and successful command output retain their existing behavior across harnesses.
+
 **Dispatch log retention.** Only regular Hearting attempt logs bound by an
 exact registry `attempt_id`, harness, and canonical jobs-state `logs/` path are
 eligible for automatic retirement. A log becomes eligible only after its
