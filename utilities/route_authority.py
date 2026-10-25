@@ -624,6 +624,12 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                     raise _contract_error("owner-closure-intensity-unknown", "owner-closure-intensity-unknown:" + route["effective_intensity"])
                 raise
         worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
+        # Strict terminal no-start rows remain in the physical registry and in
+        # dispatch-node's lineage view, but are not launched rounds. Derive the
+        # exclusion from the same launch-fence proof used by retry admission.
+        from dispatch_contract import terminal_attempt_never_started
+        rows = [(status, meta) for status, meta in rows
+                if not terminal_attempt_never_started(status, meta)]
         kinds = [_ROUND.classify_round_row(s, m, worker_type=m.get("worker_type") or worker_type) for s, m in rows]
         source_digest = facts.get("source_subject_digest")
         source_aware = False
@@ -1727,6 +1733,17 @@ def resource_predecessor_finished(row):
         reboot_evidence,
     )
     from dispatch_resource_wait import supervisor
+    execution = row.get("execution") if isinstance(row, dict) else None
+    if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+        if (row.get("resource_policy") != "supervised-owner"
+                or row.get("cancel_requested") or row.get("parent_close_requested")
+                or row.get("status") not in {"failed", "succeeded"}):
+            return False
+        code = supervisor().runner().read_sentinel(row.get("sentinel"))
+        return (code is not None and row.get("exit_code") == code
+                and not (row.get("status") == "failed" and code == 0)
+                and not (row.get("status") == "succeeded" and code != 0)
+                and resource_process_group_quiescent(row))
     if resource_never_started(row):
         return True
     identity = classify_identity(row)
@@ -1753,12 +1770,21 @@ def resource_predecessor_finished(row):
                  or resource_process_group_quiescent(row)))
 
 
-def require_resource_predecessors(rows, candidate):
+def require_resource_predecessors(rows, candidate, *, observations=None):
     """Recheck execution and evidence-address protection within the existing reservation lock."""
     from dispatch_resource_wait import resource_evidence_paths_conflict
-    if any(not resource_predecessor_finished(row) or resource_evidence_paths_conflict(row, candidate)
-           for row in rows):
-        raise ValueError("resource-route-body-conflict")
+    observations = observations or {}
+    for row in rows:
+        execution = row.get("execution") if isinstance(row, dict) else None
+        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+            captured = observations.get(row.get("run_id"))
+            if (not captured or captured.get("row") != row
+                    or captured.get("state") != "quiescent"):
+                raise ValueError("resource-route-body-conflict")
+        elif not resource_predecessor_finished(row):
+            raise ValueError("resource-route-body-conflict")
+        if resource_evidence_paths_conflict(row, candidate):
+            raise ValueError("resource-route-body-conflict")
 
 
 # Same work, another launcher. Never-started work may be taken over by a launcher that runs
@@ -2540,10 +2566,8 @@ def bind_launch_access(args, *, runtime: str, default_roots, network_available: 
             # Prospective probes without an access request need no live owner.
             # A requested grant, including in dry-run, uses start's exact lookup.
             try:
-                repo = subprocess.check_output(
-                    ["git", "-C", str(args.worktree), "rev-parse", "--show-toplevel"],
-                    text=True, stderr=subprocess.DEVNULL,
-                ).strip()
+                from dispatch_contract import work_root_identity
+                repo = work_root_identity(args.worktree, route=route)
                 args.parent_binding = resolve_live_parent_attempt(
                     args.jobs_path, parent_slug=getattr(args, "parent_slug", None) or "",
                     repo=repo,
@@ -2652,13 +2676,12 @@ def _admit_supervised_owner_resource_start(args, agent_home, jobs):
         raise _contract_error("resource-owner-start-requires-live-parent", str(route_node))
     from dispatch_contract import (
         DispatchContractError, parent_lookup_worktree, resolve_live_parent_attempt,
+        work_root_identity,
     )
     import dispatch_owner_input as INPUT
     import subprocess
     try:
-        repo = subprocess.check_output(
-            ["git", "-C", args.worktree, "rev-parse", "--show-toplevel"], text=True,
-        ).strip()
+        repo = work_root_identity(args.worktree, route=route)
         owner = resolve_live_parent_attempt(
             Path(jobs),
             parent_slug=getattr(args, "parent_slug", None) or "",

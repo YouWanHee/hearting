@@ -25,7 +25,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
-from codex_permission_profile import commit_profile_config, config_arguments
+from codex_permission_profile import (commit_profile_config, config_arguments,
+                                      recordish_profile_config, named_profiles_available)
 from worker_runtime_home import prepare_worker_home, codex_worker_arguments
 import gpu_execution_sandbox as GPU_SANDBOX
 from dispatch_contract import (
@@ -722,7 +723,7 @@ def dispatch_prompt(
         if args.route_file
         else "validated dispatch metadata"
     )
-    heartbeat = runtime_progress_prompt()
+    heartbeat = runtime_progress_prompt(args)
     no_commit_clause = commit_policy.prompt_clause(args)
     completion_delivery = getattr(args, "resolved_completion_delivery", "poll-fallback")
     supervised = completion_delivery == "app-server-supervised"
@@ -770,14 +771,13 @@ def dispatch_prompt(
         f"- owner_harness: {args.owner_harness or '-'}\n"
         f"- worktree: {args.worktree}\n"
         f"- artifact_root: {args.artifact_root}\n"
-        f"{artifact_context_prompt(os.environ)}"
+        f"{artifact_context_prompt({**os.environ, 'AGENT_RUNTIME_DIR': getattr(args, 'runtime_dir', '')})}"
         f"- route_state: {route_state}\n\n"
         "Codex realization:\n"
         f"{contract_read_prompt(args, 'codex')}"
         "- An owner has no worker mode and must not load any unit persona path.\n"
         f"- Run $AGENT_HOME/adapters/codex/bin/preflight.sh qa-policy {args.qa} {qa_track(args.capability)} and keep its required assurance in the artifact.\n"
         "- The wrapper already validated capability mode, worker unit/mode, QA, artifact root, and any route record. Re-run worker-route only for a safety recheck.\n"
-        "- Before each edit run $AGENT_HOME/adapters/codex/bin/preflight.sh write <file>; preserve required test and tool-contract checks in the artifact.\n"
         "- Codex may still auto-discover project AGENTS.md; do not explicitly load the full harness adapter bootstrap or another runtime's adapter.\n\n"
         f"{heartbeat}"
         f"{no_commit_clause}"
@@ -815,7 +815,7 @@ def apply_gpu_execution_sandbox(args: argparse.Namespace) -> None:
                 raise DispatchContractError("dispatch-evidence-parent-runtime-mismatch",
                                             "selected GPU owner sandbox differs from its checked tuple")
     args.gpu_execution_selection = selection
-    args.gpu_execution_scope = True
+    args.gpu_execution_scope = bool(selection["gpu_scope"])
     args.sandbox = selection["sandbox"]
 
 
@@ -862,6 +862,7 @@ spec_read_marker_required = HARNESS_STATE.spec_read_marker_required
 _spec_grounding_dir = HARNESS_STATE.spec_grounding_dir
 _core_grounding_dir = HARNESS_STATE.core_grounding_dir
 route_bound_worker_writable_dirs = HARNESS_STATE.route_bound_worker_writable_dirs
+nested_opencode_store_writable_dirs = HARNESS_STATE.nested_opencode_store_writable_dirs
 progress_writable_dirs = HARNESS_STATE.progress_writable_dirs
 registry_writable_launch = HARNESS_STATE.registry_writable_launch
 
@@ -889,16 +890,26 @@ def nested_owner_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
     # write access the pre-release fence closes every child as
     # `summary-owner-launch-failed`/`never-launched`.
     summary_dirs = summary_writable_dirs()
+    opencode_store_dirs = nested_opencode_store_writable_dirs(args)
     candidates = (
         canonical_registry_root,
         claude_config / "session-env",
         *summary_dirs,
+        *opencode_store_dirs,
     )
     result = []
     seen = set()
+    opencode_roots = set(opencode_store_dirs)
     for path in candidates:
-        path = path.resolve()
-        if path in summary_dirs or path.is_dir():
+        if path in opencode_roots:
+            # Keep the final app directory lexical and recheck it at the
+            # adapter boundary. Never turn a leaf symlink into a wider mount.
+            path = path.parent.resolve(strict=False) / path.name
+            if path.is_symlink():
+                continue
+        else:
+            path = path.resolve()
+        if path in summary_dirs or path in opencode_store_dirs or path.is_dir():
             if path not in seen:
                 seen.add(path)
                 result.append(path)
@@ -915,6 +926,7 @@ def ensure_owner_writable_dirs(args: argparse.Namespace) -> None:
     to_create.extend(route_bound_worker_writable_dirs(args))
     if nested_owner_writable_dirs(args):
         to_create.extend(summary_writable_dirs())
+        to_create.extend(nested_opencode_store_writable_dirs(args))
     if spec_read_marker_required(args):
         to_create.append(_spec_grounding_dir(args))
     if getattr(args, "route_id", None) or getattr(
@@ -1066,6 +1078,8 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             "--approval", args.approval,
             "--writable-root", str(args.artifact_root),
         ]
+        if getattr(args, "runtime_dir", ""):
+            command += ["--writable-root", str(args.runtime_dir)]
         if getattr(args, "report_bundle_root", None) is not None:
             command += ["--writable-root", str(args.report_bundle_root)]
         if owner_supervised:
@@ -1074,6 +1088,13 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
                 command += ["--route-file", route[0], "--route-id", route[1], "--route-hash", route[2]]
             if getattr(args, "max_continuations", None) is not None:
                 command += ["--max-continuations", str(args.max_continuations)]
+        elif getattr(args, "route_file", None) and not (
+            getattr(args, "repository_kind", None) == "non-git"
+            and uses_enclosing_codex_sandbox(args)
+        ):
+            command += ["--route-file", args.route_file,
+                        "--route-id", getattr(args, "route_id", "") or "",
+                        "--route-hash", getattr(args, "route_hash", "") or ""]
         if commit_grant_target(args):
             # The supervisor builds the native profile; it only needs to know
             # whether this launch may commit (a primary checkout then gets the
@@ -1124,6 +1145,8 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         "--add-dir",
         args.artifact_root,
     ]
+    if getattr(args, "runtime_dir", ""):
+        cmd += ["--add-dir", str(args.runtime_dir)]
     cmd += codex_worker_arguments(getattr(args, "worker_runtime_env", None))
     if getattr(args, "report_bundle_root", None) is not None:
         cmd += ["--add-dir", str(args.report_bundle_root)]
@@ -1163,15 +1186,32 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
     if getattr(args, "execution_access_grant", None) is not None:
         for writable_dir in args.execution_access_grant.additional_writable_roots:
             cmd += ["--add-dir", str(writable_dir)]
-    profile = commit_profile_config(
-        args.worktree, [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--add-dir"],
-        effective_runtime_sandbox(args), args.nested_headless_network,
-        primary_commit=commit_grant_target(args),
-    )
-    if profile is not None:
-        cmd += config_arguments(profile)
+    write_roots = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--add-dir"]
+    if getattr(args, "repository_kind", "git") == "non-git":
+        if uses_enclosing_codex_sandbox(args):
+            # The non-git parent already runs inside its checked recordish OS sandbox.
+            # This child inherits that boundary, so it can reuse the git branch's sandbox mode.
+            cmd += ["--skip-git-repo-check", "--sandbox", "danger-full-access"]
+            profile = None
+        else:
+            profile = recordish_profile_config(
+                args.worktree, write_roots,
+                args.route_file or os.environ.get("AGENT_OWNER_ROUTE_FILE"),
+                network=args.nested_headless_network,
+            )
+            if profile is None:
+                raise RuntimeError("codex-non-git-recordish-profile-unsupported")
+            cmd += ["--skip-git-repo-check", *config_arguments(profile)]
     else:
-        cmd += ["--sandbox", effective_runtime_sandbox(args)]
+        profile = commit_profile_config(
+            args.worktree, write_roots,
+            effective_runtime_sandbox(args), args.nested_headless_network,
+            primary_commit=commit_grant_target(args),
+        )
+        if profile is not None:
+            cmd += config_arguments(profile)
+        else:
+            cmd += ["--sandbox", effective_runtime_sandbox(args)]
     if args.nested_headless_network and profile is None:
         cmd += ["-c", "sandbox_workspace_write.network_access=true"]
     if args.resolved_model_settings["source"] != "inherit":
@@ -1514,8 +1554,12 @@ def main(argv: list[str]) -> int:
     worktree = Path(args.worktree)
     if not worktree.is_dir():
         return fail("worktree-not-found", 66, worktree=args.worktree)
-    if subprocess.run(["git", "-C", args.worktree, "rev-parse", "--is-inside-work-tree"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
-        return fail("not-a-git-worktree", 65, worktree=args.worktree)
+    try:
+        from dispatch_contract import launch_repository_identity
+        args.repository_identity, args.repository_kind = launch_repository_identity(
+            args.worktree, args.route_file or os.environ.get("AGENT_OWNER_ROUTE_FILE"))
+    except DispatchContractError as exc:
+        return fail(exc.reason, 65, detail=exc.detail, worktree=args.worktree, child_spawned="0")
     invalid_mount = invalid_codex_mount_target(args, worktree)
     if invalid_mount is not None:
         return fail(
@@ -1530,6 +1574,7 @@ def main(argv: list[str]) -> int:
         )
     try:
         args.artifact_root = resolve_artifact_root(args.worktree)
+        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(args.artifact_root)
         args.report_bundle_root = resolve_report_bundle_root(args.route_file, args.route_node)
     except ValueError as e:
         return fail("writable-root-resolution-failed", 64, detail=str(e), worktree=args.worktree)
@@ -1727,10 +1772,7 @@ def main(argv: list[str]) -> int:
     args.parent_binding = None
     if args.dispatch_depth == 2 and action in ("register", "start"):
         try:
-            repo = subprocess.check_output(
-                ["git", "-C", args.worktree, "rev-parse", "--show-toplevel"],
-                text=True,
-            ).strip()
+            repo = args.repository_identity
             args.parent_binding = resolve_live_parent_attempt(
                 jobs,
                 parent_slug=args.parent_slug or "",
@@ -2026,6 +2068,7 @@ def main(argv: list[str]) -> int:
             # `campaigns/<camp>/cycles/<cyc>/artifacts/` and never issue a
             # second lineage.
             **artifact_cycle_environment(os.environ),
+            "AGENT_RUNTIME_DIR": getattr(args, "runtime_dir", ""),
             "REPORT_BUNDLE_ROOT": str(args.report_bundle_root or ""),
             "AGENT_ROUTE_FILE": (
                 args.route_file

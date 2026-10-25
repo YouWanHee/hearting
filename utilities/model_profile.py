@@ -441,8 +441,8 @@ def route_selection_pin(route_file, *, worker_type: str | None, adapter: str) ->
 # `dispatch-defaults.yaml`. `capability-route.py` stamps every frame node's
 # `model_profile` from this function at compile time, which is what makes any
 # static value in the recipe a placeholder rather than a second home.
-# A framed route that runs one frame leg (ordinary work, user decision 2026-10-07) runs it at
-# `deep`; both `top` legs are for uncertain or hard-to-reverse work.
+# A framed route narrowed by an explicit simple `quick`/`direct` request runs its single leg at
+# `deep`; the default pair and all standard+ pairs use `top` for both legs.
 FRAME_SINGLE_LEG_PROFILE = "deep"
 FRAME_PROFILE_LADDER = {
     "top": {"anchor": "top", "others": "top"},

@@ -468,7 +468,14 @@ EOF
       printf 'check=failed\nreason=opencode-command-unavailable\nworktree=%s\n' "$worktree"
       exit 69
     fi
-    if ! git -C "$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git_error=$(git -C "$worktree" rev-parse --show-toplevel 2>&1) || git_status=$?
+    if [ "${git_status:-0}" -ne 0 ]; then
+      if [ ! -e "$worktree/.git" ] && [ ! -L "$worktree/.git" ] \
+        && printf '%s' "$git_error" | grep -qi 'not a git repository (or any'; then
+        opencode_runtime_projection_check
+        printf 'check=ok\nrepository=non-git\nworktree=%s\n' "$worktree"
+        exit 0
+      fi
       printf 'check=failed\nreason=not-a-git-worktree\nworktree=%s\n' "$worktree"
       exit 65
     fi

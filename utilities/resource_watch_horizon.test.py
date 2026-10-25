@@ -103,6 +103,29 @@ class ResourceWatchHorizonTest(FIX.WorkflowFixture):
                     start.assert_not_called()
                 self.assertEqual(json.loads(registry.read_text())["runs"]["fixture-run"], row)
 
+    def test_running_compute_receipt_reattaches_without_remote_observation(self):
+        import dispatch_resource_wait as OWNER_RESOURCE
+        route, _, _, registry, _, ledger, armed, row = self.living(ordinary=True)
+        row.update({"status": "running", "execution": {"kind": "compute-hosts",
+                    "run_id": "compute-live", "receipt_state": "running"},
+                    "compute_run_id": "compute-live", "pid": None, "starttime": None,
+                    "command_hash": None, "pid_namespace": None, "process_group": None})
+        row["resource_binding"] = OWNER_RESOURCE.resource_body_digest(row)
+        armed["resource_binding"] = row["resource_binding"]
+        registry.write_text(json.dumps({"runs": {row["run_id"]: row}}))
+        with mock.patch.object(SUP.RR, "compute_execution_observation",
+                               side_effect=AssertionError("remote observation under recovery")), \
+                mock.patch.object(SUP.runner(), "start_watch",
+                                  return_value=(mock.Mock(), SUP.RR.proc_identity(os.getpid()))) as start:
+            self.assertEqual(SUP.resource_liveness_readonly(armed)["liveness"], "working")
+            self.assertEqual(SUP.predecessor_liveness_readonly(armed)["liveness"], "working")
+            recovered = SUP.reattach_resource_watch(route, ledger, armed)
+        self.assertIsNotNone(recovered)
+        self.assertTrue(recovered["recovered"])
+        start.assert_called_once()
+        self.assertEqual(json.loads(registry.read_text())["runs"][row["run_id"]]["execution"],
+                         row["execution"])
+
     def test_real_observer_ready_handshake_and_replay_keep_the_same_resource(self):
         route, _, _, registry, _, ledger, armed, original = self.living()
         owned = []

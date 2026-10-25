@@ -520,7 +520,8 @@ class ZenGoV2CredentialPrecedenceTest(unittest.TestCase):
             collectors.collect_all(harness_filter={"opencode"}, jobs_path=str(empty_jobs))
         filtered = collectors.collect_all.last_usage_snapshots["opencode"]
         current_payload = filtered["payload"]["provider_availability"]
-        self.assertEqual(current_payload["opencode-go-entitlement"]["account_scope"], entitlement_scope)
+        self.assertNotIn("account_scope", current_payload["opencode-go-entitlement"])
+        self.assertNotIn("account_scope", filtered["payload"])
         self.assertNotIn("openai", current_payload)
         self.assertNotIn("account:previous-selection",
                          {row.get("account_scope") for row in filtered["providers"]})
@@ -530,8 +531,8 @@ class ZenGoV2CredentialPrecedenceTest(unittest.TestCase):
         rendered = render._usage_header_rows([session], layout="wide",
                                               usage_snapshots={"opencode": filtered})
         text = "\n".join("".join(part for part, _style in row) for row in rendered)
-        self.assertIn("Go usage unavailable", text)
-        for detail in ("credential", "entitlement", "Zen", "OpenAI", "subscription"):
+        self.assertIn("Go usage unavailable · Go subscription missing", text)
+        for detail in ("entitlement", "Zen", "OpenAI"):
             self.assertNotIn(detail, text)
 
     def test_active_account_change_does_not_inherit_old_entitlement_denial(self):
@@ -657,6 +658,20 @@ class ZenGoRenderHeaderTest(unittest.TestCase):
         self.assertIn("Go usage unavailable", text)
         for detail in ("credential", "entitlement", "Zen", "OpenAI", "subscription"):
             self.assertNotIn(detail, text)
+
+    def test_error_marker_only_cache_renders_reason_without_sessions(self):
+        from fleet import render
+        snapshots = {"opencode": {"payload": None, "freshness": "unknown",
+                                  "observed_at": None,
+                                  "error_observation": {"error": "missing-credential",
+                                                        "reason": "credential-not-found",
+                                                        "observed_at": 1000}}}
+        rows = render._usage_header_rows([], usage_snapshots=snapshots, now=1000)
+        text = self._rows_text(rows)
+        self.assertIn("opencode", text)
+        self.assertEqual(text.count("Go usage unavailable"), 1)
+        self.assertIn("Go credential not found", text)
+        self.assertNotIn("%", text)
 
     def test_session_error_marker_renders_short_unavailable_status(self):
         from fleet import render

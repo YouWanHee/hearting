@@ -20,7 +20,6 @@ inventory. It is adapter-owned output, not a legacy runtime mode copy.
 ## Use
 
 - Use Codex file, terminal, approval, sandbox, hook, and skill surfaces.
-- Run `adapters/codex/bin/preflight.sh write <file> [session-id]` before edits.
 - For `tool-contract` modes, run the named contract check before claiming the tool-backed result.
 - If a required local provider or executable is unavailable, report the unavailable contract instead of silently downgrading.
 - Treat `adapters/codex/modes/qa/code-review.md` as the adapter-owned mode guide for this runtime.
@@ -128,6 +127,11 @@ gate must converge, not peel one layer per pass.
 - **Bug potential**: runtime errors, logic errors, type mismatches
 - **Performance**: unnecessary computation, memory waste, inefficient data loading
 - **Code quality**: duplication, unclear names, overly long functions, magic numbers
+- **Scope and cost**: compare actual changed files/lines with the plan estimate;
+  check whether an existing implementation of the same function was extended
+  where practical, whether a new module or code path duplicates one that exists,
+  and how actual size compares with the plan estimate. Compare long checks with
+  the attempt budget. Estimates inform review; they are not caps.
 - **Maintainability**: hardcoded paths, config/code separation, missing error handling
 - **Framework-specific pitfalls** (e.g. PyTorch: missing `.detach()`, memory leaks,
   device mismatches, in-place operations)

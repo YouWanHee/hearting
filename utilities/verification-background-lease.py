@@ -108,6 +108,11 @@ MEMORY_POLL_SECONDS = 1.0
 MEMORY_EXCEEDED_EXIT = 125
 PSS_DUTY_FACTOR = 20
 PEAK_RECORD_FRACTION = 16
+SUBREAPER_UNAVAILABLE_EXIT = 126
+SCOPE_CLEANUP_FAILED_EXIT = 127
+_CLEANUP_ACTIVE = False
+_LAUNCHING = False
+_DEFERRED_STOP: int | None = None
 
 
 def memory_budget_bytes() -> int:
@@ -363,6 +368,12 @@ def wait_within_budget(process: subprocess.Popen[bytes], timeout: float, scope: 
 
 
 def _stop(signum, _frame):
+    global _DEFERRED_STOP
+    if _CLEANUP_ACTIVE:
+        return
+    if _LAUNCHING:
+        _DEFERRED_STOP = signum
+        return
     raise SystemExit(128 + signum)
 
 
@@ -378,9 +389,11 @@ def terminate_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _CLEANUP_ACTIVE, _LAUNCHING, _DEFERRED_STOP
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, required=True)
     parser.add_argument("--memory-budget", metavar="SIZE", help="approved scope memory ceiling")
+    parser.add_argument("--require-subreaper", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = list(args.command)
@@ -392,18 +405,32 @@ def main(argv: list[str] | None = None) -> int:
         budget, source = resolve_memory_budget(args.memory_budget)
     except ValueError as exc:
         parser.error(f"--memory-budget {exc}")
-    become_subreaper()
+    subreaper_ready = become_subreaper()
+    if (args.require_subreaper
+            and (not subreaper_ready or os.getpid() not in process_table())):
+        print("verification-subreaper-unavailable", file=sys.stderr)
+        return SUBREAPER_UNAVAILABLE_EXIT
     for signum in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, _stop)
     scope = secrets.token_hex(8)
-    process = subprocess.Popen(command, start_new_session=True,
-                               env={**os.environ, SCOPE_ENV: scope})
+    process: subprocess.Popen | None = None
     lease_path: Path | None = None
     peak = MemoryPeak()
     on_peak = None
+    status = 1
+    _CLEANUP_ACTIVE = False
+    _DEFERRED_STOP = None
+    _LAUNCHING = True
     try:
-        # An adopted descendant that exits is collected at once, so a check that
-        # waits for a fixture to die never sees it lingering as this lease's zombie.
+        # A stop delivered between Popen's return and the assignment must not
+        # lose the child identity. Defer only that window; all setup after it
+        # is already inside this lifetime's cleanup boundary.
+        process = subprocess.Popen(command, start_new_session=True,
+                                   env={**os.environ, SCOPE_ENV: scope})
+        _LAUNCHING = False
+        if _DEFERRED_STOP is not None:
+            raise SystemExit(128 + _DEFERRED_STOP)
+        # Adopted descendants are reaped without taking the command's status.
         signal.signal(signal.SIGCHLD, lambda _signum, _frame: reap_zombies(keep=process.pid))
         lease = lease_context(command, args.timeout)
         if lease is not None:
@@ -437,24 +464,32 @@ def main(argv: list[str] | None = None) -> int:
                                     peak, on_peak)
         if status is None:
             terminate_group(process)
-            return 124
-        return status
+            status = 124
     except MemoryError as exc:
         print(exc, file=sys.stderr)
-        terminate_group(process)
-        return MEMORY_EXCEEDED_EXIT
-    finally:
-        print(peak.line(budget, source), file=sys.stderr, flush=True)
-        if process.poll() is None:
+        if process is not None:
             terminate_group(process)
-        left = end_scope(scope)
-        if left:
-            print(f"verification-scope-ended pids={','.join(map(str, left))}", file=sys.stderr)
+        status = MEMORY_EXCEEDED_EXIT
+    finally:
+        _CLEANUP_ACTIVE = True
+        _LAUNCHING = False
+        print(peak.line(budget, source), file=sys.stderr, flush=True)
+        if process is not None and process.poll() is None:
+            terminate_group(process)
+        ended = end_scope(scope)
+        remaining = sorted(scope_pids(process_table(), scope))
+        if ended:
+            print(f"verification-scope-ended pids={','.join(map(str, ended))}", file=sys.stderr)
+        if remaining:
+            print(f"verification-scope-cleanup-incomplete pids={','.join(map(str, remaining))}",
+                  file=sys.stderr)
+            status = SCOPE_CLEANUP_FAILED_EXIT
         if lease_path is not None:
             try:
                 lease_path.unlink()
             except FileNotFoundError:
                 pass
+    return status
 
 
 if __name__ == "__main__":
