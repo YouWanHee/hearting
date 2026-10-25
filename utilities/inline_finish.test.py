@@ -1250,6 +1250,90 @@ class SpecInlinePublicationTest(unittest.TestCase):
         outcome = json.loads(CAP.outcome_path(fixture.route_file).read_text())
         self.assertTrue(outcome["terminal_gate_proven"])
 
+    def test_code_inline_finish_without_spec_transaction_has_no_publication_attempt(self):
+        fixture = PublicInlineFinishTest()
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        with unittest.mock.patch.object(artifact_producer, "list_references",
+                                       side_effect=AssertionError("unseeded code must not enumerate references")), \
+                unittest.mock.patch.object(artifact_producer, "admit_shared",
+                                          side_effect=AssertionError("unseeded code must not attempt publication")):
+            done = fixture.finish()
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertNotIn("shared_publication", json.loads(done.stdout))
+        self.assertEqual(artifact_producer.status(fixture.root)["shared_spec_publications"], [])
+
+
+class CodeInlinePublicationTest(unittest.TestCase):
+    def test_same_route_inline_spec_transaction_publishes_code_authoring_delta(self):
+        fixture = PublicInlineFinishTest()
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+
+        base_route = CAP.compose_route(
+            capability="autopilot-spec", capability_mode="update", shape="direct", graph=None,
+            slug="inline-code-spec-base", cwd=fixture.repo, artifact_root=fixture.root,
+            campaign_key="inline-code-spec-base", parent_harness="codex", spec_read="fixture",
+            drift_verdict="within-spec",
+            work_request={"text": "Create the isolated component base.", "owner_harness": "codex"})
+        base_binding = artifact_lifecycle.admit_runtime_route(fixture.root, base_route)
+        base_route_file = Path(base_binding.route_file)
+        base_cycle = artifact_producer.begin(fixture.root, route_file=base_route_file,
+                                             capability="autopilot-spec", intensity="direct")
+        base_prd = Path(base_cycle["cycle_dir"]) / "artifacts/spec/c/prd.md"
+        base_prd.parent.mkdir(parents=True, exist_ok=True)
+        base_prd.write_bytes(b"# Component\nBefore\n")
+        evidence = fixture.base / "base-evidence.md"
+        evidence.write_text("base cycle completion\n", encoding="utf-8")
+        for node in base_route["nodes"]:
+            if node.get("terminal") is True:
+                CAP.write_completion_marker(base_route, node, node["id"], evidence)
+        outcome, _ = CAP.close_route(base_route, base_route_file,
+                                     commit="a" * 40, summary="inline base")
+        self.assertTrue(outcome["terminal_gate_proven"], outcome)
+        artifact_producer.finalize(fixture.root, cycle_id=base_cycle["cycle_id"])
+        base_publication = artifact_producer.completed_spec_publication(
+            fixture.root, cycle_id=base_cycle["cycle_id"], settle=True)
+        self.assertEqual(base_publication["status"], "admitted", base_publication)
+
+        self.assertTrue(fixture.route.get("spec_touch"))
+        inline_node = next(node for node in fixture.route["nodes"] if node.get("terminal") is True)
+        self.assertTrue(any(scope == "spec/**" or scope.startswith("spec/")
+                            for scope in inline_node["write_scope"]))
+        transaction = ROOT / "utilities/spec-transaction.py"
+        edit = (
+            "from pathlib import Path; import os; "
+            "p=Path(os.environ['AGENT_SPEC_ROOT'])/'prd.md'; "
+            "p.write_bytes(p.read_bytes()+b'After\\n')"
+        )
+        command = [sys.executable, str(transaction), "run",
+                   "--artifact-root", str(fixture.root), "--worktree", str(fixture.repo),
+                   "--route", str(fixture.route_file), "--node", inline_node["id"],
+                   "--spec-root", "c", "--", sys.executable, "-c", edit]
+        transaction_env = fixture.env.copy()
+        transaction_env.update({"AGENT_ROUTE_FILE": str(fixture.route_file),
+                                "AGENT_ROUTE_ID": fixture.route["route_id"],
+                                "AGENT_ROUTE_NODE": inline_node["id"]})
+        prepared = subprocess.run(command, cwd=fixture.repo, env=transaction_env,
+                                  capture_output=True, text=True)
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+
+        cycle_prd = fixture.cycle_dir / "artifacts/spec/c/prd.md"
+        source_bytes = cycle_prd.read_bytes()
+        self.assertEqual(source_bytes, b"# Component\nBefore\nAfter\n")
+        finished = fixture.finish()
+        self.assertEqual(finished.returncode, 0, finished.stderr + finished.stdout)
+        receipt = json.loads(finished.stdout)
+        self.assertEqual(receipt["shared_publication"]["status"], "admitted", receipt)
+        shared_tree, _revision = artifact_producer._verified_shared_spec(
+            fixture.root, receipt["shared_publication"]["shared_reference_id"],
+            receipt["shared_publication"]["shared_reference_revision_id"])
+        self.assertEqual(shared_tree["c/prd.md"], source_bytes)
+        references = artifact_producer.list_references(fixture.root, "spec")
+        self.assertEqual(references[0]["revisions"], [
+            base_publication["shared_reference_revision_id"],
+            receipt["shared_publication"]["shared_reference_revision_id"]])
+
 
 class NextLegFinishTest(PublicInlineFinishTest):
     """A direct route that is leg 0 of an approved route plan reports `next_leg` on finish and replay."""

@@ -172,6 +172,25 @@ class LinkedWorktreeSliceLaunchTest(unittest.TestCase):
         self.assertEqual(meta["launch_head"], git("rev-parse", "HEAD", cwd=self.linked))
         self.assertEqual(meta["source_commit_branch"], "fixture-slice")
 
+    def test_linked_slice_report_uses_the_route_cycle_after_parent_validation(self):
+        import artifact_producer
+
+        begun = artifact_producer.begin(
+            self.artifact, route_file=self.route_path, capability="autopilot-code",
+            intensity="standard", require_cycle=True, jobs=self.jobs)
+        output = Path(begun["env"]["AGENT_ARTIFACT_OUTPUT_DIR"])
+        self.brief.write_text("report: evidence/ss-linked-1/report.md\n", encoding="utf-8")
+        result = self.register_slice(inherited="att-owner-bravo")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = self.slice_row()
+        meta = self.metadata(row)
+        self.assertEqual((row[3], meta["parent_attempt_id"]),
+                         (str(self.linked), "att-owner-bravo"))
+        header = Path(meta["state_ledger"]).read_text(encoding="utf-8").splitlines()[0]
+        ledger = json.loads(header.removeprefix("<!-- worker-state-ledger:v1 ").removesuffix(" -->"))
+        self.assertEqual(set(ledger["fixed_files"]),
+                         {str(self.linked / "x.txt"), str(output / "evidence/ss-linked-1/report.md")})
+
     def claim(self, attempt):
         """Claim a registered row exactly as a start does, against the exact owner it inherited."""
         binding = D.resolve_live_parent_attempt(

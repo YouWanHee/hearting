@@ -24,7 +24,7 @@ metadata:
 
 ## Slice Mode
 
-If the assignment is a parallel sub-session slice (a phase brief, fixed files, `stage_authority=0`), this is all you do: edit only the fixed files, run only the slice's verify command, and report the changed files and the verify result. Skip the Git Safety Checkpoint, phase commits and rollback below — a slice makes no git writes (no add, commit, checkout, restore, stash, reset), reads git state with `GIT_OPTIONAL_LOCKS=0`, and leaves `checklist.md` and the dev log to the owner. If a file outside the list is needed, stop and hand off.
+If the assignment is a sub-session (phase brief, fixed files, `stage_authority=0`), complete all processable in-scope items, edit only the fixed worktree files, write the report to the artifact path assigned by the phase brief or dispatch prompt, and run the narrow verify command as a required check plus any additional checks named in the brief. The report is separate from source `fixed_files`. Skip the Git Safety Checkpoint, phase commits and rollback below — a slice makes no git writes (no add, commit, checkout, restore, stash, reset), reads git state with `GIT_OPTIONAL_LOCKS=0`, and leaves `checklist.md` and the dev log to the owner. If a needed source file is outside the list, finish independent in-scope work and report the exact path, change, and unfinished item without widening the fence.
 
 ## Commit Messages
 

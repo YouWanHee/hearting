@@ -1,10 +1,11 @@
 # Sub-session responsibilities
 
 - When dispatch metadata declares a sub-session, treat its phase brief and fixed
-  file list as an execution fence. Read the previous bounded handoff and the
-  assigned `_internal/state/<attempt_id>.md`; do not reload the full specification
-  unless the phase brief names it. If a required edit falls outside the fixed
-  list, stop and hand the gap back to the owner instead of widening scope.
+  file list as an execution fence. Read the phase brief and assigned
+  `_internal/state/<attempt_id>.md`; do not reload the full specification unless
+  the phase brief names it. If a required edit falls outside the fixed list,
+  finish independent in-scope work, then report the exact path, change, and
+  unfinished item to the owner without widening scope.
   For a bound artifact-only node, the effective list names its in-scope outputs
   from the phase brief; declared worktree files are read-only inputs, and brief
   output paths are relative to the cycle output directory.
@@ -21,14 +22,12 @@
 - A sub-session has `stage_authority=0`. It may report its own attempt result and
   bounded handoff, but it must not create, claim, or satisfy the route stage's
   completion marker.
-- A sub-session that belongs to a registered serial chain (SD-119) reads the
-  chain-scoped handoff (`dispatch_subsession_handoff.py`, one file per chain
-  under the artifact root) before its first edit — it is this session's only
-  carrier of the predecessor's completed items, exact next command,
-  invariants, and forbidden files. Immediately before ending its own attempt,
-  flush a fresh chain-scoped handoff for the next index. Neither read nor
-  flush touches `PreCompact`/`PostCompact` hooks; this handoff is scoped to
-  the chain, not to compaction inside one attempt.
+- In a registered serial chain (SD-119), only index 2 or later reads a
+  predecessor handoff, using the exact path supplied in its dispatch prompt.
+  Parallel slices, index 1, and a 1/1 gap-retry have no predecessor handoff.
+  The runtime writes any successor's chain-scoped handoff from the ledger; the
+  worker does not create a separate chain handoff output. Ledger updates and
+  compaction state remain separate from that runtime handoff.
 
 Native helper support inside a sub-session is checked separately from registered
 dispatch and never changes the gate:
