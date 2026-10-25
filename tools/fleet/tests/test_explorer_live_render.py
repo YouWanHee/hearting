@@ -113,6 +113,19 @@ class HeaderRule(unittest.TestCase):
 
 
 class CutRule(unittest.TestCase):
+    def test_route_header_uses_the_cell_before_age_without_overlapping_it(self):
+        frame = _frame(_vm(), "ROUTES", cols=100)
+        header = next(index for index, row in enumerate(frame.text_rows()) if "HARNESS" in row)
+        self.assertEqual(frame.cells[header][94][0], "P")
+        self.assertEqual(frame.cells[header][95][0], "R")
+        self.assertEqual(frame.cells[header][96][0], "A")
+
+    def test_route_kind_uses_the_cell_before_age_instead_of_dropping_its_last_glyph(self):
+        route = _route(capability="lab", mode="eval", intensity="standard", age="22h 32m")
+        rows = _frame(_vm(routes=[route], repos=[]), "ROUTES", cols=80).text_rows()
+        line = next(row for row in rows if "lab(eval" in row)
+        self.assertIn("lab(eval·s22h 32m", line)
+
     def test_system_field_lines_are_cut_at_the_pane_edge_without_an_ellipsis(self):
         system = dict(_mapping()["system"], install={"version": "v1.2.3", "managed": True, "pinned": True,
                                                        "distribution": True},

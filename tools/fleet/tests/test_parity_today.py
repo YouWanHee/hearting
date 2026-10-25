@@ -7,7 +7,7 @@ from unittest import mock
 
 from tools.fleet.tests.parity_compare import diff_frames
 from tools.fleet.tests.parity_today import (_frame_from_reference, _jsonable, _unique_reference_copy_limitations,
-                                            build_live_vm, classify)
+                                            build_live_vm, classify, main)
 
 
 class TodayParityPlumbingTests(unittest.TestCase):
@@ -25,10 +25,22 @@ class TodayParityPlumbingTests(unittest.TestCase):
         value = Value(3, object())
         self.assertEqual(_jsonable(value), {"count": 3, "hidden": None})
 
+    def test_cli_returns_failure_for_unexplained_strict_residue(self):
+        residue = _record(cells=[(20, 50, "a", "dim", "b", "dim")])
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch("tools.fleet.tests.parity_today.run_capture", return_value=(Path(temp), [residue])), \
+                mock.patch("tools.fleet.tests.parity_today.write_index"), \
+                mock.patch("builtins.print"):
+            result = main(["--out", temp, "--reference", temp])
+
+        self.assertEqual(result, 1)
+
 
 def _record(width=140, rows=45, cells=(), hits=None):
     blank = " " * width
     reference, fleet2 = [blank] * rows, [blank] * rows
+    reference_cells = [[(" ", None, None) for _ in range(width)] for _ in range(rows)]
+    fleet2_cells = [[(" ", None, None) for _ in range(width)] for _ in range(rows)]
     differences = [{"kind": "cell", "row": row, "column": column, "expected": [a, ka, None], "actual": [b, kb, None]}
                    for row, column, a, ka, b, kb in cells]
     if hits is not None:
@@ -36,12 +48,52 @@ def _record(width=140, rows=45, cells=(), hits=None):
     for row, column, a, _ka, b, _kb in cells:
         reference[row] = reference[row][:column] + a + reference[row][column + 1:]
         fleet2[row] = fleet2[row][:column] + b + fleet2[row][column + 1:]
+        reference_cells[row][column] = (a, _ka, None)
+        fleet2_cells[row][column] = (b, _kb, None)
     return {"state": "OVERVIEW", "width": width, "rows": rows, "reference_rows": reference, "fleet2_rows": fleet2,
-            "reference_edge": [False] * rows, "differences": differences}
+            "reference_edge": [False] * rows, "reference_cells": reference_cells, "fleet2_cells": fleet2_cells,
+            "differences": differences, "difference_count": len(differences)}
+
+
+def _rows_record(width, state, rows, *, start=0, hits=None, profile=None, fleet_style_overrides=None):
+    height = 45
+    reference_cells = [[(" ", None, None) for _ in range(width)] for _ in range(height)]
+    fleet2_cells = [[(" ", None, None) for _ in range(width)] for _ in range(height)]
+    fleet_style_overrides = fleet_style_overrides or {}
+    for row, (reference, fleet2) in rows.items():
+        for offset, char in enumerate(reference):
+            column = start + offset
+            if column < width:
+                style = "spin" if char in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠯⠷⠻" else "dim"
+                reference_cells[row][column] = (char, style, None)
+        for offset, char in enumerate(fleet2):
+            column = start + offset
+            if column < width:
+                style = "spin" if char in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠯⠷⠻" else "dim"
+                style = fleet_style_overrides.get((row, column), style)
+                fleet2_cells[row][column] = (char, style, None)
+    reference_rows = ["".join(cell[0] for cell in row) for row in reference_cells]
+    fleet2_rows = ["".join(cell[0] for cell in row) for row in fleet2_cells]
+    differences = []
+    for row in range(height):
+        for column in range(width):
+            expected, actual = reference_cells[row][column], fleet2_cells[row][column]
+            if expected != actual:
+                differences.append({"kind": "cell", "row": row, "column": column,
+                                    "expected": list(expected), "actual": list(actual)})
+    if hits is not None:
+        differences.append({"kind": "hits", "expected": hits[0], "actual": hits[1]})
+    record = {"state": state, "width": width, "rows": height, "reference_rows": reference_rows,
+              "fleet2_rows": fleet2_rows, "reference_cells": reference_cells, "fleet2_cells": fleet2_cells,
+              "reference_edge": [False] * height, "differences": differences}
+    if profile:
+        record["reference_profile"] = profile
+        record["reference_overflow_mask"] = {"version": "r14-v87-explicit-cell-mask-v1", "profile": profile, "cells": []}
+    return record
 
 
 class ClassificationTests(unittest.TestCase):
-    def test_narrow_reference_defects_precede_content_rules_but_clean_edges_keep_real_defects(self):
+    def test_narrow_reference_edge_flag_alone_never_excludes_interior_cell_differences(self):
         answered = _record(width=80, cells=[(10, 40, "x", "dim", "y", "dim")])
         answered["state"] = "QUESTIONS"
         answered["reference_rows"][10] = " " * 33 + "ANSWERED TODAY 20" + " " * 30
@@ -60,12 +112,41 @@ class ClassificationTests(unittest.TestCase):
         clean_context["fleet2_rows"][10] = " " * 33 + "context: unknown"
 
         docs = [classify([record]) for record in (answered, context, clean_context)]
-        self.assertEqual(docs[0]["entries"][0]["class"], "excluded")
-        self.assertEqual(docs[0]["entries"][0]["rule"], "question-header-overflow")
-        self.assertEqual(docs[1]["entries"][0]["class"], "excluded")
-        self.assertIn(docs[1]["entries"][0]["rule"], {"narrow-header-overflow", "routes-narrow"})
+        self.assertEqual(docs[0]["entries"][0]["class"], "unexplained")
+        self.assertEqual(docs[1]["entries"][0]["class"], "fleet2-defect")
         self.assertEqual((docs[2]["entries"][0]["class"], docs[2]["entries"][0]["rule"]),
                          ("fleet2-defect", "session-context-line"))
+
+    def test_reference_overflow_exclusion_requires_versioned_trace_for_every_changed_cell(self):
+        record = _record(width=80, cells=[(10, 78, "x", "dim", " ", None)])
+        record["state"] = "COMPUTE"
+        record["reference_cells"][10][78] = ["x", "dim", None]
+        record["fleet2_cells"][10][78] = [" ", None, None]
+        record["reference_profile"] = "mock-r14-v87"
+        record["reference_overflow_mask"] = {"version": "r14-v87-explicit-cell-mask-v1", "profile": "mock-r14-v87",
+                                               "cells": [{"row": 10, "column": 78, "kinds": ["text-beyond-width"]}]}
+        accepted = classify([record])["entries"][0]
+        self.assertEqual((accepted["class"], accepted["rule"]), ("excluded", "r14-reference-overflow-mask"))
+
+        record["differences"].append({"kind": "cell", "row": 10, "column": 50,
+                                      "expected": ["a", "dim", None], "actual": ["b", "dim", None]})
+        record["reference_cells"][10][50] = ["a", "dim", None]
+        record["fleet2_cells"][10][50] = ["b", "dim", None]
+        record["reference_rows"][10] = record["reference_rows"][10][:50] + "a" + record["reference_rows"][10][51:]
+        record["fleet2_rows"][10] = record["fleet2_rows"][10][:50] + "b" + record["fleet2_rows"][10][51:]
+        rejected = classify([record])["entries"][0]
+        self.assertEqual(rejected["class"], "unexplained")
+
+    def test_adjacent_rows_keep_independent_reference_masks(self):
+        record = _record(width=80, cells=[(10, 78, "x", "dim", " ", None),
+                                          (11, 50, "a", "dim", "b", "dim")])
+        record["state"] = "COMPUTE"
+        record["reference_profile"] = "mock-r14-v87"
+        record["reference_overflow_mask"] = {"version": "r14-v87-explicit-cell-mask-v1", "profile": "mock-r14-v87",
+                                               "cells": [{"row": 10, "column": 78, "kinds": ["text-beyond-width"]}]}
+        entries = classify([record])["entries"]
+        self.assertEqual([(entry["rows"], entry["class"]) for entry in entries],
+                         [([10, 10], "excluded"), ([11, 11], "unexplained")])
 
     def test_a_known_style_difference_gets_a_reason_and_an_owner(self):
         document = classify([_record(cells=[(1, 21, "━", "g_blocked", "━", "grp_live")])])
@@ -79,14 +160,47 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(document["summary"]["unexplained"], 1)
 
     def test_current_prd_spinner_order_is_intentional_and_not_a_system_pending_defect(self):
-        record = _record(width=80, cells=[(0, 2, "0", "dim", "⠏", "spin")])
-        record["state"] = "SYSTEM"
-        record["reference_rows"][0] = " 0 working  ● 0 idle  ● 0 answer needed   hearting v3.50.3-20-gad247e2b6  02:38⠏"
-        record["fleet2_rows"][0] = "  ⠏ 0 working  ● 0 idle  ● 0 answer needed   hearting v3.50.3-20-gad247e2b6  02"
-
+        census = " 0 working  ● 0 idle  ● 0 answer needed   hearting v3.50.3-20-gad247e2b6  02:38"
+        record = _rows_record(80, "SYSTEM", {0: (census + "⠏", "⠏" + census)})
         entry = classify([record])["entries"][0]
 
         self.assertEqual((entry["class"], entry["rule"]), ("intended", "prd-census-spinner-order"))
+
+    def test_ellipsis_rule_requires_the_ellipsis_itself_to_be_the_changed_cell(self):
+        prefix = "a longer field value"
+        record = _rows_record(80, "ROUTES", {10: (prefix + "X", prefix + "…")}, start=33)
+        entry = classify([record])["entries"][0]
+        self.assertEqual((entry["class"], entry["rule"]), ("fleet2-defect", "hard-cut-vs-ellipsis"))
+
+        record = _rows_record(80, "ROUTES", {10: (prefix + "X", prefix + "…")}, start=33)
+        record["fleet2_cells"][10][33 + len(prefix)] = ("X", "dim", None)
+        record["differences"] = [diff for diff in record["differences"]
+                                 if not (diff.get("kind") == "cell" and diff.get("row") == 10)]
+        record["differences"].append({"kind": "cell", "row": 10, "column": 79,
+                                      "expected": ["c", "dim", None], "actual": [" ", None, None]})
+        record["reference_cells"][10][79] = ("c", "dim", None)
+        record["fleet2_cells"][10][79] = (" ", None, None)
+        record["reference_rows"][10] = " " * 79 + "c"
+        record["fleet2_rows"][10] = " " * 80
+        entry = classify([record])["entries"][0]
+        self.assertEqual(entry["class"], "unexplained")
+
+    def test_spinner_position_does_not_hide_count_version_clock_or_style_changes(self):
+        census = " 0 working  ● 0 idle  ● 0 answer needed   hearting v3.50.3-20-gad247e2b6  02:38"
+        cases = [
+            ("⠏" + census.replace("0 working", "1 working", 1), {}),
+            ("⠏" + census.replace("gad247e2b6", "bad247e2b6", 1), {}),
+            ("⠏" + census.replace("02:38", "02:39", 1), {}),
+            ("⠏" + census, {(0, 45): "blocked"}),
+            ("⠏" + census, {(0, 0): "blocked"}),
+        ]
+        for candidate, styles in cases:
+            with self.subTest(candidate=candidate, styles=styles):
+                record = _rows_record(80, "SYSTEM", {0: (census + "⠏", candidate)},
+                                      fleet_style_overrides=styles)
+                entries = classify([record])["entries"]
+                self.assertTrue(entries)
+                self.assertEqual(entries[0]["class"], "unexplained")
 
     def test_empty_answered_repo_placeholder_does_not_claim_an_aggregate_count_defect(self):
         record = _record(width=140, cells=[(7, 40, "0", "dim", "·", "dim")])
@@ -119,20 +233,46 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual((entry["class"], entry["rule"]), ("intended", "right-edge-safe-clip"))
 
     def test_unknown_compute_track_is_a_narrow_reference_copy_limit(self):
-        record = _record(width=140, cells=[(5, 55, "·", "dim", "─", "dim"),
-                                          (6, 55, "·", "dim", "─", "dim")])
-        record["state"] = "COMPUTE"
-        record["reference_copy_limitations"] = [
-            {"reference_file": "mock13.py", "host": "moving4", "gpu": gpu,
-             "unknown_cells": ["UTIL", "VRAM gauge"]} for gpu in (0, 1)]
-        record["reference_rows"][5] = " " * 33 + "  moving4   ● 0  RTX 6000 Ada     ·    ·            ·"
-        record["fleet2_rows"][5] = " " * 33 + "  moving4   ● 0  RTX 6000 Ada    ·     ··········   ·"
-        record["reference_rows"][6] = " " * 33 + "            ● 1  RTX 6000 Ada     ·    ·            ·"
-        record["fleet2_rows"][6] = " " * 33 + "            ● 1  RTX 6000 Ada    ·     ··········   ·"
+        ref0 = "  moving4   ● 0  RTX 6000 Ada     ·    ·            ·"
+        live0 = "  moving4   ● 0  RTX 6000 Ada    ·     ··········   ·"
+        ref1 = "            ● 1  RTX 6000 Ada     ·    ·            ·"
+        live1 = "            ● 1  RTX 6000 Ada    ·     ··········   ·"
+        record = self._unknown_compute_record(140, ref0, live0, ref1, live1)
 
         entry = classify([record])["entries"][0]
 
         self.assertEqual((entry["class"], entry["rule"]), ("copy-limitation", "unknown-gpu-track"))
+
+    def test_unknown_compute_track_does_not_hide_interior_glyph_or_style_changes(self):
+        ref0 = "  moving4   ● 0  RTX 6000 Ada     ·    ·            ·"
+        live0 = "  moving4   ● 0  RTX 6000 Ada    ·     ··········   ·"
+        ref1 = "            ● 1  RTX 6000 Ada     ·    ·            ·"
+        live1 = "            ● 1  RTX 6000 Ada    ·     ··········   ·"
+        wrong_glyph = self._unknown_compute_record(140, ref0, live0.replace("moving4", "movingX"), ref1, live1)
+        wrong_style = self._unknown_compute_record(140, ref0, live0, ref1, live1,
+                                                   fleet_style_overrides={(5, 35): "blocked"})
+        for record in (wrong_glyph, wrong_style):
+            with self.subTest(record=record):
+                self.assertEqual(classify([record])["entries"][0]["class"], "unexplained")
+
+    def _unknown_compute_record(self, width, ref0, live0, ref1, live1, fleet_style_overrides=None):
+        record = _rows_record(width, "COMPUTE", {5: (" " * 33 + ref0, " " * 33 + live0),
+                                                 6: (" " * 33 + ref1, " " * 33 + live1)},
+                              fleet_style_overrides=fleet_style_overrides)
+        record["reference_copy_limitations"] = [
+            {"reference_file": "mock13.py", "host": "moving4", "gpu": gpu,
+             "unknown_cells": ["UTIL", "COMPUTE block VRAM percent", "VRAM gauge", "VRAM used/total"]}
+            for gpu in (0, 1)]
+        record["reference_profile"] = "mock-r14-v87"
+        record["reference_overflow_mask"] = {"version": "r14-v87-explicit-cell-mask-v1",
+                                               "profile": "mock-r14-v87", "cells": []}
+        for row in (5, 6):
+            for column in range(73, 82):
+                record["reference_cells"][row][column] = (" ", None, None)
+                for diff in record["differences"]:
+                    if diff.get("kind") == "cell" and diff.get("row") == row and diff.get("column") == column:
+                        diff["expected"] = [" ", None, None]
+        return record
 
     def test_a_hit_difference_on_a_row_whose_cells_are_equal_is_not_derived(self):
         hit = [30, 34, 100, ["scope", "x"]]
@@ -142,12 +282,53 @@ class ClassificationTests(unittest.TestCase):
     def test_a_hit_difference_on_an_explained_row_follows_its_cells(self):
         hit = [1, 34, 100, ["usage"]]
         document = classify([_record(cells=[(1, 21, "━", "g_blocked", "━", "grp_live")], hits=([hit], []))])
-        self.assertEqual(sorted(entry["class"] for entry in document["entries"]), ["derived", "fleet2-defect"])
+        self.assertEqual(sorted(entry["class"] for entry in document["entries"]), ["fleet2-defect", "unexplained"])
 
     def test_reference_hits_beyond_the_screen_are_the_recorded_narrow_width_defect(self):
         hit = [6, 71, 88, ["ui", "sel", "top/codex"]]
         document = classify([_record(width=80, hits=([hit], []))])
-        self.assertEqual((document["entries"][0]["class"], document["entries"][0]["rule"]), ("excluded", "hit-outside-screen"))
+        self.assertEqual((document["entries"][0]["class"], document["entries"][0]["rule"]), ("unexplained", "unexplained"))
+
+    def test_only_the_versioned_r14_models_hit_mask_excludes_ordered_hit_changes(self):
+        tiers = ("top", "deep", "balanced-deep", "balanced", "light", "mini")
+        expected = [([row, 71, 88, ["ui", "sel", f"{tier}/codex"]],
+                     [row, 90, 107, ["ui", "sel", f"{tier}/opencode"]])
+                    for row, tier in enumerate(tiers, 6)]
+        before = [5, 34, 42, ["ui", "tab", "OVERVIEW"]]
+        after = [12, 34, 42, ["ui", "tab", "SYSTEM"]]
+        reference = [before, *(item for pair in expected for item in pair), after]
+        fleet2 = [[row, 71, 78, ["ui", "sel", f"{tier}/codex"]]
+                  for row, tier in enumerate(tiers, 6)]
+        record = _record(width=80, hits=(reference, [before, *fleet2, after]))
+        record["state"] = "MODELS"
+        record["reference_profile"] = "mock-r14-v87"
+        record["reference_overflow_mask"] = {"version": "r14-v87-explicit-cell-mask-v1",
+                                               "profile": "mock-r14-v87", "cells": []}
+        hit_entry = classify([record])["entries"][0]
+        self.assertEqual((hit_entry["class"], hit_entry["rule"]),
+                         ("excluded", "r14-models-overflow-hit-mask"))
+
+        reordered = _record(width=80, hits=(reference, [after, *fleet2, before]))
+        reordered["state"] = "MODELS"
+        reordered["reference_profile"] = "mock-r14-v87"
+        reordered["reference_overflow_mask"] = {"version": "r14-v87-explicit-cell-mask-v1",
+                                                 "profile": "mock-r14-v87", "cells": []}
+        self.assertEqual(classify([reordered])["entries"][0]["class"], "unexplained")
+
+    def test_an_unmasked_or_reordered_hit_stays_unexplained_even_beside_a_cell_band(self):
+        first = [6, 40, 60, ["ui", "sel", "model/a"]]
+        changed = [6, 40, 61, ["ui", "sel", "model/a"]]
+        record = _record(cells=[(6, 45, "a", "dim", "b", "dim")], hits=([first], [changed]))
+        record["state"] = "MODELS"
+        record["reference_profile"] = "mock-r14-v87"
+        record["reference_overflow_mask"] = {"version": "r14-v87-explicit-cell-mask-v1",
+                                               "profile": "mock-r14-v87", "cells": []}
+        entries = classify([record])["entries"]
+        self.assertEqual(entries[1]["class"], "unexplained")
+
+        a, b = [1, 34, 40, ["ui", "tab"]], [2, 34, 40, ["ui", "tab"]]
+        reordered = _record(hits=([a, b], [b, a]))
+        self.assertEqual(classify([reordered])["entries"][0]["class"], "unexplained")
 
 
 class InjectionPieces(unittest.TestCase):

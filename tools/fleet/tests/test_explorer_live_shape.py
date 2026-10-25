@@ -195,5 +195,26 @@ class SectionShapes(unittest.TestCase):
         self.assertEqual(vm.sessions[0]["age"], "0m")
 
 
+class CensusHeaderTests(unittest.TestCase):
+    def test_narrow_census_only_header_keeps_spinner_and_full_freshness(self):
+        from tools.fleet.explorer.chrome import draw_chrome
+        from tools.fleet.explorer.grid import CellGrid
+        from tools.fleet.explorer.state import NavState
+        from tools.fleet.explorer.view_model import ExplorerViewModel
+
+        census = {"parts": [("⠏ 0", "spin"), (" working", "dim"), ("  ● 0", "idle"),
+                             (" idle", "dim"), ("  ● 0", "blocked"), (" answer needed", "dim"),
+                             ("   ", "branch_s")]}
+        vm = ExplorerViewModel(census=census, system={"install": {"version": "v3.50.3-20-gad247e2b6"},
+                                                      "usage_api": {"freshness": "02:38"}})
+        grid = CellGrid(80, 45)
+
+        row = "".join(cell[0] for cell in draw_chrome(grid, vm, NavState(view="OVERVIEW", scope="-" )).cells[0])
+
+        self.assertTrue(row.startswith("⠏ 0 working"), row)
+        self.assertIn("v3.50.3-20-gad247e2b6", row)
+        self.assertTrue(row.endswith("02:38"), row)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -65,11 +65,13 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
     x = 1
     for text, key in parts:
         x = grid.put(x, 0, text, key, limit=census_x - 2)
-    cx = max(x + 1, width - 1 - census_width)
+    census_only = census_x == 1 and x == 1
+    cx = 0 if census_only else max(x + 1, width - 1 - census_width)
+    census_limit = width if census_only else width - 1
     for text, key in census_parts:
-        if cx >= width - 1:
+        if cx >= census_limit:
             break
-        cx = grid.put(cx, 0, text, key, limit=width - 1)
+        cx = grid.put(cx, 0, text, key, limit=census_limit)
     usage = tuple(vm.usage or ())
     if not state.usage_open:
         more_x = width - 9
