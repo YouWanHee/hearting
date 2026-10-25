@@ -8664,6 +8664,44 @@ def _resource_stage_marker_current(route, node, marker, marker_path, jobs):
         return None
 
 
+def resource_completion_reuse_proof(route, node, marker_path, marker, jobs):
+    """Expose an already admitted resource completion without a model sidecar."""
+    identity = marker.get("resource_execution_identity")
+    if node.get("kind") != "resource-runner" or identity is None:
+        return None
+    if (not isinstance(identity, str) or not identity
+            or marker.get("registered_worker") is not False
+            or marker.get("attempt_id") is not None
+            or (node.get("continuation") or {}).get("kind") != "supervised"):
+        raise DispatchContractError("resource-completion-identity-unverified", "resource completion identity is not exact")
+    currency = gate_currency(route, node, marker_path, marker, jobs=jobs)
+    readiness = completion_attempt_readiness(route, node, marker, Path(jobs))
+    if currency.state != "current" or readiness.state != "ready":
+        raise DispatchContractError("resource-completion-unverified", "resource completion is not current and ready")
+    try:
+        import workflow_state
+        ledger = workflow_state.WorkflowLedger(route["route_id"], route.get("route_hash", ""), jobs=Path(jobs))
+        stage = ledger.read_only_state().get("nodes", {}).get(node["id"], {})
+        evidence = stage.get("evidence") or {}
+        if (stage.get("state") != "STAGE_SUCCEEDED"
+                or evidence.get("identity") != identity
+                or evidence.get("resource_execution_identity") != identity
+                or evidence.get("quiescent") is not True or evidence.get("terminal") is not True
+                or not (evidence.get("owner_successor_start") is True
+                        or evidence.get("owner_terminal_settlement") is True)
+                or not isinstance(evidence.get("resource_sha256"), str)
+                or not isinstance(evidence.get("owner_attempt_id"), str)):
+            raise ValueError("resource completion has no admitted quiescence")
+        return {"resource_execution_identity": identity,
+                "resource_sha256": evidence["resource_sha256"],
+                "owner_attempt_id": evidence["owner_attempt_id"],
+                "owner_successor_start": evidence.get("owner_successor_start") is True,
+                "owner_terminal_settlement": evidence.get("owner_terminal_settlement") is True,
+                "quiescent": True, "terminal": True}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise DispatchContractError("resource-completion-quiescence-unverified", "resource quiescence is not admitted") from exc
+
+
 def evidence_change_history_path(marker_path: Path, node_id: str) -> Path:
     """The append-only history of a node's evidence edits after its marker."""
     return marker_path.parent / f"{node_id}.evidence-changes.jsonl"

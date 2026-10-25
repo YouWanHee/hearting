@@ -13,6 +13,7 @@ import signal
 import sys
 
 from dispatch_contract import mark_attempt_launch_started
+from dispatch_launch_evidence import save_fence_failure
 
 
 PR_SET_PDEATHSIG = 1
@@ -113,6 +114,18 @@ def _failure_fd(argv: list[str] | None) -> int | None:
         return None
 
 
+def _save_failure(argv: list[str] | None, exc: Exception) -> None:
+    values = sys.argv[1:] if argv is None else argv
+    values = values[:values.index("--")] if "--" in values else values
+    # Existing fence arguments identify the log; no new caller input is needed.
+    try:
+        jobs = Path(values[values.index("--jobs") + 1])
+        attempt = values[values.index("--attempt-id") + 1]
+        save_fence_failure(jobs, attempt, exc)
+    except (ValueError, IndexError):
+        pass
+
+
 def _write_failure(fd: int | None, exc: OSError | ValueError) -> None:
     if fd is None:
         return
@@ -142,9 +155,13 @@ def cli(argv: list[str] | None = None) -> int:
     try:
         return main(argv)
     except (OSError, ValueError) as exc:
+        _save_failure(argv, exc)
         _write_failure(_failure_fd(argv), exc)
         print(f"launch-fence: {exc}", file=sys.stderr)
         return 70
+    except Exception as exc:
+        _save_failure(argv, exc)
+        raise  # Preserve the unhandled exception's original exit and traceback.
 
 
 if __name__ == "__main__":

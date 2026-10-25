@@ -418,6 +418,12 @@ def main(argv: list[str] | None = None) -> int:
         budget, source = resolve_memory_budget(args.memory_budget)
     except ValueError as exc:
         parser.error(f"--memory-budget {exc}")
+    try:
+        from verification_runtime import verification_command
+        command, command_env = verification_command(command)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"loopback-only-unsupported: {exc}", file=sys.stderr)
+        return 69
     subreaper_ready = become_subreaper()
     if (args.require_subreaper
             and (not subreaper_ready or os.getpid() not in process_table())):
@@ -439,7 +445,7 @@ def main(argv: list[str] | None = None) -> int:
         # lose the child identity. Defer only that window; all setup after it
         # is already inside this lifetime's cleanup boundary.
         process = subprocess.Popen(command, start_new_session=True,
-                                   env={**os.environ, SCOPE_ENV: scope})
+                                   env={**command_env, SCOPE_ENV: scope})
         _LAUNCHING = False
         if _DEFERRED_STOP is not None:
             raise SystemExit(128 + _DEFERRED_STOP)

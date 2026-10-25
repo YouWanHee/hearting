@@ -318,6 +318,7 @@ def public_run_record(run, *, status=None, observation=None, metrics=None,
     result = {
         "schema_version": 1,
         "run_id": run.get("run_id"),
+        "observer_of": run.get("observer_of"),
         "campaign_id": run.get("campaign_id"),
         "cycle_id": run.get("cycle_id"),
         "route_id": run.get("route_id"),
@@ -542,6 +543,7 @@ def _notice_texts(run, event_kind, observation, record_path, sources):
         run_line += f" row={run['row_id']}"
     entries = [run_line, f"public run record={record}"]
     if event_kind == "final":
+        entries.append(f"status={run.get('status') or 'unknown'}; exit={run.get('exit_code')}")
         entries.append(f"마지막={points('latest_metrics', latest)}; 최고={points('best_metrics', best)}; 추세={summary.get('trend') or '판정 불가'}")
         entries.append(f"실제={_duration(observation.get('elapsed_seconds'))}; 계획={_duration(observation.get('planned_seconds'))}")
         if observation.get("attention"):
@@ -1246,6 +1248,42 @@ def _config_argument(argv):
     return refs[0] if len(refs) == 1 and refs[0] else None
 
 
+def _request_output(run):
+    """A launch's hash-bound request may name the output directly (C1, 2026-10-25)."""
+    argv = run.get("command")
+    if not isinstance(argv, list):
+        return None
+    def argument(name):
+        values = [argv[i + 1] for i, value in enumerate(argv[:-1]) if value == name]
+        values += [value[len(name) + 1:] for value in argv if value.startswith(name + '=')]
+        return values[0] if len(values) == 1 else None
+    reference, expected = argument('--request'), argument('--request-sha256')
+    if not reference or not expected:
+        return None
+    try:
+        path = Path(reference)
+        if not path.is_absolute():
+            path = Path(run['cwd']) / path
+        path, mapped = _reverse_namespace_path(path, run.get('path_namespace'))
+        if run.get('path_namespace') and not mapped:
+            return None
+        raw, _ = _read_unrooted(path)
+        if hashlib.sha256(raw).hexdigest() != _hash(expected):
+            return None
+        request = _json(raw)
+        if not isinstance(request, dict):
+            return None
+        values = {value for key in ('output', 'output_dir', 'output_folder', 'save_dir')
+                  if isinstance((value := request.get(key)), str) and value}
+        if len(values) != 1:
+            return None
+        value = next(iter(values))
+        # Reuse the existing namespace, link and directory checks.
+        return discover_output_root({**run, 'observation': {'path': value}, 'command': []})
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        return None
+
+
 def discover_output_root(run):
     """Resolve only explicit output-directory keys in an exact run config."""
     if not isinstance(run, dict):
@@ -1268,6 +1306,9 @@ def discover_output_root(run):
             except (OSError, RuntimeError, ValueError):
                 return None
     command = run.get("command")
+    request_output = _request_output(run)
+    if request_output:
+        return request_output
     cwd = run.get("cwd")
     reference = _config_argument(command) if isinstance(command, list) else None
     if not reference or not isinstance(cwd, str) or not cwd:
