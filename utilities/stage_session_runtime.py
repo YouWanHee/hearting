@@ -326,6 +326,17 @@ def bind(args: argparse.Namespace, *, artifact_root: str | Path, action: str) ->
     args.report_file = _resolve_report_output(args)
     if args.report_file:
         args.effective_fixed_files = sorted(set(args.effective_fixed_files) | {args.report_file})
+        if fence is not None and args.report_file in fence[0]:
+            try:
+                route = json.loads(Path(args.route_file).read_text(encoding="utf-8"))
+                from worker_bootstrap import qa_primary_items_sidecar
+                sidecar = qa_primary_items_sidecar(
+                    route, args.route_node, args.report_file)
+            except (OSError, TypeError, ValueError):
+                sidecar = ""
+            if sidecar:
+                args.effective_fixed_files = sorted(
+                    set(args.effective_fixed_files) | {sidecar})
     axes = {
         "attempt_schema_version": 2,
         "dispatch_depth": args.dispatch_depth,
