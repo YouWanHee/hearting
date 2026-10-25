@@ -2352,11 +2352,15 @@ Resumed retirement determines self-target from its recorded requester's session
 and pane identity. A cancelled request is terminal history:
 a new explicit request for the same lifetime accepts a fresh duty while retaining
 the cancelled record; repeated active or completed requests share that fresh duty.
-When the retire succeeds from the pane started beside the predecessor, the
-predecessor's open depth-1 routes pass to the successor, on any harness: it may
-`start` and `correct` them, and their stored completion records reach it
-(`retire ... handover=<n>`). Registry rows, their registered parent and worker
-identities stay as they are; cards and notices are not moved.
+An explicitly accepted typed cross-seat handoff records the predecessor's
+open depth-1 routes to the exact successor through the common seat ledger,
+before reply delivery or physical retirement settles. The successor may then
+`start` and `correct` them, and their stored completion records reach it. The
+registered parent, worker, receipt, claim, and ACK identities stay anchored to
+their original storage; cards and notices are not moved. Physical retirement
+remains a separate retained duty and still observes the original process
+birth, executor work, busy state, drafts, and forms. A later retire replay
+reuses the same ledger row rather than creating another transfer.
 Deferred retirement resolves succession from the recorded requester session and
 pane, with the original successor mark predating acceptance and matching both
 requester and predecessor. Proven loss of the booked predecessor
@@ -2845,9 +2849,12 @@ handoff supplies the existing `session_tidy.py handoff accept <ref>` command.
 After reading the card and referenced documents, the receiver uses that exact
 command; it binds the current receiver and transfer ref. Ordinary messages and
 cards have no accept command or successor authority. A confirmed same-seat clear
-uses the existing seat handover automatically. Explicit acceptance schedules the
-retained reply and normal predecessor retire reservation using the original exact
-identities. Delivery is receipt, not acceptance.
+uses the existing seat handover automatically. Explicit acceptance records the
+current parent and completion recipient in the common seat ledger, then schedules
+the retained reply and normal predecessor retire reservation with the original
+exact identities. Reply delivery and physical retire remain separate retained
+duties; an unknown reply does not delay the accepted authority transfer. Delivery
+is receipt, not acceptance.
 For an actionable peer request that can be completed now, reply once with the
 result. For work that will wait or take sustained effort, send one short receipt and
 continue through the existing registered continuation. Informational/no-reply
