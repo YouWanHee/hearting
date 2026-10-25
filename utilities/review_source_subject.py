@@ -195,6 +195,11 @@ def has_review_subject(route: dict, node: dict, jobs: str | Path | None = None,
         return True
     if is_deploy_review(route, node):
         return jobs is not None and deploy_request_subject(route, node, jobs) is not None
+    if _design_review(node):
+        try:
+            _design_build_node(route, node)
+        except SourceSubjectError:
+            return False  # No sealed build means no content subject to infer.
     try:
         import review_input
         if review_input.is_review_node(node) and reviewed_input is None:
@@ -1354,6 +1359,8 @@ def marker_subject(route: dict, node: dict, *, attempt_id: str | None = None,
                    evidence_sha256: str | None = None) -> dict | None:
     """Subject fields to put on a newly published completion marker."""
     reviewed_input = _review_input_binding(jobs, attempt_metadata)
+    if is_deploy_review(route, node) and not has_review_subject(route, node, jobs):
+        return None  # A request without scoped inputs keeps its existing identity.
     family = _subject_family(route, node, reviewed_input)
     if family is None and node.get("kind") == "review-worker":
         candidate = _generic_artifact_review_subject(route, node)
@@ -1470,26 +1477,8 @@ def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str |
             elif (marker.get("review_gate_closure") == "owner-closure"
                   and marker.get("review_independence") == "owner-overridden"):
                 document_review = True
-            elif jobs is not None:
-                candidate_possible = False
-                if review_input.is_plan_review_node(node):
-                    if review_input.has_plan_producer(route, node):
-                        marker_path = (Path(jobs).resolve().parent / "completion"
-                                       / str(route.get("route_id")) / "plan.json")
-                        candidate_possible = marker_path.is_file()
-                    elif not review_input.is_spec_review_node(node):
-                        try:
-                            candidate_possible = review_input.sealed_plan_input(route, node) is not None
-                        except DispatchContractError:
-                            candidate_possible = False
-                if candidate_possible:
-                    try:
-                        document_review = review_input.resolve_input(
-                            route, node, jobs) is not None
-                    except DispatchContractError:
-                        # Without an exact, currently selected input, a legacy
-                        # marker retains its pre-content identity.
-                        document_review = False
+            # An available plan today cannot identify what an unbound
+            # historical review consumed. Keep its pre-content identity.
     except ImportError:
         document_review = False
     artifact_review = _design_review(node) or document_review or generic_review

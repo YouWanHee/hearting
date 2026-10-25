@@ -7743,7 +7743,11 @@ def write_completion_marker(
         reviewed_input = None
         import review_input
         if review_input.is_review_node(node):
-            reviewed_input = review_input.resolve_input(route, node, jobs)
+            try:
+                reviewed_input = review_input.resolve_input(route, node, jobs)
+            except DispatchContractError:
+                if (attempt_metadata or {}).get("review_input_digest"):
+                    raise
         from review_source_subject import has_review_subject, observe
         if has_review_subject(route, node, jobs, reviewed_input):
             current_subject = observe(route, node, worktree=route.get("cwd"), jobs=jobs,
@@ -9707,7 +9711,11 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
     if jobs is not None:
         import review_input
         if review_input.is_review_node(node):
-            reviewed_input = review_input.resolve_input(route, node, jobs)
+            try:
+                reviewed_input = review_input.resolve_input(route, node, jobs)
+            except DispatchContractError:
+                if row_metadata.get("review_input_digest"):
+                    raise
     from review_source_subject import (SourceSubjectError, annotate_rows, has_review_subject,
                                        observe, read_binding, source_epoch)
     if has_review_subject(route, node, jobs, reviewed_input):
@@ -9724,12 +9732,14 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
                 or binding.get("family", "source") != current.get("family", "source")
                 or binding["source_epoch"] != epoch)):
             refuse("source-subject-stale", row_metadata.get("attempt_id", ""))
-        source_subject_digest = current["digest"]
         try:
             rounds = annotate_rows(jobs, rounds, route=route, node=node,
                                    family=current.get("family", "source"))
         except SourceSubjectError as exc:
             refuse("source-subject-unverifiable", getattr(exc, "reason", str(exc)))
+        if (binding is not None or current.get("family", "source") == "source"
+                or any(meta.get("_review_subject_digest") for _status, meta in rounds)):
+            source_subject_digest = current["digest"]
     choice = ROUTE_AUTHORITY.decide_continuation(route, action="owner-closure", node=node, rows=rounds,
         facts=({"source_subject_digest": source_subject_digest}
                if source_subject_digest is not None else None))

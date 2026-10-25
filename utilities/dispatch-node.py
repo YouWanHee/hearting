@@ -488,8 +488,15 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
  producer_preview = next((item for item in auto_revisions
                           if item.get("node_id")=="plan" and item.get("stage_authority")=="revision"),None)
  input_options = {"producer_preview": producer_preview} if not record_auto_revisions and producer_preview else {}
- reviewed_input = (resolve_input(route,node,jobs,reviewed_evidence,**input_options)
-                   if is_review_node(node) else None)
+ reviewed_input = None
+ if is_review_node(node):
+  try:
+   reviewed_input = resolve_input(route,node,jobs,reviewed_evidence,**input_options)
+  except DispatchContractError:
+   if reviewed_evidence or producer_preview or route.get("ancestor_plan_refresh"):
+    raise
+   # An unresolved legacy input keeps its node budget. The existing completion
+   # and launch gates retain their exact producer/integrity refusal.
  if (source_subject_digest is None
      and has_review_subject(route, node, jobs, reviewed_input)):
   from review_source_subject import SourceSubjectError, annotate_rows, observe

@@ -32,7 +32,9 @@ def is_review_node(node):
 def is_plan_review_node(node):
     return (isinstance(node, dict) and node.get("kind") == "review-worker"
             and (node.get("unit") == "qa/plan-review"
-                 or node.get("completion_gate") == "code-plan-check"))
+                 or (node.get("completion_gate") == "code-plan-check"
+                     and node.get("unit") in {"qa/simplicity-check", "qa/assumption-check",
+                         "qa/failure-mode-check", "qa/edge-case-check", "qa/test-gap-check"})))
 
 
 def is_spec_review_node(node):
