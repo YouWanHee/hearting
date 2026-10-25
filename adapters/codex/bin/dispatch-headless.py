@@ -862,6 +862,7 @@ spec_read_marker_required = HARNESS_STATE.spec_read_marker_required
 _spec_grounding_dir = HARNESS_STATE.spec_grounding_dir
 _core_grounding_dir = HARNESS_STATE.core_grounding_dir
 route_bound_worker_writable_dirs = HARNESS_STATE.route_bound_worker_writable_dirs
+nested_opencode_store_writable_dirs = HARNESS_STATE.nested_opencode_store_writable_dirs
 progress_writable_dirs = HARNESS_STATE.progress_writable_dirs
 registry_writable_launch = HARNESS_STATE.registry_writable_launch
 
@@ -889,16 +890,26 @@ def nested_owner_writable_dirs(args: argparse.Namespace) -> tuple[Path, ...]:
     # write access the pre-release fence closes every child as
     # `summary-owner-launch-failed`/`never-launched`.
     summary_dirs = summary_writable_dirs()
+    opencode_store_dirs = nested_opencode_store_writable_dirs(args)
     candidates = (
         canonical_registry_root,
         claude_config / "session-env",
         *summary_dirs,
+        *opencode_store_dirs,
     )
     result = []
     seen = set()
+    opencode_roots = set(opencode_store_dirs)
     for path in candidates:
-        path = path.resolve()
-        if path in summary_dirs or path.is_dir():
+        if path in opencode_roots:
+            # Keep the final app directory lexical and recheck it at the
+            # adapter boundary. Never turn a leaf symlink into a wider mount.
+            path = path.parent.resolve(strict=False) / path.name
+            if path.is_symlink():
+                continue
+        else:
+            path = path.resolve()
+        if path in summary_dirs or path in opencode_store_dirs or path.is_dir():
             if path not in seen:
                 seen.add(path)
                 result.append(path)
@@ -915,6 +926,7 @@ def ensure_owner_writable_dirs(args: argparse.Namespace) -> None:
     to_create.extend(route_bound_worker_writable_dirs(args))
     if nested_owner_writable_dirs(args):
         to_create.extend(summary_writable_dirs())
+        to_create.extend(nested_opencode_store_writable_dirs(args))
     if spec_read_marker_required(args):
         to_create.append(_spec_grounding_dir(args))
     if getattr(args, "route_id", None) or getattr(
@@ -1562,7 +1574,8 @@ def main(argv: list[str]) -> int:
         )
     try:
         args.artifact_root = resolve_artifact_root(args.worktree)
-        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(args.artifact_root)
+        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(
+            args.artifact_root, repository_kind=args.repository_kind, source_root=args.worktree)
         args.report_bundle_root = resolve_report_bundle_root(args.route_file, args.route_node)
     except ValueError as e:
         return fail("writable-root-resolution-failed", 64, detail=str(e), worktree=args.worktree)

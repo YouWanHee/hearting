@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import worker_bootstrap as W
 import dispatch_terminal_commit as T
 import artifact_producer as AP
 import dispatch_contract as DC
+import dispatch_wrapper_common as C
 import route_identity
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -103,6 +105,236 @@ class WorkerBootstrapTest(unittest.TestCase):
                                                "AGENT_RUNTIME_DIR": str(explicit)})
             self.assertIn(f"- runtime_dir: {explicit}", prompt)
             self.assertIn("checkpoints under runtime_dir", prompt)
+
+    def test_non_git_runtime_uses_stable_state_and_exact_inheritance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "original"
+            source.mkdir()
+            artifact_root = base / "external-artifacts"
+            artifact_root.mkdir()
+            home = base / "home"
+            xdg = base / "xdg"
+            harness = base / "harness-state"
+            digest = hashlib.sha256(str(artifact_root.resolve()).encode("utf-8")).hexdigest()
+
+            cases = (
+                ({"HOME": str(home)}, home / ".local/state/hearting/dispatch"),
+                ({"HOME": str(home), "XDG_STATE_HOME": str(xdg)}, xdg / "hearting/dispatch"),
+                ({"HOME": str(home), "XDG_STATE_HOME": str(xdg),
+                  "HARNESS_STATE_ROOT": str(harness)}, harness / "dispatch"),
+            )
+            for environ, stable_root in cases:
+                with self.subTest(environ=tuple(environ)):
+                    expected = stable_root / "project-runtimes" / digest
+                    candidate = W.runtime_dir_candidate(
+                        artifact_root, environ, repository_kind="non-git", source_root=source)
+                    self.assertEqual(candidate, str(expected))
+                    self.assertFalse(expected.exists(), "candidate selection must not create runtime state")
+                    inherited = {**environ, "AGENT_RUNTIME_DIR": str(expected)}
+                    self.assertEqual(W.runtime_dir_candidate(
+                        artifact_root, inherited, repository_kind="non-git", source_root=source),
+                        str(expected))
+
+            self.assertEqual(W.runtime_dir_candidate(
+                artifact_root, {"HOME": str(home)}, repository_kind="git", source_root=source),
+                str(artifact_root.parent / ".agent_runtime"))
+            self.assertEqual(W.runtime_dir_candidate(artifact_root, {}),
+                             str(artifact_root.parent / ".agent_runtime"))
+
+            unsafe_generated = (
+                home / ".local/state/hearting/dispatch/project-runtimes" / ("f" * 64),
+                home / ".local/state/hearting/dispatch/project-runtimes" / digest / "suffix",
+                home / ".local/state/hearting/dispatch/project-runtimes" / (digest + "0"),
+            )
+            for value in unsafe_generated:
+                with self.subTest(value=value):
+                    self.assertEqual(W.runtime_dir_candidate(
+                        artifact_root, {"HOME": str(home), "AGENT_RUNTIME_DIR": str(value)},
+                        repository_kind="non-git", source_root=source), "")
+
+            dedicated = base.parent / f"{base.name}-dedicated-runtime"
+            self.assertEqual(W.runtime_dir_candidate(
+                artifact_root, {"AGENT_RUNTIME_DIR": str(dedicated)},
+                repository_kind="non-git", source_root=source), str(dedicated))
+            self.assertEqual(W.runtime_dir_candidate(
+                artifact_root, {"HOME": str(home), "XDG_STATE_HOME": "relative"},
+                repository_kind="non-git", source_root=source), "")
+            # A broken state source cannot displace a valid explicit override.
+            self.assertEqual(W.runtime_dir_candidate(
+                artifact_root, {"XDG_STATE_HOME": "relative", "AGENT_RUNTIME_DIR": str(dedicated)},
+                repository_kind="non-git", source_root=source), str(dedicated))
+
+    def test_non_git_generated_runtime_fails_closed_on_source_artifact_release_and_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "source"
+            source.mkdir()
+            artifact_root = base / "artifacts"
+            artifact_root.mkdir()
+            digest = hashlib.sha256(str(artifact_root.resolve()).encode("utf-8")).hexdigest()
+
+            self.assertEqual(W.runtime_dir_candidate(
+                artifact_root, {"HARNESS_STATE_ROOT": str(source)},
+                repository_kind="non-git", source_root=source), "")
+            self.assertEqual(W.runtime_dir_candidate(
+                artifact_root, {"HARNESS_STATE_ROOT": str(artifact_root)},
+                repository_kind="non-git", source_root=source), "")
+            self.assertEqual(W.runtime_dir_candidate(
+                artifact_root, {"HARNESS_STATE_ROOT": str(base / ".harness/releases/v1/state")},
+                repository_kind="non-git", source_root=source), "")
+            self.assertEqual(W.runtime_dir_candidate(
+                artifact_root, {"HOME": str(base)}, repository_kind="non-git",
+                source_root=source.parent), "")
+
+            state = base / "state"
+            stable = state / "dispatch"
+            runtimes = stable / "project-runtimes"
+            outside = base / "outside"
+            outside.mkdir()
+            stable.mkdir(parents=True)
+            runtimes.symlink_to(outside, target_is_directory=True)
+            self.assertEqual(W.runtime_dir_candidate(
+                artifact_root, {"HARNESS_STATE_ROOT": str(state)},
+                repository_kind="non-git", source_root=source), "")
+            runtimes.unlink()
+            runtimes.mkdir()
+            (runtimes / digest).symlink_to(outside, target_is_directory=True)
+            self.assertEqual(W.runtime_dir_candidate(
+                artifact_root, {"HARNESS_STATE_ROOT": str(state)},
+                repository_kind="non-git", source_root=source), "")
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_non_git_generated_runtime_omits_namespace_parent_alias_before_preparation(self):
+        for location, inherited in (("home", False), ("xdg", False), ("home", True)):
+            for marker in (None, b"*\n"):
+                with self.subTest(location=location, inherited=inherited, marker=marker), \
+                        tempfile.TemporaryDirectory() as tmp:
+                    base = Path(tmp)
+                    source, artifacts, home = (base / name for name in ("source", "artifacts", "home"))
+                    for path in (source, artifacts, home):
+                        path.mkdir()
+                    (source / "user.txt").write_bytes(b"preserve source\n")
+                    (artifacts / "report.txt").write_bytes(b"preserve artifact\n")
+                    values = {"HOME": str(home)}
+                    if location == "xdg":
+                        values["XDG_STATE_HOME"] = str(base / "xdg")
+                    namespace = DC.stable_state_root(values) / "project-runtimes"
+                    namespace.mkdir(parents=True)
+                    (namespace / "other-project").mkdir()
+                    (namespace / "other-project" / "checkpoint").write_bytes(b"preserve runtime\n")
+                    if marker is not None:
+                        (namespace / ".gitignore").write_bytes(marker)
+                    digest = hashlib.sha256(str(artifacts.resolve()).encode("utf-8")).hexdigest()
+                    alias = namespace / digest
+                    alias.symlink_to(namespace, target_is_directory=True)
+                    if inherited:
+                        values["AGENT_RUNTIME_DIR"] = str(alias)
+
+                    def snapshot():
+                        return {str(path.relative_to(base)):
+                                ("link", os.readlink(path)) if path.is_symlink() else
+                                ("file", path.read_bytes(), path.stat().st_mtime_ns) if path.is_file() else
+                                ("dir",) for path in base.rglob("*")}
+
+                    before = snapshot()
+                    candidate = W.runtime_dir_candidate(
+                        artifacts, values, repository_kind="non-git", source_root=source)
+                    record = {"campaign_id": "camp_test", "cycle_id": "cyc_test", "producer_id": "prod_test"}
+                    route = {"source_commit": "unversioned", "cwd": str(source)}
+                    with mock.patch.dict(os.environ, values, clear=True), \
+                            mock.patch.object(AP, "cycle_dir", return_value=artifacts / "cycle"), \
+                            mock.patch("artifact_workflow_groups.group_for_cycle", return_value=None):
+                        produced = AP._env_for(artifacts, record, route)
+                    prepared = C.prepare_runtime_root(
+                        str(artifacts), values, repository_kind="non-git", source_root=str(source))
+                    self.assertEqual({"candidate": candidate, "producer": produced.get("AGENT_RUNTIME_DIR", ""),
+                                      "prepared": prepared, "snapshot_unchanged": snapshot() == before},
+                                     {"candidate": "", "producer": "", "prepared": "", "snapshot_unchanged": True})
+
+    def test_non_git_parent_alias_keeps_existing_outside_home_explicit_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "source"
+            artifacts = source / ".agent_reports"
+            source.mkdir()
+            artifacts.mkdir()
+            values = {"HOME": str(base / "home"), "XDG_STATE_HOME": str(base / "xdg")}
+            namespace = DC.stable_state_root(values) / "project-runtimes"
+            namespace.mkdir(parents=True)
+            digest = hashlib.sha256(str(artifacts.resolve()).encode("utf-8")).hexdigest()
+            alias = namespace / digest
+            alias.symlink_to(namespace, target_is_directory=True)
+            for explicit in (alias, namespace):
+                with self.subTest(explicit=explicit):
+                    # This is a generic dedicated override outside HOME, even
+                    # when the generated candidate itself cannot be used.
+                    self.assertEqual(W.runtime_dir_candidate(
+                        artifacts, {**values, "AGENT_RUNTIME_DIR": str(explicit)},
+                        repository_kind="non-git", source_root=source), str(namespace))
+            self.assertFalse((namespace / ".gitignore").exists())
+
+    def test_non_git_generated_runtime_keeps_safe_canonical_aliases_and_lazy_preparation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source, artifacts = base / "source", base / "artifacts"
+            source.mkdir()
+            artifacts.mkdir()
+            artifact_alias = base / "artifact-alias"
+            artifact_alias.symlink_to(artifacts, target_is_directory=True)
+            values = {"HOME": str(base / "home")}
+            stable = DC.stable_state_root(values)
+            namespace = stable / "canonical-runtimes"
+            namespace.mkdir(parents=True)
+            (stable / "project-runtimes").symlink_to(namespace, target_is_directory=True)
+            digest = hashlib.sha256(str(artifacts.resolve()).encode("utf-8")).hexdigest()
+            expected = namespace / "dedicated-runtime"
+            (namespace / digest).symlink_to(expected, target_is_directory=True)
+            for root in (artifacts, artifact_alias):
+                for override in ({}, {"AGENT_RUNTIME_DIR": str(namespace / digest)},
+                                 {"AGENT_RUNTIME_DIR": str(expected)}):
+                    with self.subTest(root=root, override=override):
+                        self.assertEqual(W.runtime_dir_candidate(
+                            root, {**values, **override}, repository_kind="non-git", source_root=source),
+                            str(expected))
+                        self.assertFalse(expected.exists(), "selection must remain pure")
+            self.assertEqual(C.prepare_runtime_root(
+                str(artifact_alias), values, repository_kind="non-git", source_root=str(source)), str(expected))
+            marker = expected / ".gitignore"
+            before = marker.read_bytes(), marker.stat().st_mtime_ns
+            self.assertEqual(C.prepare_runtime_root(
+                str(artifacts), values, repository_kind="non-git", source_root=str(source)), str(expected))
+            self.assertEqual((marker.read_bytes(), marker.stat().st_mtime_ns), before)
+            self.assertEqual(before[0], b"*\n")
+            self.assertEqual(list(source.iterdir()), [])
+            self.assertEqual(list(artifacts.iterdir()), [])
+
+    def test_producer_passes_only_validated_unversioned_route_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "original"
+            source.mkdir()
+            artifact_root = base / "external-artifacts"
+            artifact_root.mkdir()
+            home = base / "home"
+            record = {"campaign_id": "camp_test", "cycle_id": "cyc_test", "producer_id": "prod_test"}
+            route = {"source_commit": "unversioned", "cwd": str(source)}
+            values = {"HOME": str(home)}
+            with mock.patch.dict(os.environ, values, clear=True), \
+                    mock.patch.object(AP, "cycle_dir", return_value=base / "cycle"), \
+                    mock.patch("artifact_workflow_groups.group_for_cycle", return_value=None):
+                produced = AP._env_for(artifact_root, record, route)
+                legacy = AP._env_for(artifact_root, record, {"source_commit": "abc123", "cwd": str(source)})
+                route_free = AP._env_for(artifact_root, record)
+            expected = W.runtime_dir_candidate(
+                artifact_root, values, repository_kind="non-git", source_root=source)
+            self.assertEqual(produced["AGENT_RUNTIME_DIR"], expected)
+            self.assertEqual(W.runtime_dir_candidate(
+                artifact_root, {**values, **produced}, repository_kind="non-git",
+                source_root=source), expected)
+            self.assertEqual(legacy["AGENT_RUNTIME_DIR"], str(artifact_root.parent / ".agent_runtime"))
+            self.assertEqual(route_free["AGENT_RUNTIME_DIR"], str(artifact_root.parent / ".agent_runtime"))
+            self.assertFalse(Path(expected).exists(), "producer environment issuance must not prepare runtime")
 
     def test_nested_producer_environment_and_child_prompt_keep_default_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -362,6 +594,37 @@ class NodeScopeTest(unittest.TestCase):
                 prompt,
             )
             self.assertIn(str(cycle_dir / "artifacts" / "shards" / "research" / "notes.md"), prompt)
+
+    def test_completion_precedence_applies_without_route_or_done_when(self):
+        task = ("Original request: O1 record the first result; O2 calculate all group totals; "
+                "O3 inspect every file and report the findings. Execution scope: report.")
+        for worker_type in ("owner", "stage", "review", "support"):
+            with self.subTest(worker_type=worker_type):
+                prompt = W.assignment_prompt(SimpleNamespace(worker_type=worker_type), task, {})
+                self.assertTrue(prompt.startswith("Assignment:\n" + task + "\n\n"))
+                self.assertIn("Completion precedence:", prompt)
+                self.assertIn("within the approved endpoint and this node's assigned scope", prompt)
+                self.assertIn("Stop at an approved report endpoint", prompt)
+                self.assertIn("a bounded stage completes only its assigned portion", prompt)
+                self.assertIn("report it with the existing outcome semantics", prompt)
+                self.assertIn("presenting the whole request as complete", prompt)
+                self.assertNotIn("Done when (sealed ids", prompt)
+
+    def test_bounded_stage_keeps_its_scope_and_report_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            route_file = self._route(root)
+            task = "Original request: O1, O2, O3. Execution scope: report."
+            cycle_dir = root / "artifact_root" / "campaigns" / "camp1" / "cyc1"
+            prompt = W.assignment_prompt(
+                SimpleNamespace(worker_type="stage", route_file=str(route_file), route_node="research"),
+                task,
+                {"AGENT_ARTIFACT_CYCLE_ID": "cyc1", "AGENT_ARTIFACT_CYCLE_DIR": str(cycle_dir)},
+            )
+            self.assertTrue(prompt.startswith("Assignment:\n" + task + "\n\nCompletion precedence:"))
+            self.assertIn(str(cycle_dir / "artifacts" / "shards" / "research" / "notes.md"), prompt)
+            self.assertIn("approved report endpoint", prompt)
+            self.assertNotIn("Done when (sealed ids", prompt)
 
     def test_child_prompt_uses_child_node_and_preserves_exact_review_cycle_context(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -791,7 +1054,8 @@ class OwnerInlineMarkerPromptTest(OPA.OwnerRefineBase):
         self.assertIn("first finish stage review", texts[0])
 
     def test_no_text_without_a_route_or_for_a_stage_worker(self):
-        self.assertEqual(W.assignment_prompt(SimpleNamespace(worker_type="owner"), "T", {}), "Assignment:\nT\n\n")
+        prompt = W.assignment_prompt(SimpleNamespace(worker_type="owner"), "T", {})
+        self.assertIn("Assignment:\nT\n\nCompletion precedence:", prompt)
         self.assertEqual(W.owner_inline_marker_prompt(SimpleNamespace(worker_type="stage", route_file="x")), "")
 
     def test_a_code_owner_gets_the_marker_line_and_no_gate_line(self):

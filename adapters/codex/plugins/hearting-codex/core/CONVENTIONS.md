@@ -32,6 +32,8 @@ Intensity supplies the default recipe below; an explicit graph selects its stage
 | `thorough` | Strong groups plus deeper synthesis/verification | A declared group may add a third implementation-risk, failure-mode, or contrarian leg; unchanged groups remain width two | The base recipe realizes only registry-declared 2–4-way siblings; composed routes may add other bounded dispatch-depth-2 perspectives | thorough |
 | `adversarial` | Thorough plus adversarial failure-mode/security verification | Use the route-declared width and adversarial perspective; no undeclared fan-out | Bounded declared group or composed adversary/verifier; dispatch depth remains at most 2 | adversarial |
 
+Intensity controls procedure and default rigor; the recorded request, released decisions, approved endpoint, and node scope control delivery. Quick examples and concise procedures do not replace requested investigation, deliverables, or verification. Complete feasible assigned work, honor report endpoints, and report unfinished duties with the existing outcome semantics. A bounded stage stops at its assigned portion.
+
 Stage gates check whether output can feed the next stage. Independent QA runs only where selected, using a separate execution with a different declared persona or perspective. Same-harness review is independent (allocation order in §2.1). Further legs retain declared profile and perspective diversity. Final verification remains capability-specific. Never add an omitted plan-check or report an unexecuted check as passed.
 
 Dispatch depth is portable route topology, not process ancestry, runtime-native
@@ -70,7 +72,7 @@ Rigor budgets assurance inside the selected graph. It creates no stages or dispa
 | `thorough` | `thorough` | Deeper or multi-axis review | Keep declared groups and realize their thorough width, commonly adding an implementation-risk, failure-mode, or contrarian third leg | Broader evidence and adequacy review | Up to two corrections |
 | `adversarial` | `adversarial` | Hostile owner-plan critique | Realize the adversarial route width and any selected security, contradiction, or failure-mode perspective | Verification plus adversarial evidence | Two corrections plus one selected adversary pass |
 
-A correction in the retry budget is one **batched** pass that closes every blocking finding of the failing round together; the review that follows is a closure check of that list plus the delta (unit Round Protocol), never a fresh full audit. This correction obligation exists only after a substantive verdict for the current review subject. The budget unit is the **verdict round** — a round that renders an actual judgment (a recognized success note, a blocking review, or an explicit FAIL), not a crashed, capacity-dead, or invalid-envelope attempt that never reached one; the cap counts only verdict rounds, so a verdict-less round neither spends it nor creates findings to close. If no substantive verdict exists for the current subject, the next admitted review is a full independent first review even when the node has earlier verdict-less attempts in its lineage. A run of verdict-less rounds is bounded on its own axis: after `B=2` consecutive verdict-less rounds on the same node, the node is `verdictless-bound` and routes through the sealed fallback chain's remaining unregistered hop (native subagent, then owner-inline) instead of a third silent registered attempt — a live gap in verdicts is a stall, not a budget the node can keep spending against. A review round that ends with blocking findings is a completed round, not a failed worker (`completed-review-blocking`); when the verdict-round budget is spent and the last round still reports blocking findings, the owner closes the gate itself with an owner-closure record (`round_{N}.owner-closure.md`) that names every blocking round and its disposition, and `OPERATIONS §5.10` owns the evidence contract that lets that record complete the node.
+A correction in the retry budget is one **batched** pass that closes every blocking finding of the failing round together; the review that follows is a closure check of that list plus the delta (unit Round Protocol), never a fresh full audit. This correction obligation exists only after a substantive verdict for the current review subject. The budget unit is the **verdict round** — a round that renders an actual judgment (a recognized success note, a blocking review, or an explicit FAIL), not a crashed, capacity-dead, or invalid-envelope attempt that never reached one; the cap counts only verdict rounds, so a verdict-less round neither spends it nor creates findings to close. If no substantive verdict exists for the current subject, the next admitted review is a full independent first review even when the node has earlier verdict-less attempts in its lineage. A run of verdict-less rounds that actually crossed the launch fence is bounded on its own axis: after `B=2` consecutive verdict-less rounds on the same node, the node is `verdictless-bound` and routes through the sealed fallback chain's remaining unregistered hop (native subagent, then owner-inline) instead of a third silent registered attempt — a live gap in launched verdicts is a stall, not a budget the node can keep spending against. Terminal rows with the strict no-start proof stay outside this streak; an open registration still reserves its round. Their bound is the sealed fallback chain itself: one start moves past every candidate that does not start, and a group gap is placed again without the harnesses it could not start on until none remain (`parallel-headless-unavailable`). A review round that ends with blocking findings is a completed round, not a failed worker (`completed-review-blocking`); when the verdict-round budget is spent and the last round still reports blocking findings, the owner closes the gate itself with an owner-closure record (`round_{N}.owner-closure.md`) that names every blocking round and its disposition, and `OPERATIONS §5.10` owns the evidence contract that lets that record complete the node.
 
 For implementation reviews, the verdict budget is counted per automatically observed source-content subject. Reposting the same content, changing only reports or marker sequence, or returning to earlier content does not create a new budget; a different source subject gets its own ordinary independent review budget. A PASS remains bound to the subject recorded at launch and cannot satisfy a changed subject. A legacy PASS without a source binding remains unknown and is not assigned a subject from `launch_head`; if continuation reaches that marker, it resumes at the review for an ordinary independent judgment. The round number and verdict history remain node-lineage history. Owner-closure is available only for an eligible blocking review and cannot convert PASS into a new completion. A review the ship deploy node depends on is counted the same way once a parent deploy request exists: its subject is that request's hashed inputs inside the review's own input scope, so changed deploy inputs get one ordinary independent review and identical inputs stay capped.
 
@@ -89,6 +91,8 @@ Track rules:
 - Spec review checks coherence and downstream API/data/UI impact; factual citations may additionally require source checking.
 
 Intensity resolves in this order: explicit `--intensity`, capability default, then request shape in `WORKFLOW §1.1`. Rigor then maps deterministically: direct to none/light, quick to quick, standard or strong to standard, thorough to thorough, and adversarial to adversarial.
+
+For frame proposals, shape constrains the effective intensity: `direct` uses `direct`, `solo` uses `quick`, and `staged` uses `standard` or higher. A conflicting known intensity in a proposal is normalized to the shape default and recorded for review; unknown values remain invalid. A person-entered CLI mismatch is refused with the allowed values.
 
 An external adversary is required only when an adversarial graph actually selects that pass. The adapter must prove that a different reviewer, engine, or harness ran. If an explicitly requested adversarial pass is unavailable, fail loudly; if routing auto-escalated, fall back to thorough and report it. Runtime wrapper names are not portable semantics.
 
@@ -554,17 +558,27 @@ worktree. Explicit CLI paths retain their argument meaning, and route-free
 invocations keep the standalone defaults below.
 
 Execution environments, package/model caches, external checkouts and training
-checkpoints belong in the project runtime home, the sibling
-`.agent_runtime/` of the resolved artifact root, or an explicitly selected
-dedicated absolute runtime directory outside that root. Resolving through
-`artifact-root.sh` makes linked worktrees share the primary checkout's runtime
-home. Launch preparation creates this location lazily with its own `.gitignore`
-containing `*`; if the optional location cannot safely be prepared, the launch
-omits its runtime hint and permission and continues. This is not a write gate.
-Keep small reports, configs and provenance in artifacts; checkpoint records
-may point to runtime files with path, SHA256 and byte size. Use job-scoped cache
-variables when isolation is needed. Dataset bulk copies should generally be
-referenced by path and hash, without automatic classification or copying.
+checkpoints belong in the project runtime home, an explicitly selected
+dedicated absolute runtime directory outside the source, artifact, and
+artifact-parent project roots, or the generated non-Git runtime below. Git and
+unknown-kind launches retain the
+sibling `.agent_runtime/` of the resolved artifact root. A launch that has
+validated an unversioned source defaults to
+`stable_state_root(environ)/project-runtimes/<sha256(canonical-artifact-root)>`;
+the digest is the full SHA-256 hex of the canonical artifact-root UTF-8 path.
+Valid explicit overrides and exact inherited legacy sibling values keep their
+existing meaning. A child may inherit only the exact generated non-Git default;
+unsafe state resolution, source/artifact overlap, or an escaping symlink omits
+the optional runtime without falling back into the source tree. Resolving
+through `artifact-root.sh` makes linked worktrees share the primary checkout's
+artifact identity. Launch preparation creates the selected location lazily
+with its own `.gitignore` containing `*`; if the optional location cannot
+safely be prepared, the launch omits its runtime hint and permission and
+continues. This is not a write gate. Keep small reports, configs and provenance
+in artifacts; checkpoint records may point to runtime files with path, SHA256
+and byte size. Use job-scoped cache variables when isolation is needed. Dataset
+bulk copies should generally be referenced by path and hash, without automatic
+classification or copying.
 
 ### §5.2. Tier Definitions
 

@@ -23,6 +23,13 @@ ADAPTERS={
 FAKE_WORKER_TIMEOUT="30"
 
 
+def fake_shell(harness, payload):
+ # Version inspection is preparation, not a worker payload or counted spawn.
+ version = ('[ "$1" = --version ] && { echo 1.19.0; exit 0; }\n'
+            if harness == "opencode" else "")
+ return "#!/bin/sh\n" + version + payload
+
+
 class AdapterV11Test(unittest.TestCase):
  def test_stage_attempt_budget_prompt(self):
   for harness in ADAPTERS:
@@ -215,7 +222,7 @@ class AdapterV11Test(unittest.TestCase):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
    fakebin=root/"bin"; fakebin.mkdir(); fake=fakebin/harness
-   fake.write_text("#!/bin/sh\nexec sleep 60\n",encoding="utf-8"); fake.chmod(0o755)
+   fake.write_text(fake_shell(harness,"exec sleep 60\n"),encoding="utf-8"); fake.chmod(0o755)
    self.seed_parent(jobs,repo,harness=harness)
    wrapper=self.load_wrapper(harness)
    command=self.command(harness,"start",repo,jobs,logs)+["--foreground-timeout","5"]
@@ -372,6 +379,146 @@ class AdapterV11Test(unittest.TestCase):
    self.assertIn(f"source_commit_sealed={sealed}",row)
    self.assertIn("source_commit_distance=1",row)
 
+ def test_non_git_main_inherits_producer_runtime_without_source_root_entries(self):
+  import hashlib
+  import artifact_producer as AP
+  import artifact_lifecycle as AL
+  import importlib.util as _ilu
+  route_spec=_ilu.spec_from_file_location("runtime_default_compose_route",ROOT/"utilities/capability-route.py")
+  ROUTE_MODULE=_ilu.module_from_spec(route_spec); route_spec.loader.exec_module(ROUTE_MODULE)
+  from fixtures.opencode_native_context import launch_context
+  sandboxes={"claude":"adapter-default","codex":"workspace-write","opencode":"adapter-default"}
+  for harness in ADAPTERS:
+   for artifact_inside in (False,True):
+    with self.subTest(harness=harness,artifact_inside=artifact_inside), tempfile.TemporaryDirectory() as td:
+     root=Path(td); source=root/"original"; source.mkdir(); user_file=source/"user.txt"
+     user_file.write_bytes(b"original bytes stay here\n")
+     artifact=source/".agent_reports" if artifact_inside else root/"external-artifacts"
+     artifact.mkdir(parents=True)
+     jobs=root/"jobs.log"; logs=root/"logs"; fakebin=root/"bin"
+     fakebin.mkdir(); logs.mkdir()
+     home=root/"home"; home.mkdir()
+     attempt=f"att-parent-runtime-{harness}-{int(artifact_inside)}"
+     sandbox=sandboxes[harness]
+     evidence_rows=[{
+      "parent_harness":child,"parent_transport":"headless",
+      "parent_sandbox":sandboxes[child],"child_harness":child,
+      "launch_authority":"conductor","status":"supported",
+      "probe_source":f"{child}-runtime-fixture","probe_time":"2026-10-24T00:00:00Z",
+      "failure_class":"","checked_worktree":str(source.resolve()),
+      "failure_scope":"none","codex_command":"ok" if child=="codex" else "not-applicable",
+      "retry_on_isolated_worktree":0,
+     } for child in ADAPTERS]
+     base_env={"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),"HOME":str(home),
+       "AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(artifact),
+       "AGENT_DISPATCH_JOBS":str(jobs),"OPENCODE_CONFIG_CONTENT":"{}",
+       "XDG_STATE_HOME":str(root/"xdg")}
+     with mock.patch.dict(os.environ,{**base_env,"AGENT_DISPATCH_ATTEMPT_ID":attempt},clear=True):
+      route=ROUTE_MODULE.compose_route(
+       capability="autopilot-code",capability_mode="dev",shape="staged",graph="plan",
+       slug="runtime-default-fixture",cwd=source,artifact_root=artifact,unassigned=True,
+       children=list(ADAPTERS),parent_harness=harness,
+       dispatch_evidence={"tuples":evidence_rows,"native_subagent":[]})
+     AP.activate(artifact,repository_id="repo_"+"a"*32,artifact_root_id="root_"+"b"*32,
+                 w7={"campaign_id":"camp_"+"c"*32})
+     route_binding=AL.admit_runtime_route(artifact,route)
+     route_path=Path(route_binding.route_file)
+     node=next(row for row in route["nodes"] if row["id"]=="plan")
+     digest=hashlib.sha256(str(artifact.resolve()).encode("utf-8")).hexdigest()
+     expected_runtime=root/"xdg"/"hearting"/"dispatch"/"project-runtimes"/digest
+     before_names=set(os.listdir(source))
+     before_user_hash=hashlib.sha256(user_file.read_bytes()).hexdigest()
+     with mock.patch.dict(os.environ,{**base_env,"AGENT_DISPATCH_ATTEMPT_ID":attempt},clear=True):
+      producer_env=AP.prepare_route_artifact_env(route_path,start=True,jobs=jobs)
+     self.assertEqual(producer_env["AGENT_RUNTIME_DIR"],str(expected_runtime))
+
+     fake=fakebin/harness
+     child_record=f"child-{harness}-{int(artifact_inside)}.json"
+     fake.write_text("#!/usr/bin/env python3\nimport json,os,sys\nfrom pathlib import Path\n"
+      "args=sys.argv[1:]\n"
+      "if args==['--version']:\n print('2.0.32'); raise SystemExit(0)\n"
+      f"record=Path(os.environ['AGENT_RUNTIME_DIR'])/'{child_record}'\n"
+      "record.write_text(json.dumps({'argv':args,'env':dict(os.environ)}),encoding='utf-8')\n"
+      "if args[:1]==['run']:\n"
+      " print(json.dumps({'type':'text','sessionID':'ses_fixture','part':{'text':'ok'}}))\n"
+      " print(json.dumps({'type':'step_finish','sessionID':'ses_fixture','part':{'reason':'stop'}}))\n",
+      encoding="utf-8")
+     fake.chmod(0o755)
+     self.seed_parent(jobs,source,attempt=attempt,harness=harness,sandbox=sandbox)
+     wrapper=self.load_wrapper(harness)
+     argv=["dispatch-headless.py","--start","--worktree",str(source),
+      "--slug",f"runtime-default-{harness}-{int(artifact_inside)}",
+      "--capability",route["capability"],"--capability-mode",route["capability_mode"],
+      "--intensity",route["effective_intensity"],"--dispatch-depth","2",
+      "--worker-type","stage","--worker-mode",node["unit"],"--worker-role","code-plan",
+      "--assigned-contract",node["completion_gate"],"--owner","autopilot-code",
+      "--owner-harness",harness,"--unit",node["unit"],"--parent","owner",
+      "--jobs",str(jobs),"--log-dir",str(logs),"--attempt-id",f"att-child-{harness}-{int(artifact_inside)}",
+      "--parent-attempt-id",attempt,"--parent-harness",harness,"--parent-transport","headless",
+      "--parent-sandbox",sandbox,"--launch-authority","conductor",
+      "--nested-eligibility","supported","--eligibility-source",f"{harness}-fixture",
+      "--fallback-ordinal","1","--route-file",str(route_path),"--route-id",route["route_id"],
+      "--route-hash",route["route_hash"],"--route-node",node["id"],
+      "--registry-digest",route["registry_digest"],"--write-scope",";".join(node["write_scope"]),
+      "--model-role",node["role"],"--model-profile",node["model_profile"],
+      "--launch-lifecycle","foreground-scoped","--foreground-timeout","20",
+      "--prompt-text","runtime default child fixture","--qa","standard"]
+     runtime_env={**base_env,**producer_env,
+      "AGENT_DISPATCH_ATTEMPT_ID":attempt,"AGENT_DISPATCH_CHILD":"1",
+      "AGENT_ROUTE_FILE":str(route_path),"AGENT_ROUTE_ID":route["route_id"],
+      "AGENT_ROUTE_HASH":route["route_hash"]}
+     patches=[mock.patch.dict(os.environ,runtime_env,clear=True)]
+     opencode_configs=[]
+     if harness=="opencode":
+      patches.append(mock.patch.object(wrapper.opencode_context,"prepare_launch_context",
+                                       side_effect=launch_context))
+      real_permission_builder=wrapper.scoped_external_directory_config
+      def capture_opencode_config(*call_args,**call_kwargs):
+       raw=real_permission_builder(*call_args,**call_kwargs)
+       opencode_configs.append(json.loads(raw))
+       return raw
+      patches.append(mock.patch.object(wrapper,"scoped_external_directory_config",
+                                       side_effect=capture_opencode_config))
+     if hasattr(wrapper,"check_runtime_projection"):
+      patches.append(mock.patch.object(wrapper,"check_runtime_projection",return_value=0))
+     if harness=="codex":
+      patches.append(mock.patch.object(wrapper,"codex_app_server_available",return_value=False))
+     if hasattr(wrapper,"launch_summary_owner"):
+      patches.append(mock.patch.object(wrapper,"launch_summary_owner",
+                                       return_value={"summary_owner":"test-fixture"}))
+     stream=io.StringIO()
+     for patcher in patches: patcher.start()
+     try:
+      with redirect_stdout(stream): result=wrapper.main(argv)
+     finally:
+      for patcher in reversed(patches): patcher.stop()
+     output=stream.getvalue()
+     self.assertEqual(result,0,output)
+     capture=expected_runtime/child_record
+     self.assertTrue(capture.is_file(),output)
+     child=json.loads(capture.read_text(encoding="utf-8"))
+     self.assertEqual(child["env"].get("AGENT_RUNTIME_DIR"),str(expected_runtime))
+     prompt_path=next((line.split("=",1)[1] for line in output.splitlines()
+                       if line.startswith("prompt_file=")),None)
+     self.assertTrue(prompt_path and Path(prompt_path).is_file(),output)
+     self.assertIn(f"- runtime_dir: {expected_runtime}",Path(prompt_path).read_text(encoding="utf-8"))
+     if harness=="opencode":
+      def allows_runtime(config):
+       legacy=config.get("permission",{}).get("external_directory",{})
+       if isinstance(legacy,dict) and legacy.get(str(expected_runtime))=="allow":
+        return True
+       return any(row.get("action")=="external_directory"
+                  and row.get("resource")==str(expected_runtime) and row.get("effect")=="allow"
+                  for row in config.get("permissions",[]) if isinstance(row,dict))
+      self.assertTrue(any(allows_runtime(config) for config in opencode_configs),opencode_configs)
+     else:
+      self.assertTrue(any(child["argv"][i]==flag and child["argv"][i+1]==str(expected_runtime)
+                          for i,flag in enumerate(child["argv"][:-1])
+                          if flag in ("--add-dir","--writable-root")),child["argv"])
+     self.assertEqual(set(os.listdir(source)),before_names)
+     self.assertEqual(hashlib.sha256(user_file.read_bytes()).hexdigest(),before_user_hash)
+     self.assertTrue((expected_runtime/".gitignore").is_file())
+
  def test_claude_registered_child_receives_native_auth_binding_from_builder(self):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
@@ -446,7 +593,9 @@ class AdapterV11Test(unittest.TestCase):
     source_home=root/"user-runtime-home"; source_home.mkdir()
     runtime_expression=f"os.environ.get({runtime_key!r}, '')"
     fake.write_text(
-     "#!/usr/bin/python3\nimport json,os\n"
+     "#!/usr/bin/python3\nimport json,os,sys\n"
+     f"if {harness == 'opencode'!r} and sys.argv[1:] == ['--version']:\n"
+     " print('1.19.0'); raise SystemExit(0)\n"
      f"open({str(capture)!r},'w',encoding='utf-8').write(json.dumps({{"
      f"'git_optional_locks':os.environ.get('GIT_OPTIONAL_LOCKS'),"
      f"'worker_home':os.environ.get('HEARTING_WORKER_HOME'),"
@@ -1068,7 +1217,7 @@ class AdapterV11Test(unittest.TestCase):
   for repetition in range(3):
    with self.subTest(repetition=repetition), tempfile.TemporaryDirectory() as td:
     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"; fakebin=root/"bin"; fakebin.mkdir()
-    fake=fakebin/"opencode"; fake.write_text("#!/bin/sh\nexit 0\n",encoding="utf-8"); fake.chmod(0o755)
+    fake=fakebin/"opencode"; fake.write_text(fake_shell("opencode","exit 0\n"),encoding="utf-8"); fake.chmod(0o755)
     wrapper=self.load_wrapper("opencode")
     argv=["dispatch-headless.py","--start","--worktree",str(repo),"--slug","opencode-owner",
           "--capability","autopilot-code","--capability-mode","dev","--intensity","standard",
@@ -1208,7 +1357,7 @@ class AdapterV11Test(unittest.TestCase):
   root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
   fakebin=root/"bin"; fakebin.mkdir(); count=root/"child-count"
   fake=fakebin/fake_cli
-  fake.write_text("#!/bin/sh\nprintf 'child\\n' >> \"$FAKE_CHILD_COUNT\"\n",encoding="utf-8")
+  fake.write_text(fake_shell(harness,"printf 'child\\n' >> \"$FAKE_CHILD_COUNT\"\n"),encoding="utf-8")
   fake.chmod(0o755)
   command=self.command(harness,"start",repo,jobs,logs)
   self.seed_parent(jobs,repo,harness=harness)
@@ -1394,7 +1543,7 @@ class AdapterV11Test(unittest.TestCase):
     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
     fakebin=root/"bin"; fakebin.mkdir()
     fake=fakebin/harness
-    fake.write_text("#!/bin/sh\nexec sleep 60\n",encoding="utf-8"); fake.chmod(0o755)
+    fake.write_text(fake_shell(harness,"exec sleep 60\n"),encoding="utf-8"); fake.chmod(0o755)
     wrapper=self.load_wrapper(harness)
     import json
     from dispatch_capacity_evidence import launch_scope
@@ -1474,7 +1623,7 @@ class AdapterV11Test(unittest.TestCase):
     root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
     fakebin=root/"bin"; fakebin.mkdir()
     fake=fakebin/harness
-    fake.write_text("#!/bin/sh\nexec sleep 60\n",encoding="utf-8"); fake.chmod(0o755)
+    fake.write_text(fake_shell(harness,"exec sleep 60\n"),encoding="utf-8"); fake.chmod(0o755)
     wrapper=self.load_wrapper(harness)
     if harness=="opencode":
      attempt_id="att-opencode-governor-transfer-never-launched"

@@ -334,9 +334,15 @@ For every non-owner foreground worker (stage, review, support, or frame), the
 launcher also samples activity and may seal `no-progress` after the optional
 `headless.no_progress_minutes` window (default 30 minutes; 0 disables it).
 This conservative activity check treats runtime/tool uncertainty as activity;
-owners and detached workers are outside its scope. The existing launch-origin
-4h default / 24h maximum remains the final hard deadline and retains cleanup
-authority.
+owners and detached workers are outside that launcher policy. An ordinary
+supervised owner turn still uses its existing 7200-second timeout as a
+no-progress window: validated payload output or exact activity attributed to
+that turn restarts the window. A quiet turn expires only after a full,
+successfully observed idle window; uncertainty suspends expiry until a known
+quiet window can be measured. This is not an owner lifetime cap. Direct bounded
+calls and terminal handoff turns keep their fixed deadlines. The existing
+launch-origin 4h default / 24h maximum remains the final hard deadline and
+retains cleanup authority.
 
 Each SD item below keeps the rule an agent acts on; its full decision record is verbatim in `core/ADAPTATION.md §8`.
 
@@ -377,12 +383,15 @@ An optional `allocation.owner_order` in the selected dispatch defaults orders el
 Schema v4 may also define an optional top-level `worker_account` mapping for
 `claude`, `codex`, and `opencode`. It selects only the worker's authentication
 source: a Claude config directory, a Codex home for `auth.json`, or an OpenCode
-`XDG_DATA_HOME` for `opencode/auth.json`. Relative paths resolve from the
+V1 `XDG_DATA_HOME` for `opencode/auth.json`. Relative paths resolve from the
 launch cwd and `~` resolves from that launch's `HOME`. An omitted harness key
 keeps the existing source. Model affinity and allocation remain independent.
 Worker settings, permissions, hooks, models, and plugins continue to come from
 the parent config source. Credential contents are not copied or edited; Codex
-and OpenCode `auth.json` are linked from the selected source. Claude account
+and OpenCode V1 `auth.json` are linked from the selected source. OpenCode V2
+stores provider credentials and runtime state in its native XDG database and
+does not use `auth.json`; V2 account selection is not provided by
+`worker_account`. Claude account
 metadata and secure-storage path selection follow the selected config
 directory. OpenCode also accepts provider credentials from the inherited
 environment or a project `.env` ([CLI documentation](https://docs.opencode.ai/docs/cli/));
@@ -753,12 +762,22 @@ creates an unfocused tab, leaving existing panes and seat-successor records
 intact. Cards, watch and sender identity retain exact ownership checks; missing,
 foreign or unreadable hints leave placement unknown.
 
-An OpenCode child inside a Codex owner's workspace sandbox receives per-attempt
-XDG data/cache/state/config directories beneath the worktree. User configuration
-and existing authentication are linked for reading; generated dependency state
-stays in the attempt directory. The
-adapter prepares these paths before admission and reports preparation failures
-before spawning; the model does not diagnose or retry missing runtime storage.
+An OpenCode V2 child uses inherited user XDG data/state/cache, with writable
+access limited to the exact `opencode` leaves; symlinked leaves and stores
+overlapping native config paths are excluded. The config directory and whole HOME
+are not granted, and credentials or database files are not copied or linked.
+OpenCode V1 remains isolated under its worker home.
+
+Before model selection, each OpenCode launch probes its runtime version once
+with a private temporary HOME and XDG roots separate from the user stores. The
+combined stdout/stderr capture is limited to 64 KiB; overflow, timeout, or an
+unreadable version fails closed. The probe runs inside
+`verification-background-lease.py`, which requires child-subreaper and scope
+observation, then reaps detached descendants on normal exit and timeout before
+the private directory is removed. Missing containment or incomplete cleanup
+leaves the version unknown. The resulting `OPENCODE_RUNTIME_VERSION` binding
+is shared by model selection, context lookup, worker-home construction, and
+execution.
 
 **Dispatch responsibility:** execution, semantic outcome, and notification are
 separate facts.
@@ -923,7 +942,7 @@ A legacy hash collision is diagnostic
      continues to encode this conductor with the compatibility owner worker
      type and `_kernel/owner`; standard+ capability ownership is a distinct
      semantic responsibility.
-   - **Partial parallel continuation:** the original immutable launch input, or the complete exact original registry rows for older batches, supplies the source manifest and its assignment hashes. Verify its sealed digest and each member binding before reserving the one failed leg. A current retry brief belongs to that leg's launch; the original group assignment and successful peer identities remain unchanged. The replacement keeps the source member fields except its attempt ID; its current parent and retry brief are recorded by the ordinary launch path. Reused PASS, quiescence, scope and independence checks remain in force on all three harnesses.
+   - **Partial parallel continuation:** the original immutable launch input, or the complete exact original registry rows for older batches, supplies the source manifest and its assignment hashes. Verify its sealed digest and each member binding before reserving the one failed leg. A current retry brief belongs to that leg's launch; the original group assignment and successful peer identities remain unchanged. The replacement keeps the source member fields except its attempt ID; its current parent and retry brief are recorded by the ordinary launch path. Reused PASS, quiescence, scope and independence checks remain in force on all three harnesses. The ordinary group `start` finds this shape itself: when one sealed member ended with the strict no-start proof and every other member holds its current PASS marker, any live owner of the route re-launches only that member, with no continuation file and no round consumed; a still-running peer returns the same-command wait. If that successor also fails to start, the next `start` keeps the peers on their realized tuples and places only the gap again through the ordinary harness assignment without every harness it could not start on; the step seal (`<identity>.step-<n>.json`) fixes that placement and identity, the governor admits the changed gap placement only against it, and exhausted candidates end in `parallel-headless-unavailable`.
    - **Full headless ceremony:** launch an adapter-specific headless main in the worktree. It acts as a complete main for that runtime, including team roles, hooks or preflight, and plan artifacts. The adapter owns noninteractive tool and permission setup and documents its cost realization. The top-level dispatch is a dispatch-depth-1 capability owner that returns only synthesis to main.
    - At `standard+`, the dispatch-depth-1 owner is a thin conductor. It dispatches compiled `code-plan`, `plan-check`, `code-execute`, `impl-review`, `code-test`, and `code-report` nodes through dispatch-depth-2 headless sessions, reads verdict/status metadata rather than stage bodies, and passes context only through files. A route stage is the semantic work and completion-gate unit; a worker session is only an execution-capacity unit. They are not one-to-one. The owner may keep a stage in one session or declare bounded first-class sub-sessions below the same route node when scope size, context pressure, or round-trip cost warrants it. That choice is owner discretion and does not require route recompilation. A declared `parallel_group` replaces member-level starts with one exact `dispatch-batch --parallel-group` transaction. Before any stage, the owner verifies that the artifact root and `spec/` exist.
    - Artifact relocation uses that same authority to protect live work. A no-live history move does not transfer parent authority, and historical redirects never authorize root-local writes.
@@ -1011,6 +1030,7 @@ A legacy hash collision is diagnostic
    - **Approved repository-document refinement:** when a complete refine scope names an existing tracked document in the route worktree, the same acting modifier verifies its applied bytes and commits only the exact validated owned path or paths after the check passes. Direct inline work relies on its already approved depth-0 start, assigned target/worktree, native Git access, and existing git-state guard; it does not derive authority from the registered-worker policy. A registered quick or standard+ modifier uses the existing capability-owner `commit_policy.may_commit` decision and the wrapper's narrow per-worktree Git metadata grant. This does not change the refine transaction's `commit_expected` value or add a permission, actor, or topology field. Artifact-only and no-op work, report and review-only scope, and a pass with no tracked target diff produce no source commit. The existing stage commit-expected rule and declared sub-session no-commit boundary still apply.
    - **Completion marker bound to the exact attempt row under SD-70:** completing a node takes the canonical registry path and the current exact attempt id (`complete --jobs <registry> --attempt-id <id>`), not just the route/node pair. A registered worker completing its own node may omit both: with no attempt axes stated, `complete` reads `AGENT_DISPATCH_ATTEMPT_ID` when that registry row is this node's attempt, and `AGENT_DISPATCH_JOBS` once an attempt is named; an explicit value takes precedence, and the inline axes form takes nothing from the environment. An omitted `--jobs` on the other dispatch utilities takes `AGENT_DISPATCH_JOBS` when it is set; with nothing inherited, `--jobs` stays required. Completion never breadth-closes a prior `BLOCKED` row or a later retry. Marker write and row close are idempotent under retry; if the row close fails after the marker is written, the command returns a structured nonzero — rerun it rather than editing the registry.
    - **A sub-session slice reaches its own terminal (SD-130):** a `stage_authority=0` sub-session slice holds no stage gate authority, so `capability-route.py complete` refuses it (`subsession-has-no-stage-gate-authority`); a slice closes through the completion join instead and grants no marker eligibility. A slice may only start on a sealed chain: `dispatch-node.py --subsession-id --action start` requires the persisted chain manifest to name it, else `subsession-chain-manifest-unsealed`.
+   - **Replacement owners get a fresh subdivision attempt:** the sealed route, node, exact fixed-file sets and owner attempt id determine a chain's stable identity. Repeating the same slice plan under the same owner reuses that identity; a replacement owner gets a new manifest and slice attempts, while the prior owner's manifest and receipts remain intact. This does not skip completed siblings or weaken the registry lineage and child-process quiescence checks that govern replacement.
    - **Review verdict is a result, not a worker death (SD-94 owner-closure extension, SD-153 round budget):** a readable exact review FAIL is a completed blocking round, never a dead worker. The shared `review_round_cap.round_budget` is the one admission decision every registered launch surface (`dispatch-node.py`, `dispatch-batch.py`, `stage-dispatch-fallback.py`) and this owner-closure eligibility check now read: its budget unit is the **verdict round** (`classify_round_row` recognizes a success note, a blocking review, or a non-review explicit FAIL — not a crashed, capacity-dead, or invalid-envelope attempt, which is `verdict-less` and does not spend the cap by itself), and `B=2` consecutive verdict-less rounds bind the node to `verdictless-bound` (a BLOCKED round whose unmet `done_when` items, read from its `<artifact>.items.json`, are a strict subset of the previous BLOCKED round's starts that count again; items that cannot be read change nothing) instead of a third silent registered attempt. The shared `complete` writer admits an exhausted-round owner disposition only after verifying review identity, an exhausted verdict-round budget, every blocking finding's linked evidence, and the destination cycle. `dispatch_contract.owner_closure_shape` names the one closure shape a completion marker carries — `continuation` (`stage_authority=owner-closure`) or `registered-review` (`review_gate_closure=owner-closure` with `review_independence=owner-overridden`) — and every terminal-identity reader (`_marker_identity_row`, exact-terminal proof) consumes that shape instead of re-deriving it by hand. For an official continuation, the same operation verifies immutable source-route/hash and node-contract lineage, counts inherited rounds without resetting their verdict-round budget, and publishes an explicitly owner-overridden gate only in the continuation. Its current-cycle record cites the source reviews; source review rows, FAIL results, markers and sealed payloads remain unchanged. `complete --check` evaluates owner-closure admission without publication or state writes; normal completion rechecks before committing. A refusal reports the exact unsatisfied obligation.
    - **Gate-evidence revision is a marker transition, not a rewrite (SD-154):** once a completion marker's live evidence changes after publication, `dispatch_contract.gate_currency` is the one place that recomputes the evidence digest and walks a revision chain (`completion_marker_is_current` is now a one-line delegate to it, so its existing boolean call sites are unchanged); its `revised-unrecorded` state is the only one a person or the runtime may act on — every other non-`current` state (`superseded`, `completion-evidence-unreadable`, any `integrity-broken:*`) is a kept refusal, not something to record over. `capability-route.py revise --route <route-or-route-id> --node <node> --evidence <evidence-path> --basis review-findings|user-direction|owner-correction` is the one writer (`publish_revision_locked`): it publishes marker `k+1` with `stage_authority=revision` and tombstones downstream canonical markers in the same critical section. A downstream plain registered attempt is kept and printed as `kept=` only when its exact registry start followed a recorded observation of the new digest, its evidence-history chain and mtime continuity agree, its own marker is current, and every intervening dependency is proved; missing or conflicting evidence keeps the existing tombstone behavior. Legacy tombstones that meet the same proof are restored automatically on the next start or replacement claim as a revision over the tombstone, preserving the provenance chain; incomplete publication converges on the next call and reports restore errors while continuing. Gates-off edit history records a return to the original digest as `change_kind=reverted`, so that future history can reject an ABA chain. Basis refusals name the missing `--answers`, `--direction`, or `--reason` input, and next-step guidance includes `--author-attempt-id`. `dispatch-node.py`'s `admit_round` auto-records this revision (`recorded_by=runtime-auto`) before admitting a dependent node's next round whenever that node's last round was a blocking FAIL that basis-verifies against the `revised-unrecorded` upstream; when that basis verification cannot run itself, the revision stays unrecorded and the dependent's launch is refused `completion-evidence-revised-unrecorded` with `next_action` naming the `revise` command above. After a round budget is exhausted, a node whose last verdict round was a blocking FAIL and whose FAIL a revision names as its `answers` is admitted exactly one more round, `round_kind=closure-check` — spent by that verdict attempt itself, not a standing exception to the cap. The same one round within the cap + 1 verdict ceiling goes to a node whose canonical marker such a revision tombstoned, so revising a shared upstream to answer one review's FAIL does not strand a sibling review that had already passed. That refusal belongs to the opt-in gates (`HEARTING_GATES=on`). With gates off, the default, an evidence edit after its marker is not refused and prints no warning: the operations that proceed on the completion — `continuation`, a stage start, `complete`, a replacement owner's claim — keep it as one history line (`<node>.evidence-changes.jsonl` beside the marker: when, by whom, in which command, why, and the digest it replaced), and the closed route's `revisions` list it as `basis=automatic`. Reads (dry-run, `status`, Fleet) write nothing. `revise` stays the manual record and judges "unchanged" by that same comparison in both modes: the evidence it names against the digest the marker recorded (`revision-evidence-unchanged` only when they are equal).
    - Implementation-review source subjects are captured by the common runtime at registration and checked again at launch. The cap counts verdicts for the same content subject while the node's round number remains lineage-wide; a changed subject starts an ordinary independent review, and the prior subject's PASS remains historical. Same-content revision or republication does not reset that subject's budget. Pre-deploy ship reviews use the parent deploy request's hashed inputs within their input scope as that subject; without a request they keep the plain count. The existing cap+1 correction policy for other capped nodes is unchanged. A refusal may advertise owner-closure only when an exact eligible blocking review can use the existing completion writer; an all-PASS exhausted history has no owner-closure action. Normal completion and revision share source-change supersession, preserving immutable attempts and marker history.
@@ -1755,12 +1775,17 @@ lease) to stop a quiet non-owner foreground child after the optional
 `headless.no_progress_minutes` window (default 30; 0 disables it). Any activity
 or observation uncertainty keeps the child alive. A confirmed quiet window ends
 the child as `no-progress`; the launcher's finite execution budget remains the
-final hard timeout and cleanup authority. Owners and detached children are not
-covered by this foreground activity window. Progress recovery leaves a delayed
-success intact. Per-tool bookkeeping is runtime-owned. Optional heartbeats
-are work hints: test→tool is legal, and a terminal heartbeat cannot commit a
-successful result. Prose, log mtime, and repeated tool events grant no progress.
-Only declared sub-sessions receive the chain ledger/helper instructions.
+final hard timeout and cleanup authority. For an ordinary owner turn, the same
+conservative sampler is bound to the live native process and exact session or
+lease evidence; supervisor logs, unrelated sessions, broad transcript roots,
+and unrelated child activity leave its 7200-second idle window running.
+Observation uncertainty counts as unknown, not as inactivity. Direct bounded calls,
+terminal cleanup, and the distinction between activity and semantic completion
+remain unchanged. Progress recovery leaves a delayed success intact. Per-tool
+bookkeeping is runtime-owned. Optional heartbeats are work hints: test→tool is
+legal, and a terminal heartbeat cannot commit a successful result. Prose, log
+mtime, and repeated tool events grant no progress. Only declared sub-sessions
+receive the chain ledger/helper instructions.
 
 A committed result and process cleanup are separate obligations. The runtime
 join retains every owned attempt, including `done` rows, until the exact process
@@ -1912,6 +1937,13 @@ Configuration/selection errors still fail; the human-readable probe retains
 its reachability exit status. Required measurements are checked from the JSON
 by their owning verification contract, separate from payload execution.
 
+`compute-hosts self [--json]` measures only this machine through the same
+read-only probe and does not load the inventory. Fleet uses that observation
+when the inventory is missing or still a template; remote hosts and detached
+runs still require inventory configuration. This observation grants no run
+root or execution access. Usage error reasons are separate from last-good quota
+data; quota freshness remains tied to its successful observation.
+
 A live direct SSH launch may cross the process boundary without forwarding its
 Claude Code, Codex, or OpenCode session variable. In that case the probe may
 form a transient exact bridge only by joining a stable same-EUID local `ssh`
@@ -1936,6 +1968,14 @@ running on a host with this mapping refuses local run-root operations because
 its shared path still names the unmodified mount. Keep the mapping as an
 unquoted YAML block mapping; inline maps are not supported by the inventory
 parser.
+
+When an already completed `compute-hosts` run is offered to a supervised
+resource node, `resource-runner start --compute-run <run-id>` validates the
+same route and sealed resource contract, its durable wrapper receipt, exit and
+declared outputs, then rechecks the remote process group. The run id alone is
+not completion evidence. A successful handoff creates a new same-node retry
+while retaining the original row and history; the route owner's ordinary
+successor start remains responsible for verification admission.
 
 `claim <host> <pid> [--harness <runtime> --session <id>]` (default: the calling
 session, when it is one unique harness session) is the narrow bridge for
@@ -2064,7 +2104,9 @@ Hearting runs use a private tmux server namespace derived from the host-local
 GPU lease state root. Its first start has release, attempt, route, and session
 pins cleared and runs from `/`; each new session receives only the launcher's
 validated session/release/attempt provenance plus its exact compute run id and
-host with tmux `-e`; stale resource-run and lease-release markers are empty.
+host with a shell-quoted `exec env` prefix on the session command; the first
+wrapper process receives that validated launch environment, and stale
+resource-run and lease-release markers are present but empty.
 The selected working directory is passed with `-c`. The namespace is recorded
 in run metadata, and `runs`/`stop` address that same server. Older run metadata
 without a transport keeps its legacy default
@@ -2511,7 +2553,19 @@ recipient generation. The notice-summary digest remains a separate fact, and a
 generic `received` ledger row is insufficient. Registered-batch continuation
 and handover duties retain their own settlement rules. Owner identity readers
 reuse the generation-checked registry input; current-row and non-registry
-authority checks remain fresh and completion verdicts are not memoized.
+authority checks remain fresh. The shared obligation runner may reuse a
+historical settlement observation only while the exact owner row and every
+identified settlement dependency remain unchanged. This is a scheduling
+optimization: it does not satisfy delivery, inspection, claim, mutation, or
+completion authority. Missing, unreadable, unstable, or untracked dependencies
+require a fresh observation and remain unknown until that observation succeeds.
+The first explicit lifecycle producer may initialize one state-root directory
+beneath an existing parent and then carries that root identity through its
+recovery-lock and runner request. Observers reuse that identity: recovery stops
+when the state-root or runner-lock inode is replaced and does not recreate a
+removed root. Terminal obligation history is retained only for its bounded,
+source-verified retention window, while pending work and exact late receipts
+remain recoverable.
 
 Identity on the ledger (F-100c): every steward record carries `to.session_id` resolved
 through `herdr agent get` (Claude UUID, Codex thread id; herdr reports no id for

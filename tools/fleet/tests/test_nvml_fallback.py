@@ -33,6 +33,7 @@ class NVMLFallbackTest(unittest.TestCase):
         for name, content in {
             "proc/stat": "cpu  100 0 0 900\ncpu0 100 0 0 900\n",
             "proc/uptime": "10000 0\n", "proc/loadavg": "0 0 0\n",
+            "proc/sys/kernel/random/boot_id": "fixture-boot-id\n",
             "proc/driver/nvidia/version": "NVRM version: NVIDIA UNIX Open Kernel Module  580.173.02\n",
             "var/run/reboot-required": "reboot required\n",
         }.items():

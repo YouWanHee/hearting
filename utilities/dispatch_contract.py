@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+import operator
 from pathlib import Path
 import re
 import signal
@@ -2044,6 +2045,58 @@ def process_start_ticks(pid: int) -> str | None:
         return None
 
 
+def pidfd_open(pid: int, flags: int = 0) -> int:
+    """Open a descriptor bound to one process, including older Python builds.
+
+    The raw syscall is verified only for Linux x86_64 LP64. Other ABIs need
+    their own checked syscall table before they can use this fallback.
+    """
+    native = getattr(os, "pidfd_open", None)
+    if callable(native):
+        return native(pid, flags)
+
+    def unsupported() -> OSError:
+        return OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+
+    if sys.platform != "linux":
+        raise unsupported()
+    try:
+        import ctypes
+        import platform
+    except ImportError:
+        raise unsupported() from None
+    if (platform.machine() != "x86_64" or ctypes.sizeof(ctypes.c_void_p) != 8
+            or ctypes.sizeof(ctypes.c_long) != 8):
+        raise unsupported()
+
+    # Validate before ctypes converts arguments; narrowing a PID could bind
+    # the descriptor to an entirely different process.
+    pid_number = operator.index(pid)
+    flags_number = operator.index(flags)
+    if not -(1 << 31) <= pid_number < (1 << 31):
+        raise OverflowError("pid out of range for pid_t")
+    if not 0 <= flags_number < (1 << 32):
+        raise OverflowError("flags out of range for unsigned int")
+    try:
+        syscall = ctypes.CDLL(None, use_errno=True).syscall
+    except (OSError, AttributeError, TypeError):
+        raise unsupported() from None
+    if not callable(syscall):
+        raise unsupported()
+    syscall.restype = ctypes.c_long
+    fd = syscall(ctypes.c_long(434), ctypes.c_int(pid_number),
+                 ctypes.c_uint(flags_number))
+    if fd == -1:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    try:
+        os.set_inheritable(fd, False)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def process_namespace_identity(pid: int | str = "self") -> str | None:
     """Return the PID namespace inode without treating an unreadable link as absence."""
 
@@ -2976,6 +3029,7 @@ ROUTE_STATE_REFUSAL_REASONS = (
     "review-round-budget-exhausted",
     "review-verdictless-bound",
     "round-unsettled",
+    "resource-owner-stage-admission-blocked",
 )
 
 # Receipts and the ledger carry the same bounded facts, never a clipped copy
@@ -3101,6 +3155,9 @@ def route_state_next_action(reason: str, detail: str, route_file: str | None,
         return "route the round through the sealed fallback chain's remaining unregistered hop (native-subagent, then owner-inline)"
     if reason == "round-unsettled":
         return "wait for the live round to settle before starting the next one"
+    if reason == "resource-owner-stage-admission-blocked":
+        return ("inspect the typed resource route-state reason and next_action; "
+                "use the current route owner's existing start/correct path")
     return "-"
 
 
@@ -11740,30 +11797,92 @@ class RefusedChainClose:
     unclosed_delivery: tuple[str, ...]
 
 
+_NO_START_PROCESS_IDENTITY_KEYS = (
+    "pid",
+    "pid_start",
+    "pid_scope",
+    "pid_host",
+    "pid_host_start",
+    "pid_host_ns",
+    "pid_host_proof",
+    "pid_ns",
+    "pid_observer_ns",
+    "pgid",
+    "pgid_host",
+    "launch_cgroup_b64",
+    "launch_cgroup_ns",
+    "group_reap_proof",
+    "group_reap_pgid",
+    "attempt_descendant_proof",
+    "attempt_descendant_observer_ns",
+    "attempt_descendant_residue",
+    "attempt_descendant_residue_count",
+    "attempt_descendant_residue_basis",
+    "attempt_descendant_residue_at",
+    "reap_watch",
+    "reap_watch_pid",
+    "post_exit_receipt_substitute",
+)
+
+
+def _has_persisted_process_identity(metadata: Mapping[str, str]) -> bool:
+    """Any child identity or descendant/reap evidence contradicts no-start."""
+    return any(metadata.get(key) for key in _NO_START_PROCESS_IDENTITY_KEYS)
+
+
 def attempt_row_never_started(fields: list[str]) -> bool:
     """Prove that a row has never crossed the durable launch fence."""
 
     if len(fields) != 6:
         return False
     metadata = parse_registry_metadata(fields[5])
-    # A claimed row, a row carrying a PID, and a reaped-before-publish row all
-    # remain supervisor-reconciliation evidence. Only an untouched open row or
-    # an explicitly adapter-closed never-launched row with no claim/identity
-    # can be proven never started here.
+    # A claimed row, any persisted child identity, and a reaped-before-publish
+    # row remain supervisor-reconciliation evidence. Parent lineage and
+    # registration metadata are deliberately not execution identity.
     return (
         metadata.get("launch_started") != "1"
         and metadata.get("launch_claimed") == "0"
-        and not metadata.get("pid")
+        and not _has_persisted_process_identity(metadata)
         and metadata.get("launch_outcome", "") in {"", "never-launched"}
     )
+
+
+def attempt_row_terminal_never_started(fields: list[str]) -> bool:
+    """True only for a terminal row carrying strict never-started fence proof."""
+    if len(fields) != 6 or fields[1] not in {"done", "cancelled", "killed"}:
+        return False
+    return terminal_attempt_never_started(fields[1], parse_registry_metadata(fields[5]))
+
+
+def terminal_attempt_never_started(status: str, metadata: Mapping[str, str]) -> bool:
+    """Metadata form of the same terminal no-start proof for semantic censuses."""
+    if status not in {"done", "cancelled", "killed"}:
+        return False
+    if metadata.get("launch_outcome") != "never-launched":
+        return False
+    if (metadata.get("launch_started") == "1" or metadata.get("launch_claimed") != "0"
+            or _has_persisted_process_identity(metadata)):
+        return False
+    # Reviewing a terminal conflict records its inspection, not which outcome
+    # was correct. Retained contradictory results still preclude strict proof.
+    if (metadata.get("terminal_conflict") == "1"
+            or any(metadata.get(key) for key in (
+                "terminal_conflicts_b64", "conflicting_terminal_note", "conflicting_failure_class"))):
+        return False
+    # A committed work result contradicts a never-launched disposition.
+    if (metadata.get("note") in SUCCESS_NOTES
+            or metadata.get("note") in {"completed-review-blocking", "dead-worker-fail"}
+            or metadata.get("failure_class") in {"pass", "success", "fail", "blocked"}):
+        return False
+    return True
 
 
 def attempt_row_withdrawn_before_launch(fields: list[str]) -> bool:
     """Identify a never-started registration withdrawn under the jobs lock.
 
-    An unclaimed open row may still be launched. Only a terminal row explicitly
-    closed as cancelled has lost that launch authority and can leave the round
-    census without hiding a real pre-launch failure.
+    An unclaimed open row may still be launched. This helper names only the
+    cancellation-specific subset; `attempt_row_terminal_never_started` is the
+    broader strict predicate used by round census and retry.
     """
 
     if len(fields) != 6 or not attempt_row_never_started(fields):

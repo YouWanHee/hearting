@@ -37,6 +37,30 @@ class WorkerHomes(unittest.TestCase):
             for name in ('dispatch_allocation', 'claude_credential_recovery')
         }
 
+    def test_v2_launch_binding_keeps_native_xdg_store(self):
+        root, builder = self._minimal_packaged_builder()
+        home = self.base / 'v2-home'
+        xdg = self.base / 'v2-xdg'
+        config = self.base / 'v2-config'
+        home.mkdir()
+        config.mkdir()
+        (config / 'opencode.json').write_text('{}', encoding='utf-8')
+        values = builder.build_worker_home(
+            root, 'opencode', 'stage', 'v2-bound-store',
+            env={**self.env, 'HOME': str(home), 'XDG_DATA_HOME': str(xdg / 'data'),
+                 'XDG_STATE_HOME': str(xdg / 'state'), 'XDG_CACHE_HOME': str(xdg / 'cache'),
+                 'XDG_CONFIG_HOME': str(xdg / 'config'), 'OPENCODE_CONFIG_DIR': str(config),
+                 'OPENCODE_RUNTIME_VERSION': '2.0.32'},
+            destination=self.base / 'v2-worker-home',
+        )
+        self.assertNotIn('XDG_DATA_HOME', values)
+        self.assertNotIn('XDG_STATE_HOME', values)
+        self.assertNotIn('XDG_CACHE_HOME', values)
+        self.assertEqual(values['OPENCODE_CONFIG_DIR'] if 'OPENCODE_CONFIG_DIR' in values else None,
+                         None)
+        self.assertIsNone(values['OPENCODE_DB'])
+        self.assertEqual((config / 'opencode.json').read_text(encoding='utf-8'), '{}')
+
     def tearDown(self):
         self.tmp.cleanup()
         for name, module in self._module_snapshot.items():
@@ -915,14 +939,13 @@ class WorkerHomes(unittest.TestCase):
             'plugins': ['user-plugin'],
             'mcp': {'servers': {'user-server': {'type': 'local', 'command': ['tool']}}},
         }))
-        env = {**self.env, 'HOME': str(self.base), 'XDG_DATA_HOME': str(data_home),
-               'XDG_CONFIG_HOME': str(self.base / 'config'),
+        env = {**self.env, 'HOME': str(self.base), 'OPENCODE_RUNTIME_VERSION': '2.0.32',
+               'XDG_DATA_HOME': str(data_home), 'XDG_CONFIG_HOME': str(self.base / 'config'),
                'XDG_STATE_HOME': str(self.base / 'state'),
                'XDG_CACHE_HOME': str(self.base / 'cache'),
                'OPENCODE_CONFIG_DIR': str(config_source)}
-        with patch.dict(os.environ, {'OPENCODE_RUNTIME_VERSION': '2.0.32'}):
-            result = prepare_worker_home(ROOT, 'opencode', 'stage', 'v2-worker', env=env,
-                                         destination=self.base / 'v2-worker-home')
+        result = prepare_worker_home(ROOT, 'opencode', 'stage', 'v2-worker', env=env,
+                                     destination=self.base / 'v2-worker-home')
         self.assertNotIn('XDG_DATA_HOME', result)
         self.assertNotIn('OPENCODE_CONFIG_DIR', result)
         home = Path(result['HEARTING_WORKER_HOME'])

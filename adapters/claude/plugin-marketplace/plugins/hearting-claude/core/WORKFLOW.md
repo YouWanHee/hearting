@@ -472,10 +472,13 @@ reason and continues from the original cwd. Preview, explain, non-start
 `compose`, and low-level `compile` remain read-only), artifact root
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
-`compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the
-artifact root and neither this session's read hook recorded reading it unchanged
-nor the caller named what was read; the latest `prd.md` of
-a `shared/spec/<ref>/` revision only adds one `[경로]` card line with its path), and both
+`compose-spec-read-required` when the artifact root's governing legacy
+`spec/prd.md` is selected and this session's read hook has not recorded reading
+it unchanged, unless the caller named what was read; the governing candidates
+come from `artifact_cutover.prd_candidates`, so a shared revision supersedes a
+legacy copy and only adds one `[경로]` card line with its path. A checkout PRD
+outside the artifact root is informational and is not a marker-gate input;
+absence evidence distinguishes that checkout file from a governing PRD), and both
 eligibility probes (`dispatch-readiness`). The result is sealed, verified,
 bound, and guarded exactly like a recipe route: `selection.route_origin`
 records `compose` or `preset`, `selection.shape` records the shape, a staged
@@ -942,8 +945,12 @@ itself cannot carry the closure, because `route_hash` covers every other field.
 An unclosed route is indistinguishable from abandoned work, and the same applies
 to the other things a finished attempt leaves behind: a merged worktree and
 branch, a spec `pipeline_state.yaml` still naming a live phase, and a memory
-handoff still `pending` after its obligation is met. Close what the attempt
-opened, or the next session pays for it in reconstruction.
+handoff still `pending` after its obligation is met. Registered delivery
+reconciliation expires only the exact record whose original recipient has
+positive dead PID/start evidence; a closed identity-matched route settles its
+bound duty as not-required while retaining the record. Unknown liveness and a
+live successor remain pending, and unchanged observations are not rewritten.
+Close what the attempt opened, or the next session pays for it in reconstruction.
 
 ### 0.6. Tracked-Workflow Lifecycle and Continuation
 
@@ -963,13 +970,28 @@ or unobservable recorded process group remains pending; exact prior-boot
 evidence or a complete empty-group observation can establish execution end.
 Exact inspection reads the worker's result; requesting more failure detail is
 optional and cannot become a second completion gate.
+
+On the same OPEN route, the current owner may start a new supervised resource
+retry with `resource-runner start --compute-run <run-id>` after a completed
+`compute-hosts` execution. Before creating the retry row, the runtime checks
+the sealed command, inputs and provenance, exit evidence, output receipts, and
+fresh remote process-group quiescence; it preserves the prior failure row and
+sentinel. The owner's normal start admits verification separately; compute
+exit is execution evidence only.
 The runtime acknowledges a delivered notification after its receiving turn
-finishes. Delivery does not restrict the owner's tools or prove stage success;
+finishes. Claude PostToolUse events with a nonempty `agent_id` belong to a
+subagent or teammate even when `session_id` names the parent conversation; they
+record outbound SendMessage calls but leave inbound parent context pending for
+the main session. `agent_type` alone does not identify that case. Delivery does
+not restrict the owner's tools or prove stage success;
 launch dependencies, write authorization and terminal cleanup scopes own those
 decisions. Repeating a notification cannot declare the owner abandoned.
 
 A steward's idle-notify subscription is observation, not a continuation; the
 registered-continuation obligation below still applies (`core/OPERATIONS.md §5.14`).
+The Claude gate carrier may claim, emit, or settle a gate only while it still
+holds the arm and effective seat; a handed-away carrier leaves the gate record
+for its successor.
 
 This section is capability-independent. `autopilot-lab`, `autopilot-code`,
 `autopilot-ship`, spec/research, CI and GitHub check cycles, external-state
@@ -1150,6 +1172,8 @@ Autopilot entrypoints choose `intensity`; verification rigor is derived from it 
 | Important multi-file or risk-bearing work | `strong` | A `deep` owner plus the declared plan/review groups; selected high-value anchors may widen to a third profile/perspective leg while other groups remain width two |
 | Complex cross-domain or cross-harness work | `thorough` | Bounded dispatch-depth-2 perspective and verifier workers |
 | High-stakes, irreversible, security, or external-facing work | `adversarial` | Thorough plus an explicit adversary, failure-mode, or security pass |
+
+The quick row describes the lighter procedure, not a smaller deliverable. The original request, approved endpoint, and assigned scope remain the completion boundary: examples and concise reports do not replace requested investigation, results, or verification. A report endpoint ends with the approved report; a bounded stage finishes only its assigned work and reports any actual unfinished duty through the existing outcome semantics.
 
 Only `direct` has no plan. Every other autopilot graph includes a plan check, but independent QA is not repeated after every sub-stage by default. Independent passes use route-declared bounded groups with separate execution contexts and distinct personas, retaining model-profile/perspective asymmetry where declared; every review — down to a `direct`/`quick` self-check — carries the refute-by-default adversarial stance. `CONVENTIONS §1` is canonical for the graph.
 

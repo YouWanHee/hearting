@@ -17,6 +17,8 @@ from fleet import fleet, render  # noqa: E402
 from fleet.collectors import resource_runs  # noqa: E402
 from fleet.model import ResourceJob  # noqa: E402
 import resource_run_registry  # noqa: E402
+import resource_placement  # noqa: E402
+import resource_progress  # noqa: E402
 
 
 def flatten(lines):
@@ -141,6 +143,58 @@ class ResourceRunFleetTest(unittest.TestCase):
         self.assertEqual([row.run_id for row in rows], ["gpu-0", "gpu-1"])
         self.assertTrue(all(row.project == "project" for row in rows))
         self.assertTrue(all(row.liveness == "working" for row in rows))
+
+    def test_compute_execution_row_survives_scan_and_json_without_observation(self):
+        execution = {
+            "kind": "compute-hosts", "run_id": "compute-1", "host": "gpu-a",
+            "receipt_state": "finished", "meta_sha256": "m" * 64,
+            "exit_sha256": "e" * 64, "receipt_sha256": "r" * 64,
+            "outputs_sha256": "o" * 64, "contract_sha256": "c" * 64,
+        }
+        registry_row = {
+            "execution": execution, "cwd": "/work/project", "status": "succeeded",
+            "resource_policy": "supervised-owner", "started_at": 100,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            index = root / "index.json"
+            reg = root / "resource-runs.json"
+            reg.write_text(json.dumps({
+                "schema_version": 1, "runs": {"resource-1": registry_row},
+            }))
+            resource_run_registry.register_registry(reg, index)
+            identity_reader = mock.Mock(side_effect=AssertionError("local PID probe"))
+            with mock.patch.dict(os.environ, {"AGENT_RESOURCE_RUN_INDEX": str(index)}), \
+                    mock.patch.object(resource_run_registry, "compute_execution_observation",
+                                      side_effect=AssertionError("remote compute observation")) as remote, \
+                    mock.patch.object(resource_placement, "observe",
+                                      side_effect=AssertionError("GPU placement observation")) as placement, \
+                    mock.patch.object(resource_progress, "collect",
+                                      side_effect=AssertionError("remote progress observation")) as progress, \
+                    mock.patch.object(resource_progress, "remote_candidates",
+                                      side_effect=AssertionError("remote candidate observation")) as candidates:
+                self.assertEqual(
+                    resource_run_registry.classify_identity(registry_row, identity_reader),
+                    ("stale", None, "compute-hosts-recorded-state-non-authoritative"),
+                )
+                rows = resource_runs.collect()
+                payload = json.loads(fleet._snapshot_json([], [], rows, show_all=True))
+
+        self.assertEqual(len(rows), 1, resource_runs.collect.last_diagnostics)
+        row = rows[0]
+        self.assertEqual(row.liveness, "exited")
+        self.assertEqual(row.execution, execution)
+        self.assertEqual(row.compute_host, "gpu-a")
+        self.assertEqual(row.compute_run_id, "compute-1")
+        json_row = payload["resource_jobs"][0]
+        self.assertEqual(json_row["execution"], execution)
+        self.assertEqual(json_row["compute_host"], "gpu-a")
+        self.assertEqual(json_row["compute_run_id"], "compute-1")
+        identity_reader.assert_not_called()
+        remote.assert_not_called()
+        placement.assert_not_called()
+        progress.assert_not_called()
+        candidates.assert_not_called()
 
     def test_every_field_the_scanner_emits_is_a_field_the_row_accepts(self):
         """Producer and consumer key sets, pinned together.

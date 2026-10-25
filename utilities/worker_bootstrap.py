@@ -228,32 +228,87 @@ def artifact_cycle_environment(environ) -> dict[str, str]:
     return values
 
 
-def runtime_dir_candidate(artifact_root, environ=None) -> str:
-    """Purely resolve an optional project runtime path; never create it here."""
+def _non_git_runtime_candidate(root: Path, values, source_root) -> str:
+    """Choose the stable external runtime for a validated non-Git source."""
+    import hashlib
+
+    try:
+        from dispatch_contract import stable_state_root
+
+        state_root = stable_state_root(values)
+        state_root_real = state_root.resolve(strict=False)
+        runtimes_root = state_root / "project-runtimes"
+        runtimes_root_real = runtimes_root.resolve(strict=False)
+        digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()
+        candidate = (runtimes_root / digest).resolve(strict=False)
+
+        # A state override may itself contain legacy internal symlinks, but the
+        # generated components must remain proper descendants of their namespace.
+        if (not runtimes_root_real.is_relative_to(state_root_real)
+                or runtimes_root_real == state_root_real
+                or not candidate.is_relative_to(runtimes_root_real)
+                or candidate == runtimes_root_real):
+            return ""
+
+        source = Path(source_root).expanduser().resolve(strict=False) if source_root else root.parent
+
+        def overlaps(left: Path, right: Path) -> bool:
+            return (left == right or left.is_relative_to(right) or right.is_relative_to(left))
+
+        if overlaps(candidate, source) or overlaps(candidate, root):
+            return ""
+        if "releases" in candidate.parts or ".harness" in candidate.parts:
+            return ""
+        return str(candidate)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return ""
+
+
+def runtime_dir_candidate(artifact_root, environ=None, *, repository_kind=None, source_root=None) -> str:
+    """Purely resolve an optional runtime path; never create it here.
+
+    The keyword context is optional so existing producer and helper callers
+    retain the historical Git/unknown behavior.
+    """
     import os
     values = os.environ if environ is None else environ
     try:
         root = Path(artifact_root).expanduser().resolve(strict=False)
         raw = values.get("AGENT_RUNTIME_DIR", "")
+        legacy_default = (root.parent / ".agent_runtime").resolve(strict=False)
+        generated_default = (_non_git_runtime_candidate(root, values, source_root)
+                             if repository_kind == "non-git" else "")
         if raw:
             supplied = Path(raw).expanduser()
             if not supplied.is_absolute():
                 return ""
             candidate = supplied.resolve(strict=False)
-            default = (root.parent / ".agent_runtime").resolve(strict=False)
             # Nested dispatch inherits this generated default as an override.
             # Preserve exactly that path while keeping user overrides fenced.
-            if candidate == default:
+            if candidate == legacy_default or (generated_default and candidate == Path(generated_default)):
                 return str(candidate)
             home = Path.home().resolve(strict=False)
             project = root.parent
+            source = Path(source_root).expanduser().resolve(strict=False) if source_root else project
+            supplied_home = values.get("HOME")
+            home_roots = {home}
+            if supplied_home:
+                configured_home = Path(supplied_home).expanduser()
+                if configured_home.is_absolute():
+                    home_roots.add(configured_home.resolve(strict=False))
             if (candidate == Path("/") or candidate == home or candidate == project
-                    or candidate.is_relative_to(root) or candidate.is_relative_to(home)
-                    or candidate.is_relative_to(project)):
+                    or candidate.is_relative_to(root) or candidate.is_relative_to(project)
+                    or any(candidate == boundary or candidate.is_relative_to(boundary)
+                           or boundary.is_relative_to(candidate)
+                           for boundary in home_roots)
+                    or candidate == source or candidate.is_relative_to(source)
+                    or source.is_relative_to(candidate)):
                 return ""
             if "releases" in candidate.parts or ".harness" in candidate.parts:
                 return ""
             return str(candidate)
+        if repository_kind == "non-git":
+            return generated_default
         return str(root.parent / ".agent_runtime")
     except (OSError, RuntimeError, TypeError, ValueError):
         return ""
@@ -501,6 +556,21 @@ def node_scope_prompt(scope: "NodeScope") -> str:
     return " ".join(lines) + "\n"
 
 
+def completion_scope_prompt() -> str:
+    """Keep procedure defaults subordinate to the approved request and node scope."""
+    return (
+        "Completion precedence:\n"
+        "Complete feasible remaining duties in the recorded request within the "
+        "approved endpoint and this node's assigned scope. Quick examples, concise "
+        "reports, and role or intensity defaults do not replace requested "
+        "investigation, deliverables, or verification. Stop at an approved report "
+        "endpoint; a bounded stage completes only its assigned portion and leaves "
+        "deferred stages to their owners. If assigned work remains unfinished or "
+        "blocked, report it with the existing outcome semantics instead of "
+        "presenting the whole request as complete.\n\n"
+    )
+
+
 def released_task_prompt(args) -> str:
     """Carry the same released task across owner/stage and runtime boundaries.
 
@@ -550,7 +620,9 @@ def released_task_prompt(args) -> str:
     return (
         "Released task context (frame-review):\n"
         "The recorded scope and decisions below govern this work. Apply the "
-        "assigned stage within that scope; role defaults do not expand it. Cite "
+        "assigned stage within that scope; role and intensity defaults neither "
+        "expand nor shrink it. Quick examples and concise reporting are procedure "
+        "defaults, not scope changes. Cite "
         "applicable decision ids in the output.\n\n"
         f"{intent}\n"
     )
@@ -796,7 +868,8 @@ def assignment_prompt(args, task: str, environ) -> str:
     if getattr(args, "worker_type", None) != "frame":
         route_file = getattr(args, "route_file", None)
         if not route_file:
-            return f"Assignment:\n{task.rstrip()}\n\n{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}"
+            return (f"Assignment:\n{task.rstrip()}\n\n{completion_scope_prompt()}"
+                    f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}")
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
         source_worktree = _linked_slice_source_worktree(args, route)
         scope_environment = _child_scope_environment(args, route, environ, source_worktree)
@@ -807,7 +880,8 @@ def assignment_prompt(args, task: str, environ) -> str:
             source_worktree=source_worktree,
             source_worktree_verified=source_worktree is not None,
         )
-        return (f"Assignment:\n{task.rstrip()}\n\n{plan_leg_prompt(route, getattr(args, 'route_node', None))}"
+        return (f"Assignment:\n{task.rstrip()}\n\n{completion_scope_prompt()}"
+                f"{plan_leg_prompt(route, getattr(args, 'route_node', None))}"
                 f"{node_scope_prompt(scope)}{input_sources_prompt(route, getattr(args, 'route_node', None))}\n"
                 f"{automatic_consumer_prompt(route, getattr(args, 'route_node', None))}"
                 f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}")

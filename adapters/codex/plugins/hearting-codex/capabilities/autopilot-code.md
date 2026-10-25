@@ -73,6 +73,9 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
 2. **write only inside the open cycle.** Every durable artifact goes under
    the current node's declared outputs under `AGENT_ARTIFACT_OUTPUT_DIR`.
    `artifact_producer.py` owns cycle output paths and shared revisions.
+   Keep datasets, environments, and caches under `runtime_dir` or an established
+   external project location. If they remain inside a cycle, `core/CORE.md`
+   documents payload self-exclusion markers and recognized runtime structures.
 3. **stage workers join, never fork.** `standard+` stage workers receive
    `AGENT_ARTIFACT_CAMPAIGN_ID`/`CYCLE_ID`/`PRODUCER_ID`/`CYCLE_DIR`/`OUTPUT_DIR`
    from the owner (dispatch env pass-through); the resolver applies the
@@ -126,6 +129,8 @@ Pipeline intensity is the primary ceremony selector. `direct` is inline and `qui
 | `verify` | sanity check for `direct`; focused command/review inside the quick one-shot worker; `code-test` evidence for `standard+` |
 | `synth` | only when dispatch-depth-2 perspective/verifier/adversary workers ran |
 | `report` | concise user report for `direct`; quick returns its concise report from its registered-headless dispatch-depth-1 one-shot conductor; `code-report`/`pipeline_summary.md` for `standard+` |
+
+Quick keeps its inline micro-plan, focused verification, and concise report. Those procedure defaults do not reduce the work: the original request, approved endpoint, and assigned scope determine the required results. Complete feasible remaining duties within that scope, preserve an approved report endpoint, and report genuinely unfinished assigned work with the existing verdict semantics. A bounded stage completes only its assigned part.
 
 Stage-local gates must not become full independent QA loops after every sub-stage. Keep plan-check small, concentrate expensive independent review in the selected risk point or final verification, and keep raw logs in artifacts rather than parent context. A stage remains one semantic gate even when the dispatch-depth-1 owner realizes it as several bounded sessions; those sub-sessions have no gate authority and return phase-brief/ledger/handoff evidence only. `code-plan`, `code-refine`, and `code-test` inherit the selected graph: `code-plan` is standard+ durable planning, `code-refine` is optional correction, and `code-test` is final concrete verification rather than hardcoded-thorough QA.
 
