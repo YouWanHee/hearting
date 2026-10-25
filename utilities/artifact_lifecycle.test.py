@@ -451,6 +451,34 @@ class ArtifactLifecycleCompletionTest(LifecycleTestBase):
             content_root=fx["content_dir"], route_file=fx["route_file"],
         )
 
+    def test_first_completion_with_preserved_history_keeps_role_and_payload_checks(self):
+        fx = self._fixture()
+        previous = json.loads(json.dumps(fx["document"]))
+        previous["cycle"]["state"] = "abandoned"
+        missing = json.loads(json.dumps(fx["document"]))
+        missing["artifacts"] = []
+        missing["artifact_revisions"] = []
+        decision = L.evaluate_cycle_completion(
+            missing, content_root=fx["content_dir"], route_file=fx["route_file"],
+            preserved=[previous], first_completion=True)
+        self.assertEqual(decision.status, "reject")
+        self.assertEqual(decision.reasons[0].code, "completion-required-artifact-missing")
+
+        (fx["content_dir"] / "plan.md").write_bytes(b"changed after the abandoned preimage\n")
+        decision = L.evaluate_cycle_completion(
+            fx["document"], content_root=fx["content_dir"], route_file=fx["route_file"],
+            preserved=[previous], first_completion=True)
+        self.assertEqual(decision.status, "reject")
+        self.assertEqual(decision.reasons[0].code, "completion-artifact-verification-failed")
+
+    def test_first_completion_requires_preserved_history_context(self):
+        fx = self._fixture()
+        decision = L.evaluate_cycle_completion(
+            fx["document"], content_root=fx["content_dir"], route_file=fx["route_file"],
+            first_completion=True)
+        self.assertEqual(decision.status, "reject")
+        self.assertEqual(decision.reasons[0].code, "completion-history-unverified")
+
     def test_recorded_owner_terminal_uses_outcome_row_without_worker_marker(self):
         from types import SimpleNamespace
         route = {"route_id": "rt-recorded-owner", "route_hash": "hash",

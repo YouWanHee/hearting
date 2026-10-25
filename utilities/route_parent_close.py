@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 import dispatch_contract as DC
 import workflow_state as WS
@@ -806,7 +807,7 @@ def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
     ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
     prior = settled_result(route, ledger)
     if prior:
-        _finish_existing_cycle(route)
+        _finish_existing_cycle(route, jobs=jobs)
         return prior
     resources = _resources_for_close(value, jobs)
     protected = {(r["kind"], r["run_id"], r.get("registry")): r
@@ -933,22 +934,164 @@ def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
                         "route_hash": route["route_hash"], "actor": "parent-close",
                         "evidence": {"parent_close_result": outcome}})
         WS._atomic_write(target, json.dumps(outcome, indent=2) + "\n")
-    _finish_existing_cycle(route)
+    _finish_existing_cycle(route, jobs=jobs)
     return outcome
 
 
-def _finish_existing_cycle(route):
+def _finish_existing_cycle(route, *, jobs=None):
     # This is ordinary producer closure, never a dependency on retaining its
     # files. Absence/deletion leaves the cancellation result fully replayable.
     import artifact_producer as AP
     root = Path(route["artifact_root"])
     try:
+        if verified_owner_pin_handoff_close(route, jobs=jobs):
+            return
         cycle = AP.route_cycle_for(root, route)
         if cycle and cycle.get("state") == "open":
             AP.finalize(root, cycle_id=cycle["cycle_id"], state="abandoned",
                         abandon_reason="operator-decision", lock_timeout=0.5)
     except (OSError, ValueError, AP.ProducerError):
         pass
+
+
+def verified_owner_pin_handoff_close(route, *, jobs=None):
+    """Return durable owner-pin handoff evidence, including its successor when prepared.
+
+    The summary is only a selector. Authority comes from the immutable route,
+    its exact close intent/result, the cancelled owner row, and a recorded move
+    of the owner pin away from that launch. A missing successor is a valid
+    pending handoff because close precedes continuation publication.
+    """
+    try:
+        import route_authority as AUTH
+        import route_identity as RI
+        import route_lineage as RL
+
+        root = Path(route["artifact_root"]).resolve()
+        route_id, route_hash = route.get("route_id"), route.get("route_hash")
+        if not isinstance(route_id, str) or not isinstance(route_hash, str):
+            return None
+        path = RL.canonical_route_path(root, route_id)
+        path.lstat()
+        if not path.is_file() or path.is_symlink() or path.resolve() != path:
+            return None
+        sealed = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(sealed, dict) or sealed.get("route_id") != route_id
+                or sealed.get("route_hash") != route_hash
+                or RI.route_hash(sealed) != route_hash):
+            return None
+
+        jobs = jobs_path(jobs)
+        ledger = WS.WorkflowLedger(route_id, route_hash, jobs=jobs)
+        close_intent = ledger_intent(sealed, ledger)
+        result = settled_result(sealed, ledger)
+        journal = ledger.journal()
+        if (not isinstance(close_intent, dict) or not isinstance(result, dict)
+                or close_intent.get("summary") != "owner-pin-handoff"
+                or close_intent.get("route_file") != str(path)
+                or close_intent.get("owner_attempt_id") != result.get("owner_attempt_id")
+                or close_intent.get("route", {}).get("route_id") != route_id
+                or close_intent.get("route", {}).get("route_hash") != route_hash
+                or result.get("route_id") != route_id or result.get("route_hash") != route_hash
+                or result.get("summary") != "owner-pin-handoff"
+                or result.get("state") != "cancelled" or result.get("reason") != NOTE
+                or result.get("terminal_gate_proven") is not False):
+            return None
+        if (not any(entry.get("actor") == "parent-close"
+                    and (entry.get("evidence") or {}).get("parent_close") == close_intent
+                    for entry in journal)
+                or not any(entry.get("actor") == "parent-close"
+                    and (entry.get("evidence") or {}).get("parent_close_result") == result
+                    for entry in journal)):
+            return None
+        owner_attempt = close_intent.get("owner_attempt_id")
+        attempts = close_intent.get("attempts")
+        if (not isinstance(owner_attempt, str) or not isinstance(attempts, list)
+                or owner_attempt not in attempts or result.get("owner_attempt_id") != owner_attempt):
+            return None
+
+        outcome_path = path.with_suffix(".outcome.json")
+        outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+        if (not isinstance(outcome, dict) or outcome.get("route_id") != route_id
+                or outcome.get("route_hash") != route_hash
+                or outcome.get("summary") != "owner-pin-handoff"
+                or outcome.get("state") != "cancelled"
+                or outcome.get("owner_attempt_id") != owner_attempt
+                or outcome.get("terminal_gate_proven") is not False):
+            return None
+
+        rows = _rows(jobs, {owner_attempt})
+        owner = rows.get(owner_attempt)
+        if owner is None:
+            return None
+        fields, metadata = owner
+        if (metadata.get("worker_type") != "owner" or fields[1] in OPEN
+                or metadata.get("failure_class") != "cancelled"
+                or metadata.get("parent_close_route_id") != route_id
+                or metadata.get("parent_close_route_hash") != route_hash
+                or metadata.get("parent_close_settled") != "1"
+                or metadata.get("owner_route_id") != route_id
+                or metadata.get("owner_route_hash") != route_hash
+                or Path(metadata.get("owner_route_file", "")).resolve() != path
+                or metadata.get("harness") not in AUTH.PIN_HARNESSES):
+            return None
+
+        workflow = ledger.read_only_state()
+        if workflow.get("journal_unreadable") or workflow.get("workflow_state") != "CANCELLED":
+            return None
+
+        launch_harness = metadata["harness"]
+        successor_path_value = result.get("successor_route")
+        successor = None
+        target_harness = AUTH.sealed_pin_harness(sealed, worker_type="owner")
+        if successor_path_value:
+            successor_path = Path(successor_path_value)
+            if successor_path.resolve() != RL.canonical_route_path(root, successor_path.stem):
+                return None
+            successor_path.lstat()
+            if (not successor_path.is_file() or successor_path.is_symlink()
+                    or successor_path.resolve() != successor_path):
+                return None
+            successor = json.loads(successor_path.read_text(encoding="utf-8"))
+            successor_pins = successor.get("selection_pins") if isinstance(successor, dict) else None
+            sealed_owner_pin = (successor_pins or {}).get("owner") if isinstance(successor_pins, dict) else None
+            target_harness = (sealed_owner_pin or {}).get("harness") if isinstance(sealed_owner_pin, dict) else None
+            if (not isinstance(successor, dict)
+                    or successor.get("route_id") != successor_path.stem
+                    or RI.route_hash(successor) != successor.get("route_hash")
+                    or successor.get("source_route_id") != route_id
+                    or successor.get("source_route_hash") != route_hash
+                    or target_harness not in AUTH.PIN_HARNESSES
+                    or successor.get("reason") != f"owner-pin-handoff:{owner_attempt}:{target_harness}"
+                    or successor.get("continuation_contract_version") != 1):
+                return None
+            lineage = RL.verified_route_lineage(successor, artifact_root=root, observe=True)
+            if len(lineage) < 2 or lineage[1].get("route_id") != route_id:
+                return None
+            recorded_pins = result.get("handoff_pins")
+            if (not isinstance(recorded_pins, dict)
+                    or (recorded_pins.get("owner") or {}).get("harness") != target_harness
+                    or result.get("successor_route") != str(successor_path)):
+                return None
+
+        changes = [row for row in AUTH.pin_changes(sealed)
+                   if row.get("target") == "owner"
+                   and (row.get("previous") or {}).get("harness") in (None, launch_harness)
+                   and (row.get("pin") or {}).get("harness") == target_harness
+                   and target_harness != launch_harness]
+        close_at = datetime.fromisoformat(str(close_intent.get("at", "")).replace("Z", "+00:00"))
+        changes = [row for row in changes
+                   if isinstance(row.get("by"), dict)
+                   and row["by"].get("harness") in AUTH.PIN_HARNESSES
+                   and row["by"].get("session_id") == metadata.get("parent_sid")
+                   and datetime.fromisoformat(str(row.get("at", "")).replace("Z", "+00:00")) <= close_at]
+        if not target_harness or not changes:
+            return None
+        return {"route": sealed, "route_file": str(path), "owner_attempt_id": owner_attempt,
+                "launch_harness": launch_harness, "target_harness": target_harness,
+                "successor": successor, "successor_route": str(successor_path_value or "")}
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, AttributeError):
+        return None
 
 
 def recover_attempt(jobs, metadata):
