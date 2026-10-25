@@ -1558,7 +1558,11 @@ def _gpu_process_records(snapshot):
                 elapsed = _num(process.get("elapsed_s"))
                 gib = _gib(process.get("used_memory_mib"))
                 processes.append({"host": host.get("host"), "gpu": gpu.get("index"),
-                    "session_id": session_tags.get((owner_harness, owner_sid), owner_sid),
+                    # Keep the source identity for JSON/evidence, and carry only an exact
+                    # current-board tag for the display. A departed or unmatched owner has
+                    # no visible session tag; the full ID is not a display label.
+                    "session_id": owner_sid,
+                    "session_tag": session_tags.get((owner_harness, owner_sid)),
                     "cwd": _gpu_repo(process.get("cwd")),
                     "command": _short_gpu_command(process.get("command")),
                     "vram": (f"{gib:.1f} GB" if gib is not None else None),

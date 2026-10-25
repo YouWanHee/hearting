@@ -60,6 +60,10 @@ def conform(live, samples, path, problems):
     if kind == "map":
         keys = set().union(*(set(sample) for sample in samples if bucket(sample) == "map"))
         for key in live:
+            if path == "system.gpu_processes[]" and key == "session_tag":
+                if live[key] is not None and not isinstance(live[key], str):
+                    problems.append(f"{path}.session_tag: expected optional string")
+                continue
             if path == "system" and key in ("gpu_process_summary", "unregistered_gpu_summary"):
                 if not isinstance(live[key], dict) or set(live[key]) - {"count", "unregistered", "owner", "remaining"}:
                     problems.append(f"system.{key}: invalid summary shape")
@@ -79,7 +83,7 @@ def conform(live, samples, path, problems):
                 if path == "system" and key == "gpu_processes":
                     for index, process in enumerate(live[key]):
                         if not isinstance(process, dict) or set(process) - {
-                                "host", "gpu", "session_id", "cwd", "command", "vram", "age"}:
+                                "host", "gpu", "session_id", "session_tag", "cwd", "command", "vram", "age"}:
                             problems.append(f"system.gpu_processes[{index}]: invalid process record shape")
                     continue
                 if path == "system" and key == "unregistered_gpu_processes":

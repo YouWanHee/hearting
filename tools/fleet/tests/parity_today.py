@@ -169,7 +169,10 @@ def build_live_vm(capture_dir):
     seats_path, config_path = capture_dir / "seat-reads.json", capture_dir / "model-config.json"
     seats = json.loads(seats_path.read_text(encoding="utf-8")) if seats_path.exists() else None
     config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else None
-    detail = _merged_detail(details, seats, config) if details else None
+    # A capture can have no per-session detail reads and still contain an independent
+    # model-config observation. Keep that source in the VM instead of letting the reference
+    # renderer's hand-written model tables stand in for missing data.
+    detail = _merged_detail(details, seats, config) if details or seats is not None or config is not None else None
     return build_view_model(snapshot, accepted_detail=detail, now=now), now
 
 
@@ -274,6 +277,61 @@ def _has(pattern, text):
     return re.search(pattern, text) is not None
 
 
+def _answered_repo_count(text):
+    """Return an answered header's explicit repo/count pair, when both are present."""
+    if "ANSWERED TODAY" not in text:
+        return None
+    tail = _collapse(text.split("ANSWERED TODAY", 1)[1])
+    match = re.match(r"([A-Za-z0-9_.-]+)\s+(\d+)\s+·\s+\d+\s+decision records", tail)
+    return (match.group(1), int(match.group(2))) if match else None
+
+
+def _answered_count_diff(record, band):
+    if record["state"] != "QUESTIONS" or band["pane"] != "right":
+        return False
+    reference, fleet2 = _band_text(band)
+    ref_value, fleet_value = _answered_repo_count(reference), _answered_repo_count(fleet2)
+    return bool(ref_value and fleet_value and ref_value[0] == fleet_value[0]
+                and ref_value[1] != fleet_value[1])
+
+
+def _system_pending_diff(record, band):
+    if record["state"] != "SYSTEM" or band["pane"] != "frame":
+        return False
+    reference, fleet2 = _band_text(band)
+    pattern = r"(\d+|·) deliveries pending"
+    ref_value, fleet_value = re.search(pattern, reference), re.search(pattern, fleet2)
+    return bool(ref_value and fleet_value and ref_value.group(1) != fleet_value.group(1))
+
+
+def _reserved_terminal_column(record, band):
+    """The live renderer reserves its last column; accept only those exact right-edge clips."""
+    width = record["width"]
+    diffs = [d for d in record.get("differences", ())
+             if d.get("kind") == "cell" and d.get("row") in band["rows"]]
+    if not diffs or any(d.get("column", -1) < width - 2 for d in diffs):
+        return False
+    if not any(d.get("column") == width - 1 for d in diffs):
+        return False
+    if band["pane"] == "frame" and record["state"] in {
+            "OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "MEMORY", "SYSTEM"}:
+        return band["rows"] == [42] and all(_has(r"^\s*≋ ", line) for line in band["reference"])
+    if band["pane"] == "right" and record["state"] == "SYSTEM":
+        return band["rows"] == [8] and all("collectors:" in line for line in band["reference"])
+    return False
+
+
+def _unknown_compute_track(record, band):
+    limitations = record.get("reference_copy_limitations") or ()
+    moving4 = {item.get("gpu") for item in limitations
+               if item.get("reference_file") == "mock13.py" and item.get("host") == "moving4"
+               and "VRAM gauge" in item.get("unknown_cells", ())}
+    return (record["state"] == "COMPUTE" and record["width"] in (140, 168)
+            and band["pane"] == "right" and band["rows"] == [5, 6]
+            and moving4 == {0, 1}
+            and all("RTX 6000 Ada" in line for line in band["reference"]))
+
+
 CHROME = "tools/fleet/explorer/chrome.py"
 TABLES = "tools/fleet/explorer/tables.py"
 PAGES = "tools/fleet/explorer/pages.py"
@@ -296,6 +354,17 @@ RULES = [
     ("blank-cell-key", "intended", None,
      "only blank cells differ, and only in their foreground key: a space has no glyph and no background, so nothing visible differs",
      lambda r, b: b["blank_only"]),
+    ("prd-census-spinner-order", "intended", None,
+     "the current PRD pulse row puts the spinner before the census counts; this frozen reference copy puts it after the clock",
+     lambda r, b: b["pane"] == "frame" and b["rows"] == [0] and
+     _has(r"^\s*\d+ working .*\d{2}:\d{2}⠏$", b["reference"][0]) and
+     _has(r"^\s*⠏\s*\d+ working", b["fleet2"][0])),
+    ("right-edge-safe-clip", "intended", None,
+     "fleet2 reserves the final terminal column on the shared feed and SYSTEM collector row; the frozen reference writes into that cell",
+     _reserved_terminal_column),
+    ("unknown-gpu-track", "copy-limitation", None,
+     "moving4 GPU 0/1 UTIL and VRAM values are None: the reference copy can show · but cannot draw fleet2's empty 10-cell unknown track; no zero is synthesized",
+     _unknown_compute_track),
     ("legend-overflow-80", "excluded", None,
      "80 columns: the reference's key legend is 91 cells wide and is cut at the screen edge (`F feed`); fleet2 drops the "
      "hint keys by priority (chrome.py draw_chrome) - reference self-defect, narrow-width intent",
@@ -362,9 +431,8 @@ RULES = [
      lambda r, b: r["state"] == "PEERS" and b["pane"] == "right" and b["text_equal"] and
      all((d["reference"] or [""])[0] in "├┤" for d in b["samples"])),
     ("answered-head", "fleet2-defect", TABLES,
-     "ANSWERED TODAY header: `<first repo> <n>` where n is that repo's answered rows in the reference; fleet2 writes the total of all repos "
-     "(20) after the first repo's name (tables.py:904)",
-     lambda r, b: _has("ANSWERED TODAY", b["reference"][0]) and _has("ANSWERED TODAY", b["fleet2"][0])),
+     "ANSWERED TODAY shows a different count for the same explicit repo in the reference and Fleet2",
+     _answered_count_diff),
     ("question-empty-now", "copy-limitation", None,
      "a waiting question whose `now` text is empty: the reference draws nothing after `now:` (all 22:53 questions carried text); fleet2 draws `·`",
      lambda r, b: r["state"] == "QUESTIONS" and _has(r"now:\s*$", b["reference"][0]) and _has(r"now:\s+·", b["fleet2"][0])),
@@ -409,8 +477,8 @@ RULES = [
      "80/100 columns: MODELS rows, the edit panel foot and the CONTEXT bars run to the screen edge in the reference and are cut there",
      lambda r, b: r["width"] in (80, 100) and r["state"] == "MODELS" and b["ref_edge"]),
     ("system-status", "fleet2-defect", CHROME,
-     "SYSTEM status line with an unread `pending` count: fleet2 prints `· deliveries pending`, the reference prints the number",
-     lambda r, b: r["state"] == "SYSTEM" and b["pane"] == "frame"),
+     "SYSTEM status line shows an observed pending-delivery count differently between renderers",
+     _system_pending_diff),
     ("overview-80", "excluded", None,
      "80 columns: the reference's OVERVIEW draws NOW text over the CTX column and header (`TCTXE`), the known 80-column OVERVIEW self-defect",
      lambda r, b: r["width"] == 80 and r["state"] in ("OVERVIEW", "repo") and b["pane"] == "right" and

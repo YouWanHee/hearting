@@ -95,6 +95,7 @@ class ConfigFields(unittest.TestCase):
 
     def test_first_tick_process_row_is_kept_and_gpu_processes_use_renderer_record_shape(self):
         snapshot = {"sessions": [{"harness": "codex", "pid": 44, "proc_start": 100,
+                                  "session_id": "sid-exact", "session_tag": "a3",
                                   "cwd": "/work/SR_CorrNet-wt/branch", "liveness": "working"}],
                     "resources": [], "compute_hosts": {"hosts": [{"host": "host-a", "gpus": [
                         {"index": 0, "processes": [{"command": "python -B /tmp/resume.py --request-sha256 0123456789abcdef",
@@ -105,9 +106,23 @@ class ConfigFields(unittest.TestCase):
         vm = build_view_model(snapshot, now=2_000_000_000)
         self.assertEqual(len(vm.sessions), 1)
         self.assertEqual(vm.system["gpu_processes"][0]["session_id"], "sid-exact")
+        self.assertEqual(vm.system["gpu_processes"][0]["session_tag"], "a3")
         self.assertEqual(vm.system["gpu_processes"][0]["command"], "resume.py")
         self.assertEqual(vm.system["gpu_processes"][0]["vram"], "2.5 GB")
         self.assertEqual(vm.system["gpu_processes"][0]["age"], "1h 0m")
+
+    def test_unmatched_gpu_owner_keeps_exact_id_but_has_no_display_tag(self):
+        snapshot = {"sessions": [], "resources": [], "compute_hosts": {"hosts": [{"host": "host-a", "gpus": [
+            {"index": 0, "processes": [{"command": "python train.py", "used_memory_mib": 1024,
+                "elapsed_s": 60, "cwd": "/work/repo",
+                "session_owner": {"harness": "codex", "session_id": "departed-session"}}]}]}]},
+            "unregistered_gpu": []}
+
+        vm = build_view_model(snapshot, now=2_000_000_000)
+        process = vm.system["gpu_processes"][0]
+
+        self.assertEqual(process["session_id"], "departed-session")
+        self.assertIsNone(process["session_tag"])
 
     def test_compute_host_uses_per_thread_cpu_and_swap_telemetry(self):
         host = {"host": "host-a", "self": True, "reachable": True, "cpu_count": 4,

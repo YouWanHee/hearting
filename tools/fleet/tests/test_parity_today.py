@@ -7,7 +7,7 @@ from unittest import mock
 
 from tools.fleet.tests.parity_compare import diff_frames
 from tools.fleet.tests.parity_today import (_frame_from_reference, _jsonable, _unique_reference_copy_limitations,
-                                            classify)
+                                            build_live_vm, classify)
 
 
 class TodayParityPlumbingTests(unittest.TestCase):
@@ -78,6 +78,62 @@ class ClassificationTests(unittest.TestCase):
         document = classify([_record(cells=[(20, 50, "a", "dim", "b", "dim")])])
         self.assertEqual(document["summary"]["unexplained"], 1)
 
+    def test_current_prd_spinner_order_is_intentional_and_not_a_system_pending_defect(self):
+        record = _record(width=80, cells=[(0, 2, "0", "dim", "⠏", "spin")])
+        record["state"] = "SYSTEM"
+        record["reference_rows"][0] = " 0 working  ● 0 idle  ● 0 answer needed   hearting v3.50.3-20-gad247e2b6  02:38⠏"
+        record["fleet2_rows"][0] = "  ⠏ 0 working  ● 0 idle  ● 0 answer needed   hearting v3.50.3-20-gad247e2b6  02"
+
+        entry = classify([record])["entries"][0]
+
+        self.assertEqual((entry["class"], entry["rule"]), ("intended", "prd-census-spinner-order"))
+
+    def test_empty_answered_repo_placeholder_does_not_claim_an_aggregate_count_defect(self):
+        record = _record(width=140, cells=[(7, 40, "0", "dim", "·", "dim")])
+        record["state"] = "QUESTIONS"
+        record["reference_rows"][7] = " " * 33 + " ── ANSWERED TODAY  0 · 0 decision records in all projects ───────"
+        record["fleet2_rows"][7] = " " * 33 + " ── ANSWERED TODAY  · 0 · 0 decision records in all projects ─────"
+
+        entry = classify([record])["entries"][0]
+
+        self.assertEqual(entry["class"], "unexplained")
+
+    def test_answered_repo_count_difference_requires_the_same_explicit_repo(self):
+        record = _record(width=140, cells=[(7, 40, "6", "dim", "20", "dim")])
+        record["state"] = "QUESTIONS"
+        record["reference_rows"][7] = " " * 33 + " ── ANSWERED TODAY  SR_CorrNet 6 · 32 decision records in all projects"
+        record["fleet2_rows"][7] = " " * 33 + " ── ANSWERED TODAY  SR_CorrNet 20 · 32 decision records in all projects"
+
+        entry = classify([record])["entries"][0]
+
+        self.assertEqual((entry["class"], entry["rule"]), ("fleet2-defect", "answered-head"))
+
+    def test_rightmost_feed_cell_is_the_recorded_terminal_guard(self):
+        record = _record(width=80, cells=[(42, 78, "수", "soft", " ", None),
+                                         (42, 79, "", "soft", " ", None)])
+        record["reference_rows"][42] = " ≋ event text ends with 수"
+        record["fleet2_rows"][42] = " ≋ event text ends with"
+
+        entry = classify([record])["entries"][0]
+
+        self.assertEqual((entry["class"], entry["rule"]), ("intended", "right-edge-safe-clip"))
+
+    def test_unknown_compute_track_is_a_narrow_reference_copy_limit(self):
+        record = _record(width=140, cells=[(5, 55, "·", "dim", "─", "dim"),
+                                          (6, 55, "·", "dim", "─", "dim")])
+        record["state"] = "COMPUTE"
+        record["reference_copy_limitations"] = [
+            {"reference_file": "mock13.py", "host": "moving4", "gpu": gpu,
+             "unknown_cells": ["UTIL", "VRAM gauge"]} for gpu in (0, 1)]
+        record["reference_rows"][5] = " " * 33 + "  moving4   ● 0  RTX 6000 Ada     ·    ·            ·"
+        record["fleet2_rows"][5] = " " * 33 + "  moving4   ● 0  RTX 6000 Ada    ·     ··········   ·"
+        record["reference_rows"][6] = " " * 33 + "            ● 1  RTX 6000 Ada     ·    ·            ·"
+        record["fleet2_rows"][6] = " " * 33 + "            ● 1  RTX 6000 Ada    ·     ··········   ·"
+
+        entry = classify([record])["entries"][0]
+
+        self.assertEqual((entry["class"], entry["rule"]), ("copy-limitation", "unknown-gpu-track"))
+
     def test_a_hit_difference_on_a_row_whose_cells_are_equal_is_not_derived(self):
         hit = [30, 34, 100, ["scope", "x"]]
         document = classify([_record(hits=([hit], []))])
@@ -95,6 +151,64 @@ class ClassificationTests(unittest.TestCase):
 
 
 class InjectionPieces(unittest.TestCase):
+    def test_saved_model_config_is_loaded_when_detail_reads_are_empty(self):
+        with tempfile.TemporaryDirectory() as temp:
+            capture = Path(temp)
+            (capture / "fleet-json.json").write_text("{}", encoding="utf-8")
+            (capture / "snapshot-bundle.json").write_text('{"captured_at": 123.0}', encoding="utf-8")
+            (capture / "detail-reads.json").write_text("{}", encoding="utf-8")
+            (capture / "seat-reads.json").write_text("{}", encoding="utf-8")
+            config = {"profiles": []}
+            (capture / "model-config.json").write_text('{"profiles": []}', encoding="utf-8")
+
+            with mock.patch("tools.fleet.tests.snapshot_fixture.replay_source_bundle",
+                            return_value=("snapshot", None)), \
+                    mock.patch("tools.fleet.tests.parity_today._merged_detail",
+                               return_value="accepted-detail") as merge_detail, \
+                    mock.patch("tools.fleet.explorer.live.build_view_model", return_value="view-model") as build_vm:
+                vm, now = build_live_vm(capture)
+
+        self.assertEqual((vm, now), ("view-model", 123.0))
+        merge_detail.assert_called_once_with({}, {}, config)
+        build_vm.assert_called_once_with("snapshot", accepted_detail="accepted-detail", now=123.0)
+
+    def test_reference_tree_drops_repo_rows_without_a_current_session(self):
+        from tools.fleet.tests.reference_injection import _project_rows
+
+        vm = {"repos": [{"id": "ended", "name": "ended"}, {"id": "active", "name": "active"}],
+              "sessions": [{"tag": "a3", "repo_id": "active", "repo": "active"}]}
+        rows = _project_rows(vm, [{"tag": "a3"}])
+
+        self.assertEqual([(name, len(sessions)) for name, _done, _age, sessions in rows], [("active", 1)])
+
+    def test_absent_model_config_clears_reference_seed_values(self):
+        from types import SimpleNamespace
+        from tools.fleet.tests.reference_injection import _inject_models
+
+        renderer = SimpleNamespace(
+            mock2=SimpleNamespace(LIVE={"allocation_fields": ["seed"], "allocation_note": "seed"}),
+            PROFILES=["seed"], PROFILE_MAP={"seed": {}}, MODEL_CHOICES={"seed": []}, MAIN_ONLY={"seed": []},
+            EFFORTS=["seed"], POOLS={"seed": None}, EFF_KEY={"seed": "seed"}, MODEL_SHOWN={"seed": "seed"},
+            CTX={"seed": 1}, CTX_HOW={"seed": "seed"}, TIDY=(1, 2), KTOK={"seed": 1})
+
+        _inject_models(renderer, None)
+
+        self.assertEqual(renderer.PROFILES, [])
+        self.assertEqual(renderer.MODEL_CHOICES, {})
+        self.assertEqual(renderer.MAIN_ONLY, {})
+        self.assertEqual(renderer.CTX, {})
+        self.assertEqual(renderer.TIDY, ())
+        self.assertNotIn("allocation_fields", renderer.mock2.LIVE)
+        self.assertNotIn("allocation_note", renderer.mock2.LIVE)
+
+    def test_compute_footer_uses_captured_host_gpu_states(self):
+        from tools.fleet.tests.reference_injection import _compute_foot
+
+        vm = {"compute": [["a", False, [], [], [], [[0, "working"], [1, "idle"]]],
+                           ["b", False, [], [], [], [[0, "idle"]]]]}
+
+        self.assertEqual(_compute_foot(vm), "2/2 hosts · GPU 1/3 working · 1 host idle")
+
     def test_unknown_compute_metrics_remain_none_and_render_as_unknown_cells(self):
         from types import SimpleNamespace
         from tools.fleet.tests.reference_injection import _adapt_unknown_compute_cells

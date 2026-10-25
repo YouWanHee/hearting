@@ -356,14 +356,8 @@ def inject_live(renderer, vm):
     """
     vm = dict(vm)
     m2, m3, m4, m5, m6, m12 = (getattr(renderer, name) for name in ("mock2", "mock3", "mock4", "mock5", "mock6", "mock12"))
-    repos = vm.get("repos") or ()
     sessions = [_session_row(row) for row in vm.get("sessions") or () if row.get("tag")]
-    by_repo = {}
-    for source, row in zip([s for s in vm.get("sessions") or () if s.get("tag")], sessions):
-        by_repo.setdefault(source.get("repo_id") or source.get("repo") or "·", []).append(row)
-    projects = [(repo.get("name") or repo.get("id"), repo.get("done"), repo.get("age") or "·",
-                 by_repo.pop(repo.get("id") or repo.get("name"), [])) for repo in repos]
-    projects += [(name, None, "·", rows) for name, rows in by_repo.items()]
+    projects = _project_rows(vm, sessions)
     _put(m3.PROJECTS, projects)
     _put(m5.SESS, {s["tag"]: s for _n, _d, _a, rows in projects for s in rows})
     renderer.PROJECT_OF.clear()
@@ -378,10 +372,26 @@ def inject_live(renderer, vm):
     _inject_rest(renderer, vm, sessions)
     _inject_history(renderer, vm)
     _inject_models(renderer, vm.get("models"))
+    _adapt_reference_overview(renderer)
+    _adapt_reference_memory_summary(renderer, vm)
+    _adapt_reference_system(renderer)
     renderer.ROOT_STATUS.update(_status(renderer, vm, 0))
     limitations = _adapt_unknown_compute_cells(renderer, vm.get("compute"))
     return {"injected": sorted(renderer.mock2.LIVE), "unresolved": [],
             "reference_copy_limitations": limitations}
+
+
+def _project_rows(vm, sessions):
+    """Project only repo groups that have a current session, as the Explorer tree does."""
+    by_repo = {}
+    for source, row in zip([s for s in vm.get("sessions") or () if s.get("tag")], sessions):
+        by_repo.setdefault(source.get("repo_id") or source.get("repo") or "·", []).append(row)
+    projects = [(repo.get("name") or repo.get("id"), repo.get("done"), repo.get("age") or "·",
+                 by_repo.pop(repo.get("id") or repo.get("name"), [])) for repo in vm.get("repos") or ()]
+    projects += [(name, None, "·", rows) for name, rows in by_repo.items()]
+    # A repo with no current session has no row in the Explorer tree. Keeping its
+    # historical reference seed here makes the same VM draw a different tree.
+    return [project for project in projects if project[3]]
 
 
 def _deep(value):
@@ -545,6 +555,11 @@ def _inject_rest(renderer, vm, sessions):
     live["census"] = (working, idle, asking)
     live["version"] = install.get("version") or "·"
     live["watch"] = {w.get("repo"): w.get("text") for w in (vm.get("peer_edges") or {}).get("watches") or ()}
+    live["memory_summary"] = system.get("memory_summary")
+    live["compute_foot"] = _compute_foot(vm)
+    from tools.fleet.explorer.tables import repo_label
+    live["project_count"] = sum(1 for repo in vm.get("repos") or ()
+                                if repo_label(repo.get("name", "·")))
     when = {}
     for up, down in (vm.get("peer_edges") or {}).get("side_lanes") or ():
         pair = []
@@ -567,6 +582,7 @@ def _inject_rest(renderer, vm, sessions):
     live["system"] = dict(
         version=install.get("version") or "·", managed=bool(install.get("managed")), pinned=bool(install.get("pinned")),
         distribution=bool(install.get("distribution")), runtimes=tuple(system.get("runtimes") or ()),
+        collectors=tuple(system.get("collectors") or ()),
         usage_state=usage_api.get("state") or "·", usage_fresh=str(usage_api.get("freshness") or "·"),
         active=dispatch.get("governor_active", "·"), cap=dispatch.get("governor_cap", "·"),
         dispatch=system.get("dispatch_count", "·"), jobs=dispatch.get("jobs", "·"),
@@ -579,7 +595,8 @@ def _inject_rest(renderer, vm, sessions):
     answered_total = system.get("answered_total")
     rows = (vm.get("answered") or [[None, []]])[0]
     live["answered_head"] = "%s%d · %s decision records in all projects" % (
-        (rows[0] + " ") if rows[0] else "", len(rows[1]), answered_total if answered_total is not None else sum(len(r[1]) for r in vm.get("answered") or ()))
+        ((str(rows[0]) if rows[0] else "·") + " "), len(rows[1]),
+        answered_total if answered_total is not None else sum(len(r[1]) for r in vm.get("answered") or ()))
     _put(m3.FEED, [tuple(e) for e in vm.get("events") or ()])
     _put(m3.COMPUTE, [_deep(host) for host in vm.get("compute") or ()])
     for module in (m4, renderer.mock12, m9):
@@ -592,16 +609,125 @@ def _inject_rest(renderer, vm, sessions):
             gb = float(str(p.get("vram", "0")).split()[0])
         except ValueError:
             gb = 0.0
+        display_tag = p.get("session_tag") if "session_tag" in p else p.get("session_id")
         procs.setdefault((p.get("host"), p.get("gpu")), []).append(
-            dict(tag=p.get("session_id"), repo=p.get("cwd") or "·", cmd=p.get("command") or "", gb=gb,
+            dict(tag=display_tag, repo=p.get("cwd") or "·", cmd=p.get("command") or "", gb=gb,
                  age=p.get("age") or "·", unreg=not p.get("registered")))
     _put(renderer.GPU_PROCS, procs)
     renderer.ROOT_STATUS.update(_status(renderer, vm, working))
 
 
+def _compute_foot(vm):
+    """Short COMPUTE footer derived from the same host/GPU records as the live VM."""
+    hosts = tuple(vm.get("compute") or ())
+    if not hosts:
+        return "·"
+    gpus = [gpu for host in hosts for gpu in (host[5] if len(host) > 5 else ())]
+    working = sum(1 for gpu in gpus if len(gpu) > 1 and gpu[1] == "working")
+    idle_hosts = sum(1 for host in hosts if len(host) > 5 and host[5]
+                     and all(len(gpu) > 1 and gpu[1] == "idle" for gpu in host[5]))
+    return "%d/%d hosts · GPU %d/%d working · %d host idle" % (
+        len(hosts), len(hosts), working, len(gpus), idle_hosts)
+
+
+def _adapt_reference_overview(renderer):
+    """Keep the reference tree session-only while its summary counts all live repo records."""
+    draw = renderer.t_overview
+    adapted = _patch_reference_function(draw, [
+        ('n(len(PROJECTS), "project")',
+         'n(mock2.LIVE.get("project_count", len(PROJECTS)), "project")'),
+    ], "overview project count")
+    renderer.t_overview = adapted
+    renderer.ROOT_FN["OVERVIEW"] = adapted
+
+
+def _adapt_reference_memory_summary(renderer, vm):
+    """Replace the frozen memory summary text with the capture's observed fields."""
+    m4 = renderer.mock4
+    m4.PARITY_MEMORY_SUMMARY = dict((vm.get("system") or {}).get("memory_summary") or {})
+    draw = m4.t_memory
+    old = ('g.put(X + 1, y, "32 added today · 6 projects · 43 expired at 00:03 (lifecycle) · 15 latest shown", "dim")')
+    new = (
+        'summary = PARITY_MEMORY_SUMMARY or {}\n'
+        '    latest = summary.get("latest", "·")\n'
+        '    text = "%s added today · %s projects · %s expired" % (\n'
+        '        summary.get("added_today", "·"), summary.get("projects", "·"), summary.get("expired", "·"))\n'
+        '    if summary.get("expired_at"):\n'
+        '        text += " at " + str(summary["expired_at"])\n'
+        '    text += " (lifecycle) · %s latest shown" % latest\n'
+        '    g.put(X + 1, y, text, "dim")'
+    )
+    adapted = _patch_reference_function(draw, [(old, new)], "memory summary")
+    m4.t_memory = adapted
+    renderer.ROOT_FN["MEMORY"] = adapted
+
+
+def _system_runtime_parts(values):
+    values = tuple(values or ())
+    if not values:
+        return [("·", "dim")]
+    parts = []
+    for index, value in enumerate(values):
+        if index:
+            parts.append((" · ", "dim"))
+        parts.append((str(value), "hb_" + str(value)))
+    return parts
+
+
+def _system_collector_parts(values):
+    values = tuple(values or ())
+    if not values:
+        return [("·", "dim")]
+    parts = []
+    for index, value in enumerate(values):
+        if index:
+            parts.append(("  ", "dim"))
+        parts.extend(((str(value) + " ", "dim"), ("✓", "done")))
+    return parts
+
+
+def _adapt_reference_system(renderer):
+    """Use the VM's runtime/collector observations, including explicit unknown cells."""
+    m9 = renderer.mock9
+    m9._parity_runtime_parts = _system_runtime_parts
+    m9._parity_collector_parts = _system_collector_parts
+    draw = m9.t_system
+    source = textwrap.dedent(inspect.getsource(draw))
+    lines = source.splitlines()
+    replacements = {
+        '("runtimes:", sum(': '("runtimes:", _parity_runtime_parts(S.get("runtimes"))),',
+        '("collectors:", [': '("collectors:", _parity_collector_parts(S.get("collectors")))])',
+    }
+    seen = set()
+    for index, line in enumerate(lines):
+        for marker, replacement in replacements.items():
+            if marker in line:
+                if marker in seen:
+                    raise RuntimeError("reference SYSTEM renderer changed; cannot inject live fields safely")
+                indent = line[:len(line) - len(line.lstrip())]
+                lines[index] = indent + replacement
+                seen.add(marker)
+                break
+    if seen != set(replacements):
+        raise RuntimeError("reference SYSTEM renderer changed; cannot inject live fields safely")
+    source = "\n".join(lines)
+    old_owner = '"%s · owner [%s] · see COMPUTE" % (S["gpu_count"], S["gpu_owner"])'
+    new_owner = '"%s%s · see COMPUTE" % (S["gpu_count"], (" · owner [%s]" % S["gpu_owner"]) if S["gpu_owner"] != "·" else "")'
+    if source.count(old_owner) != 1:
+        raise RuntimeError("reference SYSTEM owner field changed; cannot preserve unknown ownership safely")
+    source = source.replace(old_owner, new_owner, 1)
+    namespace = draw.__globals__
+    exec(compile(source, draw.__code__.co_filename, "exec"), namespace)
+    adapted = namespace.get(draw.__name__)
+    if not callable(adapted):
+        raise RuntimeError("reference SYSTEM adapter did not load")
+    m9.t_system = adapted
+    renderer.ROOT_FN["SYSTEM"] = adapted
+
+
 def _status(renderer, vm, working):
     sessions, routes, questions = vm.get("sessions") or (), vm.get("routes") or (), vm.get("questions") or ()
-    n = lambda k, w: "%d %s%s" % (k, w, "" if k == 1 else "s")
+    n = lambda k, w, plural=None: "%d %s" % (k, w if k == 1 else (plural or w + "s"))
     system = vm.get("system") or {}
     seats = renderer.mock5.SEATS
     hosts = vm.get("compute") or ()
@@ -609,6 +735,13 @@ def _status(renderer, vm, working):
     busy = sum(1 for g in gpus if g[1] == "working")
     links = (vm.get("peer_edges") or {}).get("links") or ()
     pending = (system.get("peer_delivery") or {}).get("pending", "·")
+    models = vm.get("models") or {}
+    profiles = len(models.get("profiles") or ())
+    profile_map = models.get("profile_map") or {}
+    harnesses = len(profile_map) if isinstance(profile_map, dict) else 0
+    allocation_fields = (models.get("allocation") or {}).get("fields") or ()
+    strategy = next((str(parts[0][0]) for label, parts in allocation_fields
+                     if label == "strategy:" and parts), "balanced")
     return {
         "OVERVIEW": "%s · %s · %s" % (n(len(sessions), "session"), n(len(routes), "route"), n(len(questions), "question")),
         "PEERS": "%s · %s · %s" % (n(len(links), "link"), n(sum(1 for s in sessions if s.get("steward")), "steward"),
@@ -620,6 +753,8 @@ def _status(renderer, vm, working):
         "COMPUTE": "%s · GPU %d/%d" % (n(len(hosts), "host"), busy, len(gpus)),
         "MEMORY": "today %s added · %s expired" % ((system.get("memory_summary") or {}).get("added_today", "·"),
                                                    (system.get("memory_summary") or {}).get("expired", "·")),
+        "MODELS": "%s × %s · %s allocation" % (n(profiles, "profile"),
+                                                  n(harnesses, "harness", "harnesses"), strategy),
         "SYSTEM": "%s · %s pending" % ((system.get("install") or {}).get("version", "·"),
                                        ("1 delivery" if pending == 1 else "%s deliveries" % pending)),
     }
@@ -647,25 +782,26 @@ def _deep_lists(value):
 
 
 def _inject_models(renderer, models):
-    """The MODELS tables from a model-config read; absent a read, the copy keeps its hand tables."""
+    """Inject model-config values; an absent read clears the copy's hand-written values."""
     if not isinstance(models, dict):
-        return
+        models = {}
     live = renderer.mock2.LIVE
     renderer.PROFILES[:] = list(models.get("profiles") or ())
     _put(renderer.PROFILE_MAP, {h: {p: (_tup(cell) if cell else None) for p, cell in cells.items()}
                                 for h, cells in (models.get("profile_map") or {}).items()})
     _put(renderer.MODEL_CHOICES, {h: list(items) for h, items in (models.get("model_choices") or {}).items()})
     _put(renderer.MAIN_ONLY, {h: list(items) for h, items in (models.get("main_only") or {}).items()})
-    renderer.EFFORTS[:] = list(models.get("efforts") or renderer.EFFORTS)
+    renderer.EFFORTS[:] = list(models.get("efforts") or ())
     _put(renderer.POOLS, {p: (_deep(pool) if pool else None) for p, pool in (models.get("pools") or {}).items()})
-    _put(renderer.EFF_KEY, dict(models.get("effort_keys") or renderer.EFF_KEY))
+    _put(renderer.EFF_KEY, dict(models.get("effort_keys") or {}))
     _put(renderer.MODEL_SHOWN, dict(models.get("shown") or {}))
-    _put(renderer.CTX, dict(models.get("context") or renderer.CTX))
-    _put(renderer.CTX_HOW, dict(models.get("context_source") or renderer.CTX_HOW))
-    if models.get("tidy"):
-        renderer.TIDY = tuple(models["tidy"])
-    _put(renderer.KTOK, dict(models.get("token_units") or renderer.KTOK))
+    _put(renderer.CTX, dict(models.get("context") or {}))
+    _put(renderer.CTX_HOW, dict(models.get("context_source") or {}))
+    renderer.TIDY = tuple(models.get("tidy") or ())
+    _put(renderer.KTOK, dict(models.get("token_units") or {}))
     allocation = models.get("allocation") or {}
+    live.pop("allocation_fields", None)
+    live.pop("allocation_note", None)
     if allocation.get("fields"):
         live["allocation_fields"] = [(label, [tuple(part) for part in parts]) for label, parts in allocation["fields"]]
     if allocation.get("note"):
