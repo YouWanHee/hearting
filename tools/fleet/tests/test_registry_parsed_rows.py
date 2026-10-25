@@ -237,6 +237,36 @@ class ParsedRegistryRowsTest(unittest.TestCase):
                 dispatch._orphan_registry_rows_for_pass(path, registry, None)
                 self.assertEqual(reader.call_count, 3)
 
+    def test_orphan_rows_cache_is_bounded_and_overflow_reads_without_eviction(self):
+        registry = object()
+        cache = {
+            f"/registry/{index}": [{"order": index, "meta": {"attempt_id": str(index)}}]
+            for index in range(dispatch._ORPHAN_ROWS_PASS_CACHE_LIMIT)
+        }
+        retained = dict(cache)
+        fresh = [{"order": 999, "meta": {"attempt_id": "fresh"}}]
+        with mock.patch.object(dispatch, "_orphan_registry_rows", return_value=fresh) as reader:
+            first = dispatch._orphan_registry_rows_for_pass("/registry/overflow", registry, cache)
+            second = dispatch._orphan_registry_rows_for_pass("/registry/overflow", registry, cache)
+        self.assertIs(first, fresh)
+        self.assertIs(second, fresh)
+        self.assertEqual(reader.call_count, 2)
+        self.assertEqual(len(cache), dispatch._ORPHAN_ROWS_PASS_CACHE_LIMIT)
+        self.assertEqual(cache, retained)
+
+    def test_orphan_rows_cache_is_fresh_for_each_pinned_pass(self):
+        registry = object()
+        path = "/registry/shared"
+        first_rows = [{"order": 0, "meta": {"attempt_id": "first"}}]
+        second_rows = [{"order": 0, "meta": {"attempt_id": "second"}}]
+        with mock.patch.object(dispatch, "_orphan_registry_rows",
+                               side_effect=[first_rows, second_rows]) as reader:
+            first = dispatch._orphan_registry_rows_for_pass(path, registry, {})
+            second = dispatch._orphan_registry_rows_for_pass(path, registry, {})
+        self.assertIs(first, first_rows)
+        self.assertIs(second, second_rows)
+        self.assertEqual(reader.call_count, 2)
+
     def test_collection_falls_back_for_legacy_and_whitespace_continuation_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "jobs.log"

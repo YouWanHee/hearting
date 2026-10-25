@@ -319,14 +319,20 @@ def _orphan_registry_rows(path, registry):
     return rows
 
 
+_ORPHAN_ROWS_PASS_CACHE_LIMIT = 128
+
+
 def _orphan_registry_rows_for_pass(path, registry, cache):
     """Share orphan rows only inside the caller's pinned collection pass."""
     if cache is None:
         return _orphan_registry_rows(path, registry)
     key = os.path.abspath(os.fspath(path))
-    if key not in cache:
-        cache[key] = _orphan_registry_rows(path, registry)
-    return cache[key]
+    if key in cache:
+        return cache[key]
+    rows = _orphan_registry_rows(path, registry)
+    if len(cache) < _ORPHAN_ROWS_PASS_CACHE_LIMIT:
+        cache[key] = rows
+    return rows
 
 
 def _parse_registry_lines(path, lines, generation, *, first_line=0,

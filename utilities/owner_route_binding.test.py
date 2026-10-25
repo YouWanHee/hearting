@@ -119,53 +119,6 @@ class RegistrySnapshotMemoTest(unittest.TestCase):
             M._registry_snapshot(self.jobs)
         self.assertEqual(str(caught.exception), "owner-route-jobs-unreadable")
 
-
-class VerifiedRoutePassCacheTest(unittest.TestCase):
-    def test_unit_digest_snapshot_is_reused_only_within_one_pass_cache(self):
-        with tempfile.TemporaryDirectory() as td:
-            units = Path(td) / "units"
-            package = units / "dev"
-            package.mkdir(parents=True)
-            profile = package / "backend.md"
-            profile.write_text("---\nname: backend\n---\nfirst body\n", encoding="utf-8")
-            first_pass = {}
-            first_digest = M.ROUTE._unit_catalog_digest_for_pass(first_pass, units)
-
-            profile.write_text("---\nname: backend-v2\n---\nsecond body\n", encoding="utf-8")
-            self.assertEqual(M.ROUTE._unit_catalog_digest_for_pass(first_pass, units),
-                             first_digest)
-            self.assertNotEqual(M.ROUTE._unit_catalog_digest_for_pass({}, units),
-                                first_digest)
-
-    def test_route_verification_reuses_only_the_same_file_generation(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "route.json"
-            path.write_text("{}", encoding="utf-8")
-            binding = M.OwnerRouteBinding(str(path), "rt-cache", "sha256:cache")
-            verified = {"route_id": "rt-cache", "route_hash": "sha256:cache"}
-            cache = {}
-            def verify(raw, expected_cwd=None, *, _unit_catalog_cache=None):
-                M.ROUTE._unit_catalog_digest_for_pass(_unit_catalog_cache)
-                return verified
-            with mock.patch.object(M.ROUTE, "unit_catalog_digest",
-                                   return_value="sha256:units") as units_digest, \
-                    mock.patch.object(M.ROUTE, "verify_route", side_effect=verify) as verified_call:
-                first = M._verified_binding(binding, verification_cache=cache)
-                second = M._verified_binding(binding, verification_cache=cache)
-                self.assertEqual(verified_call.call_count, 1)
-                self.assertEqual(units_digest.call_count, 1)
-                self.assertIs(first[0], second[0])
-
-                path.write_text('{"changed":true}', encoding="utf-8")
-                third = M._verified_binding(binding, verification_cache=cache)
-                fourth = M._verified_binding(binding, verification_cache=cache)
-                self.assertEqual(verified_call.call_count, 2)
-                self.assertEqual(units_digest.call_count, 1)
-                self.assertEqual(third[0], {"changed": True})
-                self.assertIs(third[0], fourth[0])
-            self.assertLessEqual(len(cache), 128)
-
-
 class OwnerRouteBindingTest(unittest.TestCase):
     def test_owner_tuple_failure_details(self):
         self.assertEqual(M.owner_binding_tuple_failure_fields(
@@ -722,6 +675,74 @@ class OwnerRouteLifecycleTest(unittest.TestCase):
         return M.publish_owner_route_attachment_from_environment(
             jobs, target_route=self._payload(path, route), environ=self._env(jobs)
         )
+
+    def test_lifecycle_reverifies_changed_transitive_unit_catalog(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            jobs.write_text(
+                self._row(td).replace("capability_mode=debug", "capability_mode=dev")
+                .replace("intensity=standard", "intensity=quick"),
+                encoding="utf-8",
+            )
+            units = Path(td) / "units"
+            package = units / "dev"
+            package.mkdir(parents=True)
+            profile = package / "backend.md"
+            profile.write_text("---\nname: backend\n---\nfirst body\n", encoding="utf-8")
+            route_path = Path(td) / "route.json"
+            actual_digest = M.ROUTE.unit_catalog_digest
+
+            def test_catalog_digest(units_root=None):
+                return actual_digest(units_root or units)
+
+            with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}), \
+                    mock.patch.object(M.ROUTE, "unit_catalog_digest",
+                                      side_effect=test_catalog_digest):
+                route = M.ROUTE.compile_route(
+                    "autopilot-code", "dev", "quick", td, Path(td) / "artifacts",
+                    predicates=[], transport=None, tracking="tracked",
+                    tracked_gate_evidence={
+                        "spec_read": {"satisfied": True, "source": "canonical-prd-sha256"},
+                        "drift_verdict": "within-spec", "workflow_mode": "tracked",
+                        "artifact_guard": {"satisfied": True,
+                                           "source": "conductor-prechecked"},
+                    },
+                    registered_headless_evidence={"candidates": [
+                        {"harness": harness, "transport": "headless",
+                         "surface": "registered-headless", "status": "supported",
+                         "probe_source": "fixture-probe", "probe_time": "2026-07-20T00:00:00Z"}
+                        for harness in ("claude", "codex")
+                    ]},
+                )
+                route.update({
+                    "owner_attempt_id": self.ATTEMPT,
+                    "advance_generation": 0,
+                    "route_family_key": "family-owner-transitive-catalog",
+                })
+                route["route_hash"] = M.ROUTE.route_hash(route)
+                route["route_id"] = "rt-" + route["route_hash"].split(":", 1)[1][:16]
+                route_path.write_text(json.dumps(route), encoding="utf-8")
+
+                with mock.patch.object(M.ROUTE, "verify_route",
+                                       wraps=M.ROUTE.verify_route) as verify:
+                    self._attach(td, jobs, route_path, route)
+                    current, status = M.resolve_owner_route_lifecycle(
+                        jobs, owner_attempt_id=self.ATTEMPT,
+                    )
+                    self.assertEqual(current.route_id, route["route_id"])
+                    self.assertEqual(status, "owner-route-post-launch-attachment")
+                    verified_before_change = verify.call_count
+
+                    profile.write_text(
+                        "---\nname: backend-v2\n---\nsecond body\n", encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        M.OwnerRouteBindingError, "owner-route-binding-route-invalid",
+                    ):
+                        M.resolve_owner_route_lifecycle(
+                            jobs, owner_attempt_id=self.ATTEMPT,
+                        )
+                    self.assertGreater(verify.call_count, verified_before_change)
 
     def test_post_launch_generation_zero_attachment_and_restart_resolution(self):
         with tempfile.TemporaryDirectory() as td:

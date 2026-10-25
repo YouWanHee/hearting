@@ -550,38 +550,12 @@ def publish_owner_route_advance(jobs: str | Path, *, owner_attempt_id: str,
 
 
 def _verified_binding(binding: OwnerRouteBinding, *, expected_cwd: str | None = None,
-                      observer=None, verification_cache=None) -> tuple[dict, dict]:
-    path = Path(binding.route_file)
+                      observer=None) -> tuple[dict, dict]:
     if observer is not None:
-        observer("file", path)
-    cache_key = None
-    if verification_cache is not None:
-        try:
-            before = path.stat()
-            resolved = str(path.resolve(strict=True))
-            signature = (before.st_mode, before.st_dev, before.st_ino, before.st_size,
-                         before.st_mtime_ns, before.st_ctime_ns)
-            cache_key = (str(path.absolute()), resolved, signature, expected_cwd,
-                         binding.route_id, binding.route_hash)
-            cached = verification_cache.get(cache_key)
-            if cached is not None:
-                after = path.stat()
-                after_resolved = str(path.resolve(strict=True))
-                after_signature = (after.st_mode, after.st_dev, after.st_ino, after.st_size,
-                                   after.st_mtime_ns, after.st_ctime_ns)
-                if after_resolved == resolved and after_signature == signature:
-                    return cached
-        except (OSError, RuntimeError, ValueError):
-            cache_key = None
+        observer("file", Path(binding.route_file))
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if verification_cache is None:
-            verified = ROUTE.verify_route(raw, expected_cwd=expected_cwd)
-        else:
-            verified = ROUTE.verify_route(
-                raw, expected_cwd=expected_cwd,
-                _unit_catalog_cache=verification_cache,
-            )
+        raw = json.loads(Path(binding.route_file).read_text(encoding="utf-8"))
+        verified = ROUTE.verify_route(raw, expected_cwd=expected_cwd)
     except (OSError, ValueError, TypeError) as exc:
         raise OwnerRouteBindingError("owner-route-binding-route-invalid") from exc
     if (verified.get("route_id"), verified.get("route_hash")) != (
@@ -590,25 +564,12 @@ def _verified_binding(binding: OwnerRouteBinding, *, expected_cwd: str | None = 
         if gates_on():
             raise OwnerRouteBindingError("owner-route-binding-hash-mismatch")
         same_work_or_refuse("owner-route-binding-hash-mismatch")
-    if cache_key is not None and len(verification_cache) < 128:
-        try:
-            after = path.stat()
-            after_resolved = str(path.resolve(strict=True))
-            after_signature = (after.st_mode, after.st_dev, after.st_ino, after.st_size,
-                               after.st_mtime_ns, after.st_ctime_ns)
-            if after_resolved == cache_key[1] and after_signature == cache_key[2]:
-                # Fleet callers treat the verified route mappings as read-only.
-                # This cache is supplied by one projection pass and then discarded.
-                verification_cache[cache_key] = (raw, verified)
-        except (OSError, RuntimeError, ValueError):
-            pass
     return raw, verified
 
 
 def _resolve_attachment_locked(jobs: Path, owner_attempt_id: str,
                                fields: list[str], meta: dict[str, str],
-                               observer=None, verification_cache=None
-                               ) -> OwnerRouteBinding | None:
+                               observer=None) -> OwnerRouteBinding | None:
     path = _attachment_root(jobs) / _attachment_key(owner_attempt_id)
     if observer is not None:
         observer("file", path)
@@ -627,9 +588,8 @@ def _resolve_attachment_locked(jobs: Path, owner_attempt_id: str,
         attachment.route_id,
         attachment.route_hash,
     )
-    _, route = _verified_binding(
-        binding, expected_cwd=attachment.worktree, observer=observer,
-        verification_cache=verification_cache)
+    _, route = _verified_binding(binding, expected_cwd=attachment.worktree,
+                                 observer=observer)
     route_checks = (
         (int(route.get("advance_generation") or 0) == 0,
          "owner-route-attachment-generation-invalid"),
@@ -684,7 +644,7 @@ def resolve_owner_route_lifecycle(jobs: str | Path, *, owner_attempt_id: str,
                                   sealed_binding: OwnerRouteBinding | None = None,
                                   sealed_generation: int | None = None,
                                   registry_rows: list[tuple[list[str], dict[str, str]]] | None = None,
-                                  observer=None, verification_cache=None
+                                  observer=None
                                   ) -> tuple[OwnerRouteBinding | None, str]:
     """Resolve launch binding or post-launch attachment, then verified advances."""
     canonical_jobs = Path(jobs).expanduser()
@@ -718,15 +678,13 @@ def resolve_owner_route_lifecycle(jobs: str | Path, *, owner_attempt_id: str,
         anchor_status = "owner-route-launch-binding"
     else:
         anchor = _resolve_attachment_locked(canonical_jobs, owner_attempt_id, fields, meta,
-                                            observer=observer,
-                                            verification_cache=verification_cache)
+                                            observer=observer)
         anchor_status = "owner-route-post-launch-attachment"
     if anchor is None:
         return None, "owner-route-binding-absent"
     current, advance_status = resolve_owner_route_advance(
         jobs, owner_attempt_id=owner_attempt_id, anchor=anchor,
         anchor_generation=sealed_generation, registry_rows=rows, observer=observer,
-        verification_cache=verification_cache,
     )
     if advance_status in {"owner-route-advance-current"}:
         return current, advance_status
@@ -820,7 +778,7 @@ def resolve_owner_route_advance(
     jobs: str | Path, *, owner_attempt_id: str, anchor: OwnerRouteBinding,
     anchor_generation: int | None = None,
     registry_rows: list[tuple[list[str], dict[str, str]]] | RegistryView | None = None,
-    observer=None, verification_cache=None,
+    observer=None,
 ) -> tuple[OwnerRouteBinding, str]:
     """Follow only verified, child-adopted predecessor candidates.
 
@@ -843,8 +801,7 @@ def resolve_owner_route_advance(
         observer("members", first_path)
     first_candidates = list(first_path.glob("*.json")) if first_path.is_dir() else []
     try:
-        _current_raw, current_route = _verified_binding(
-            anchor, observer=observer, verification_cache=verification_cache)
+        _current_raw, current_route = _verified_binding(anchor, observer=observer)
         route_generation = int(current_route.get("advance_generation") or 0)
     except (OwnerRouteBindingError, ValueError, TypeError) as exc:
         if not first_candidates:
