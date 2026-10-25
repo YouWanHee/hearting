@@ -83,7 +83,7 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
             # still progresses. Legacy recovery instead fails A's only copy.
             import session_notice
             with mock.patch.object(steward.peer_obligations, "retain_session_notice", return_value=False):
-                other_notice = session_notice.notify("claude", "other", key="inventory-other",
+                other_notice = peer._legacy_notice("claude", "other", key="inventory-other",
                     subject="fixture", text="private", jobs=self.jobs_path)
             broken_path = pending.record_path(self.tmp_root, "other", other_notice["delivery_id"])
             broken_path.write_text(json.dumps(dict(other_notice, receipt={})))

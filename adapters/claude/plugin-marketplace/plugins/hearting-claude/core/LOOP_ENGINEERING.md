@@ -38,7 +38,10 @@ ACK write failure leaves the verified receipt usable for suppressing another
 send while settlement is retried naturally. The original body's receipt markers
 bind that identity for first writes and receipt retries, including retained
 notices; a replacement row remains a different identity even with the same
-receipt digest. Output, process exit, queue
+receipt digest. Ordinary notices keep their stored provenance or exact parent
+or owner-session authority, then use the common confirmed recipient lineage.
+The existing notice courier carries both current and legacy duties through the
+same grouping, first-write and receipt checks. Output, process exit, queue
 acceptance, or an incomplete native-history read is not receipt evidence.
 Receiving a notice settles delivery only: it does not complete the work or its
 follow-up. When native receipt evidence is absent or unknown, emission remains

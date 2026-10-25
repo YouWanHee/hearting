@@ -1233,11 +1233,47 @@ def record_recipient(record: dict, storage_key: str, *, harness: str,
     return binding[1] if binding is not None else None
 
 
+def _notice_recipient_binding(lineage, jobs, source_harness, *, read_context=None):
+    """Resolve the stored notice authority before following qualified tidy edges."""
+    from harness_capabilities import HARNESSES, parent_completion
+    try:
+        kind = lineage["kind"]
+        if kind == "attempt-parent":
+            from dispatch_completion_join import current_attempt_row
+            row = current_attempt_row(jobs, lineage["attempt_id"]) if jobs is not None else None
+            if (row is None or row.status not in {"open", "running", "done"}
+                    or row.metadata.get("parent_sid") != lineage["session_id"]
+                    or _registered_parent_harness(row.metadata) != source_harness
+                    or row.metadata.get("parent_completion_delivery") != parent_completion(source_harness).get("carrier")
+                    or not eligible_row(row.metadata)):
+                return None
+            sid, holder_harness = _effective(row.metadata, jobs, read_context=read_context)
+            return (holder_harness, sid) if sid and holder_harness in HARNESSES else None
+        if kind == "owner-session":
+            from dispatch_completion_join import current_attempt_row, read_supervisor_phase_state
+            from dispatch_contract import dispatch_state_root
+            row = current_attempt_row(jobs, lineage["attempt_id"]) if jobs is not None else None
+            if (row is None or row.status not in {"open", "running", "done"}
+                    or row.metadata.get("harness") != source_harness):
+                return None
+            state = read_supervisor_phase_state(
+                dispatch_state_root(jobs) / "supervisor-state" / (lineage["attempt_id"] + ".json"),
+                lineage["attempt_id"])
+            resource = state.resource if state is not None else None
+            if not isinstance(resource, dict) or resource.get("session_id") != lineage["session_id"]:
+                return None
+        end, state = chain_end(source_harness, lineage["session_id"], read_context=read_context)
+        return None if state == "unresolved" else (source_harness, end)
+    except (ImportError, OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
 def record_recipient_binding(record: dict, storage_key: str, *, harness: str,
                              jobs=None, read_context=None) -> Optional[tuple[str, str]]:
     """Resolve one stored record through its immutable identity and current lineage.
 
-    Route-free notices use their validated receipt and the storage SID's chain.
+    Notices validate their stored provenance, parent or owner-session authority
+    before following the common confirmed lineage.
     Registered records require every attempt to remain registered under the supplied key;
     their explicit binding holder, when present, is then followed to the graph end.
     """
@@ -1247,11 +1283,13 @@ def record_recipient_binding(record: dict, storage_key: str, *, harness: str,
     if isinstance(receipt, dict) and receipt.get("kind") == "notice":
         try:
             import session_notice
-            session_notice.validate_pending_record(record)
-        except (ImportError, ValueError, TypeError, KeyError, AttributeError):
+            from harness_capabilities import HARNESSES, parent_completion
+            source_harness = next((name for name in HARNESSES
+                if parent_completion(name).get("carrier") == record.get("recipient_kind")), None)
+            jobs, lineage = session_notice.pending_lineage(record, source_harness, storage_key, jobs)
+            return _notice_recipient_binding(lineage, jobs, source_harness, read_context=read_context)
+        except (ImportError, OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError):
             return None
-        end, state = chain_end(harness, storage_key, read_context=read_context)
-        return None if state == "unresolved" else (harness, end)
     ids = record.get("attempt_ids")
     if not isinstance(ids, list) or not ids or any(not isinstance(item, str) for item in ids):
         return None

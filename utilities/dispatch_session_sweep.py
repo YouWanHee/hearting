@@ -690,6 +690,7 @@ _COMPUTE_RUN_NOTICE_RE = re.compile(
     r"^run (?P<run_id>[A-Za-z0-9_-]+) on (?P<host>[A-Za-z0-9_.-]+) "
     r"ended with exit (?P<exit>[0-9]+)(?: \([^()\n]*\))?"
     r"(?:; started by attempt [^;\n]+ in route [^;\n]+)?"
+    r"(?:; 지표 없음; 계획 시간 미상; run 기록 경로 없음)?"
     r"; read it with: compute-hosts tail (?P<tail>[A-Za-z0-9_-]+)$"
 )
 
@@ -703,9 +704,21 @@ def _compute_run_notice(record: dict) -> dict | None:
             or receipt.get("subject") != "compute run"):
         return None
     match = _COMPUTE_RUN_NOTICE_RE.fullmatch(receipt.get("text", ""))
-    if (not match or match.group("tail") != match.group("run_id")
-            or receipt_key != f"compute-run:{match.group('run_id')}"):
+    if not match or match.group("tail") != match.group("run_id"):
         return None
+    original_key = f"compute-run:{match.group('run_id')}"
+    if receipt_key != original_key:
+        from harness_capabilities import HARNESSES, parent_completion
+        harness = next((name for name in HARNESSES
+            if parent_completion(name).get("carrier") == record.get("recipient_kind")), None)
+        storage = record.get(STORAGE_KEY)
+        if not harness or not storage or receipt_key != f"{original_key}:{harness}:{storage}":
+            return None
+        try:
+            import session_notice
+            session_notice.pending_lineage(record, harness, storage)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+            return None
     run_id, host = match.group("run_id"), match.group("host")
     identity = re.fullmatch(r"(?P<host>.+)-(?P<stamp>[0-9]{8}-[0-9]{6})(?:-(?P<label>.*))?", run_id)
     if not identity or identity.group("host") != host:

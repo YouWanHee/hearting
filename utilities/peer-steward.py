@@ -6739,7 +6739,8 @@ def _resume_message_obligation(duty, store, *, read_context=None):
                            "observed_pane": pinned_pane})
                 return
         producer = row.get("producer_binding") or {}
-        if (producer.get("schema") == peer_message._RUNTIME_NOTICE_SCHEMA
+        if (producer.get("schema") in {peer_message._RUNTIME_NOTICE_SCHEMA,
+                                        peer_message._SESSION_NOTICE_PRODUCER_SCHEMA}
                 and recipient.get("harness") == "claude"
                 and state in {"idle", "done"}
                 and row.get("state") == "pending"):
@@ -6749,7 +6750,13 @@ def _resume_message_obligation(duty, store, *, read_context=None):
             # prompt or create a second transfer.
             body_text = row.get("text") or ""
             source, separator, _trailer = body_text.rpartition("\n\n(runtime-from:")
-            if separator and peer_obligations.ordinary_notice_transfer_is_current(row):
+            if row.get("body_ref"):
+                try:
+                    source = peer_message.read_peer_payload(ref)["body"]
+                    separator = True
+                except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                    separator = False
+            if separator and peer_obligations.session_notice_delivery_current(row):
                 with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body:
                     body.write(source)
                     body.flush()
@@ -7179,196 +7186,8 @@ def _closed_registered_route_outcome(row, jobs):
 
 
 def _resume_ordinary_notice_obligation(duty, store):
-    """Deliver one immutable run notice through the existing native peer courier."""
-    from harness_capabilities import parent_completion
-    import dispatch_pending_delivery as pending
-    from dispatch_notice_state import keep_claim
-    from dispatch_session_sweep import STORAGE_KEY, delivery_context
-    identity = (duty.get("intent") or {}).get("identity") or {}
-    intent = duty.get("intent") or {}
-    jobs = Path(identity.get("jobs", ""))
-    storage = identity.get("storage_recipient")
-    carrier = intent.get("carrier")
-    delivery_id = intent.get("delivery_id")
-    if (not jobs.is_absolute() or not storage or not delivery_id
-            or carrier != parent_completion(identity.get("recipient_harness"))
-                .get("carrier")):
-        return
-    root = jobs.parent
-    try:
-        record = pending.read(root, storage, delivery_id)
-        if (record is None or record.get("recipient_kind") != carrier
-                or record.get("delivery_id") != delivery_id
-                or record.get("receipt_digest") != intent.get("receipt_digest")):
-            store.update(duty["id"], state="unknown", observation={"reason": "notice-record-unavailable"},
-                         skip_unchanged=True)
-            return
-        import session_notice
-        session_notice.validate_pending_record(record)
-    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
-        store.update(duty["id"], state="unknown", observation={"reason": "notice-record-unavailable"},
-                     skip_unchanged=True)
-        return
-    if record.get("state") in {"acked", "rejected", "expired"}:
-        store.update(duty["id"], state="complete", delivery=record["state"], cleanup="complete",
-                     skip_unchanged=True)
-        return
-
-    observation = duty.get("observation") or {}
-    bindings = dict(observation.get("transfer_bindings") or {})
-    current_target = peer_obligations._ordinary_notice_target(identity, carrier)
-    if current_target is None:
-        store.update(duty["id"], state="pending", observation={**observation,
-            "reason": "recipient-lineage-unavailable"}, skip_unchanged=True)
-        return
-    recipient_harness, recipient_sid, current_storage = current_target
-    if current_storage != storage:
-        store.update(duty["id"], state="unknown", observation={**observation,
-            "reason": "notice-storage-lineage-conflict"}, skip_unchanged=True)
-        return
-    if (recipient_harness == "opencode"
-            and recipient_sid == identity.get("recipient_session_id")):
-        # OpenCode's existing completion carrier watches the same immutable
-        # pending-delivery record and confirms promptAsync in native history.
-        # Leave it open for that carrier; do not create a parallel peer transfer.
-        store.update(duty["id"], state="pending", observation={
-            **observation, "reason": "native-opencode-carrier-owns-notice"},
-            skip_unchanged=True)
-        return
-
-    observation = dict(observation)
-    transfer_ref = observation.get("transfer_ref")
-    if transfer_ref:
-        try:
-            transfer = peer_message._read_pending(transfer_ref, roots=[root])
-        except (OSError, ValueError, TypeError, RuntimeError):
-            transfer = None
-        if transfer and transfer.get("state") == "received":
-            matched = peer_obligations.acknowledge_ordinary_notice_delivery(
-                transfer, roots=[root])
-            current_record = pending.read(root, storage, delivery_id)
-            if current_record and current_record.get("state") == "acked":
-                store.update(duty["id"], state="complete", delivery="acknowledged",
-                             cleanup="complete", observation={**observation,
-                                "receipt_ref": transfer_ref}, skip_unchanged=True)
-                return
-            if matched:
-                store.update(duty["id"], state="pending", observation={**observation,
-                    "reason": "received-delivery-ack-pending"}, skip_unchanged=True)
-                return
-            store.update(duty["id"], state="unknown", observation={**observation,
-                "reason": "received-notice-history-unbound"}, skip_unchanged=True)
-            return
-        if (transfer and transfer.get("state") in {"pending", "queued", "unverified"}
-                and (transfer.get("to") or {}).get("harness") == recipient_harness
-                and (transfer.get("to") or {}).get("session_id") == recipient_sid):
-            return  # The existing message courier owns the exact accepted transfer.
-
-    agents = []
-    try:
-        result = subprocess.run(_herdr_argv("agent", "list"), capture_output=True,
-                                text=True, timeout=5)
-        agents = (json.loads(result.stdout).get("result") or {}).get("agents") or []
-    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
-        agents = []
-    matches = [row for row in agents if row.get("agent") == recipient_harness
-               and (row.get("agent_session") or {}).get("value") == recipient_sid]
-    if len(matches) != 1:
-        store.update(duty["id"], state="pending", observation={**observation,
-            "reason": "recipient-unavailable", "recipient_sid": recipient_sid,
-            "recipient_harness": recipient_harness}, skip_unchanged=True)
-        return
-    pane = matches[0].get("pane_id")
-    if not isinstance(pane, str) or not pane or _resolve_target(pane)[:2] != (
-            recipient_harness, recipient_sid):
-        store.update(duty["id"], state="pending", observation={**observation,
-            "reason": "recipient-identity-unverified", "recipient_sid": recipient_sid},
-            skip_unchanged=True)
-        return
-
-    # Resolve the exact parent binding again immediately before claiming and sending.
-    refreshed = peer_obligations._ordinary_notice_target(identity, carrier)
-    if refreshed != current_target or _resolve_target(pane)[:2] != (recipient_harness, recipient_sid):
-        store.update(duty["id"], state="pending", observation={**observation,
-            "reason": "recipient-lineage-changed"}, skip_unchanged=True)
-        return
-
-    owner = "retained-rewake:" + duty["id"]
-    try:
-        if record.get("state") in {"claimed", "sent-ambiguous"}:
-            pending.reclaim(root, storage, delivery_id, now_ns=time.monotonic_ns())
-            record = pending.read(root, storage, delivery_id)
-        if record is None or record.get("state") != "pending":
-            return
-        record = pending.claim(root, storage, delivery_id, claim_owner=owner,
-            lease_seconds=30, require_generation_proof=False, jobs=jobs,
-            retry_context=f"{recipient_harness}:{recipient_sid}:{pane}:{duty['id']}")
-    except pending.PendingDeliveryError:
-        return
-    if not keep_claim(root, storage, delivery_id, record, owner, jobs=jobs):
-        return
-    try:
-        ack_identity = pending.received_ack_identity(record, storage, delivery_id)
-    except pending.PendingDeliveryError:
-        pending.release_claim(root, storage, delivery_id, claim_owner=owner)
-        return
-    context_record = {**record, STORAGE_KEY: storage, "_identity": ack_identity}
-    message = delivery_context([(root, [context_record])])
-    producer_binding = {
-        "schema": peer_message._RUNTIME_NOTICE_SCHEMA,
-        "duty_id": duty["id"], "jobs": str(jobs.resolve(strict=False)),
-        "carrier": carrier, "delivery_id": delivery_id,
-        "receipt_digest": record["receipt_digest"],
-        "recipient": {"harness": recipient_harness, "session_id": recipient_sid},
-        "route_id": intent.get("route_id") or "route-free", "route_node": "notice",
-    }
-    if not peer_message._valid_runtime_producer_binding(
-            producer_binding, {"harness": "runtime", "session_id": None,
-                              "name": "Hearting runtime"},
-            producer_binding["recipient"], [duty["id"], delivery_id]):
-        pending.release_claim(root, storage, delivery_id, claim_owner=owner)
-        return
-
-    prepared = []
-    def retain_transfer(ref):
-        bindings[ref] = producer_binding
-        observation.update({"transfer_ref": ref, "transfer_bindings": bindings,
-                            "recipient_sid": recipient_sid,
-                            "recipient_harness": recipient_harness,
-                            "storage_recipient": storage, "claim_owner": owner,
-                            "producer_binding": producer_binding})
-        store.update(duty["id"], state="pending", observation=dict(observation),
-                     delivery="peer-courier", cleanup="pending")
-        prepared.append(ref)
-
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body:
-        body.write(message)
-        body.flush()
-        if (peer_obligations._ordinary_notice_target(identity, carrier) != current_target
-                or _resolve_target(pane)[:2] != (recipient_harness, recipient_sid)):
-            pending.release_claim(root, storage, delivery_id, claim_owner=owner)
-            store.update(duty["id"], state="pending", observation={**observation,
-                "reason": "recipient-lineage-changed"}, skip_unchanged=True)
-            return
-        args = build_parser().parse_args(["prompt", pane, "--body-file", body.name,
-                                          "--ref", duty["id"], "--ref", delivery_id])
-        code = cmd_prompt(args, expected_recipient=(recipient_harness, recipient_sid),
-                          on_prepared=retain_transfer, producer_binding=producer_binding)
-    current = pending.read(root, storage, delivery_id)
-    if current and current.get("state") == "acked":
-        store.update(duty["id"], state="complete", delivery="acknowledged", cleanup="complete")
-    elif prepared or code in {0, 3}:
-        try:
-            pending.mark_sent_ambiguous(root, storage, delivery_id, claim_owner=owner)
-        except pending.PendingDeliveryError:
-            pass
-        store.update(duty["id"], state="pending", delivery="peer-courier", cleanup="pending",
-                     observation=dict(observation))
-    else:
-        try:
-            pending.release_claim(root, storage, delivery_id, claim_owner=owner)
-        except pending.PendingDeliveryError:
-            pass
+    """Compatibility entry for one canonical duty; the normal courier owns notices."""
+    _resume_session_notice_obligations([duty], store)
 
 
 def _resume_registered_obligation(duty, store, *, read_context=None):
@@ -8341,7 +8160,7 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
         # for batches, and confirmed lineage/current recipients for notices.
         # Their bounded consumers must see that authority on every runner pass.
         retryable = (duty.get("state") == "unknown" and fingerprint is not None
-                     and kind not in {"registered-batch", "session-notice"})
+                     and kind not in {"registered-batch", "session-notice", "run-notice"})
         if retryable:
             prior = retry_state.get(duty_id)
             if (prior is not None and prior[0] == fingerprint
@@ -8350,7 +8169,7 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
         else:
             retry_state.pop(duty_id, None)
         try:
-            if kind == "session-notice":
+            if kind in {"session-notice", "run-notice"}:
                 notice_duties.append(duty)
             elif kind == "message" or duty.get("id", "").startswith(("message-", "delay-")):
                 _resume_message_obligation(duty, store, read_context=read_context)
@@ -8362,8 +8181,6 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
                             persist_followup=True)
             elif kind == "registered-batch":
                 _resume_registered_obligation(duty, store, read_context=read_context)
-            elif kind == "run-notice":
-                _resume_ordinary_notice_obligation(duty, store)
         except Exception:
             try:
                 store.update(duty["id"], observer_error="observer-unavailable")
@@ -8488,7 +8305,7 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
     """Deliver notices through the existing herdr census and peer courier."""
     import dispatch_pending_delivery as pending
     from dispatch_notice_state import keep_claim
-    from dispatch_seat_handover import record_recipient
+    from dispatch_seat_handover import record_recipient_binding
     from dispatch_session_sweep import STORAGE_KEY, IDENTITY_KEY, delivery_context
     from dispatch_recipient_receipt import claimed_send_current, release_unsubmitted_claim
     import session_notice
@@ -8499,31 +8316,42 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
     for duty in duties:
         intent = duty.get("intent") or {}
         identity = intent.get("identity") or {}
-        harness, storage_sid = identity.get("harness"), identity.get("storage_sid")
-        if (identity.get("state_root") != str(root) or not harness or not storage_sid
-                or intent.get("carrier") is None):
+        source = peer_obligations._notice_duty_source(duty, root)
+        if source is None:
+            continue
+        source_harness, storage_sid, delivery_id, source_jobs = source
+        if not source_harness or not storage_sid or not delivery_id:
             continue
         try:
-            record = pending.read(root, storage_sid, identity["delivery_id"])
-            if (not record or record.get("receipt_digest") != identity.get("receipt_digest")
-                    or record.get("state") not in pending.OPEN_STATES
-                    or record.get("recipient_kind") != intent.get("carrier")):
-                if record and record.get("state") in {"acked", "rejected", "expired"}:
-                    store.update(duty["id"], state="complete", delivery=record["state"], cleanup="complete")
+            record = pending.read(root, storage_sid, delivery_id)
+            if record and record.get("state") in {"acked", "rejected", "expired"}:
+                store.update(duty["id"], state="complete", delivery=record["state"], cleanup="complete")
+                continue
+            if (not record or record.get("state") not in pending.OPEN_STATES
+                    or not peer_obligations._notice_duty_matches(
+                        duty, record, root, storage_sid, delivery_id, source_jobs)):
                 continue
             session_notice.validate_pending_record(record)
-            recipient_sid = record_recipient(record, storage_sid, harness=harness,
-                                             read_context=read_context)
-            if recipient_sid:
-                candidates.append((duty, harness, storage_sid, recipient_sid, record))
-            else:
-                # Historical exact receipts settle the original identity even
-                # when today's lineage no longer has a unique recipient.
+            pair = record_recipient_binding(record, storage_sid, harness=source_harness,
+                                            jobs=source_jobs, read_context=read_context)
+            if pair is None:
                 ref = (duty.get("observation") or {}).get("transfer_ref")
                 if ref:
                     message = peer_message._read_pending(ref, roots=[root], state_root=root)
                     if message and message.get("state") == "received":
                         peer_obligations.acknowledge_session_notice_delivery(message, roots=[root])
+                        continue
+                store.update(duty["id"], state="pending", observation={
+                    **(duty.get("observation") or {}), "reason": "recipient-lineage-unavailable"},
+                    skip_unchanged=True)
+                continue
+            harness, recipient_sid = pair
+            if intent.get("kind") == "run-notice" and pair == ("opencode", storage_sid):
+                store.update(duty["id"], state="pending", observation={
+                    **(duty.get("observation") or {}), "reason": "native-opencode-carrier-owns-notice"},
+                    skip_unchanged=True)
+                continue
+            candidates.append((duty, harness, storage_sid, recipient_sid, record))
         except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             continue
     if not candidates:
@@ -8565,7 +8393,10 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
         if ref:
             message = peer_message._read_pending(ref, roots=[root], state_root=root)
             if message and message.get("state") == "received":
-                peer_obligations.acknowledge_session_notice_delivery(message, roots=[root])
+                matched = peer_obligations.acknowledge_session_notice_delivery(message, roots=[root])
+                if not matched:
+                    store.update(item[0]["id"], state="unknown", observation={**obs,
+                        "reason": "received-notice-history-unbound"}, skip_unchanged=True)
                 return
             # Accepted and ambiguous transfers are never redirected or resent.
             if message and message.get("state") in {"queued", "unverified"}:
@@ -8581,7 +8412,7 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
                     # holder after the existing same-owner lease expires.
                     originals = list(peer_obligations._session_notice_delivery_bindings(message, roots=[root]))
                     if (not originals or len(originals) != len(
-                            (message.get("producer_binding") or {}).get("records") or ())):
+                            (message.get("producer_binding") or {}).get("records") or [None])):
                         return
                     for _store, _duty, record, _root, storage, delivery_id in originals:
                         retargeted[(storage, delivery_id)] = (ref, record)
@@ -8610,13 +8441,15 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
         if len(matches) != 1:
             for item in batch:
                 store.update(item[0]["id"], observer_error="recipient-unavailable",
-                             observation={"recipient_sid": recipient_sid})
+                             observation={**(item[0].get("observation") or {}),
+                                          "recipient_sid": recipient_sid, "reason": "recipient-unavailable"})
             return
         pane = matches[0].get("pane_id")
         if not isinstance(pane, str) or not pane or pane == "-":
             for item in batch:
                 store.update(item[0]["id"], observer_error="recipient-unavailable",
-                             observation={"recipient_sid": recipient_sid})
+                             observation={**(item[0].get("observation") or {}),
+                                          "recipient_sid": recipient_sid, "reason": "recipient-unavailable"})
             return
         if _resolve_target(pane)[:2] != (harness, recipient_sid):
             return
@@ -8627,14 +8460,13 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
         producer_records = []
         refs = []
         for item_duty, item_harness, storage_sid, item_sid, original in batch:
+            source_jobs = peer_obligations._notice_duty_source(item_duty, root)[3]
             fresh = pending.read(root, storage_sid, original["delivery_id"])
             if (not fresh or fresh.get("receipt_digest") != original.get("receipt_digest")
-                    or record_recipient(fresh, storage_sid, harness=item_harness,
-                                        read_context=None) != item_sid
+                    or record_recipient_binding(fresh, storage_sid, harness=item_harness,
+                                                jobs=source_jobs, read_context=None) != (harness, item_sid)
                     or _resolve_target(pane)[:2] != (harness, recipient_sid)):
-                if (storage_sid, original["delivery_id"]) in retargeted:
-                    return
-                continue
+                return
             owner = "retained-rewake:" + item_duty["id"]
             prior = retargeted.get((storage_sid, fresh["delivery_id"]))
             try:
@@ -8647,7 +8479,7 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
                         if not transfer or transfer.get("state") != "pending":
                             return
                         originals = list(peer_obligations._session_notice_delivery_bindings(transfer, roots=[root]))
-                        if len(originals) != len(transfer["producer_binding"]["records"]):
+                        if len(originals) != len(transfer["producer_binding"].get("records") or [None]):
                             return
                         fresh = pending.read(root, storage_sid, original["delivery_id"])
                         if (not fresh or (fresh.get("claim_owner") != owner
@@ -8657,21 +8489,17 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
                             return
                     if pending.read_submission_fence(root, storage_sid, fresh["delivery_id"],
                             expected_identity=pending.submission_fence_identity(fresh, item_sid)) is not None:
-                        if prior:
-                            return
-                        continue
+                        return
                     # Only a verified still-pending transfer explains a legacy
                     # sent-ambiguous preparation; native ambiguity stays held.
                     if fresh.get("state") == "claimed" or prior and fresh.get("state") == "sent-ambiguous":
                         deadline = fresh.get("claim_deadline_ns")
                         if type(deadline) is not int or time.monotonic_ns() < deadline:
-                            if prior:
-                                return
-                            continue
+                            return
                         fresh = pending.reclaim(root, storage_sid, fresh["delivery_id"],
                                                 now_ns=time.monotonic_ns())
                     claim = pending.claim(root, storage_sid, fresh["delivery_id"], claim_owner=owner,
-                        lease_seconds=30, require_generation_proof=False, jobs=jobs,
+                        lease_seconds=30, require_generation_proof=False, jobs=source_jobs,
                         retry_context=f"{harness}:{recipient_sid}:{pane}:{item_duty['id']}")
                     original_identity = (prior[1][IDENTITY_KEY] if prior else
                         pending.received_ack_identity(original, storage_sid, original["delivery_id"]))
@@ -8679,8 +8507,8 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
                         release_unsubmitted_claim(root, storage_sid,
                             {**original, IDENTITY_KEY: original_identity}, owner, item_sid)
                         return
-                if not keep_claim(root, storage_sid, fresh["delivery_id"], claim, owner, jobs=jobs):
-                    continue
+                if not keep_claim(root, storage_sid, fresh["delivery_id"], claim, owner, jobs=source_jobs):
+                    return
                 stored = dict(claim)
                 identity = pending.received_ack_identity(stored, storage_sid, fresh["delivery_id"])
                 view = {**claim, STORAGE_KEY: storage_sid, IDENTITY_KEY: identity}
@@ -8689,9 +8517,7 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
                     "delivery_id": fresh["delivery_id"], "receipt_digest": fresh["receipt_digest"]})
                 refs.extend((item_duty["id"], fresh["delivery_id"]))
             except (OSError, ValueError, RuntimeError):
-                if prior:
-                    return
-                continue
+                return
         if not claimed:
             return
         body = delivery_context([(root, [entry[5] for entry in claimed])])
@@ -8706,7 +8532,10 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
         def bind_transfer(ref):
             prepared.append(ref)
             for item_duty, storage_sid, delivery_id, _owner, _stored, _view in claimed:
-                store.update(item_duty["id"], observation={"transfer_ref": ref,
+                previous = item_duty.get("observation") or {}
+                bindings = {**(previous.get("transfer_bindings") or {}), ref: producer}
+                store.update(item_duty["id"], observation={**previous, "transfer_ref": ref,
+                    "transfer_bindings": bindings,
                     "storage_sid": storage_sid, "delivery_id": delivery_id,
                     "recipient_sid": recipient_sid, "producer_binding": producer})
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body_file:
@@ -8715,9 +8544,12 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
             ref_args = [arg for ref in dict.fromkeys(refs) for arg in ("--ref", ref)]
             args = build_parser().parse_args(["prompt", pane, "--body-file", body_file.name,
                                                *ref_args])
+            if any(_resolve_target(pane)[:2] != (harness, recipient_sid) for _entry in claimed):
+                return
             for _duty, storage_sid, delivery_id, owner, stored, _view in claimed:
-                if (not claimed_send_current(root, storage_sid, stored, owner, harness, recipient_sid)
-                        or _resolve_target(pane)[:2] != (harness, recipient_sid)):
+                source_jobs = peer_obligations._notice_duty_source(_duty, root)[3]
+                if not claimed_send_current(root, storage_sid, stored, owner, harness, recipient_sid,
+                                            jobs=source_jobs):
                     return
             code = cmd_prompt(args, expected_recipient=(harness, recipient_sid),
                               on_prepared=bind_transfer, producer_binding=producer)

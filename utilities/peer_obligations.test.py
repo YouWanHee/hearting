@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import contextlib
 import errno
 import importlib.util
 import fcntl
@@ -51,6 +52,31 @@ def _pidfd_handoff_available():
 
 
 _PIDFD_HANDOFF = _pidfd_handoff_available()
+
+
+def _legacy_notice(harness, sid, *, key, subject, text, jobs, route_id="route-free",
+                   required_action="read-notice"):
+    """Historical private notice tag and duty, as stored before the zero-attempt writer; no registry row."""
+    import hashlib
+    import dispatch_pending_delivery as pending
+    import session_notice
+    receipt = session_notice.validate({"schema_version": 1, "kind": "notice", "key": key,
+        "subject": subject, "text": " ".join(text.split())[:600], "required_action": required_action})
+    from harness_capabilities import parent_completion
+    delivery_id = "delivery-" + hashlib.sha256(f"notice\0{key}".encode()).hexdigest()
+    tag = "notice-" + delivery_id.removeprefix("delivery-")[:32]
+    root = Path(jobs).parent
+    record = pending.read(root, sid, delivery_id)
+    if record is None:
+        record = pending.create(root, recipient_kind=parent_completion(harness)["carrier"],
+            recipient_key=sid, delivery_id=delivery_id, session_generation="",
+            session_generation_supported="0", attempt_ids=[tag], parent_attempt_id=tag,
+            route_id=route_id, route_node="notice", receipt=receipt,
+            receipt_digest=session_notice.receipt_digest(receipt), row_revisions={tag: "notice"}, lineage=[])
+    import peer_obligations
+    # Historical retention failure leaves the original record for discovery.
+    peer_obligations.retain_session_notice(Path(jobs), harness, sid, record)
+    return record
 
 
 class ObligationStoreTest(unittest.TestCase):
@@ -1005,7 +1031,7 @@ class ObligationStoreTest(unittest.TestCase):
         records, duties = [], []
         for index in range(member_count):
             with mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
-                record = session_notice.notify(harness, sid, key=f"notice:{sid}:{index}",
+                record = _legacy_notice(harness, sid, key=f"notice:{sid}:{index}",
                     subject="completed", text="finished", jobs=self.jobs)
             duty = next(duty for duty in self.store.list(kinds={"session-notice"})
                         if duty["intent"]["identity"]["delivery_id"] == record["delivery_id"])
@@ -1222,7 +1248,7 @@ class ObligationStoreTest(unittest.TestCase):
                 with self.subTest(index=index, mutation=mutation):
                     sid = f"runner-{index}-{mutation}"
                     with mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
-                        records = [session_notice.notify("claude", sid, key=f"runner:{sid}:{n}",
+                        records = [_legacy_notice("claude", sid, key=f"runner:{sid}:{n}",
                                    subject="done", text="completed", jobs=self.jobs) for n in range(4)]
                     duties = [duty for duty in self.store.list(kinds={"session-notice"})
                               if duty["intent"]["identity"]["storage_sid"] == sid]
@@ -1274,7 +1300,7 @@ class ObligationStoreTest(unittest.TestCase):
         peer = peer_steward.peer_message
         sid, successor = "next-pass-original", "next-pass-current"
         with mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
-            records = [session_notice.notify("claude", sid, key=f"recovery:{n}", subject="done",
+            records = [_legacy_notice("claude", sid, key=f"recovery:{n}", subject="done",
                        text="finished", jobs=self.jobs) for n in range(4)]
         duties = self.store.list(kinds={"session-notice"})
         real_render = sweep.delivery_context
@@ -1664,7 +1690,7 @@ class ObligationStoreTest(unittest.TestCase):
                "AGENT_DISPATCH_JOBS": str(self.jobs)}
         with mock.patch.dict(os.environ, env), \
              mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
-            record = session_notice.notify("claude", "sid-notice", key="run:legacy",
+            record = _legacy_notice("claude", "sid-notice", key="run:legacy",
                 subject="compute run", text="finished", jobs=self.jobs)
             store = obligations.ObligationStore(self.jobs.parent)
             sessions = self.root / "xdg-state" / "hearting" / "session-tidy" / "sessions"
@@ -1715,7 +1741,7 @@ class ObligationStoreTest(unittest.TestCase):
                "AGENT_DISPATCH_JOBS": str(self.jobs)}
         with mock.patch.dict(os.environ, env), \
              mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
-            record = session_notice.notify("claude", "sid-notice", key="run:malformed-pane",
+            record = _legacy_notice("claude", "sid-notice", key="run:malformed-pane",
                 subject="compute run", text="finished", jobs=self.jobs)
             store = obligations.ObligationStore(self.jobs.parent)
             sessions = self.root / "xdg-state" / "hearting" / "session-tidy" / "sessions"
@@ -1774,10 +1800,10 @@ class ObligationStoreTest(unittest.TestCase):
                 }
                 with mock.patch.dict(os.environ, env), \
                      mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
-                    front_record = session_notice.notify(
+                    front_record = _legacy_notice(
                         "claude", "sid-a-blocked", key="notice:" + case + ":front",
                         subject="front", text="blocked", jobs=jobs)
-                    back_record = session_notice.notify(
+                    back_record = _legacy_notice(
                         "claude", "sid-z-live", key="notice:" + case + ":back",
                         subject="back", text="deliver", jobs=jobs)
                     self.assertIsNotNone(front_record)
@@ -2611,6 +2637,614 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
         self.assertEqual((mismatched_work[0].delivery_state, mismatched_ready.state),
                          ("unknown", "unknown"))
 
+
+class CanonicalNoticeJoinTest(unittest.TestCase):
+    """Real zero-attempt writer, current duty, common courier and native boundaries."""
+    setUp = ObligationStoreTest.setUp
+    tearDown = ObligationStoreTest.tearDown
+    _native_first_write = ObligationStoreTest._native_first_write
+
+    def notices(self, harness="claude", sid="canonical-A", count=1, *, label="trial", offset=0,
+                exit_code=0, lineage=None):
+        import session_notice
+        records = []
+        with mock.patch.object(obligations, "ensure_normal_runner", return_value=False), \
+             mock.patch.object(obligations, "request_dispatch_reconciliation", return_value=False):
+            for index in range(offset, offset + count):
+                run = f"host-20261025-12{index:02d}00-{label}"
+                records.append(session_notice.notify(harness, sid, key="compute-run:" + run,
+                    subject="compute run", jobs=self.jobs, lineage=lineage,
+                    text=f"run {run} on host ended with exit {exit_code}; read it with: compute-hosts tail {run}"))
+        self.assertTrue(all(record["attempt_ids"] == [] and record["parent_attempt_id"] == ""
+                            and record["row_revisions"] == {} for record in records))
+        return records
+
+    def duties(self, sid=None):
+        return [duty for duty in self.store.list(kinds={"run-notice"}, states=obligations._PENDING_STATES | {"complete", "cancelled"})
+                if sid is None or duty["intent"]["identity"]["storage_recipient"] == sid]
+
+    def edge(self, harness, origin, target, *, source="tidy-clear"):
+        import session_tidy
+        session_tidy._append_ledger_entry(session_tidy.Seat("pane", "canonical-" + origin),
+            {"event": "succession", "source": source, "harness": harness,
+             "from": {"harness": harness, "sid": origin}, "sid": target, "ts": 1})
+
+    def parent_row(self, sid, *, harness="claude", index=0):
+        from route_identity import route_hash
+        route = {"route_id": "rt-canonical-" + str(index), "nodes": [{"id": "execute"}]}
+        route["route_hash"] = route_hash(route)
+        path = self.root / (route["route_id"] + ".json")
+        path.write_text(json.dumps(route))
+        from harness_capabilities import parent_completion
+        meta = {"attempt_schema_version": "2", "attempt_id": "att-canonical-" + str(index),
+            "parent_sid": sid, "parent_harness": harness, "harness": harness,
+            "parent_completion_delivery": parent_completion(harness)["carrier"],
+            "dispatch_depth": "1", "worker_type": "owner", "registered_worker": "1",
+            "route_file": str(path), "route_id": route["route_id"],
+            "route_hash": route["route_hash"], "route_node": "execute"}
+        with self.jobs.open("a") as handle:
+            handle.write("now\topen\t/fixture\t/fixture\towner\t" +
+                         ",".join(key + "=" + value for key, value in meta.items()) + "\n")
+        return meta
+
+    def courier(self, harness, sid, *, receive=False):
+        import contextlib
+        from types import SimpleNamespace
+        @contextlib.contextmanager
+        def native():
+            peer = peer_steward.peer_message
+            sent = []
+            def prepare(args, *, expected_recipient, on_prepared, producer_binding):
+                body = Path(args.body_file).read_text()
+                wire, ref = peer.prepare_peer_message(body,
+                    {"harness": "runtime", "session_id": None, "name": "Hearting runtime"},
+                    {"harness": expected_recipient[0], "session_id": expected_recipient[1]},
+                    defer=True, refs=args.ref, producer_binding=producer_binding)
+                on_prepared(ref)
+                sent.append(peer._read_pending(ref))
+                if receive:
+                    self.assertEqual(peer.receive_peer_message(wire, {
+                        "harness": expected_recipient[0], "session_id": expected_recipient[1]}), 0)
+                return 0 if receive else 3
+            census = {"result": {"agents": [{"agent": harness, "pane_id": "w1:pCanonical",
+                      "agent_session": {"value": sid}}]}}
+            with mock.patch.object(peer_steward, "_herdr_argv", return_value=["private-herdr"]), \
+                 mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=0, stdout=json.dumps(census))), \
+                 mock.patch.object(peer_steward, "_resolve_target", return_value=(harness, sid)), \
+                 mock.patch.object(peer_steward, "cmd_prompt", side_effect=prepare):
+                yield sent
+        return native()
+
+    def transfer(self, harness="claude", sid="canonical-A", count=1, *, old_schema=False, referenced=False):
+        import dispatch_pending_delivery as pending
+        import dispatch_session_sweep as sweep
+        records = self.notices(harness, sid, count)
+        by_id = {duty["intent"]["delivery_id"]: duty for duty in self.duties(sid)}
+        duties = [by_id[record["delivery_id"]] for record in records]
+        claimed = [pending.claim(self.root, sid, record["delivery_id"],
+            claim_owner="retained-rewake:" + duty["id"], lease_seconds=30, jobs=self.jobs)
+            for record, duty in zip(records, duties)]
+        body = sweep.delivery_context([(self.root, [{**record, sweep.STORAGE_KEY: sid,
+            sweep.IDENTITY_KEY: pending.received_ack_identity(record, sid, record["delivery_id"])}
+            for record in claimed])])
+        recipient = {"harness": harness, "session_id": sid}
+        if old_schema:
+            self.assertEqual(count, 1)
+            intent = duties[0]["intent"]
+            producer = {"schema": "retained-runtime-notice-v1", "jobs": str(self.jobs),
+                "duty_id": duties[0]["id"], "recipient": recipient,
+                **{key: intent[key] for key in ("carrier", "delivery_id", "receipt_digest", "route_id", "route_node")}}
+        else:
+            producer = {"schema": "session-notice-runtime-v1", "jobs": str(self.jobs),
+                "duty_id": duties[0]["id"], "recipient": recipient,
+                "records": [{"duty_id": duty["id"], "storage_sid": sid,
+                    "delivery_id": record["delivery_id"], "receipt_digest": record["receipt_digest"]}
+                    for record, duty in zip(records, duties)]}
+        refs = [value for record, duty in zip(records, duties) for value in (duty["id"], record["delivery_id"])]
+        peer = peer_steward.peer_message
+        with mock.patch.object(peer, "_reference_access_evidence_valid", return_value=referenced):
+            wire, ref = peer.prepare_peer_message(body + ("\n" + "padding " * 400 if referenced else ""),
+                {"harness": "runtime", "session_id": None, "name": "Hearting runtime"},
+                recipient, defer=True, refs=refs, producer_binding=producer)
+        for duty in duties:
+            self.store.update(duty["id"], observation={"transfer_ref": ref,
+                "transfer_bindings": {ref: producer}, "producer_binding": producer})
+        return ref, recipient, claimed, duties
+
+    def test_confirmed_successor_uses_one_original_duty_on_all_harnesses(self):
+        from dispatch_seat_handover import record_recipient_binding
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                old, current = "canonical-" + harness, "current-" + harness
+                record, = self.notices(harness, old)
+                duty, = self.duties(old)
+                self.edge(harness, old, current)
+                self.assertEqual(record_recipient_binding(record, old, harness=harness), (harness, current))
+                self.assertEqual(obligations._ordinary_notice_target(duty["intent"]["identity"],
+                    duty["intent"]["carrier"]), (harness, current, old))
+                with self.courier(harness, current, receive=True) as sent:
+                    peer_steward._reconcile_obligations(self.store, [duty])
+                self.assertEqual(len(sent), 1)
+                self.assertIn(record["delivery_id"], sent[0]["text"])
+                self.assertEqual(self.store.get(duty["id"])["state"], "complete")
+                self.assertEqual(len(self.duties(old)), 1)
+
+    def test_current_watch_producer_keeps_ordinary_family_grouping(self):
+        from types import SimpleNamespace
+        spec = importlib.util.spec_from_file_location("canonical_watch_producer", _HERE / "compute-hosts.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        with mock.patch.object(obligations, "ensure_normal_runner", return_value=False), \
+             mock.patch.object(obligations, "request_dispatch_reconciliation", return_value=False):
+            for index in range(4):
+                run = f"host-20261025-12{index:02d}00-trial"
+                directory = self.root / "private-ended-runs" / run
+                directory.mkdir(parents=True)
+                (directory / "meta.json").write_text(json.dumps({"run_id": run, "host": "host",
+                    "provenance": {"session": {"harness": "claude", "id": "canonical-A"}}}))
+                (directory / "exit_code").write_text("0")
+                self.assertEqual(module.cmd_watch_run(SimpleNamespace(run_dir=str(directory)), now=lambda: 0,
+                    sleep=lambda _seconds: self.fail("fixture is already ended")), 0)
+        duties = self.duties()
+        self.assertEqual(len(duties), 4)
+        with self.courier("claude", "canonical-A", receive=True) as sent:
+            peer_steward._reconcile_obligations(self.store, duties)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("compute run summary: 4 runs", sent[0]["text"])
+        self.assertEqual(sent[0]["text"].count("HEARTING_RECEIPT_V1 "), 4)
+        self.assertTrue(all(duty["intent"]["delivery_id"] in sent[0]["text"] for duty in duties))
+
+    def test_checkpoint_and_experiment_exit_keep_their_own_lines_and_receipts(self):
+        import session_notice
+        records = self.notices(count=3)
+        with mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
+            for event in ("checkpoint", "exit"):
+                records.append(session_notice.notify("claude", "canonical-A", jobs=self.jobs,
+                    key="experiment:own-run:" + event + ":1:claude:canonical-A",
+                    subject="experiment " + event + " (1/1)", text="own-run " + event + ": keep metrics and timing"))
+        with self.courier("claude", "canonical-A", receive=True) as sent:
+            peer_steward._reconcile_obligations(self.store, self.duties())
+        self.assertEqual(len(sent), 1)
+        body = sent[0]["text"]
+        self.assertEqual(body.count("compute run summary: 3 runs"), 1)
+        for event in ("checkpoint", "exit"):
+            self.assertIn("experiment " + event + " (1/1): own-run " + event + ": keep metrics and timing", body)
+        self.assertEqual(body.count("HEARTING_RECEIPT_V1 "), 5)
+        self.assertTrue(all(record["delivery_id"] in body for record in records))
+
+    def test_grouping_keeps_experiments_failures_unknown_and_every_marker(self):
+        import session_notice
+        records = self.notices(count=3) + self.notices(count=3, label="other")
+        records += self.notices(offset=10, exit_code=1)
+        with mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
+            records.append(session_notice.notify("claude", "canonical-A", key="unknown", subject="compute run",
+                text="unclassified exit observation", jobs=self.jobs))
+        with self.courier("claude", "canonical-A", receive=True) as sent:
+            peer_steward._reconcile_obligations(self.store, self.duties())
+        self.assertEqual(len(sent), 1)
+        body = sent[0]["text"]
+        self.assertEqual(body.count("compute run summary: 3 runs"), 2)
+        self.assertIn("label=trial", body)
+        self.assertIn("label=other", body)
+        self.assertIn("ended with exit 1", body)
+        self.assertIn("unclassified exit observation", body)
+        self.assertEqual(body.count("HEARTING_RECEIPT_V1 "), 8)
+        self.assertTrue(all(record["delivery_id"] in body for record in records))
+
+    def test_first_eight_then_four_and_other_recipient_progress(self):
+        self.notices(sid="A", count=12)
+        self.notices(sid="Z")
+        selection, counts = {}, []
+        for sid in ("A", "Z", "A"):
+            with self.courier("claude", sid, receive=True) as sent:
+                peer_steward._reconcile_obligations(self.store, self.duties(),
+                    notice_selection=selection, runner_incarnation="canonical-test")
+            self.assertEqual(len(sent), 1)
+            counts.append(sent[0]["text"].count("HEARTING_RECEIPT_V1 "))
+        self.assertEqual(counts, [8, 1, 4])
+        self.assertTrue(all(duty["state"] == "complete" for duty in self.duties()))
+
+    def test_each_canonical_member_rechecks_owner_identity_lease_and_fence(self):
+        import dispatch_pending_delivery as pending
+        for harness in ("claude", "codex"):
+            for count in (1, 4, 8):
+                for index in range(count):
+                    for mutation in ("owner", "identity", "lease", "fence", "float-lease", "boolean-lease"):
+                        with self.subTest(harness=harness, count=count, index=index, mutation=mutation):
+                            sid = f"canonical-{harness}-{count}-{index}-{mutation}"
+                            ref, recipient, records, duties = self.transfer(harness, sid, count)
+                            original = records[index]
+                            did = original["delivery_id"]
+                            def change():
+                                if mutation == "owner":
+                                    pending.release_claim(self.root, sid, did, claim_owner=original["claim_owner"])
+                                    pending.claim(self.root, sid, did, claim_owner="foreign-owner", lease_seconds=30,
+                                        jobs=self.jobs, retry_context="foreign")
+                                elif mutation == "fence":
+                                    pending.prepare_submission_fence(self.root, sid, did,
+                                        claim_owner=original["claim_owner"],
+                                        expected_identity=pending.submission_fence_identity(original, sid))
+                                else:
+                                    path = pending.record_path(self.root, sid, did)
+                                    raw = json.loads(path.read_text())
+                                    raw.update({"session_generation": "replacement"} if mutation == "identity" else
+                                        {"claim_deadline_ns": float(time.monotonic_ns() + 30_000_000_000)} if mutation == "float-lease" else
+                                        {"claim_deadline_ns": True} if mutation == "boolean-lease" else
+                                        {"claim_deadline_ns": time.monotonic_ns() - 1})
+                                    path.write_text(json.dumps(raw))
+                            with mock.patch.object(pending, "renew_unsubmitted_claim", return_value=original) if mutation == "lease" else contextlib.nullcontext():
+                                self.assertEqual(self._native_first_write(ref, recipient, before=change), [])
+
+    def test_retained_single_notice_schema_uses_the_same_first_write_guard(self):
+        import dispatch_pending_delivery as pending
+        for harness in ("claude", "codex"):
+            for mutation in ("none", "owner", "identity", "fence"):
+                with self.subTest(harness=harness, mutation=mutation):
+                    sid = "single-" + harness + mutation
+                    ref, recipient, records, duties = self.transfer(harness, sid, old_schema=True)
+                    original, = records
+                    def change():
+                        path = pending.record_path(self.root, sid, original["delivery_id"])
+                        if mutation == "owner":
+                            pending.release_claim(self.root, sid, original["delivery_id"], claim_owner=original["claim_owner"])
+                            pending.claim(self.root, sid, original["delivery_id"], claim_owner="other-owner", lease_seconds=30,
+                                          jobs=self.jobs, retry_context="other")
+                        elif mutation == "identity":
+                            raw = json.loads(path.read_text()); raw["session_generation"] = "replacement"
+                            path.write_text(json.dumps(raw))
+                        elif mutation == "fence":
+                            pending.prepare_submission_fence(self.root, sid, original["delivery_id"],
+                                claim_owner=original["claim_owner"], expected_identity=pending.submission_fence_identity(original, sid))
+                    self.assertEqual(len(self._native_first_write(ref, recipient, before=change)), int(mutation == "none"))
+
+    def test_original_receipt_survives_handover_unknown_graph_and_ack_retry(self):
+        import dispatch_pending_delivery as pending
+        import session_tidy
+        peer = peer_steward.peer_message
+        for old_schema in (False, True):
+            for referenced in (False, True):
+                with self.subTest(old_schema=old_schema, referenced=referenced):
+                    sid = "receipt-" + str(old_schema) + str(referenced)
+                    ref, recipient, records, duties = self.transfer(sid=sid,
+                        count=1 if old_schema else 4, old_schema=old_schema, referenced=referenced)
+                    wire = peer._read_pending(ref)["text"]
+                    seal = peer._transfer_path(ref).read_bytes()
+                    self.edge("claude", sid, sid + "-next")
+                    bad = session_tidy.state_root() / "sessions" / (sid + "-unknown.jsonl")
+                    bad.parent.mkdir(parents=True, exist_ok=True); bad.write_text("{")
+                    for record in records:
+                        path = pending.record_path(self.root, sid, record["delivery_id"])
+                        raw = json.loads(path.read_text()); raw.update(claim_owner="new-owner", claim_deadline_ns=1)
+                        path.write_text(json.dumps(raw))
+                    with mock.patch.object(pending, "ack_received", side_effect=OSError("ACK unavailable")):
+                        self.assertEqual(peer.receive_peer_message(wire, recipient), 0)
+                    received = peer._read_pending(ref)
+                    self.assertEqual(received["text"], wire)
+                    self.assertTrue(all(pending.read(self.root, sid, record["delivery_id"])["state"] == "claimed"
+                                        for record in records))
+                    with mock.patch.object(peer, "prepare_peer_message", side_effect=AssertionError("replay")), \
+                         mock.patch.object(obligations, "_ordinary_notice_target", side_effect=AssertionError("historical ACK needs no current graph")):
+                        self.assertTrue(peer._ack_registered_delivery(received))
+                    self.assertTrue(all(pending.read(self.root, sid, record["delivery_id"])["state"] == "acked"
+                                        for record in records))
+                    self.assertEqual(peer._transfer_path(ref).read_bytes(), seal)
+                    bad.unlink()  # This test's private malformed ledger only.
+
+    def test_same_digest_replacement_is_not_adopted_at_group_or_single_receipt(self):
+        import dispatch_pending_delivery as pending
+        peer = peer_steward.peer_message
+        for old_schema in (False, True):
+            for referenced in (False, True):
+                with self.subTest(old_schema=old_schema, referenced=referenced):
+                    sid = "replacement-" + str(old_schema) + str(referenced)
+                    ref, recipient, records, duties = self.transfer(sid=sid,
+                        count=1 if old_schema else 4, old_schema=old_schema, referenced=referenced)
+                    original = records[0]
+                    path = pending.record_path(self.root, sid, original["delivery_id"])
+                    raw = json.loads(path.read_text()); raw["session_generation"] = "replacement"
+                    path.write_text(json.dumps(raw))
+                    self.assertEqual(peer.receive_peer_message(peer._read_pending(ref)["text"], recipient), 0)
+                    replacement = pending.read(self.root, sid, original["delivery_id"])
+                    self.assertEqual(replacement["receipt_digest"], original["receipt_digest"])
+                    self.assertNotEqual(replacement["state"], "acked")
+                    self.assertTrue(all(pending.read(self.root, sid, record["delivery_id"])["state"] == "acked"
+                                        for record in records[1:]))
+
+    def test_exact_pending_renewal_keeps_original_owner_identity_and_count(self):
+        import dispatch_pending_delivery as pending
+        for old_schema in (False, True):
+            for harness in ("claude", "codex"):
+                sid = "renew-" + harness + str(old_schema)
+                ref, recipient, records, duties = self.transfer(harness, sid, old_schema=old_schema)
+                record, = records
+                path = pending.record_path(self.root, sid, record["delivery_id"])
+                raw = json.loads(path.read_text()); raw["claim_deadline_ns"] = time.monotonic_ns() - 1
+                path.write_text(json.dumps(raw))
+                with mock.patch.object(pending, "renew_unsubmitted_claim", wraps=pending.renew_unsubmitted_claim) as renewal:
+                    self.assertEqual(len(self._native_first_write(ref, recipient)), 1)
+                self.assertEqual(renewal.call_count, 1)
+                current = pending.read(self.root, sid, record["delivery_id"])
+                self.assertGreater(current["claim_deadline_ns"], time.monotonic_ns())
+                self.assertEqual(current["claim_owner"], record["claim_owner"])
+                self.assertEqual(current["attempts"], record["attempts"])
+                self.assertEqual(pending.received_ack_identity(current, sid, record["delivery_id"]),
+                                 pending.received_ack_identity(record, sid, record["delivery_id"]))
+
+    def test_explicit_binding_pair_precedes_tidy_and_depth_one_has_no_twelve_limit(self):
+        import dispatch_seat_handover as handover
+        import session_tidy
+        self.edge("claude", "A", "tidy-B")
+        for index in range(14):
+            meta = self.parent_row("A", index=index)
+            record, = self.notices(sid="A", label="authority-" + str(index), lineage={
+                "kind": "attempt-parent", "harness": "claude", "session_id": "A", "attempt_id": meta["attempt_id"]})
+            if index == 13:
+                session_tidy._append_ledger_entry(session_tidy.Seat("pane", "canonical-explicit"),
+                    {"event": "handover", "source": "retire", "harness": "codex", "sid": "A",
+                     "from": {"harness": "claude", "sid": "A"}, "ts": 1,
+                     "bindings": [handover.binding_of(self.jobs, meta)]})
+                self.edge("codex", "A", "codex-C")
+            expected = ("codex", "codex-C") if index == 13 else ("claude", "tidy-B")
+            duty = next(d for d in self.duties("A") if d["intent"]["delivery_id"] == record["delivery_id"])
+            self.assertEqual(handover.record_recipient_binding(record, "A", harness="claude", jobs=self.jobs), expected)
+            self.assertEqual(obligations._ordinary_notice_target(duty["intent"]["identity"],
+                duty["intent"]["carrier"]), (*expected, "A"))
+        with self.courier("codex", "codex-C", receive=True) as sent:
+            peer_steward._reconcile_obligations(self.store, [duty])
+        self.assertEqual(len(sent), 1)
+
+    def test_unknown_unchanged_duty_rechecks_new_lineage_before_backoff(self):
+        record, = self.notices()
+        duty, = self.duties()
+        duty = self.store.update(duty["id"], state="unknown", observation={"reason": "recipient-lineage-unavailable"})
+        retry = {duty["id"]: (peer_steward._obligation_retry_fingerprint(duty), time.monotonic() + 60, 1)}
+        self.edge("claude", "canonical-A", "new-current")
+        with self.courier("claude", "new-current", receive=True) as sent:
+            peer_steward._reconcile_obligations(self.store, [duty], retry_state=retry)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(self.store.get(duty["id"])["state"], "complete")
+        self.assertNotIn(duty["id"], retry)
+        self.assertIn(record["delivery_id"], sent[0]["text"])
+
+    def test_later_native_observation_rechecks_the_whole_canonical_body(self):
+        import dispatch_pending_delivery as pending
+        records = self.notices(count=4)
+        calls = []
+        def target(*args, **kwargs):
+            calls.append(True)
+            if len(calls) == 6:
+                self.edge("claude", "canonical-A", "late-successor")
+            return "claude", "canonical-A"
+        with self.courier("claude", "canonical-A") as sent, \
+             mock.patch.object(peer_steward, "_resolve_target", side_effect=target):
+            peer_steward._reconcile_obligations(self.store, self.duties())
+        self.assertGreaterEqual(len(calls), 6)
+        self.assertEqual(sent, [])
+        self.assertTrue(all(pending.read(self.root, "canonical-A", record["delivery_id"])["state"] == "pending"
+                            for record in records))
+
+    def test_writer_retry_uses_original_stored_lineage_and_one_logical_duty(self):
+        import session_notice
+        first = self.parent_row("A", index=0)
+        second = self.parent_row("A", index=1)
+        original = {"kind": "attempt-parent", "harness": "claude", "session_id": "A", "attempt_id": first["attempt_id"]}
+        record, = self.notices(sid="A", lineage=original)
+        with mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
+            session_notice.notify("claude", "A", key=record["receipt"]["key"], subject=record["receipt"]["subject"],
+                text=record["receipt"]["text"], jobs=self.jobs,
+                lineage={**original, "attempt_id": second["attempt_id"]})
+        duty, = self.duties("A")
+        self.assertEqual(duty["intent"]["identity"]["lineage"], original)
+        self.assertEqual(duty["intent"]["delivery_id"], record["delivery_id"])
+
+    def test_unknown_early_member_keeps_every_other_exact_original_receipt(self):
+        import dispatch_pending_delivery as pending
+        peer = peer_steward.peer_message
+        ref, recipient, records, duties = self.transfer(count=4)
+        path = pending.record_path(self.root, recipient["session_id"], records[0]["delivery_id"])
+        raw = json.loads(path.read_text()); raw["lineage"] = ["unknown-authority"]
+        path.write_text(json.dumps(raw))
+        self.assertEqual(peer.receive_peer_message(peer._read_pending(ref)["text"], recipient), 0)
+        self.assertNotEqual(pending.read(self.root, recipient["session_id"], records[0]["delivery_id"])["state"], "acked")
+        self.assertTrue(all(pending.read(self.root, recipient["session_id"], record["delivery_id"])["state"] == "acked"
+                            for record in records[1:]))
+
+    def test_owner_session_uses_exact_resource_authority_before_tidy(self):
+        import dispatch_completion_join as join
+        from dispatch_contract import dispatch_state_root
+        from dispatch_seat_handover import record_recipient_binding
+        meta = self.parent_row("registered-parent")
+        state = dispatch_state_root(self.jobs) / "supervisor-state" / (meta["attempt_id"] + ".json")
+        join._write_supervisor_state_unlocked(state, meta["attempt_id"], set(),
+            resource={"session_id": "owner-A", "delivered": [], "outbox": None})
+        record, = self.notices(sid="owner-A", lineage={"kind": "owner-session", "harness": "claude",
+            "session_id": "owner-A", "attempt_id": meta["attempt_id"]})
+        self.edge("claude", "owner-A", "owner-B")
+        self.assertEqual(record_recipient_binding(record, "owner-A", harness="claude"), ("claude", "owner-B"))
+        state.write_text("{")
+        self.assertIsNone(record_recipient_binding(record, "owner-A", harness="claude"))
+
+    def test_missing_contradictory_manual_and_fork_authority_stays_unresolved(self):
+        import dispatch_seat_handover as handover
+        import session_notice
+        record, = self.notices()
+        self.assertIsNone(handover.record_recipient_binding({**record, "lineage": []}, "canonical-A", harness="claude"))
+        wrong = session_notice._stored_lineage(self.jobs, {"kind": "provenance", "harness": "codex", "session_id": "canonical-A"})
+        self.assertIsNone(handover.record_recipient_binding({**record, "lineage": [wrong]}, "canonical-A", harness="claude"))
+        for binding in (None, [], {"kind": "unknown", "harness": "claude", "session_id": "canonical-A"}):
+            stored = session_notice.LINEAGE_PREFIX + json.dumps({"jobs": str(self.jobs), "binding": binding})
+            self.assertIsNone(handover.record_recipient_binding({**record, "lineage": [stored]}, "canonical-A", harness="claude"))
+        self.edge("claude", "canonical-A", "manual-B", source="manual-clear")
+        self.assertEqual(handover.record_recipient_binding(record, "canonical-A", harness="claude"), ("claude", "canonical-A"))
+        self.edge("claude", "canonical-A", "B")
+        self.edge("claude", "canonical-A", "C")
+        self.assertIsNone(handover.record_recipient_binding(record, "canonical-A", harness="claude"))
+
+
+
+    def test_canonical_route_free_runner_releases_only_original_unsubmitted_group_claims(self):
+        import dispatch_pending_delivery as pending
+        import dispatch_session_sweep as sweep
+        import session_notice
+        from types import SimpleNamespace
+        for index in range(4):
+            for mutation in ("identity", "owner", "fence", "lease", "terminal"):
+                with self.subTest(index=index, mutation=mutation):
+                    sid = f"runner-{index}-{mutation}"
+                    with mock.patch.object(obligations, "ensure_normal_runner", return_value=False):
+                        records = [session_notice.notify("claude", sid, key=f"runner:{sid}:{n}",
+                                   subject="done", text="completed", jobs=self.jobs) for n in range(4)]
+                    duties = [duty for duty in self.duties()
+                              if duty["intent"]["identity"]["storage_recipient"] == sid]
+                    changed = records[index]["delivery_id"]
+                    captured = {}
+                    real_render = sweep.delivery_context
+                    def render(groups):
+                        record = pending.read(self.root, sid, changed)
+                        if mutation == "owner":
+                            pending.release_claim(self.root, sid, changed, claim_owner=record["claim_owner"])
+                            pending.claim(self.root, sid, changed, claim_owner="other-carrier", lease_seconds=30,
+                                          jobs=self.jobs, retry_context="new-owner")
+                        elif mutation == "terminal":
+                            pending.ack_received(self.root, sid, changed,
+                                expected_identity=pending.received_ack_identity(record, sid, changed),
+                                acked_by="already-exact")
+                        elif mutation == "fence":
+                            pending.prepare_submission_fence(self.root, sid, changed,
+                                claim_owner=record["claim_owner"],
+                                expected_identity=pending.submission_fence_identity(record, sid))
+                        else:
+                            path = pending.record_path(self.root, sid, changed)
+                            raw = json.loads(path.read_text())
+                            raw.update({"route_node": "replacement-node"} if mutation == "identity" else
+                                       {"claim_deadline_ns": time.monotonic_ns() - 1})
+                            path.write_text(json.dumps(raw))
+                        path = pending.record_path(self.root, sid, changed)
+                        captured["bytes"] = path.read_bytes()
+                        return real_render(groups)
+                    agents = {"result": {"agents": [{"agent": "claude", "pane_id": "w1:pNotice",
+                              "agent_session": {"value": sid}}]}}
+                    with mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
+                            returncode=0, stdout=json.dumps(agents))), \
+                         mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", sid)), \
+                         mock.patch.object(sweep, "delivery_context", side_effect=render), \
+                         mock.patch.object(peer_steward, "cmd_prompt") as prompt:
+                        peer_steward._resume_session_notice_obligations(duties, self.store)
+                    prompt.assert_not_called()
+                    self.assertEqual(pending.record_path(self.root, sid, changed).read_bytes(), captured["bytes"])
+                    self.assertTrue(all(pending.read(self.root, sid, r["delivery_id"])["state"] == "pending"
+                                        for r in records if r["delivery_id"] != changed))
+
+    def test_canonical_prepared_notice_group_recovers_after_later_handover_without_mutating_old_transfer(self):
+        import dispatch_pending_delivery as pending
+        import session_tidy as tidy
+        from types import SimpleNamespace
+        peer = peer_steward.peer_message
+        os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.root)
+        ref, recipient, records, duties = self.transfer("claude", "canonical-retarget", 4)
+        sid, successor = recipient["session_id"], "retargeted-current-holder"
+        seal = peer._transfer_path(ref).read_bytes()
+        for record, duty in zip(records, duties):
+            pending.mark_sent_ambiguous(self.root, sid, record["delivery_id"], claim_owner=record["claim_owner"])
+            self.store.update(duty["id"], observation={**self.store.get(duty["id"])["observation"], "transfer_ref": ref})
+        tidy._append_ledger_entry(tidy.Seat("pane", "prepared-retarget"),
+            dict(event="succession", source="tidy-clear", harness="claude", sid=successor,
+                 **{"from": {"harness": "claude", "sid": sid}}, ts=1))
+        for record in records:
+            path = pending.record_path(self.root, sid, record["delivery_id"])
+            raw = json.loads(path.read_text()); raw["claim_deadline_ns"] = time.monotonic_ns() - 1
+            path.write_text(json.dumps(raw))
+        sent = []
+        def courier(args, *, expected_recipient, on_prepared, producer_binding):
+            self.assertEqual(expected_recipient, ("claude", successor))
+            wire, new_ref = peer.prepare_peer_message(Path(args.body_file).read_text(),
+                {"harness": "runtime", "session_id": None, "name": "Hearting runtime"},
+                {"harness": "claude", "session_id": successor}, defer=True,
+                refs=args.ref, producer_binding=producer_binding)
+            on_prepared(new_ref); sent.append(new_ref)
+            self.assertEqual(peer.receive_peer_message(wire, {"harness": "claude", "session_id": successor}), 0)
+            return 0
+        agents = {"result": {"agents": [{"agent": "claude", "pane_id": "w1:pRetarget",
+                  "agent_session": {"value": successor}}]}}
+        with mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(agents))), \
+             mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", successor)), \
+             mock.patch.object(peer_steward, "cmd_prompt", side_effect=courier):
+            peer_steward._resume_session_notice_obligations(self.duties(), self.store)
+        self.assertEqual(len(sent), 1)
+        self.assertNotEqual(sent[0], ref)
+        self.assertEqual(peer._transfer_path(ref).read_bytes(), seal)
+        self.assertEqual(peer._read_pending(ref)["state"], "pending")
+        self.assertTrue(all(pending.read(self.root, sid, r["delivery_id"])["state"] == "acked" for r in records))
+
+    def test_canonical_prepared_retarget_holds_group_for_changed_owner_fence_identity_or_live_lease(self):
+        import dispatch_pending_delivery as pending
+        import session_tidy as tidy
+        from types import SimpleNamespace
+        peer = peer_steward.peer_message
+        os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.root)
+        for mutation in ("owner", "fence", "identity", "queued", "unverified", "live-lease"):
+            with self.subTest(mutation=mutation):
+                ref, recipient, records, duties = self.transfer("claude", "canonical-held-" + mutation, 4)
+                sid, successor = recipient["session_id"], "current-" + mutation
+                for record, duty in zip(records, duties):
+                    pending.mark_sent_ambiguous(self.root, sid, record["delivery_id"], claim_owner=record["claim_owner"])
+                    self.store.update(duty["id"], observation={**self.store.get(duty["id"])["observation"], "transfer_ref": ref})
+                    path = pending.record_path(self.root, sid, record["delivery_id"])
+                    raw = json.loads(path.read_text()); raw["claim_deadline_ns"] = time.monotonic_ns() - 1
+                    path.write_text(json.dumps(raw))
+                tidy._append_ledger_entry(tidy.Seat("pane", "held-" + mutation),
+                    dict(event="succession", source="tidy-clear", harness="claude", sid=successor,
+                         **{"from": {"harness": "claude", "sid": sid}}, ts=1))
+                last = max(records, key=lambda value: value["delivery_id"])
+                path = pending.record_path(self.root, sid, last["delivery_id"])
+                if mutation in {"queued", "unverified"}:
+                    peer._save_pending(dict(peer._read_pending(ref), state=mutation))
+                elif mutation == "fence":
+                    raw = json.loads(path.read_text()); raw["state"] = "claimed"
+                    path.write_text(json.dumps(raw))
+                    pending.prepare_submission_fence(self.root, sid, last["delivery_id"],
+                        claim_owner=last["claim_owner"],
+                        expected_identity=pending.submission_fence_identity(last, sid))
+                else:
+                    raw = json.loads(path.read_text())
+                    raw.update({"claim_owner": "other-carrier"} if mutation == "owner" else
+                               {"route_node": "replacement-node"} if mutation == "identity" else
+                               {"claim_deadline_ns": time.monotonic_ns() + 30_000_000_000})
+                    path.write_text(json.dumps(raw))
+                protected = path.read_bytes()
+                agents = {"result": {"agents": [{"agent": "claude", "pane_id": "w1:pHeld",
+                          "agent_session": {"value": successor}}]}}
+                with mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
+                        returncode=0, stdout=json.dumps(agents))), \
+                     mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", successor)), \
+                     mock.patch.object(peer_steward, "cmd_prompt") as prompt:
+                    peer_steward._resume_session_notice_obligations([self.store.get(d["id"]) for d in duties], self.store)
+                prompt.assert_not_called()
+                self.assertEqual(path.read_bytes(), protected)
+                if mutation == "live-lease":
+                    # Earlier claims returned safely to pending can recover normally too.
+                    raw = json.loads(path.read_text()); raw["claim_deadline_ns"] = time.monotonic_ns() - 1
+                    path.write_text(json.dumps(raw))
+                    sent = []
+                    def courier(args, *, expected_recipient, on_prepared, producer_binding):
+                        wire, new_ref = peer.prepare_peer_message(Path(args.body_file).read_text(),
+                            {"harness": "runtime", "session_id": None, "name": "Hearting runtime"},
+                            {"harness": "claude", "session_id": successor}, defer=True,
+                            refs=args.ref, producer_binding=producer_binding)
+                        on_prepared(new_ref); sent.append(new_ref)
+                        self.assertEqual(peer.receive_peer_message(wire, {"harness": "claude", "session_id": successor}), 0)
+                        return 0
+                    with mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
+                            returncode=0, stdout=json.dumps(agents))), \
+                         mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", successor)), \
+                         mock.patch.object(peer_steward, "cmd_prompt", side_effect=courier), \
+                         mock.patch.object(pending.time, "time_ns", return_value=time.time_ns() + 1_000_000_000):
+                        peer_steward._resume_session_notice_obligations([self.store.get(d["id"]) for d in duties], self.store)
+                    self.assertEqual(len(sent), 1)
+                    self.assertTrue(all(pending.read(self.root, sid, r["delivery_id"])["state"] == "acked" for r in records))
 
 if __name__ == "__main__":
     unittest.main()

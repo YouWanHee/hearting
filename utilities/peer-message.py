@@ -292,7 +292,7 @@ def _valid_session_notice_producer_binding(binding, sender, recipient=None, refs
             or sender.get("name") != "Hearting runtime"):
         return False
     if (not isinstance(binding.get("duty_id"), str)
-            or not re.fullmatch(r"session-notice-[0-9a-f]{32}", binding["duty_id"])
+            or not re.fullmatch(r"(?:session|run)-notice-[0-9a-f]{32}", binding["duty_id"])
             or not isinstance(binding.get("jobs"), str) or not Path(binding["jobs"]).is_absolute()
             or not isinstance(binding.get("recipient"), dict)
             or not _valid_transfer_endpoint(binding["recipient"])):
@@ -304,7 +304,7 @@ def _valid_session_notice_producer_binding(binding, sender, recipient=None, refs
     refs = set(refs or ())
     for row in rows:
         if (not isinstance(row, dict) or set(row) != required
-                or not re.fullmatch(r"session-notice-[0-9a-f]{32}", str(row.get("duty_id") or ""))
+                or not re.fullmatch(r"(?:session|run)-notice-[0-9a-f]{32}", str(row.get("duty_id") or ""))
                 or not all(isinstance(row.get(key), str) and row[key]
                            for key in ("storage_sid", "delivery_id"))
                 or not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}",
@@ -2358,7 +2358,8 @@ def acknowledge_message_obligations(received, *, pending_lock_held=False):
 def _received_delivery_text(row, original_text=None):
     """Retain the existing original body while an exact delivery ACK may need retrying."""
     if (row.get("dispatch_notice") or row.get("dispatch_notices")
-            or (row.get("producer_binding") or {}).get("schema") == _SESSION_NOTICE_PRODUCER_SCHEMA):
+            or (row.get("producer_binding") or {}).get("schema") in {
+                _SESSION_NOTICE_PRODUCER_SCHEMA, _RUNTIME_NOTICE_SCHEMA}):
         text = row.get("text") or original_text
         if (isinstance(text, str)
                 and hashlib.sha256(text.encode("utf-8")).hexdigest() == row.get("body_sha256")):

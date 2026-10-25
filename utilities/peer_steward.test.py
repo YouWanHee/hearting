@@ -5653,6 +5653,26 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
 
 
 class RetainedRunNoticeCarrierTest(_TmpRootMixin, unittest.TestCase):
+    def parent_row(self, sid):
+        from route_identity import route_hash
+        route = {"route_id": "rt-notice-parent", "nodes": [{"id": "execute"}]}
+        route["route_hash"] = route_hash(route)
+        path = self.tmp_root / "notice-parent.json"
+        path.write_text(json.dumps(route))
+        metadata = {"attempt_schema_version": "2", "attempt_id": "att-owner", "parent_sid": sid, "parent_harness": "claude",
+            "parent_completion_delivery": "claude-parent-runtime", "dispatch_depth": "1",
+            "worker_type": "owner", "registered_worker": "1", "harness": "claude",
+            "route_file": str(path), "route_id": route["route_id"],
+            "route_hash": route["route_hash"], "route_node": "execute"}
+        self.jobs_path.write_text("now\trunning\t/fixture\t/fixture\towner\t" +
+            ",".join(key + "=" + value for key, value in metadata.items()) + "\n")
+
+    def succession(self, origin, target):
+        import session_tidy
+        session_tidy._append_ledger_entry(session_tidy.Seat("pane", "retained-run-notice"),
+            {"event": "succession", "source": "tidy-clear", "harness": "claude",
+             "from": origin, "sid": target, "ts": 1})
+
     def setUp(self):
         super().setUp()
         self.sid = "fixture-owner-session"
@@ -5673,7 +5693,7 @@ class RetainedRunNoticeCarrierTest(_TmpRootMixin, unittest.TestCase):
 
     def _run_notice_duty(self, harness, duty, *, fail_ack=False, forget_binding=False,
                          target_state="idle", target_sid=None,
-                         queue_accept_only=False):
+                         queue_accept_only=False, duties=None):
         import dispatch_pending_delivery as pending_delivery
         target_sid = target_sid or self.sid
         target_ident = {**self.ident, "harness": harness, "session_id": target_sid}
@@ -5742,12 +5762,9 @@ class RetainedRunNoticeCarrierTest(_TmpRootMixin, unittest.TestCase):
                                   return_value=peer_steward._screen_lines(CLAUDE_SUGGESTION)), \
                 mock.patch.object(peer_steward, "_herdr_prompt", side_effect=native_receive), \
                 mock.patch.object(peer_steward.peer_message, "deliver_pending_codex",
-                                  side_effect=native_queue), \
-                mock.patch.object(peer_steward.peer_obligations,
-                    "_ordinary_notice_target",
-                    return_value=(harness, target_sid, self.sid)):
+                                  side_effect=native_queue):
             peer_steward._reconcile_obligations(
-                store, duties=peer_steward._runner_duties(store, [duty]))
+                store, duties=peer_steward._runner_duties(store, duties or [duty]))
         return store, sends
 
     def _resume_claude_message_duty(self, duty, store):
@@ -5884,12 +5901,40 @@ class RetainedRunNoticeCarrierTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(pending_delivery.read(
             self.tmp_root, self.sid, notice["delivery_id"])["state"], "sent-ambiguous")
 
+    def test_referenced_group_busy_retry_keeps_original_body_ref_and_receipts(self):
+        import session_notice
+        import dispatch_pending_delivery as pending
+        peer = peer_steward.peer_message
+        records = [session_notice.notify("claude", self.sid, key="long-checkpoint-" + str(index),
+            subject="experiment checkpoint", text="metric=0.5; " + "observed " * 60,
+            jobs=self.jobs_path) for index in range(8)]
+        store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        duties = store.list(kinds={"run-notice"})
+        with mock.patch.object(peer_steward, "_peer_reference_access_evidence", return_value={"fixture": True}), \
+             mock.patch.object(peer, "_reference_access_evidence_valid", return_value=True):
+            store, sends = self._run_notice_duty("claude", duties[0], duties=duties, target_state="working")
+        self.assertEqual(sends, [])
+        ref = store.get(duties[0]["id"])["observation"]["transfer_ref"]
+        transfer = peer._read_pending(ref)
+        self.assertIsNotNone(transfer.get("body_ref"))
+        original_payload = peer.read_peer_payload(ref)["body"]
+        self.assertEqual(original_payload.count("HEARTING_RECEIPT_V1 "), 8)
+        seal = peer._transfer_path(ref).read_bytes()
+        self._resume_claude_message_duty(store.get("message-" + ref), store)
+        self.assertEqual(peer._read_pending(ref)["state"], "received")
+        self.assertEqual(peer.read_peer_payload(ref)["body"], original_payload)
+        self.assertEqual(peer._transfer_path(ref).read_bytes(), seal)
+        self.assertEqual(len(list(peer._transfer_path(ref).parent.glob("*.json"))), 1)
+        self.assertTrue(all(pending.read(self.tmp_root, self.sid, record["delivery_id"])["state"] == "acked"
+                            for record in records))
+
     def test_parent_handover_refreshes_recipient_without_rekeying_notice(self):
         import dispatch_completion_join as join
         import dispatch_pending_delivery as pending_delivery
         import dispatch_seat_handover as handover
         import session_notice
         original_sid, successor_sid = "sid-parent-old", "sid-parent-new"
+        self.parent_row(original_sid)
         lineage = {"kind": "attempt-parent", "attempt_id": "att-owner",
                    "harness": "claude", "session_id": original_sid}
         with mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner",
@@ -5902,16 +5947,11 @@ class RetainedRunNoticeCarrierTest(_TmpRootMixin, unittest.TestCase):
         identity = {"jobs": str(self.jobs_path), "storage_recipient": original_sid,
                     "recipient_harness": "claude", "recipient_session_id": original_sid,
                     "lineage": lineage}
-        row = SimpleNamespace(status="running", metadata={
-            "parent_sid": original_sid, "parent_completion_delivery": "claude-parent-runtime"})
-        with mock.patch.object(join, "current_attempt_row", return_value=row), \
-                mock.patch.object(handover, "effective_parent",
-                                  side_effect=[original_sid, successor_sid]), \
-                mock.patch.object(handover, "effective_parent_harness", return_value="claude"):
-            first = peer_steward.peer_obligations._ordinary_notice_target(
-                identity, "claude-parent-runtime")
-            second = peer_steward.peer_obligations._ordinary_notice_target(
-                identity, "claude-parent-runtime")
+        first = peer_steward.peer_obligations._ordinary_notice_target(
+            identity, "claude-parent-runtime")
+        self.succession(original_sid, successor_sid)
+        second = peer_steward.peer_obligations._ordinary_notice_target(
+            identity, "claude-parent-runtime")
         before = pending_delivery.read(self.tmp_root, original_sid, notice["delivery_id"])
         frozen = pending_delivery.received_ack_identity(before, original_sid, notice["delivery_id"])
         after = pending_delivery.read(self.tmp_root, original_sid, notice["delivery_id"])
@@ -5926,6 +5966,8 @@ class RetainedRunNoticeCarrierTest(_TmpRootMixin, unittest.TestCase):
         import dispatch_pending_delivery as pending_delivery
         import session_notice
         original_sid, successor_sid = "sid-parent-old", "sid-parent-new"
+        self.parent_row(original_sid)
+        self.succession(original_sid, successor_sid)
         self.sid = original_sid
         self.ident = {**self.ident, "session_id": original_sid}
         lineage = {"kind": "attempt-parent", "attempt_id": "att-owner",
@@ -5989,13 +6031,13 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
 
         with mock.patch.object(peer_steward.peer_obligations,
                                "ensure_normal_runner", return_value=False):
-            blocked = session_notice.notify(
+            blocked = _legacy_notice(
                 "claude", "sid-a-storage", key="runner-blocked",
                 subject="blocked notice", text="keep original recipient key", jobs=self.jobs_path)
-            blocked_retry = session_notice.notify(
+            blocked_retry = _legacy_notice(
                 "claude", "sid-a-storage", key="runner-blocked",
                 subject="blocked notice", text="keep original recipient key", jobs=self.jobs_path)
-            later = session_notice.notify(
+            later = _legacy_notice(
                 "claude", "sid-z-storage", key="runner-later",
                 subject="later notice", text="deliver through fixture courier", jobs=self.jobs_path)
 
@@ -6030,9 +6072,9 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
                 # real runner take its existing replaced-root exit path next pass.
                 lock_path.unlink()
 
-        def recipient_for_storage(_record, storage_sid, *, harness, read_context=None):
-            return {"sid-a-storage": "sid-a-blocked",
-                    "sid-z-storage": "sid-z-live"}.get(storage_sid)
+        def recipient_for_storage(_record, storage_sid, *, harness, jobs=None, read_context=None):
+            return (harness, {"sid-a-storage": "sid-a-blocked",
+                    "sid-z-storage": "sid-z-live"}[storage_sid])
 
         with lock_path.open("w", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -6040,7 +6082,7 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
                                    return_value=["herdr", "agent", "list"]), \
                  mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
                      stdout=json.dumps(inventory), returncode=0)), \
-                 mock.patch("dispatch_seat_handover.record_recipient",
+                 mock.patch("dispatch_seat_handover.record_recipient_binding",
                             side_effect=recipient_for_storage), \
                  mock.patch.object(peer_steward, "_resolve_target",
                                    return_value=("claude", "sid-z-live", "fixture")), \
@@ -10759,10 +10801,35 @@ class RetireTerminalFollowupRegressionTest(_TmpRootMixin, unittest.TestCase):
         self.assertNotIn(duty["id"], {row["id"] for row in store.list()})
 
 
+def _legacy_notice(harness, sid, *, key, subject, text, jobs, route_id="route-free",
+                   required_action="read-notice"):
+    """Historical private notice tag and duty, as stored before the zero-attempt writer; no registry row."""
+    import hashlib
+    import dispatch_pending_delivery as pending
+    import session_notice
+    receipt = session_notice.validate({"schema_version": 1, "kind": "notice", "key": key,
+        "subject": subject, "text": " ".join(text.split())[:600], "required_action": required_action})
+    from harness_capabilities import parent_completion
+    delivery_id = "delivery-" + hashlib.sha256(f"notice\0{key}".encode()).hexdigest()
+    tag = "notice-" + delivery_id.removeprefix("delivery-")[:32]
+    root = Path(jobs).parent
+    record = pending.read(root, sid, delivery_id)
+    if record is None:
+        record = pending.create(root, recipient_kind=parent_completion(harness)["carrier"],
+            recipient_key=sid, delivery_id=delivery_id, session_generation="",
+            session_generation_supported="0", attempt_ids=[tag], parent_attempt_id=tag,
+            route_id=route_id, route_node="notice", receipt=receipt,
+            receipt_digest=session_notice.receipt_digest(receipt), row_revisions={tag: "notice"}, lineage=[])
+    import peer_obligations
+    # Historical retention failure leaves the original record for discovery.
+    peer_obligations.retain_session_notice(Path(jobs), harness, sid, record)
+    return record
+
+
 class SessionNoticeIntegrationCorrectionTest(_TmpRootMixin, unittest.TestCase):
     def notice(self, harness="claude", sid="A", key="correction"):
         import session_notice
-        return session_notice.notify(harness, sid, key=key, subject="integration notice",
+        return _legacy_notice(harness, sid, key=key, subject="integration notice",
                                      text="immutable completion", jobs=self.jobs_path)
 
     def edge(self, harness, origin, target):
