@@ -114,17 +114,18 @@ class RegistryRecord:
 class _RegistrySegment:
     """One append batch and the indexes for rows introduced by that batch."""
 
-    __slots__ = ("lines", "records", "malformed_rows", "completion_latest",
+    __slots__ = ("records", "malformed_lines", "malformed_rows", "completion_latest",
                  "completion_errors", "completion_all", "completion_children",
                  "completion_by_parent_sid",
                  "completion_by_route_alias", "settlement_owners",
+                 "observation_owners",
                  "handover_latest", "handover_by_parent", "handover_by_binding",
                  "headless_owner_rows", "selection_by_parent", "selection_by_slug",
                  "selection_by_attempt", "selection_by_parent_slug")
 
     def __init__(self, lines: tuple[str, ...], order_base: int):
-        self.lines = lines
         records = []
+        malformed_lines = []
         completion_latest = {}
         completion_errors = {}
         completion_all = {}
@@ -132,6 +133,7 @@ class _RegistrySegment:
         completion_by_parent_sid = {}
         completion_by_route_alias = {}
         settlement_owners = []
+        observation_owners = []
         handover_latest = {}
         selection_by_parent = {}
         selection_by_slug = {}
@@ -142,6 +144,7 @@ class _RegistrySegment:
             fields = tuple(line.split("\t"))
             if len(fields) != 6:
                 self.malformed_rows += 1
+                malformed_lines.append((order_base + relative_order, line))
                 continue
             record = RegistryRecord(order_base + relative_order, fields)
             records.append(record)
@@ -176,10 +179,13 @@ class _RegistrySegment:
                     and completion_meta.get("launch_started") == "1"
                     and completion_meta.get("supervisor_lease") == "flock-v1"):
                 settlement_owners.append(record)
+            if completion_meta.get("worker_type") == "owner":
+                observation_owners.append(record)
             handover_attempt = handover_meta.get("attempt_id")
             if handover_attempt:
                 handover_latest[handover_attempt] = (fields[1], record)
         self.records = tuple(records)
+        self.malformed_lines = tuple(malformed_lines)
         self.completion_latest = completion_latest
         self.completion_errors = completion_errors
         self.completion_all = {key: tuple(value) for key, value in completion_all.items()}
@@ -191,6 +197,7 @@ class _RegistrySegment:
             key: tuple(value) for key, value in completion_by_route_alias.items()
         }
         self.settlement_owners = tuple(settlement_owners)
+        self.observation_owners = tuple(observation_owners)
         self.handover_latest = handover_latest
         self.selection_by_parent = {key: tuple(value) for key, value in selection_by_parent.items()}
         self.selection_by_slug = {key: tuple(value) for key, value in selection_by_slug.items()}
@@ -222,12 +229,23 @@ class _RegistrySegment:
                 headless.append((status, record))
         self.headless_owner_rows = tuple(headless)
 
+    @property
+    def lines(self) -> tuple[str, ...]:
+        """Rebuild compatibility lines on demand without retaining duplicate rows."""
+        malformed = dict(self.malformed_lines)
+        records = {record.order: record for record in self.records}
+        if not records and not malformed:
+            return ()
+        first, last = min((*records, *malformed)), max((*records, *malformed))
+        return tuple(records[order].raw if order in records else malformed[order]
+                     for order in range(first, last + 1))
+
     @classmethod
     def compact(cls, segments: tuple["_RegistrySegment", ...]):
         """Merge index deltas without reparsing their registry rows."""
         result = cls.__new__(cls)
-        result.lines = tuple(line for segment in segments for line in segment.lines)
         result.records = tuple(record for segment in segments for record in segment.records)
+        result.malformed_lines = tuple(line for segment in segments for line in segment.malformed_lines)
         result.malformed_rows = sum(segment.malformed_rows for segment in segments)
         result.completion_latest = {}
         result.completion_errors = {}
@@ -269,6 +287,8 @@ class _RegistrySegment:
         }
         result.settlement_owners = tuple(record for segment in segments
                                         for record in segment.settlement_owners)
+        result.observation_owners = tuple(record for segment in segments
+                                          for record in segment.observation_owners)
         result.selection_by_parent = {key: tuple(value) for key, value in selection_by_parent.items()}
         result.selection_by_slug = {key: tuple(value) for key, value in selection_by_slug.items()}
         result.selection_by_attempt = {key: tuple(value) for key, value in selection_by_attempt.items()}
@@ -282,7 +302,7 @@ class _RegistrySegment:
 class RegistryView:
     """Immutable segmented registry view with incremental append indexes."""
 
-    __slots__ = ("path_identity", "resolved_path", "signature", "_raw", "_fd", "_segments", "_tail",
+    __slots__ = ("path_identity", "resolved_path", "signature", "_fd", "_segments", "_tail",
                  "line_count", "record_count", "malformed_rows", "has_partial_tail",
                  "last_observed_at", "_has_duplicate_attempts", "_invalid_utf8_prefix",
                  "has_invalid_utf8", "_raw_digest", "_prefix_reuse_eligible",
@@ -293,7 +313,6 @@ class RegistryView:
         self.path_identity = path_identity
         self.resolved_path = resolved_path
         self.signature = signature
-        self._raw = raw if previous is None else previous._raw + raw
         self._fd = fd
         self._append_only_generation = previous is not None
         self.last_observed_at = time.monotonic()
@@ -460,6 +479,21 @@ class RegistryView:
 
     def settlement_owner_candidates(self):
         return tuple(record for segment in self._segments for record in segment.settlement_owners)
+
+    def answer_wait_owner_candidates(self):
+        """All owner rows for observational wait projection (no lease filter)."""
+        return tuple(record for segment in self._segments for record in segment.observation_owners)
+
+    def route_alias_candidates(self, *aliases):
+        """Return every row matching aliases; callers must validate full route identity."""
+        selected = {}
+        for segment in self._segments:
+            selected_aliases = aliases or tuple(segment.completion_by_route_alias)
+            for alias in selected_aliases:
+                if alias:
+                    for record in segment.completion_by_route_alias.get(alias, ()):
+                        selected[record.order] = record
+        return tuple(selected[key] for key in sorted(selected))
 
     def records_since(self, order: int):
         """Return records in appended segments after an observed row cursor."""
@@ -822,7 +856,8 @@ def _observe_generation(path: Path) -> tuple[RegistryView, tuple[str, ...]]:
                 and cached.signature[:2] == signature[:2]
                 and signature[2] > cached.signature[2]
                 and len(raw) == signature[2]
-                and raw[:cached.signature[2]] == cached._raw
+                and hashlib.sha256(memoryview(raw)[:cached.signature[2]]).digest()
+                    == cached._raw_digest.digest()
                 and not any(separator in raw for separator in _NON_CANONICAL_LINE_SEPARATORS)
                 and not _utf8_status(raw)[0]
             )
@@ -885,7 +920,7 @@ def registry_snapshot(jobs: Path) -> RegistrySnapshot:
         reason = "registry-partial-tail"
     elif view.malformed_rows:
         reason = "registry-malformed"
-    elif tuple(lines) != view.lines:
+    elif not view._prefix_reuse_eligible:
         # The segmented view indexes LF records. Non-canonical splitlines
         # separators remain readable for diagnostics but cannot prove absence.
         reason = "registry-line-boundary-invalid"
@@ -989,7 +1024,7 @@ def _drop(identity: str) -> "RegistryView | None":
     global _CACHE_BYTES
     removed = _CACHE.pop(identity, None)
     if removed is not None:
-        _CACHE_BYTES -= len(removed._raw)
+        _CACHE_BYTES -= removed.signature[2]
         _close_view_fd(removed)
     return removed
 
@@ -997,14 +1032,14 @@ def _drop(identity: str) -> "RegistryView | None":
 def _remember(identity: str, view: RegistryView) -> None:
     """Cache one generation within the existing bounds; the caller holds ``_LOCK``."""
     global _CACHE_BYTES
-    if len(view._raw) <= _CACHE_MAX_BYTES:
+    if view.signature[2] <= _CACHE_MAX_BYTES:
         _CACHE[identity] = view
-        _CACHE_BYTES += len(view._raw)
+        _CACHE_BYTES += view.signature[2]
     else:
         _close_view_fd(view)
     while (len(_CACHE) > _CACHE_MAX_PATHS or _CACHE_BYTES > _CACHE_MAX_BYTES):
         _evicted_identity, evicted = _CACHE.popitem(last=False)
-        _CACHE_BYTES -= len(evicted._raw)
+        _CACHE_BYTES -= evicted.signature[2]
         _close_view_fd(evicted)
         _METRICS["cache_evictions"] += 1
 
