@@ -9504,6 +9504,20 @@ class EnvironmentAttemptDefaultTest(unittest.TestCase):
     self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence),
      "--check","--output",str(self.base/"out.json")],env)
 
+ def test_resource_check_is_not_applicable_without_jobs_or_attempt_and_shows_start_path(self):
+  t=TestRoute()
+  route=R.compile_route(**t.args(capability="autopilot-lab",capability_mode="setup",
+   artifact_root=self.base/"artifacts",requested_intensity="auto",predicates=[],signals=["resource-run"],
+   transport="headless",inline_reason=None,dispatch_evidence=t.dispatch(t.nested())))
+  node=next(n for n in route["nodes"] if n.get("kind")=="resource-runner")
+  path=Path(route["artifact_root"])/".runtime"/"routes"/(route["route_id"]+".json")
+  path.parent.mkdir(parents=True); path.write_text(json.dumps(route))
+  evidence=self.base/"artifacts"/"read-only.md"; evidence.write_text("none\n")
+  result,=self._main(["complete","--route",str(path),"--node",node["id"],
+   "--evidence",str(evidence),"--check"],{})
+  self.assertEqual(result["result"],"not-applicable")
+  self.assertIn("--compute-run <run-id>",result["next_action"])
+
 class ShipPackageOwnerCompletionTest(OwnerRegisteredCompletionTest):
  """The standard package owner uses existing registered completion and closure."""
  def fixture(self, **overrides):

@@ -145,6 +145,8 @@ def write(armed, row, *, preserve=False):
         "run_id", "pid", "starttime", "command_hash", "pid_namespace", "process_group",
         "command", "cwd", "log", "sentinel", "status", "exit_code", "started_at", "ended_at",
         "failure_class", "parent_attempt_id", "config_ref", "config_sha256", "source_commit")}
+    if "execution" in row:
+        facts["execution"] = row["execution"]
     facts.update(route_id=armed["route_id"], route_hash=armed.get("route_hash"),
                  node=armed["node"], declared_outputs=receipt["expected_outputs"])
     prior = namespace["runs"].get(row["run_id"])

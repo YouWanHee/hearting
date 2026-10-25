@@ -970,6 +970,14 @@ or unobservable recorded process group remains pending; exact prior-boot
 evidence or a complete empty-group observation can establish execution end.
 Exact inspection reads the worker's result; requesting more failure detail is
 optional and cannot become a second completion gate.
+
+On the same OPEN route, the current owner may start a new supervised resource
+retry with `resource-runner start --compute-run <run-id>` after a completed
+`compute-hosts` execution. Before creating the retry row, the runtime checks
+the sealed command, inputs and provenance, exit evidence, output receipts, and
+fresh remote process-group quiescence; it preserves the prior failure row and
+sentinel. The owner's normal start admits verification separately; compute
+exit is execution evidence only.
 The runtime acknowledges a delivered notification after its receiving turn
 finishes. Claude PostToolUse events with a nonempty `agent_id` belong to a
 subagent or teammate even when `session_id` names the parent conversation; they

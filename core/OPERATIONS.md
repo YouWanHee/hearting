@@ -1958,6 +1958,14 @@ its shared path still names the unmodified mount. Keep the mapping as an
 unquoted YAML block mapping; inline maps are not supported by the inventory
 parser.
 
+When an already completed `compute-hosts` run is offered to a supervised
+resource node, `resource-runner start --compute-run <run-id>` validates the
+same route and sealed resource contract, its durable wrapper receipt, exit and
+declared outputs, then rechecks the remote process group. The run id alone is
+not completion evidence. A successful handoff creates a new same-node retry
+while retaining the original row and history; the route owner's ordinary
+successor start remains responsible for verification admission.
+
 `claim <host> <pid> [--harness <runtime> --session <id>]` (default: the calling
 session, when it is one unique harness session) is the narrow bridge for
 an already detached `nohup`/`setsid` process whose runtime ancestor and session

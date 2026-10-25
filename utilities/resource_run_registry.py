@@ -297,6 +297,16 @@ def classify_identity(run: dict, identity_reader=proc_identity) -> tuple[str, di
     """Return working/reaping/exited/stale without trusting registry status."""
     if not isinstance(run, dict):
         return "stale", None, "recorded-identity-incomplete"
+    execution = run.get("execution")
+    if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+        # Shared classification is used by surveys and writer-lock callbacks:
+        # it may consume only the recorded receipt and must never probe SSH.
+        # A recorded finished receipt is deliberately stale here; terminal
+        # authority requires the explicit fresh observer at its decision point.
+        receipt_state = execution.get("receipt_state")
+        if receipt_state == "running" and run.get("status") == "running":
+            return "working", None, "compute-hosts-recorded-running"
+        return "stale", None, "compute-hosts-recorded-state-non-authoritative"
     if (not any(run.get(key) is not None for key in IDENTITY_KEYS)
             and resource_never_started(run)):
         return "exited", None, "launcher-recorded-not-started"
@@ -356,6 +366,10 @@ def resource_never_started(run: dict) -> bool:
 
 def resource_process_group_quiescent(run: dict) -> bool:
     """Prove a supervised resource's private process group has no live payloads."""
+    execution = run.get("execution") if isinstance(run, dict) else None
+    if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+        observed = compute_execution_observation(run)
+        return observed.get("state") == "quiescent"
     if resource_never_started(run):
         return True
     # Older resource rows did not record namespace/process-group bindings.
@@ -398,6 +412,45 @@ def resource_process_group_quiescent(run: dict) -> bool:
         return True
     except (OSError, KeyError, TypeError, ValueError):
         return False
+
+
+def compute_execution_identity(run: dict) -> str | None:
+    """Return the stable compute identity only with a complete output receipt.
+
+    ``outputs_sha256`` is required evidence, but remains outside the persisted
+    identity string so existing adopted rows and completion markers keep their
+    identity. Replay compares this digest separately before reusing that row.
+    """
+    execution = run.get("execution") if isinstance(run, dict) else None
+    if not isinstance(execution, dict) or execution.get("kind") != "compute-hosts":
+        return None
+    required = ("run_id", "meta_sha256", "exit_sha256", "receipt_sha256",
+                "outputs_sha256", "contract_sha256")
+    if not all(isinstance(execution.get(key), str) and execution[key] for key in required):
+        return None
+    identity_fields = ("run_id", "meta_sha256", "exit_sha256", "receipt_sha256", "contract_sha256")
+    return "compute-hosts:" + ":".join(str(execution[key]) for key in identity_fields)
+
+
+def compute_execution_observation(run: dict) -> dict:
+    """Re-read shared run evidence and make a fresh remote group observation."""
+    execution = run.get("execution") if isinstance(run, dict) else None
+    if not isinstance(execution, dict) or execution.get("kind") != "compute-hosts":
+        return {"state": "unknown", "reason": "compute-run-execution-missing"}
+    try:
+        import importlib.util
+        module_path = Path(__file__).with_name("compute-hosts.py")
+        spec = importlib.util.spec_from_file_location("resource_compute_hosts", module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError("compute-hosts loader unavailable")
+        compute = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(compute)
+        config = compute.load_config()
+        if str(Path(config["run_root"]).resolve(strict=True)) != str(Path(execution["run_root"]).resolve(strict=True)):
+            return {"state": "unknown", "reason": "compute-run-root-changed"}
+        return compute.observe_run_quiescence(config, execution["run_id"], expected=execution)
+    except (OSError, ValueError, KeyError, TypeError, ImportError, AttributeError) as exc:
+        return {"state": "unknown", "reason": "compute-run-observation-unavailable:" + type(exc).__name__}
 
 
 def is_alive(run: dict, identity_reader=proc_identity) -> bool:
@@ -585,7 +638,16 @@ def _start_epoch(run: dict) -> float | None:
 def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_identity,
                   now=None) -> dict:
     now = time.time() if now is None else float(now)
-    liveness, current, reason = classify_identity(run, identity_reader=identity_reader)
+    execution = run.get("execution") if isinstance(run, dict) else None
+    if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+        # Status display consumes the already-recorded remote receipt. Authority
+        # decisions use the explicit fresh observer and never probe local /proc.
+        receipt_state = execution.get("receipt_state")
+        liveness = "working" if receipt_state == "running" else (
+            "exited" if receipt_state == "finished" else "stale")
+        current, reason = None, "compute-hosts-recorded-receipt"
+    else:
+        liveness, current, reason = classify_identity(run, identity_reader=identity_reader)
     cwd = run.get("cwd") if isinstance(run.get("cwd"), str) else ""
     log_path = run.get("log") or run.get("log_path")
     log_updated_at = None
@@ -622,6 +684,9 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         "pid": run.get("pid"), "starttime": run.get("starttime"),
         "command_hash": run.get("command_hash"), "process_group": run.get("process_group"),
         "pid_namespace": run.get("pid_namespace"),
+        "execution": execution,
+        "compute_run_id": execution.get("run_id") if isinstance(execution, dict) else None,
+        "compute_host": execution.get("host") if isinstance(execution, dict) else None,
         "command": (run["command"] if isinstance(run.get("command"), list)
                     and all(isinstance(arg, str) for arg in run["command"]) else None),
         "registry_status": run.get("status"), "registry_path": str(registry),
