@@ -248,7 +248,9 @@ class MetricSourcesTest(unittest.TestCase):
         (wrong / "bundle" / "admission.json").write_text(
             '{"admitted":false,"snapshot":{"t":10}}')
         result = metrics.read_admission_sources([wrong], run_id="target", now=20)
-        self.assertEqual((result["coverage"], result["latest"]), ("unknown", None))
+        self.assertEqual(result["coverage"], "unknown")
+        self.assertEqual(result["latest"]["state"], "unknown")
+        self.assertEqual([sample["state"] for sample in result["samples"]], ["unknown"])
 
         ambiguous = self.root / "ambiguous"
         (ambiguous / "bundle").mkdir(parents=True)
@@ -257,7 +259,9 @@ class MetricSourcesTest(unittest.TestCase):
         (ambiguous / "bundle" / "admission.json").write_text(
             '{"admitted":false,"snapshot":{"t":10}}')
         result = metrics.read_admission_sources([ambiguous], run_id="target", now=20)
-        self.assertEqual((result["coverage"], result["latest"]), ("unknown", None))
+        self.assertEqual(result["coverage"], "unknown")
+        self.assertEqual(result["latest"]["state"], "unknown")
+        self.assertEqual([sample["state"] for sample in result["samples"]], ["unknown"])
 
         foreign_row = self.root / "foreign-row"
         (foreign_row / "bundle").mkdir(parents=True)
@@ -299,16 +303,30 @@ class MetricSourcesTest(unittest.TestCase):
                 "admitted": False, "snapshot": {"t": stamp}}))
         cursor = None
         original_scandir = os.scandir
+        pass_yields = [0]
 
         class OrderedScandir:
-            def __init__(self, entries):
+            def __init__(self, entries, counter):
                 self.entries = entries
+                self.counter = counter
+                self.index = 0
 
             def __enter__(self):
-                return iter(self.entries)
+                return self
 
             def __exit__(self, *_exc):
                 return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.index >= len(self.entries):
+                    raise StopIteration
+                entry = self.entries[self.index]
+                self.index += 1
+                self.counter[0] += 1
+                return entry
 
         for reverse_roots in (False, True):
             for reverse_records in (False, True):
@@ -320,17 +338,19 @@ class MetricSourcesTest(unittest.TestCase):
                     reverse = ((path == root and reverse_roots)
                                or (path.parent == root and reverse_records))
                     entries.sort(key=lambda entry: entry.name, reverse=reverse)
-                    return OrderedScandir(entries)
+                    return OrderedScandir(entries, pass_yields)
                 with self.subTest(reverse_roots=reverse_roots,
                                   reverse_records=reverse_records), \
                         mock.patch.object(metrics, "MAX_ADMISSION_ENTRIES", 3), \
                         mock.patch.object(metrics.os, "scandir", ordered_scandir):
                     for _ in range(4):
+                        pass_yields[0] = 0
                         result = metrics.read_admission_sources([root], run_id="target",
                             started_at=0, now=30, cursor=cursor)
                         cursor = result["cursor"]
                         for sample in result["samples"]:
                             samples[sample["at"]] = sample
+                        self.assertEqual(result["entries"], pass_yields[0])
                         self.assertLessEqual(result["entries"], 3)
                     self.assertEqual(set(samples), {10.0, 20.0})
 
@@ -342,11 +362,13 @@ class MetricSourcesTest(unittest.TestCase):
             '{"run_id":"target","started_at":0}')
         (bundle / "02-decision.json").write_text(
             '{"admitted":false,"snapshot":{"t":10}}')
-        with mock.patch.object(metrics, "MAX_ADMISSION_ENTRIES", 2):
+        with mock.patch.object(metrics, "MAX_ADMISSION_ENTRIES", 4), \
+                mock.patch.object(metrics, "MAX_ADMISSION_BYTES_PER_PASS", 45):
             partial = metrics.read_admission_sources([root], run_id="target",
                 started_at=0, now=20)
             self.assertEqual(partial["coverage"], "partial")
             self.assertEqual(partial["samples"], [])
+            self.assertTrue(partial["cursor"]["scan"][str(root)]["last_file"])
 
             stale = root / "bundle-old"
             bundle.rename(stale)
@@ -357,9 +379,153 @@ class MetricSourcesTest(unittest.TestCase):
                 '{"admitted":false,"snapshot":{"t":15}}')
             changed = metrics.read_admission_sources([root], run_id="target",
                 started_at=0, now=20, cursor=partial["cursor"])
+            resolved = metrics.read_admission_sources([root], run_id="target",
+                started_at=0, now=20, cursor=changed["cursor"])
+            final = metrics.read_admission_sources([root], run_id="target",
+                started_at=0, now=20, cursor=resolved["cursor"])
         self.assertEqual(changed["samples"], [])
-        self.assertIsNone(changed["latest"])
         self.assertIn("admission-bundle-generation-changed", changed["warnings"])
+        self.assertEqual(resolved["samples"], [])
+        self.assertEqual([sample["state"] for sample in final["samples"]], ["unknown"])
+        self.assertEqual(final["latest"]["state"], "unknown")
+
+    def test_admission_reader_keeps_binding_when_record_and_decision_are_on_separate_pages(self):
+        root = self.root / "split-binding-pages"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        for run_first in (True, False):
+            for path in bundle.iterdir():
+                path.unlink()
+            names = (("01-run.json", "02-decision.json") if run_first
+                     else ("02-run.json", "01-decision.json"))
+            (bundle / names[0]).write_text('{"run_id":"target","started_at":0}')
+            (bundle / names[1]).write_text(
+                '{"admitted":false,"snapshot":{"t":10}}')
+            with self.subTest(run_first=run_first), \
+                    mock.patch.object(metrics, "MAX_ADMISSION_ENTRIES", 4), \
+                    mock.patch.object(metrics, "MAX_ADMISSION_BYTES_PER_PASS", 45):
+                first = metrics.read_admission_sources([root], run_id="target",
+                    started_at=0, now=20)
+                self.assertEqual(first["coverage"], "partial")
+                self.assertEqual(first["samples"], [])
+                expected_first = min(names)
+                self.assertEqual(first["cursor"]["scan"][str(root)]["last_file"],
+                                 expected_first)
+                second = metrics.read_admission_sources([root], run_id="target",
+                    started_at=0, now=20, cursor=first["cursor"])
+                self.assertEqual([sample["state"] for sample in second["samples"]],
+                                 ["denied"])
+                self.assertEqual(second["latest"]["state"], "denied")
+
+    def test_admission_reader_invalidates_replaced_foreign_binding_file(self):
+        root = self.root / "replaced-binding-file"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        binding = bundle / "01-run.json"
+        binding.write_text('{"run_id":"target","started_at":0}')
+        (bundle / "02-decision.json").write_text(
+            '{"admitted":false,"snapshot":{"t":10}}')
+        with mock.patch.object(metrics, "MAX_ADMISSION_ENTRIES", 4), \
+                mock.patch.object(metrics, "MAX_ADMISSION_BYTES_PER_PASS", 45):
+            partial = metrics.read_admission_sources([root], run_id="target",
+                started_at=0, now=20)
+            binding.write_text('{"run_id":"foreign","started_at":0}')
+            changed = metrics.read_admission_sources([root], run_id="target",
+                started_at=0, now=20, cursor=partial["cursor"])
+            resolved = metrics.read_admission_sources([root], run_id="target",
+                started_at=0, now=20, cursor=changed["cursor"])
+        self.assertIn("admission-bundle-generation-changed", changed["warnings"])
+        self.assertEqual(changed["samples"], [])
+        self.assertEqual([sample["state"] for sample in resolved["samples"]], ["unknown"])
+        self.assertEqual(resolved["latest"]["state"], "unknown")
+
+    def test_admission_reader_bounds_cross_page_binding_and_decision_summary(self):
+        root = self.root / "bounded-binding-summary"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "01-run.json").write_text(
+            '{"run_id":"target","started_at":0}')
+        for index in range(8):
+            (bundle / f"{index + 2:02d}-decision.json").write_text(json.dumps({
+                "admitted": False, "snapshot": {"t": 10 + index}}))
+        with mock.patch.object(metrics, "MAX_ADMISSION_PENDING_DECISIONS", 1):
+            result = metrics.read_admission_sources([root], run_id="target",
+                started_at=0, now=30)
+        self.assertEqual(result["coverage"], "partial")
+        self.assertIn("admission-binding-summary-limit", result["warnings"])
+        self.assertLessEqual(len(result["samples"]), 1)
+        self.assertTrue(all(sample["state"] == "unknown" for sample in result["samples"]))
+        self.assertEqual(result["latest"]["state"], "unknown")
+
+    def test_admission_oversized_root_and_child_lists_stop_without_rescanning_prefix(self):
+        original_scandir = os.scandir
+
+        class CountingScandir:
+            def __init__(self, entries, counter):
+                self.entries = entries
+                self.counter = counter
+                self.index = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.index >= len(self.entries):
+                    raise StopIteration
+                entry = self.entries[self.index]
+                self.index += 1
+                self.counter[0] += 1
+                return entry
+
+        for listing_kind in ("root", "child"):
+            for reverse in (False, True):
+                root = self.root / f"oversized-{listing_kind}-{reverse}"
+                if listing_kind == "root":
+                    scan_path = root
+                    root.mkdir()
+                    for index in range(5):
+                        (root / f"entry-{index}.json").write_text("{}")
+                else:
+                    bundle = root / "bundle"
+                    bundle.mkdir(parents=True)
+                    scan_path = bundle
+                    for index in range(5):
+                        (bundle / f"entry-{index}.json").write_text("{}")
+                calls = {}
+                yielded = [0]
+
+                def ordered_scandir(path):
+                    path = Path(path)
+                    calls[str(path)] = calls.get(str(path), 0) + 1
+                    entries = list(original_scandir(path))
+                    entries.sort(key=lambda entry: entry.name, reverse=reverse)
+                    return CountingScandir(entries, yielded)
+
+                cursor = None
+                results = []
+                with self.subTest(listing_kind=listing_kind, reverse=reverse), \
+                        mock.patch.object(metrics, "MAX_ADMISSION_ENTRIES", 3), \
+                        mock.patch.object(metrics.os, "scandir", ordered_scandir):
+                    for _ in range(4):
+                        yielded[0] = 0
+                        result = metrics.read_admission_sources([root], run_id="target",
+                            now=20, cursor=cursor)
+                        cursor = result["cursor"]
+                        results.append(result)
+                        self.assertEqual(result["entries"], yielded[0])
+                        self.assertLessEqual(yielded[0], 3)
+
+                expected_warning = ("admission-root-listing-limit"
+                    if listing_kind == "root" else "admission-bundle-listing-limit")
+                self.assertTrue(any(expected_warning in item["warnings"] for item in results))
+                self.assertEqual(results[-1]["coverage"], "partial")
+                self.assertEqual(calls.get(str(scan_path)), 1)
 
     def test_admission_reader_keeps_backward_time_unknown_until_new_valid_sample(self):
         root = self.root / "time-order"
@@ -430,7 +596,7 @@ class MetricSourcesTest(unittest.TestCase):
         damaged = metrics.read_admission_sources([root], run_id="target",
             started_at=0, now=112, cursor=valid["cursor"])
         self.assertEqual(damaged["coverage"], "partial")
-        self.assertIsNone(damaged["latest"])
+        self.assertEqual(damaged["latest"]["state"], "unknown")
         self.assertTrue(any("symlink" in warning for warning in damaged["warnings"]))
         self.assertTrue(any("unbounded" in warning for warning in damaged["warnings"]))
 

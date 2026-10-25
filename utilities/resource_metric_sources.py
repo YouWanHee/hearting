@@ -26,6 +26,10 @@ MAX_ADMISSION_RECORD_BYTES = 64 * 1024
 MAX_ADMISSION_ENTRIES = 4096
 ADMISSION_TIME_BUDGET_SECONDS = 0.250
 MAX_ADMISSION_SAMPLE_IDS = 4096
+MAX_ADMISSION_CACHED_ENTRIES = 8192
+MAX_ADMISSION_SOURCE_FILES = 128
+MAX_ADMISSION_PENDING_DECISIONS = 256
+MAX_ADMISSION_PENDING_BYTES = 128 * 1024
 _EPOCH_FILE = re.compile(r"^(valid|train)-epoch-(\d{4,})\.json$")
 _VALID_NUMBER = (int, float)
 
@@ -823,6 +827,11 @@ def _admission_root(path):
     return absolute, info
 
 
+def _admission_stat_token(info):
+    return ":".join(str(getattr(info, key)) for key in
+        ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"))
+
+
 def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                            started_at=None, now=None, cursor=None,
                            monotonic=None, time_budget=ADMISSION_TIME_BUDGET_SECONDS):
@@ -847,7 +856,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
     entry_count = byte_count = 0
     partial = exhausted = False
     sample_ids = ([item for item in prior.get("sample_ids", []) if isinstance(item, str)]
-                  if prior.get("schema_version") == 2
+                  if prior.get("schema_version") in {2, 3}
                   and isinstance(prior.get("sample_ids"), list) else [])
     sample_ids = sample_ids[-MAX_ADMISSION_SAMPLE_IDS:]
     seen_ids = set(sample_ids)
@@ -866,7 +875,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
             continue
         generation = f"{info.st_dev}:{info.st_ino}"
         roots_out.append({"path": str(root), "generation": generation})
-        root_rows.append((root, generation))
+        root_rows.append((root, generation, _admission_stat_token(info)))
 
     previous_roots = prior.get("root_generations")
     previous_roots = previous_roots if isinstance(previous_roots, dict) else {}
@@ -883,22 +892,140 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
     new_valid_times = []
     new_invalid_timestamp = False
 
+    def new_binding_state(bundle_key, bundle_identity):
+        return {"bundle": bundle_key, "identity": bundle_identity,
+                "target_seen": False, "foreign_seen": False,
+                "generation_fields": [], "source_files": {},
+                "binding_sources": {},
+                "decisions": {}, "partial": False, "overflow": False}
+
+    def binding_summary_size(state):
+        summary = {"fields": state["generation_fields"],
+                   "files": state["source_files"],
+                   "binding_files": state["binding_sources"],
+                   "decisions": state["decisions"]}
+        try:
+            return len(json.dumps(summary, sort_keys=True, separators=(",", ":"),
+                                  ensure_ascii=False, allow_nan=False).encode("utf-8"))
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return MAX_ADMISSION_PENDING_BYTES + 1
+
+    def overflow_binding_summary(state):
+        state["overflow"] = True
+        state["partial"] = True
+
+    def add_binding_document(state, document, file_name, file_token):
+        if state.get("overflow") is True:
+            return
+        objects = list(_admission_objects(document))
+        run_ids = {obj.get("run_id") for obj in objects
+                   if isinstance(obj.get("run_id"), str)}
+        if run_ids:
+            state["target_seen"] = state.get("target_seen") is True or run_id in run_ids
+            state["foreign_seen"] = (state.get("foreign_seen") is True
+                or any(value != run_id for value in run_ids))
+            fields = [{key: obj.get(key) for key in
+                ("run_id", "started_at", "pid", "starttime", "command_hash",
+                 "config_sha256", "row_id", "row_key") if key in obj}
+                for obj in objects if obj.get("run_id") == run_id]
+            known_fields = {json.dumps(item, sort_keys=True, separators=(",", ":"),
+                                      ensure_ascii=False, default=str)
+                            for item in state["generation_fields"]}
+            for item in fields:
+                encoded = json.dumps(item, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False, default=str)
+                if encoded not in known_fields:
+                    if len(state["generation_fields"]) >= MAX_ADMISSION_SOURCE_FILES:
+                        overflow_binding_summary(state)
+                        return
+                    state["generation_fields"].append(item)
+                    known_fields.add(encoded)
+                    if binding_summary_size(state) > MAX_ADMISSION_PENDING_BYTES:
+                        state["generation_fields"].pop()
+                        overflow_binding_summary(state)
+                        return
+            if file_name not in state["binding_sources"] \
+                    and len(state["binding_sources"]) >= MAX_ADMISSION_SOURCE_FILES:
+                overflow_binding_summary(state)
+                return
+            previous_binding = state["binding_sources"].get(file_name)
+            state["binding_sources"][file_name] = file_token
+            if binding_summary_size(state) > MAX_ADMISSION_PENDING_BYTES:
+                if previous_binding is None:
+                    state["binding_sources"].pop(file_name, None)
+                else:
+                    state["binding_sources"][file_name] = previous_binding
+                overflow_binding_summary(state)
+                return
+            if file_name not in state["source_files"] \
+                    and len(state["source_files"]) >= MAX_ADMISSION_SOURCE_FILES:
+                if previous_binding is None:
+                    state["binding_sources"].pop(file_name, None)
+                else:
+                    state["binding_sources"][file_name] = previous_binding
+                overflow_binding_summary(state)
+                return
+            previous_source = state["source_files"].get(file_name)
+            state["source_files"][file_name] = file_token
+            if binding_summary_size(state) > MAX_ADMISSION_PENDING_BYTES:
+                if previous_source is None:
+                    state["source_files"].pop(file_name, None)
+                else:
+                    state["source_files"][file_name] = previous_source
+                if previous_binding is None:
+                    state["binding_sources"].pop(file_name, None)
+                else:
+                    state["binding_sources"][file_name] = previous_binding
+                overflow_binding_summary(state)
+                return
+        decisions = _admission_decisions([document])
+        if decisions:
+            if file_name not in state["source_files"] \
+                    and len(state["source_files"]) >= MAX_ADMISSION_SOURCE_FILES:
+                overflow_binding_summary(state)
+                return
+            previous_source = state["source_files"].get(file_name)
+            state["source_files"][file_name] = file_token
+            if binding_summary_size(state) > MAX_ADMISSION_PENDING_BYTES:
+                if previous_source is None:
+                    state["source_files"].pop(file_name, None)
+                else:
+                    state["source_files"][file_name] = previous_source
+                overflow_binding_summary(state)
+                return
+            for sample, row_ids in decisions:
+                previous = state["decisions"].get(sample["sample_id"])
+                if previous is None and len(state["decisions"]) >= MAX_ADMISSION_PENDING_DECISIONS:
+                    overflow_binding_summary(state)
+                    return
+                state["decisions"][sample["sample_id"]] = {
+                    "sample": sample, "row_ids": sorted(row_ids)}
+                if binding_summary_size(state) > MAX_ADMISSION_PENDING_BYTES:
+                    if previous is None:
+                        state["decisions"].pop(sample["sample_id"], None)
+                    else:
+                        state["decisions"][sample["sample_id"]] = previous
+                    overflow_binding_summary(state)
+                    return
+
     registry_abs = Path(os.path.abspath(registry_path)) if registry_path else None
-    scan_state = dict(prior.get("scan", {})) if isinstance(prior.get("scan"), dict) else {}
+    scan_state = (dict(prior.get("scan", {}))
+                  if prior.get("schema_version") == 3
+                  and isinstance(prior.get("scan"), dict) else {})
     if root_generation_changed:
         # A cursor position and dedup inventory belong to the source root that
         # produced them. Do not carry either into a replacement root.
         scan_state = {}
         sample_ids = []
         seen_ids = set()
-    for root, root_generation in root_rows:
+    for root, root_generation, root_listing_generation in root_rows:
         if monotonic() >= deadline or entry_count >= MAX_ADMISSION_ENTRIES \
                 or byte_count >= MAX_ADMISSION_BYTES_PER_PASS:
             partial = exhausted = True
             break
         root_key = str(root)
         root_state = scan_state.get(root_key, {})
-        root_state = root_state if isinstance(root_state, dict) else {}
+        root_state = dict(root_state) if isinstance(root_state, dict) else {}
         last_bundle = root_state.get("last_bundle") if isinstance(root_state.get("last_bundle"), str) else ""
         last_root_entry = root_state.get("last_root_entry") \
             if isinstance(root_state.get("last_root_entry"), str) else ""
@@ -907,42 +1034,137 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
         try:
             root_entry_limit = max(1, min(MAX_ADMISSION_ENTRIES // 2,
                                           MAX_ADMISSION_ENTRIES - 1))
-            root_listing_partial = False
-            def collect_root_entries():
-                nonlocal root_listing_partial, exhausted, partial
+            root_listing = root_state.get("root_listing")
+            if isinstance(root_listing, dict) \
+                    and root_listing.get("generation") != root_listing_generation:
+                active_state = root_state.get("active_bundle")
+                if isinstance(active_state, dict):
+                    try:
+                        active_info = (root / active_state.get("key", "")).lstat()
+                        active_identity = f"{active_info.st_dev}:{active_info.st_ino}"
+                    except (OSError, TypeError):
+                        active_identity = ""
+                    if active_identity != active_state.get("identity"):
+                        warnings.append("admission-bundle-generation-changed")
+                    else:
+                        warnings.append("admission-root-generation-changed")
+                else:
+                    warnings.append("admission-root-generation-changed")
+                uncertainty_reason = uncertainty_reason or "generation-changed"
+                prior_latest_at = None
+                root_state = {"last_bundle": ""}
+                root_listing = None
+                last_bundle = last_root_entry = last_file = ""
+            if root_state.get("root_blocked_generation") == root_listing_generation:
+                warnings.append("admission-root-listing-limit")
+                partial = True
+                scan_state[root_key] = root_state
+                continue
+            if root_state.get("root_blocked_generation"):
+                root_state.pop("root_blocked_generation", None)
+            if not (isinstance(root_listing, dict)
+                    and root_listing.get("generation") == root_listing_generation
+                    and isinstance(root_listing.get("entries"), list)):
+                # Cache complete bounded listings. A capped raw prefix cannot
+                # resume safely, so remember that generation as partial.
+                if MAX_ADMISSION_ENTRIES - entry_count < min(3, MAX_ADMISSION_ENTRIES):
+                    partial = exhausted = True
+                    scan_state[root_key] = root_state
+                    break
                 collected = []
-                scanned = 0
-                with os.scandir(root) as listing:
-                    for entry in listing:
-                        if (monotonic() >= deadline
-                                or scanned >= MAX_ADMISSION_ENTRIES):
-                            partial = True
-                            exhausted = True
-                            root_listing_partial = True
-                            break
-                        scanned += 1
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                collected.append((entry.name, Path(entry.path), True))
-                            elif entry.is_file(follow_symlinks=False):
-                                path = Path(entry.path)
-                                if (registry_abs is None or Path(os.path.abspath(path)) != registry_abs) \
-                                        and path.suffix.lower() != ".jsonl":
-                                    collected.append((entry.name, path, False))
-                            elif entry.is_symlink():
-                                warnings.append("admission-symlink-skipped")
-                                partial = True
-                            else:
-                                info = entry.stat(follow_symlinks=False)
-                                if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
-                                    warnings.append("admission-special-file-skipped")
-                                    partial = True
-                        except OSError:
-                            warnings.append("admission-entry-unreadable")
-                            partial = True
-                return sorted(collected, key=lambda item: item[0])
-
-            all_entries = collect_root_entries()
+                listing_warnings = []
+                listing_partial = False
+                try:
+                    with os.scandir(root) as listing:
+                        for entry in listing:
+                            entry_count += 1
+                            try:
+                                if entry.is_dir(follow_symlinks=False):
+                                    info = entry.stat(follow_symlinks=False)
+                                    collected.append((entry.name, Path(entry.path), True,
+                                                      _admission_stat_token(info)))
+                                elif entry.is_file(follow_symlinks=False):
+                                    path = Path(entry.path)
+                                    if ((registry_abs is None
+                                         or Path(os.path.abspath(path)) != registry_abs)
+                                            and path.suffix.lower() != ".jsonl"):
+                                        info = entry.stat(follow_symlinks=False)
+                                        collected.append((entry.name, path, False,
+                                                          _admission_stat_token(info)))
+                                elif entry.is_symlink():
+                                    listing_warnings.append("admission-symlink-skipped")
+                                    listing_partial = True
+                                else:
+                                    info = entry.stat(follow_symlinks=False)
+                                    if not (stat.S_ISREG(info.st_mode)
+                                            or stat.S_ISDIR(info.st_mode)):
+                                        listing_warnings.append(
+                                            "admission-special-file-skipped")
+                                        listing_partial = True
+                            except OSError:
+                                listing_warnings.append("admission-entry-unreadable")
+                                listing_partial = True
+                            if monotonic() >= deadline or entry_count >= MAX_ADMISSION_ENTRIES:
+                                listing_partial = True
+                                break
+                except OSError:
+                    listing_warnings.append("admission-root-unreadable")
+                    listing_partial = True
+                try:
+                    after_token = _admission_stat_token(root.lstat())
+                except OSError:
+                    after_token = ""
+                if after_token != root_listing_generation:
+                    listing_partial = True
+                    listing_warnings.append("admission-root-generation-changed")
+                if listing_partial and (entry_count >= MAX_ADMISSION_ENTRIES
+                                        or monotonic() >= deadline or not after_token):
+                    warnings.extend(listing_warnings)
+                    warnings.append("admission-root-listing-limit")
+                    root_state["root_blocked_generation"] = root_listing_generation
+                    root_state.pop("root_listing", None)
+                    partial = True
+                    exhausted = (entry_count >= MAX_ADMISSION_ENTRIES
+                                 or monotonic() >= deadline)
+                    scan_state[root_key] = root_state
+                    if exhausted:
+                        break
+                    continue
+                if after_token != root_listing_generation:
+                    warnings.extend(listing_warnings)
+                    partial = True
+                    scan_state[root_key] = root_state
+                    continue
+                collected.sort(key=lambda item: item[0])
+                existing_cache = sum(
+                    len(state.get("root_listing", {}).get("entries", []))
+                    + len(state.get("bundle_listing", {}).get("files", []))
+                    for state in scan_state.values() if isinstance(state, dict)
+                    and (isinstance(state.get("root_listing"), dict)
+                         or isinstance(state.get("bundle_listing"), dict)))
+                if len(collected) + existing_cache > MAX_ADMISSION_CACHED_ENTRIES:
+                    warnings.append("admission-listing-cache-limit")
+                    root_state["root_blocked_generation"] = root_listing_generation
+                    partial = True
+                    scan_state[root_key] = root_state
+                    continue
+                root_listing = {"generation": root_listing_generation,
+                                "entries": [{"name": item[0], "directory": item[2],
+                                             "token": item[3]} for item in collected],
+                                "partial": listing_partial,
+                                "warnings": sorted(set(listing_warnings))}
+                root_state["root_listing"] = root_listing
+                root_state.pop("root_blocked_generation", None)
+                if listing_partial:
+                    partial = True
+                    warnings.extend(listing_warnings)
+            else:
+                warnings.extend(root_listing.get("warnings", []))
+                if root_listing.get("partial"):
+                    partial = True
+            scan_state[root_key] = root_state
+            all_entries = [(item["name"], root / item["name"], item["directory"],
+                            item["token"]) for item in root_listing["entries"]]
             after_cursor = ([item for item in all_entries
                              if not last_root_entry or item[0] > last_root_entry])
             before_cursor = ([item for item in all_entries
@@ -950,38 +1172,47 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
             page_entries = after_cursor[:root_entry_limit]
             if len(page_entries) < root_entry_limit:
                 page_entries.extend(before_cursor[:root_entry_limit - len(page_entries)])
-            entries = list(page_entries)
-            entry_count += len(page_entries)
-            if root_listing_partial:
+            if len(page_entries) < len(all_entries):
                 partial = True
+            entries = list(page_entries)
             if page_entries:
                 last_root_entry = page_entries[-1][0]
 
             all_root_files = [item for item in all_entries if not item[2]]
+            active_bundle_key = (root_state.get("listing_bundle")
+                                 if isinstance(root_state.get("listing_bundle"), str)
+                                 else last_bundle if last_file else "")
             if last_file and last_bundle == "@root" and all_root_files:
                 entries = [item for item in entries if item[2]]
                 entries.extend(all_root_files)
-            elif last_file and last_bundle and last_bundle != "@root" \
-                    and not any(item[0] == last_bundle and item[2] for item in entries):
+            if active_bundle_key and active_bundle_key != "@root" \
+                    and not any(item[0] == active_bundle_key and item[2] for item in entries):
                 active = next((item for item in all_entries
-                               if item[0] == last_bundle and item[2]), None)
+                               if item[0] == active_bundle_key and item[2]), None)
                 if active is None:
-                    active_path = root / last_bundle
+                    active_path = root / active_bundle_key
                     try:
                         active_info = active_path.lstat()
                         if (stat.S_ISDIR(active_info.st_mode)
                                 and not stat.S_ISLNK(active_info.st_mode)):
-                            active = (last_bundle, active_path, True)
+                            active = (active_bundle_key, active_path, True,
+                                      _admission_stat_token(active_info))
                     except OSError:
                         pass
                 if active is not None:
                     entries.append(active)
-            if entries and last_bundle:
+            listing_bundle_key = (root_state.get("listing_bundle")
+                                  if isinstance(root_state.get("listing_bundle"), str)
+                                  else "")
+            if entries and listing_bundle_key:
+                entries = ([item for item in entries if item[0] == listing_bundle_key]
+                           + [item for item in entries if item[0] != listing_bundle_key])
+            elif entries and last_bundle:
                 entries = ([item for item in entries if item[0] > last_bundle]
                            + [item for item in entries if item[0] <= last_bundle])
             root_files = [item for item in entries if not item[2]]
             bundles = ([(root, root_files)] if root_files else [])
-            bundles.extend((path, None) for _, path, is_dir in entries if is_dir)
+            bundles.extend((path, None) for _, path, is_dir, _token in entries if is_dir)
             next_bundle = last_bundle
             next_bundle_generation = (root_state.get("bundle_generation")
                                       if isinstance(root_state.get("bundle_generation"), str)
@@ -1004,6 +1235,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     break
                 bundle_key = "@root" if bundle == root else bundle.name
                 bundle_identity = root_generation
+                bundle_listing_generation = root_listing_generation
                 if bundle != root:
                     try:
                         bundle_info = bundle.lstat()
@@ -1011,10 +1243,37 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                                 or not stat.S_ISDIR(bundle_info.st_mode)):
                             raise ValueError("admission-bundle-replaced")
                         bundle_identity = f"{bundle_info.st_dev}:{bundle_info.st_ino}"
+                        bundle_listing_generation = _admission_stat_token(bundle_info)
                     except (OSError, ValueError) as exc:
                         warnings.append("admission-bundle-unreadable:" + str(exc))
                         partial = True
                         continue
+                blocked_bundles = root_state.get("blocked_bundles", {})
+                blocked_bundles = (dict(blocked_bundles)
+                                   if isinstance(blocked_bundles, dict) else {})
+                if blocked_bundles.get(bundle_key) == bundle_listing_generation:
+                    warnings.append("admission-bundle-listing-limit")
+                    partial = True
+                    continue
+                if blocked_bundles.get(bundle_key):
+                    blocked_bundles.pop(bundle_key, None)
+                    root_state["blocked_bundles"] = blocked_bundles
+                cached_bundle = root_state.get("bundle_listing")
+                if isinstance(cached_bundle, dict) \
+                        and cached_bundle.get("bundle") == bundle_key \
+                        and (cached_bundle.get("identity") != bundle_identity
+                             or cached_bundle.get("generation") != bundle_listing_generation):
+                    warnings.append("admission-bundle-generation-changed")
+                    uncertainty_reason = uncertainty_reason or "generation-changed"
+                    prior_latest_at = None
+                    root_state.pop("bundle_listing", None)
+                    root_state.pop("binding_state", None)
+                    root_state.pop("binding_sources", None)
+                    root_state.pop("binding_sources_bundle", None)
+                    prior_latest_at = None
+                    if bundle_key == last_bundle:
+                        last_file = ""
+                        root_state["last_file"] = ""
                 file_cursor = last_file if bundle_key == last_bundle else ""
                 if file_cursor:
                     prior_identity = root_state.get("bundle_generation")
@@ -1023,61 +1282,203 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                             warnings.append("admission-bundle-generation-changed")
                             uncertainty_reason = uncertainty_reason or "generation-changed"
                         file_cursor = ""
+                        root_state.pop("binding_state", None)
+                        root_state.pop("binding_sources", None)
+                        root_state.pop("binding_sources_bundle", None)
+
+                binding_state = root_state.get("binding_state")
+                if not (file_cursor and isinstance(binding_state, dict)
+                        and binding_state.get("bundle") == bundle_key
+                        and binding_state.get("identity") == bundle_identity):
+                    binding_state = new_binding_state(bundle_key, bundle_identity)
+                else:
+                    source_files = binding_state.get("source_files", {})
+                    source_files = source_files if isinstance(source_files, dict) else {}
+                    changed_source = False
+                    changed_binding_source = False
+                    for source_name, source_token in source_files.items():
+                        if monotonic() >= deadline:
+                            partial = exhausted = True
+                            changed_source = True
+                            break
+                        try:
+                            observed_token = _admission_stat_token((bundle / source_name).lstat())
+                        except OSError:
+                            observed_token = ""
+                        if observed_token != source_token:
+                            changed_source = True
+                            changed_binding_source = source_name in binding_state.get(
+                                "binding_sources", {})
+                            break
+                    if changed_source and not exhausted:
+                        warnings.append("admission-bundle-generation-changed")
+                        uncertainty_reason = uncertainty_reason or "generation-changed"
+                        if changed_binding_source:
+                            prior_latest_at = None
+                        file_cursor = ""
+                        binding_state = new_binding_state(bundle_key, bundle_identity)
+                        root_state.pop("bundle_listing", None)
+                        if bundle == root:
+                            root_state.pop("root_listing", None)
+                    elif changed_source:
+                        root_state["binding_state"] = binding_state
+                        scan_state[root_key] = root_state
+                        partial = True
+                        break
 
                 files = listed
                 listing_partial = False
+                bundle_listing = root_state.get("bundle_listing")
+                if files is None and isinstance(bundle_listing, dict) \
+                        and bundle_listing.get("bundle") == bundle_key \
+                        and bundle_listing.get("identity") == bundle_identity \
+                        and bundle_listing.get("generation") == bundle_listing_generation:
+                    cached_files = bundle_listing.get("files", [])
+                    cache_stale = False
+                    changed_name = None
+                    for cached_file in cached_files:
+                        if monotonic() >= deadline:
+                            partial = exhausted = True
+                            break
+                        try:
+                            observed_token = _admission_stat_token(
+                                (bundle / cached_file["name"]).lstat())
+                        except (OSError, KeyError, TypeError):
+                            observed_token = ""
+                        if observed_token != cached_file.get("token"):
+                            cache_stale = True
+                            changed_name = cached_file.get("name")
+                            break
+                    if exhausted:
+                        scan_state[root_key] = root_state
+                        break
+                    if cache_stale:
+                        warnings.append("admission-bundle-generation-changed")
+                        uncertainty_reason = uncertainty_reason or "generation-changed"
+                        old_binding_sources = root_state.get("binding_sources", {})
+                        old_binding_sources = (old_binding_sources
+                            if isinstance(old_binding_sources, dict) else {})
+                        if (root_state.get("binding_sources_bundle") == bundle_key
+                                and changed_name in old_binding_sources):
+                            prior_latest_at = None
+                        root_state.pop("bundle_listing", None)
+                        root_state.pop("binding_state", None)
+                        root_state.pop("binding_sources", None)
+                        root_state.pop("binding_sources_bundle", None)
+                        file_cursor = ""
+                        binding_state = new_binding_state(bundle_key, bundle_identity)
+                        bundle_listing = None
+                    else:
+                        files = [(item["name"], bundle / item["name"], False,
+                                  item["token"]) for item in cached_files
+                                 if isinstance(item, dict)
+                                 and isinstance(item.get("name"), str)]
+                        warnings.extend(bundle_listing.get("warnings", []))
+                        if bundle_listing.get("partial") is True:
+                            partial = True
+                            binding_state["partial"] = True
                 if files is None:
-                    files = []
-                    scanned = 0
+                    if MAX_ADMISSION_ENTRIES - entry_count < min(3, MAX_ADMISSION_ENTRIES):
+                        partial = exhausted = True
+                        root_state["listing_bundle"] = bundle_key
+                        scan_state[root_key] = root_state
+                        break
+                    files, listing_warnings = [], []
+                    listing_partial = False
                     try:
                         with os.scandir(bundle) as listing:
                             for child in listing:
-                                if (monotonic() >= deadline
-                                        or scanned >= MAX_ADMISSION_ENTRIES):
-                                    partial = exhausted = True
-                                    listing_partial = True
-                                    break
-                                scanned += 1
+                                entry_count += 1
                                 try:
                                     if (child.is_file(follow_symlinks=False)
                                             and not child.name.lower().endswith(".jsonl")):
-                                        files.append((child.name, Path(child.path), False))
+                                        info = child.stat(follow_symlinks=False)
+                                        files.append((child.name, Path(child.path), False,
+                                                      _admission_stat_token(info)))
                                     elif child.is_symlink():
-                                        warnings.append("admission-symlink-skipped")
-                                        partial = True
+                                        listing_warnings.append("admission-symlink-skipped")
+                                        listing_partial = True
                                     else:
                                         info = child.stat(follow_symlinks=False)
-                                        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
-                                            warnings.append("admission-special-file-skipped")
-                                            partial = True
+                                        if not (stat.S_ISREG(info.st_mode)
+                                                or stat.S_ISDIR(info.st_mode)):
+                                            listing_warnings.append(
+                                                "admission-special-file-skipped")
+                                            listing_partial = True
                                 except OSError:
-                                    warnings.append("admission-entry-unreadable")
-                                    partial = True
+                                    listing_warnings.append("admission-entry-unreadable")
+                                    listing_partial = True
+                                if (monotonic() >= deadline
+                                        or entry_count >= MAX_ADMISSION_ENTRIES):
+                                    listing_partial = True
+                                    break
                     except OSError:
-                        warnings.append("admission-bundle-unreadable")
-                        partial = True
+                        listing_warnings.append("admission-bundle-unreadable")
                         listing_partial = True
-                files.sort(key=lambda item: item[0])
+                    try:
+                        after_bundle = _admission_stat_token(bundle.lstat())
+                    except OSError:
+                        after_bundle = ""
+                    if after_bundle != bundle_listing_generation:
+                        listing_partial = True
+                        listing_warnings.append("admission-bundle-generation-changed")
+                    warnings.extend(listing_warnings)
+                    if listing_partial and (entry_count >= MAX_ADMISSION_ENTRIES
+                                            or monotonic() >= deadline or not after_bundle):
+                        warnings.append("admission-bundle-listing-limit")
+                        blocked_bundles[bundle_key] = bundle_listing_generation
+                        root_state["blocked_bundles"] = blocked_bundles
+                        root_state.pop("bundle_listing", None)
+                        root_state.pop("listing_bundle", None)
+                        root_state["last_bundle"] = bundle_key
+                        partial = True
+                        exhausted = (entry_count >= MAX_ADMISSION_ENTRIES
+                                     or monotonic() >= deadline)
+                        scan_state[root_key] = root_state
+                        if exhausted:
+                            break
+                        continue
+                    if after_bundle != bundle_listing_generation:
+                        warnings.append("admission-bundle-generation-changed")
+                        uncertainty_reason = uncertainty_reason or "generation-changed"
+                        partial = True
+                        root_state.pop("bundle_listing", None)
+                        root_state.pop("binding_state", None)
+                        continue
+                    files.sort(key=lambda item: item[0])
+                    existing_cache = sum(
+                        len(state.get("root_listing", {}).get("entries", []))
+                        + len(state.get("bundle_listing", {}).get("files", []))
+                        for state in scan_state.values() if isinstance(state, dict)
+                        and (isinstance(state.get("root_listing"), dict)
+                             or isinstance(state.get("bundle_listing"), dict)))
+                    if existing_cache + len(files) > MAX_ADMISSION_CACHED_ENTRIES:
+                        warnings.append("admission-listing-cache-limit")
+                        blocked_bundles[bundle_key] = bundle_listing_generation
+                        root_state["blocked_bundles"] = blocked_bundles
+                        partial = True
+                        continue
+                    if bundle != root:
+                        root_state["bundle_listing"] = {
+                            "bundle": bundle_key, "identity": bundle_identity,
+                            "generation": bundle_listing_generation,
+                            "files": [{"name": item[0], "token": item[3]}
+                                      for item in files],
+                            "partial": listing_partial,
+                            "warnings": sorted(set(listing_warnings))}
+                    if listing_partial:
+                        partial = True
+                        binding_state["partial"] = True
+                    listing_partial = False
+                    root_state.pop("listing_bundle", None)
                 if file_cursor:
                     files = [item for item in files if item[0] > file_cursor]
-                    if not files and not listing_partial:
-                        next_bundle = bundle_key
-                        next_file = ""
-                        next_bundle_generation = bundle_identity
-                        scan_state[root_key] = {"last_bundle": next_bundle,
-                            "last_file": next_file, "last_root_entry": last_root_entry,
-                            "bundle_generation": next_bundle_generation}
-                        continue
-                available_entries = MAX_ADMISSION_ENTRIES - entry_count
-                page_partial = len(files) > available_entries
-                if page_partial:
-                    files = files[:available_entries]
-                    partial = exhausted = True
-                entry_count += len(files)
-                bundle_incomplete = listing_partial or page_partial
+                bundle_incomplete = listing_partial
                 documents = []
                 last_file_processed = file_cursor
-                for file_name, path, _ in files:
+                source_changed = False
+                binding_source_changed = False
+                for file_name, path, _, expected_token in files:
                     if monotonic() >= deadline or byte_count >= MAX_ADMISSION_BYTES_PER_PASS:
                         partial = exhausted = True
                         bundle_incomplete = True
@@ -1087,6 +1488,13 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                             continue
                         _check_parents(path, bundle)
                         file_info = path.lstat()
+                        if _admission_stat_token(file_info) != expected_token:
+                            source_changed = True
+                            binding_source_changed = file_name in binding_state.get(
+                                "binding_sources", {})
+                            warnings.append("admission-bundle-generation-changed")
+                            uncertainty_reason = uncertainty_reason or "generation-changed"
+                            break
                         if not stat.S_ISREG(file_info.st_mode):
                             warnings.append("admission-record-not-regular")
                             partial = True
@@ -1099,13 +1507,20 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                             last_file_processed = file_name
                             continue
                         remaining = MAX_ADMISSION_BYTES_PER_PASS - byte_count
-                        if remaining <= 0:
+                        if file_info.st_size > remaining:
                             partial = exhausted = True
                             bundle_incomplete = True
                             break
-                        raw, _info = _read_file(path, bundle,
+                        raw, read_info = _read_file(path, bundle,
                             min(MAX_ADMISSION_RECORD_BYTES, remaining))
                         byte_count += len(raw)
+                        if _admission_stat_token(read_info) != expected_token:
+                            source_changed = True
+                            binding_source_changed = file_name in binding_state.get(
+                                "binding_sources", {})
+                            warnings.append("admission-bundle-generation-changed")
+                            uncertainty_reason = uncertainty_reason or "generation-changed"
+                            break
                         try:
                             document = _admission_json_object(raw)
                         except (ValueError, UnicodeError, RecursionError) as exc:
@@ -1116,7 +1531,8 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                             last_file_processed = file_name
                             continue
                         if isinstance(document, (dict, list)):
-                            documents.append(document)
+                            documents.append((document, file_name,
+                                              _admission_stat_token(read_info)))
                         elif path.suffix.lower() == ".json" or raw.lstrip().startswith((b"{", b"[")):
                             warnings.append("admission-json-not-object")
                             partial = True
@@ -1125,6 +1541,17 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         warnings.append("admission-record-unavailable:" + str(exc))
                         partial = True
                     last_file_processed = file_name
+                if source_changed:
+                    if binding_source_changed:
+                        prior_latest_at = None
+                    file_cursor = ""
+                    last_file_processed = ""
+                    bundle_incomplete = True
+                    documents = []
+                    binding_state = new_binding_state(bundle_key, bundle_identity)
+                    root_state.pop("bundle_listing", None)
+                    if bundle == root:
+                        root_state.pop("root_listing", None)
                 try:
                     current_bundle = bundle.lstat()
                     current_identity = (f"{current_bundle.st_dev}:{current_bundle.st_ino}"
@@ -1132,7 +1559,11 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                                         and not stat.S_ISLNK(current_bundle.st_mode) else "")
                 except OSError:
                     current_identity = ""
-                if current_identity != bundle_identity:
+                    current_listing_generation = ""
+                else:
+                    current_listing_generation = _admission_stat_token(current_bundle)
+                if (current_identity != bundle_identity
+                        or current_listing_generation != bundle_listing_generation):
                     warnings.append("admission-root-generation-changed" if bundle == root
                                     else "admission-bundle-generation-changed")
                     uncertainty_reason = uncertainty_reason or "generation-changed"
@@ -1140,37 +1571,93 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     documents = []
                     last_file_processed = ""
                     bundle_incomplete = False
+                    binding_state = new_binding_state(bundle_key, bundle_identity)
+                    root_state.pop("bundle_listing", None)
+                    if bundle == root:
+                        root_state.pop("root_listing", None)
+                for document, file_name, file_token in documents:
+                    add_binding_document(binding_state, document, file_name, file_token)
+                if binding_state.get("overflow"):
+                    warnings.append("admission-binding-summary-limit")
+                    partial = True
+                if any(marker in warning for warning in warnings
+                       for marker in ("record-unavailable", "record-unbounded",
+                                      "json-not-object", "nonfinite", "duplicate-key")):
+                    binding_state["partial"] = True
                 next_bundle = bundle_key
                 next_file = last_file_processed if bundle_incomplete else ""
                 next_bundle_generation = (bundle_identity
-                                          if current_identity == bundle_identity else "")
-                scan_state[root_key] = {"last_bundle": next_bundle, "last_file": next_file,
-                    "last_root_entry": last_root_entry,
-                    "bundle_generation": next_bundle_generation}
+                                          if current_identity == bundle_identity
+                                          and current_listing_generation == bundle_listing_generation
+                                          else "")
+                root_state["last_bundle"] = next_bundle
+                root_state["last_file"] = next_file
+                root_state["last_root_entry"] = last_root_entry
+                root_state["bundle_generation"] = next_bundle_generation
+                if bundle_incomplete:
+                    root_state["binding_state"] = binding_state
+                    root_state["active_bundle"] = {"key": bundle_key,
+                                                    "identity": bundle_identity}
+                    if not next_file:
+                        root_state["listing_bundle"] = bundle_key
+                else:
+                    root_state.pop("binding_state", None)
+                    root_state.pop("active_bundle", None)
+                    root_state.pop("listing_bundle", None)
+                    root_state["binding_sources"] = binding_state.get("binding_sources", {})
+                    root_state["binding_sources_bundle"] = bundle_key
+                scan_state[root_key] = root_state
+                if binding_state.get("overflow"):
+                    warnings.append("admission-binding-summary-limit")
+                    partial = True
+                if bundle_incomplete:
+                    if binding_state.get("decisions"):
+                        generation_fields = binding_state.get("generation_fields", [])
+                        generation_material = json.dumps(sorted(generation_fields,
+                            key=lambda item: json.dumps(item, sort_keys=True)),
+                            sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=False, default=str)
+                        provisional_generation = hashlib.sha256(
+                            (root_generation + ":" + bundle_identity + ":" +
+                             generation_material + ":partial").encode("utf-8")
+                        ).hexdigest()[:24]
+                        provisional_rows = []
+                        for saved in binding_state["decisions"].values():
+                            row = saved["sample"]
+                            row_ids = set(saved.get("row_ids", []))
+                            if row_key and str(row_key) != "run":
+                                requested_row = str(row_key)
+                                if row_ids and requested_row not in row_ids:
+                                    continue
+                            provisional_rows.append({**row, "state": "unknown",
+                                "reasons": [], "priority_blockers": []})
+                        if provisional_rows:
+                            candidates.append({"ambiguous": True,
+                                "generation": provisional_generation, "samples": [],
+                                "all_samples": provisional_rows, "path": str(bundle)})
+                    if exhausted:
+                        break
+                    processed_bundle = True
+                    break
                 if exhausted:
                     break
-                if not documents:
-                    continue
-                objects = [obj for doc in documents for obj in _admission_objects(doc)]
-                run_ids = {obj.get("run_id") for obj in objects
-                           if isinstance(obj.get("run_id"), str)}
-                if run_id not in run_ids:
-                    continue
-                generation_fields = [{key: obj.get(key) for key in
-                    ("run_id", "started_at", "pid", "starttime", "command_hash",
-                     "config_sha256", "row_id", "row_key") if key in obj}
-                    for obj in objects if obj.get("run_id") == run_id]
+                generation_fields = binding_state.get("generation_fields", [])
                 generation_material = json.dumps(sorted(generation_fields,
                     key=lambda item: json.dumps(item, sort_keys=True)), sort_keys=True,
                     separators=(",", ":"), ensure_ascii=False, default=str)
                 bundle_generation = hashlib.sha256(
                     (root_generation + ":" + bundle_identity + ":" + generation_material)
                     .encode("utf-8")).hexdigest()[:24]
-                if run_ids != {run_id}:
-                    candidates.append({"ambiguous": True, "generation": bundle_generation,
-                                       "samples": [], "path": str(bundle)})
-                    continue
-                decisions = _admission_decisions(documents)
+                exact_binding = (binding_state.get("target_seen") is True
+                                 and binding_state.get("foreign_seen") is not True
+                                 and binding_state.get("partial") is not True
+                                 and binding_state.get("overflow") is not True)
+                if binding_state.get("decisions") and not binding_state.get("target_seen"):
+                    warnings.append("admission-run-binding-missing")
+                if binding_state.get("foreign_seen"):
+                    warnings.append("admission-run-binding-ambiguous")
+                decisions = [(item["sample"], frozenset(item.get("row_ids", [])))
+                             for item in binding_state.get("decisions", {}).values()]
                 if not decisions:
                     continue
                 if row_key and str(row_key) != "run":
@@ -1190,6 +1677,9 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     decisions = [decision for decision, _row_ids in decisions]
                 current_rows = []
                 for row in decisions:
+                    if not exact_binding:
+                        row = ({**row, "state": "unknown", "reasons": [],
+                                "priority_blockers": []})
                     dedup_key = hashlib.sha256(
                         (bundle_generation + ":" + row["sample_id"]).encode("utf-8")
                     ).hexdigest()
@@ -1217,12 +1707,11 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         unseen.append(row)
                         seen_ids.add(dedup_key)
                         sample_ids.append(dedup_key)
-                candidates.append({"ambiguous": False, "generation": bundle_generation,
+                candidates.append({"ambiguous": not exact_binding,
+                                   "generation": bundle_generation,
                                    "samples": unseen, "all_samples": current_rows,
                                    "path": str(bundle)})
-            scan_state[root_key] = {"last_bundle": next_bundle, "last_file": next_file,
-                "last_root_entry": last_root_entry,
-                "bundle_generation": next_bundle_generation}
+            scan_state[root_key] = root_state
             if exhausted:
                 break
         except (OSError, ValueError, TypeError) as exc:
@@ -1234,18 +1723,17 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
         seen_ids = set(sample_ids)
         warnings.append("admission-dedup-inventory-truncated")
         partial = True
-    next_cursor = {"schema_version": 2, "root_generations": current_roots,
+    next_cursor = {"schema_version": 3, "root_generations": current_roots,
                    "scan": scan_state, "sample_ids": sample_ids,
                    "latest_at": prior_latest_at}
-    target_candidates = [candidate for candidate in candidates if not candidate.get("ambiguous")]
     ambiguous = any(candidate.get("ambiguous") for candidate in candidates)
     by_payload = {}
-    for candidate in target_candidates:
+    for candidate in candidates:
         payload = tuple(sorted(row["sample_id"] for row in candidate.get("all_samples", [])))
         by_payload.setdefault(payload, candidate)
     selected = list(by_payload.values())
     latest = generation = None
-    if not ambiguous and len(selected) == 1 and not partial and not exhausted:
+    if len(selected) == 1:
         chosen = selected[0]
         generation = chosen.get("generation")
         all_samples = chosen.get("all_samples", [])
@@ -1268,7 +1756,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
             uncertainty_reason = "source-missing"
     if new_invalid_timestamp:
         uncertainty_reason = "timestamp-invalid"
-    valid_times = [row.get("at") for candidate in target_candidates
+    valid_times = [row.get("at") for candidate in candidates
         for row in candidate.get("all_samples", [])
         if row.get("state") in {"admitted", "denied"}
         and isinstance(row.get("at"), (int, float)) and not isinstance(row.get("at"), bool)
@@ -1285,8 +1773,8 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
         latest = {**latest, "state": "unknown"}
     next_cursor["uncertainty_reason"] = uncertainty_reason
     coverage = ("partial" if partial or exhausted else
-                "observed" if latest is not None else "unknown")
-    unique_new = {row["sample_id"]: row for candidate in target_candidates
+                "unknown" if latest is None or ambiguous else "observed")
+    unique_new = {row["sample_id"]: row for candidate in candidates
                   for row in candidate.get("samples", [])}
     if valid_times:
         next_cursor["latest_at"] = max(valid_times)
