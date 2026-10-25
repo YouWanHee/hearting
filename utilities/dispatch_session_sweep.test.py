@@ -1343,6 +1343,299 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
             len(log_path.read_text(encoding="utf-8").splitlines()), 2
         )
 
+class SweepBatchBoundaryTest(IsolatedRootMixin, unittest.TestCase):
+    """Real registered groups; only semantic readiness and native observation are fake."""
+
+    _seed = SweepTest._seed
+    SID = "sess-owner"
+    KIND = "claude-parent-runtime"
+
+    def seed_batch(self, size=2):
+        from route_identity import route_hash
+        import dispatch_seat_handover as handover
+
+        serial = getattr(self, "_batch_serial", 0) + 1
+        self._batch_serial = serial
+        base = Path(self._tmp.name) / f"case-{serial}"
+        self.root = base / "dispatch"
+        self.root.mkdir(parents=True)
+        self.enterContext(mock.patch.dict(os.environ, {
+            "XDG_STATE_HOME": str(base / "state"),
+            "AGENT_DISPATCH_JOBS": str(self.root / "jobs.log"),
+        }))
+        jobs = self.root / "jobs.log"
+        jobs.touch()
+        ids, metas = [], []
+        for index in range(size):
+            did = f"delivery-{serial:08x}{index:024x}"
+            aid, rid = f"att-boundary-{serial}-{index}", f"rt-boundary-{serial}-{index}"
+            route = {"route_id": rid, "parent_cycle_id": f"cycle-boundary-{serial}",
+                     "nodes": [{"id": "frame"}]}
+            route["route_hash"] = route_hash(route)
+            path = self.root / f"{rid}.json"
+            path.write_text(json.dumps(route), encoding="utf-8")
+            meta = {"attempt_id": aid, "dispatch_depth": "1", "registered_worker": "1",
+                    "worker_type": "frame", "parent_sid": self.SID, "parent_harness": "claude",
+                    "delivery_intent": "1", "delivery_id": did, "failure_class": "pass",
+                    "note": "completed-marker", "delivery_intent_at_ns": str(time.monotonic_ns()),
+                    "launch_outcome": "reaped-before-publish", "route_file": str(path),
+                    "route_id": rid, "route_hash": route["route_hash"], "route_node": "frame"}
+            with jobs.open("a", encoding="utf-8") as handle:
+                handle.write("2026-10-25T00:00:00Z\tdone\t/fixture/repo\t/fixture/wt\tfixture\t" +
+                             ",".join(f"{key}={value}" for key, value in meta.items()) + "\n")
+            receipt = _receipt(state="ready", parent_attempt_id="att-boundary-parent",
+                               job_registry=str(jobs), delivery_classification="success",
+                               children=[{"attempt_id": aid, "status": "done", "readiness": "ready",
+                                          "required_action": "advance-completed",
+                                          "delivery_classification": "success"}])
+            self._seed(delivery_id=did, attempt_ids=[aid], parent_attempt_id="att-boundary-parent",
+                       route_id=rid, route_node="frame", receipt=receipt,
+                       row_revisions={aid: "fixture-revision"})
+            ids.append(did)
+            metas.append(meta)
+        self.ids, self.metas = ids, metas
+        self.identities = [PD.received_ack_identity(self.read(did), self.SID, did) for did in ids]
+        handover._LINEAGE_GRAPH_CACHE.clear()
+        from dispatch_notice_state import resolve_delivery_batch
+        batch = resolve_delivery_batch(jobs, self.read(ids[0]), recipient_key=self.SID,
+                                       delivery_root=self.root)
+        self.assertFalse(batch["held"])
+        self.assertEqual(batch["delivery_ids"], tuple(ids))
+        return ids
+
+    def read(self, did):
+        return PD.read(self.root, self.SID, did)
+
+    def move(self, indices, target="new-holder"):
+        import dispatch_seat_handover as handover
+        directory = Path(os.environ["XDG_STATE_HOME"]) / "hearting/session-tidy/sessions"
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / "boundary-retire.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"event": "handover", "source": "retire", "harness": "claude",
+                                     "sid": target, "from": {"harness": "claude", "sid": self.SID},
+                                     "ts": time.monotonic_ns(), "bindings": [handover.binding_of(
+                                         self.root / "jobs.log", self.metas[i]) for i in indices]}) + "\n")
+
+    def sweep(self, observer=None, *, session=None, continuation=None):
+        with mock.patch("dispatch_notice_state.keep_claim", return_value=True), \
+             mock.patch("dispatch_supervision.continue_for_parent", side_effect=continuation or (
+                 lambda *_a, **_k: None)):
+            return SWEEP.sweep_deliver(self.root, self.KIND, session or self.SID,
+                                       receipt_observer=observer)
+
+    def later_observer(self, action, *, trigger=None, evidence=None):
+        trigger = trigger or self.ids[-1]
+        observed, acted = [], []
+        def observe(_root, _storage, record):
+            observed.append(record["delivery_id"])
+            # The first seed observation is before the group claim. Only
+            # mutate while the real common group owns all these records.
+            if (record["delivery_id"] == trigger and not acted
+                    and all(self.read(did)["state"] == "claimed" for did in self.ids)):
+                acted.append(True)
+                action()
+            return evidence() if evidence else None
+        return observe, observed, acted
+
+    def retry_ready(self):
+        # Advance only the courier's existing wall-clock retry interval.
+        deadlines = []
+        for did in self.ids:
+            path = PD.courier_retry_path(PD.record_path(self.root, self.SID, did))
+            deadlines.append(json.loads(path.read_text())["retry"]["next_attempt_at_ns"]
+                             if path.exists() else 0)
+        return mock.patch.object(PD.time, "time_ns", return_value=max(deadlines) + 1)
+
+    def assert_original(self):
+        for did, identity in zip(self.ids, self.identities):
+            self.assertEqual(PD.received_ack_identity(self.read(did), self.SID, did), identity)
+            self.assertIsNone(PD.read(self.root, "new-holder", did))
+
+    def test_all_current_groups_and_singleton_keep_original_identities(self):
+        for size in (1, 2, 4):
+            with self.subTest(size=size):
+                ids = self.seed_batch(size)
+                records, count = self.sweep()
+                self.assertEqual(count, size)
+                self.assertEqual([r["delivery_id"] for r in records], ids)
+                self.assertEqual([r[SWEEP.STORAGE_KEY] for r in records], [self.SID] * size)
+                self.assertEqual([r[SWEEP.IDENTITY_KEY] for r in records], self.identities)
+                self.assert_original()
+
+    def test_native_observation_cannot_leave_any_group_position_stale(self):
+        for size, target, trigger in ((2, 0, 1), (2, 1, 0), (4, 0, 3), (4, 2, 3)):
+            with self.subTest(size=size, target=target, trigger=trigger):
+                ids = self.seed_batch(size)
+                observe, observed, acted = self.later_observer(
+                    lambda: self.move([target]), trigger=ids[trigger])
+                records, count = self.sweep(observe)
+                self.assertTrue(acted)
+                self.assertIn(ids[trigger], observed)
+                self.assertEqual(count, size)
+                self.assertEqual(records, [])
+                self.assertEqual([self.read(d)["state"] for d in ids], ["pending"] * size)
+                self.assert_original()
+
+    def test_continuation_change_holds_group_and_singleton_at_output(self):
+        for size in (1, 3):
+            with self.subTest(size=size):
+                ids = self.seed_batch(size)
+                acted = []
+                def continuation(record, **_kwargs):
+                    if record["delivery_id"] == ids[-1]:
+                        acted.append(True)
+                        self.move([0])
+                records, _ = self.sweep(continuation=continuation)
+                self.assertTrue(acted)
+                self.assertEqual(records, [])
+                self.assertEqual([self.read(d)["state"] for d in ids], ["pending"] * size)
+                self.assert_original()
+
+    def test_whole_group_recovers_for_current_recipient_after_late_handover(self):
+        ids = self.seed_batch(3)
+        observe, _observed, acted = self.later_observer(lambda: self.move(range(3)))
+        self.assertEqual(self.sweep(observe)[0], [])
+        self.assertTrue(acted)
+        with self.retry_ready():
+            self.assertEqual(self.sweep()[0], [])
+            records, _ = self.sweep(session="new-holder")
+        self.assertEqual([r["delivery_id"] for r in records], ids)
+        self.assertEqual(SWEEP.ack_delivered(self.root, "new-holder", records,
+                                            acked_by="fixture-received"), 3)
+        self.assertEqual([self.read(d)["state"] for d in ids], ["acked"] * 3)
+        self.assertEqual(self.sweep(session="new-holder")[0], [])
+        self.assert_original()
+
+    def test_late_native_evidence_settles_earlier_member_and_holds_remainder(self):
+        import dispatch_recipient_receipt as receipt
+        for ack_failure in (False, True):
+            with self.subTest(ack_failure=ack_failure):
+                ids = self.seed_batch(3)
+                evidence = [None]
+                def received():
+                    evidence[0] = receipt.claude_feedback_evidence([{
+                        "type": "user", "sessionId": self.SID, "summary": "Stop hook feedback",
+                        "message": {"content": receipt.receipt_marker(self.read(ids[0]), self.SID)},
+                    }], self.SID)
+                observe, _observed, acted = self.later_observer(received, evidence=lambda: evidence[0])
+                with contextlib.ExitStack() as stack:
+                    if ack_failure:
+                        stack.enter_context(mock.patch.object(PD, "ack_received", side_effect=OSError("fixture ACK failure")))
+                    records, _ = self.sweep(observe)
+                self.assertTrue(acted)
+                self.assertEqual(records, [])
+                self.assertEqual([self.read(d)["state"] for d in ids],
+                                 ["pending" if ack_failure else "acked", "pending", "pending"])
+                with self.retry_ready():
+                    remaining, _ = self.sweep(lambda *_a: evidence[0])
+                self.assertEqual([r["delivery_id"] for r in remaining], ids[1:])
+                self.assertEqual(self.read(ids[0])["state"], "acked")
+                self.assert_original()
+
+    def test_late_claim_owner_change_preserves_other_carrier_and_releases_remainder(self):
+        ids = self.seed_batch(3)
+        successor = []
+        def transfer():
+            current = self.read(ids[0])
+            PD.reclaim(self.root, self.SID, ids[0], now_ns=current["claim_deadline_ns"] + 1)
+            successor.append(PD.claim(self.root, self.SID, ids[0], claim_owner="other-carrier",
+                                      lease_seconds=120, require_generation_proof=False))
+        observe, _observed, acted = self.later_observer(transfer)
+        self.assertEqual(self.sweep(observe)[0], [])
+        self.assertTrue(acted)
+        self.assertEqual(self.read(ids[0]), successor[0])
+        self.assertEqual([self.read(d)["state"] for d in ids[1:]], ["pending", "pending"])
+        self.assert_original()
+
+    def test_expired_or_invalid_late_lease_never_reaches_output(self):
+        for deadline in (0, None, True, "future"):
+            for size in (1, 3):
+                with self.subTest(deadline=deadline, size=size):
+                    ids = self.seed_batch(size)
+                    def expire():
+                        path = PD.record_path(self.root, self.SID, ids[0])
+                        value = json.loads(path.read_text())
+                        value["claim_deadline_ns"] = deadline
+                        path.write_text(json.dumps(value))
+                    observe, _observed, acted = self.later_observer(expire)
+                    self.assertEqual(self.sweep(observe)[0], [])
+                    self.assertTrue(acted)
+                    # Ordinary singleton recovery keeps its established lease.
+                    self.assertEqual([self.read(d)["state"] for d in ids],
+                                     ["claimed"] if size == 1 else ["pending"] * size)
+                    self.assert_original()
+
+    def test_late_immutable_replacement_is_not_emitted_or_released(self):
+        ids = self.seed_batch(3)
+        changed = []
+        def replace():
+            path = PD.record_path(self.root, self.SID, ids[0])
+            value = json.loads(path.read_text())
+            value["row_revisions"] = {self.metas[0]["attempt_id"]: "replacement-revision"}
+            path.write_text(json.dumps(value))
+            changed.append(path.read_bytes())
+        observe, _observed, acted = self.later_observer(replace)
+        self.assertEqual(self.sweep(observe)[0], [])
+        self.assertTrue(acted)
+        self.assertEqual(PD.record_path(self.root, self.SID, ids[0]).read_bytes(), changed[0])
+        self.assertEqual([self.read(d)["state"] for d in ids[1:]], ["pending", "pending"])
+
+    def test_native_settlement_during_later_observation_holds_partial_group(self):
+        ids = self.seed_batch(3)
+        def settle():
+            PD.ack_received(self.root, self.SID, ids[0], expected_identity=self.identities[0],
+                            acked_by="fixture-other-native-receipt")
+        observe, _observed, acted = self.later_observer(settle)
+        self.assertEqual(self.sweep(observe)[0], [])
+        self.assertTrue(acted)
+        self.assertEqual([self.read(d)["state"] for d in ids], ["acked", "pending", "pending"])
+        with self.retry_ready():
+            remaining, _ = self.sweep()
+        self.assertEqual([r["delivery_id"] for r in remaining], ids[1:])
+        self.assert_original()
+
+    def test_native_observation_budget_releases_whole_group_for_next_sweep(self):
+        ids = self.seed_batch(3)
+        clock = [0]
+        observe, _observed, acted = self.later_observer(lambda: clock.__setitem__(0, 7_000_000_000))
+        with mock.patch.object(SWEEP, "time", SimpleNamespace(monotonic_ns=lambda: clock[0], time_ns=time.time_ns)):
+            records, _ = self.sweep(observe)
+        self.assertTrue(acted)
+        self.assertEqual(records, [])
+        self.assertEqual([self.read(d)["state"] for d in ids], ["pending"] * 3)
+        with self.retry_ready():
+            recovered, _ = self.sweep()
+        self.assertEqual([r["delivery_id"] for r in recovered], ids)
+        self.assert_original()
+
+    def test_submitted_earlier_member_is_held_without_requeue(self):
+        for submitted in ("sent-ambiguous", "prepared", "accepted"):
+            with self.subTest(submitted=submitted):
+                ids = self.seed_batch(3)
+                saved = []
+                def submit():
+                    current = self.read(ids[0])
+                    if submitted == "sent-ambiguous":
+                        PD.mark_sent_ambiguous(self.root, self.SID, ids[0], claim_owner=current["claim_owner"])
+                    else:
+                        identity = PD.submission_fence_identity(current, self.SID)
+                        PD.prepare_submission_fence(self.root, self.SID, ids[0],
+                                                    claim_owner=current["claim_owner"], expected_identity=identity)
+                        if submitted == "accepted":
+                            PD.record_submission_accepted(self.root, self.SID, ids[0],
+                                                          claim_owner=current["claim_owner"],
+                                                          expected_identity=identity,
+                                                          queue_submission_id="fixture-queue")
+                    saved.append(PD.record_path(self.root, self.SID, ids[0]).read_bytes())
+                observe, _observed, acted = self.later_observer(submit)
+                self.assertEqual(self.sweep(observe)[0], [])
+                self.assertTrue(acted)
+                self.assertEqual(PD.record_path(self.root, self.SID, ids[0]).read_bytes(), saved[0])
+                self.assertEqual([self.read(d)["state"] for d in ids[1:]], ["pending", "pending"])
+                self.assertEqual(self.sweep()[0], [])
+                self.assert_original()
+
+
 class StrictGateReceiptRenderTest(unittest.TestCase):
     """The strict gate receipt a Codex owner raises is shown as a gate, with what to read."""
 

@@ -349,6 +349,7 @@ def sweep_deliver(
                "opencode" if recipient_kind.startswith("opencode") else "")
     legacy_bindings_by_evidence: dict[int, tuple[dict, dict]] = {}
     visited_batch_ids: set[str] = set()
+    latest_evidence = native_evidence
 
     def currently_addressed(record, storage_key):
         from dispatch_seat_handover import record_for_session, storage_recipients
@@ -358,12 +359,17 @@ def sweep_deliver(
             storage_key=storage_key)
 
     def settle_observed(record):
+        nonlocal latest_evidence
         evidence = native_evidence
         if receipt_observer is not None:
             try:
                 evidence = receipt_observer(root, record.get(STORAGE_KEY) or session_id, record)
             except Exception:
                 evidence = None
+        latest_evidence = evidence
+        return settle_evidence(record, evidence)
+
+    def settle_evidence(record, evidence):
         if harness == "claude" and isinstance(evidence, dict):
             key = id(evidence)
             cached = legacy_bindings_by_evidence.get(key)
@@ -389,6 +395,27 @@ def sweep_deliver(
         except Exception:
             return {"received": False, "settled": False,
                     "reason": "native-receipt-unknown"}
+
+    def unsubmitted(record, storage_key):
+        fence = pending_delivery.read_submission_fence(
+            root, storage_key, record["delivery_id"], expected_identity=
+            pending_delivery.submission_fence_identity(record, session_id))
+        return fence is None or fence.get("state") == "not-accepted"
+
+    def release_group(records, storage_key, claim_owner, identities):
+        for member in records:
+            member_id = member["delivery_id"]
+            try:
+                fresh = pending_delivery.read(root, storage_key, member_id)
+                if (fresh is not None and fresh.get("state") == "claimed"
+                        and fresh.get("claim_owner") == claim_owner
+                        and pending_delivery.received_ack_identity(
+                            fresh, storage_key, member_id) == identities[member_id]
+                        and unsubmitted(fresh, storage_key)):
+                    pending_delivery.release_claim(root, storage_key, member_id,
+                                                   claim_owner=claim_owner)
+            except (OSError, pending_delivery.PendingDeliveryError):
+                pass
 
     # The session's own records, then the records of a cleared predecessor at the same pane
     # that the seat handover bound to it. Those stay stored (and acked) under the registered
@@ -441,16 +468,13 @@ def sweep_deliver(
             continue
         group_ids = {member.get("delivery_id") for member in group_claims}
         visited_batch_ids.update(group_ids)
+        group_identities = {member["delivery_id"]: pending_delivery.received_ack_identity(
+            member, storage_key, member["delivery_id"]) for member in group_claims}
         # Check elapsed at the group boundary. A group that crossed the
         # six-second carrier budget while claiming is released as a whole.
         if (len(group_claims) > 1 and time.monotonic_ns() - start_ns
                 > DELIVER_BUDGET_SECONDS * 1_000_000_000):
-            for member in group_claims:
-                try:
-                    pending_delivery.release_claim(root, storage_key, member["delivery_id"],
-                                                   claim_owner=claim_owner)
-                except pending_delivery.PendingDeliveryError:
-                    pass
+            release_group(group_claims, storage_key, claim_owner, group_identities)
             continue
         group_output = []
         group_ok = True
@@ -458,8 +482,7 @@ def sweep_deliver(
         from dispatch_notice_state import keep_claim
         for record in group_claims:
             member_id = record["delivery_id"]
-            expected_identity = pending_delivery.received_ack_identity(
-                record, storage_key, member_id)
+            expected_identity = group_identities[member_id]
             try:
                 if not keep_claim(root, storage_key, member_id, record, claim_owner, jobs=jobs):
                     group_ok = False
@@ -489,15 +512,52 @@ def sweep_deliver(
                                             recipient_kind=recipient_kind)
             group_output.append({**record, STORAGE_KEY: storage_key, IDENTITY_KEY: expected_identity,
                                  **({CONTINUED_KEY: continued} if continued else {})})
+        # A later native snapshot can contain an earlier member's exact receipt,
+        # even when its claim/recipient changed or the ACK write must be retried.
+        # Reuse that observation without starting another native read mid-check.
+        for member in group_claims:
+            member_id = member["delivery_id"]
+            try:
+                fresh = pending_delivery.read(root, storage_key, member_id)
+                if (fresh is None or pending_delivery.received_ack_identity(
+                        fresh, storage_key, member_id) != group_identities[member_id]):
+                    group_ok = False
+                    continue
+                if settle_evidence({**fresh, STORAGE_KEY: storage_key}, latest_evidence)["received"]:
+                    group_ok = False
+            except (OSError, pending_delivery.PendingDeliveryError):
+                group_ok = False
+        # Every native observation and continuation above can change any member.
+        # Validate the whole group here; no native callback or continuation may
+        # intervene between these current checks and handing out the group.
+        if group_ok:
+            for member in group_claims:
+                member_id = member["delivery_id"]
+                try:
+                    final = pending_delivery.read(root, storage_key, member_id)
+                    deadline = final.get("claim_deadline_ns") if final is not None else None
+                    if (final is None or pending_delivery.received_ack_identity(
+                            final, storage_key, member_id) != group_identities[member_id]
+                            or final.get("state") != "claimed"
+                            or final.get("claim_owner") != claim_owner
+                            or type(deadline) is not int or deadline <= time.monotonic_ns()
+                            or not unsubmitted(final, storage_key)):
+                        group_ok = False
+                        break
+                    if not currently_addressed(final, storage_key):
+                        group_ok = False
+                        authority_changed = True
+                        break
+                except (OSError, pending_delivery.PendingDeliveryError):
+                    group_ok = False
+                    break
+        if (len(group_claims) > 1 and time.monotonic_ns() - start_ns
+                > DELIVER_BUDGET_SECONDS * 1_000_000_000):
+            group_ok = False
         if not group_ok:
             if len(group_claims) == 1 and not authority_changed:
                 continue  # Preserve the established singleton recovery lease.
-            for member in group_claims:
-                try:
-                    pending_delivery.release_claim(root, storage_key, member["delivery_id"],
-                                                   claim_owner=claim_owner)
-                except (OSError, pending_delivery.PendingDeliveryError):
-                    pass
+            release_group(group_claims, storage_key, claim_owner, group_identities)
             continue
         claimed.extend(group_output)
     elapsed_ns = time.monotonic_ns() - start_ns
