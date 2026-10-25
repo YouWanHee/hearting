@@ -463,7 +463,8 @@ class PendingDeliveryCountsTest(unittest.TestCase):
         self.assertEqual(pending_delivery.read(
             self.state_root, "expired-A", expired["delivery_id"])["state"], "expired")
 
-    def _registered_registry_fixture(self, root, filename, suffix, *, target="claude", same_sid=False):
+    def _registered_registry_fixture(self, root, filename, suffix, *, target="claude", same_sid=False,
+                                     legacy_empty_registry=False):
         import dispatch_seat_handover as handover
         import session_tidy as tidy
         from route_identity import route_hash
@@ -476,7 +477,8 @@ class PendingDeliveryCountsTest(unittest.TestCase):
         route["route_hash"] = route_hash(route)
         route_path = root / "route.json"; route_path.write_text(json.dumps(route))
         receipt = {"schema_version": 2, "state": "ready", "parent_attempt_id": "att-parent",
-            "job_registry": str(jobs), "delivery_classification": "success", "children": [{
+            "job_registry": "" if legacy_empty_registry else str(jobs),
+            "delivery_classification": "success", "children": [{
                 "attempt_id": aid, "status": "done", "readiness": "ready", "reason": "terminal-complete",
                 "required_action": "advance-completed", "harness": "claude", "delivery_classification": "success"}]}
         record = pending_delivery.create(root, recipient_kind="claude-parent-runtime", recipient_key=sid,
@@ -527,6 +529,16 @@ class PendingDeliveryCountsTest(unittest.TestCase):
                     self.assertIsNone(self._observed_registry_count([first[0], second[0]], live)["no_recipient"])
                     first[0].write_bytes(original)
                     self.assertEqual(self._observed_registry_count([first[0], second[0]], live)["no_recipient"], 2)
+
+    def test_legacy_empty_registry_keeps_the_observed_filename_over_copied_default(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):
+            jobs, record, sid, holder = self._registered_registry_fixture(
+                self.state_root / "legacy", "original-legacy.tsv", "legacy-empty",
+                legacy_empty_registry=True)
+            default = jobs.parent / "copied-default.log"; default.write_bytes(jobs.read_bytes())
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(default)}):
+                self.assertEqual(self._observed_registry_count([jobs], {("claude", sid)})["no_recipient"], 1)
+                self.assertEqual(self._observed_registry_count([jobs], {holder})["no_recipient"], 0)
 
     def test_cross_harness_same_sid_and_every_duplicate_body_keep_original_registry(self):
         with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history")}):

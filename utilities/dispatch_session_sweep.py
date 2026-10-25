@@ -261,9 +261,7 @@ def record_jobs(root: Path, record: dict, *, observed_jobs=None) -> Path | None:
     receipt = record.get("receipt") or {}
     raw = receipt.get("job_registry")
     try:
-        if "job_registry" in receipt:
-            if not isinstance(raw, str) or not raw:
-                return None
+        if isinstance(raw, str) and raw:
             jobs = Path(raw).expanduser()
         else:
             jobs = (Path(observed_jobs) if observed_jobs is not None else
