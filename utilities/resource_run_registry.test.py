@@ -438,6 +438,98 @@ class ResourceRegistryTest(unittest.TestCase):
             self.assertEqual(view["experiment_run_record"]["output_dir"], str(output))
             self.assertEqual(view["experiment_run_record"]["metric_summary"]["latest"]["value"], -8.77)
 
+    def test_explicit_observer_requires_exact_terminal_evidence_and_reuses_one_notice(self):
+        import resource_progress
+        import dispatch_pending_delivery
+        from peer_obligations import ObligationStore
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "dispatch" / "jobs.log"
+            jobs.parent.mkdir()
+            jobs.write_text("")
+            artifact = root / "artifact"
+            artifact.mkdir()
+            output = root / "run"
+            (output / "logs").mkdir(parents=True)
+            (output / "logs" / "epochs.jsonl").write_text(
+                '{"epoch":1,"split":"valid","losses":{"L_se":-8.0}}\n')
+            registry_path = root / "resource-runs.json"
+            run_id = "observer-terminal-evidence"
+            row = {
+                "run_id": run_id, "pid": 99999999, "starttime": "1",
+                "command_hash": "c" * 64, "status": "running", "started_at": 100,
+                "output_dir": str(output), "artifact_root": str(artifact),
+                "jobs": str(jobs), "notify": {"harness": "claude", "id": "fixture-supervisor"},
+            }
+            registry_path.write_text(json.dumps({"schema_version": 1, "runs": {run_id: row}}))
+            state_path = resource_progress._observation_state_path(row, registry_path, "run")
+            statuses = (("unknown", "unknown"), ("stale", "stale"),
+                        ("reaping", "reaping"), ("exited", "unknown"))
+            with mock.patch.object(resource_progress, "observe_experiment",
+                                   wraps=resource_progress.observe_experiment) as observe, \
+                    mock.patch("session_notice.notify",
+                               side_effect=AssertionError("unverified state sent a notice")):
+                for index, (liveness, public_status) in enumerate(statuses):
+                    with self.subTest(liveness=liveness), \
+                            mock.patch.object(registry, "classify_identity",
+                                return_value=(liveness, None, "fixture-" + liveness)):
+                        view = registry.observe_run_if_due(run_id, row, registry_path,
+                            now=120 + index)
+                    self.assertFalse(observe.call_args.kwargs["final"])
+                    public = view["experiment_run_record"]
+                    self.assertEqual(public["status"], public_status)
+                    self.assertIsNone(public["ended_at"])
+                    self.assertIsNone(public["rows"][0]["ended_at"])
+                    state = resource_progress._read_observation_state(state_path)
+                    self.assertNotIn("final:run", state.get("event_keys", []))
+                    self.assertFalse(any(event.get("kind") == "final"
+                                         for event in state.get("outbox", [])))
+            self.assertEqual(ObligationStore(jobs.parent).list(kinds={"run-notice"}), [])
+            self.assertFalse((jobs.parent / "pending-delivery").exists())
+
+            sentinel = root / "run.exit"
+            sentinel.write_text("7\n")
+            ended_at = 125.0
+            terminal = {**row, "status": "failed", "workflow_state": "FAILED_RETRYABLE",
+                        "failure_class": "exit-7", "exit_code": 7, "sentinel": str(sentinel),
+                        "ended_at": ended_at}
+            registry_path.write_text(json.dumps({"schema_version": 1,
+                                                  "runs": {run_id: terminal}}))
+            with mock.patch.object(resource_progress, "observe_experiment",
+                                   wraps=resource_progress.observe_experiment) as observe, \
+                    mock.patch("peer_obligations.ensure_normal_runner", return_value=False), \
+                    mock.patch("peer_obligations.request_dispatch_reconciliation", return_value=False), \
+                    mock.patch.object(registry, "classify_identity",
+                        return_value=("exited", None, "process-absent")):
+                final_view = registry.observe_run_if_due(run_id, terminal, registry_path, now=180)
+                self.assertTrue(observe.call_args.kwargs["final"])
+                repeat_view = registry.observe_run_if_due(run_id, terminal, registry_path, now=181)
+                self.assertTrue(observe.call_args.kwargs["final"])
+
+            public = final_view["experiment_run_record"]
+            repeated_public = repeat_view["experiment_run_record"]
+            self.assertEqual(public["status"], "failed")
+            self.assertEqual(public["ended_at"], ended_at)
+            self.assertEqual(public["rows"][0]["ended_at"], ended_at)
+            self.assertEqual(repeated_public["status"], "failed")
+            self.assertEqual(repeated_public["ended_at"], ended_at)
+            self.assertEqual(terminal["exit_code"], 7)
+            self.assertEqual(terminal["failure_class"], "exit-7")
+            record_path = resource_progress.public_record_path(artifact, run_id)
+            self.assertEqual(list(record_path.parent.glob("*.json")), [record_path])
+            state = resource_progress._read_observation_state(state_path)
+            final_events = [event for event in state.get("outbox", [])
+                            if event.get("kind") == "final"]
+            self.assertEqual(len(final_events), 1)
+            self.assertEqual(final_events[0]["key"], "final:run")
+            duties = ObligationStore(jobs.parent).list(kinds={"run-notice"})
+            self.assertEqual(len(duties), 1)
+            delivery_id = duties[0]["intent"]["delivery_id"]
+            notice = dispatch_pending_delivery.read(jobs.parent, "fixture-supervisor", delivery_id)
+            self.assertIsNotNone(notice)
+            self.assertEqual(notice["state"], "pending")
+
     def test_normalize_scan_and_read_cli_leave_observation_record_and_pending_unchanged(self):
         import resource_progress
         import dispatch_session_sweep as sweep

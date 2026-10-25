@@ -794,15 +794,36 @@ def observe_run_if_due(run_id: str, run: dict, registry: Path, *, now=None,
             candidate_run.pop("started_at", None)
         else:
             candidate_run["started_at"] = row_start if row_start is not None else started_at
+        final = False
+        execution = run.get("execution") if isinstance(run.get("execution"), dict) else {}
+        if view.get("liveness") != "working" and execution.get("kind") != "compute-hosts":
+            # Process disappearance is not an execution result. Reuse the existing
+            # lifecycle authority, which requires its exact exit/sentinel (or its
+            # positive never-started classification) before this writer can finalize.
+            try:
+                from route_authority import resource_predecessor_finished
+                final = bool(resource_predecessor_finished(run))
+            except Exception:  # noqa: BLE001 -- observation cannot alter run lifecycle
+                final = False
+        if not final:
+            # A lifecycle row may carry a provisional end timestamp after an
+            # unverifiable disappearance. Keep that out of the experiment view
+            # until the existing exact-terminal authority confirms completion.
+            candidate_run.pop("ended_at", None)
+        public_status = view.get("liveness")
+        if not final and public_status == "exited":
+            # Process absence without its exact exit evidence leaves the result
+            # unknown; liveness alone is not a terminal experiment status.
+            public_status = "unknown"
         observe_experiment(candidate_run, Path(registry), now, root=metric_root,
             row_key=str(row_key), started_at=row_start,
             planned_seconds=run.get("planned_seconds"),
             progress=({key: row_progress.get(key) for key in
                        ("completed", "total", "unit", "updated_at", "age_s")
                        if key in row_progress} if isinstance(row_progress, dict) else None),
-            final=view.get("liveness") != "working",
-            status=(run.get("status") if run.get("status") not in {None, "running"}
-                    else view.get("liveness")),
+            final=final,
+            status=((run.get("status") if run.get("status") not in {None, "running"}
+                     else view.get("liveness")) if final else public_status),
             poll_interval_seconds=interval_seconds)
     return normalize_run(run_id, run, Path(registry), identity_reader=proc_identity, now=now)
 
