@@ -20,6 +20,98 @@ A = importlib.util.module_from_spec(S)
 sys.modules[S.name] = A
 S.loader.exec_module(A)
 
+import owner_route_binding as OWNER_BINDING
+
+
+OWNER_ATTEMPT = "att-owner-activity"
+
+
+def owner_route(root: Path, route_id: str, generation: int, source=None):
+    route = {
+        "route_id": route_id,
+        "route_hash": f"sha256:{route_id}",
+        "advance_generation": generation,
+        "route_family_key": "family-owner-activity",
+        "owner_attempt_id": OWNER_ATTEMPT,
+        "cwd": str(root),
+        "repo": str(root),
+        "capability": "autopilot-code",
+        "capability_mode": "debug",
+        "effective_intensity": "standard",
+        "artifact_root": str(root / "artifacts"),
+        "reused_nodes": [],
+    }
+    if source is not None:
+        edge = {"from_route_id": source["route_id"],
+                "from_route_hash": source["route_hash"]}
+        route.update({"source_route_id": source["route_id"],
+                      "source_route_hash": source["route_hash"],
+                      "source_route_supersession": edge,
+                      "supersession_edges": [edge]})
+    path = root / f"{route_id}.json"
+    path.write_text(json.dumps(route), encoding="utf-8")
+    return path, route
+
+
+def owner_registry(root: Path, route_path: Path, route: dict, *, status="running",
+                   extra_metadata=(), child_rows=()):
+    jobs = root / "jobs.log"
+    metadata = {
+        "attempt_id": OWNER_ATTEMPT,
+        "worker_type": "owner",
+        "unit": "_kernel/owner",
+        "attempt_schema_version": "2",
+        "dispatch_depth": "1",
+        "registered_worker": "1",
+        "execution_surface": "registered-headless",
+        "owner_harness": "codex",
+        "capability": "autopilot-code",
+        "capability_mode": "debug",
+        "intensity": "standard",
+        "artifact_root": str(root / "artifacts"),
+        "parent_sid": "launch-parent-session",
+        "owner_route_file": str(route_path),
+        "owner_route_id": route["route_id"],
+        "owner_route_hash": route["route_hash"],
+        "log_file": str(root / "owner.log"),
+    }
+    metadata.update(dict(extra_metadata))
+    jobs.write_text("\t".join(("2026-10-25T00:00:00Z", status, str(root),
+                                str(root), "owner", ",".join(
+                                    f"{key}={value}" for key, value in metadata.items())))
+                    + "\n" + "".join(child_rows), encoding="utf-8")
+    (root / "owner.log").write_text("owner supervision\n", encoding="utf-8")
+    return jobs, metadata
+
+
+def adopted_child_row(root: Path, route_path: Path, route: dict) -> str:
+    metadata = {
+        "attempt_id": "att-owner-activity-child",
+        "parent_attempt_id": OWNER_ATTEMPT,
+        "attempt_schema_version": "2",
+        "dispatch_depth": "2",
+        "registered_worker": "1",
+        "execution_surface": "registered-headless",
+        "worker_type": "stage",
+        "unit": "dev/backend",
+        "route_file": str(route_path),
+        "route_id": route["route_id"],
+        "route_hash": route["route_hash"],
+        "route_node": "execute",
+        "capability": route["capability"],
+        "capability_mode": route["capability_mode"],
+        "artifact_root": route["artifact_root"],
+        "launch_started": "1",
+    }
+    return "\t".join(("2026-10-25T00:00:01Z", "open", str(root), str(root),
+                        "child", ",".join(f"{key}={value}" for key, value in metadata.items()))) + "\n"
+
+
+def owner_args(root: Path, jobs: Path, route_path: Path, route: dict):
+    return SimpleNamespace(parent_attempt_id=OWNER_ATTEMPT, jobs=str(jobs),
+                           route_file=str(route_path), route_id=route["route_id"],
+                           route_hash=route["route_hash"], worktree=str(root))
+
 
 class ForegroundActivityTests(unittest.TestCase):
     def test_owner_is_exempt_before_defaults_are_read(self):
@@ -246,7 +338,7 @@ class ForegroundActivityTests(unittest.TestCase):
                 argv = (proc / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
                 record = {
                     "attempt_id": "owner-1", "schema_version": 1,
-                    "route_id": "route-1", "route_node": "owner",
+                    "route_id": "route-1", "route_node": "_owner",
                     "pid": process.pid, "pid_start": stat["start"],
                     "pgid": process.pid, "deadline": time.time() + 30,
                     "command_digest": hashlib.sha256(b"\0".join(argv)).hexdigest(),
@@ -256,8 +348,8 @@ class ForegroundActivityTests(unittest.TestCase):
                 lease.write_text(json.dumps(record), encoding="utf-8")
                 context = A.ForegroundActivityContext(
                     window_seconds=7200, harness="codex", log_path=root / "attempt.log",
-                    metadata={"attempt_id": "owner-1", "route_id": "route-1",
-                              "route_node": "owner"}, jobs=jobs, owner_turn=True,
+                    metadata={"attempt_id": "owner-1", "route_id": "route-1"},
+                    jobs=jobs, owner_turn=True,
                 )
                 monitor = A.ForegroundActivityMonitor(process.pid, stat["start"], context)
                 self.assertTrue(monitor._lease_active())
@@ -271,36 +363,112 @@ class ForegroundActivityTests(unittest.TestCase):
                 process.terminate()
                 process.wait(timeout=5)
 
-    def test_owner_turn_factory_requires_the_exact_registered_owner_binding(self):
-        args = SimpleNamespace(parent_attempt_id="owner-1", jobs="/tmp/jobs.log",
-                               route_id="route-1", route_hash="sha256:route-1",
-                               worktree="/tmp/work")
-        process = SimpleNamespace(pid=4242)
-        row = SimpleNamespace(
-            attempt_id="owner-1", status="running",
-            metadata={"worker_type": "owner", "route_id": "route-1",
-                      "route_hash": "sha256:route-1", "route_node": "owner",
-                      "log_file": "/tmp/owner.log"},
-        )
-        monitor = mock.Mock()
-        with mock.patch("dispatch_completion_join.exact_attempt_row", return_value=row), \
-             mock.patch.object(A, "_stat", return_value={"start": "77"}), \
-             mock.patch.object(A, "ForegroundActivityMonitor", return_value=monitor) as create:
-            activity = A.owner_turn_activity(args, process, harness="codex", window_seconds=20)
-        context = create.call_args.args[2]
-        self.assertTrue(context.owner_turn)
-        self.assertEqual(context.metadata["runtime_pid"], "4242")
-        self.assertEqual(context.metadata["runtime_start"], "77")
-        self.assertEqual(context.metadata["route_node"], "owner")
-        activity.expired(now=0)
-        monitor.sample.assert_called_once()
+    def test_owner_turn_factory_resolves_the_real_launch_binding_without_a_route_node(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            route_path, route = owner_route(root, "rt-owner-launch", 0)
+            jobs, _metadata = owner_registry(root, route_path, route)
+            args = owner_args(root, jobs, route_path, route)
+            process = SimpleNamespace(pid=4242)
+            monitor = mock.Mock()
+            with mock.patch.object(OWNER_BINDING.ROUTE, "verify_route",
+                                   side_effect=lambda raw, **_kwargs: raw), \
+                 mock.patch.object(A, "_stat", return_value={"start": "77"}), \
+                 mock.patch.object(A, "ForegroundActivityMonitor", return_value=monitor) as create:
+                activity = A.owner_turn_activity(
+                    args, process, harness="codex", window_seconds=20)
+            context = create.call_args.args[2]
+            self.assertTrue(context.owner_turn)
+            self.assertEqual(context.metadata["attempt_id"], OWNER_ATTEMPT)
+            self.assertEqual(context.metadata["route_id"], route["route_id"])
+            self.assertEqual(context.metadata["route_hash"], route["route_hash"])
+            self.assertEqual(context.metadata["runtime_pid"], "4242")
+            self.assertEqual(context.metadata["runtime_start"], "77")
+            self.assertNotIn("route_node", context.metadata)
+            activity.expired(now=0)
+            monitor.sample.assert_called_once()
 
-        row.metadata["worker_type"] = "stage"
-        with mock.patch("dispatch_completion_join.exact_attempt_row", return_value=row), \
-             mock.patch.object(A, "ForegroundActivityMonitor",
-                               side_effect=AssertionError("mismatched attempt must not be sampled")):
-            uncertain = A.owner_turn_activity(args, process, harness="codex", window_seconds=20)
-        self.assertFalse(uncertain.expired(now=0))
+    def test_owner_turn_factory_follows_an_adopted_continuation_binding(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first_path, first = owner_route(root, "rt-owner-r0", 0)
+            next_path, next_route = owner_route(root, "rt-owner-r1", 1, source=first)
+            jobs, _metadata = owner_registry(root, first_path, first)
+            source = OWNER_BINDING.OwnerRouteBinding(
+                str(first_path.resolve()), first["route_id"], first["route_hash"])
+            target = OWNER_BINDING.OwnerRouteBinding(
+                str(next_path.resolve()), next_route["route_id"], next_route["route_hash"])
+            with mock.patch.object(OWNER_BINDING.ROUTE, "verify_route",
+                                   side_effect=lambda raw, **_kwargs: raw):
+                OWNER_BINDING.publish_owner_route_advance(
+                    jobs, owner_attempt_id=OWNER_ATTEMPT, source=source, target=target,
+                    from_generation=0, to_generation=1,
+                    route_family_key="family-owner-activity")
+            with jobs.open("a", encoding="utf-8") as stream:
+                stream.write(adopted_child_row(root, next_path, next_route))
+            args = owner_args(root, jobs, next_path, next_route)
+            monitor = mock.Mock()
+            with mock.patch.object(OWNER_BINDING.ROUTE, "verify_route",
+                                   side_effect=lambda raw, **_kwargs: raw), \
+                 mock.patch.object(A, "_stat", return_value={"start": "78"}), \
+                 mock.patch.object(A, "ForegroundActivityMonitor", return_value=monitor) as create:
+                activity = A.owner_turn_activity(
+                    args, SimpleNamespace(pid=4243), harness="codex", window_seconds=20)
+            context = create.call_args.args[2]
+            self.assertEqual(context.metadata["route_id"], next_route["route_id"])
+            self.assertEqual(context.metadata["route_hash"], next_route["route_hash"])
+            self.assertNotIn("route_node", context.metadata)
+            activity.expired(now=0)
+            monitor.sample.assert_called_once()
+
+    def test_owner_turn_factory_keeps_conflicting_or_invalid_identity_uncertain(self):
+        cases = ("stage-shaped-row", "refreshed-args-mismatch", "sealed-hash-conflict")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                route_path, route = owner_route(root, "rt-owner-conflict", 0)
+                extra = {"route_id": "rt-other", "route_node": "fabricated"} \
+                    if case == "stage-shaped-row" else {}
+                if case == "sealed-hash-conflict":
+                    extra = {"owner_route_hash": "sha256:conflict"}
+                jobs, _metadata = owner_registry(
+                    root, route_path, route, extra_metadata=extra)
+                args = owner_args(root, jobs, route_path, route)
+                if case == "refreshed-args-mismatch":
+                    args.route_id = "rt-other"
+                with mock.patch.object(OWNER_BINDING.ROUTE, "verify_route",
+                                       side_effect=lambda raw, **_kwargs: raw), \
+                     mock.patch.object(A, "_stat", return_value={"start": "79"}), \
+                     mock.patch.object(A, "ForegroundActivityMonitor",
+                                       side_effect=AssertionError("conflicting binding sampled")):
+                    uncertain = A.owner_turn_activity(
+                        args, SimpleNamespace(pid=4244), harness="codex", window_seconds=20)
+                self.assertFalse(uncertain.expired(now=0))
+                self.assertTrue(uncertain.observer().uncertain)
+
+    def test_confirmed_quiet_expires_after_factory_binds_real_owner_row(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            route_path, route = owner_route(root, "rt-owner-quiet", 0)
+            jobs, _metadata = owner_registry(root, route_path, route)
+            args = owner_args(root, jobs, route_path, route)
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                start_new_session=True,
+            )
+            try:
+                with mock.patch.object(OWNER_BINDING.ROUTE, "verify_route",
+                                       side_effect=lambda raw, **_kwargs: raw), \
+                     mock.patch.object(A.ForegroundActivityMonitor, "_runtime_lineage",
+                                       return_value={(process.pid, A._stat(
+                                           Path("/proc") / str(process.pid) / "stat")["start"])}):
+                    activity = A.owner_turn_activity(
+                        args, process, harness="codex", window_seconds=0.1)
+                    self.assertFalse(activity.expired(now=1.0))
+                    self.assertTrue(activity.expired(now=1.11))
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
 
 
 if __name__ == "__main__":

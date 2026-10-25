@@ -2155,6 +2155,110 @@ class ActiveTurnDeadlineParityTest(unittest.TestCase):
             self.assertGreater(time.monotonic() - started, 0.3)
             self.assertEqual(text, "done")
 
+    def test_current_turn_native_content_and_output_deltas_renew_activity(self):
+        from foreground_activity import ActivityObservation
+        from session_supervisor_decisions import OwnerTurnActivity
+        module = load_supervisor_module()
+        accepted = (
+            "item/agentMessage/delta",
+            "item/plan/delta",
+            "item/commandExecution/outputDelta",
+        )
+        for method in accepted:
+            with self.subTest(method=method):
+                self.assertTrue(module.codex_payload_progress({
+                    "method": method,
+                    "params": {"threadId": "thread-1", "turnId": "turn-1",
+                               "itemId": "item-1", "delta": "working"},
+                }, "thread-1", "turn-1"))
+        for event in (
+            {"method": "item/agentMessage/delta", "params": {
+                "threadId": "thread-other", "turnId": "turn-1",
+                "itemId": "item-1", "delta": "foreign thread"}},
+            {"method": "item/commandExecution/outputDelta", "params": {
+                "threadId": "thread-1", "turnId": "turn-other",
+                "itemId": "item-1", "delta": "foreign turn"}},
+            {"method": "item/plan/delta", "params": {
+                "threadId": "thread-1", "turnId": "turn-1",
+                "itemId": "item-1", "delta": ""}},
+            {"method": "thread/tokenUsage/updated", "params": {
+                "threadId": "thread-1", "turnId": "turn-1",
+                "tokenUsage": {"totalTokens": 1}}},
+            {"method": "turn/started", "params": {
+                "threadId": "thread-1", "turnId": "turn-1"}},
+            {"method": "thread/name/updated", "params": {
+                "threadId": "thread-1", "turnId": "turn-1", "name": "status"}},
+            {"method": "item/agentMessage/delta", "params": {
+                "threadId": "thread-1", "turnId": "turn-1", "delta": "no item id"}},
+        ):
+            self.assertFalse(module.codex_payload_progress(event, "thread-1", "turn-1"),
+                             event["method"])
+
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / "streaming_delta_app.py"
+            script.write_text(textwrap.dedent("""\
+                import json, sys, time
+                def send(value): print(json.dumps(value), flush=True)
+                for line in sys.stdin:
+                    request = json.loads(line)
+                    if request.get('method') == 'turn/start':
+                        send({'jsonrpc':'2.0','id':request['id'],'result':{'turn':{'id':'turn-1'}}})
+                        for index in range(12):
+                            send({'jsonrpc':'2.0','method':'item/agentMessage/delta','params':{
+                                'threadId':'thread-1','turnId':'turn-1',
+                                'itemId':'message-1','delta':'part'}})
+                            time.sleep(0.05)
+                        send({'jsonrpc':'2.0','method':'item/completed','params':{
+                            'threadId':'thread-1','turnId':'turn-1','item':{
+                                'type':'agentMessage','id':'message-1','text':'done'}}})
+                        send({'jsonrpc':'2.0','method':'turn/completed','params':{
+                            'threadId':'thread-1','turn':{'id':'turn-1','status':'completed'}}})
+            """))
+            server = module.AppServer([sys.executable, str(script)], temp, dict(os.environ))
+            self.addCleanup(server.close)
+            args = SimpleNamespace(worktree=temp, writable_root=[], sandbox="danger-full-access",
+                                   network_access=False, approval="inherit", model=None,
+                                   reasoning=None, owner_input=None)
+            activity = OwnerTurnActivity(
+                lambda: ActivityObservation(False, False, ("quiet",)),
+                window_seconds=0.3, sample_seconds=0.05,
+            )
+            started = time.monotonic()
+            with mock.patch.object(module, "emit"):
+                text, _item = module.run_turn(
+                    server, thread_id="thread-1", prompt="go", args=args, activity=activity)
+            self.assertGreater(time.monotonic() - started, 0.3)
+            self.assertEqual(text, "done")
+
+    def test_transport_exception_clears_the_current_turn_activity(self):
+        from foreground_activity import ActivityObservation
+        from session_supervisor_decisions import OwnerTurnActivity
+        module = load_supervisor_module()
+
+        class BrokenServer:
+            owner_turn_activity = None
+            git_failure_feedback = None
+
+            def request(self, _method, _params):
+                return {"turn": {"id": "turn-1"}}
+
+            def next_event(self):
+                raise module.SupervisorError("app-server-eof")
+
+        server = BrokenServer()
+        activity = OwnerTurnActivity(
+            lambda: ActivityObservation(False, False, ("quiet",)),
+            window_seconds=1, sample_seconds=0.05,
+        )
+        args = SimpleNamespace(worktree="/tmp", writable_root=[], sandbox="danger-full-access",
+                               network_access=False, approval="inherit", model=None,
+                               reasoning=None, owner_input=None)
+        with mock.patch.object(module, "emit"), \
+             self.assertRaisesRegex(module.SupervisorError, "app-server-eof"):
+            module.run_turn(server, thread_id="thread-1", prompt="go", args=args,
+                            activity=activity)
+        self.assertIsNone(server.owner_turn_activity)
+
     def test_token_accounting_events_do_not_hide_confirmed_owner_inactivity(self):
         from foreground_activity import ActivityObservation
         from session_supervisor_decisions import OwnerTurnActivity

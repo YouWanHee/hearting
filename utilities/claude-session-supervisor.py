@@ -80,6 +80,7 @@ import commit_policy
 
 ROOT = Path(__file__).resolve().parents[1]
 TERMINAL_COMMIT_GATE_DEFAULT = False
+MAX_CLAUDE_STREAM_RECORD_BYTES = 16_777_216
 
 
 def terminal_commit_enabled(args: argparse.Namespace) -> bool:
@@ -874,7 +875,7 @@ class ClaudeStreamSession:
             if self.idle_reset and self.owner_activity is None:
                 deadline = time.monotonic() + timeout
             self.output_buffer += chunk
-            if len(self.output_buffer) > 16_777_216:
+            if len(self.output_buffer) > MAX_CLAUDE_STREAM_RECORD_BYTES:
                 raise SupervisorError("claude-stream-message-oversized")
             parsed_event = False
             while b"\n" in self.output_buffer:
@@ -1161,7 +1162,6 @@ def run_turn(
                 args, process, harness="claude", session_id=session_id,
                 window_seconds=timeout,
             )
-            output_buffer = bytearray()
             pending = b""
             final: dict[str, Any] | None = None
             fallback: dict[str, Any] | None = None
@@ -1180,10 +1180,11 @@ def run_turn(
                                 eof = True
                                 selector.unregister(key.fileobj)
                                 continue
-                            output_buffer.extend(chunk)
                             pending += chunk
                             while b"\n" in pending:
                                 raw_line, pending = pending.split(b"\n", 1)
+                                if len(raw_line) > MAX_CLAUDE_STREAM_RECORD_BYTES:
+                                    raise SupervisorError("claude-stream-message-oversized")
                                 try:
                                     value = json.loads(raw_line.decode("utf-8"))
                                 except (UnicodeDecodeError, ValueError):
@@ -1196,6 +1197,8 @@ def run_turn(
                                     fallback = value
                                     if result_answers_turn(value):
                                         final = value
+                            if len(pending) > MAX_CLAUDE_STREAM_RECORD_BYTES:
+                                raise SupervisorError("claude-stream-message-oversized")
                         if activity.expired(payload_progress=payload_progress):
                             raise subprocess.TimeoutExpired(command, timeout)
                     if pending:
@@ -1209,17 +1212,6 @@ def run_turn(
                                 final = value
                 if final is None:
                     final = fallback
-                if final is None:
-                    for line in bytes(output_buffer).splitlines():
-                        try:
-                            value = json.loads(line.decode("utf-8"))
-                        except (UnicodeDecodeError, ValueError):
-                            continue
-                        if isinstance(value, dict) and value.get("type") == "result":
-                            fallback = value
-                            if result_answers_turn(value):
-                                final = value
-                    final = final or fallback
                 if final is None:
                     raise SupervisorError("claude-result-missing")
                 return final, process.wait()

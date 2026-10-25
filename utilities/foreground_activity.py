@@ -42,6 +42,47 @@ class ActivityObservation:
     reasons: tuple[str, ...]
 
 
+OWNER_BINDING_STATUSES = {
+    "owner-route-launch-binding",
+    "owner-route-post-launch-attachment",
+    "owner-route-advance-current",
+}
+
+
+def resolve_owner_activity_binding(jobs: Path, attempt_id: str,
+                                   metadata: Mapping[str, str]):
+    """Resolve the exact route identity shared by an owner observer and lease.
+
+    Depth-1 owners carry ``owner_route_*`` and own no route node. Keep that
+    identity on the existing attachment/adoption lifecycle; stage-shaped
+    route metadata is a conflict, not an owner binding.
+    """
+    from owner_route_binding import (
+        OwnerRouteBinding,
+        resolve_owner_route_lifecycle,
+    )
+
+    if any(metadata.get(key) for key in ("route_id", "route_hash", "route_node")):
+        raise RuntimeError("owner activity has stage-shaped route identity")
+    sealed_values = (
+        metadata.get("owner_route_file", ""),
+        metadata.get("owner_route_id", ""),
+        metadata.get("owner_route_hash", ""),
+    )
+    if any(sealed_values) and not all(sealed_values):
+        raise RuntimeError("owner activity route binding is incomplete")
+    sealed = OwnerRouteBinding(
+        str(Path(sealed_values[0]).resolve(strict=False)),
+        sealed_values[1], sealed_values[2],
+    ) if all(sealed_values) else None
+    binding, status = resolve_owner_route_lifecycle(
+        jobs, owner_attempt_id=attempt_id, sealed_binding=sealed,
+    )
+    if binding is None or status not in OWNER_BINDING_STATUSES:
+        raise RuntimeError(f"owner activity route binding unavailable: {status}")
+    return binding
+
+
 def resolve_activity_policy(worker_type: str | None) -> ActivityPolicy:
     """Resolve the one defaults-backed window; owners never read configuration."""
     if worker_type == "owner":
@@ -154,17 +195,24 @@ def owner_turn_activity(args, process, *, harness: str,
         metadata = dict(row.metadata or {})
         route_id = str(getattr(args, "route_id", "") or "")
         route_hash = str(getattr(args, "route_hash", "") or "")
-        route_node = str(metadata.get("route_node", "") or "")
+        route_file = str(getattr(args, "route_file", "") or "")
         if (
             row.attempt_id != attempt_id
             or row.status not in {"open", "running"}
             or metadata.get("worker_type") != "owner"
-            or metadata.get("route_id") != route_id
-            or (route_hash and metadata.get("route_hash") != route_hash)
-            or not route_node
+            or metadata.get("dispatch_depth") != "1"
             or not metadata.get("log_file")
+            or not route_id or not route_hash or not route_file
         ):
             raise RuntimeError("owner activity attempt identity mismatch")
+        binding = resolve_owner_activity_binding(jobs, attempt_id, metadata)
+        if (
+            binding.route_id != route_id
+            or binding.route_hash != route_hash
+            or str(Path(binding.route_file).resolve(strict=False))
+                != str(Path(route_file).resolve(strict=False))
+        ):
+            raise RuntimeError("owner activity current route binding mismatch")
         pid = int(process.pid)
         proc = Path("/proc") / str(pid)
         start = _stat(proc / "stat")["start"]
@@ -189,8 +237,7 @@ def owner_turn_activity(args, process, *, harness: str,
             metadata={
                 "attempt_id": attempt_id,
                 "route_id": route_id,
-                "route_node": route_node,
-                "route_hash": str(metadata.get("route_hash", "")),
+                "route_hash": route_hash,
                 "runtime_pid": str(pid),
                 "runtime_start": str(start),
             },
@@ -305,11 +352,16 @@ class ForegroundActivityMonitor:
             deadline = float(data["deadline"])
             argv = (Path("/proc") / str(pid) / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
             digest = hashlib.sha256(b"\0".join(argv)).hexdigest()
+            if self.context.owner_turn:
+                from dispatch_completion_join import OWNER_ROUTE_NODE
+                expected_route_node = OWNER_ROUTE_NODE
+            else:
+                expected_route_node = self.context.metadata.get("route_node")
             return (
                 data.get("attempt_id") == attempt
                 and data.get("schema_version") == 1
                 and data.get("route_id") == self.context.metadata.get("route_id")
-                and data.get("route_node") == self.context.metadata.get("route_node")
+                and data.get("route_node") == expected_route_node
                 and math.isfinite(deadline) and deadline > time.time()
                 and _stat(Path("/proc") / str(pid) / "stat")["start"] == start
                 and pgid == pid and _stat(Path("/proc") / str(pid) / "stat")["pgid"] == pgid

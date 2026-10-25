@@ -929,84 +929,84 @@ def run_turn(
     final_item: dict[str, Any] | None = None
     turn_error: dict[str, Any] | None = None
     server.owner_turn_activity = activity
-    while True:
-        event = server.next_event()
-        if "id" in event and "method" in event:
-            raise SupervisorError("app-server-unexpected-request")
-        method = event.get("method")
-        raw_params = event.get("params")
-        event_params = raw_params if isinstance(raw_params, dict) else {}
-        completed_turn = event_params.get("turn")
-        terminal_event = (method == "turn/completed" and isinstance(completed_turn, dict)
-                          and completed_turn.get("id") == turn_id)
-        if activity is not None and not terminal_event and activity.expired(
-                payload_progress=codex_payload_progress(event, thread_id, turn_id)):
-            server.owner_turn_activity = None
-            raise SupervisorError("codex-turn-no-progress")
-        # The exact notification method that carries a same-turn TurnError
-        # ahead of `turn/completed` is not confirmed from observed traffic
-        # (plan.md item 4 sampling found zero structured-error rows); match
-        # on shape (this turn's id + an `error` object) rather than bet on
-        # one method name, so this still works whatever that method is
-        # called. `turn/completed.turn.error` below remains the primary,
-        # confirmed source either way.
-        if event_params.get("turnId") == turn_id and isinstance(
-            event_params.get("error"), dict
-        ):
-            turn_error = event_params["error"]
-        if (method == "thread/tokenUsage/updated"
-                and event_params.get("threadId") == thread_id
-                and event_params.get("turnId") == turn_id):
-            usage = normalize_token_usage(event_params.get("tokenUsage"))
-            if usage is not None:
-                emit({
-                    "type": "dispatch.supervisor.token_usage",
-                    "thread_id": thread_id,
-                    "turn_id": event_params.get("turnId"),
-                    "token_usage": usage,
-                })
-        if method == "item/started" and event_params.get("turnId") == turn_id:
-            raw_item = event_params.get("item")
-            if isinstance(raw_item, dict) and raw_item.get("type") == "commandExecution":
-                emit({"type": "item.started", "item": normalize_item(raw_item)})
-        if method == "item/completed" and event_params.get("turnId") == turn_id:
-            raw_item = event_params.get("item")
-            if isinstance(raw_item, dict):
-                if event_params.get("threadId") == thread_id and feedback is not None:
-                    feedback.consider(thread_id, turn_id, raw_item)
-                item = normalize_item(raw_item)
-                emit({"type": "item.completed", "item": item})
-                if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
-                    final_text = item["text"]
-                    final_item = item
-        completed = event_params.get("turn")
-        if (
-            method == "turn/completed"
-            and isinstance(completed, dict)
-            and completed.get("id") == turn_id
-        ):
-            emit({"type": "dispatch.supervisor.turn.completed", "thread_id": thread_id,
-                  "turn_id": turn_id, "status": completed.get("status")})
-            if completed.get("status") != "completed":
-                server.owner_turn_activity = None
+    try:
+        while True:
+            event = server.next_event()
+            if "id" in event and "method" in event:
+                raise SupervisorError("app-server-unexpected-request")
+            method = event.get("method")
+            raw_params = event.get("params")
+            event_params = raw_params if isinstance(raw_params, dict) else {}
+            completed_turn = event_params.get("turn")
+            terminal_event = (method == "turn/completed" and isinstance(completed_turn, dict)
+                              and completed_turn.get("id") == turn_id)
+            if activity is not None and not terminal_event and activity.expired(
+                    payload_progress=codex_payload_progress(event, thread_id, turn_id)):
+                raise SupervisorError("codex-turn-no-progress")
+            # The exact notification method that carries a same-turn TurnError
+            # ahead of `turn/completed` is not confirmed from observed traffic
+            # (plan.md item 4 sampling found zero structured-error rows); match
+            # on shape (this turn's id + an `error` object) rather than bet on
+            # one method name, so this still works whatever that method is
+            # called. `turn/completed.turn.error` below remains the primary,
+            # confirmed source either way.
+            if event_params.get("turnId") == turn_id and isinstance(
+                event_params.get("error"), dict
+            ):
+                turn_error = event_params["error"]
+            if (method == "thread/tokenUsage/updated"
+                    and event_params.get("threadId") == thread_id
+                    and event_params.get("turnId") == turn_id):
+                usage = normalize_token_usage(event_params.get("tokenUsage"))
+                if usage is not None:
+                    emit({
+                        "type": "dispatch.supervisor.token_usage",
+                        "thread_id": thread_id,
+                        "turn_id": event_params.get("turnId"),
+                        "token_usage": usage,
+                    })
+            if method == "item/started" and event_params.get("turnId") == turn_id:
+                raw_item = event_params.get("item")
+                if isinstance(raw_item, dict) and raw_item.get("type") == "commandExecution":
+                    emit({"type": "item.started", "item": normalize_item(raw_item)})
+            if method == "item/completed" and event_params.get("turnId") == turn_id:
+                raw_item = event_params.get("item")
+                if isinstance(raw_item, dict):
+                    if event_params.get("threadId") == thread_id and feedback is not None:
+                        feedback.consider(thread_id, turn_id, raw_item)
+                    item = normalize_item(raw_item)
+                    emit({"type": "item.completed", "item": item})
+                    if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                        final_text = item["text"]
+                        final_item = item
+            completed = event_params.get("turn")
+            if (
+                method == "turn/completed"
+                and isinstance(completed, dict)
+                and completed.get("id") == turn_id
+            ):
+                emit({"type": "dispatch.supervisor.turn.completed", "thread_id": thread_id,
+                      "turn_id": turn_id, "status": completed.get("status")})
+                if completed.get("status") != "completed":
+                    if feedback is not None:
+                        feedback.finish_turn(turn_id)
+                    raw_completed_error = completed.get("error")
+                    error = (
+                        raw_completed_error
+                        if isinstance(raw_completed_error, dict)
+                        else turn_error
+                    )
+                    payload = _turn_failed_payload(turn_id, error)
+                    emit(payload)
+                    raise TurnFailed(payload)
+                if control is not None:
+                    control.completed(turn_id)
                 if feedback is not None:
                     feedback.finish_turn(turn_id)
-                raw_completed_error = completed.get("error")
-                error = (
-                    raw_completed_error
-                    if isinstance(raw_completed_error, dict)
-                    else turn_error
-                )
-                payload = _turn_failed_payload(turn_id, error)
-                emit(payload)
-                raise TurnFailed(payload)
-            if control is not None:
-                control.completed(turn_id)
-            if feedback is not None:
-                feedback.finish_turn(turn_id)
+                return final_text, final_item
+    finally:
+        if server.owner_turn_activity is activity:
             server.owner_turn_activity = None
-            return final_text, final_item
-
 
 _apply_notice = DECISIONS.apply_notice
 
@@ -1075,7 +1075,7 @@ def context_window_arguments(args: argparse.Namespace) -> list[str]:
 
 
 def codex_payload_progress(event: dict[str, Any], thread_id: str, turn_id: str) -> bool:
-    """Accept only work events bound to this native thread and turn."""
+    """Accept only native work payloads bound to this thread and turn."""
     method = event.get("method")
     params = event.get("params")
     if not isinstance(params, dict):
@@ -1086,6 +1086,15 @@ def codex_payload_progress(event: dict[str, Any], thread_id: str, turn_id: str) 
         return True
     if method in {"item/started", "item/completed"}:
         return isinstance(params.get("item"), dict)
+    if method in {
+        "item/agentMessage/delta",
+        "item/plan/delta",
+        "item/commandExecution/outputDelta",
+    }:
+        item_id = params.get("itemId")
+        delta = params.get("delta")
+        return (isinstance(item_id, str) and bool(item_id)
+                and isinstance(delta, str) and bool(delta))
     return False
 
 

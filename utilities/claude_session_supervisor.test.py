@@ -3099,6 +3099,101 @@ class ActiveTurnDeadlineTest(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
+    def test_process_transport_discards_many_records_and_accepts_final_result_without_newline(self):
+        from foreground_activity import ActivityObservation
+        from session_supervisor_decisions import OwnerTurnActivity
+        script = self.root / "many-records-process.py"
+        script.write_text(
+            "import json,sys\n"
+            "prompt=sys.stdin.read()\n"
+            "record={'type':'assistant','text':'x'*65500}\n"
+            "for _ in range(300): sys.stdout.write(json.dumps(record)+'\\n')\n"
+            "sys.stdout.write(json.dumps({'type':'result','subtype':'success',"
+            "'result':str(len(prompt))}))\n",
+            encoding="utf-8",
+        )
+        record_size = len(json.dumps({"type": "assistant", "text": "x" * 65500}).encode()) + 1
+        self.assertGreater(record_size * 300, 16_777_216)
+        activity = OwnerTurnActivity(
+            lambda: ActivityObservation(True, False, ("active",)),
+            window_seconds=0.3, sample_seconds=0.05,
+        )
+        processes = []
+        prompt_files = []
+        real_popen = supervisor.subprocess.Popen
+        real_temporary_file = supervisor.tempfile.TemporaryFile
+
+        def capture_process(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        def capture_prompt_file(*args, **kwargs):
+            handle = real_temporary_file(*args, **kwargs)
+            prompt_files.append(handle)
+            return handle
+
+        with mock.patch.object(supervisor, "claude_command",
+                               return_value=[sys.executable, str(script)]), \
+             mock.patch.object(supervisor.subprocess, "Popen", side_effect=capture_process), \
+             mock.patch.object(supervisor.tempfile, "TemporaryFile", side_effect=capture_prompt_file), \
+             mock.patch("foreground_activity.owner_turn_activity", return_value=activity):
+            result, rc = supervisor.run_turn(
+                self.args, "session", "p" * 200_000, resume=False, ordinary_owner_turn=True)
+        self.assertEqual((result["result"], rc), ("200000", 0))
+        self.assertEqual(len(processes), 1)
+        self.assertTrue(processes[0].stdout.closed)
+        self.assertTrue(prompt_files[0].closed)
+
+    def test_process_transport_rejects_oversized_unfinished_record_and_closes_handles(self):
+        from foreground_activity import ActivityObservation
+        from session_supervisor_decisions import OwnerTurnActivity
+        received = self.root / "oversized-prompt"
+        script = self.root / "oversized-record-process.py"
+        script.write_text(
+            "import pathlib,sys,time\n"
+            f"pathlib.Path({str(received)!r}).write_text(sys.stdin.read())\n"
+            "sys.stdout.buffer.write(b'x'*2048)\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        activity = OwnerTurnActivity(
+            lambda: ActivityObservation(False, False, ("quiet",)),
+            window_seconds=5, sample_seconds=0.05,
+        )
+        processes = []
+        prompt_files = []
+        real_popen = supervisor.subprocess.Popen
+        real_temporary_file = supervisor.tempfile.TemporaryFile
+
+        def capture_process(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        def capture_prompt_file(*args, **kwargs):
+            handle = real_temporary_file(*args, **kwargs)
+            prompt_files.append(handle)
+            return handle
+
+        with mock.patch.object(supervisor, "MAX_CLAUDE_STREAM_RECORD_BYTES", 1024), \
+             mock.patch.object(supervisor, "claude_command",
+                               return_value=[sys.executable, str(script)]), \
+             mock.patch.object(supervisor.subprocess, "Popen", side_effect=capture_process), \
+             mock.patch.object(supervisor.tempfile, "TemporaryFile", side_effect=capture_prompt_file), \
+             mock.patch("foreground_activity.owner_turn_activity", return_value=activity):
+            with self.assertRaisesRegex(supervisor.SupervisorError,
+                                        "claude-stream-message-oversized"):
+                supervisor.run_turn(
+                    self.args, "session", "ambiguous-prompt", resume=False,
+                    ordinary_owner_turn=True)
+        self.assertEqual(received.read_text(), "ambiguous-prompt")
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
+        self.assertTrue(processes[0].stdout.closed)
+        self.assertTrue(prompt_files[0].closed)
+
 
 class TerminalCommitActivationTests(unittest.TestCase):
     """§13.53.2: both halves of the checked support must hold.
