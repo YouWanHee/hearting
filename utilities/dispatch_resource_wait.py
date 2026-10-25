@@ -139,7 +139,8 @@ def start_binding(route, route_file, args, environ):
             phase=state.phase, outbox=state.outbox, resource=resource)
     args.jobs, args.parent_attempt_id = str(jobs), attempt
     return {"parent_attempt_id": attempt, "session_id": session,
-        "harness": row.metadata.get("harness"), "route_id": route["route_id"],
+        **({"harness": row.metadata["harness"]} if row.metadata.get("harness") else {}),
+        "route_id": route["route_id"],
         "route_hash": route["route_hash"], "jobs": str(jobs),
         "owner_pid": parent.pid, "owner_start": parent.pid_start,
         **({"launch_scope": "codex-owner-controller"} if row.metadata.get("harness") == "codex" else {})}
@@ -369,8 +370,8 @@ def pending_prompt(path, parent, args=None, control=None):
     if not box:
         return None
     row = None
+    receipt = box["receipt"]
     if args is not None and control is not None:
-        receipt = box["receipt"]
         expected = {"parent_attempt_id": parent, "session_id": control.thread_id,
                     "route_id": args.route_id, "route_hash": args.route_hash,
                     "jobs": str(Path(args.jobs).resolve())}
@@ -404,7 +405,8 @@ def pending_prompt(path, parent, args=None, control=None):
         "Continue only the already authorized next work; do not restart the resource.")
     return ("Runtime resource receipt (not a model child or verification PASS): "
         + json.dumps(box["receipt"], sort_keys=True, separators=(",", ":"))
-        + _experiment_result_note(row)
+        + (receipt["experiment_result"] if "experiment_result" in receipt
+           else _experiment_result_note(row or receipt))
         + "\nUse pending user corrections first. " + next_work + " Exit is not workflow completion.")
 
 
@@ -515,6 +517,7 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
                     "resource-watch-lost" if lost_watch and not evidence.get("terminal") else stage.get("state"),
                 **({"launch_error": receipt_row["launch_error"]} if receipt_row.get("launch_error") else {}),
                 "verification_pass": False, "workflow_complete": False,
+                "experiment_result": _experiment_result_note(receipt_row),
                 "successors": list(armed["successors"]) if proven else []}
             digest = RESUME.row_digest(receipt)
             resource["outbox"] = {"receipt_id": "resource-" + digest[:32], "digest": digest,
