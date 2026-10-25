@@ -1522,7 +1522,7 @@ closure exists. An ordinarily closed route uses the existing compose surface to
 open a new route. The agreed exception is a rejected settlement from an owner
 whose PASS is proven by the shared verdict reader: it keeps the existing
 compose guidance until same-route PASS-settlement recovery is implemented.
-Observation failure is never treated as closure or PASS. Old PASS markers are
+An observation failure counts as neither closure nor PASS. Old PASS markers are
 provenance, not authority for new bytes. These choices add no flag, required
 input, gate or approval, and the same resource judgment serves owner settlement
 and workflow completion on all three harnesses.
