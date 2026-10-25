@@ -8063,46 +8063,85 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
 
 
 def _discover_session_notice_duties(store):
-    """Recover old open notices; return False when discovery is unavailable."""
+    """Recover usable old notices; False keeps partial discovery with this runner."""
     import dispatch_pending_delivery as pending
     import session_notice
-    from dispatch_seat_handover import (_registered_parent_harness, latest_rows,
+    from dispatch_registry_cache import registry_snapshot
+    from dispatch_seat_handover import (_registered_parent_harness,
                                         lineage_graph, record_recipient)
     state_root = store.root.parent.parent.resolve()
     jobs = state_root / "jobs.log"
+    observed = True
+    candidates = set()
     try:
-        candidates = set(lineage_graph().ledger_keys)
+        candidates.update(lineage_graph().ledger_keys)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         # Unavailable authority cannot authorize notices or abandon the runner's
         # other accepted work. Retry discovery on its next ordinary pass.
-        return False
+        observed = False
     try:
-        for status, meta in latest_rows(jobs).values():
+        # The compatibility latest_rows helper hides unavailable reads as {}.
+        # Use the same parser's complete snapshot and keep its usable rows.
+        snapshot = registry_snapshot(jobs)
+        observed = snapshot.complete and observed
+        for status, meta in snapshot.view.handover_latest().values():
             sid = str(meta.get("parent_sid") or "")
             harness = _registered_parent_harness(meta)
             if sid and harness:
                 candidates.add((harness, sid))
-    except (OSError, ValueError, KeyError, RuntimeError):
-        pass
+    except FileNotFoundError:
+        pass  # Route-free notices do not require a jobs registry.
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        observed = False
     for harness, storage_sid in candidates:
+        entries = []
         try:
-            entries = sorted(pending.record_directory(state_root, storage_sid).glob("delivery-*.json"))
-        except (OSError, pending.PendingDeliveryError):
+            directory = pending.record_directory(state_root, storage_sid)
+            info = directory.stat()
+        except FileNotFoundError:
             continue
-        for entry in entries:
+        except (OSError, pending.PendingDeliveryError):
+            observed = False
+            continue
+        try:
+            if not stat.S_ISDIR(info.st_mode):
+                raise OSError("pending-directory-unavailable")
+            # glob/is_file can suppress observation errors. Preserve entries
+            # already yielded even if enumeration subsequently becomes partial.
+            for entry in directory.iterdir():
+                if entry.name.startswith("delivery-") and entry.suffix == ".json":
+                    entries.append(entry)
+        except OSError:
+            observed = False
+        for entry in sorted(entries):
             try:
+                try:
+                    info = entry.stat()
+                except FileNotFoundError:
+                    continue  # A removed record is ordinary absence.
+                if not stat.S_ISREG(info.st_mode):
+                    raise OSError("pending-record-unavailable")
                 record = pending.read(state_root, storage_sid, entry.stem)
-                if (not record or record.get("state") not in pending.OPEN_STATES
-                        or record.get("receipt", {}).get("kind") != "notice"
-                        or not record.get("recipient_kind")):
+                if not record or record.get("state") not in pending.OPEN_STATES:
+                    continue
+                receipt = record.get("receipt", {})
+                if not isinstance(receipt, dict):
+                    observed = False
+                    continue
+                kind = receipt.get("kind")
+                if kind is not None and not isinstance(kind, str):
+                    observed = False
+                    continue
+                if kind != "notice":
                     continue
                 session_notice.validate_pending_record(record)
                 if record_recipient(record, storage_sid, harness=harness) is None:
+                    observed = False
                     continue
                 peer_obligations.retain_session_notice(jobs, harness, storage_sid, record)
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
-                continue
-    return True
+                observed = False
+    return observed
 
 
 def _resume_session_notice_obligations(duties, store, *, read_context=None,

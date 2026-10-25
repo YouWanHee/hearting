@@ -48,6 +48,7 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
 
     def exercise(self, failure="read-none", *, legacy=False, service=False,
                  replace_lock=False, historical=False, no_resend=None):
+        inventory = failure.startswith("pending-") or failure.startswith("receipt-")
         store, message = self.pending_message()
         if historical or no_resend and no_resend != "fenced":
             notice, ref, _ = self.prepared_notice("claude", "A", "B", "runner-outage")
@@ -76,6 +77,21 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
         failed_path = tidy._ledger_path(other)
         directory = failed_path.parent
         ledger_before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in directory.iterdir()}
+        broken_path = None
+        if inventory:
+            # Another candidate can be unavailable while A's accepted notice
+            # still progresses. Legacy recovery instead fails A's only copy.
+            import session_notice
+            with mock.patch.object(steward.peer_obligations, "retain_session_notice", return_value=False):
+                other_notice = session_notice.notify("claude", "other", key="inventory-other",
+                    subject="fixture", text="private", jobs=self.jobs_path)
+            broken_path = pending.record_path(self.tmp_root, "other", other_notice["delivery_id"])
+            broken_path.write_text(json.dumps(dict(other_notice, receipt={})))
+            failed_path = (pending.record_path(self.tmp_root, "A", notice["delivery_id"])
+                           if legacy else broken_path)
+            directory = failed_path.parent
+        observed_path_before = ((failed_path.read_bytes(), failed_path.stat().st_mtime_ns)
+                                if inventory else None)
         notice_before = pending.read(self.tmp_root, "A", notice["delivery_id"])
         identity = pending.received_ack_identity(notice_before, "A", notice["delivery_id"])
         handover._LINEAGE_GRAPH_CACHE.clear()  # Cold graph; writer retention used the healthy generation.
@@ -84,6 +100,8 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
         watch_calls, batch_calls, external_passes, read_contexts = [], [], [], []
         started = threading.Event()
         real_read, real_stat, real_lstat, real_iterdir = tidy.read_bytes, Path.stat, Path.lstat, Path.iterdir
+        real_text = Path.read_text
+        real_recipient = handover.record_recipient
         real_begin = steward.peer_obligations.ObligationStore.begin_read_pass
         real_discovery, real_readiness = steward._discover_session_notice_duties, steward._runner_readiness_loop
         real_reconcile = steward._reconcile_obligations
@@ -102,8 +120,10 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
             return real_read(path)
 
         def stat(path, *args, **kwargs):
-            if unavailable and failure == "directory-stat" and path == directory:
+            if unavailable and failure in {"directory-stat", "pending-directory-stat"} and path == directory:
                 raise PermissionError("fixture lineage directory stat")
+            if unavailable and failure == "pending-record-stat" and path == failed_path:
+                raise PermissionError("fixture pending record stat")
             return real_stat(path, *args, **kwargs)
 
         def lstat(path, *args, **kwargs):
@@ -112,9 +132,25 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
             return real_lstat(path, *args, **kwargs)
 
         def iterdir(path):
-            if unavailable and failure == "enumeration" and path == directory:
+            if unavailable and failure in {"enumeration", "pending-enumeration"} and path == directory:
                 raise PermissionError("fixture lineage enumeration")
             return real_iterdir(path)
+
+        def read_text(path, *args, **kwargs):
+            if unavailable and inventory and path == failed_path:
+                if failure == "pending-read":
+                    raise PermissionError("fixture pending read")
+                if failure == "pending-parse":
+                    return '{"receipt":'
+                if failure.startswith("receipt-"):
+                    body = {"null": None, "list": [], "string": "notice", "scalar": 7, "bool": True}
+                    return json.dumps(dict(json.loads(real_text(path)), receipt=body[failure[8:]]))
+            return real_text(path, *args, **kwargs)
+
+        def recipient(record, storage_sid, **kwargs):
+            if unavailable and failure == "pending-unresolved" and storage_sid == "A":
+                return None
+            return real_recipient(record, storage_sid, **kwargs)
 
         def begin(current):
             real_begin(current)
@@ -178,8 +214,15 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
                     fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertEqual(store.get(message["id"])["state"], "complete")
             if len(delays) <= 2:
-                native.assert_not_called()
-                self.assertEqual(handover._LINEAGE_GRAPH_CACHE, {})
+                if inventory and legacy:
+                    self.assertEqual(observed_path_before,
+                                     (failed_path.read_bytes(), real_stat(failed_path).st_mtime_ns))
+                if not inventory or legacy or historical or no_resend:
+                    native.assert_not_called()
+                else:
+                    self.assertEqual(native.call_count, 1, "usable notice progresses during partial inventory")
+                if not inventory:
+                    self.assertEqual(handover._LINEAGE_GRAPH_CACHE, {})
             if historical and len(delays) == 1:
                 receive_exact()  # Exact historical receipt settles while authority is unknown.
             if len(delays) == 2:
@@ -202,6 +245,8 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
                     mock.patch.object(Path, "stat", new=stat),
                     mock.patch.object(Path, "lstat", new=lstat),
                     mock.patch.object(Path, "iterdir", new=iterdir),
+                    mock.patch.object(Path, "read_text", new=read_text),
+                    mock.patch.object(handover, "record_recipient", side_effect=recipient),
                     mock.patch.object(steward.peer_obligations.ObligationStore, "begin_read_pass", new=begin),
                     mock.patch.object(steward, "_discover_session_notice_duties", side_effect=discover),
                     mock.patch.object(steward, "_reconcile_obligations", side_effect=reconcile),
@@ -253,6 +298,10 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
         for context in contexts:
             context.close.assert_called_once()
         self.assertEqual(ledger_before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in ledger_before})
+        if inventory and not legacy:
+            self.assertEqual(observed_path_before,
+                             (failed_path.read_bytes(), failed_path.stat().st_mtime_ns),
+                             "unrelated failed observations are read-only")
         final = pending.read(self.tmp_root, "A", notice["delivery_id"])
         self.assertEqual(pending.received_ack_identity(final, "A", notice["delivery_id"]), identity)
         if replace_lock or no_resend:
@@ -311,6 +360,217 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
 
     def test_fenced_notice_is_not_resent(self):
         self.exercise(no_resend="fenced")
+
+    def test_pending_directory_stat_keeps_useful_work(self):
+        self.exercise("pending-directory-stat")
+
+    def test_pending_record_stat_keeps_useful_work(self):
+        self.exercise("pending-record-stat")
+
+    def test_pending_enumeration_keeps_useful_work(self):
+        self.exercise("pending-enumeration")
+
+    def test_pending_read_keeps_useful_work(self):
+        self.exercise("pending-read")
+
+    def test_pending_parse_keeps_useful_work(self):
+        self.exercise("pending-parse")
+
+    def test_null_receipt_keeps_useful_work(self):
+        self.exercise("receipt-null")
+
+    def test_list_receipt_keeps_useful_work(self):
+        self.exercise("receipt-list")
+
+    def test_string_receipt_keeps_useful_work(self):
+        self.exercise("receipt-string")
+
+    def test_scalar_receipt_keeps_useful_work(self):
+        self.exercise("receipt-scalar")
+
+    def test_bool_receipt_keeps_useful_work(self):
+        self.exercise("receipt-bool")
+
+    def test_partial_legacy_inventory_waits_for_same_bytes_recovery(self):
+        self.exercise("pending-read", legacy=True)
+
+    def test_unresolved_legacy_recipient_keeps_existing_wait_and_authority(self):
+        self.exercise("pending-unresolved", legacy=True)
+
+    def test_partial_inventory_service_replacement_closes_worker_and_context(self):
+        self.exercise("pending-read", service=True)
+
+    def test_partial_inventory_replaced_lock_preserves_work(self):
+        self.exercise("pending-enumeration", legacy=True, replace_lock=True)
+
+    def test_partial_inventory_historical_receipt_still_settles_exactly(self):
+        self.exercise("pending-read", historical=True)
+
+    def test_partial_inventory_prepared_notice_is_not_resent(self):
+        self.exercise("pending-read", no_resend="pending")
+
+    def test_partial_inventory_queued_notice_is_not_resent(self):
+        self.exercise("pending-read", no_resend="queued")
+
+    def test_partial_inventory_unverified_notice_is_not_resent(self):
+        self.exercise("pending-read", no_resend="unverified")
+
+    def test_partial_inventory_missing_notice_is_not_resent(self):
+        self.exercise("pending-read", no_resend="missing")
+
+    def test_partial_inventory_fenced_notice_is_not_resent(self):
+        self.exercise("pending-read", no_resend="fenced")
+
+
+class ScannerInventoryObservationTest(peer._TmpRootMixin, unittest.TestCase):
+    notice = RunnerDiscoveryObservationTest.notice
+    edge = RunnerDiscoveryObservationTest.edge
+    store = RunnerDiscoveryObservationTest.store
+    duties = RunnerDiscoveryObservationTest.duties
+
+    def setUp(self):
+        super().setUp()
+        os.environ["AGENT_HOME"] = str(ROOT)
+        handover._LINEAGE_GRAPH_CACHE.clear()
+
+    def legacy_notice(self, sid="A"):
+        with mock.patch.object(steward.peer_obligations, "retain_session_notice", return_value=False):
+            return self.notice(sid=sid, key="inventory-" + sid)
+
+    def snapshot(self, paths):
+        return {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in paths}
+
+    def test_bad_records_before_and_after_valid_notice_do_not_abort_or_prove_empty(self):
+        record = self.legacy_notice()
+        seat = self.edge("claude", "A", "B")
+        good = pending.record_path(self.tmp_root, "A", record["delivery_id"])
+        others = [good.parent / ("delivery-" + key + ".json") for key in ("000", "zzz")]
+        for path in others:
+            path.write_text(json.dumps(dict(record, delivery_id=path.stem, receipt={})))
+        paths = [good, *others, tidy._ledger_path(seat), self.jobs_path]
+        before = self.snapshot(paths)
+        real_read = Path.read_text
+        variants = [dict(record, receipt=body) for body in (None, [], "notice", 1, True)]
+        variants += [dict(record, **{key: value}) for key, value in (
+            ("receipt", {"kind": "notice"}), ("receipt", {"kind": []}),
+            ("state", []), ("state", {}), ("recipient_kind", []),
+            ("receipt_digest", "wrong"), (pending.SUBMISSION_FENCE_FIELD, None),
+            (pending.SUBMISSION_FENCE_FIELD, []), (pending.COURIER_RETRY_FIELD, []),
+            (pending.COURIER_RETRY_FIELD, {"context_digest": []}))]
+        variants += [{k: v for k, v in record.items() if k != "receipt"}, [], None, "truncated"]
+        for bad_path in others:
+            for index, body in enumerate(variants):
+                with self.subTest(position=bad_path.name, variant=index):
+                    touched = []
+                    def read(path, *args, **kwargs):
+                        if path in [good, *others]:
+                            touched.append(path)
+                        if path == bad_path:
+                            return '{"receipt":' if body == "truncated" else json.dumps(body)
+                        return real_read(path, *args, **kwargs)
+                    with mock.patch.object(Path, "read_text", new=read):
+                        self.assertFalse(steward._discover_session_notice_duties(self.store()))
+                    self.assertEqual(set(touched), set([good, *others]))
+                    self.assertEqual(len(self.duties()), 1, "valid legacy notice retained despite other input")
+                    self.assertEqual(self.duties()[0]["intent"]["identity"]["delivery_id"], record["delivery_id"])
+                    self.assertEqual(before, self.snapshot(paths))
+        self.assertTrue(steward._discover_session_notice_duties(self.store()))
+
+    def test_legacy_nonnotice_terminal_and_claim_fields_keep_existing_formats(self):
+        record = self.legacy_notice()
+        self.edge("claude", "A", "B")
+        path = pending.record_path(self.tmp_root, "A", record["delivery_id"])
+        real_read = Path.read_text
+        cases = [dict(record, receipt=body) for body in ({}, {"kind": "completion"}, {"result": "PASS"})]
+        cases += [dict(record, state="acked", receipt=None, claim_authority="deliverer-unproven")]
+        cases += [{k: v for k, v in dict(record, receipt={}).items() if k != "claim_authority"}]
+        # The current pending format permits these claim fields. Discovery does
+        # not invent a stricter schema or use them as native-send authority.
+        cases += [dict(record, claim_owner=[], claim_deadline_ns={})]
+        before = self.snapshot([path, self.jobs_path])
+        for index, body in enumerate(cases):
+            with self.subTest(case=index), mock.patch.object(Path, "read_text", new=lambda p,*a,**kw:
+                    json.dumps(body) if p == path else real_read(p,*a,**kw)):
+                self.assertTrue(steward._discover_session_notice_duties(self.store()))
+        self.assertEqual(before, self.snapshot([path, self.jobs_path]))
+
+    def test_partial_enumeration_keeps_already_yielded_usable_candidates(self):
+        record = self.legacy_notice()
+        self.edge("claude", "A", "B")
+        path = pending.record_path(self.tmp_root, "A", record["delivery_id"])
+        real_iterdir = Path.iterdir
+        def iterdir(directory):
+            if directory == path.parent:
+                def partial():
+                    yield path
+                    raise PermissionError("fixture late enumeration failure")
+                return partial()
+            return real_iterdir(directory)
+        with mock.patch.object(Path, "iterdir", new=iterdir):
+            self.assertFalse(steward._discover_session_notice_duties(self.store()))
+        self.assertEqual(len(self.duties()), 1)
+
+    def test_registry_failure_keeps_graph_candidates_and_recovers_same_generation(self):
+        import dispatch_registry_cache as cache
+        record = self.legacy_notice()
+        self.edge("claude", "A", "B")
+        other = self.legacy_notice("registry-only")
+        self.jobs_path.write_text("now\trunning\t/w\t/w\tfixture\tattempt_id=fixture,parent_sid=registry-only,parent_harness=claude\n")
+        paths = [self.jobs_path, pending.record_path(self.tmp_root, "A", record["delivery_id"]),
+                 pending.record_path(self.tmp_root, "registry-only", other["delivery_id"])]
+        before = self.snapshot(paths)
+        real_stat = Path.stat
+        def stat(path, *a, **kw):
+            if path == self.jobs_path:
+                raise PermissionError("fixture registry stat")
+            return real_stat(path, *a, **kw)
+        cache.clear_cache()
+        with mock.patch.object(Path, "stat", new=stat):
+            self.assertFalse(steward._discover_session_notice_duties(self.store()))
+        self.assertTrue(steward._discover_session_notice_duties(self.store()))
+        self.assertEqual({d["intent"]["identity"]["storage_sid"] for d in self.duties()}, {"A", "registry-only"})
+        self.assertEqual(before, self.snapshot(paths))
+
+    def test_partial_registry_text_preserves_usable_rows(self):
+        record = self.legacy_notice("registry-only")
+        row = b"now\trunning\t/w\t/w\tfixture\tattempt_id=fixture,parent_sid=registry-only,parent_harness=claude\n"
+        for suffix in (b"partial", b"bad\n", b"\xff\n"):
+            with self.subTest(suffix=suffix):
+                self.jobs_path.write_bytes(row + suffix)
+                before = self.snapshot([self.jobs_path])
+                self.assertFalse(steward._discover_session_notice_duties(self.store()))
+                self.assertEqual(len(self.duties()), 1)
+                self.assertEqual(before, self.snapshot([self.jobs_path]))
+
+    def test_absent_registry_does_not_block_valid_route_free_notice(self):
+        self.legacy_notice()
+        self.edge("claude", "A", "B")
+        self.jobs_path.unlink()
+        self.assertTrue(steward._discover_session_notice_duties(self.store()))
+        self.assertEqual(len(self.duties()), 1)
+
+    def test_healthy_missing_and_empty_pending_inventory_normally_exit(self):
+        store = self.store()
+        tidy._append_ledger_entry(tidy.Seat("pane", "empty"), dict(event="start", harness="claude", sid="empty"))
+        directory = pending.record_directory(self.tmp_root, "empty")
+        for present in (False, True):
+            if present:
+                directory.mkdir(parents=True)
+            with self.subTest(present=present), contextlib.ExitStack() as stack:
+                for patch in (mock.patch.object(steward, "_runner_readiness_loop"),
+                        mock.patch.object(steward, "_external_obligation_snapshot", return_value={}),
+                        mock.patch.object(steward, "_external_obligation_signature", return_value=()),
+                        mock.patch.object(steward, "_external_obligation_snapshot_unchanged", return_value=True),
+                        mock.patch.object(steward, "_reconcile_external_obligations"),
+                        mock.patch.object(steward, "_publish_watch_readiness")):
+                    stack.enter_context(patch)
+                sleep = stack.enter_context(mock.patch.object(steward.time, "sleep"))
+                self.assertTrue(steward._discover_session_notice_duties(store))
+                with (store.root/steward.peer_obligations.RUNNER_LOCK_NAME).open("w") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    self.assertEqual(steward.cmd_obligation_runner(SimpleNamespace(
+                        state_root=self.tmp_root, lock_fd=lock.fileno())), 0)
+                sleep.assert_not_called()
 
 
 class FleetDuplicateObservationTest(peer._TmpRootMixin, unittest.TestCase):
