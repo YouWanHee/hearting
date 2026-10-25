@@ -32,9 +32,8 @@ Two questions, two functions:
   registered ``parent_sid``) hold records addressed to B, and for which attempts.
 
 Both answers come from one lineage judgment (:func:`_lineage_holder`), so delivery and resume
-authority never disagree.  Both answer "the registered parent" whenever there is no relation, so a call without a
-handover behaves exactly as before.  No failure here may block a caller: every public
-function returns the registered answer on any error.
+authority never disagree. Both answer "the registered parent" when usable state has no
+relation. Unavailable lineage leaves authority unresolved until observation recovers.
 """
 
 from __future__ import annotations
@@ -82,13 +81,23 @@ class LineageGraph:
 
 
 def _lineage_signature(directory: Path):
+    location = str(directory.resolve(strict=False))
     try:
-        files = tuple((path.name, path.stat().st_mtime_ns, path.stat().st_size)
-                      for path in sorted(directory.glob("*.jsonl"))
-                      if path.is_file() and not path.is_symlink())
-        return str(directory.resolve(strict=False)), files
-    except OSError:
-        return str(directory.resolve(strict=False)), ()
+        info = directory.stat()
+    except FileNotFoundError:
+        return location, ()
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError("lineage-directory-unavailable")
+    files = []
+    # glob/is_file can suppress observation failures and resemble an empty scan.
+    for path in sorted(directory.iterdir()):
+        if path.suffix != ".jsonl":
+            continue
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("lineage-ledger-unavailable")
+        files.append((path.name, info.st_mtime_ns, info.st_size))
+    return location, tuple(files)
 
 
 def _build_lineage_graph(read_context=None) -> LineageGraph:
@@ -119,6 +128,8 @@ def _build_lineage_graph_uncached(signature) -> LineageGraph:
         ledger_key = Path(filename).stem
         seat = st.Seat("pane", ledger_key)
         rows = st._read_ledger_lines(seat)
+        if not getattr(rows, "usable", True):
+            raise OSError("lineage-ledger-unavailable")
         rows_by_key[ledger_key] = rows
         for index, row in enumerate(rows):
             row_harness, row_sid = row.get("harness"), row.get("sid")
@@ -189,8 +200,11 @@ def lineage_graph(*, read_context=None) -> LineageGraph:
 
 
 def chain_end(harness: str, sid: str, *, read_context=None) -> tuple[str, str]:
-    """Return the unique chain end, or ``(sid, 'unresolved')`` for ambiguity/cycles."""
-    return _chain_end(lineage_graph(read_context=read_context), harness, sid)
+    """Return the unique end, or unresolved for ambiguity or unavailable observation."""
+    try:
+        return _chain_end(lineage_graph(read_context=read_context), harness, sid)
+    except (OSError, ValueError, TypeError):
+        return sid, "unresolved"
 
 
 def _chain_end(graph: LineageGraph, harness: str, sid: str) -> tuple[str, str]:
@@ -1120,8 +1134,8 @@ def _effective(meta: dict, jobs=None, *, read_context=None, extra_seats=()) -> t
         holder, holder_harness, state = _lineage_holder(
             {}, key, registered, harness, read_context=read_context)
         return ("" if state == "unresolved" else holder), holder_harness
-    except Exception:  # noqa: BLE001 - the registered answer is always safe
-        return registered, _registered_parent_harness(meta)
+    except Exception:  # noqa: BLE001 - incomplete observation grants no current authority
+        return "", harness
 
 
 def _registered_parent_harness(meta: dict) -> str:
@@ -1228,8 +1242,7 @@ def lineage_effect_lock(meta: dict, jobs, expected_parent: str, *, wait: float =
 
 def effective_parent(meta: dict, jobs=None, *, read_context=None) -> str:
     """The session that answers for ``meta``'s attempt now: the registered ``parent_sid``, or
-    the end of its handover lineage. An observed unresolved lineage has no authority;
-    unreadable handover state retains the legacy registered-parent fallback."""
+    the end of its handover lineage. Unresolved or unavailable lineage has no authority."""
     return _effective(meta, jobs, read_context=read_context)[0]
 
 
@@ -1240,6 +1253,14 @@ def effective_parent_harness(meta: dict, jobs=None, *, read_context=None) -> str
 
 def record_recipient(record: dict, storage_key: str, *, harness: str,
                      jobs=None, read_context=None) -> Optional[str]:
+    """SID-only compatibility projection of the common current recipient binding."""
+    binding = record_recipient_binding(record, storage_key, harness=harness,
+                                       jobs=jobs, read_context=read_context)
+    return binding[1] if binding is not None else None
+
+
+def record_recipient_binding(record: dict, storage_key: str, *, harness: str,
+                             jobs=None, read_context=None) -> Optional[tuple[str, str]]:
     """Resolve one stored record through its immutable identity and current lineage.
 
     Route-free notices use their validated receipt and the storage SID's chain.
@@ -1256,7 +1277,7 @@ def record_recipient(record: dict, storage_key: str, *, harness: str,
         except (ImportError, ValueError, TypeError, KeyError, AttributeError):
             return None
         end, state = chain_end(harness, storage_key, read_context=read_context)
-        return None if state == "unresolved" else end
+        return None if state == "unresolved" else (harness, end)
     ids = record.get("attempt_ids")
     if not isinstance(ids, list) or not ids or any(not isinstance(item, str) for item in ids):
         return None
@@ -1289,7 +1310,10 @@ def record_recipient(record: dict, storage_key: str, *, harness: str,
         if state == "unresolved":
             return None
         targets.add((target, target_harness))
-    return next(iter(targets))[0] if len(targets) == 1 else None
+    if len(targets) != 1:
+        return None
+    sid, current_harness = next(iter(targets))
+    return current_harness, sid
 
 
 _OWN_SEATS: dict = {}
@@ -1317,9 +1341,7 @@ def owns(meta: dict, session: str, jobs=None, *, read_context=None) -> bool:
     Without a registry that is the registered parent.  With one it is the end of the
     handover lineage, so a registered parent that handed the job on no longer owns it.
     For the caller's own session its own seat is read too, like
-    :func:`storage_recipients`.  If the handover state cannot be read, ``_effective``
-    deliberately falls back to the registered parent, preserving the existing safe
-    default.
+    :func:`storage_recipients`. Unavailable lineage leaves current authority unresolved.
     """
     if not session:
         return False

@@ -223,10 +223,11 @@ class PendingDeliveryCountsTest(unittest.TestCase):
                 "live": set(live),
             }
         def resolve_recipient(_record, key, *, harness, read_context=None):
-            return (recipient_by_storage or {}).get(key, recipient_sid)
+            sid = (recipient_by_storage or {}).get(key, recipient_sid)
+            return (harness, sid) if sid is not None else None
 
         with mock.patch("dispatch_seat_handover.lineage_graph", return_value=graph), \
-                mock.patch("dispatch_seat_handover.record_recipient",
+                mock.patch("dispatch_seat_handover.record_recipient_binding",
                            side_effect=resolve_recipient):
             counts = dispatch._pending_delivery_counts(
                 paths, session_observation=session_observation)
@@ -245,8 +246,8 @@ class PendingDeliveryCountsTest(unittest.TestCase):
             "live": set(),
         }
         with mock.patch("dispatch_seat_handover.lineage_graph", return_value=graph), \
-                mock.patch("dispatch_seat_handover.record_recipient",
-                           return_value=recipient_sid):
+                mock.patch("dispatch_seat_handover.record_recipient_binding",
+                           return_value=("claude", recipient_sid) if recipient_sid is not None else None):
             return dispatch._pending_delivery_counts(
                 [str(self.jobs_path)], session_observation=observation)
 

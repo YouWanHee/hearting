@@ -598,14 +598,46 @@ def _ledger_path(seat: Seat) -> Path:
     return state_root() / "sessions" / f"{seat.key}.jsonl"
 
 
+class _LedgerLines(list):
+    """Legacy row list with observation health for authority readers."""
+    usable = True
+
+
 def _read_ledger_lines(seat: Seat) -> list[dict]:
     raw = read_bytes(_ledger_path(seat))
-    entries = []
+    entries = _LedgerLines()
+    entries.usable = raw is not None
+    if raw is not None:
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            entries.usable = False
     for line in (raw or b"").decode("utf-8", "replace").splitlines():
+        if not line.strip():
+            continue
         try:
             item = json.loads(line)
         except ValueError:
+            entries.usable = False
             continue
+        if not isinstance(item, dict):
+            entries.usable = False
+            continue
+        event, source = item.get("event"), item.get("source")
+        if event in ("handover", "succession") and not isinstance(source, str):
+            entries.usable = False
+        relation = (event == "succession" and (source is None or source == "tidy-clear")
+                    or event == "handover" and (source is None or isinstance(source, str)
+                        and source in {"clear", "reservation", "first-message", "retire"}))
+        if relation:
+            origin = item.get("from")
+            if isinstance(origin, dict):
+                origin = origin.get("sid") if (source == "retire"
+                    or origin.get("harness") == item.get("harness")) else None
+            if (not source or not all(isinstance(value, str) and value
+                                      for value in (item.get("harness"), item.get("sid"), origin))
+                    or not isinstance(item.get("bindings", []), list)):
+                entries.usable = False
         if isinstance(item, dict) and item.get("sid"):
             entries.append(item)
     return entries

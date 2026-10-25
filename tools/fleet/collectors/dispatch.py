@@ -3975,6 +3975,7 @@ def _pending_delivery_counts(paths, *, session_observation=None):
         try:
             root = dispatch_state_root(path)
         except (OSError, TypeError, ValueError):
+            no_recipient_unknown = True
             continue
         if root in seen_roots:
             continue
@@ -3995,18 +3996,36 @@ def _pending_delivery_counts(paths, *, session_observation=None):
                     "observing", "delivery-pending", "unknown"}:
                 retained_batch_duties += 1
         pending_root = root / "pending-delivery"
-        if not pending_root.is_dir():
-            continue
         try:
-            record_files = list(pending_root.glob("*/*.json"))
-        except OSError:
+            info = pending_root.stat()
+        except FileNotFoundError:
             continue
+        except OSError:
+            no_recipient_unknown = True
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            no_recipient_unknown = True
+            continue
+        record_files = []
+        try:
+            # Explicit enumeration preserves failures that glob can suppress.
+            for recipient_dir in sorted(pending_root.iterdir()):
+                try:
+                    if stat.S_ISDIR(recipient_dir.stat().st_mode):
+                        record_files.extend(sorted(path for path in recipient_dir.iterdir()
+                                                   if path.suffix == ".json"))
+                except OSError:
+                    no_recipient_unknown = True
+        except OSError:
+            no_recipient_unknown = True
         for record_file in record_files:
             try:
                 record = json.loads(record_file.read_text(encoding="utf-8"))
             except (OSError, ValueError):
+                no_recipient_unknown = True
                 continue
             if not isinstance(record, dict):
+                no_recipient_unknown = True
                 continue
             delivery_id = record.get("delivery_id")
             recipient_digest = record.get("recipient_digest")
@@ -4070,13 +4089,13 @@ def _pending_delivery_counts(paths, *, session_observation=None):
                         continue
                     seen_no_recipient.add(identity)
                     try:
-                        from dispatch_seat_handover import record_recipient
-                        recipient_sid = record_recipient(record, storage_sid, harness=harness)
+                        from dispatch_seat_handover import record_recipient_binding
+                        recipient = record_recipient_binding(record, storage_sid, harness=harness)
                     except Exception:
-                        recipient_sid = None
-                    if recipient_sid is None:
+                        recipient = None
+                    if recipient is None:
                         no_recipient_unknown = True
-                    elif (harness, recipient_sid) not in live_sessions:
+                    elif recipient not in live_sessions:
                         no_recipient += 1
             elif state == "expired":
                 expired += 1
