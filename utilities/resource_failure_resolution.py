@@ -181,18 +181,157 @@ def descendants(route, predecessor):
     return result
 
 
+def _retry_registry(armed):
+    """Return the current resource runs and failed row when readable."""
+    try:
+        value = json.loads(Path(armed.get("resource_registry") or "").read_text())
+        runs = value.get("runs") if isinstance(value, dict) else None
+        if not isinstance(runs, dict):
+            return {}, {}
+        row = runs.get(armed.get("predecessor_id"))
+        return runs, row if isinstance(row, dict) else {}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}, {}
+
+
+def _route_context(route, armed, failed_row):
+    """Resolve the exact route record and retain a best-effort resume handle."""
+    fallback = None
+    for source, key in ((armed, "route_file"), (failed_row, "route")):
+        candidate = source.get(key)
+        if candidate is None or candidate == "":
+            continue
+        if not isinstance(candidate, str):
+            return fallback, route, False
+        path = Path(candidate)
+        if fallback is None:
+            fallback = path
+        try:
+            observed = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return path, route, False
+        if (not isinstance(observed, dict)
+                or observed.get("route_id") != route.get("route_id")
+                or observed.get("route_hash") != route.get("route_hash")):
+            return path, route, False
+        return path, observed, True
+
+    try:
+        import artifact_lifecycle
+        canonical = artifact_lifecycle.canonical_route_path(
+            Path(route["artifact_root"]), route["route_id"])
+    except (ImportError, KeyError, TypeError, ValueError, OSError):
+        return fallback, route, False
+    if fallback is None:
+        fallback = canonical
+    try:
+        observed = json.loads(canonical.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return canonical, route, False
+    if (isinstance(observed, dict)
+            and observed.get("route_id") == route.get("route_id")
+            and observed.get("route_hash") == route.get("route_hash")):
+        return canonical, observed, True
+    return canonical, route, False
+
+
+def _owner_continuation(route, route_path, failed_row, jobs):
+    """Use the receipt's effective owner and shared continuation judgment."""
+    parent = failed_row.get("parent_attempt_id")
+    if not isinstance(parent, str) or not parent or route_path is None:
+        return None
+    try:
+        import dispatch_replacement as DR
+        import route_authority
+        import owner_route_binding as ORB
+        import route_lineage
+        from dispatch_contract import parse_registry_metadata
+        from dispatch_registry_cache import registry_snapshot
+
+        jobs_path = Path(jobs).expanduser()
+        snapshot = registry_snapshot(jobs_path)
+        if not snapshot.complete:
+            return None
+        rows = []
+        for line in snapshot.lines:
+            fields = line.split("\t")
+            if len(fields) != 6:
+                return None
+            rows.append((fields, parse_registry_metadata(fields[5])))
+        effective, _lineage = DR.effective_attempts(jobs_path, {parent})
+        if len(effective) != 1:
+            return None
+        owner_id = next(iter(effective))
+        if not snapshot.matches_jobs(jobs_path):
+            return None
+        owner_rows = [(fields, metadata) for fields, metadata in rows
+                      if metadata.get("attempt_id") == owner_id]
+        if len(owner_rows) != 1:
+            return None
+        fields, metadata = owner_rows[0]
+        if (metadata.get("worker_type") != "owner"
+                or metadata.get("attempt_id") != owner_id
+                or metadata.get("dispatch_depth") != "1"
+                or len(fields) < 2):
+            return None
+
+        binding, binding_status = ORB.resolve_owner_route_lifecycle(
+            jobs_path, owner_attempt_id=owner_id, registry_rows=rows)
+        if (binding is None or binding_status not in {
+                "owner-route-launch-binding", "owner-route-post-launch-attachment",
+                "owner-route-advance-current"}):
+            return None
+        active_raw = json.loads(Path(binding.route_file).read_text(encoding="utf-8"))
+        active_verified = ORB.ROUTE.verify_route(active_raw)
+        if (active_verified.get("route_id"), active_verified.get("route_hash")) != (
+                binding.route_id, binding.route_hash):
+            return None
+        # The lifecycle resolver verified this exact binding and every adopted
+        # generation; recheck the reread bytes and their route ancestry before
+        # using them for guidance.
+        ancestry = route_lineage.verified_route_lineage(active_raw, observe=True)
+        if not any((item.get("route_id"), item.get("route_hash")) ==
+                   (route.get("route_id"), route.get("route_hash")) for item in ancestry):
+            return None
+        if not snapshot.matches_jobs(jobs_path):
+            return None
+        answered = bool(DR._retained_corrections(jobs_path, owner_id))
+        decision = route_authority.decide_continuation(
+            active_raw, action="owner", jobs=jobs_path,
+            status=fields[1], metadata=metadata, facts={"answered": answered})
+        if not snapshot.matches_jobs(jobs_path):
+            return None
+        return decision, owner_id, metadata, active_raw, Path(binding.route_file)
+    except Exception:
+        # Guidance generation must preserve the typed resource failure even when
+        # registry, lineage, retained-answer, or process evidence is unavailable.
+        return None
+
+
+def _retry_message(route, run_id, retry, nodes, reason):
+    revalidate = ", ".join(nodes[1:]) or "후속 단계 없음"
+    return (f"실패한 resource {run_id}의 사유는 {reason}입니다. 실패 기록과 기존 산출물은 그대로 보존합니다."
+            f" 같은 검증 구성과 smoke inputs를 사용해 route {route['route_id']}에서 새 resource attempt {retry}를"
+            " 별도 output directory에 실행하고,"
+            f" 새 출력 bytes를 기준으로 후속 단계({revalidate})를 다시 검증합니다."
+            " 과거 PASS 표시는 새 bytes의 검증 근거가 아닙니다.")
+
+
 def retry_step(route, armed, jobs, reason):
-    """The existing compose surface opens a new leg; no caller input file needed."""
+    """Select correction, resume, or compose from route and owner receipt state.
+
+    Ordinary exact closed routes compose; cancellation remains protected even
+    after closure. A live or unanswered BLOCKED/FAIL owner gets its existing
+    correction command. Other open or unobservable states,
+    including retained answers, gates, cancellation, and waits, resume the
+    route. Only a proven PASS owner's rejected settlement keeps the agreed
+    compose exception until same-route settlement recovery is implemented.
+    """
     nodes = [armed["node"], *[node["id"] for node in descendants(route, armed["node"])]]
     run_id = armed["predecessor_id"]
     suffix = re.search(r"__a([1-9][0-9]*)$", run_id)
     base = run_id[:suffix.start()] if suffix else run_id
-    try:
-        runs = json.loads(Path(armed.get("resource_registry") or "").read_text())["runs"]
-    except (OSError, ValueError, KeyError, TypeError):
-        runs = {}  # The new cycle uses a separate registry and output directory.
-    if not isinstance(runs, dict):
-        runs = {}
+    runs, failed_row = _retry_registry(armed)
     # Even a missing registry cannot reuse the attempt that just failed.
     ordinal = int(suffix.group(1)) + 1 if suffix else 1
     while f"{base}__a{ordinal}" in runs:
@@ -202,7 +341,6 @@ def retry_step(route, armed, jobs, reason):
     try:
         import route_parent_close
         route_file = armed.get("route_file") or route.get("_route_file")
-        failed_row = runs.get(run_id) if isinstance(runs, dict) else {}
         attempts = {value for value in (
             armed.get("parent_attempt_id"),
             (armed.get("owner_wait") or {}).get("parent_attempt_id"),
@@ -225,28 +363,109 @@ def retry_step(route, armed, jobs, reason):
     except Exception:
         # An advisory discovery failure never hides the original recovery.
         compute_hint = ""
-    task = (f"Continue the approved task from {route['route_id']}. Resource {run_id} remains failed: {reason}. "
+    route_path, observed_route, route_valid = _route_context(route, armed, failed_row)
+
+    resume_route_path = route_path
+
+    def resume(continuation="resume"):
+        try:
+            from parent_next_directive import resume_command
+            command = resume_command(resume_route_path, jobs, agent_home=Path(__file__).resolve().parents[1])
+        except Exception:
+            command = ""
+        return {"command": command, "run_id": retry, "revalidate_nodes": nodes[1:],
+                "meaning": "route 상태를 닫힘 또는 답변 가능한 owner로 확인하지 못했습니다. 기존 resume_command를 따릅니다.",
+                "continuation": continuation}
+
+    owner = None
+    guidance_route = observed_route
+    guidance_path = route_path
+    if route_valid and route_path is not None:
+        owner = _owner_continuation(observed_route, route_path, failed_row, jobs)
+        if owner is not None:
+            _decision, _owner_id, _metadata, active_route, active_path = owner
+            if any(node.get("id") == armed["node"]
+                   for node in active_route.get("nodes", [])):
+                guidance_route, guidance_path = active_route, active_path
+                resume_route_path = active_path
+                nodes = [armed["node"], *[node["id"] for node in
+                                           descendants(active_route, armed["node"])]]
+            else:
+                owner = None
+
+    outcome = None
+    if route_valid and guidance_path is not None:
+        try:
+            import dispatch_notice_state
+            outcome = dispatch_notice_state.closed_outcome(guidance_path, guidance_route)
+            if outcome:
+                import route_authority
+                protection = route_authority.decide_continuation(
+                    guidance_route, action="owner", facts={"cancelled":
+                        outcome.get("disposition") == "cancelled"
+                        or outcome.get("state") == "cancelled"})
+                if protection.state == "protected":
+                    return resume("resume-protected")
+        except Exception:
+            return resume("resume-unobservable")
+    if outcome and not outcome.get("finish_pending"):
+        continuation = "closed-compose"
+    elif not route_valid or route_path is None:
+        return resume("resume-unobservable")
+    else:
+        if owner is None:
+            return resume()
+        decision, owner_id, metadata, _active_route, _active_path = owner
+        if decision.state in {"answer", "running"}:
+            try:
+                from parent_next_directive import correction_command
+                command = (correction_command(owner_id, jobs,
+                    agent_home=Path(__file__).resolve().parents[1]) + " --message-file /dev/stdin")
+            except Exception:
+                return resume("resume-unobservable")
+            message = _retry_message(guidance_route, run_id, retry, nodes, reason) + compute_hint
+            return {"command": shlex.join(["printf", "%s", message]) + " | " + command,
+                    "run_id": retry, "revalidate_nodes": nodes[1:],
+                    "meaning": ("BLOCKED owner이면 먼저 owner_report를 확인하고, 답으로 맞는 경우 이 재시도 안내를 전달합니다. "
+                                "같은 route의 새 attempt만 지시하며 과거 PASS를 새 bytes의 근거로 삼지 않습니다."),
+                    "continuation": "correct"}
+        if decision.state == "settle" and metadata.get("worker_type") == "owner":
+            try:
+                from dispatch_attempt_policy import verdict_pass
+                pass_settlement = verdict_pass(metadata)
+            except Exception:
+                pass_settlement = False
+            if pass_settlement:
+                continuation = "pass-settlement-compose"
+            else:
+                return resume()
+        else:
+            return resume()
+
+    compose_route = guidance_route if owner is not None else route
+    task = (f"Continue the approved task from {compose_route['route_id']}. Resource {run_id} remains failed: {reason}. "
             f"Retain its registry, sentinel, outputs and all historical PASS/FAIL records unchanged. "
             f"Reuse its checked configuration and smoke inputs, run a distinct resource attempt {retry} "
             "in this new cycle's output directory, and revalidate every selected downstream stage against "
             "the new output bytes. Historical PASS markers do not complete this leg. Original task:\n"
-            + str((route.get("work_request") or {}).get("text") or route.get("slug", ""))
+            + str((compose_route.get("work_request") or {}).get("text") or compose_route.get("slug", ""))
             + compute_hint)
     argv = ["hearting", "run", "capability-route", "compose", "--start", "--shape", "staged",
-            "--capability", route["capability"], "--capability-mode", route["capability_mode"],
-            "--intensity", route["effective_intensity"], "--graph", ",".join(nodes),
+            "--capability", compose_route["capability"], "--capability-mode", compose_route["capability_mode"],
+            "--intensity", compose_route["effective_intensity"], "--graph", ",".join(nodes),
             # A pipe can be read only once. Supplying the existing slug option
             # keeps compose's slug inference from consuming the task first.
-            "--slug", f"{route['route_id']}-{armed['node']}-retry-a{ordinal}",
-            "--cwd", route["cwd"], "--artifact-root", route["artifact_root"],
+            "--slug", f"{compose_route['route_id']}-{armed['node']}-retry-a{ordinal}",
+            "--cwd", compose_route["cwd"], "--artifact-root", compose_route["artifact_root"],
             "--jobs", str(jobs), "--prompt-file", "/dev/stdin"]
-    if route.get("campaign_key"):
-        argv += ["--campaign-key", route["campaign_key"]]
+    if compose_route.get("campaign_key"):
+        argv += ["--campaign-key", compose_route["campaign_key"]]
     else:
         argv += ["--unassigned"]
     return {"command": shlex.join(["printf", "%s", task]) + " | " + shlex.join(argv),
             "run_id": retry, "revalidate_nodes": nodes[1:],
-            "meaning": "원본 실패를 보존하고 새 실행의 산출물로 후속 단계를 다시 검증합니다."}
+            "meaning": "원본 실패를 보존하고 새 실행의 산출물로 후속 단계를 다시 검증합니다.",
+            "continuation": continuation}
 
 
 def prove(route, ledger, armed, failure, gates, jobs, module, *, snapshots=None,
@@ -415,8 +634,9 @@ def reconcile(route, ledger, gates, jobs, module, *, compute_observations=None):
             armed = json.loads(path.read_text())
             if not isinstance(armed, dict):
                 raise ValueError('resource-watch-unreadable')
-            if isinstance(armed.get('resource_registry'), str):
-                retry_armed['resource_registry'] = armed['resource_registry']
+            for key in ('resource_registry', 'route_file'):
+                if isinstance(armed.get(key), str):
+                    retry_armed[key] = armed[key]
             if armed.get("predecessor_kind") != "resource":
                 raise ValueError('resource-watch-binding-mismatch')
             if compute_observations and node_id in compute_observations:
