@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+import operator
 from pathlib import Path
 import re
 import signal
@@ -2044,6 +2045,58 @@ def process_start_ticks(pid: int) -> str | None:
         return None
 
 
+def pidfd_open(pid: int, flags: int = 0) -> int:
+    """Open a descriptor bound to one process, including older Python builds.
+
+    The raw syscall is verified only for Linux x86_64 LP64. Other ABIs need
+    their own checked syscall table before they can use this fallback.
+    """
+    native = getattr(os, "pidfd_open", None)
+    if callable(native):
+        return native(pid, flags)
+
+    def unsupported() -> OSError:
+        return OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+
+    if sys.platform != "linux":
+        raise unsupported()
+    try:
+        import ctypes
+        import platform
+    except ImportError:
+        raise unsupported() from None
+    if (platform.machine() != "x86_64" or ctypes.sizeof(ctypes.c_void_p) != 8
+            or ctypes.sizeof(ctypes.c_long) != 8):
+        raise unsupported()
+
+    # Validate before ctypes converts arguments; narrowing a PID could bind
+    # the descriptor to an entirely different process.
+    pid_number = operator.index(pid)
+    flags_number = operator.index(flags)
+    if not -(1 << 31) <= pid_number < (1 << 31):
+        raise OverflowError("pid out of range for pid_t")
+    if not 0 <= flags_number < (1 << 32):
+        raise OverflowError("flags out of range for unsigned int")
+    try:
+        syscall = ctypes.CDLL(None, use_errno=True).syscall
+    except (OSError, AttributeError, TypeError):
+        raise unsupported() from None
+    if not callable(syscall):
+        raise unsupported()
+    syscall.restype = ctypes.c_long
+    fd = syscall(ctypes.c_long(434), ctypes.c_int(pid_number),
+                 ctypes.c_uint(flags_number))
+    if fd == -1:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    try:
+        os.set_inheritable(fd, False)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def process_namespace_identity(pid: int | str = "self") -> str | None:
     """Return the PID namespace inode without treating an unreadable link as absence."""
 
@@ -2976,6 +3029,7 @@ ROUTE_STATE_REFUSAL_REASONS = (
     "review-round-budget-exhausted",
     "review-verdictless-bound",
     "round-unsettled",
+    "resource-owner-stage-admission-blocked",
 )
 
 # Receipts and the ledger carry the same bounded facts, never a clipped copy
@@ -3101,6 +3155,9 @@ def route_state_next_action(reason: str, detail: str, route_file: str | None,
         return "route the round through the sealed fallback chain's remaining unregistered hop (native-subagent, then owner-inline)"
     if reason == "round-unsettled":
         return "wait for the live round to settle before starting the next one"
+    if reason == "resource-owner-stage-admission-blocked":
+        return ("inspect the typed resource route-state reason and next_action; "
+                "use the current route owner's existing start/correct path")
     return "-"
 
 

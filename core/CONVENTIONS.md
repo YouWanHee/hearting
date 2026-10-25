@@ -92,6 +92,8 @@ Track rules:
 
 Intensity resolves in this order: explicit `--intensity`, capability default, then request shape in `WORKFLOW §1.1`. Rigor then maps deterministically: direct to none/light, quick to quick, standard or strong to standard, thorough to thorough, and adversarial to adversarial.
 
+For frame proposals, shape constrains the effective intensity: `direct` uses `direct`, `solo` uses `quick`, and `staged` uses `standard` or higher. A conflicting known intensity in a proposal is normalized to the shape default and recorded for review; unknown values remain invalid. A person-entered CLI mismatch is refused with the allowed values.
+
 An external adversary is required only when an adversarial graph actually selects that pass. The adapter must prove that a different reviewer, engine, or harness ran. If an explicitly requested adversarial pass is unavailable, fail loudly; if routing auto-escalated, fall back to thorough and report it. Runtime wrapper names are not portable semantics.
 
 `--no-fact-check` and `--no-style-audit` remain orthogonal and appear only on capabilities that expose those checks. `code-plan` realizes durable plan and plan-check for standard+; quick keeps an inline micro-plan. `code-refine` corrects an existing durable plan and is not automatic in quick. `code-test` scales concrete verification with rigor. `code-report` reports and synthesizes without adding QA.
@@ -556,17 +558,27 @@ worktree. Explicit CLI paths retain their argument meaning, and route-free
 invocations keep the standalone defaults below.
 
 Execution environments, package/model caches, external checkouts and training
-checkpoints belong in the project runtime home, the sibling
-`.agent_runtime/` of the resolved artifact root, or an explicitly selected
-dedicated absolute runtime directory outside that root. Resolving through
-`artifact-root.sh` makes linked worktrees share the primary checkout's runtime
-home. Launch preparation creates this location lazily with its own `.gitignore`
-containing `*`; if the optional location cannot safely be prepared, the launch
-omits its runtime hint and permission and continues. This is not a write gate.
-Keep small reports, configs and provenance in artifacts; checkpoint records
-may point to runtime files with path, SHA256 and byte size. Use job-scoped cache
-variables when isolation is needed. Dataset bulk copies should generally be
-referenced by path and hash, without automatic classification or copying.
+checkpoints belong in the project runtime home, an explicitly selected
+dedicated absolute runtime directory outside the source, artifact, and
+artifact-parent project roots, or the generated non-Git runtime below. Git and
+unknown-kind launches retain the
+sibling `.agent_runtime/` of the resolved artifact root. A launch that has
+validated an unversioned source defaults to
+`stable_state_root(environ)/project-runtimes/<sha256(canonical-artifact-root)>`;
+the digest is the full SHA-256 hex of the canonical artifact-root UTF-8 path.
+Valid explicit overrides and exact inherited legacy sibling values keep their
+existing meaning. A child may inherit only the exact generated non-Git default;
+unsafe state resolution, source/artifact overlap, or an escaping symlink omits
+the optional runtime without falling back into the source tree. Resolving
+through `artifact-root.sh` makes linked worktrees share the primary checkout's
+artifact identity. Launch preparation creates the selected location lazily
+with its own `.gitignore` containing `*`; if the optional location cannot
+safely be prepared, the launch omits its runtime hint and permission and
+continues. This is not a write gate. Keep small reports, configs and provenance
+in artifacts; checkpoint records may point to runtime files with path, SHA256
+and byte size. Use job-scoped cache variables when isolation is needed. Dataset
+bulk copies should generally be referenced by path and hash, without automatic
+classification or copying.
 
 ### §5.2. Tier Definitions
 

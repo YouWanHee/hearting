@@ -102,6 +102,9 @@ launcher와 공용 `compute-hosts` operator launcher도 함께 설치합니다. 
 외부 PATH 파일과 symlink는 보존되며, 전체 uninstall만 소유한 공용 link를
 제거하고 부분 runtime uninstall은 이를 유지합니다.
 
+Inventory가 비어 있어도 Fleet는 이 기계의 읽기 전용 compute 관측을 보여 주며,
+원격 host와 detached run에는 계속 inventory 설정이 필요합니다.
+
 `hearting update`는 새 release를 staging에서 검증한 뒤 active pointer를
 전환하고 실패하면 이전 release로 rollback합니다. 이미 열린 agent session이
 자동으로 지침을 다시 읽는 것은 아니므로 update 뒤 `runtime status`에서
@@ -266,8 +269,9 @@ git config core.hooksPath tools/git-hooks
 ```
 
 `pre-push`는 CI가 돌리는 것과 동일한 생성물 검사를 수행하고 실패할 push를
-거부합니다. 커밋이 공개되고 release workflow가 태그를 붙이기 전에 drift를
-잡습니다. `git push --no-verify`로 우회할 수 있습니다.
+거부해 커밋이 공개되기 전에 drift를 잡습니다. 릴리스 workflow는 별도의
+유지보수자 요청 뒤에 게시합니다. `git push --no-verify`로 hook을 우회할 수
+있습니다.
 
 공유 정의를 변경한 후에는 모든 생성 projection을 갱신하고 drift를
 검사합니다.

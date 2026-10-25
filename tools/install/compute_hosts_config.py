@@ -25,7 +25,7 @@ TEMPLATE = """\
 # local machine is discovered by matching `hostname`, never written down.
 #
 # Until at least one host below is uncommented and filled in, `compute-hosts`
-# and the Fleet COMPUTE RESOURCES panel report this file as a template.
+# reports this file as a template; Fleet can still observe this machine locally.
 # Check the result with:  harness config status
 schema_version: 1
 
