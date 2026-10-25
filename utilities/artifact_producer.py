@@ -2104,7 +2104,10 @@ def _env_for(root: Path, record: Mapping[str, Any], route: Optional[Mapping[str,
         "AGENT_ARTIFACT_OUTPUT_DIR": str(directory / "artifacts"),
     }
     import worker_bootstrap
-    runtime_candidate = worker_bootstrap.runtime_dir_candidate(root)
+    runtime_context = {}
+    if route and route.get("source_commit") == "unversioned":
+        runtime_context = {"repository_kind": "non-git", "source_root": route.get("cwd")}
+    runtime_candidate = worker_bootstrap.runtime_dir_candidate(root, **runtime_context)
     if runtime_candidate:
         env["AGENT_RUNTIME_DIR"] = runtime_candidate
     # This is an already-declared producer context. Carrying it through the
