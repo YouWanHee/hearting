@@ -11343,6 +11343,230 @@ class SessionNoticeIntegrationCorrectionTest(_TmpRootMixin, unittest.TestCase):
         self.assertFalse(self.jobs_path.exists())
 
 
+class SessionNoticeTerminalIdentityTest(_TmpRootMixin, unittest.TestCase):
+    """Terminal delivery settles only its original canonical or legacy duty."""
+    transport = SessionNoticeIntegrationCorrectionTest.transport
+
+    def setUp(self):
+        import dispatch_contract
+        for name, value in (("_proc_start_for_store", "100001"),
+                            ("request_dispatch_reconciliation", False)):
+            patch = mock.patch.object(peer_steward.peer_obligations, name, return_value=value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        for name, value in (("process_start_ticks", "100001"),
+                            ("process_identity_disposition", "live")):
+            patch = mock.patch.object(dispatch_contract, name, return_value=value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        super().setUp()
+        self.store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+
+    def notice(self, kind, key, *, harness="claude", jobs=None, lineage=None):
+        import session_notice
+        jobs = jobs or self.jobs_path
+        writer = session_notice.notify if kind == "run-notice" else _legacy_notice
+        extra = {"lineage": lineage} if kind == "run-notice" else {}
+        record = writer(harness, "terminal-A", key=key, subject="terminal notice",
+                        text="original result", route_id="rt-original", jobs=jobs, **extra)
+        duties = self.store.list(kinds={kind})
+        duty, = [d for d in duties if (d["intent"].get("delivery_id") or
+                    d["intent"]["identity"].get("delivery_id")) == record["delivery_id"]]
+        self.assertTrue(peer_steward.peer_obligations._notice_duty_matches(
+            duty, record, self.tmp_root, "terminal-A", record["delivery_id"], jobs))
+        return record, duty
+
+    def replace_record(self, original, **changes):
+        """Install a normally readable private replacement with its own sidecars."""
+        import dispatch_pending_delivery as pending
+        value = {**original, **changes}
+        replacement_root = self.tmp_root / ("replacement-" + original["delivery_id"])
+        pending.create(replacement_root, recipient_key="terminal-A", **{
+            key: value[key] for key in ("recipient_kind", "delivery_id", "session_generation",
+                "session_generation_supported", "attempt_ids", "parent_attempt_id", "route_id",
+                "route_node", "receipt", "receipt_digest", "row_revisions", "lineage")})
+        shutil.copytree(pending.record_directory(replacement_root, "terminal-A"),
+                        pending.record_directory(self.tmp_root, "terminal-A"), dirs_exist_ok=True)
+        return pending.read(self.tmp_root, "terminal-A", original["delivery_id"])
+
+    def terminal(self, record, state):
+        import dispatch_pending_delivery as pending
+        delivery_id = record["delivery_id"]
+        claimed = pending.claim(self.tmp_root, "terminal-A", delivery_id,
+                                claim_owner="private-terminal", lease_seconds=30)
+        if state == "acked":
+            result = pending.ack(self.tmp_root, "terminal-A", delivery_id, acked_by="private-receiver")
+        elif state == "rejected":
+            result = pending.reject_claimed(self.tmp_root, "terminal-A", delivery_id,
+                claim_owner="private-terminal", reason="private-carrier-refusal",
+                expected_identity=pending.received_ack_identity(claimed, "terminal-A", delivery_id))
+        else:
+            result = pending.expire_if_due(self.tmp_root, "terminal-A", delivery_id,
+                actor="dispatch-reconcile", reason="recipient-session-gone")
+        self.assertEqual(result["state"], state)
+        return result
+
+    def resume(self, duties):
+        peer_steward._resume_session_notice_obligations(duties, self.store)
+
+    def test_matching_original_terminal_states_settle_both_producers_on_every_harness(self):
+        import dispatch_pending_delivery as pending
+        for kind in ("run-notice", "session-notice"):
+            for harness in ("claude", "codex", "opencode"):
+                for state in ("acked", "rejected", "expired"):
+                    with self.subTest(kind=kind, harness=harness, state=state):
+                        record, duty = self.notice(kind, kind + harness + state, harness=harness)
+                        terminal = self.terminal(record, state)
+                        path = pending.record_path(self.tmp_root, "terminal-A", record["delivery_id"])
+                        before = (path.read_bytes(), path.stat().st_mtime_ns)
+                        with mock.patch.object(peer_steward, "cmd_prompt") as send:
+                            self.resume([duty])
+                        send.assert_not_called()
+                        settled = self.store.get(duty["id"])
+                        self.assertEqual((settled["state"], settled["delivery"], settled["cleanup"]),
+                                         ("complete", state, "complete"))
+                        self.assertEqual(settled["intent"], duty["intent"])
+                        self.assertEqual(pending.read(self.tmp_root, "terminal-A", record["delivery_id"]), terminal)
+                        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_foreign_terminal_digest_and_carrier_leave_the_original_duty_unchanged(self):
+        import dispatch_pending_delivery as pending
+        for kind in ("run-notice", "session-notice"):
+            for changed in ("digest", "carrier"):
+                for state in ("acked", "rejected", "expired"):
+                    with self.subTest(kind=kind, changed=changed, state=state):
+                        record, duty = self.notice(kind, kind + changed + state)
+                        receipt = {**record["receipt"], "text": "different immutable result"}
+                        changes = ({"receipt": receipt, "receipt_digest": pending._canonical_receipt_digest(receipt)}
+                                   if changed == "digest" else {"recipient_kind": "codex-native-queue"})
+                        replacement = self.replace_record(record, **changes)
+                        terminal = self.terminal(replacement, state)
+                        self.assertFalse(peer_steward.peer_obligations._notice_duty_matches(
+                            duty, terminal, self.tmp_root, "terminal-A", record["delivery_id"], self.jobs_path))
+                        self.resume([duty])
+                        self.assertEqual(self.store.get(duty["id"]), duty)
+                        self.assertEqual(pending.read(self.tmp_root, "terminal-A", record["delivery_id"]), terminal)
+
+    def test_canonical_route_and_stored_lineage_must_match_before_terminal_settlement(self):
+        import session_notice
+        for field in ("route_id", "lineage"):
+            for state in ("acked", "rejected", "expired"):
+                with self.subTest(field=field, state=state):
+                    record, duty = self.notice("run-notice", field + state)
+                    changes = {field: "rt-foreign"} if field == "route_id" else {field: [
+                        session_notice._stored_lineage(self.jobs_path, {"kind": "owner-session",
+                            "harness": "claude", "session_id": "terminal-A", "attempt_id": "att-foreign"})]}
+                    replacement = self.terminal(self.replace_record(record, **changes), state)
+                    self.assertFalse(peer_steward.peer_obligations._notice_duty_matches(
+                        duty, replacement, self.tmp_root, "terminal-A", record["delivery_id"], self.jobs_path))
+                    self.resume([duty])
+                    self.assertEqual(self.store.get(duty["id"]), duty)
+
+    def test_legacy_route_compatibility_does_not_require_canonical_lineage_fields(self):
+        record, duty = self.notice("session-notice", "legacy-route")
+        self.assertNotIn("lineage", duty["intent"]["identity"])
+        self.assertNotIn("route_id", duty["intent"])
+        terminal = self.terminal(self.replace_record(record, route_id="rt-legacy-compatible"), "acked")
+        self.assertTrue(peer_steward.peer_obligations._notice_duty_matches(
+            duty, terminal, self.tmp_root, "terminal-A", record["delivery_id"], self.jobs_path))
+        self.resume([duty])
+        self.assertEqual(self.store.get(duty["id"])["state"], "complete")
+
+    def test_missing_or_unreadable_terminal_record_keeps_duty_until_original_evidence_returns(self):
+        import dispatch_pending_delivery as pending
+        for kind in ("run-notice", "session-notice"):
+            for damage in ("missing", "json", "directory"):
+                with self.subTest(kind=kind, damage=damage):
+                    record, duty = self.notice(kind, kind + damage)
+                    self.terminal(record, "acked")
+                    path = pending.record_path(self.tmp_root, "terminal-A", record["delivery_id"])
+                    original = path.read_bytes()
+                    path.unlink()
+                    if damage == "json":
+                        path.write_text("{")
+                    elif damage == "directory":
+                        path.mkdir()
+                    self.resume([duty])
+                    self.assertEqual(self.store.get(duty["id"]), duty)
+                    if damage == "directory":
+                        path.rmdir()  # Only this fixture's non-file read error.
+                    path.write_bytes(original)
+                    self.resume([duty])
+                    self.assertEqual(self.store.get(duty["id"])["state"], "complete")
+
+    def test_terminal_settlement_uses_original_lineage_and_nondefault_registry_filename(self):
+        import session_notice
+        jobs = self.tmp_root / "original-notices.tsv"
+        jobs.touch()
+        lineage = {"kind": "attempt-parent", "harness": "claude", "session_id": "terminal-A",
+                   "attempt_id": "att-original-parent"}
+        record, duty = self.notice("run-notice", "stored-origin", jobs=jobs, lineage=lineage)
+        identity = copy.deepcopy(duty["intent"]["identity"])
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs_path)}):
+            retry = session_notice.notify("claude", "terminal-A", key="stored-origin",
+                subject="terminal notice", text="original result", jobs=jobs)
+            self.assertEqual(retry["delivery_id"], record["delivery_id"])
+            self.assertEqual(self.store.get(duty["id"])["intent"]["identity"], identity)
+            self.terminal(record, "acked")
+            jobs.unlink()  # A completed original needs no current registry row.
+            self.resume([duty])
+        self.assertEqual(identity["jobs"], str(jobs))
+        self.assertEqual(identity["lineage"], lineage)
+        self.assertEqual(self.store.get(duty["id"])["state"], "complete")
+        self.assertEqual(self.store.get(duty["id"])["intent"], duty["intent"])
+
+    def test_original_and_foreign_terminals_do_not_block_valid_group_siblings(self):
+        import dispatch_pending_delivery as pending
+        terminals, foreign, open_records = [], [], []
+        for kind in ("run-notice", "session-notice"):
+            record, duty = self.notice(kind, kind + "original-terminal")
+            self.terminal(record, "acked")
+            terminals.append(duty)
+            record, duty = self.notice(kind, kind + "foreign-terminal")
+            receipt = {**record["receipt"], "text": "foreign result"}
+            self.terminal(self.replace_record(record, receipt=receipt,
+                receipt_digest=pending._canonical_receipt_digest(receipt)), "acked")
+            foreign.append(duty)
+            for index in range(2):
+                open_records.append(self.notice(kind, kind + "open-" + str(index)))
+        duties = [*foreign, *terminals, *(d for _record, d in open_records)]
+        with self.transport("terminal-A") as native:
+            self.resume(duties)
+        native.assert_called_once()
+        self.assertTrue(all(self.store.get(d["id"])["state"] == "complete" for d in terminals))
+        self.assertEqual([self.store.get(d["id"]) for d in foreign], foreign)
+        refs = {self.store.get(d["id"])["observation"]["transfer_ref"] for _r, d in open_records}
+        self.assertEqual(len(refs), 1)
+        transfer = peer_steward.peer_message._read_pending(refs.pop())
+        self.assertEqual(transfer["text"].count("HEARTING_RECEIPT_V1 "), 4)
+        self.assertEqual({r["delivery_id"] for r, _d in open_records},
+                         {item["delivery_id"] for item in transfer["producer_binding"]["records"]})
+        self.assertEqual(peer_steward.peer_message.receive_peer_message(transfer["text"],
+            {"harness": "claude", "session_id": "terminal-A"}), 0)
+        with mock.patch.object(peer_steward, "cmd_prompt") as send:
+            self.resume([self.store.get(d["id"]) for d in duties])
+        send.assert_not_called()
+        self.assertEqual([self.store.get(d["id"]) for d in foreign], foreign)
+        self.assertTrue(all(self.store.get(d["id"])["state"] == "complete" for _r, d in open_records))
+
+    def test_concurrent_terminal_duty_is_preserved_at_the_store_update_lock(self):
+        for kind in ("run-notice", "session-notice"):
+            for state in ("complete", "cancelled"):
+                with self.subTest(kind=kind, state=state):
+                    record, duty = self.notice(kind, kind + state)
+                    self.terminal(record, "acked")
+                    original_lock = self.store._lock
+                    settled = []
+                    def lock(duty_id):
+                        other = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+                        settled.append(other.update(duty_id, state=state, delivery="already-settled",
+                            cleanup="complete", observation={"transfer_ref": "f" * 32}))
+                        return original_lock(duty_id)
+                    with mock.patch.object(self.store, "_lock", side_effect=lock):
+                        self.resume([duty])
+                    self.assertEqual(self.store.get(duty["id"]), settled[0])
+
+
 class ExplicitHolderAuthorityTest(_TmpRootMixin, unittest.TestCase):
     edge = SessionNoticeIntegrationCorrectionTest.edge
 

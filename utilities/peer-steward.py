@@ -8325,12 +8325,14 @@ def _resume_session_notice_obligations(duties, store, *, read_context=None,
             continue
         try:
             record = pending.read(root, storage_sid, delivery_id)
-            if record and record.get("state") in {"acked", "rejected", "expired"}:
-                store.update(duty["id"], state="complete", delivery=record["state"], cleanup="complete")
+            if (not record or not peer_obligations._notice_duty_matches(
+                    duty, record, root, storage_sid, delivery_id, source_jobs)):
                 continue
-            if (not record or record.get("state") not in pending.OPEN_STATES
-                    or not peer_obligations._notice_duty_matches(
-                        duty, record, root, storage_sid, delivery_id, source_jobs)):
+            if record.get("state") in {"acked", "rejected", "expired"}:
+                store.update(duty["id"], state="complete", delivery=record["state"], cleanup="complete",
+                             expected_phases={(duty.get("observation") or {}).get("phase", "waiting")})
+                continue
+            if record.get("state") not in pending.OPEN_STATES:
                 continue
             session_notice.validate_pending_record(record)
             pair = record_recipient_binding(record, storage_sid, harness=source_harness,

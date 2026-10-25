@@ -895,15 +895,24 @@ class PendingDeliveryCountsTest(unittest.TestCase):
         import session_tidy as tidy
         with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_root / "history"),
                 "AGENT_DISPATCH_JOBS": str(self.state_root / "unavailable.tsv")}), \
-             mock.patch.object(peer_obligations, "ensure_normal_runner", return_value=False):
+             mock.patch.object(peer_obligations, "ensure_normal_runner", return_value=False), \
+             mock.patch.object(peer_obligations, "request_dispatch_reconciliation", return_value=False), \
+             mock.patch.object(peer_obligations, "_proc_start_for_store", return_value="100001"):
             jobs = self.state_root / "unavailable.tsv"
-            session_notice.notify("claude", "route-free-storage", key="registry-free",
-                                  subject="completed", text="done", jobs=jobs)
+            notice = session_notice.notify("claude", "route-free-storage", key="registry-free",
+                                           subject="completed", text="done", jobs=jobs)
+            retry = session_notice.notify("claude", "route-free-storage", key="registry-free",
+                                          subject="completed", text="done", jobs=jobs)
+            self.assertEqual(retry["delivery_id"], notice["delivery_id"])
+            self.assertEqual(len(peer_obligations.ObligationStore(self.state_root).list(kinds={"run-notice"})), 1)
             tidy._append_ledger_entry(tidy.Seat("pane", "route-free"),
                                      dict(event="start", harness="claude", sid="route-free-storage", ts=1))
             self.assertFalse(jobs.exists())
             self.assertEqual(self._observed_registry_count([jobs], set())["no_recipient"], 1)
             self.assertEqual(self._observed_registry_count([jobs], {("claude", "route-free-storage")})["no_recipient"], 0)
+            unknown = dispatch._pending_delivery_counts([str(jobs)], session_observation={"complete": False})
+            self.assertEqual(unknown["pending"], 1)
+            self.assertIsNone(unknown["no_recipient"])
 
     def test_render_and_overview_show_known_count_but_never_unknown_as_zero(self):
         from fleet import render
