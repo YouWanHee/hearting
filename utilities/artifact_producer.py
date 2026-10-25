@@ -6574,6 +6574,42 @@ def _provisional_completion_context(root: Path, record: Mapping[str, Any],
     return binding, sealed_route, outcome
 
 
+def _manifest_terminal_source_digest(root: Path, record: Mapping[str, Any],
+                                     document: Mapping[str, Any]) -> Optional[str]:
+    """Resolve snapshot artifact facts through the producer's original scan algorithm."""
+    manifest_path = _record_cycle_manifest_path(root, record)
+    current = _read_json(manifest_path)
+    if (not isinstance(current, Mapping)
+            or artifact_manifest.canonical_bytes(current) != artifact_manifest.canonical_bytes(document)):
+        return None
+    directory = manifest_path.parent
+    known: Dict[str, List[Any]] = {}
+    snapshot_facts: List[Tuple[str, str, int]] = []
+    for row in document.get("artifact_revisions", []) or []:
+        if not isinstance(row, Mapping):
+            return None
+        locator = row.get("locator")
+        rel = locator.get("path") if isinstance(locator, Mapping) else None
+        digest, size = row.get("content_digest"), row.get("byte_size")
+        if (not isinstance(rel, str) or not isinstance(digest, str)
+                or not isinstance(size, int) or isinstance(size, bool)):
+            return None
+        snapshot_facts.append((rel, digest, size))
+        try:
+            observed = os.lstat(str(directory / rel))
+            if stat.S_ISREG(observed.st_mode):
+                known[rel] = [*_fingerprint(observed), digest]
+        except OSError:
+            pass
+    try:
+        facts = _scan_cycle_facts(directory, excluded=[], excluded_symlinks=[], known=known)
+    except (OSError, ProducerError, ValueError, TypeError):
+        return None
+    if sorted(facts) != sorted(snapshot_facts):
+        return None
+    return _digest(_canonical([[rel, digest] for rel, digest, _size in facts]))
+
+
 def _historical_handoff_completion_context(root: Path, record: Mapping[str, Any],
                                           document: Mapping[str, Any],
                                           expected_binding: Optional[Mapping[str, Any]], *,
@@ -6714,6 +6750,8 @@ def _historical_handoff_completion_context(root: Path, record: Mapping[str, Any]
                     or terminal_events[0].get("provenance", {}).get("source_revision_id")
                         != document.get("manifest_revision_id")
                     or terminal_events[0].get("provenance", {}).get("producer_route_id") != route_id
+                    or terminal_events[0].get("provenance", {}).get("algorithm_version") != ALGORITHM_VERSION
+                    or terminal_events[0].get("provenance", {}).get("schema_version") != 1
                     or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(
                         terminal_events[0].get("provenance", {}).get("source_digest") or ""))
                     or terminal_events[0].get("payload", {}).get("artifact_root_id") != identity.artifact_root_id
@@ -6725,6 +6763,28 @@ def _historical_handoff_completion_context(root: Path, record: Mapping[str, Any]
                         terminal_events[0].get("payload", {}).get("outcome_digest") or ""))):
                 return None
             historical_terminal_event = terminal_events[0]
+            try:
+                source_snapshot = artifact_lifecycle.find_manifest_snapshot(
+                    root, cycle_id,
+                    manifest_revision_id=historical_terminal_event["provenance"]["source_revision_id"])
+                source_digest = (_manifest_terminal_source_digest(root, record, source_snapshot)
+                                 if isinstance(source_snapshot, Mapping)
+                                 and artifact_manifest.validate(source_snapshot).ok
+                                 and artifact_manifest.manifest_digest(source_snapshot)
+                                     == artifact_manifest.manifest_digest(document)
+                                 and artifact_manifest.canonical_bytes(source_snapshot)
+                                     == artifact_manifest.canonical_bytes(document)
+                                 else None)
+            except (KeyError, TypeError, ValueError, UnicodeError):
+                return None
+            if (not isinstance(source_snapshot, Mapping)
+                    or source_snapshot.get("manifest_id") != historical_terminal_event[
+                        "provenance"].get("source_manifest_id")
+                    or source_snapshot.get("manifest_revision_id") != historical_terminal_event[
+                        "provenance"].get("source_revision_id")
+                    or source_digest != historical_terminal_event[
+                        "provenance"].get("source_digest")):
+                return None
         abandoned = [event for event in document.get("events", []) or []
                      if isinstance(event, Mapping) and event.get("event_type") == "cycle.abandoned"
                      and event.get("target_id") == cycle_id]

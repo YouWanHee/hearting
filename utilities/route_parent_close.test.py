@@ -1049,6 +1049,12 @@ class ParentCloseTest(unittest.TestCase):
 
         allocator = setup.PRODUCER.artifact_identity.IdAllocator()
         revision_id = allocator.allocate("manifest_revision")
+        excluded, excluded_symlinks = [], []
+        source_facts = PRODUCER._scan_cycle_facts(
+            setup.cycle_dir, excluded=excluded, excluded_symlinks=excluded_symlinks)
+        self.assertEqual(sorted(source_facts), sorted(
+            (row["locator"]["path"], row["content_digest"], row["byte_size"])
+            for row in document["artifact_revisions"]))
         event = {
             "event_id": allocator.allocate("event"),
             "stream_id": allocator.allocate("stream"),
@@ -1064,8 +1070,7 @@ class ParentCloseTest(unittest.TestCase):
                 "algorithm_version": PRODUCER.ALGORITHM_VERSION,
                 "schema_version": 1,
                 "source_digest": PRODUCER._digest(PRODUCER._canonical([
-                    [row["locator"]["path"], row["content_digest"]]
-                    for row in document["artifact_revisions"]
+                    [rel, digest] for rel, digest, _size in source_facts
                 ])),
             },
             "evidence_ids": [],
@@ -1110,6 +1115,109 @@ class ParentCloseTest(unittest.TestCase):
         finally:
             artifact_admission._release_lock(root, fd)
         return candidate
+
+    def _replace_historical_fixture_preimage(self, setup, document):
+        """Pair fixture-only current/snapshot bytes and advance its normal index/record."""
+        import artifact_admission
+        import artifact_lifecycle as LIFECYCLE
+        import artifact_producer as PRODUCER
+
+        root = setup.fixture.artifacts
+        manifest_path = setup.cycle_dir / "manifest.json"
+        snapshot_path = LIFECYCLE.manifest_snapshot_path(
+            root, setup.cycle_id, document["manifest_revision_id"])
+        raw = setup.MANIFEST.canonical_bytes(document)
+        snapshot_path.write_bytes(raw)
+        PRODUCER._write_atomic(manifest_path, raw)
+        fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT)
+        try:
+            record = PRODUCER.read_cycle_record(root, setup.cycle_id)
+            index = artifact_admission.load_index(root)
+            digest = setup.MANIFEST.manifest_digest(document)
+            PRODUCER._commit_sealed(root, record, document, digest, now=time.time(),
+                                    index=index, previous_digest=record["manifest_digest"])
+        finally:
+            artifact_admission._release_lock(root, fd)
+        return PRODUCER.read_cycle_record(root, setup.cycle_id)
+
+    def test_historical_terminal_provenance_digest_is_recomputed_before_finish(self):
+        from dispatch_completion_join import exact_attempt_row
+
+        setup = self._prepare_historical_two_hop_fixture()
+        fixture = setup.fixture
+        PRODUCER, TERMINAL = setup.PRODUCER, setup.TERMINAL
+        try:
+            owner_row = exact_attempt_row(fixture.jobs, setup.final_owner["attempt_id"])
+            request = TERMINAL._completion_request(fixture.jobs, "done", owner_row.metadata)
+            interrupted = TERMINAL.settle_terminal_commit(
+                request, TERMINAL.TerminalCommitServices(crash_after="close-after"))
+            self.assertEqual(interrupted.result, "recoverable", interrupted)
+            binding = TERMINAL.load_producer_binding(
+                artifact_root=fixture.artifacts, route_id=setup.final_route["route_id"],
+                owner_attempt_id=setup.final_owner["attempt_id"]).binding
+            preimage = self._seed_historical_terminal_prefix(setup)
+            source_facts = PRODUCER._scan_cycle_facts(
+                setup.cycle_dir, excluded=[], excluded_symlinks=[])
+            valid_digest = PRODUCER._digest(PRODUCER._canonical([
+                [rel, digest] for rel, digest, _size in source_facts
+            ]))
+            terminal = next(event for event in preimage["events"]
+                            if event.get("event_type") == "route.terminal.recorded")
+            self.assertEqual(terminal["provenance"]["source_digest"], valid_digest)
+            self.assertIsNotNone(PRODUCER._historical_handoff_completion_context(
+                fixture.artifacts, PRODUCER.read_cycle_record(fixture.artifacts, setup.cycle_id),
+                preimage, binding, jobs=fixture.jobs))
+
+            tampered = json.loads(json.dumps(preimage))
+            terminal = next(event for event in tampered["events"]
+                            if event.get("event_type") == "route.terminal.recorded")
+            terminal["provenance"]["source_digest"] = "sha256:" + "f" * 64
+            record = self._replace_historical_fixture_preimage(setup, tampered)
+            self.assertEqual((record["state"], record["cycle_state"]), ("sealed", "abandoned"))
+            tampered_context = PRODUCER._historical_handoff_completion_context(
+                fixture.artifacts, record, tampered, binding, jobs=fixture.jobs)
+
+            env = dict(os.environ)
+            env["AGENT_DISPATCH_JOBS"] = str(fixture.jobs)
+            command = [sys.executable, str(HERE / "dispatch_terminal_commit.py"),
+                       "finish", "--jobs", str(fixture.jobs),
+                       "--attempt", setup.final_owner["attempt_id"]]
+            shared_root = fixture.artifacts / "shared"
+            shared_before = sorted(path.relative_to(fixture.artifacts).as_posix()
+                                   for path in shared_root.rglob("*")) if shared_root.exists() else []
+            result = subprocess.run(command, cwd=HERE.parent, env=env,
+                                    capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(result.returncode, 0, result.stderr[-2000:])
+            self.assertIsNone(tampered_context, "paired manifest/snapshot provenance digest must be recomputed")
+            current = json.loads((setup.cycle_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(current["cycle"]["state"], "abandoned")
+            self.assertEqual(current, tampered)
+            self.assertEqual(len([event for event in current["events"]
+                                 if event.get("event_type") == "cycle.completed"]), 0)
+            self.assertEqual(PRODUCER.read_cycle_record(fixture.artifacts, setup.cycle_id)["manifest_digest"],
+                             setup.MANIFEST.manifest_digest(tampered))
+            shared_after = sorted(path.relative_to(fixture.artifacts).as_posix()
+                                  for path in shared_root.rglob("*")) if shared_root.exists() else []
+            self.assertEqual(shared_after, shared_before)
+
+            cases = (
+                ("source_manifest_id", PRODUCER.artifact_identity.IdAllocator().allocate("manifest")),
+                ("source_revision_id", PRODUCER.artifact_identity.IdAllocator().allocate("manifest_revision")),
+                ("producer_route_id", "rt-" + "f" * 16),
+                ("algorithm_version", PRODUCER.ALGORITHM_VERSION + "-other"),
+                ("schema_version", 2),
+            )
+            for field, bad_value in cases:
+                candidate = json.loads(json.dumps(tampered))
+                saved = next(event for event in candidate["events"]
+                             if event.get("event_type") == "route.terminal.recorded")
+                saved["provenance"][field] = bad_value
+                record = self._replace_historical_fixture_preimage(setup, candidate)
+                self.assertIsNone(PRODUCER._historical_handoff_completion_context(
+                    fixture.artifacts, record, candidate, binding,
+                    jobs=fixture.jobs), field)
+        finally:
+            fixture.doCleanups()
 
     def test_historical_terminal_prefix_normal_finish_retry_keeps_explicit_jobs(self):
         from dispatch_completion_join import exact_attempt_row
@@ -1170,13 +1278,14 @@ class ParentCloseTest(unittest.TestCase):
                     self.assertIsNotNone(PRODUCER._historical_handoff_completion_context(
                         fixture.artifacts, record, setup.prior_document, expected_binding,
                         jobs=fixture.jobs), "A context must accept the same explicit registry")
+                    source_facts = PRODUCER._scan_cycle_facts(
+                        setup.cycle_dir, excluded=[], excluded_symlinks=[])
                     historical = PRODUCER._historical_handoff_completion_context(
                         fixture.artifacts, record, preimage, expected_binding, jobs=fixture.jobs)
                     self.assertIsNotNone(historical, "B preimage must pass the full historical verifier")
                     projection = PRODUCER._provisional_completion_projection(
                         fixture.artifacts, record, preimage,
-                        [(row["locator"]["path"], row["content_digest"], row["byte_size"])
-                         for row in preimage["artifact_revisions"]],
+                        source_facts,
                         revision_id=PRODUCER.artifact_identity.IdAllocator().allocate("manifest_revision"),
                         allocator=PRODUCER.artifact_identity.IdAllocator(), now=time.time(),
                         expected_binding=expected_binding, previous_document=preimage, jobs=fixture.jobs)
