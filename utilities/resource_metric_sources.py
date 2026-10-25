@@ -847,7 +847,8 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
     entry_count = byte_count = 0
     partial = exhausted = False
     sample_ids = ([item for item in prior.get("sample_ids", []) if isinstance(item, str)]
-                  if isinstance(prior.get("sample_ids"), list) else [])
+                  if prior.get("schema_version") == 2
+                  and isinstance(prior.get("sample_ids"), list) else [])
     sample_ids = sample_ids[-MAX_ADMISSION_SAMPLE_IDS:]
     seen_ids = set(sample_ids)
     raw_roots = roots if isinstance(roots, (list, tuple)) else [roots]
@@ -872,7 +873,8 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
     current_roots = {row["path"]: row["generation"] for row in roots_out}
     uncertainty_reason = prior.get("uncertainty_reason")
     uncertainty_reason = uncertainty_reason if isinstance(uncertainty_reason, str) else None
-    if previous_roots and previous_roots != current_roots:
+    root_generation_changed = bool(previous_roots and previous_roots != current_roots)
+    if root_generation_changed:
         warnings.append("admission-root-generation-changed")
         uncertainty_reason = uncertainty_reason or "generation-changed"
         prior_latest_at = None
@@ -883,6 +885,12 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
 
     registry_abs = Path(os.path.abspath(registry_path)) if registry_path else None
     scan_state = dict(prior.get("scan", {})) if isinstance(prior.get("scan"), dict) else {}
+    if root_generation_changed:
+        # A cursor position and dedup inventory belong to the source root that
+        # produced them. Do not carry either into a replacement root.
+        scan_state = {}
+        sample_ids = []
+        seen_ids = set()
     for root, root_generation in root_rows:
         if monotonic() >= deadline or entry_count >= MAX_ADMISSION_ENTRIES \
                 or byte_count >= MAX_ADMISSION_BYTES_PER_PASS:
@@ -894,27 +902,25 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
         last_bundle = root_state.get("last_bundle") if isinstance(root_state.get("last_bundle"), str) else ""
         last_root_entry = root_state.get("last_root_entry") \
             if isinstance(root_state.get("last_root_entry"), str) else ""
+        last_file = (root_state.get("last_file")
+                     if isinstance(root_state.get("last_file"), str) else "")
         try:
-            entries = []
             root_entry_limit = max(1, min(MAX_ADMISSION_ENTRIES // 2,
                                           MAX_ADMISSION_ENTRIES - 1))
             root_listing_partial = False
-            def collect_root_entries(*, after_cursor):
-                nonlocal entry_count, root_listing_partial, exhausted, partial
+            def collect_root_entries():
+                nonlocal root_listing_partial, exhausted, partial
                 collected = []
+                scanned = 0
                 with os.scandir(root) as listing:
                     for entry in listing:
-                        if monotonic() >= deadline or entry_count >= MAX_ADMISSION_ENTRIES:
+                        if (monotonic() >= deadline
+                                or scanned >= MAX_ADMISSION_ENTRIES):
                             partial = True
                             exhausted = True
                             root_listing_partial = True
                             break
-                        if last_root_entry and ((entry.name > last_root_entry) != after_cursor):
-                            continue
-                        if len(collected) >= root_entry_limit:
-                            root_listing_partial = True
-                            break
-                        entry_count += 1
+                        scanned += 1
                         try:
                             if entry.is_dir(follow_symlinks=False):
                                 collected.append((entry.name, Path(entry.path), True))
@@ -934,18 +940,42 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         except OSError:
                             warnings.append("admission-entry-unreadable")
                             partial = True
-                return collected
-            entries = collect_root_entries(after_cursor=True)
-            if (last_root_entry and len(entries) < root_entry_limit and not exhausted
-                    and not root_listing_partial):
-                wrapped = collect_root_entries(after_cursor=False)
-                names = {item[0] for item in entries}
-                entries.extend(item for item in wrapped if item[0] not in names)
+                return sorted(collected, key=lambda item: item[0])
+
+            all_entries = collect_root_entries()
+            after_cursor = ([item for item in all_entries
+                             if not last_root_entry or item[0] > last_root_entry])
+            before_cursor = ([item for item in all_entries
+                              if last_root_entry and item[0] <= last_root_entry])
+            page_entries = after_cursor[:root_entry_limit]
+            if len(page_entries) < root_entry_limit:
+                page_entries.extend(before_cursor[:root_entry_limit - len(page_entries)])
+            entries = list(page_entries)
+            entry_count += len(page_entries)
             if root_listing_partial:
                 partial = True
-            if entries:
-                last_root_entry = max(item[0] for item in entries)
-            entries.sort(key=lambda item: item[0])
+            if page_entries:
+                last_root_entry = page_entries[-1][0]
+
+            all_root_files = [item for item in all_entries if not item[2]]
+            if last_file and last_bundle == "@root" and all_root_files:
+                entries = [item for item in entries if item[2]]
+                entries.extend(all_root_files)
+            elif last_file and last_bundle and last_bundle != "@root" \
+                    and not any(item[0] == last_bundle and item[2] for item in entries):
+                active = next((item for item in all_entries
+                               if item[0] == last_bundle and item[2]), None)
+                if active is None:
+                    active_path = root / last_bundle
+                    try:
+                        active_info = active_path.lstat()
+                        if (stat.S_ISDIR(active_info.st_mode)
+                                and not stat.S_ISLNK(active_info.st_mode)):
+                            active = (last_bundle, active_path, True)
+                    except OSError:
+                        pass
+                if active is not None:
+                    entries.append(active)
             if entries and last_bundle:
                 entries = ([item for item in entries if item[0] > last_bundle]
                            + [item for item in entries if item[0] <= last_bundle])
@@ -953,8 +983,9 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
             bundles = ([(root, root_files)] if root_files else [])
             bundles.extend((path, None) for _, path, is_dir in entries if is_dir)
             next_bundle = last_bundle
-            last_file = (root_state.get("last_file")
-                         if isinstance(root_state.get("last_file"), str) else "")
+            next_bundle_generation = (root_state.get("bundle_generation")
+                                      if isinstance(root_state.get("bundle_generation"), str)
+                                      else "")
             if last_bundle:
                 current_index = next((index for index, item in enumerate(bundles)
                     if ("@root" if item[0] == root else item[0].name) == last_bundle), None)
@@ -971,16 +1002,42 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         or entry_count >= MAX_ADMISSION_ENTRIES:
                     partial = exhausted = True
                     break
+                bundle_key = "@root" if bundle == root else bundle.name
+                bundle_identity = root_generation
+                if bundle != root:
+                    try:
+                        bundle_info = bundle.lstat()
+                        if (stat.S_ISLNK(bundle_info.st_mode)
+                                or not stat.S_ISDIR(bundle_info.st_mode)):
+                            raise ValueError("admission-bundle-replaced")
+                        bundle_identity = f"{bundle_info.st_dev}:{bundle_info.st_ino}"
+                    except (OSError, ValueError) as exc:
+                        warnings.append("admission-bundle-unreadable:" + str(exc))
+                        partial = True
+                        continue
+                file_cursor = last_file if bundle_key == last_bundle else ""
+                if file_cursor:
+                    prior_identity = root_state.get("bundle_generation")
+                    if prior_identity != bundle_identity:
+                        if prior_identity:
+                            warnings.append("admission-bundle-generation-changed")
+                            uncertainty_reason = uncertainty_reason or "generation-changed"
+                        file_cursor = ""
+
                 files = listed
+                listing_partial = False
                 if files is None:
                     files = []
+                    scanned = 0
                     try:
                         with os.scandir(bundle) as listing:
                             for child in listing:
-                                if monotonic() >= deadline or entry_count >= MAX_ADMISSION_ENTRIES:
+                                if (monotonic() >= deadline
+                                        or scanned >= MAX_ADMISSION_ENTRIES):
                                     partial = exhausted = True
+                                    listing_partial = True
                                     break
-                                entry_count += 1
+                                scanned += 1
                                 try:
                                     if (child.is_file(follow_symlinks=False)
                                             and not child.name.lower().endswith(".jsonl")):
@@ -999,16 +1056,31 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     except OSError:
                         warnings.append("admission-bundle-unreadable")
                         partial = True
+                        listing_partial = True
                 files.sort(key=lambda item: item[0])
-                bundle_key = "@root" if bundle == root else bundle.name
-                if last_file and bundle_key == last_bundle:
-                    files = ([item for item in files if item[0] > last_file]
-                             + [item for item in files if item[0] <= last_file])
+                if file_cursor:
+                    files = [item for item in files if item[0] > file_cursor]
+                    if not files and not listing_partial:
+                        next_bundle = bundle_key
+                        next_file = ""
+                        next_bundle_generation = bundle_identity
+                        scan_state[root_key] = {"last_bundle": next_bundle,
+                            "last_file": next_file, "last_root_entry": last_root_entry,
+                            "bundle_generation": next_bundle_generation}
+                        continue
+                available_entries = MAX_ADMISSION_ENTRIES - entry_count
+                page_partial = len(files) > available_entries
+                if page_partial:
+                    files = files[:available_entries]
+                    partial = exhausted = True
+                entry_count += len(files)
+                bundle_incomplete = listing_partial or page_partial
                 documents = []
-                last_file_processed = last_file if bundle_key == last_bundle else ""
+                last_file_processed = file_cursor
                 for file_name, path, _ in files:
                     if monotonic() >= deadline or byte_count >= MAX_ADMISSION_BYTES_PER_PASS:
                         partial = exhausted = True
+                        bundle_incomplete = True
                         break
                     try:
                         if registry_abs is not None and Path(os.path.abspath(path)) == registry_abs:
@@ -1029,6 +1101,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         remaining = MAX_ADMISSION_BYTES_PER_PASS - byte_count
                         if remaining <= 0:
                             partial = exhausted = True
+                            bundle_incomplete = True
                             break
                         raw, _info = _read_file(path, bundle,
                             min(MAX_ADMISSION_RECORD_BYTES, remaining))
@@ -1052,9 +1125,28 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         warnings.append("admission-record-unavailable:" + str(exc))
                         partial = True
                     last_file_processed = file_name
+                try:
+                    current_bundle = bundle.lstat()
+                    current_identity = (f"{current_bundle.st_dev}:{current_bundle.st_ino}"
+                                        if stat.S_ISDIR(current_bundle.st_mode)
+                                        and not stat.S_ISLNK(current_bundle.st_mode) else "")
+                except OSError:
+                    current_identity = ""
+                if current_identity != bundle_identity:
+                    warnings.append("admission-root-generation-changed" if bundle == root
+                                    else "admission-bundle-generation-changed")
+                    uncertainty_reason = uncertainty_reason or "generation-changed"
+                    partial = True
+                    documents = []
+                    last_file_processed = ""
+                    bundle_incomplete = False
                 next_bundle = bundle_key
-                next_file = last_file_processed if exhausted else ""
-                scan_state[root_key] = {"last_bundle": next_bundle, "last_file": next_file}
+                next_file = last_file_processed if bundle_incomplete else ""
+                next_bundle_generation = (bundle_identity
+                                          if current_identity == bundle_identity else "")
+                scan_state[root_key] = {"last_bundle": next_bundle, "last_file": next_file,
+                    "last_root_entry": last_root_entry,
+                    "bundle_generation": next_bundle_generation}
                 if exhausted:
                     break
                 if not documents:
@@ -1072,7 +1164,8 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     key=lambda item: json.dumps(item, sort_keys=True)), sort_keys=True,
                     separators=(",", ":"), ensure_ascii=False, default=str)
                 bundle_generation = hashlib.sha256(
-                    (root_generation + generation_material).encode("utf-8")).hexdigest()[:24]
+                    (root_generation + ":" + bundle_identity + ":" + generation_material)
+                    .encode("utf-8")).hexdigest()[:24]
                 if run_ids != {run_id}:
                     candidates.append({"ambiguous": True, "generation": bundle_generation,
                                        "samples": [], "path": str(bundle)})
@@ -1097,6 +1190,9 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     decisions = [decision for decision, _row_ids in decisions]
                 current_rows = []
                 for row in decisions:
+                    dedup_key = hashlib.sha256(
+                        (bundle_generation + ":" + row["sample_id"]).encode("utf-8")
+                    ).hexdigest()
                     stamp = row.get("at")
                     if start is not None and stamp is not None and stamp < start:
                         continue
@@ -1106,23 +1202,27 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                             and stamp < float(prior_latest_at)))
                     if invalid_time:
                         row = {**row, "state": "unknown"}
-                        if row["sample_id"] not in seen_ids:
+                        if dedup_key not in seen_ids:
                             new_invalid_timestamp = True
                     elif row["state"] in {"admitted", "denied"} and stamp is not None \
-                            and row["sample_id"] not in seen_ids:
+                            and dedup_key not in seen_ids:
                         new_valid_times.append(float(stamp))
                     current_rows.append(row)
                 unseen = []
                 for row in current_rows:
-                    if row["sample_id"] not in seen_ids:
+                    dedup_key = hashlib.sha256(
+                        (bundle_generation + ":" + row["sample_id"]).encode("utf-8")
+                    ).hexdigest()
+                    if dedup_key not in seen_ids:
                         unseen.append(row)
-                        seen_ids.add(row["sample_id"])
-                        sample_ids.append(row["sample_id"])
+                        seen_ids.add(dedup_key)
+                        sample_ids.append(dedup_key)
                 candidates.append({"ambiguous": False, "generation": bundle_generation,
                                    "samples": unseen, "all_samples": current_rows,
                                    "path": str(bundle)})
             scan_state[root_key] = {"last_bundle": next_bundle, "last_file": next_file,
-                                    "last_root_entry": last_root_entry}
+                "last_root_entry": last_root_entry,
+                "bundle_generation": next_bundle_generation}
             if exhausted:
                 break
         except (OSError, ValueError, TypeError) as exc:
@@ -1134,7 +1234,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
         seen_ids = set(sample_ids)
         warnings.append("admission-dedup-inventory-truncated")
         partial = True
-    next_cursor = {"schema_version": 1, "root_generations": current_roots,
+    next_cursor = {"schema_version": 2, "root_generations": current_roots,
                    "scan": scan_state, "sample_ids": sample_ids,
                    "latest_at": prior_latest_at}
     target_candidates = [candidate for candidate in candidates if not candidate.get("ambiguous")]
