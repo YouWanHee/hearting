@@ -2970,6 +2970,33 @@ class CompletionWatchTest(unittest.TestCase):
             self.root / "artifacts", "here-1")
         self.assertEqual(record["status"], "finished")
 
+    def test_rootless_compute_observation_uses_exact_admission_and_shared_summary(self):
+        module = load_module()
+        import resource_progress
+        bundle = self.run_dir / "unfamiliar-bundle"
+        bundle.mkdir()
+        (bundle / "execution.json").write_text(json.dumps({
+            "run_id": "here-1", "started_at": 0}))
+        (bundle / "decision.json").write_text(json.dumps({
+            "admitted": False, "snapshot": {"t": 900},
+            "reasons": ["capacity"]}))
+        self.meta["started_at"] = "1970-01-01T00:00:00+00:00"
+        self.meta.pop("output_dir", None)
+        (self.run_dir / "meta.json").write_text(json.dumps(self.meta))
+        state = self.root / "runtime" / "rootless-observation.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(resource_progress, "_observation_state_path", return_value=state), \
+                mock.patch("session_notice.notify", return_value={"state": "pending"}):
+            result = module._observe_compute_experiment(self.meta, self.run_dir, 1000)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["observation"]["admission"]["state"], "waiting")
+        self.assertIsNone(result["observation"]["reached"])
+        self.assertIsNone(result["observation"]["eta_seconds"])
+        summary = module._compute_observation_summary(result)
+        self.assertIn("admission waiting", summary)
+        self.assertIn("sample ratio 1.0", summary)
+        self.assertNotIn("wait duration", summary.lower())
+
     def test_watch_outlives_old_deadline_and_waits_for_a_valid_exit_code(self):
         module = load_module()
         clock, calls, notices = [0.0], [], []

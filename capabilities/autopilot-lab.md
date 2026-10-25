@@ -200,6 +200,26 @@ without a plan it is two hours, then every 12 hours. Known metrics, rules, basel
 and time budgets are optional. Missing sources or ETA stay explicit and do not
 interrupt a run or change exit, sentinel, verification, or approval state. Notices
 carry the run id and stable public run-record path when available.
+
+Admission is another optional observation axis, independent of metric progress.
+The shared observer can use bounded records tied to exact run provenance when
+the output root is absent; evidence must also match an exact row when it is
+row-specific, and ambiguous evidence remains unknown. Public records and notices
+can summarize valid, denied and unknown admission samples, their observed sample
+ratio, freshness, and bounded reasons. A sample ratio is not a duration or a
+compute-time ratio; without explicit measured wait boundaries, wait duration
+stays unknown. Admission does not imply resumed work or supply a progress counter.
+
+Stagnation is based on strict increases in the same comparable counter or metric
+stream. Repeated fresh samples at the same value refresh observation age but do
+not reset the last-increase clock. The existing two-hour advisory can describe
+time since the last increase, or time since the first comparable observation
+when no increase has been observed. No progress signal means stagnation and ETA
+are unknown. A new run, row, or source generation starts a new comparison. Do not
+subtract admission samples or spans from elapsed time, or infer a rate or ETA
+from them. Existing lifecycle, optional-failure, recipient, and delivery-receipt
+semantics remain authoritative.
+
 For matrix plans, the default is to queue each completed row's decision-metric
 evaluation on the existing approved queue while the next row trains, then update
 the leaderboard artifact; successive halving is a default option for many rows.
