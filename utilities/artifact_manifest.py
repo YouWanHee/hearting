@@ -1645,6 +1645,9 @@ def validate_update(
     before_cycle = previous.get("cycle") if isinstance(previous.get("cycle"), dict) else {}
     after_cycle = document.get("cycle") if isinstance(document.get("cycle"), dict) else {}
     provisional_completion = before_cycle.get("state") == "active" and after_cycle.get("state") == "completed"
+    historical_handoff_completion = (
+        before_cycle.get("state") == "abandoned" and after_cycle.get("state") == "completed")
+    completion_transition = provisional_completion or historical_handoff_completion
     retired_ids = set(retired_artifact_ids)
     for key in ("events", "routes"):
         before = [r for r in previous.get(key, []) or []]
@@ -1654,13 +1657,14 @@ def validate_update(
             dispensable = dispensable_retired_recording_ids(before, retired_ids)
             retained_before = [row for row in before if not (
                 isinstance(row, dict) and row.get("event_id") in dispensable)]
-        if after[: len(retained_before)] != retained_before and not (key == "routes" and provisional_completion):
+        if after[: len(retained_before)] != retained_before and not (
+                key == "routes" and provisional_completion):
             violations.append(Violation(
                 "update-earlier-%s-changed" % key, "$.%s" % key,
                 "a refreshed document keeps every earlier %s exactly" % key))
         elif key == "events":
             allowed = {"artifact.revision.recorded", "route.terminal.recorded"}
-            if provisional_completion:
+            if completion_transition:
                 allowed.add("cycle.completed")
             for row in after[len(retained_before):]:
                 if not isinstance(row, dict) or row.get("event_type") not in allowed:
@@ -1671,7 +1675,7 @@ def validate_update(
         if key in changeable_cycle_fields and key != "state":
             continue  # a move or a new parent (§45 D-126) says which fields it may change
         if before_cycle.get(key) != after_cycle.get(key):
-            if not (key == "state" and provisional_completion):
+            if not (key == "state" and completion_transition):
                 violations.append(Violation(
                     "update-cycle-field-changed", "$.cycle.%s" % key, "a refresh does not change the cycle"))
     if provisional_completion:
@@ -1707,6 +1711,48 @@ def validate_update(
             elif changed[0].get("terminal_evidence_id") != terminal_events[0].get("event_id"):
                 violations.append(Violation("update-completion-event-binding-invalid", "$.routes",
                                             "the terminal route row must name its appended event"))
+    if historical_handoff_completion:
+        before_routes = [row for row in previous.get("routes", []) or [] if isinstance(row, dict)]
+        after_routes = [row for row in document.get("routes", []) or [] if isinstance(row, dict)]
+        suffix = [row for row in after_routes[len(before_routes):]]
+        event_suffix = [row for row in (document.get("events") or [])[len(previous.get("events") or []):]
+                        if isinstance(row, dict)]
+        cycle_events = [row for row in event_suffix if row.get("event_type") == "cycle.completed"
+                        and row.get("target_id") == after_cycle.get("cycle_id")]
+        terminal_events = [row for row in event_suffix
+                           if row.get("event_type") == "route.terminal.recorded"
+                           and row.get("target_id") == after_cycle.get("cycle_id")]
+        cycle_event_rows = [row for row in event_suffix if row.get("event_type") == "cycle.completed"]
+        terminal_event_rows = [row for row in event_suffix
+                               if row.get("event_type") == "route.terminal.recorded"]
+        old_pending = (len(before_routes) == 1 and before_routes[0].get("terminal_marker") == "pending"
+                       and not before_routes[0].get("terminal_evidence_id"))
+        if (not old_pending or len(suffix) != 1 or len(cycle_events) != 1
+                or len(terminal_events) != 1 or len(cycle_event_rows) != 1
+                or len(terminal_event_rows) != 1
+                or any(row.get("event_type") not in {
+                    "artifact.revision.recorded", "cycle.completed", "route.terminal.recorded"}
+                       for row in event_suffix)):
+            violations.append(Violation(
+                "update-historical-completion-shape-invalid", "$.routes",
+                "historical completion appends one exact successor row and one completion event pair"))
+        elif (suffix[0].get("route_id") == before_routes[0].get("route_id")
+              or suffix[0].get("artifact_root_id") != previous.get("artifact_root_id")
+              or not suffix[0].get("route_hash") or not suffix[0].get("terminal_marker")
+              or not suffix[0].get("terminal_evidence_id")
+              or suffix[0].get("terminal_evidence_id") != terminal_events[0].get("event_id")):
+            violations.append(Violation(
+                "update-historical-completion-route-invalid", "$.routes",
+                "the appended successor keeps the old route and binds its exact terminal event"))
+        elif terminal_events[0].get("payload", {}).get("artifact_root_id") != previous.get("artifact_root_id") \
+                or terminal_events[0].get("payload", {}).get("route_id") != suffix[0].get("route_id") \
+                or terminal_events[0].get("payload", {}).get("route_hash") != suffix[0].get("route_hash") \
+                or terminal_events[0].get("payload", {}).get("terminal_marker_digest") != suffix[0].get("terminal_marker") \
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}",
+                                    terminal_events[0].get("payload", {}).get("outcome_digest", "")):
+            violations.append(Violation(
+                "update-historical-completion-event-invalid", "$.events",
+                "the terminal event payload names the appended route and marker"))
     relocation = document.get("relocation") or {}
     moving_root = (relocation.get("source_artifact_root_id") == previous.get("artifact_root_id")
                    and relocation.get("source_repository_id") == previous.get("repository_id")

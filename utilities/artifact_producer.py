@@ -5657,16 +5657,22 @@ def finalize(
             # request fingerprint needed to prove "same retry" (D-8).
             published = _published_cycle_state(root, record)
             if published != state:
-                if published == "active" and state == "completed":
+                if published in {"active", "abandoned"} and state == "completed":
+                    if published == "abandoned" and expected_binding is None:
+                        raise ProducerError(
+                            "finalize-state-conflict",
+                            f"{cycle_id}: requested=completed published_cycle_state=abandoned storage_state=sealed",
+                        )
                     refreshed = _refresh_cycle_locked(root, record, now=now, allocator=alloc,
                                                       crash_after_manifest=crash_after_manifest,
-                                                      prescan=prescan, last_try=_last_try)
+                                                      prescan=prescan, last_try=_last_try,
+                                                      expected_binding=expected_binding)
                     latest = read_cycle_record(root, cycle_id)
                     completed_state = _published_cycle_state(root, latest) if latest else None
                     if completed_state != "completed":
                         raise ProducerError(
                             "finalize-state-conflict",
-                            f"{cycle_id}: requested=completed published_cycle_state=active storage_state=sealed",
+                            f"{cycle_id}: requested=completed published_cycle_state={published} storage_state=sealed",
                         )
                     return _finish({**refreshed, "storage_state": "sealed", "cycle_state": "completed"})
                 raise ProducerError(
@@ -5682,7 +5688,7 @@ def finalize(
                     # A route continuing this closed cycle finishes it again (§45 D-127): the
                     # document gets that route's own terminal record before it is proved.
                     _refresh_cycle_locked(root, record, now=now, allocator=alloc, prescan=prescan,
-                                          last_try=_last_try)
+                                          last_try=_last_try, expected_binding=expected_binding)
                     record = read_cycle_record(root, cycle_id)
                 verified = _verify_sealed_cycle_locked(root, record, expected_binding)
                 return _finish({**verified, "storage_state": "sealed", "cycle_state": published})
@@ -5692,7 +5698,8 @@ def finalize(
                 # document is published when they differ.
                 refreshed = _refresh_cycle_locked(root, record, now=now, allocator=alloc,
                                                   crash_after_manifest=crash_after_manifest,
-                                                  prescan=prescan, last_try=_last_try)
+                                                  prescan=prescan, last_try=_last_try,
+                                                  expected_binding=expected_binding)
                 return _finish({**refreshed, "storage_state": "sealed", "cycle_state": published})
             return _finish({"status": "already-sealed", "cycle_id": cycle_id,
                     "manifest_digest": record.get("manifest_digest"),
@@ -6534,22 +6541,243 @@ def _provisional_completion_context(root: Path, record: Mapping[str, Any],
     return binding, sealed_route, outcome
 
 
+def _historical_handoff_completion_context(root: Path, record: Mapping[str, Any],
+                                          document: Mapping[str, Any],
+                                          expected_binding: Optional[Mapping[str, Any]]):
+    """Prove the sole historical abandoned shape that exact finish may complete.
+
+    Every owner-pin edge, the abandoned manifest snapshot, the current producer
+    binding, and the terminal claim are re-read. Audit route bindings and the
+    abandoned enum are never used as authority.
+    """
+    try:
+        import dispatch_contract
+        import dispatch_terminal_commit as DTC
+        import route_parent_close
+
+        if not isinstance(expected_binding, Mapping) or expected_binding.get("contract") != DTC.CONTRACT:
+            return None
+        cycle_id = record.get("cycle_id")
+        route_id, route_hash = expected_binding.get("route_id"), expected_binding.get("route_hash")
+        owner_attempt = expected_binding.get("owner_attempt_id")
+        if (record.get("state") != "sealed" or record.get("cycle_state") != "abandoned"
+                or record.get("deleted_at")
+                or record.get("abandon_reason") not in (None, "operator-decision")
+                or not cycle_id or not route_id or not route_hash or not owner_attempt
+                or document.get("cycle", {}).get("state") != "abandoned"):
+            return None
+
+        record_path = cycle_record_path(root, cycle_id)
+        record_stat = record_path.lstat()
+        if (not stat.S_ISREG(record_stat.st_mode) or record_path.is_symlink()
+                or record_path.resolve() != record_path):
+            return None
+        raw_record = record_path.read_bytes()
+        stored_record = json.loads(raw_record.decode("utf-8"))
+        if not isinstance(stored_record, dict) or stored_record != dict(record):
+            return None
+        identity = artifact_lifecycle.read_root_identity(root)
+        if identity is None:
+            return None
+        root_identity = {"repository_id": identity.repository_id,
+                         "artifact_root_id": identity.artifact_root_id}
+        if (expected_binding.get("artifact_root") != str(Path(root).resolve())
+                or expected_binding.get("root_identity") != root_identity
+                or expected_binding.get("cycle_id") != cycle_id
+                or expected_binding.get("campaign_id") != record.get("campaign_id")
+                or expected_binding.get("producer_id") != record.get("producer_id")
+                or expected_binding.get("cycle_record_digest") != DTC.cycle_identity_digest(record)
+                or expected_binding.get("route_file") != str(
+                    route_lineage.canonical_route_path(root, route_id))):
+            return None
+
+        cycle = document.get("cycle") or {}
+        input_digest = _digest(_canonical({
+            "route_id": record.get("route_id"), "route_hash": record.get("route_hash"),
+            "capability": record.get("capability"), "intensity": record.get("intensity"),
+        }))
+        if (document.get("artifact_root_id") != identity.artifact_root_id
+                or document.get("repository_id") != identity.repository_id
+                or cycle.get("cycle_id") != cycle_id
+                or cycle.get("campaign_id") != record.get("campaign_id")
+                or cycle.get("parent_cycle_id") != record.get("parent_cycle_id")
+                or cycle.get("started_on") != record.get("started_on")
+                or cycle.get("input_digest") != input_digest
+                or document.get("producer", {}).get("producer_id") != record.get("producer_id")):
+            return None
+
+        snapshots = [entry[1] for entry in artifact_lifecycle.read_manifest_snapshots(root, cycle_id)
+                     if isinstance(entry, (list, tuple)) and len(entry) > 1
+                     and isinstance(entry[1], Mapping)]
+        document_digest = artifact_manifest.manifest_digest(document)
+        if not any(artifact_manifest.manifest_digest(old) == document_digest
+                   and artifact_manifest.canonical_bytes(old) == artifact_manifest.canonical_bytes(document)
+                   for old in snapshots):
+            return None
+
+        route_path = route_lineage.canonical_route_path(root, route_id)
+        route = load_route(root, route_path, expected_identity={"route_id": route_id,
+                                                                 "route_hash": route_hash})
+        if (expected_binding.get("route_id") != route.get("route_id")
+                or route.get("capability") != record.get("capability")
+                or route.get("effective_intensity") != record.get("intensity")):
+            return None
+        lineage = route_lineage.verified_route_lineage(route, artifact_root=root, observe=True)
+        forward = list(reversed(lineage))
+        if (len(forward) < 2 or forward[0].get("route_id") != record.get("route_id")
+                or forward[0].get("route_hash") != record.get("route_hash")
+                or any(item.get("capability") != record.get("capability")
+                       or item.get("effective_intensity") != record.get("intensity")
+                       for item in forward)):
+            return None
+        admission = cycle_route_admission(root, record, route, finalize=True, validation_only=True)
+        if not admission.allow:
+            return None
+        for predecessor, successor in zip(forward, forward[1:]):
+            proof = route_parent_close.verified_owner_pin_handoff_close(predecessor)
+            prepared = (proof or {}).get("successor")
+            if (not proof or not isinstance(prepared, Mapping)
+                    or prepared.get("route_id") != successor.get("route_id")
+                    or prepared.get("route_hash") != successor.get("route_hash")):
+                return None
+
+        old_routes = document.get("routes") or []
+        if (len(old_routes) != 1 or not isinstance(old_routes[0], Mapping)
+                or old_routes[0].get("artifact_root_id") != identity.artifact_root_id
+                or old_routes[0].get("route_id") != forward[-2].get("route_id")
+                or old_routes[0].get("route_hash") != forward[-2].get("route_hash")
+                or old_routes[0].get("terminal_marker") != "pending"
+                or old_routes[0].get("terminal_evidence_id") != ""):
+            return None
+        abandoned = [event for event in document.get("events", []) or []
+                     if isinstance(event, Mapping) and event.get("event_type") == "cycle.abandoned"
+                     and event.get("target_id") == cycle_id]
+        if (len(abandoned) != 1
+                or (abandoned[0].get("payload") or {}).get("abandon_reason") != "operator-decision"
+                or (abandoned[0].get("provenance") or {}).get("producer_route_id")
+                    != forward[-2].get("route_id")
+                or any(event.get("event_type") == "cycle.completed"
+                       for event in document.get("events", []) or [] if isinstance(event, Mapping))):
+            return None
+
+        binding_result = DTC.load_producer_binding(
+            artifact_root=root, route_id=route_id, owner_attempt_id=owner_attempt)
+        if dict(binding_result.binding or {}) != dict(expected_binding):
+            return None
+        binding_stat = binding_result.path.lstat()
+        if (not stat.S_ISREG(binding_stat.st_mode) or binding_result.path.is_symlink()
+                or binding_result.path.resolve() != binding_result.path):
+            return None
+        jobs_value = os.environ.get("AGENT_DISPATCH_JOBS")
+        if not jobs_value:
+            return None
+        jobs = Path(jobs_value)
+        owner_binding = DTC.validate_owner_route(
+            jobs=jobs, route_file=route_path, owner_attempt_id=owner_attempt)
+        if (owner_binding.route_id != route_id or owner_binding.route_hash != route_hash
+                or owner_binding.route_file != str(route_path) or not route_is_closed(root, route)
+                or _live_review_lease(root, cycle_id) is not None):
+            return None
+
+        route_module = artifact_lifecycle._load_capability_route()
+        gates = route_module.terminal_gate_observation(route, jobs=jobs, exact_terminal=True)
+        if route_module.terminal_gate_proven(gates) is not True:
+            return None
+        from workflow_state import WorkflowLedger
+        workflow = WorkflowLedger(route_id, route_hash, jobs=jobs).read_only_state()
+        if workflow.get("journal_unreadable") or workflow.get("workflow_state") == "CANCELLED":
+            return None
+        binding, sealed_route = artifact_lifecycle.bind_existing_runtime_route(
+            root, route_path, expected_root_id=identity.artifact_root_id)
+        outcome_path = Path(binding.outcome_file)
+        outcome_stat = outcome_path.lstat()
+        if (not stat.S_ISREG(outcome_stat.st_mode) or outcome_path.is_symlink()
+                or outcome_path.resolve() != outcome_path):
+            return None
+        outcome_raw = outcome_path.read_bytes()
+        outcome = json.loads(outcome_raw.decode("utf-8"))
+        if (binding.route_id != route_id or binding.route_hash != route_hash
+                or outcome.get("route_id") != route_id or outcome.get("route_hash") != route_hash
+                or outcome.get("route_file") != str(route_path)
+                or outcome.get("terminal_gate_proven") is not True
+                or outcome.get("terminal_owner_attempt_id") != owner_attempt
+                or outcome.get("autoclose") is not None
+                or outcome.get("disposition") in {"abandoned", "operator-decision", "cancelled"}):
+            return None
+
+        terminal_state_path = DTC.terminal_slot(root, route_id, owner_attempt) / "terminal-commit.json"
+        terminal_state_stat = terminal_state_path.lstat()
+        if (not stat.S_ISREG(terminal_state_stat.st_mode) or terminal_state_path.is_symlink()
+                or terminal_state_path.resolve() != terminal_state_path):
+            return None
+        terminal_state = json.loads(terminal_state_path.read_text(encoding="utf-8"))
+        marker_digest = DTC.terminal_marker_digest(list(gates.values()))
+        commit_id = DTC.terminal_commit_id(route_id=route_id, route_hash=route_hash,
+            owner_attempt_id=owner_attempt, marker_digest=marker_digest,
+            producer_digest=binding_result.digest)
+        if (not isinstance(terminal_state, dict) or terminal_state.get("state") != "route-closed"
+                or terminal_state.get("route_id") != route_id
+                or terminal_state.get("route_hash") != route_hash
+                or terminal_state.get("owner_attempt_id") != owner_attempt
+                or terminal_state.get("terminal_marker_digest") != marker_digest
+                or terminal_state.get("producer_binding_digest") != binding_result.digest
+                or terminal_state.get("terminal_commit_id") != commit_id
+                or outcome.get("terminal_marker_digest") != marker_digest
+                or outcome.get("terminal_commit_id") != commit_id):
+            return None
+        claim = dispatch_contract.terminal_claim_observation(jobs, route_id, owner_attempt)
+        claim_proof = (claim or {}).get("proof")
+        if (not isinstance(claim_proof, Mapping)
+                or claim.get("route_id") != route_id
+                or claim.get("owner_attempt_id") != owner_attempt
+                or claim_proof.get("terminal_commit_id") != commit_id
+                or claim_proof.get("terminal_marker_digest") != marker_digest
+                or claim_proof.get("producer_binding_digest") != binding_result.digest):
+            return None
+        request = DTC.TerminalCommitRequest(route_file=route_path, owner_attempt_id=owner_attempt,
+                                            jobs=jobs, artifact_root=root)
+        children = DTC._prove_route_children(request, route, gates)
+        if children.status != "proved":
+            return None
+        return binding, sealed_route, outcome, snapshots, gates
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, AttributeError, ProducerError,
+            artifact_lifecycle.LifecycleError, route_lineage.RouteLineageError,
+            dispatch_lock_order.LockOrderError):
+        return None
+
+
 def _evaluate_provisional_completion(root: Path, record: Mapping[str, Any], candidate: Mapping[str, Any],
-                                     binding: Any, outcome: Mapping[str, Any]) -> bool:
+                                     binding: Any, outcome: Mapping[str, Any], *,
+                                     preserved: Optional[Sequence[Mapping[str, Any]]] = None,
+                                     first_completion: bool = False) -> bool:
     """First-completion proof of a completed candidate: required roles, payload, marker, terminal digests."""
     try:
         decision = artifact_lifecycle.evaluate_cycle_completion(
             candidate, content_root=_record_cycle_manifest_path(root, record).parent,
             route_file=route_lineage.canonical_route_path(root, binding.route_id),
             expected_root_id=binding.artifact_root_id, payload_verified=False,
-            inline_finish_id=outcome.get("inline_finish_id"))
+            inline_finish_id=outcome.get("inline_finish_id"), preserved=preserved,
+            first_completion=first_completion)
     except (artifact_lifecycle.LifecycleError, OSError, ValueError):
         return False
     return decision.ok
 
 
-def _provisional_completion_holds(root: Path, record: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
+def _provisional_completion_holds(root: Path, record: Mapping[str, Any], candidate: Mapping[str, Any],
+                                  expected_binding: Optional[Mapping[str, Any]] = None) -> bool:
     """Re-ask, at publication, what the candidate was built on (called under the admission lock)."""
+    manifest_path = _record_cycle_manifest_path(root, record)
+    previous = _read_json(manifest_path)
+    if not isinstance(previous, Mapping):
+        return False
+    state = (previous.get("cycle") or {}).get("state")
+    if state == "abandoned":
+        context = _historical_handoff_completion_context(root, record, previous, expected_binding)
+        if context is None:
+            return False
+        binding, _sealed_route, outcome, preserved, _gates = context
+        return _evaluate_provisional_completion(root, record, candidate, binding, outcome,
+                                                preserved=preserved, first_completion=True)
     context = _provisional_completion_context(root, record, candidate.get("artifact_root_id"))
     if context is None:
         return False
@@ -6560,9 +6788,50 @@ def _provisional_completion_holds(root: Path, record: Mapping[str, Any], candida
 def _provisional_completion_projection(root: Path, record: Mapping[str, Any], document: Mapping[str, Any],
                                        facts: Sequence[Tuple[str, str, int]], *, revision_id: str,
                                        allocator: artifact_identity.IdAllocator,
-                                       now: Optional[float]) -> Optional[Dict[str, Any]]:
-    """Bind exact late terminal proof to one provisional active cycle revision."""
-    if not isinstance(document.get("cycle"), Mapping) or document["cycle"].get("state") != "active":
+                                       now: Optional[float],
+                                       expected_binding: Optional[Mapping[str, Any]] = None,
+                                       previous_document: Optional[Mapping[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Bind exact late terminal proof to an active or verified handoff revision."""
+    if not isinstance(document.get("cycle"), Mapping):
+        return None
+    document_state = document["cycle"].get("state")
+    if document_state == "abandoned":
+        history_source = previous_document or document
+        context = _historical_handoff_completion_context(root, record, history_source, expected_binding)
+        if context is None:
+            return None
+        binding, sealed_route, outcome, preserved, gates = context
+        additions = _leaf_terminal_additions(root, record, document, facts,
+            allocator=allocator, revision_id=revision_id, now=now)
+        if additions is None or additions["binding"].route_id != binding.route_id:
+            return None
+        candidate = json.loads(json.dumps(document))
+        candidate["manifest_revision_id"] = revision_id
+        candidate["cycle"]["state"] = "completed"
+        cycle_digest = _digest(_canonical([[rel, digest, size] for rel, digest, size in facts]))
+        provenance = {"source_manifest_id": document["manifest_id"],
+                      "source_revision_id": revision_id, "producer_route_id": binding.route_id,
+                      "algorithm_version": ALGORITHM_VERSION, "schema_version": 1,
+                      "source_digest": cycle_digest}
+        cycle_event = {"event_id": allocator.allocate("event"), "stream_id": allocator.allocate("stream"),
+                       "stream_sequence": 1, "event_type": "cycle.completed",
+                       "target_id": record["cycle_id"],
+                       "actor": {"kind": "producer", "id": record["producer_id"]},
+                       "recorded_at": _rfc3339(now), "provenance": provenance,
+                       "evidence_ids": [], "payload": {}}
+        candidate["routes"] = list(candidate.get("routes", [])) + [additions["row"]]
+        candidate["events"] = list(candidate.get("events", [])) + [cycle_event, additions["event"]]
+        try:
+            candidate = artifact_lifecycle._derive_terminal_evidence(
+                candidate, additions["binding"], additions["route"], recorded_gates=gates)
+        except (artifact_lifecycle.LifecycleError, OSError, ValueError) as exc:
+            return None
+        completion_history = list(preserved)
+        if not _evaluate_provisional_completion(root, record, candidate, binding, outcome,
+                                               preserved=completion_history, first_completion=True):
+            return None
+        return candidate
+    if document_state != "active":
         return None
     context = _provisional_completion_context(root, record, document.get("artifact_root_id"))
     if context is None:
@@ -6937,6 +7206,7 @@ def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optiona
                           allocator: Optional[artifact_identity.IdAllocator] = None,
                           crash_after_manifest: bool = False,
                           prescan: Optional[_Prescan] = None, last_try: bool = True,
+                          expected_binding: Optional[Mapping[str, Any]] = None,
                           trigger: str = "finalize") -> Dict[str, Any]:
     """Re-finalize a closed cycle: publish its next manifest document if any file changed.
 
@@ -6996,7 +7266,9 @@ def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optiona
         changes = {"added": [], "modified": [], "removed": [], "reclassified": []}
     revision_id = refreshed["manifest_revision_id"] if refreshed is not None else alloc.allocate("manifest_revision")
     provisional = _provisional_completion_projection(root, record, refreshed or document, facts,
-                                                     revision_id=revision_id, allocator=alloc, now=now)
+                                                     revision_id=revision_id, allocator=alloc, now=now,
+                                                     expected_binding=expected_binding,
+                                                     previous_document=document)
     if provisional is not None:
         refreshed = provisional
         additions = None
@@ -7787,7 +8059,8 @@ def _history_published(root: Path, cycle_id: str) -> bool:
 def _publish_refresh(root: Path, cycle_id: str, manifest_path: Path, raw: bytes, digest: str,
                      refreshed: Mapping[str, Any], new_digest: str, scan: _RefreshScan,
                      changes: Mapping[str, Sequence[str]], lines: Sequence[Mapping[str, Any]], *,
-                     now: float, crash_after_manifest: bool) -> Optional[str]:
+                     now: float, crash_after_manifest: bool,
+                     expected_binding: Optional[Mapping[str, Any]] = None) -> Optional[str]:
     """Publish a prepared next document; `None` on success, else why this run skipped.
 
     The refresh lock is held and the admission lock is not.  The files are re-checked with
@@ -7810,9 +8083,10 @@ def _publish_refresh(root: Path, cycle_id: str, manifest_path: Path, raw: bytes,
             return "superseded"
         # An active -> completed candidate was decided from observations taken before this
         # lock; a lease, route or outcome that moved since keeps the document as it is.
+        previous_state = (json.loads(raw.decode("utf-8")).get("cycle") or {}).get("state")
         if ((refreshed.get("cycle") or {}).get("state") == "completed"
-                and (json.loads(raw.decode("utf-8")).get("cycle") or {}).get("state") == "active"
-                and not _provisional_completion_holds(root, record, refreshed)):
+                and previous_state in {"active", "abandoned"}
+                and not _provisional_completion_holds(root, record, refreshed, expected_binding)):
             return "superseded"
         index = artifact_admission.load_index(root)  # the one read of this locked section
         row = index.manifests.get(cycle_id)

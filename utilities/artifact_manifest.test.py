@@ -1116,6 +1116,47 @@ class TestUpdateDocument(unittest.TestCase):
         after["manifest_revision_id"] = "mrev_" + "d" * 32
         return before, after
 
+    def _historical_handoff_pair(self):
+        before = _valid_document()
+        before["cycle"]["state"] = "abandoned"
+        before["routes"][0]["terminal_marker"] = "pending"
+        before["routes"][0]["terminal_evidence_id"] = ""
+        after = copy.deepcopy(before)
+        after["manifest_revision_id"] = idm.IdAllocator().allocate("manifest_revision")
+        after["cycle"]["state"] = "completed"
+        allocator = idm.IdAllocator()
+        route_id = "rt-successor"
+        route_hash = _sha(6)
+        marker = _sha(7)
+        cycle_id = after["cycle"]["cycle_id"]
+        provenance = copy.deepcopy(after["events"][0]["provenance"])
+        provenance["producer_route_id"] = route_id
+        cycle_event = {
+            "event_id": allocator.allocate("event"), "stream_id": allocator.allocate("stream"),
+            "stream_sequence": 1, "event_type": "cycle.completed", "target_id": cycle_id,
+            "actor": {"kind": "producer", "id": after["producer"]["producer_id"]},
+            "recorded_at": "2026-08-11T00:02:00Z", "provenance": copy.deepcopy(provenance),
+            "evidence_ids": [], "payload": {},
+        }
+        terminal_event = {
+            "event_id": allocator.allocate("event"), "stream_id": allocator.allocate("stream"),
+            "stream_sequence": 1, "event_type": "route.terminal.recorded", "target_id": cycle_id,
+            "actor": {"kind": "system", "id": "capability-route"},
+            "recorded_at": "2026-08-11T00:02:01Z", "provenance": copy.deepcopy(provenance),
+            "evidence_ids": [], "payload": {
+                "artifact_root_id": after["artifact_root_id"], "route_id": route_id,
+                "route_hash": route_hash, "outcome_digest": _sha(8),
+                "terminal_marker_digest": marker,
+            },
+        }
+        after["routes"].append({
+            "artifact_root_id": after["artifact_root_id"], "route_id": route_id,
+            "route_hash": route_hash, "terminal_marker": marker,
+            "terminal_evidence_id": terminal_event["event_id"],
+        })
+        after["events"].extend([cycle_event, terminal_event])
+        return before, after
+
     def test_removed_artifacts_leave_references_that_earlier_copies_resolve(self):
         before, after = self._pair()
         after["artifacts"], after["artifact_revisions"] = [], []
@@ -1198,6 +1239,26 @@ class TestUpdateDocument(unittest.TestCase):
         after["events"].append(stray)
         self.assertIn("update-event-type-not-allowed",
                       _codes(m.validate_update(after, preserved=[before], previous=before)))
+
+    def test_historical_handoff_completion_appends_one_exact_successor(self):
+        before, after = self._historical_handoff_pair()
+        report = m.validate_update(after, preserved=[before], previous=before)
+        self.assertTrue(report.ok, report.violations)
+
+        changed_prefix = copy.deepcopy(after)
+        changed_prefix["routes"][0]["route_hash"] = _sha(9)
+        self.assertIn("update-earlier-routes-changed",
+                      _codes(m.validate_update(changed_prefix, preserved=[before], previous=before)))
+
+        extra_route = copy.deepcopy(after)
+        extra_route["routes"].append(copy.deepcopy(after["routes"][-1]))
+        self.assertIn("update-historical-completion-shape-invalid",
+                      _codes(m.validate_update(extra_route, preserved=[before], previous=before)))
+
+        wrong_event = copy.deepcopy(after)
+        wrong_event["events"][-1]["payload"]["route_hash"] = _sha(10)
+        self.assertIn("update-historical-completion-event-invalid",
+                      _codes(m.validate_update(wrong_event, preserved=[before], previous=before)))
 
 
 class CampaignSupersededFoldTest(unittest.TestCase):

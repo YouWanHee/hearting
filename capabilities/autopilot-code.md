@@ -91,6 +91,8 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    follow-up, display, and cleanup duties after the model turn or bounded
    observer exits; startup and reconnect resume the exact unfinished duty
    without replaying the assignment or requiring a manual rearm.
+   An exact owner-pin handoff settles the predecessor's cancellation but keeps
+   its cycle available to the sealed continuation; it is not task abandonment.
    Campaign satisfaction is a separate optional owner judgment. An exact owner
    primary may contain a `campaign-goal` JSON fence with `campaign_id`,
    `verdict: "satisfied"`, and optional `reason`; a JSON primary uses the
