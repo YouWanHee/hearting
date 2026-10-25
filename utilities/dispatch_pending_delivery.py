@@ -1510,9 +1510,38 @@ def reclaim(root: Path, recipient_key: str, delivery_id: str, *, now_ns: int) ->
         return _public_record(updated)
 
 
+def renew_unsubmitted_claim(root: Path, recipient_key: str, delivery_id: str, *,
+                           claim_owner: str, expected_identity: dict,
+                           target_session: str, lease_seconds: float) -> dict:
+    """Renew the same owned lease for an exact peer transfer still pending I/O.
+
+    No ownership transfer, attempt increment, or submission-state change. The
+    caller owns the pending transfer lock; this store CAS protects concurrent
+    identity/owner/terminal/fence changes under the existing record lock.
+    """
+    path = record_path(root, recipient_key, delivery_id)
+    with _record_reference_lock(path):
+        value = _read_unlocked(path)
+        if (value is None or value.get("state") not in {"claimed", "sent-ambiguous"}
+                or value.get("claim_owner") != claim_owner
+                or received_ack_identity(value, recipient_key, delivery_id) != expected_identity
+                or type(value.get("claim_deadline_ns")) is not int):
+            raise PendingDeliveryError("pending-delivery-claim-refused", "renew-claim-changed")
+        _check_submission_identity(value, submission_fence_identity(value, target_session))
+        fence = value.get(SUBMISSION_FENCE_FIELD)
+        if fence is not None and fence.get("state") != "not-accepted":
+            raise PendingDeliveryError("pending-delivery-claim-refused", "submission-already-fenced")
+        if value["claim_deadline_ns"] <= time.monotonic_ns():
+            value = dict(value, claim_deadline_ns=time.monotonic_ns() + int(lease_seconds * 1e9))
+            _write_unlocked(path, value)
+        return _public_record(value)
+
+
 def release_claim(root: Path, recipient_key: str, delivery_id: str, *, claim_owner: str,
                   failure_reason: str | None = None,
-                  retry_base_delay_seconds: float | None = None) -> dict:
+                  retry_base_delay_seconds: float | None = None,
+                  expected_identity: dict | None = None,
+                  unsubmitted_to: str | None = None) -> dict:
     """Return only this carrier's claim and persist its next retry interval.
 
     Claim counts remain ownership transfers. The mutable courier retry fields
@@ -1526,6 +1555,21 @@ def release_claim(root: Path, recipient_key: str, delivery_id: str, *, claim_own
             raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
         if value.get("state") not in {"claimed", "sent-ambiguous"} or value.get("claim_owner") != claim_owner:
             return _public_record(value)
+        if (expected_identity is not None
+                and received_ack_identity(value, recipient_key, delivery_id) != expected_identity):
+            return _public_record(value)
+        if expected_identity is not None:
+            fence = value.get(SUBMISSION_FENCE_FIELD)
+            if fence is not None and fence.get("state") != "not-accepted":
+                return _public_record(value)
+        if unsubmitted_to is not None:
+            _check_submission_identity(value, submission_fence_identity(value, unsubmitted_to))
+            fence = value.get(SUBMISSION_FENCE_FIELD)
+            deadline = value.get("claim_deadline_ns")
+            if (value.get("state") != "claimed"
+                    or type(deadline) is not int or deadline <= time.monotonic_ns()
+                    or fence is not None and fence.get("state") != "not-accepted"):
+                return _public_record(value)
         updated = dict(value)
         retry = (_read_courier_retry_unlocked(path, value)
                  or _new_courier_retry())

@@ -28,6 +28,33 @@ def fixture_tempdir(stack):
 
 
 class OpenCodeV2PluginTest(unittest.TestCase):
+    def test_synchronous_completion_transport_preserves_existing_output_capacity(self):
+        node = shutil.which("node")
+        self.assertIsNotNone(node)
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            helper = folder / "reply.py"
+            helper.write_text("import json\nprint(json.dumps({'text': 'x'*1100000, 'records': []}))\n")
+            script = r'''
+import fs from 'node:fs'
+import {spawnSync} from 'node:child_process'
+import assert from 'node:assert/strict'
+const source = fs.readFileSync(process.env.PLUGIN_PATH, 'utf8')
+const a = source.indexOf('function carrierCommand(')
+const b = source.indexOf('function createCompletionCarrier(ctx)', a)
+assert(a >= 0 && b > a)
+const invoke = new Function('resolveRuntimeTarget', 'sweepRel', 'root', 'spawnSync', 'CARRIER_KIND',
+  source.slice(a,b) + '\nreturn carrierCommand("settle", "B", {}, () => {}, true)')
+const result = invoke(() => ({root: process.cwd(), helper: process.env.REPLY_HELPER}),
+  'utilities/dispatch_session_sweep.py', process.cwd(), spawnSync, 'opencode-turn')
+assert.equal(result?.text?.length, 1100000)
+console.log(JSON.stringify({bytes: result.text.length}))
+'''
+            result = subprocess.run([node, "--input-type=module", "-e", script], cwd=folder,
+                env=dict(BASE_ENV, PLUGIN_PATH=str(ROOT / "adapters/opencode/plugins/hearting-guards.js"),
+                         REPLY_HELPER=str(helper)), capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def completion_case(self, **case):
         """Exact carrier/helpers/events; real private notice, lineage, sweep and store.
 
@@ -90,7 +117,21 @@ import dispatch_session_sweep as sweep
 import dispatch_pending_delivery as pending
 assert Path(sweep.__file__).resolve() == root/'utilities/dispatch_session_sweep.py'
 sweep._state_roots = lambda: [Path(os.environ['AGENT_DISPATCH_JOBS']).parent]
-if sys.argv[1] == 'replace-claim':
+if sys.argv[1] == 'move-lineage':
+    import json
+    import dispatch_seat_handover as handover
+    import session_tidy as tidy
+    folder = tidy.state_root() / 'sessions'
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / 'reviewer-late-successor.jsonl').write_text(json.dumps({
+        'event': 'succession', 'source': 'tidy-clear', 'harness': 'opencode',
+        'sid': 'C', 'from': 'B', 'ts': 4}) + '\n')
+    handed = json.load(sys.stdin)['records']
+    targets = [handover.record_recipient(pending.read(Path(r['root']), r['storage_key'], r['delivery_id']),
+        r['storage_key'], harness='opencode') for r in handed]
+    assert targets and set(targets) == {'C'}, targets
+    print(json.dumps({'actual_current_recipients': targets}))
+elif sys.argv[1] == 'replace-claim':
     import json
     handed = json.load(sys.stdin)['records'][0]
     base, sid, did = Path(handed['root']), handed['storage_key'], handed['delivery_id']
@@ -132,8 +173,10 @@ const boundary = name => {
   if (name !== cfg.boundary || changed) return
   changed = true
   if (cfg.change === 'origin') api.invalidate()
+  else if (cfg.change === 'client') ctx.client = {...ctx.client, session: {...session}}
   else if (cfg.change === 'dispose') carrier.dispose(true)
   else if (cfg.change === 'claim') bridge('replace-claim', handed)
+  else if (cfg.change === 'lineage') logs.push(bridge('move-lineage', handed))
   else if (cfg.change === 'peer-working') api.peerStatus('working')
   else carrier.status('B', cfg.change || 'blocked')
 }
@@ -184,13 +227,13 @@ const session = {
 }
 if (cfg.native === 'missing-api') delete session.status
 const ctx = {directory: process.cwd(), client: {session, app: {log: async row => logs.push(row.body.extra)}}}
-const command = async (action, sid, data) => {
+const command = (action, sid, data, observe, synchronous = false) => {
   const result = bridge(action, data)
   if (action === 'deliver') handed = result
   // Queue the event after the helper response, before the caller resumes.
   if (cfg.afterAwait && action === cfg.boundary) queueMicrotask(() => boundary(action))
   else boundary(action)
-  return result
+  return synchronous ? result : Promise.resolve(result)
 }
 const setup = new Function('ctx', 'carrierCommand', 'path', 'readdirSync', 'readFileSync',
   'realpathSync', 'createHash', 'setInterval', 'baseDir', 'isWorkerSession', 'pendingPeerDelivery',
@@ -247,6 +290,15 @@ try {
                                 is None for row in notices))
             return observed, final
 
+    def test_completion_carrier_rechecks_lineage_after_native_and_helper_awaits(self):
+        for storage in ("A", "B"):
+            for boundary in ("root:2", "status:2", "history:2", "settle"):
+                for count in (1, 2):
+                    with self.subTest(storage=storage, boundary=boundary, count=count):
+                        self.completion_case(storage=storage, boundary=boundary,
+                                             change="lineage", writes=0, count=count,
+                                             afterAwait=boundary == "settle")
+
     def test_completion_carrier_withholds_own_and_inherited_non_idle_turns(self):
         for storage in ("A", "B"):
             for status in ("blocked", "working", "busy", "retry", "idle"):
@@ -263,10 +315,10 @@ try {
     def test_completion_carrier_rechecks_every_prewrite_await_and_releases_own_claim(self):
         for boundary in ("roots", "recipients", "root:1", "status:1", "history:1", "deliver",
                          "root:2", "status:2", "history:2", "settle"):
-            for change in ("blocked", "working", "origin"):
+            for change in ("blocked", "working", "origin", "client"):
                 with self.subTest(boundary=boundary, change=change):
                     self.completion_case(boundary=boundary, change=change, writes=0)
-        for change in ("blocked", "peer-working", "dispose"):
+        for change in ("blocked", "peer-working", "dispose", "client"):
             with self.subTest(afterAwait=change):
                 self.completion_case(boundary="settle", afterAwait=True, change=change, writes=0)
 

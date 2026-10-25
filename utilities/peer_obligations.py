@@ -1072,15 +1072,10 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False,
             return
         if intent.get("notice_delivery_id") and record.get("receipt_digest") != intent.get("notice_digest"):
             return
-        from dispatch_seat_handover import effective_parent, effective_parent_harness
-        parent = (effective_parent(row.metadata, jobs) if read_context is None else
-                  effective_parent(row.metadata, jobs, read_context=read_context))
         if require_current_recipient:
-            parent_harness = (effective_parent_harness(row.metadata, jobs)
-                              if read_context is None else effective_parent_harness(
-                                  row.metadata, jobs, read_context=read_context))
-            expected_harness = (identity.get("harness", "") if parent == str(
-                row.metadata.get("parent_sid") or "") else parent_harness or identity.get("harness", ""))
+            from dispatch_seat_handover import _effective
+            parent, parent_harness = _effective(row.metadata, jobs, read_context=read_context)
+            expected_harness = parent_harness or identity.get("harness", "")
             if (parent != binding["recipient_sid"]
                     or expected_harness != recipient.get("harness")):
                 return
@@ -1157,14 +1152,14 @@ def _session_notice_delivery_bindings(message, roots=None, *, received_only=Fals
 def _current_session_notice_bindings(message):
     """Current authority for a new write; historical receipts use the immutable reader."""
     import dispatch_pending_delivery as pending
-    from dispatch_seat_handover import record_recipient
+    from dispatch_seat_handover import record_recipient_binding
     binding = message.get("producer_binding") or {}
     recipient = message.get("to") or {}
     matches = list(_session_notice_delivery_bindings(message))
     if (not matches or len(matches) != len(binding.get("records") or ())
             or any(record.get("state") not in pending.OPEN_STATES
-                   or record_recipient(record, storage, harness=recipient.get("harness"))
-                      != recipient.get("session_id")
+                   or record_recipient_binding(record, storage, harness=recipient.get("harness"))
+                      != (recipient.get("harness"), recipient.get("session_id"))
                    for _store, _duty, record, _root, storage, _delivery in matches)):
         return []
     return matches
@@ -1173,6 +1168,55 @@ def _current_session_notice_bindings(message):
 def session_notice_delivery_current(message):
     """Recheck a prepared notice immediately before its existing transport's first write."""
     return bool(_current_session_notice_bindings(message))
+
+
+def registered_submission_current(message):
+    """Authorize every retained output member after all binding/native reads."""
+    import dispatch_pending_delivery as pending
+    from dispatch_recipient_receipt import claimed_send_current
+    from dispatch_seat_handover import record_recipient_binding
+    declared = message.get("dispatch_notices")
+    if declared is None:
+        declared = [message["dispatch_notice"]] if message.get("dispatch_notice") else []
+    if not declared:
+        # Runtime producers must acquire their exact dispatch bindings before
+        # the first write. Ordinary peer transfers have no registered duty.
+        return (message.get("producer_binding") or {}).get("schema") != "registered-runtime-completion-v1"
+    matches = list(_registered_delivery_bindings(message))
+    recipient = message.get("to") or {}
+    if len(matches) != len(declared):
+        return False
+    owners = {item["delivery_id"]: item["claim_owner"] for item in declared}
+    # A deferred immutable peer transfer has never entered native I/O. Older
+    # retained producers stamped its underlying record sent-ambiguous already
+    # at preparation. Only this still-pending exact transfer may finish that
+    # first write; queued/unverified transfers keep their no-resend path.
+    hook_context_recovery = (message.get("state") == "queued"
+        and message.get("receipt") == "hook-context-emitted"
+        and recipient.get("harness") == "claude")
+    if message.get("state") != "pending" and not hook_context_recovery:
+        return False
+    for _store, duty, _row, record, root, storage, delivery_id in matches:
+        jobs = Path(duty["intent"]["identity"]["jobs"])
+        if (record_recipient_binding(record, storage, harness=recipient.get("harness"), jobs=jobs)
+                != (recipient.get("harness"), recipient.get("session_id"))
+                or record.get("claim_owner") != owners[delivery_id]):
+            return False
+        deadline = record.get("claim_deadline_ns")
+        if (record.get("state") in {"claimed", "sent-ambiguous"}
+                and type(deadline) is int and deadline <= time.monotonic_ns()):
+            try:
+                pending.renew_unsubmitted_claim(root, storage, delivery_id,
+                    claim_owner=owners[delivery_id], target_session=recipient["session_id"],
+                    expected_identity=pending.received_ack_identity(record, storage, delivery_id),
+                    lease_seconds=30)
+            except (OSError, ValueError, RuntimeError):
+                return False
+    return all(claimed_send_current(root, storage, record, owners[delivery_id],
+        recipient.get("harness"), recipient.get("session_id"), jobs=Path(
+            (duty.get("intent") or {})["identity"]["jobs"]),
+        claim_states=("claimed", "sent-ambiguous"))
+        for _store, duty, _row, record, root, storage, delivery_id in matches)
 
 
 def session_notice_submission_current(message):

@@ -1377,10 +1377,11 @@ def storage_recipients(session: str, env=None, harness: Optional[str] = None) ->
                     parent = str(binding.get("parent") or row.get("from") or "")
                     if not parent:
                         continue
-                    holder, _holder_harness, state = _lineage_holder(
+                    holder, holder_harness, state = _lineage_holder(
                         rows_by_seat, key, parent,
                         str(row.get("harness") or current_harness or ""))
-                    if state == "unresolved" or holder != session:
+                    if (state == "unresolved" or holder != session
+                            or current_harness and holder_harness != current_harness):
                         continue
                     owed.setdefault(parent, set()).add(binding["attempt"])
         for key, attempts in owed.items():
@@ -1458,17 +1459,17 @@ def _chain_to(rows: list, session: str) -> list:
 
 
 def record_for_session(record: dict, allowed: Optional[frozenset], *, session=None, harness=None,
-                       storage_key=None, read_context=None) -> bool:
+                       storage_key=None, read_context=None, jobs=None) -> bool:
     """Apply current recipient authority, including records under the taker's own key.
 
     The attempt-only form remains available for legacy exact binding callers.
     A discovery scope is never authority over a currently unresolved recipient.
     """
     if session is not None and storage_key is not None:
-        resolved = record_recipient(record, storage_key, harness=str(harness or ""),
-                                    read_context=read_context)
+        resolved = record_recipient_binding(record, storage_key, harness=str(harness or ""),
+                                            read_context=read_context, jobs=jobs)
         if resolved is not None:
-            return resolved == session
+            return resolved == (harness, session) if harness else resolved[1] == session
         receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
         end, state = chain_end(str(harness or ""), storage_key, read_context=read_context)
         if (receipt.get("kind") == "notice" or state == "unresolved"
@@ -1477,7 +1478,7 @@ def record_for_session(record: dict, allowed: Optional[frozenset], *, session=No
         # Old registered receipts may predate retained registry rows. Only that
         # missing-row case may use the existing exact attempt binding fallback.
         ids = record.get("attempt_ids") or []
-        jobs = _default_jobs()
+        jobs = Path(jobs) if jobs is not None else _default_jobs()
         registered = latest_rows(jobs) if jobs is not None else {}
         if any(attempt in registered for attempt in ids):
             return False

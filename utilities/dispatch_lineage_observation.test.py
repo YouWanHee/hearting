@@ -600,6 +600,83 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
             receipt_digest=pending._canonical_receipt_digest(receipt), row_revisions={meta["attempt_id"]: "original"})
         return meta, record, seat
 
+    def test_typed_record_and_storage_scopes_keep_current_harness_pair(self):
+        for source, target in (("claude", "codex"), ("codex", "claude")):
+            tag = "pair-" + source
+            meta, record, seat = self.handoff(tag, source, target)
+            from harness_capabilities import parent_completion
+            carrier = parent_completion(source)["carrier"]
+            body = {"schema_version": 2, "state": "ready", "parent_attempt_id": "att-pair-parent",
+                    "job_registry": str(self.jobs_path), "children": []}
+            record = pending.create(self.tmp_root, recipient_kind=carrier, recipient_key=tag + "-A",
+                delivery_id="delivery-pair-" + source, session_generation="", session_generation_supported="0",
+                attempt_ids=record["attempt_ids"], parent_attempt_id="att-pair-parent", route_id=meta["route_id"],
+                route_node="execute", receipt=body, receipt_digest=pending._canonical_receipt_digest(body),
+                row_revisions={meta["attempt_id"]: "revision"})
+            context = PeerReadContext()
+            for recipient in (tag + "-Z", tag + "-Y"):
+                if recipient.endswith("Y"):
+                    self.edge(target, tag + "-Z", recipient)
+                for harness in (source, target):
+                    with self.subTest(source=source, target=target, recipient=recipient, harness=harness):
+                        self.assertEqual(handover.record_recipient_binding(record, tag + "-A",
+                            harness=harness, read_context=context), (target, recipient))
+                        self.assertEqual(handover.record_for_session(record, None, session=recipient,
+                            harness=harness, storage_key=tag + "-A", read_context=context), harness == target)
+                        with mock.patch.object(handover, "pane_seat", return_value=seat):
+                            scopes = dict(handover.storage_recipients(recipient, harness=harness))
+                        self.assertEqual(tag + "-A" in scopes, harness == target)
+                with mock.patch.object(handover, "pane_seat", return_value=seat), \
+                        mock.patch("dispatch_notice_state.keep_claim", return_value=True):
+                    wrong, _count = sweep.sweep_deliver(self.tmp_root, carrier, recipient)
+                self.assertEqual(wrong, [])
+                self.assertEqual(pending.read(self.tmp_root, tag + "-A", record["delivery_id"])["state"], "pending")
+            # Legacy attempt-only form remains usable without a new harness argument.
+            self.assertTrue(handover.record_for_session(record, frozenset(record["attempt_ids"])))
+
+    def test_unavailable_shared_graph_never_confirms_readable_local_history(self):
+        seat = self.edge("claude", "history-A", "history-B")
+        for sid, ts in (("history-A", 1), ("history-B", 3)):
+            tidy._append_ledger_entry(seat, dict(event="start", harness="claude", sid=sid, ts=ts))
+        other = tidy._ledger_path(tidy.Seat("pane", "hidden-history"))
+        other.write_text(json.dumps(dict(event="start", harness="claude", sid="unrelated", ts=1)) + "\n")
+        original = other.read_bytes()
+        def project():
+            with mock.patch.object(tidy, "_lineage_transcript", return_value={"path": None, "status": "missing"}) as transcripts:
+                rows = tidy.seat_lineage(seat, harness="claude", sid="history-B")
+            self.assertEqual({call.args[1] for call in transcripts.call_args_list}, {"history-A", "history-B"})
+            return rows
+        self.assertEqual(project()[0]["relation"], "confirmed")
+        real_lstat, real_iterdir = Path.lstat, Path.iterdir
+        for failure in ("malformed", "read", "stat", "enumeration", "partial-local"):
+            with self.subTest(failure=failure), contextlib.ExitStack() as stack:
+                handover._LINEAGE_GRAPH_CACHE.clear()
+                if failure == "malformed":
+                    other.write_bytes(original + b"{bad\n")
+                elif failure == "read":
+                    stack.enter_context(self.unreadable(other))
+                elif failure == "stat":
+                    def lstat(path, *a, **kw):
+                        if path == other: raise PermissionError("fixture stat")
+                        return real_lstat(path, *a, **kw)
+                    stack.enter_context(mock.patch.object(Path, "lstat", lstat))
+                elif failure == "enumeration":
+                    def iterdir(path):
+                        if path == other.parent: raise PermissionError("fixture enumerate")
+                        return real_iterdir(path)
+                    stack.enter_context(mock.patch.object(Path, "iterdir", iterdir))
+                else:
+                    local = tidy._ledger_path(seat)
+                    before = local.read_bytes()
+                    local.write_bytes(before + b"{bad\n")
+                rows = project()
+                self.assertTrue(rows)
+                self.assertTrue(all(row["relation"] == "unknown" and row["predecessor"] is None for row in rows))
+                self.assertIsNone(tidy._confirmed_predecessor(rows, "claude", "history-B"))
+                if failure == "partial-local": local.write_bytes(before)
+            other.write_bytes(original)
+            self.assertEqual(project()[0]["relation"], "confirmed")
+
     def test_fleet_uses_coherent_current_harness_sid_and_successors(self):
         live, paths = set(), []
         for harness in ("codex", "opencode"):
@@ -617,6 +694,27 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
         self.assertEqual([self.snapshot(path) for path in paths], before)
         self.ambiguity("codex", "fleet-codex-Y", "fork")
         self.assertIsNone(self.counts(live)["no_recipient"])
+
+    def test_hidden_fork_merge_cycle_history_and_viewer_share_unknown_relation(self):
+        import session_history
+        for kind in ("fork", "merge", "cycle"):
+            with self.subTest(kind=kind):
+                a, b, c = ("history-" + kind + suffix for suffix in ("-A", "-B", "-C"))
+                seat = self.edge("claude", a, b)
+                for sid, ts in ((a, 1), (b, 2)):
+                    tidy._append_ledger_entry(seat, dict(event="start", harness="claude", sid=sid, ts=ts))
+                origin, target = (a, c) if kind == "fork" else (c, b) if kind == "merge" else (b, a)
+                hidden = self.edge("claude", origin, target)
+                paths = [tidy._ledger_path(item) for item in (seat, hidden)]
+                before = [self.snapshot(path) for path in paths]
+                with mock.patch.object(tidy, "_lineage_transcript", return_value={"path": None, "status": "missing"}):
+                    rows = tidy.seat_lineage(seat, harness="claude", sid=b)
+                self.assertIsNone(tidy._confirmed_predecessor(rows, "claude", b))
+                self.assertIsNone(rows[0]["predecessor"])
+                self.assertEqual(rows[0]["relation"], "unknown")
+                entries, _reason = session_history._entries_for_generation(rows, 1)
+                self.assertTrue(all(row.get("_label") != "확정된 이전 대화" for row in entries))
+                self.assertEqual([self.snapshot(path) for path in paths], before)
 
     def test_same_sid_on_different_harnesses_and_mixed_aggregate(self):
         first, record, _ = self.registered_record("same", "codex")

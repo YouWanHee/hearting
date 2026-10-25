@@ -90,6 +90,238 @@ class ObligationStoreTest(unittest.TestCase):
                     "effective_recipient": dict(recipient),
                     "recipient_binding": binding, "received_at": received_at}}
 
+    def registered_transfer(self, harness="codex", *, prepare=True):
+        """Two exact routes and their real retained producer/dispatch bindings."""
+        import dispatch_pending_delivery as pending
+        from route_identity import route_hash
+        from harness_capabilities import parent_completion
+        carrier = parent_completion(harness)["carrier"]
+        sid = "retained-" + harness
+        members, duties, metas = [], [], []
+        for index in range(2):
+            aid, did, rid = (f"att-retained-{harness}-{index}",
+                             f"delivery-retained-{harness}-{index}", f"rt-retained-{harness}-{index}")
+            route = {"route_id": rid, "parent_cycle_id": "cycle-retained-" + harness,
+                     "nodes": [{"id": "frame"}]}
+            route["route_hash"] = route_hash(route)
+            rp = self.root / (rid + ".json")
+            rp.write_text(json.dumps(route))
+            body = {"schema_version": 2, "state": "ready", "parent_attempt_id": "att-parent",
+                    "job_registry": str(self.jobs), "delivery_classification": "success",
+                    "children": [{"attempt_id": aid, "status": "done", "readiness": "ready",
+                        "reason": "terminal-complete", "required_action": "advance-completed",
+                        "harness": harness, "delivery_classification": "success"}]}
+            record = pending.create(self.root, recipient_kind=carrier, recipient_key=sid,
+                delivery_id=did, session_generation="", session_generation_supported="0",
+                attempt_ids=[aid], parent_attempt_id="att-parent", route_id=rid, route_node="frame",
+                receipt=body, receipt_digest=pending._canonical_receipt_digest(body), row_revisions={aid: "revision"})
+            meta = dict(attempt_id=aid, attempt_schema_version="2", dispatch_depth="1",
+                registered_worker="1", worker_type="frame", parent_sid=sid, parent_harness=harness,
+                parent_attempt_id="att-parent", parent_completion_delivery=carrier,
+                delivery_intent="1", delivery_intent_at_ns=str(time.monotonic_ns()),
+                delivery_id=did, delivery_receipt_digest=record["receipt_digest"],
+                delivery_row_revision="revision", failure_class="pass", note="completed-marker",
+                launch_outcome="reaped-before-publish", route_file=str(rp), route_id=rid,
+                route_hash=route["route_hash"], route_node="frame")
+            with self.jobs.open("a") as handle:
+                handle.write("now\tdone\t/fixture/repo\t/fixture/wt\tframe\t" +
+                             ",".join(key + "=" + value for key, value in meta.items()) + "\n")
+            identity = dict(jobs=str(self.jobs), attempt_id=aid, session_id=sid,
+                            harness=harness, server="default")
+            duty = self.store.create(obligations.stable_duty_id("registered-batch", identity),
+                                     "registered-batch", identity, {"carrier": carrier})
+            members.append(record)
+            duties.append(duty)
+            metas.append(meta)
+        if not prepare:
+            return sid, members, duties, metas
+        owner = "retained-rewake:" + duties[0]["id"]
+        claimed = pending.claim_ready_batch(self.root, sid, members[0]["delivery_id"],
+            claim_owner=owner, lease_seconds=30, require_generation_proof=False, jobs=self.jobs)
+        self.assertEqual(len(claimed), 2)
+        recipient = {"harness": harness, "session_id": sid}
+        bindings = [dict(duty_id=duty["id"], jobs=str(self.jobs), attempt_id=meta["attempt_id"],
+            carrier=carrier, recipient_sid=sid, storage_recipient=sid,
+            delivery_id=record["delivery_id"], receipt_digest=record["receipt_digest"], claim_owner=owner)
+            for duty, meta, record in zip(duties, metas, members)]
+        producer = dict(schema="registered-runtime-completion-v1", duty_id=duties[0]["id"],
+            jobs=str(self.jobs), attempt_id=metas[0]["attempt_id"], carrier=carrier,
+            delivery_id=members[0]["delivery_id"], receipt_digest=members[0]["receipt_digest"],
+            recipient=recipient, route_id=metas[0]["route_id"], route_node="frame",
+            dispatch_notices=[{key: binding[key] for key in ("duty_id", "attempt_id", "delivery_id",
+                "storage_recipient", "receipt_digest", "claim_owner")} for binding in bindings])
+        refs = [value for binding in bindings for value in (
+            binding["duty_id"], binding["attempt_id"], binding["delivery_id"])]
+        message = "\n".join(__import__("dispatch_recipient_receipt").receipt_marker(record, sid)
+                             for record in claimed)
+        peer = peer_steward.peer_message
+        _text, ref = peer.prepare_peer_message(message,
+            {"harness": "runtime", "session_id": None, "name": "Hearting runtime"},
+            recipient, defer=True, refs=refs, producer_binding=producer)
+        peer.bind_dispatch_notice(ref, bindings)
+        transfer = peer._read_pending(ref)
+        self.assertEqual(len(list(obligations._registered_delivery_bindings(transfer))), 2)
+        return ref, recipient, claimed, metas
+
+    def resume_registered_case(self, late):
+        import dispatch_pending_delivery as pending
+        import dispatch_seat_handover as handover
+        import session_tidy as tidy
+        sid, records, duties, metas = self.registered_transfer("codex", prepare=False)
+        sent = []
+        def continued(record, **_kwargs):
+            if late and record["delivery_id"] == records[-1]["delivery_id"]:
+                tidy._append_ledger_entry(tidy.Seat("pane", "retained-late-member"),
+                    dict(event="handover", source="retire", harness="codex", sid="new-holder",
+                         **{"from": sid}, ts=1, bindings=[handover.binding_of(self.jobs, metas[0])]))
+        def courier(args, *, expected_recipient, on_prepared, producer_binding):
+            body = Path(args.body_file).read_text()
+            peer = peer_steward.peer_message
+            _text, ref = peer.prepare_peer_message(body,
+                {"harness": "runtime", "session_id": None, "name": "Hearting runtime"},
+                {"harness": expected_recipient[0], "session_id": expected_recipient[1]},
+                defer=True, refs=args.ref, producer_binding=producer_binding)
+            on_prepared(ref)
+            transfer = peer._read_pending(ref)
+            self.assertEqual(len(list(obligations._registered_delivery_bindings(transfer))), 2)
+            self.assertTrue(obligations.registered_submission_current(transfer))
+            sent.append(transfer)
+            return 3
+        agents = {"result": {"agents": [{"agent": "codex", "pane_id": "w1:pRetained",
+            "agent_session": {"value": sid}}]}}
+        with mock.patch.object(peer_steward.subprocess, "run", return_value=type("Result", (), {
+                "stdout": json.dumps(agents), "returncode": 0})()), \
+                mock.patch.object(peer_steward, "_resolve_target", return_value=("codex", sid)), \
+                mock.patch.object(peer_steward, "cmd_prompt", side_effect=courier), \
+                mock.patch("dispatch_notice_state.keep_claim", return_value=True), \
+                mock.patch("dispatch_supervision.continue_for_parent", side_effect=continued):
+            peer_steward._resume_registered_obligation(duties[0], self.store)
+        self.assertEqual(len(sent), 0 if late else 1)
+        for record in records:
+            current = pending.read(self.root, sid, record["delivery_id"])
+            self.assertEqual(current["state"], "pending" if late else "sent-ambiguous")
+            self.assertEqual(pending.received_ack_identity(current, sid, record["delivery_id"]),
+                             pending.received_ack_identity(record, sid, record["delivery_id"]))
+        if sent:
+            self.assertEqual(len(sent[0]["dispatch_notices"]), 2)
+            self.assertTrue(all(record["delivery_id"] in sent[0]["text"] for record in records))
+
+    def test_registered_resume_producer_binds_every_real_route_member(self):
+        self.resume_registered_case(False)
+
+    def test_registered_resume_holds_group_after_later_member_continuation_redirects_first(self):
+        self.resume_registered_case(True)
+
+    def test_registered_same_sid_cross_harness_handover_reaches_current_pair(self):
+        import dispatch_pending_delivery as pending
+        import dispatch_seat_handover as handover
+        import session_tidy as tidy
+        for source, target in (("claude", "codex"), ("codex", "claude")):
+            with self.subTest(source=source, target=target):
+                sid, records, duties, metas = self.registered_transfer(source, prepare=False)
+                tidy._append_ledger_entry(tidy.Seat("pane", "same-sid-pair-" + source),
+                    dict(event="handover", source="retire", harness=target, sid=sid,
+                         **{"from": {"harness": source, "sid": sid}}, ts=1,
+                         bindings=[handover.binding_of(self.jobs, meta) for meta in metas]))
+                self.assertEqual(handover.record_recipient_binding(records[0], sid,
+                    harness=source, jobs=self.jobs), (target, sid))
+                sent = []
+                def courier(args, *, expected_recipient, on_prepared, producer_binding):
+                    self.assertEqual(expected_recipient, (target, sid))
+                    peer = peer_steward.peer_message
+                    _text, ref = peer.prepare_peer_message(Path(args.body_file).read_text(),
+                        {"harness": "runtime", "session_id": None, "name": "Hearting runtime"},
+                        {"harness": target, "session_id": sid}, defer=True, refs=args.ref,
+                        producer_binding=producer_binding)
+                    on_prepared(ref)
+                    transfer = peer._read_pending(ref)
+                    self.assertEqual(len(list(obligations._registered_delivery_bindings(transfer))), 2)
+                    self.assertTrue(obligations.registered_submission_current(transfer))
+                    sent.append(transfer)
+                    return 3
+                agents = {"result": {"agents": [{"agent": harness, "pane_id": "w1:p-" + harness,
+                    "agent_session": {"value": sid}} for harness in (source, target)]}}
+                with mock.patch.object(peer_steward.subprocess, "run", return_value=type("Result", (), {
+                        "stdout": json.dumps(agents), "returncode": 0})()), \
+                        mock.patch.object(peer_steward, "_resolve_target", side_effect=lambda pane, *_a, **_kw:
+                            (pane.removeprefix("w1:p-"), sid)), \
+                        mock.patch.object(peer_steward, "_settle_claude_native_dispatch_receipt", return_value=False), \
+                        mock.patch.object(peer_steward, "cmd_prompt", side_effect=courier), \
+                        mock.patch("dispatch_notice_state.keep_claim", return_value=True):
+                    peer_steward._resume_registered_obligation(duties[0], self.store)
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0]["to"], {"harness": target, "session_id": sid})
+                self.assertTrue(all(pending.read(self.root, sid, record["delivery_id"])["state"]
+                                    == "sent-ambiguous" for record in records))
+
+    def test_registered_deferred_write_and_native_add_check_every_bound_member(self):
+        import dispatch_pending_delivery as pending
+        import dispatch_seat_handover as handover
+        import session_tidy as tidy
+        import codex_queue_delivery as queue
+        peer = peer_steward.peer_message
+        for harness in ("claude", "codex", "opencode"):
+            ref, recipient, records, metas = self.registered_transfer(harness)
+            def move(index):
+                tidy._append_ledger_entry(tidy.Seat("pane", "retained-away-" + harness),
+                    dict(event="handover", source="retire", harness=harness,
+                         sid="next-holder", **{"from": recipient["session_id"]}, ts=time.monotonic_ns(),
+                         bindings=[handover.binding_of(self.jobs, metas[index])]))
+            if harness == "codex":
+                added = []
+                def send(*args, **kwargs):
+                    move(0)
+                    kwargs["before_add"]()
+                    added.append(kwargs["message"])
+                    return {"status": "queued", "queued_submission_id": "q"}
+                with mock.patch("codex_queue_dispatch.resolve_queue_socket", return_value=self.root / "native.sock"), \
+                        mock.patch.object(queue, "send_at_least_once", side_effect=send):
+                    result = peer.deliver_pending_codex(ref)
+                self.assertEqual(result["status"], "unverified")
+                self.assertEqual(added, [])
+            else:
+                reserved = peer.reserve_pending_herdr(ref, recipient)
+                self.assertIsNotNone(reserved)
+                move(1)
+                self.assertIsNone(peer.begin_pending_write(reserved, recipient=recipient))
+            self.assertNotEqual(peer._read_pending(ref)["state"], "received")
+            self.assertTrue(all(pending.read(self.root, recipient["session_id"], record["delivery_id"])["state"]
+                                != "acked" for record in records))
+
+    def test_registered_deferred_transfer_renews_only_its_unsent_exact_claim(self):
+        import dispatch_pending_delivery as pending
+        peer = peer_steward.peer_message
+        ref, recipient, records, _metas = self.registered_transfer("claude")
+        for record in records:
+            path = pending.record_path(self.root, recipient["session_id"], record["delivery_id"])
+            raw = json.loads(path.read_text())
+            raw.update(state="sent-ambiguous", claim_deadline_ns=time.monotonic_ns() - 1)
+            path.write_text(json.dumps(raw))
+        reserved = peer.reserve_pending_herdr(ref, recipient)
+        self.assertIsNotNone(reserved)
+        self.assertEqual(peer.begin_pending_write(reserved, recipient=recipient)["state"], "unverified")
+        self.assertIsNone(peer.begin_pending_write(reserved, recipient=recipient))
+        for record in records:
+            fresh = pending.read(self.root, recipient["session_id"], record["delivery_id"])
+            self.assertGreater(fresh["claim_deadline_ns"], time.monotonic_ns())
+            self.assertEqual(fresh["attempts"], record["attempts"])
+            self.assertEqual(pending.received_ack_identity(fresh, recipient["session_id"], record["delivery_id"]),
+                             pending.received_ack_identity(record, recipient["session_id"], record["delivery_id"]))
+
+    def test_registered_hook_context_recovery_preserves_existing_native_boundary(self):
+        peer = peer_steward.peer_message
+        ref, recipient, _records, _metas = self.registered_transfer("claude")
+        original = peer._read_pending(ref)
+        for state, reason in (("queued", "native-queue-accepted"), ("unverified", "native-inflight")):
+            peer._save_pending(dict(original, state=state, receipt=reason))
+            self.assertFalse(obligations.registered_submission_current(peer._read_pending(ref)))
+        peer._save_pending(dict(original, state="queued", receipt="hook-context-emitted"))
+        reserved = peer.reserve_pending_herdr(ref, recipient, receipt="hook-context-inflight",
+                                              allow_hook_context_recovery=True)
+        self.assertIsNotNone(reserved)
+        self.assertEqual(peer.begin_pending_write(reserved, recipient=recipient,
+            receipt="hook-context-inflight")["state"], "unverified")
+
     def test_list_reuses_json_generation_and_observes_external_changes(self):
         first = self.store.create("cached-one", "message", {}, {"ref": "a" * 32})
         second = self.store.create("cached-two", "retire", {}, {"target": "pane"})
@@ -778,7 +1010,7 @@ class ObligationStoreTest(unittest.TestCase):
             self.assertFalse(obligations.acknowledge_registered_delivery(
                 message, roots=[self.root / "foreign-artifacts"]))
             self.assertEqual(ack.call_count, 0)
-            with mock.patch("dispatch_seat_handover.effective_parent", return_value="successor"):
+            with mock.patch("dispatch_seat_handover._effective", return_value=("successor", "claude")):
                 self.assertFalse(obligations.acknowledge_registered_delivery(message, roots=[self.root]))
             self.assertEqual(ack.call_count, 0)
 
@@ -799,7 +1031,7 @@ class ObligationStoreTest(unittest.TestCase):
                 "to": {"harness": "claude", "session_id": "successor-c"},
                 "dispatch_notice": {**prior_recipient_transfer["dispatch_notice"],
                                     "recipient_sid": "successor-c"}}
-            with mock.patch("dispatch_seat_handover.effective_parent", return_value="successor-c"):
+            with mock.patch("dispatch_seat_handover._effective", return_value=("successor-c", "claude")):
                 self.assertFalse(obligations.acknowledge_registered_delivery(
                     prior_recipient_transfer, roots=[self.root]))
                 self.assertTrue(obligations.acknowledge_registered_delivery(

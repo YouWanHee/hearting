@@ -206,7 +206,7 @@ def addressed_records(root: Path, recipient_kind: str, session_id: str) -> tuple
                     and record.get("state") in pending_delivery.OPEN_STATES
                     and record_for_session(record, allowed, session=session_id,
                                            harness=harness,
-                                           storage_key=storage_key)):
+                                           storage_key=storage_key, jobs=record_jobs(root, record))):
                 records.append({**record, STORAGE_KEY: storage_key})
     return records, count
 
@@ -356,7 +356,7 @@ def sweep_deliver(
         scopes = dict(storage_recipients(session_id, harness=harness))
         return storage_key in scopes and record_for_session(
             record, scopes[storage_key], session=session_id, harness=harness,
-            storage_key=storage_key)
+            storage_key=storage_key, jobs=record_jobs(root, record))
 
     def settle_observed(record):
         evidence = native_evidence
@@ -413,7 +413,7 @@ def sweep_deliver(
                             fresh, storage_key, member_id) == identities[member_id]
                         and unsubmitted(fresh, storage_key)):
                     pending_delivery.release_claim(root, storage_key, member_id,
-                                                   claim_owner=claim_owner)
+                        claim_owner=claim_owner, expected_identity=identities[member_id])
             except (OSError, pending_delivery.PendingDeliveryError):
                 pass
 
@@ -1094,15 +1094,24 @@ def main(argv: list[str] | None = None) -> int:
         roots = _state_roots()
         allowed_roots = {Path(root).resolve() for root in roots}
         targets = []
+        requested_complete, unavailable_ids = True, set()
         if isinstance(requested, list):
             for item in requested:
                 if not isinstance(item, dict):
+                    requested_complete = False
                     continue
                 try:
                     root = Path(item["root"]).resolve()
-                    if root in allowed_roots:
-                        targets.append((root, item["storage_key"], item["delivery_id"], item))
-                except (KeyError, TypeError):
+                    storage, delivery_id = item["storage_key"], item["delivery_id"]
+                    if (root not in allowed_roots or not isinstance(storage, str) or not storage
+                            or not isinstance(delivery_id, str) or not delivery_id):
+                        requested_complete = False
+                        if isinstance(delivery_id, str):
+                            unavailable_ids.add(delivery_id)
+                        continue
+                    targets.append((root, storage, delivery_id, item))
+                except (KeyError, TypeError, OSError, RuntimeError):
+                    requested_complete = False
                     continue
         else:
             for root in roots:
@@ -1114,9 +1123,16 @@ def main(argv: list[str] | None = None) -> int:
             text = handed.get("text")
             if isinstance(text, str):
                 identities = []
-                for _root, _storage, delivery_id, item in targets:
+                # The exact native body includes every original member, even
+                # when one root is no longer admitted. Only admitted targets
+                # may be read/ACKed; their historical proof is still usable.
+                for item in requested:
+                    if not isinstance(item, dict):
+                        continue
+                    delivery_id = item.get("delivery_id")
                     identity = item.get("immutable_identity")
-                    if (isinstance(identity, dict) and identity.get("delivery_id") == delivery_id):
+                    if (isinstance(delivery_id, str) and isinstance(identity, dict)
+                            and identity.get("delivery_id") == delivery_id):
                         identities.append((delivery_id, identity))
                 expected = _opencode_expected_message(text, identities)
                 if expected["bindings"]:
@@ -1158,7 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
                         break
         evidence = opencode_messages_evidence(
             handed.get("messages"), args.session, expected_messages)
-        received_ids, unknown_ids, settled_count = set(), set(), 0
+        received_ids, unknown_ids, settled_count = set(), set(unavailable_ids), 0
         remaining_context, remaining_handoffs = [], []
         for root, storage, delivery_id, handed_record in targets:
             try:
@@ -1210,6 +1226,26 @@ def main(argv: list[str] | None = None) -> int:
                 if isinstance(requested, list) and isinstance(handed_record, dict):
                     unknown_ids.add(delivery_id)
                 continue
+        # Receipt settlement above precedes authority admission. Every original
+        # unreceived member must still be current after all views/observations.
+        if isinstance(requested, list):
+            from dispatch_recipient_receipt import claimed_send_current, release_unsubmitted_claim
+            for root, storage, delivery_id, item in targets:
+                if delivery_id in received_ids:
+                    continue
+                original = {"delivery_id": delivery_id,
+                            IDENTITY_KEY: (item or {}).get("immutable_identity")}
+                if not claimed_send_current(root, storage, original,
+                        (item or {}).get("claim_owner"), "opencode", args.session):
+                    unknown_ids.add(delivery_id)
+            if unknown_ids or not requested_complete:
+                for root, storage, delivery_id, item in targets:
+                    if delivery_id not in received_ids:
+                        release_unsubmitted_claim(root, storage,
+                            {"delivery_id": delivery_id,
+                             IDENTITY_KEY: (item or {}).get("immutable_identity")},
+                            (item or {}).get("claim_owner"), args.session)
+                remaining_context, remaining_handoffs = [], []
         print(json.dumps({"received_ids": sorted(received_ids), "settled_count": settled_count,
                           "unknown_ids": sorted(unknown_ids), "text": delivery_context(remaining_context),
                           "records": remaining_handoffs},
@@ -1262,7 +1298,10 @@ def main(argv: list[str] | None = None) -> int:
                 done += ack_delivered(root, args.session, [{"delivery_id": delivery_id, STORAGE_KEY: key}],
                                       acked_by=f"{args.recipient_kind}:{args.session}")
             else:
-                pending_delivery.release_claim(root, key, delivery_id, claim_owner=item["claim_owner"])
+                from dispatch_recipient_receipt import release_unsubmitted_claim
+                release_unsubmitted_claim(root, key,
+                    {"delivery_id": delivery_id, IDENTITY_KEY: item.get("immutable_identity")},
+                    item["claim_owner"], args.session)
                 done += 1
         except (KeyError, TypeError, OSError, pending_delivery.PendingDeliveryError):
             continue

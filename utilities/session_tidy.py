@@ -1059,8 +1059,14 @@ def seat_lineage(seat: Seat, *, harness=None, sid=None) -> list[dict]:
             cards[key] = ([{"generation": max(generations), "path": None, "status": "expired"}]
                           if generations else [])
         locations[key] = _lineage_transcript(name, session, str(summary.get("transcript") or ""))
-    return _project_seat_lineage(rows, cards, locations, harness=harness,
-                                 sid=current_sid, graph=graph)
+    projected = _project_seat_lineage(rows, cards, locations, harness=harness,
+                                     sid=current_sid, graph=graph)
+    if graph is None:
+        # Readable local history cannot establish uniqueness in an unavailable
+        # shared graph. Keep the rows without inventing a second authority.
+        for item in projected:
+            item["predecessor"], item["relation"] = None, "unknown"
+    return projected
 
 
 def _confirmed_predecessor(lineage: list[dict], harness: str, sid: str) -> Optional[dict]:

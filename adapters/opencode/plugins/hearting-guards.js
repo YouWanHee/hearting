@@ -1417,8 +1417,22 @@ const CARRIER_NEGATIVE_CACHE_MS = 1200
 const sweepRel = path.join("utilities", "dispatch_session_sweep.py")
 const OWED_STATES = new Set(["pending", "claimed", "sent-ambiguous"])
 
-// One bounded sweep step off the server's event loop; any failure is null.
-function carrierCommand(action, sid, handed, observe = () => {}) {
+// One bounded sweep step; any failure is null. Ordinary steps are asynchronous;
+// the last effect check uses the same operation synchronously before the write.
+function carrierCommand(action, sid, handed, observe = () => {}, synchronous = false) {
+  if (synchronous) {
+    // At the effect boundary, a Promise response would leave another event-loop
+    // turn in which the returned authority could become stale. Reuse the same
+    // settle operation synchronously, then call promptAsync without an await.
+    const target = resolveRuntimeTarget(sweepRel)
+    try {
+      const result = spawnSync("python3", [target.helper, action, "--recipient-kind", CARRIER_KIND,
+        "--session", sid || ""], { cwd: target.root,
+        env: { ...process.env, AGENT_HOME: target.root }, input: JSON.stringify(handed || {}),
+        encoding: "utf8", timeout: 10000, killSignal: "SIGKILL", maxBuffer: Infinity })
+      return !result.error && result.status === 0 ? JSON.parse(result.stdout || "null") : null
+    } catch { return null }
+  }
   return new Promise((resolve) => {
     let out = ""
     let child
@@ -1583,7 +1597,7 @@ function createCompletionCarrier(ctx) {
       // recheck after the native admission awaits, including when admission
       // failed: historical exact receipts still settle without a new send.
       const finalMessages = await compactMessages(ctx, sid)
-      const beforeSend = await command("settle", sid, {
+      let beforeSend = await command("settle", sid, {
         records: claimed.records, messages: finalMessages, text: claimed.text,
       })
       if (!beforeSend) {
@@ -1609,6 +1623,20 @@ function createCompletionCarrier(ctx) {
         log("settle", sid, "empty-context-released")
         return
       }
+      // Revalidate after the asynchronous helper response too. No native read
+      // follows this transport-boundary check; exact receipts still settle first.
+      beforeSend = carrierCommand("settle", sid, {
+        records: claimed.records, messages: finalMessages, text: claimed.text,
+      }, (reason, extra) => log("command", sid, reason, extra), true)
+      if (!beforeSend) {
+        await command("release", sid, { records: claimed.records })
+        log("settle", sid, "effect-boundary-unavailable-released")
+        return
+      }
+      if (!beforeSend?.text || !beforeSend.records?.length || beforeSend.unknown_ids?.length) {
+        log("settle", sid, "effect-boundary-withheld")
+        return
+      }
       // No await between this last local/identity check and promptAsync.
       // Only the remaining claims validated by settle may be released here.
       if (!canSend || !Array.isArray(finalMessages) || !current()) {
@@ -1621,7 +1649,7 @@ function createCompletionCarrier(ctx) {
       let httpStatus
       try {
         const result = await Promise.race([
-          prompter().promptAsync({ path: { id: sid },
+          client.promptAsync({ path: { id: sid },
             body: { parts: [{ type: "text", text: beforeSend.text }] } }),
           new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("carrier-timeout")), 5000) }),
         ])

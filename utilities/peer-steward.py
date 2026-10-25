@@ -7129,7 +7129,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
     from dispatch_completion_join import current_attempt_row
     from dispatch_notice_state import keep_claim
     import dispatch_pending_delivery as pending
-    from dispatch_seat_handover import effective_parent, effective_parent_harness, lineage_effect_lock
+    from dispatch_seat_handover import _effective, lineage_effect_lock
     from dispatch_session_sweep import (
         IDENTITY_KEY, STORAGE_KEY, addressed_records, delivery_context, is_human_gate_record,
     )
@@ -7169,10 +7169,8 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
     # a replacement process after that runtime died. Unknown identity stays protected.
     # The duty follows confirmed handover; the signed queue stays under the
     # registered parent, even when its current recipient is a successor.
-    recipient_sid = effective_parent(row.metadata, jobs, read_context=read_context)
-    recipient_harness = (harness if recipient_sid == str(row.metadata.get("parent_sid") or "")
-                         else effective_parent_harness(row.metadata, jobs, read_context=read_context)
-                         or harness)
+    recipient_sid, recipient_harness = _effective(row.metadata, jobs, read_context=read_context)
+    recipient_harness = recipient_harness or harness
     storage_recipient = row.metadata.get("parent_sid", "")
     # Transfers are immutable. A transfer reserved for an earlier recipient
     # cannot hold the current duty open or be redirected; the current recipient
@@ -7190,11 +7188,10 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
 
     def fresh_recipient_row():
         fresh = current_attempt_row(jobs, identity["attempt_id"])
-        fresh_harness = (effective_parent_harness(fresh.metadata, jobs)
-                         if fresh is not None else "")
+        fresh_pair = _effective(fresh.metadata, jobs) if fresh is not None else ("", "")
+        fresh_pair = (fresh_pair[0], fresh_pair[1] or harness)
         if (fresh is None or fresh.status != row.status
-                or effective_parent(fresh.metadata, jobs) != recipient_sid
-                or (fresh_harness and fresh_harness != recipient_harness)
+                or fresh_pair != (recipient_sid, recipient_harness)
                 or any(fresh.metadata.get(key) != row.metadata.get(key)
                        for key in identity_fields)):
             return None
@@ -7299,7 +7296,8 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                 return
             row = fresh
             original_sid = str(row.metadata.get("parent_sid") or "")
-            if len(matches) == 0 and recipient_sid == original_sid and row.status == "done":
+            if (len(matches) == 0 and (recipient_harness, recipient_sid) == (harness, original_sid)
+                    and row.status == "done"):
                 with lineage_effect_lock(row.metadata, jobs, recipient_sid) as current_owner:
                     final_row = current_attempt_row(jobs, identity["attempt_id"])
                     if (not current_owner or final_row is None or final_row.status != "done"
@@ -7368,16 +7366,22 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
             # Positive holds and claims owned by another carrier leave every
             # obligation open for the runner's existing retry/backoff.
             return
+        from dispatch_recipient_receipt import release_unsubmitted_claim
+        def release_members():
+            for acquired in claimed_members:
+                release_unsubmitted_claim(jobs.parent, storage_recipient, acquired,
+                                          claim_owner, recipient_sid)
+
         member_context = []
         transfer_members = []
         for claimed in claimed_members:
             member_id = claimed["delivery_id"]
             stored_member = pending.read(jobs.parent, storage_recipient, member_id)
-            if (stored_member is None or not keep_claim(
+            expected_identity = pending.received_ack_identity(claimed, storage_recipient, member_id)
+            if (stored_member is None or pending.received_ack_identity(
+                    stored_member, storage_recipient, member_id) != expected_identity or not keep_claim(
                     jobs.parent, storage_recipient, member_id, claimed, claim_owner, jobs=jobs)):
-                for acquired in claimed_members:
-                    pending.release_claim(jobs.parent, storage_recipient,
-                        acquired["delivery_id"], claim_owner=claim_owner)
+                release_members()
                 return
             attempt_ids = list(stored_member.get("attempt_ids") or [])
             if not attempt_ids and member_id == delivery_id:
@@ -7391,9 +7395,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                              if candidate is not None and candidate.status == "done"
                              and (seed_notice or candidate.metadata.get("delivery_id") == member_id)]
             if len(matching_rows) != 1:
-                for acquired in claimed_members:
-                    pending.release_claim(jobs.parent, storage_recipient,
-                        acquired["delivery_id"], claim_owner=claim_owner)
+                release_members()
                 return
             member_row = matching_rows[0]
             if len(claimed_members) == 1 and member_id == delivery_id:
@@ -7407,17 +7409,10 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                 member_duty = store.get(member_duty_id)
             if (member_duty is None or (member_duty.get("intent") or {}).get("carrier")
                     != intent["carrier"]):
-                for acquired in claimed_members:
-                    pending.release_claim(jobs.parent, storage_recipient,
-                        acquired["delivery_id"], claim_owner=claim_owner)
+                release_members()
                 return
-            try:
-                member_ack = pending.received_ack_identity(
-                    stored_member, storage_recipient, member_id)
-            except pending.PendingDeliveryError:
-                member_ack = None
             context_item = {**claimed, STORAGE_KEY: storage_recipient,
-                            **({IDENTITY_KEY: member_ack} if member_ack else {})}
+                            IDENTITY_KEY: expected_identity}
             member_context.append(context_item)
             transfer_members.append({"duty_id": member_duty_id, "jobs": str(jobs),
                 "attempt_id": member_row.attempt_id,
@@ -7427,9 +7422,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                 "receipt_digest": stored_member.get("receipt_digest"),
                 "row": member_row, "duty": member_duty, "record": stored_member})
         if not transfer_members:
-            for acquired in claimed_members:
-                pending.release_claim(jobs.parent, storage_recipient,
-                    acquired["delivery_id"], claim_owner=claim_owner)
+            release_members()
             return
         if (recipient_harness == "claude" and len(transfer_members) == 1
                 and _settle_claude_native_dispatch_receipt(
@@ -7443,6 +7436,12 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
             if continued:
                 member_context[index][CONTINUED_KEY] = continued
         message = delivery_context([(jobs.parent, member_context)])
+        from dispatch_recipient_receipt import claimed_send_current
+        if not all(claimed_send_current(jobs.parent, storage_recipient, member,
+                claim_owner, recipient_harness, recipient_sid, jobs=jobs)
+                for member in claimed_members):
+            release_members()
+            return
         first_member = transfer_members[0]
         producer_binding = {
             "schema": peer_message._RUNTIME_PRODUCER_SCHEMA,
@@ -7465,9 +7464,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
             member["duty_id"], member["attempt_id"], member["delivery_id"])]
         if not peer_message._valid_runtime_producer_binding(
                 producer_binding, runtime_sender, producer_binding["recipient"], transfer_refs):
-            for member in transfer_members:
-                pending.release_claim(jobs.parent, storage_recipient,
-                    member["delivery_id"], claim_owner=claim_owner)
+            release_members()
             return
         # The normal prompt command seals the body, checks the recipient again,
         # and retains it through forms, busy turns and sender/observer exit (#446).
@@ -7505,9 +7502,7 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                 store.update(member["duty_id"], state="pending",
                              delivery="peer-courier", cleanup="pending")
         else:
-            for member in transfer_members:
-                pending.release_claim(jobs.parent, storage_recipient,
-                    member["delivery_id"], claim_owner=claim_owner)
+            release_members()
     finally:
         globals()["_HERDR_SESSION"] = old_server
 

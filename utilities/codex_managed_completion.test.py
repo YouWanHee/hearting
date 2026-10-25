@@ -25,6 +25,17 @@ PARENT = "att-parent"
 SESSION = "thread-managed-parent"
 
 
+def native_add_result(result):
+    """A successful fake native add still executes the production boundary callback."""
+    def send(*_args, **kwargs):
+        # An exact existing queue item is observation, so the real API never
+        # enters before_add on that branch (including allow_add=False).
+        if not result.get("already_pending") and kwargs.get("before_add"):
+            kwargs["before_add"]()
+        return result
+    return send
+
+
 def load_completion_module():
     sys.path.insert(0, str(ROOT / "utilities"))
     spec = importlib.util.spec_from_file_location(
@@ -892,9 +903,9 @@ class OneSidedCachedReceiptPathTest(unittest.TestCase):
                                        side_effect=QueueSession), \
                      mock.patch.object(module.codex_queue_delivery, "_rpc", side_effect=rpc), \
                      mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
-                                       return_value={"status": "queued", "queued_submission_id": "q-1",
+                                       side_effect=native_add_result({"status": "queued", "queued_submission_id": "q-1",
                                                      "already_pending": False,
-                                                     "started_after_interrupt": False}) as send:
+                                                     "started_after_interrupt": False})) as send:
                     if cache_shape == "hand-edited-missing-required-action":
                         with self.assertRaises(KeyError):
                             module._execute_once(args)
@@ -1471,9 +1482,9 @@ class NativeQueueDeliveryTest(unittest.TestCase):
             thread = {"thread": {"id": SESSION, "cwd": "/repo"}}
             with mock.patch.object(module.codex_queue_delivery, "_rpc", return_value=thread), \
                  mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
-                                   return_value={"status": "queued", "queued_submission_id": "q-1",
+                                   side_effect=native_add_result({"status": "queued", "queued_submission_id": "q-1",
                                                  "already_pending": False,
-                                                 "started_after_interrupt": False}) as send:
+                                                 "started_after_interrupt": False})) as send:
                 first = module._native_queue_delivery_once(args, receipt, {attempt})
             self.assertEqual(first["status"], "sent-ambiguous")
             message = send.call_args.kwargs["message"]
@@ -1912,16 +1923,26 @@ class NativeQueueDeliveryTest(unittest.TestCase):
             interval=0.01,
             delivery_retry_interval=0.01,
         )
+        def claim_record(*_args, **kwargs):
+            ledger_record.update(state="claimed", claim_owner=kwargs["claim_owner"],
+                                 claim_deadline_ns=time.monotonic_ns() + 60_000_000_000)
+            return dict(ledger_record)
+
+        def refuse(*_args, **kwargs):
+            kwargs["before_add"]()
+            raise module.codex_queue_delivery.QueueDeliveryError("queue-start-refused")
+
         with mock.patch.object(module.codex_queue_delivery, "_rpc", return_value={
                 "thread": {"id": SESSION, "cwd": "/tmp/repo"}}), \
              mock.patch.object(module, "current_session_children", return_value=[row]), \
              mock.patch.object(module.pending_delivery, "read", return_value=ledger_record), \
-             mock.patch.object(module.pending_delivery, "claim") as claim, \
+             mock.patch.object(module.pending_delivery, "claim", side_effect=claim_record) as claim, \
+             mock.patch.object(module.pending_delivery, "read_submission_fence", return_value=None), \
              mock.patch.object(module.pending_delivery, "release_claim") as release, \
              mock.patch.object(module.pending_delivery, "mark_sent_ambiguous") as ambiguous, \
              mock.patch.object(module.pending_delivery, "ack") as ack, \
              mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
-                 side_effect=module.codex_queue_delivery.QueueDeliveryError("queue-start-refused")):
+                 side_effect=refuse):
             with self.assertRaisesRegex(module.codex_queue_delivery.QueueDeliveryError, "queue-start-refused"):
                 module._native_queue_delivery_once(args, receipt, {"att-one"})
         release.assert_called_once()
@@ -2011,7 +2032,7 @@ class NativeQueueDeliveryTest(unittest.TestCase):
                                    return_value={"state": "accepted"}), \
                  mock.patch.object(module.pending_delivery, "record_submission_accepted"), \
                  mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
-                                   return_value={"status": "queued", "already_pending": True}) as send, \
+                                   side_effect=native_add_result({"status": "queued", "already_pending": True})) as send, \
                  mock.patch.object(module.codex_queue_delivery, "list_queue", return_value=[item]):
                 watcher._one(path)
             send.assert_called_once()
@@ -2067,7 +2088,7 @@ class NativeQueueDeliveryTest(unittest.TestCase):
                      mock.patch.object(module.pending_delivery, "mark_sent_ambiguous"), \
                      mock.patch.object(module.pending_delivery, "ack") as ack, \
                      mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
-                                       return_value={"status": "queued", "already_pending": True}), \
+                                       side_effect=native_add_result({"status": "queued", "already_pending": True})), \
                      mock.patch.object(module.codex_queue_delivery, "list_queue", return_value=[]), \
                      mock.patch.object(module.codex_queue_delivery, "_known_consumed",
                                        return_value=consumed) as observed:
@@ -2314,6 +2335,8 @@ class NativeQueueSiblingBatchTest(unittest.TestCase):
                                jobs=self.jobs, timeout=2.0, delivery_retry_interval=0.01)
 
         def send(path, **kwargs):
+            if kwargs.get("before_add"):
+                kwargs["before_add"]()
             self.sent.append(kwargs)
             return {"status": "consumed", "turn_id": f"turn-{len(self.sent)}",
                     "turn_status": "completed"}
@@ -2475,6 +2498,137 @@ class NativeQueueSiblingBatchTest(unittest.TestCase):
         self.assertEqual(result["status"], "accepted")
         self.assertEqual(len(sent), 1)  # Never resent: the previous wording was the consumed body.
         self.assertEqual(self._states()[member[1]], "acked")
+
+
+
+
+class ExpandedBatchAuthorityTest(unittest.TestCase):
+
+    def case(self, mode, count=2, body_limit=None):
+        import dispatch_pending_delivery as pending
+        import dispatch_seat_handover as handover
+        from dispatch_notice_state import resolve_delivery_batch
+        from route_identity import route_hash
+        mod = load_completion_module()
+        if body_limit is not None:
+            mod.QUEUE_BODY_LIMIT = body_limit
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / 'jobs.log'
+            sid = 'registered-parent'
+            ids = []
+            metas = []
+            receipts = []
+            for i in range(count):
+                aid = f'att-review-{i}'
+                did = f'delivery-{i:032x}'
+                rid = f'rt-review-{i}'
+                route = {'route_id': rid, 'parent_cycle_id': 'cycle-review-batch', 'nodes': [{'id': 'frame'}]}
+                route['route_hash'] = route_hash(route)
+                rp = root / (rid + '.json')
+                rp.write_text(json.dumps(route))
+                child = {'attempt_id': aid, 'status': 'done', 'readiness': 'ready', 'reason': 'terminal-complete', 'required_action': 'advance-completed', 'harness': 'codex', 'delivery_classification': 'success'}
+                receipt = {'schema_version': 2, 'state': 'ready', 'parent_attempt_id': 'att-review-parent', 'job_registry': str(jobs), 'children': [child], 'delivery_classification': 'success'}
+                record = pending.create(root, recipient_kind='codex-native-queue', recipient_key=sid, delivery_id=did, session_generation='', session_generation_supported='0', attempt_ids=[aid], parent_attempt_id='att-review-parent', route_id=rid, route_node='frame', receipt=receipt, receipt_digest=pending._canonical_receipt_digest(receipt), row_revisions={aid: 'revision'})
+                meta = {'attempt_id': aid, 'attempt_schema_version': '2', 'execution_surface': 'registered-headless', 'launch_claimed': '1', 'launch_outcome': 'reaped-before-publish', 'dispatch_depth': '1', 'registered_worker': '1', 'worker_type': 'frame', 'parent_sid': sid, 'parent_harness': 'codex', 'harness': 'codex', 'parent_attempt_id': 'att-review-parent', 'route_file': str(rp), 'route_id': rid, 'route_hash': route['route_hash'], 'route_node': 'frame', 'delivery_intent': '1', 'delivery_intent_at_ns': str(time.monotonic_ns()), 'failure_class': 'pass', 'note': 'completed-marker', 'delivery_id': did, 'parent_completion_delivery': 'codex-native-queue', 'delivery_recipient_kind': 'codex-native-queue', 'delivery_row_revision': 'revision', 'delivery_receipt_digest': record['receipt_digest']}
+                ids.append(did)
+                metas.append(meta)
+                receipts.append(receipt)
+            jobs.write_text(''.join(('2026-10-25T00:00:00Z\tdone\t/fixture/repo\t/fixture/wt\tframe\t' + ','.join((k + '=' + v for k, v in meta.items())) + '\n' for meta in metas)))
+            with mock.patch.dict(os.environ, {'AGENT_DISPATCH_JOBS': str(jobs), 'XDG_STATE_HOME': str(root / 'state')}, clear=False):
+                getattr(handover, '_LINEAGE_GRAPH_CACHE', {}).clear()
+                seen = []
+                sent = []
+                protected = {}
+
+                def targets():
+                    return [handover.effective_parent(meta, jobs) for meta in metas]
+
+                def move(index):
+                    folder = root / 'state/hearting/session-tidy/sessions'
+                    folder.mkdir(parents=True, exist_ok=True)
+                    (folder / 'explicit-away.jsonl').write_text(json.dumps({'event': 'handover', 'source': 'retire', 'harness': 'codex', 'sid': 'new-holder', 'from': {'harness': 'codex', 'sid': sid}, 'ts': 1, 'bindings': [handover.binding_of(jobs, metas[index])]}) + '\n')
+                    snapshots = root / 'state/hearting/session-tidy/handover'
+                    snapshots.mkdir(parents=True, exist_ok=True)
+                    (snapshots / 'explicit-away.json').write_text(json.dumps({'schema': 1, 'seat': {'kind': 'pane', 'key': 'explicit-away'}, 'from': {'harness': 'codex', 'sid': sid}, 'bindings': [handover.binding_of(jobs, metas[index])]}))
+                batch = resolve_delivery_batch(jobs, pending.read(root, sid, ids[0]), recipient_key=sid, delivery_root=root)
+                self.assertFalse(batch['held'])
+                self.assertEqual(set(batch['delivery_ids']), set(ids))
+                self.assertEqual(targets(), [sid] * count)
+                if mode == 'already-away':
+                    move(1)
+                    self.assertEqual(targets(), [sid, 'new-holder'])
+
+                def mutate(index):
+                    if mode.startswith('native-away') or mode.startswith('emit-away'):
+                        move(index)
+                    elif mode.startswith(('owner-', 'lease-', 'identity-')):
+                        path = pending.record_path(root, sid, ids[index])
+                        raw = json.loads(path.read_text())
+                        if mode.startswith('owner-'):
+                            raw['claim_owner'] = 'other-carrier'
+                        elif mode.startswith('lease-'):
+                            raw['claim_deadline_ns'] = True
+                        else:
+                            raw['row_revisions'] = {metas[index]['attempt_id']: 'changed'}
+                        path.write_text(json.dumps(raw))
+                        protected[index] = path.read_bytes()
+
+                def keep(_r, _s, did, _record, _owner, **kw):
+                    seen.append(did)
+                    if mode == 'late-away' and did == ids[-1]:
+                        move(0)
+                    return True
+
+                def send(_path, **kwargs):
+                    if mode.startswith(('native-away', 'owner-', 'lease-', 'identity-')):
+                        mutate(int(mode.rsplit('-', 1)[1]))
+                    if kwargs.get('before_add'):
+                        kwargs['before_add']()
+                    sent.append(dict({k: v for k, v in kwargs.items() if k != 'before_add'}, actual_current_recipients=targets()))
+                    return {'status': 'queued', 'queued_submission_id': 'fixture-queue-item'}
+                args = SimpleNamespace(queue_socket=root / 'no-native.sock', thread_id=sid, jobs=jobs, timeout=2.0, delivery_retry_interval=0.01)
+                with mock.patch.object(mod.codex_queue_delivery, '_rpc', return_value={'thread': {'id': sid, 'cwd': '/fixture/repo'}}), mock.patch.object(mod.codex_queue_delivery, 'send_at_least_once', side_effect=send), mock.patch('dispatch_notice_state.keep_claim', side_effect=keep):
+                    try:
+                        result = mod._native_queue_delivery_once(args, receipts[0], {metas[0]['attempt_id']})
+                    except mod.CompletionError as exc:
+                        result = {'refused': str(exc)}
+                print(json.dumps({'mode': mode, 'real_batch_ids': list(batch['delivery_ids']), 'keep_order': seen, 'sends': sent, 'result': result, 'states': [pending.read(root, sid, d)['state'] for d in ids]}, sort_keys=True), flush=True)
+                if mode == 'current':
+                    self.assertEqual(len(sent), 1)
+                    self.assertTrue(all((d in sent[0]['message'] for d in ids)))
+                else:
+                    self.assertEqual(sent, [], 'an expanded sibling batch must not send any member whose current recipient differs')
+                    for index, did in enumerate(ids):
+                        current = pending.read(root, sid, did)
+                        self.assertIsNone(pending.read(root, 'new-holder', did))
+                        if index in protected:
+                            self.assertEqual(pending.record_path(root, sid, did).read_bytes(), protected[index])
+                        else:
+                            self.assertEqual(current['state'], 'pending')
+
+    def test_future_unit_member_is_checked_before_first_native_add(self):
+        self.case('native-away-23', count=24, body_limit=4000)
+
+    def test_current_batch_positive(self):
+        self.case('current')
+
+    def test_already_reassigned_sibling_must_withhold_whole_batch(self):
+        self.case('already-away')
+
+    def test_later_member_check_cannot_leave_first_member_authority_stale(self):
+        self.case('late-away')
+
+    def test_singleton_and_four_member_positive(self):
+        for count in (1, 4):
+            with self.subTest(count=count):
+                self.case('current', count)
+
+    def test_every_member_at_native_boundary_and_mutable_claims(self):
+        for kind in ('native-away', 'owner', 'lease', 'identity'):
+            for index in (0, 1):
+                with self.subTest(kind=kind, index=index):
+                    self.case(kind + '-' + str(index))
 
 
 if __name__ == "__main__":

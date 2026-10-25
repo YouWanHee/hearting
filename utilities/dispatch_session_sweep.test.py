@@ -569,6 +569,8 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
             "storage_key": record.get(SWEEP.STORAGE_KEY) or session_id,
             "delivery_id": record["delivery_id"],
             "claim_owner": record["claim_owner"],
+            "immutable_identity": record.get(SWEEP.IDENTITY_KEY) or PD.received_ack_identity(
+                record, record.get(SWEEP.STORAGE_KEY) or session_id, record["delivery_id"]),
         }
         output = io.StringIO()
         with mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"records": [item]}))), \
@@ -686,7 +688,7 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         bound = frozenset({"att-0000000000000000000000000000bbbb"})
         with mock.patch.object(handover, "storage_recipients",
                                return_value=[("sess-owner", bound)]), \
-                mock.patch.object(handover, "record_recipient", return_value="sess-new"), \
+                mock.patch.object(handover, "record_recipient_binding", return_value=("claude", "sess-new")), \
                 mock.patch.object(PD.time, "time_ns", return_value=retry["next_attempt_at_ns"] - 1):
             handed, _ = SWEEP.sweep_deliver(
                 self.root, "claude-parent-runtime", "sess-new")
@@ -816,10 +818,10 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         bound = frozenset({"att-0000000000000000000000000000bbbb"})
         with mock.patch.object(handover, "storage_recipients",
                                return_value=[("sess-new", None), ("sess-old", bound)]), \
-                mock.patch.object(handover, "record_recipient",
+                mock.patch.object(handover, "record_recipient_binding",
                                   side_effect=lambda record, _storage, **_kwargs:
-                                  "sess-new" if set(record.get("attempt_ids") or ()) <= bound
-                                  else "sess-old"):
+                                  ("claude", "sess-new" if set(record.get("attempt_ids") or ()) <= bound
+                                  else "sess-old")):
             records, count = SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-new")
             self.assertEqual([r["delivery_id"] for r in records], ["delivery-" + "a" * 32])
             self.assertEqual(count, 2)                                  # both are seen; only the bound one is taken
@@ -1349,6 +1351,169 @@ class SweepBatchBoundaryTest(IsolatedRootMixin, unittest.TestCase):
     _seed = SweepTest._seed
     SID = "sess-owner"
     KIND = "claude-parent-runtime"
+
+    def settle_batch(self, size=2):
+        self.KIND = "opencode-turn"
+        self.seed_batch(size)
+        jobs = self.root / "jobs.log"
+        jobs.write_text(jobs.read_text().replace("parent_harness=claude", "parent_harness=opencode"))
+        for did in self.ids:
+            path = PD.record_path(self.root, self.SID, did)
+            raw = json.loads(path.read_text())
+            raw["recipient_kind"] = self.KIND
+            path.write_text(json.dumps(raw))
+        records, _count = self.sweep()
+        self.assertEqual(len(records), size)
+        self.identities = [PD.received_ack_identity(self.read(did), self.SID, did) for did in self.ids]
+        return {"text": SWEEP.delivery_context([(self.root, records)]), "records": [
+            {"root": str(self.root), "storage_key": self.SID, "delivery_id": record["delivery_id"],
+             "claim_owner": record["claim_owner"], "immutable_identity": identity}
+            for record, identity in zip(records, self.identities)], "messages": []}
+
+    def settle(self, handed, *, roots=None):
+        output = io.StringIO()
+        with mock.patch.object(SWEEP, "_state_roots", return_value=roots or [self.root]), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(handed))), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(SWEEP.main(["settle", "--recipient-kind", self.KIND,
+                                         "--session", self.SID]), 0)
+        return json.loads(output.getvalue())
+
+    def test_final_settle_holds_mixed_redirection_and_current_holder_recovers_original_key(self):
+        import dispatch_seat_handover as handover
+        for positions in ([0], [1], [0, 1]):
+            with self.subTest(positions=positions):
+                handed = self.settle_batch()
+                seat = handover._st().Seat("pane", "settle-" + str(self._batch_serial))
+                handover._st()._append_ledger_entry(seat, dict(event="handover", source="retire",
+                    harness="opencode", sid="new-holder", **{"from": self.SID}, ts=1,
+                    bindings=[handover.binding_of(self.root / "jobs.log", self.metas[i]) for i in positions]))
+                result = self.settle(handed)
+                self.assertEqual((result["records"], result["text"]), ([], ""))
+                self.assertEqual([self.read(did)["state"] for did in self.ids], ["pending"] * 2)
+                # Complete the handoff, then the existing sweep recovers the same group.
+                handover._st()._append_ledger_entry(seat, dict(event="handover", source="retire",
+                    harness="opencode", sid="new-holder", **{"from": self.SID}, ts=2,
+                    bindings=[handover.binding_of(self.root / "jobs.log", meta) for meta in self.metas]))
+                with self.retry_ready():
+                    recovered, _ = self.sweep(session="new-holder")
+                self.assertEqual([record["delivery_id"] for record in recovered], self.ids)
+                self.assertEqual(SWEEP.ack_delivered(self.root, "new-holder", recovered,
+                                                    acked_by="fixture-exact-receipt"), 2)
+                self.assert_original()
+
+    def test_final_settle_exact_receipt_precedes_unavailable_authority_and_ack_retry(self):
+        import session_tidy as tidy
+        handed = self.settle_batch()
+        handed["messages"] = [{"info": {"sessionID": self.SID, "role": "user"},
+                               "parts": [{"type": "text", "text": handed["text"]}]}]
+        path = tidy._ledger_path(tidy.Seat("pane", "unavailable-final-settle"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{bad\n")
+        with mock.patch.object(PD, "ack_received", side_effect=OSError("fixture ACK write failed")):
+            first = self.settle(handed)
+        self.assertEqual(first["received_ids"], self.ids)
+        self.assertEqual((first["text"], first["records"], first["settled_count"]), ("", [], 0))
+        second = self.settle(handed)
+        self.assertEqual(second["settled_count"], 2)
+        self.assertEqual([self.read(did)["state"] for did in self.ids], ["acked"] * 2)
+        self.assert_original()
+
+    def test_final_settle_resolves_each_records_original_registry_filename_and_root(self):
+        import dispatch_seat_handover as handover
+        for default in ("empty", "copied"):
+            with self.subTest(default=default):
+                self.seed_batch()
+                old_root = self.root
+                seeds = [self.read(did) for did in self.ids]
+                self.root = old_root / "original-dispatch"
+                self.root.mkdir()
+                jobs = self.root / "retained-jobs.tsv"
+                original_rows = (old_root / "jobs.log").read_text().replace(
+                    "parent_harness=claude", "parent_harness=opencode")
+                jobs.write_text(original_rows)
+                default_jobs = old_root / "new-default-jobs.tsv"
+                default_jobs.write_text(original_rows if default == "copied" else "")
+                self.enterContext(mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(default_jobs)}))
+                self.KIND = "opencode-turn"
+                for seed in seeds:
+                    body = {**seed["receipt"], "job_registry": str(jobs)}
+                    PD.create(self.root, recipient_kind=self.KIND, recipient_key=self.SID,
+                        delivery_id=seed["delivery_id"], session_generation="", session_generation_supported="0",
+                        attempt_ids=seed["attempt_ids"], parent_attempt_id=seed["parent_attempt_id"],
+                        route_id=seed["route_id"], route_node=seed["route_node"], receipt=body,
+                        receipt_digest=PD._canonical_receipt_digest(body), row_revisions=seed["row_revisions"])
+                claimed = PD.claim_ready_batch(self.root, self.SID, self.ids[0],
+                    claim_owner="named-registry-carrier", lease_seconds=30, jobs=jobs)
+                self.assertEqual(len(claimed), 2)
+                handed = {"text": SWEEP.delivery_context([(self.root, [
+                    {**record, SWEEP.STORAGE_KEY: self.SID} for record in claimed])]), "messages": [], "records": [
+                    {"root": str(self.root), "storage_key": self.SID, "delivery_id": record["delivery_id"],
+                     "claim_owner": record["claim_owner"], "immutable_identity": PD.received_ack_identity(
+                         record, self.SID, record["delivery_id"])} for record in claimed]}
+                self.assertEqual(len(self.settle(handed)["records"]), 2)
+                self.assertEqual([record["delivery_id"] for record in SWEEP.addressed_records(
+                    self.root, self.KIND, self.SID)[0]], self.ids)
+                seat = handover._st().Seat("pane", "named-registry-" + default)
+                handover._st()._append_ledger_entry(seat, dict(event="handover", source="retire",
+                    harness="opencode", sid="new-holder", **{"from": self.SID}, ts=1,
+                    bindings=[handover.binding_of(jobs, self.metas[0])]))
+                self.assertEqual(handover.record_recipient_binding(self.read(self.ids[0]), self.SID,
+                    harness="opencode", jobs=jobs), ("opencode", "new-holder"))
+                self.assertEqual([record["delivery_id"] for record in SWEEP.addressed_records(
+                    self.root, self.KIND, self.SID)[0]], self.ids[1:])
+                settled = self.settle(handed)
+                self.assertEqual((settled["text"], settled["records"]), ("", []))
+                self.assertEqual([self.read(did)["state"] for did in self.ids], ["pending"] * 2)
+                # An exact historical receipt still settles before unavailable
+                # registry admission, even though its current holder moved.
+                jobs.rename(jobs.with_suffix(".unavailable"))
+                handed["messages"] = [{"info": {"sessionID": self.SID, "role": "user"},
+                                       "parts": [{"type": "text", "text": handed["text"]}]}]
+                received = self.settle(handed)
+                self.assertEqual(received["received_ids"], self.ids)
+                self.assertEqual(received["settled_count"], 2)
+
+    def test_final_settle_holds_every_original_root_but_preserves_known_exact_receipts(self):
+        handed = self.settle_batch(1)
+        original = self.read(self.ids[0])
+        other_root = self.root.parent / "other-dispatch"
+        other_root.mkdir()
+        other_jobs = other_root / "original-jobs.tsv"
+        other_id = "delivery-other-original-root"
+        other_jobs.write_text((self.root / "jobs.log").read_text().replace(self.ids[0], other_id))
+        body = {**original["receipt"], "job_registry": str(other_jobs)}
+        PD.create(other_root, recipient_kind=self.KIND, recipient_key=self.SID, delivery_id=other_id,
+            session_generation="", session_generation_supported="0", attempt_ids=original["attempt_ids"],
+            parent_attempt_id=original["parent_attempt_id"], route_id=original["route_id"],
+            route_node=original["route_node"], receipt=body, receipt_digest=PD._canonical_receipt_digest(body),
+            row_revisions=original["row_revisions"])
+        other = PD.claim(other_root, self.SID, other_id, claim_owner="other-root-carrier",
+                         lease_seconds=30, jobs=other_jobs)
+        other_path = PD.record_path(other_root, self.SID, other_id)
+        before = other_path.read_bytes()
+        handed["text"] = SWEEP.delivery_context([
+            (self.root, [{**original, SWEEP.STORAGE_KEY: self.SID}]),
+            (other_root, [{**other, SWEEP.STORAGE_KEY: self.SID}])])
+        handed["records"].append({"root": str(other_root), "storage_key": self.SID,
+            "delivery_id": other_id, "claim_owner": other["claim_owner"],
+            "immutable_identity": PD.received_ack_identity(other, self.SID, other_id)})
+        # The later root observation omitted an original member. It cannot
+        # authorize a partial new body or access/release the unadmitted root.
+        result = self.settle(handed)
+        self.assertEqual((result["text"], result["records"]), ("", []))
+        self.assertIn(other_id, result["unknown_ids"])
+        self.assertEqual(self.read(self.ids[0])["state"], "pending")
+        self.assertEqual(other_path.read_bytes(), before)
+        handed["messages"] = [{"info": {"sessionID": self.SID, "role": "user"},
+                               "parts": [{"type": "text", "text": handed["text"]}]}]
+        known = self.settle(handed)
+        self.assertEqual(known["received_ids"], self.ids)
+        self.assertEqual(self.read(self.ids[0])["state"], "acked")
+        self.assertEqual(other_path.read_bytes(), before)
+        recovered = self.settle(handed, roots=[self.root, other_root])
+        self.assertEqual(set(recovered["received_ids"]), set(self.ids + [other_id]))
+        self.assertEqual(PD.read(other_root, self.SID, other_id)["state"], "acked")
 
     def seed_batch(self, size=2):
         from route_identity import route_hash
@@ -2195,6 +2360,50 @@ console.log(JSON.stringify({carrierEnv: globalThis.carrierEnv}));
         self.assertIn(("claim", "claimed"), [(item["stage"], item["reason"]) for item in carrier])
         self.assertIn(("prompt", "accepted"), [(item["stage"], item["reason"]) for item in carrier])
         self.assertTrue(all("text" not in item for item in carrier))
+
+    def test_actual_transport_revalidates_after_helper_stdout_before_prompt(self):
+        """Mutate real lineage after the asynchronous helper has flushed its result.
+
+        The imported committed plugin and both transport implementations are
+        exact. Only the private helper entrypoint adds deterministic scheduling.
+        """
+        ids = self.seed_cycle_batch()
+        runtime = self.root.parent / "transport-runtime"
+        (runtime / "utilities").mkdir(parents=True)
+        for name in ("core", "adapters", "hooks", "tools"):
+            (runtime / name).symlink_to(ROOT / name, target_is_directory=True)
+        for path in (ROOT / "utilities").iterdir():
+            if path.name != "dispatch_session_sweep.py":
+                (runtime / "utilities" / path.name).symlink_to(path, target_is_directory=path.is_dir())
+        helper = runtime / "utilities/dispatch_session_sweep.py"
+        helper.write_text(
+            "import sys\nfrom pathlib import Path\n"
+            + "sys.path.insert(0, " + repr(str(ROOT / "utilities")) + ")\n"
+            + "import dispatch_session_sweep as sweep\nimport session_tidy as tidy\n"
+            + "code = sweep.main(sys.argv[1:])\n"
+            + "marker = Path(" + repr(str(runtime / "changed")) + ")\n"
+            + "if sys.argv[1] == 'settle' and not marker.exists():\n"
+            + "    marker.touch()\n"
+            + "    tidy._append_ledger_entry(tidy.Seat('pane', 'transport-successor'), "
+            + repr(dict(event="succession", source="tidy-clear", harness="opencode",
+                        sid="ses-oc-current-C", **{"from": self.SID}, ts=1)) + ")\n"
+            + "sys.exit(code)\n")
+        result = self.run_plugin(self.IDLE_THEN_WAIT.replace(
+            'row.extra?.reason === "native-receipt-before-send"',
+            '["native-receipt-before-send", "effect-boundary-withheld"].includes(row.extra?.reason)'),
+            extra_env={"AGENT_HOME": str(runtime)})
+        self.assertTrue((runtime / "changed").exists())
+        self.assertEqual(result["prompts"], [])
+        self.assertTrue(any(row.get("extra", {}).get("reason") == "effect-boundary-withheld"
+                            for row in result["logs"]))
+        self.assertEqual([PD.read(self.root, self.SID, did)["state"] for did in ids], ["pending"] * 2)
+        with mock.patch("dispatch_seat_handover.pane_seat", return_value=SimpleNamespace(
+                kind="pane", key="transport-successor")):
+            current, _ = SWEEP.sweep_deliver(self.root, "opencode-turn", "ses-oc-current-C")
+        self.assertEqual([record["delivery_id"] for record in current], ids)
+        self.assertEqual(SWEEP.ack_delivered(self.root, "ses-oc-current-C", current,
+                                            acked_by="fixture-exact-receipt"), 2)
+        self.assertTrue(all(PD.read(self.root, "ses-oc-current-C", did) is None for did in ids))
 
     def test_native_receipt_from_another_carrier_suppresses_prompt_async(self):
         import dispatch_recipient_receipt as recipient_receipt

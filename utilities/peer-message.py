@@ -1482,6 +1482,9 @@ def begin_pending_write(row, *, recipient=None, receipt=None, claimant=None):
             from peer_obligations import session_notice_delivery_current
             if not session_notice_delivery_current(current):
                 return None
+        from peer_obligations import registered_submission_current
+        if not registered_submission_current(current):
+            return None
         updated = dict(current, state="unverified", receipt=receipt or claim.get("receipt")
                        or "delivery-inflight")
         _save_pending(updated)
@@ -1603,6 +1606,9 @@ def deliver_pending_codex(ref, *, timeout=1.0):
                 from peer_obligations import session_notice_delivery_current
                 if not session_notice_delivery_current(current):
                     raise QueueDeliveryError("peer-notice-recipient-changed-before-add")
+            from peer_obligations import registered_submission_current
+            if not registered_submission_current(current):
+                raise QueueDeliveryError("peer-dispatch-recipient-changed-before-add")
             _save_pending(dict(current, state="unverified", receipt="native-queue-inflight"))
 
     error = None

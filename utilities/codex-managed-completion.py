@@ -1279,6 +1279,7 @@ def _native_queue_delivery_once(
     claimed: list[str] = []
     retry_base = min(max(args.delivery_retry_interval, 0.05), 15.0)
     retry_failure = "native-queue-pass-incomplete"
+    effect_observed_ids: set[str] = set()
 
     def consumed_by(thread_id: str, bodies: list[str]):
         """The consumed turn for the first body that exactly matches native history."""
@@ -1297,11 +1298,17 @@ def _native_queue_delivery_once(
             raise first_error
         return None, bodies[0]
 
-    def send_unit(bodies: list[str]):
+    def send_unit(unit_records: list[dict], bodies: list[str]):
+        from dispatch_recipient_receipt import claimed_send_current
+        def before_add():
+            if not all(claimed_send_current(root, args.thread_id, record,
+                    claim_owner, "codex", target, jobs=args.jobs) for record in pending_output.values()):
+                raise CompletionError("native-queue-target-changed")
         try:
             result = codex_queue_delivery.send_at_least_once(
                 path, thread_id=target, client_message_id=unit_client_id,
-                message=bodies[0], timeout=5.0, require_message_match=True, **transport)
+                message=bodies[0], timeout=5.0, require_message_match=True,
+                before_add=before_add, **transport)
             return result, bodies[0]
         except codex_queue_delivery.QueueDeliveryError as exc:
             if len(bodies) == 1 or str(exc) not in _LEGACY_HISTORY_MISMATCH:
@@ -1345,7 +1352,7 @@ def _native_queue_delivery_once(
                       "turn_status": consumed.get("status")}
             turn_thread = args.thread_id
         elif allow_enqueue:
-            result, body = send_unit(bodies)
+            result, body = send_unit(unit_records, bodies)
             send_observed = (result.get("status") == "queued"
                              and not result.get("already_pending"))
         else:
@@ -1361,6 +1368,8 @@ def _native_queue_delivery_once(
                     **transport)
                 result["status"] = "queued"
 
+        if result["status"] in {"queued", "consumed"}:
+            effect_observed_ids.update(unit_ids)
         if result["status"] == "consumed":
             turn_id = result.get("turn_id")
             turn_status = result.get("turn_status")
@@ -1495,10 +1504,13 @@ def _native_queue_delivery_once(
                 args.thread_id, [record["delivery_id"] for record in unit_records]))
                 for unit_records, body in _batch_units(root, args.thread_id, list(kept.values()))]
         result = {"schema_version": 1, "status": "accepted", "thread_id": args.thread_id}
+        pending_output = dict(kept)
         for unit_records, bodies, unit_client_id in units:
             result = deliver_unit(unit_records, bodies)
             if result.get("status") != "accepted":
                 return result
+            for member in unit_records:
+                pending_output.pop(member["delivery_id"], None)
         return result
     except Exception as exc:
         retry_failure = str(exc) or type(exc).__name__
@@ -1507,9 +1519,19 @@ def _native_queue_delivery_once(
         # Each network pass owns a bounded claim, never the whole watch window.
         # A rejected send and partial claim cannot hide receipts on the next
         # prompt; an ack or another owner's claim is preserved by the CAS.
+        from dispatch_recipient_receipt import release_unsubmitted_claim
         for delivery_id in claimed:
-            pending_delivery.release_claim(
-                root, args.thread_id, delivery_id, claim_owner=claim_owner,
+            member = group[delivery_id]
+            if delivery_id in effect_observed_ids:
+                # Preserve the native queue's existing bounded observation /
+                # ACK-retry lifecycle. Its stable client id prevents resends.
+                # Fenced transfers retain their separate acceptance authority.
+                pending_delivery.release_claim(root, args.thread_id, delivery_id,
+                    claim_owner=claim_owner, expected_identity=pending_delivery.received_ack_identity(
+                        member, args.thread_id, delivery_id), failure_reason=retry_failure,
+                    retry_base_delay_seconds=retry_base)
+                continue
+            release_unsubmitted_claim(root, args.thread_id, member, claim_owner, target,
                 failure_reason=retry_failure, retry_base_delay_seconds=retry_base)
 
 
