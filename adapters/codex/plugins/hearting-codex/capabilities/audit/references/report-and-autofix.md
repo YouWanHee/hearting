@@ -81,6 +81,8 @@ Then print at most eight localized lines containing completion, artifact name an
 
 ### Follow-up
 
+`--report-only` remains accepted for compatibility; reporting without edits or dispatch is already the default.
+
 The audit ends after writing and reporting its findings. If the user explicitly
 requests corrections, pass the report to the existing `autopilot-code` or
 `autopilot-refine` flow; the audit itself does not dispatch work.

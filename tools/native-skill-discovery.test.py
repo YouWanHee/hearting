@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import base64
 from pathlib import Path
 import re
+import secrets
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,8 +55,14 @@ class NativeSkillDiscoveryTest(unittest.TestCase):
                 path.mkdir(parents=True, exist_ok=True)
             make_repo(repo, env)
 
-            native = repo / "native-skills" / "code-execute" / "SKILL.md"
-            compat = repo / "claude-compat-skills" / "code-execute" / "SKILL.md"
+            version = subprocess.run([binary, "--version"], cwd=repo, env=env,
+                                     capture_output=True, text=True, timeout=30)
+            self.assertEqual(version.returncode, 0, version.stderr)
+            major = re.search(r"(\d+)\.\d+\.\d+", version.stdout)
+            self.assertIsNotNone(major, version.stdout)
+            modern = int(major.group(1)) >= 2
+            native = repo / (".opencode/skills" if modern else "native-skills") / "code-execute" / "SKILL.md"
+            compat = repo / (".claude/skills" if modern else "claude-compat-skills") / "code-execute" / "SKILL.md"
             user = xdg / "opencode" / "skills" / "user-supplied" / "SKILL.md"
             for path in (native, compat, user):
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,26 +84,76 @@ class NativeSkillDiscoveryTest(unittest.TestCase):
                 "XDG_DATA_HOME": str(home / ".local" / "share"),
                 "XDG_CACHE_HOME": str(home / ".cache"),
                 "XDG_STATE_HOME": str(home / ".local" / "state"),
-                "OPENCODE_CONFIG_CONTENT": json.dumps({"skills": {"paths": [str(native.parent.parent),
-                                                                                str(compat.parent.parent)]}}),
+                "OPENCODE_CONFIG_CONTENT": json.dumps({"skills": (
+                    [str(native.parent.parent), str(compat.parent.parent)] if modern else
+                    {"paths": [str(native.parent.parent), str(compat.parent.parent)]})}),
             })
             env.pop("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS", None)
-            result = subprocess.run([binary, "debug", "skill"], cwd=repo, env=env,
-                                    capture_output=True, text=True, timeout=30)
-            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-            found = json.loads(result.stdout)
+
+            def discover():
+                if not modern:
+                    result = subprocess.run([binary, "debug", "skill"], cwd=repo, env=env,
+                                            capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+                    return json.loads(result.stdout)
+                # A standalone one-request API snapshot can precede skill-plugin
+                # settlement. Keep one private fixture server for the same 30s
+                # deadline; never attach to the user's managed service.
+                password = secrets.token_urlsafe(32)
+                server_env = {**env, "OPENCODE_SERVER_PASSWORD": password,
+                              "OPENCODE_SERVER_USERNAME": "opencode"}
+                with socket.socket() as listener:
+                    listener.bind(("127.0.0.1", 0))
+                    port = listener.getsockname()[1]
+                with (root / "fixture-server.log").open("w") as log:
+                    server = subprocess.Popen(
+                        [binary, "serve", "--hostname", "127.0.0.1", "--port", str(port)],
+                        cwd=repo, env=server_env, stdout=log, stderr=subprocess.STDOUT,
+                        start_new_session=True)
+                    try:
+                        deadline = time.monotonic() + 30
+                        while time.monotonic() < deadline:
+                            request = urllib.request.Request(
+                                f"http://127.0.0.1:{port}/api/skill",
+                                headers={"Authorization": "Basic " + base64.b64encode(
+                                    ("opencode:" + password).encode()).decode(),
+                                    "x-opencode-directory": str(repo)})
+                            try:
+                                with urllib.request.urlopen(request, timeout=2) as response:
+                                    payload = json.load(response)
+                            except (urllib.error.URLError, TimeoutError):
+                                time.sleep(0.1)
+                                continue
+                            self.assertEqual(Path(payload["location"]["directory"]).resolve(), repo.resolve())
+                            entries = payload["data"]
+                            if {"code-execute", "user-supplied"} <= {item["id"] for item in entries}:
+                                return [{**item, "location": item["path"]} for item in entries]
+                            time.sleep(0.1)
+                        self.fail("OpenCode V2 did not discover both fixture skills within 30s")
+                    finally:
+                        if server.poll() is None:
+                            server.terminate()
+                        try:
+                            server.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            server.kill()
+                            server.wait(timeout=5)
+
+            found = discover()
             duplicate_entries = [item for item in found if item.get("name") == "code-execute"]
             user_entries = [item for item in found if item.get("name") == "user-supplied"]
             self.assertEqual(len(duplicate_entries), 1)
             self.assertEqual(Path(duplicate_entries[0]["location"]).resolve(), compat.resolve())
 
-            # Native OpenCode discovery accepts only the OpenCode frontmatter
-            # with the required explicit name. Claude falls back to its folder.
+            # V1 requires the explicit OpenCode name. V2 uses path-derived IDs
+            # and its documented native-versus-compatibility source precedence.
             compat.write_text(compat_text, encoding="utf-8")
-            result = subprocess.run([binary, "debug", "skill"], cwd=repo, env=env,
-                                    capture_output=True, text=True, timeout=30)
-            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-            found = json.loads(result.stdout)
+            if modern:
+                # V2 uses path-derived IDs even without name frontmatter. Its
+                # normal native source outranks automatic Claude compatibility;
+                # the explicit bad override above is no longer configured.
+                env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"skills": []})
+            found = discover()
             native_entries = [item for item in found if item.get("name") == "code-execute"]
             user_entries = [item for item in found if item.get("name") == "user-supplied"]
             self.assertEqual(len(native_entries), 1)
