@@ -190,7 +190,10 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
                 lock_path.unlink()  # Private replacement exercises the existing runner exit.
                 lock_path.touch()
             elif len(delays) == 3:
-                receive_exact()
+                if historical:
+                    self.assertFalse(self.duties(), "exact receipt is already settled; only external work remains")
+                else:
+                    receive_exact()
 
         try:
             with lock_path.open("w") as lock, self.transport("B") as native, contextlib.ExitStack() as stack:
@@ -235,7 +238,8 @@ class RunnerDiscoveryObservationTest(peer._TmpRootMixin, unittest.TestCase):
                 thread.join(3)
         self.assertEqual(messages, [message["id"]])
         self.assertEqual(discoveries[:1 if replace_lock else 2], [False] * (1 if replace_lock else 2))
-        self.assertEqual(delays[:1 if replace_lock else 2], [1.0] if replace_lock else [1.0, 1.7])
+        expected_delays = [1.0] if replace_lock else [1.0, 1.0 if historical else 1.7]
+        self.assertEqual(delays[:len(expected_delays)], expected_delays)
         self.assertEqual(len(ordinary_passes), len(discoveries))
         self.assertEqual(len({id(context) for context in ordinary_passes}), len(discoveries))
         self.assertEqual(len({id(context) for context in read_contexts}), len(discoveries))
