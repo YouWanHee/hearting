@@ -509,6 +509,16 @@ class OpenPaneTmuxTest(_IsolatedMixin, unittest.TestCase):
         return subprocess.run(["tmux", "-S", str(self.socket), *args], capture_output=True, text=True,
                               env=self.env, timeout=10, check=False)
 
+    def test_split_uses_percentage_syntax_supported_by_legacy_and_current_tmux(self):
+        calls = []
+        def run(argv):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="%2\n", stderr="")
+        surface = ts.TmuxSurface(run, "/private/socket")
+        self.assertEqual(surface.split("%1", "right", str(self.root)), "%2")
+        self.assertEqual(calls[0][3:], ["split-window", "-d", "-t", "%1", "-h", "-p", "50",
+                                         "-c", str(self.root), "-P", "-F", "#{pane_id}"])
+
     def start_server(self, border=None):
         self.socket = self.root / f"tmux-{border or 'default'}.sock"
         self.env = {key: value for key, value in os.environ.items() if key not in _SURFACE_ENV}
