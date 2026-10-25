@@ -321,6 +321,27 @@ class LegacyDesignRegistryBasisTest(unittest.TestCase):
         route["route_id"] = "rt-" + route["route_hash"].split(":", 1)[1][:16]
         return current, old_registry, route
 
+    def test_pre_authoring_design_registry_keeps_exact_digest_after_main_integration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            current, old, route = self._original_style_route(Path(temporary) / "pruned")
+            code = next(item for item in old["recipes"] if item["capability"] == "autopilot-code")
+            execute = next(item for item in code["standard_plus"]["nodes"] if item["id"] == "execute")
+            for item in (code["quick"], execute):
+                item["write_scope"].remove("spec/**")
+                del item["guard_preconditions"]
+            route["registry_digest"] = R.TOPO.registry_digest(old)
+            route["capability_registry_digest"] = R.TOPO.capability_registry_digest(old, "autopilot-design")
+            route["route_hash"] = R.route_hash(route)
+            route["route_id"] = "rt-" + route["route_hash"].split(":", 1)[1][:16]
+            with mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}):
+                self.assertEqual(R.verify_route(route)["route_hash"], route["route_hash"])
+                changed = copy.deepcopy(current)
+                next(item for item in changed["recipes"] if item["capability"] == "autopilot-code")[
+                    "quick"]["resource_class"] = "changed"
+                with mock.patch.object(R.TOPO, "load_registry", return_value=changed):
+                    with self.assertRaisesRegex(ValueError, "registry"):
+                        R.verify_route(route)
+
     def test_unavailable_old_catalogue_and_release_verify_from_exact_digests(self):
         with tempfile.TemporaryDirectory() as temporary:
             self.base = Path(temporary)

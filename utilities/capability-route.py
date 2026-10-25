@@ -753,7 +753,21 @@ def _continuation_reused_evidence(route, node):
     except (OSError,ValueError) as exc:
         raise ValueError(f"continuation-source-node-unverified:{node_id}:marker") from exc
     import review_input
-    if (review_input.is_review_node(node)
+    identified_input = False
+    if review_input.is_plan_review_node(node):
+        if review_input.has_plan_producer(route, node):
+            identified_input = (directory / "plan.json").is_file()
+        else:
+            try:
+                identified_input = review_input.sealed_plan_input(route, node) is not None
+            except DispatchContractError:
+                pass
+        if identified_input:
+            try:
+                identified_input = review_input.resolve_input(route, node, jobs) is not None
+            except DispatchContractError:
+                identified_input = False
+    if (identified_input
             and not isinstance(marker.get("source_subject"), dict)
             and marker.get("review_gate_closure") != "owner-closure"):
         # Historical marker validity does not prove a continuation's reviewed
@@ -5571,7 +5585,29 @@ def _authenticated_legacy_design_registry(route, basis, current_registry):
             return None
 
         if TOPO.registry_digest(sealed) != route.get("registry_digest"):
-            return None
+            # Main added route-local code authoring after these design routes
+            # were sealed. Undo only that exact unrelated declaration delta;
+            # the complete sealed registry digest must still match.
+            codes = [item for item in sealed.get("recipes", [])
+                     if item.get("capability") == "autopilot-code"]
+            if len(codes) != 1:
+                return None
+            quick = codes[0].get("quick") or {}
+            executes = [item for item in (codes[0].get("standard_plus") or {}).get("nodes", [])
+                        if item.get("id") == "execute"]
+            if (len(executes) != 1
+                    or quick.get("write_scope") != ["source-scoped", "plans/<cycle>/**", "spec/**"]
+                    or executes[0].get("write_scope") != [
+                        "source/**", "spec/**", "checklist.md", "dev_logs/**", "evidence/**"]
+                    or any(item.get("guard_preconditions") != ["artifact-order-prechecked"]
+                           for item in (quick, executes[0]))):
+                return None
+            for item in (quick, executes[0]):
+                item["write_scope"].remove("spec/**")
+                del item["guard_preconditions"]
+            TOPO.validate_registry(sealed)
+            if TOPO.registry_digest(sealed) != route.get("registry_digest"):
+                return None
         if route.get("composed"):
             recipe = route.get("composed_recipe")
             if (not isinstance(recipe, dict)
