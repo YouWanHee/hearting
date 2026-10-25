@@ -181,6 +181,70 @@ class ComputeRunLauncherIdentityTest(unittest.TestCase):
             self.assertEqual(recorded["provenance"]["notify"],
                              {"harness": "claude", "id": "route-parent"})
 
+    def test_resource_parent_launch_keeps_payload_provenance_and_share_contract(self):
+        import gpu_leases
+
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_root = root / "runs"
+            route_file = root / "route.json"
+            route_file.write_text("{}\n", encoding="utf-8")
+            registry = root / "resource-runs.json"
+            registry.write_text("{}\n", encoding="utf-8")
+            route_id, route_hash = "rt-resource-parent", "sha256:resource-parent"
+            route = {"route_id": route_id, "route_hash": route_hash,
+                     "route_file": str(route_file)}
+            parent_contract = {"route_id": route_id, "route_file": str(route_file),
+                               "route_hash": route_hash, "run_id": "parent-run",
+                               "node": "full-run"}
+            parent = {"run_id": "parent-run", "registry": str(registry),
+                      "route_id": route_id, "route_file": str(route_file),
+                      "route_hash": route_hash, "contract": parent_contract}
+            payload_home = str(root / "payload-home")
+            provenance = {"AGENT_HOME": str(root / "agent-home"),
+                          "AGENT_DISPATCH_ATTEMPT_ID": "att-parent"}
+            args = SimpleNamespace(host="here", command=["python", "-c", "pass"],
+                name="resource-child", cwd=None, env=None, gpus=None, share=True,
+                dry_run=False, json=True)
+            receipt = {"gpus": "", "gpu_lease": None,
+                       "tmux_transport": {"kind": "nohup-v1"}}
+            remote = mock.Mock(return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(receipt) + "\n", stderr=""))
+            with mock.patch.object(module, "load_config", return_value={
+                    "run_root": run_root, "hosts": {}}), \
+                 mock.patch.object(module, "_refuse_namespace_self"), \
+                 mock.patch.object(module, "_select", return_value=[
+                     ("here", {"ssh_host": "local"})]), \
+                 mock.patch.object(module, "_run_gpu_observation", return_value={
+                     "reachable": True, "gpus": []}), \
+                 mock.patch.object(module, "_launcher_provenance", return_value=provenance), \
+                 mock.patch.object(module, "_launcher_session_owner", return_value=None), \
+                 mock.patch.object(module, "_launcher_route", return_value=route), \
+                 mock.patch.object(module, "_resource_parent", return_value=parent), \
+                 mock.patch.object(module, "_select_payload_agent_home", return_value=(
+                     payload_home, "published", "fixture")), \
+                 mock.patch.object(module, "remote", remote), \
+                 mock.patch.object(module, "_spawn_completion_watch", return_value=False), \
+                 mock.patch.object(gpu_leases, "launcher_session_environment",
+                                   return_value={}), \
+                 mock.patch.object(gpu_leases, "serialized_compute_source",
+                                   return_value="# synthetic compute source\n"), \
+                 mock.patch.object(gpu_leases, "serialized_payload_source",
+                                   return_value="# synthetic payload source\n"), \
+                 mock.patch("sys.stdout", new=io.StringIO()):
+                self.assertEqual(module.cmd_run(args), 0)
+
+            (run_dir,) = list(run_root.iterdir())
+            meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["provenance"]["resource"], parent)
+            self.assertEqual(meta["provenance"]["payload_agent_home"], payload_home)
+            self.assertEqual(meta["provenance"]["agent_home_status"], "published")
+            self.assertTrue(meta["execution_contract"]["share"])
+            self.assertEqual(meta["execution_contract"]["resource_parent"], parent_contract)
+            launch_script = shlex.split(remote.call_args.args[1])[2]
+            self.assertIn("'HEARTING_RESOURCE_RUN_ID': 'parent-run'", launch_script)
+
 
 class SSHNamespacePrefixTest(unittest.TestCase):
     HOST = {"ssh_host": "example.invalid", "ssh_port": 1689, "ssh_user": "operator"}
@@ -598,6 +662,307 @@ class RunGPUObservationTest(unittest.TestCase):
         self.assertIsNone(json.loads(text)["gpu_observation"]["suggested_gpu"])
 
 
+class ComputeRunQuiescenceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.module = load_module()
+        self.run_id = "fixture-compute-run"
+        self.run_dir = self.root / self.run_id
+        self.run_dir.mkdir()
+        self.identity = {"pid": 12, "starttime": "44", "process_group": 12,
+                         "pid_namespace": "pid:[77]", "boot_id": "boot-fixture"}
+        output = self.root / "science.json"
+        output.write_text('{"result":1}\n')
+        output_row = {"path": "science.json", "sha256": self.module.hashlib.sha256(
+            output.read_bytes()).hexdigest(), "size": output.stat().st_size, "state": "present"}
+        parent_contract = {"artifact_base": str(self.root), "declared_outputs": ["science.json"]}
+        contract = {"resource_parent": parent_contract}
+        contract_sha = self.module.hashlib.sha256(json.dumps(
+            contract, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+        meta = {"run_id": self.run_id, "host": "fixture",
+                "provenance": {"resource": {"contract": parent_contract}},
+                "execution_contract": contract, "contract_sha256": contract_sha}
+        (self.run_dir / "meta.json").write_text(json.dumps(meta))
+        (self.run_dir / "exit_code").write_text("0\n")
+        (self.run_dir / "launch-receipt.json").write_text(json.dumps({
+            "schema_version": 1, "run_id": self.run_id, "host": "fixture", "identity": self.identity,
+            "state": "finished", "exit_code": 0,
+        }))
+        (self.run_dir / "outputs.json").write_text(json.dumps({
+            "schema_version": 1, "run_id": self.run_id, "outputs": [output_row]}))
+        self.config = {"run_root": self.root, "hosts": {"fixture": {"ssh_host": "host"}}}
+        self.expected = {
+            "meta_sha256": self.module.hashlib.sha256((self.run_dir / "meta.json").read_bytes()).hexdigest(),
+            "exit_sha256": self.module.hashlib.sha256((self.run_dir / "exit_code").read_bytes()).hexdigest(),
+            "receipt_sha256": self.module.hashlib.sha256((self.run_dir / "launch-receipt.json").read_bytes()).hexdigest(),
+            "outputs_sha256": self.module.hashlib.sha256((self.run_dir / "outputs.json").read_bytes()).hexdigest(),
+            "contract": contract, "provenance": {"contract": parent_contract},
+        }
+
+    def observe(self, payload):
+        return self.module.observe_run_quiescence(
+            self.config, self.run_id, expected=self.expected,
+            remote_call=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                [], 0, json.dumps(payload), ""))
+
+    def test_resource_parent_lineage_requires_exact_route_registry_owner_and_node(self):
+        jobs = self.root / "jobs.log"
+        jobs.write_text("")
+        route_file = self.root / "route.json"
+        route_file.write_text(json.dumps({"route_id": "rt-parent", "route_hash": "sha256:parent",
+            "nodes": [{"id": "full-run", "kind": "resource-runner",
+                       "continuation": {"kind": "supervised"}, "outputs": ["science.json"]}]}))
+        registry = self.root / "resource-runs.json"
+        owner = {"parent_attempt_id": "att-owner", "jobs": str(jobs),
+                 "route_id": "rt-parent", "route_hash": "sha256:parent"}
+        row = {"run_id": "parent-run", "resource_policy": "supervised-owner",
+               "route": str(route_file), "node": "full-run", "jobs": str(jobs),
+               "parent_attempt_id": "att-owner", "owner_wait": owner,
+               "status": "running", "command": ["compute-hosts", "run"]}
+        registry.write_text(json.dumps({"runs": {"parent-run": row}}))
+        values = {"HEARTING_RESOURCE_RUN_ID": "parent-run",
+                  "HEARTING_RESOURCE_REGISTRY": str(registry)}
+        route = {"route_id": "rt-parent", "route_file": str(route_file)}
+        parent = self.module._resource_parent(values, route)
+        self.assertEqual(parent["contract"]["route_hash"], "sha256:parent")
+        owner["parent_attempt_id"] = "att-foreign"
+        row["owner_wait"] = owner
+        registry.write_text(json.dumps({"runs": {"parent-run": row}}))
+        self.assertIsNone(self.module._resource_parent(values, route))
+
+    def test_quiescence_requires_matching_fresh_remote_empty_group(self):
+        result = self.observe({"state": "empty", "reason": "observed-empty"})
+        self.assertEqual(result["state"], "quiescent")
+        self.assertEqual(result["identity"], self.identity)
+
+    def test_live_or_unknown_remote_group_never_proves_quiescence(self):
+        self.assertEqual(self.observe({"state": "populated"})["state"], "not-quiescent")
+        self.assertEqual(self.observe({"state": "unknown"})["state"], "unknown")
+
+    def test_changed_exit_bytes_invalidate_the_observation(self):
+        (self.run_dir / "exit_code").write_text("1\n")
+        result = self.observe({"state": "empty"})
+        self.assertEqual(result["reason"], "compute-run-evidence-changed")
+
+
+class ComputeOutputReceiptTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.artifacts = self.root / "artifacts"
+        self.artifacts.mkdir()
+        self.run_root = self.root / "compute-runs"
+        self.run_id = "fixture-output-run"
+        self.run_dir = self.run_root / self.run_id
+        self.run_dir.mkdir(parents=True)
+        self.module = load_module()
+        self.config = {"run_root": self.run_root,
+                       "hosts": {"fixture": {"ssh_host": "fixture.invalid"}}}
+        self.module.remote = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, '{"state":"empty","reason":"fixture-empty-group"}\n', "")
+        self.identity = {"pid": 12, "starttime": "44", "process_group": 12,
+                         "pid_namespace": "pid:[77]", "boot_id": "boot-fixture"}
+
+    def write_execution(self, declared, files):
+        for relative, raw in files.items():
+            target = self.artifacts / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+        parent_contract = {"run_id": "fixture-resource", "route_id": "rt-output-fixture",
+                           "route_hash": "sha256:output-fixture",
+                           "artifact_base": str(self.artifacts),
+                           "declared_outputs": list(declared)}
+        provenance = {"run_id": "fixture-resource", "route_id": parent_contract["route_id"],
+                      "route_hash": parent_contract["route_hash"],
+                      "contract": parent_contract}
+        contract = {"resource_parent": parent_contract,
+                    "route": {"route_id": parent_contract["route_id"],
+                              "route_hash": parent_contract["route_hash"]}}
+        canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":")).encode("utf-8")
+        meta = {"run_id": self.run_id, "host": "fixture",
+                "provenance": {"resource": provenance},
+                "execution_contract": contract,
+                "contract_sha256": self.module.hashlib.sha256(canonical).hexdigest()}
+        (self.run_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        (self.run_dir / "exit_code").write_text("0\n", encoding="ascii")
+        (self.run_dir / "launch-receipt.json").write_text(json.dumps({
+            "schema_version": 1, "run_id": self.run_id, "host": "fixture-host",
+            "identity": self.identity, "state": "finished", "exit_code": 0,
+            "started_at": 1.0, "ended_at": 2.0,
+        }), encoding="utf-8")
+        receipt = self.module._record_compute_outputs(self.run_dir, meta)
+        return receipt, meta
+
+    def observe(self):
+        return self.module.execution_record(self.config, self.run_id)
+
+    def test_standard_full_run_glob_receipt_reaches_fresh_quiescent_observation(self):
+        declared = ["run.json", "logs/**", "experiment-artifact"]
+        receipt, _meta = self.write_execution(declared, {
+            "run.json": b'{"run":"full"}\n',
+            "logs/train.log": b"train complete\n",
+            "logs/nested/metrics.json": b'{"loss":0.1}\n',
+        })
+        self.assertEqual([row["path"] for row in receipt["outputs"]],
+                         ["logs/nested/metrics.json", "logs/train.log", "run.json"])
+        self.assertTrue(all(row["state"] == "present" for row in receipt["outputs"]))
+        result = self.observe()
+        self.assertEqual(result["state"], "quiescent", result)
+        self.assertEqual([row["path"] for row in result["execution"]["outputs"]],
+                         ["logs/nested/metrics.json", "logs/train.log", "run.json"])
+
+    def test_standard_eval_run_glob_receipt_reaches_fresh_quiescent_observation(self):
+        declared = ["run.json", "raw-results/**"]
+        receipt, _meta = self.write_execution(declared, {
+            "run.json": b'{"run":"eval"}\n',
+            "raw-results/fold-1/scores.json": b'{"accuracy":0.9}\n',
+        })
+        self.assertEqual([row["path"] for row in receipt["outputs"]],
+                         ["raw-results/fold-1/scores.json", "run.json"])
+        self.assertEqual(self.observe()["state"], "quiescent")
+
+    def test_overlapping_recursive_patterns_are_sorted_and_deduplicated(self):
+        declared = ["run.json", "logs/**", "logs/nested/**", "experiment-artifact"]
+        receipt, _meta = self.write_execution(declared, {
+            "run.json": b"run\n", "logs/z.log": b"z\n",
+            "logs/nested/a.log": b"a\n",
+        })
+        paths = [row["path"] for row in receipt["outputs"]]
+        self.assertEqual(paths, ["logs/nested/a.log", "logs/z.log", "run.json"])
+        self.assertEqual(len(paths), len(set(paths)))
+        self.assertNotIn("experiment-artifact", paths)
+        self.assertEqual(self.observe()["state"], "quiescent")
+
+    def test_zero_match_is_recorded_as_missing_and_refused(self):
+        receipt, _meta = self.write_execution(["run.json", "logs/**", "experiment-artifact"], {
+            "run.json": b"run\n",
+        })
+        missing = [row for row in receipt["outputs"] if row.get("state") == "missing"]
+        self.assertEqual(missing, [{"path": "logs/**", "state": "missing", "reason": "no-matches"}])
+        result = self.observe()
+        self.assertEqual(result["state"], "not-quiescent")
+        self.assertEqual(result["reason"], "compute-run-output-missing")
+        self.assertEqual(result["differences"][0]["field"], "outputs.logs/**")
+
+    def test_literal_run_json_receipt_shape_stays_compatible(self):
+        receipt, _meta = self.write_execution(["run.json"], {"run.json": b"literal\n"})
+        self.assertEqual(set(receipt), {"schema_version", "run_id", "outputs", "observed_at"})
+        self.assertEqual(set(receipt["outputs"][0]), {"path", "sha256", "size", "state"})
+        self.assertEqual(receipt["outputs"][0]["path"], "run.json")
+        self.assertEqual(self.observe()["state"], "quiescent")
+
+    def test_added_removed_and_mutated_glob_members_break_the_receipt_snapshot(self):
+        self.write_execution(["run.json", "logs/**"], {
+            "run.json": b"run\n", "logs/one.log": b"one\n", "logs/two.log": b"two\n",
+        })
+        self.assertEqual(self.observe()["state"], "quiescent")
+        (self.artifacts / "logs/added.log").write_bytes(b"added\n")
+        result = self.observe()
+        self.assertEqual(result["reason"], "compute-run-output-membership-changed")
+        self.assertEqual(result["differences"][0]["field"], "outputs.paths")
+        (self.artifacts / "logs/added.log").unlink()
+        (self.artifacts / "logs/one.log").unlink()
+        self.assertEqual(self.observe()["reason"], "compute-run-output-membership-changed")
+        (self.artifacts / "logs/one.log").write_bytes(b"one changed\n")
+        self.assertEqual(self.observe()["reason"], "compute-run-output-changed")
+
+    def test_snapshot_recheck_reports_output_receipt_and_file_bytes_expected_actual(self):
+        self.write_execution(["run.json", "logs/**"], {
+            "run.json": b"run\n", "logs/train.log": b"complete\n",
+        })
+        execution = self.observe()["execution"]
+        output_path = self.artifacts / "logs/train.log"
+        original_output = output_path.read_bytes()
+        output_path.write_bytes(b"changed\n")
+        differences = self.module.run_snapshot_differences(
+            self.config, self.run_id, execution)
+        file_difference = next(item for item in differences
+                               if item["field"] == "outputs.logs/train.log")
+        original_row = next(row for row in execution["outputs"]
+                            if row["path"] == "logs/train.log")
+        self.assertEqual(file_difference["expected"], {
+            "sha256": original_row["sha256"], "size": original_row["size"]})
+        self.assertNotEqual(file_difference["expected"], file_difference["actual"])
+        output_path.write_bytes(original_output)
+
+        receipt_path = self.run_dir / "outputs.json"
+        receipt = json.loads(receipt_path.read_bytes())
+        receipt["observed_at"] = receipt.get("observed_at", 0) + 1
+        receipt_path.write_text(json.dumps(receipt, ensure_ascii=False,
+                                           sort_keys=True) + "\n", encoding="utf-8")
+        differences = self.module.run_snapshot_differences(
+            self.config, self.run_id, execution)
+        receipt_difference = next(item for item in differences
+                                  if item["field"] == "compute_run.outputs_sha256")
+        self.assertEqual(receipt_difference["expected"], execution["outputs_sha256"])
+        self.assertNotEqual(receipt_difference["expected"], receipt_difference["actual"])
+
+    def test_snapshot_recheck_reports_sealed_pattern_set_expected_actual(self):
+        declared = ["run.json", "logs/**", "experiment-artifact"]
+        _receipt, _meta = self.write_execution(declared, {
+            "run.json": b"run\n", "logs/train.log": b"complete\n",
+        })
+        execution = self.observe()["execution"]
+        meta_path = self.run_dir / "meta.json"
+        meta = json.loads(meta_path.read_bytes())
+        parent = meta["provenance"]["resource"]["contract"]
+        parent["declared_outputs"] = ["run.json"]
+        meta["execution_contract"]["resource_parent"] = parent
+        meta["contract_sha256"] = self.module.hashlib.sha256(json.dumps(
+            meta["execution_contract"], ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        differences = self.module.run_snapshot_differences(
+            self.config, self.run_id, execution)
+        pattern_difference = next(item for item in differences
+                                  if item["field"] == "declared_outputs")
+        self.assertEqual(pattern_difference["expected"], declared)
+        self.assertEqual(pattern_difference["actual"], ["run.json"])
+
+    def test_symlink_leaf_ancestor_and_base_escape_never_hash_external_bytes(self):
+        external = self.root / "external.bin"
+        external.write_bytes(b"outside-secret-bytes\n")
+        external_hash = self.module.hashlib.sha256(external.read_bytes()).hexdigest()
+        for name, prepare in (
+                ("leaf", lambda: (self.artifacts / "logs").mkdir(exist_ok=True)),
+                ("ancestor", lambda: None)):
+            with self.subTest(kind=name):
+                for path in self.artifacts.iterdir():
+                    if path.is_dir() and not path.is_symlink():
+                        import shutil
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+                prepare()
+                target = self.artifacts / "logs" if name == "ancestor" else self.artifacts / "logs/external.bin"
+                if name == "ancestor":
+                    target.symlink_to(self.root, target_is_directory=True)
+                else:
+                    target.symlink_to(external)
+                receipt, _meta = self.write_execution(["run.json", "logs/**"], {
+                    "run.json": b"run\n",
+                })
+                self.assertNotIn(external_hash, json.dumps(receipt))
+                self.assertNotEqual(self.observe()["state"], "quiescent")
+        for unsafe in ("../external.bin", str(external)):
+            with self.subTest(pattern=unsafe):
+                for path in self.artifacts.iterdir():
+                    if path.is_dir() and not path.is_symlink():
+                        import shutil
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+                receipt, _meta = self.write_execution(["run.json", unsafe], {
+                    "run.json": b"run\n",
+                })
+                self.assertNotIn(external_hash, json.dumps(receipt))
+                self.assertNotEqual(self.observe()["state"], "quiescent")
+
+
 class ComputeHostsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -641,6 +1006,20 @@ class ComputeHostsTest(unittest.TestCase):
                                 text=True, capture_output=True, env=env)
         self.assertEqual(result.returncode, 2)
         self.assertIn("not initialized", result.stderr)
+
+    def test_self_command_probes_local_without_loading_inventory(self):
+        module = load_module()
+        expected = {"host": "fixture-machine", "reachable": True, "gpus": [{"index": 0}]}
+        output = io.StringIO()
+        with mock.patch.object(module.socket, "gethostname", return_value="fixture-machine"), \
+                mock.patch.object(module, "load_config", side_effect=AssertionError("inventory read")), \
+                mock.patch.object(module, "probe_host", return_value=expected) as probe, \
+                mock.patch("sys.stdout", output):
+            self.assertEqual(module.main(["self", "--json"]), 0)
+        probe.assert_called_once_with("fixture-machine", {"ssh_host": "local"}, (), ())
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["hosts"][0]["host"], "fixture-machine")
+        self.assertTrue(payload["hosts"][0]["self"])
 
     def test_static_listing_reads_the_inventory(self):
         result = self.run_tool("list", "--static", "--json")
@@ -1677,6 +2056,12 @@ class ComputeHostsTest(unittest.TestCase):
         run_dir = self.run_root / "launch-in-progress"
         run_dir.mkdir(parents=True)
         self.assertEqual(module._run_state(config, run_dir.name)["state"], "unknown")
+        receipt = {"schema_version": 1, "run_id": run_dir.name,
+                   "identity": {"pid": 1234, "starttime": "fixture-start"}}
+        (run_dir / "launch-receipt.json").write_text(json.dumps(receipt))
+        observed = module._run_state(config, run_dir.name)
+        self.assertEqual(observed["state"], "unknown")
+        self.assertEqual(observed["launch_receipt"], receipt)
         # The payload can finish even before the launcher records metadata.
         (run_dir / "exit_code").write_text("0\n")
         self.assertEqual(module._run_state(config, run_dir.name)["state"], "finished")

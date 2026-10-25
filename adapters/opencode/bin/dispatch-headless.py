@@ -256,6 +256,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--agent", default="build")
     p.add_argument("--model-role", default=os.environ.get("OPENCODE_DISPATCH_MODEL_ROLE"))
     p.add_argument("--model-profile", default=os.environ.get("OPENCODE_DISPATCH_MODEL_PROFILE"))
+    p.add_argument("--pair-model-profile")
     p.add_argument("--model", default=os.environ.get("OPENCODE_DISPATCH_MODEL"))
     p.add_argument("--variant", default=os.environ.get("OPENCODE_DISPATCH_VARIANT"))
     p.add_argument(
@@ -519,8 +520,16 @@ def _select_model_settings(args: argparse.Namespace) -> dict[str, str]:
 
 
 def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
-    selected = _select_model_settings(args)
-    if (selected.get("source") in {"profile", "role"}
+    context = WRAPPER_COMMON.prepare_pair_model_rotation(args, harness="opencode")
+    selection_args = args
+    if context.get("status") == "rotated":
+        import copy
+        selection_args = copy.copy(args)
+        selection_args.model_profile = context["profile"]
+    selected = _select_model_settings(selection_args)
+    if context.get("status") == "rotated" and selected.get("source") == "profile":
+        selected["source"] = "profile+diversity"
+    if (selected.get("source") in {"profile", "role", "profile+diversity"}
             and opencode_runtime.is_v2()):
         # The first automatically eligible candidate runs. Without one, an
         # unverified primary still runs here (automatic placement has already
@@ -1298,7 +1307,8 @@ def main(argv: list[str]) -> int:
         return fail(exc.reason, 65, detail=exc.detail, worktree=args.worktree, child_spawned="0")
     try:
         args.artifact_root = resolve_artifact_root(args.worktree)
-        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(args.artifact_root)
+        args.runtime_dir = WRAPPER_COMMON.prepare_runtime_root(
+            args.artifact_root, repository_kind=args.repository_kind, source_root=args.worktree)
         args.report_bundle_root = resolve_report_bundle_root(args.route_file, args.route_node)
         args.opencode_config_content = scoped_external_directory_config(
             args.artifact_root,
@@ -1873,8 +1883,9 @@ def main(argv: list[str]) -> int:
                                 if args.report_bundle_root is not None else None),
             execution_access_roots=[
                 str(value) for value in (
-                    args.execution_access_grant.additional_writable_roots
-                    if args.execution_access_grant is not None else ()
+                    (*((Path(args.runtime_dir),) if args.runtime_dir else ()),
+                     *(args.execution_access_grant.additional_writable_roots
+                       if args.execution_access_grant is not None else ()))
                 )
             ],
             execution_access_read_roots=[

@@ -8,14 +8,17 @@ the command exits, times out, or the lease is told to stop, whatever is still
 in that scope is terminated. A test that left a runner or refresher behind
 used to keep it running on a shared host until something else killed it.
 
-The scope's resident memory has one ceiling, so a leak ends this command
-instead of the kernel's OOM killer ending other work on the host.
+The scope's memory is measured as proportional set size so shared pages count
+once, with resident size used where PSS cannot be read. The --memory-budget SIZE
+option replaces the default ceiling with an approved value, and the lease prints
+the scope's peak on exit.
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+from fractions import Fraction
 import hashlib
 import json
 import os
@@ -82,8 +85,21 @@ def lease_context(command: list[str], timeout: float) -> tuple[Path, dict[str, o
     if row is None or row[0] not in {"open", "running"}:
         return None
     metadata = row[1]
-    route_id = metadata.get("route_id", "")
-    route_node = metadata.get("route_node", "")
+    if metadata.get("worker_type") == "owner":
+        if metadata.get("dispatch_depth") != "1":
+            return None
+        try:
+            from dispatch_completion_join import OWNER_ROUTE_NODE
+            from foreground_activity import resolve_owner_activity_binding
+            binding = resolve_owner_activity_binding(jobs, attempt, metadata)
+        except Exception:
+            # A verification lease is optional. An owner without a uniquely
+            # resolved current binding runs under the existing no-lease path.
+            return None
+        route_id, route_node = binding.route_id, OWNER_ROUTE_NODE
+    else:
+        route_id = metadata.get("route_id", "")
+        route_node = metadata.get("route_node", "")
     if not route_id or not route_node:
         return None
     digest = hashlib.sha256("\0".join(command).encode("utf-8")).hexdigest()
@@ -103,6 +119,8 @@ SCOPE_ENV = "HEARTING_VERIFICATION_SCOPE"
 _PR_SET_CHILD_SUBREAPER = 36
 MEMORY_POLL_SECONDS = 1.0
 MEMORY_EXCEEDED_EXIT = 125
+PSS_DUTY_FACTOR = 20
+PEAK_RECORD_FRACTION = 16
 SUBREAPER_UNAVAILABLE_EXIT = 126
 SCOPE_CLEANUP_FAILED_EXIT = 127
 _CLEANUP_ACTIVE = False
@@ -112,12 +130,53 @@ _DEFERRED_STOP: int | None = None
 
 def memory_budget_bytes() -> int:
     """16 GiB, or a quarter of this host's memory when that is smaller."""
-    try:
-        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (OSError, ValueError):
-        total = 0
+    total = host_memory_bytes()
     budget = 16 * 1024 ** 3
     return min(budget, total // 4) if total > 0 else budget
+
+
+def host_memory_bytes() -> int:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (OSError, ValueError):
+        return 0
+
+
+def parse_size(text: str) -> int:
+    import re
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([A-Za-z]*)", text.strip())
+    if not match:
+        raise ValueError("invalid size")
+    number, unit = match.groups()
+    unit = unit.lower()
+    if unit in ("", "b"):
+        if "." in number:
+            raise ValueError("fractional bytes")
+        multiplier = 1
+    else:
+        decimal = unit in {"kb", "mb", "gb", "tb"}
+        prefix = unit[:-2] if unit.endswith("ib") else unit[:-1] if unit.endswith("b") else unit
+        if prefix not in ("k", "m", "g", "t"):
+            raise ValueError("unknown size unit")
+        exponent = ("k", "m", "g", "t").index(prefix) + 1
+        multiplier = (1000 if decimal else 1024) ** exponent
+    result = int(Fraction(number) * multiplier)
+    if result < 1:
+        raise ValueError("size is less than one byte")
+    return result
+
+
+def resolve_memory_budget(raw: str | None) -> tuple[int, str]:
+    if raw is None:
+        return memory_budget_bytes(), "default"
+    try:
+        value = parse_size(raw)
+    except ValueError:
+        raise ValueError(f"{raw!r}: expected a positive size such as 140GB, 8GiB or 1073741824") from None
+    host = host_memory_bytes()
+    if host > 0 and value > host:
+        raise ValueError(f"{raw!r} is {value} bytes, above this host's {host} bytes")
+    return value, "option"
 
 
 def become_subreaper() -> bool:
@@ -143,6 +202,76 @@ def process_table() -> dict[int, tuple[int, int]]:
             continue
         table[int(name)] = (int(fields[1]), int(fields[21]) * page)
     return table
+
+
+def pss_bytes(pid: int) -> int | None:
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", "rb") as handle:
+            for line in handle:
+                if line.startswith(b"Pss:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def measure_scope(table: dict[int, tuple[int, int]], pids: set[int]) -> tuple[int, str]:
+    measured = 0
+    fallbacks = 0
+    live = 0
+    for pid in pids:
+        value = pss_bytes(pid)
+        if value is None:
+            if pid not in table or not os.path.exists(f"/proc/{pid}/stat"):
+                continue
+            value = table[pid][1]
+            fallbacks += 1
+        measured += value
+        live += 1
+    if fallbacks == 0:
+        measure = "pss-sum"
+    elif fallbacks == live:
+        measure = "rss-sum"
+    else:
+        measure = "mixed"
+    return measured, measure
+
+
+class MemoryPeak:
+    def __init__(self):
+        self.bytes: int | None = None
+        self.measure: str | None = None
+        self.samples = 0
+        self.interval = 0.0
+        self.rss_peak: int | None = None
+        self.rss_samples = 0
+        self.written: int | None = None
+
+    def record_rss(self, value: int) -> None:
+        self.rss_samples += 1
+        self.rss_peak = value if self.rss_peak is None else max(self.rss_peak, value)
+
+    def record(self, value: int, measure: str, period: float) -> None:
+        self.samples += 1
+        self.interval = max(self.interval, period)
+        if self.bytes is None or value > self.bytes:
+            self.bytes = value
+            self.measure = measure
+
+    def json_due(self, budget: int) -> bool:
+        return self.samples > 0 and (self.written is None or
+                                     self.bytes - self.written >= budget // PEAK_RECORD_FRACTION)
+
+    def line(self, budget: int, source: str) -> str:
+        if self.samples == 0:
+            measured = "bytes=none measure=none interval_s=none rss_sum_peak_bytes=none"
+        else:
+            measured = (f"bytes={self.bytes} measure={self.measure} "
+                        f"interval_s={self.interval:.1f} rss_sum_peak_bytes={self.rss_peak}")
+        return (f"verification-memory-peak {measured} scope=tree-aggregate "
+                f"samples={self.samples} rss_samples={self.rss_samples} "
+                f"rss_interval_s={MEMORY_POLL_SECONDS:g} budget_bytes={budget} "
+                f"budget_source={source}")
 
 
 def scope_pids(table: dict[int, tuple[int, int]], scope: str | None) -> set[int]:
@@ -215,9 +344,14 @@ def end_scope(scope: str | None, *, grace: float = 2.0) -> list[int]:
     return ended
 
 
-def wait_within_budget(process: subprocess.Popen[bytes], timeout: float, scope: str) -> int | None:
+def wait_within_budget(process: subprocess.Popen[bytes], timeout: float, scope: str,
+                       budget: int | None = None, source: str = "default",
+                       peak: MemoryPeak | None = None, on_peak=None) -> int | None:
     """The command's exit status; None on expiry. Raises MemoryError past the budget."""
-    budget = memory_budget_bytes()
+    budget = memory_budget_bytes() if budget is None else budget
+    peak = MemoryPeak() if peak is None else peak
+    overlap = 0
+    next_pss = 0.0
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
@@ -228,10 +362,22 @@ def wait_within_budget(process: subprocess.Popen[bytes], timeout: float, scope: 
         except subprocess.TimeoutExpired:
             pass
         table = process_table()
-        resident = sum(table[pid][1] for pid in scope_pids(table, scope) if pid in table)
-        if resident > budget:
-            raise MemoryError(f"verification-memory-budget-exceeded resident_bytes={resident} "
-                              f"budget_bytes={budget}")
+        pids = {pid for pid in scope_pids(table, scope) if pid in table}
+        rss_sum = sum(table[pid][1] for pid in pids)
+        peak.record_rss(rss_sum)
+        if rss_sum - overlap > budget or time.monotonic() >= next_pss:
+            started = time.monotonic()
+            measured, measure = measure_scope(table, pids)
+            cost = time.monotonic() - started
+            overlap = max(0, rss_sum - measured)
+            period = max(MEMORY_POLL_SECONDS, PSS_DUTY_FACTOR * cost)
+            next_pss = time.monotonic() + period
+            peak.record(measured, measure, period)
+            if on_peak is not None and peak.json_due(budget):
+                on_peak(peak, measure)
+            if measured > budget:
+                raise MemoryError(f"verification-memory-budget-exceeded resident_bytes={measured} "
+                                  f"budget_bytes={budget} budget_source={source} measure={measure}")
 
 
 def _stop(signum, _frame):
@@ -259,6 +405,7 @@ def main(argv: list[str] | None = None) -> int:
     global _CLEANUP_ACTIVE, _LAUNCHING, _DEFERRED_STOP
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, required=True)
+    parser.add_argument("--memory-budget", metavar="SIZE", help="approved scope memory ceiling")
     parser.add_argument("--require-subreaper", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -267,6 +414,10 @@ def main(argv: list[str] | None = None) -> int:
         command = command[1:]
     if args.timeout <= 0 or not command:
         parser.error("a positive --timeout and command are required")
+    try:
+        budget, source = resolve_memory_budget(args.memory_budget)
+    except ValueError as exc:
+        parser.error(f"--memory-budget {exc}")
     subreaper_ready = become_subreaper()
     if (args.require_subreaper
             and (not subreaper_ready or os.getpid() not in process_table())):
@@ -277,6 +428,8 @@ def main(argv: list[str] | None = None) -> int:
     scope = secrets.token_hex(8)
     process: subprocess.Popen | None = None
     lease_path: Path | None = None
+    peak = MemoryPeak()
+    on_peak = None
     status = 1
     _CLEANUP_ACTIVE = False
     _DEFERRED_STOP = None
@@ -298,11 +451,24 @@ def main(argv: list[str] | None = None) -> int:
             identity = process_launch_identity(process.pid)
             if identity.get("pid_start") and identity.get("pgid") == str(process.pid):
                 value.update({"pid": process.pid, "pid_start": identity["pid_start"],
-                              "pgid": process.pid})
+                              "pgid": process.pid, "memory_budget_bytes": budget,
+                              "memory_budget_source": source})
+                if args.memory_budget is not None:
+                    value["memory_budget_option"] = args.memory_budget
                 atomic_json(lease_path, value)
             else:
                 lease_path = None
-        status = wait_within_budget(process, args.timeout, scope)
+        if lease_path is not None:
+            def on_peak(current: MemoryPeak, measure: str) -> None:
+                value.update(memory_measure=measure, memory_peak_bytes=current.bytes,
+                             memory_peak_measure=current.measure)
+                try:
+                    atomic_json(lease_path, value)
+                except OSError:
+                    return
+                current.written = current.bytes
+        status = wait_within_budget(process, args.timeout, scope, budget, source,
+                                    peak, on_peak)
         if status is None:
             terminate_group(process)
             status = 124
@@ -314,6 +480,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         _CLEANUP_ACTIVE = True
         _LAUNCHING = False
+        print(peak.line(budget, source), file=sys.stderr, flush=True)
         if process is not None and process.poll() is None:
             terminate_group(process)
         ended = end_scope(scope)
