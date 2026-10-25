@@ -5,6 +5,7 @@ A route that borrows nothing and uses no optional part or widened choice keeps
 the node bytes it had before the catalog existed (golden fixture below); a
 `capability:stage` token borrows a shareable part into the host route.
 """
+import copy
 import hashlib
 import importlib.util
 import json
@@ -137,6 +138,35 @@ def _historical_setup_projection(recipe, case):
     return {**recipe, "promotion_signals": signals}
 
 
+def _historical_code_node_projection(node, case):
+    if node.get("id") != "execute":
+        return node
+    case.assertEqual(node["write_scope"],
+                     ["source/**", "spec/**", "checklist.md", "dev_logs/**", "evidence/**"])
+    case.assertEqual(node["guard_preconditions"], ["artifact-order-prechecked"])
+    historical = copy.deepcopy(node)
+    historical["write_scope"].remove("spec/**")
+    del historical["guard_preconditions"]
+    return historical
+
+
+def _historical_code_recipe_projection(recipe, case):
+    """Keep the pre-catalog fixture while checking the exact code-authoring delta."""
+    if recipe.get("capability") != "autopilot-code":
+        return recipe
+    historical = copy.deepcopy(recipe)
+    quick = historical["quick"]
+    case.assertEqual(quick["write_scope"], ["source-scoped", "plans/<cycle>/**", "spec/**"])
+    case.assertEqual(quick["guard_preconditions"], ["artifact-order-prechecked"])
+    quick["write_scope"].remove("spec/**")
+    del quick["guard_preconditions"]
+    historical["standard_plus"]["nodes"] = [
+        _historical_code_node_projection(node, case)
+        for node in historical["standard_plus"]["nodes"]
+    ]
+    return historical
+
+
 def _historical_terminal_notice_projection(recipe, case):
     """This fixture predates terminal omission diagnostics, not their graph."""
     meta = recipe.get("compose") or {}
@@ -212,6 +242,8 @@ def golden_payload(case):
         # policy suite checks that new selection and its warning separately.
         if isinstance(value, dict) and value.get("capability") == "autopilot-lab" and "setup" in value.get("modes", []):
             value = _historical_setup_projection(value, case)
+        if isinstance(value, dict) and value.get("capability") == "autopilot-code":
+            value = _historical_code_recipe_projection(value, case)
         if isinstance(value, dict) and "compose" in value:
             value = _historical_terminal_notice_projection(value, case)
         text = _normalize(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False), case)
@@ -224,12 +256,16 @@ def golden_payload(case):
             scenarios[name] = {"error": f"{type(exc).__name__}: {exc}"}
             return
         R.verify_route(route, R.ROOT)
+        # Verify the current route first; project only the separately asserted
+        # authoring scope delta for this historical catalog comparison.
+        nodes = ([_historical_code_node_projection(node, case) for node in route["nodes"]]
+                 if route["capability"] == "autopilot-code" else route["nodes"])
         entry = {"node_ids": [n["id"] for n in route["nodes"]],
-                 "nodes": {n["id"]: _digest(n) for n in route["nodes"]},
+                 "nodes": {n["id"]: _digest(n) for n in nodes},
                  "input_sources": {n["id"]: n["input_sources"] for n in route["nodes"] if "input_sources" in n},
                  "card": _historical_gpu_card(route, R.compose_card(route), case),
                  # The brief names the prior cycle's dated folder; pin its normalized text, not the raw digest.
-                 "briefs": {n["id"]: _digest(ADVANCE.render_stage_brief(route, n)[0]) for n in route["nodes"]
+                 "briefs": {n["id"]: _digest(ADVANCE.render_stage_brief(route, n)[0]) for n in nodes
                             if n.get("kind") != "runtime-terminal"}}
         entry.update({key: _digest(route[key]) for key in GOLDEN_KEYS if key in route})
         scenarios[name] = entry
@@ -258,7 +294,8 @@ def golden_payload(case):
     record("framed:route-frame", lambda: case.compose_framed(intensity="strong"))
     registry = TOPO.load_registry()
     registry = json.loads(json.dumps(registry))
-    registry["recipes"] = [_historical_setup_projection(recipe, case) for recipe in registry["recipes"]]
+    registry["recipes"] = [_historical_code_recipe_projection(
+        _historical_setup_projection(recipe, case), case) for recipe in registry["recipes"]]
     digests = {capability: TOPO.capability_registry_digest(registry, capability)
                for capability in sorted({r["capability"] for r in registry["recipes"]})}
     return _normalize(json.dumps({"scenarios": scenarios, "capability_registry_digest": digests},
@@ -266,19 +303,19 @@ def golden_payload(case):
 
 
 class GoldenTest(CatalogBase):
-    """A165-5: catalog-free routes keep their pre-catalog bytes and capability digest."""
+    """Pin catalog-free routes while allowing the adopted design layout migration."""
 
     maxDiff = None
 
-    def test_catalog_free_routes_match_the_pre_catalog_golden(self):
+    def test_catalog_free_routes_match_the_current_layout_golden(self):
         payload = golden_payload(self)
         if os.environ.get("SD165_GOLDEN_WRITE") == "1":
             GOLDEN.parent.mkdir(parents=True, exist_ok=True)
             GOLDEN.write_text(payload + "\n", encoding="utf-8")
             return
         if not GOLDEN.is_file():
-            self.fail("utilities/fixtures/sd165-route-golden.json missing; generate it on the "
-                      "pre-catalog tree with SD165_GOLDEN_WRITE=1")
+            self.fail("utilities/fixtures/sd165-route-golden.json missing; regenerate it with "
+                      "SD165_GOLDEN_WRITE=1 after an intentional topology change")
         expected = json.loads(GOLDEN.read_text(encoding="utf-8"))
         actual = json.loads(payload)
         self.assertEqual(sorted(actual["scenarios"]), sorted(expected["scenarios"]))
@@ -286,6 +323,27 @@ class GoldenTest(CatalogBase):
             with self.subTest(scenario=name):
                 self.assertEqual(actual["scenarios"][name], expected["scenarios"][name])
         self.assertEqual(actual["capability_registry_digest"], expected["capability_registry_digest"])
+
+
+class HistoricalCodeScopeTest(unittest.TestCase):
+    def test_projection_is_exact_and_does_not_change_the_current_recipe(self):
+        recipe = TOPO.resolve_recipe(TOPO.load_registry(), "autopilot-code", "dev")
+        before = copy.deepcopy(recipe)
+        historical = _historical_code_recipe_projection(recipe, self)
+        self.assertEqual(recipe, before)
+        self.assertEqual(historical["quick"]["write_scope"], ["source-scoped", "plans/<cycle>/**"])
+        execute = next(n for n in historical["standard_plus"]["nodes"] if n["id"] == "execute")
+        self.assertEqual(execute["write_scope"], ["source/**", "checklist.md", "dev_logs/**", "evidence/**"])
+        self.assertNotIn("guard_preconditions", execute)
+
+    def test_unapproved_scope_or_guard_changes_are_not_projected_away(self):
+        for field, value in (("write_scope", ["source/**", "spec/**", "unexpected/**"]),
+                             ("guard_preconditions", [])):
+            recipe = copy.deepcopy(TOPO.resolve_recipe(TOPO.load_registry(), "autopilot-code", "dev"))
+            execute = next(n for n in recipe["standard_plus"]["nodes"] if n["id"] == "execute")
+            execute[field] = value
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                _historical_code_recipe_projection(recipe, self)
 
 
 class HistoricalGpuExceptionTest(unittest.TestCase):
@@ -449,9 +507,9 @@ class BorrowTest(CatalogBase):
                  "parts/autopilot-research/synthesis/cards/**"],
             # literal: every cycle anchor is kept
             ("autopilot-design", "default", "refs,autopilot-research:synthesis,build,visual-verify,handoff"):
-                ["designs/<cycle>/parts/autopilot-research/synthesis/analysis_summary.md",
+                ["designs/parts/autopilot-research/synthesis/analysis_summary.md",
                  "spec/design/parts/autopilot-research/synthesis/analysis_summary.md",
-                 "designs/<cycle>/parts/autopilot-research/synthesis/cards/**",
+                 "designs/parts/autopilot-research/synthesis/cards/**",
                  "spec/design/parts/autopilot-research/synthesis/cards/**"],
             ("autopilot-spec", "api", "research,autopilot-research:synthesis,review,prd-transaction"):
                 ["spec/parts/autopilot-research/synthesis/analysis_summary.md",
@@ -678,8 +736,8 @@ class StagesTest(unittest.TestCase):
         self.assertNotIn("autopilot-lab:full-run", by_host[("autopilot-draft", ("doc", "paper", "presentation"))])
         design = next(b for b in blocks if b["capability"] == "autopilot-design")
         self.assertEqual(design["frame_brief_inputs"], [
-            "designs/<cycle>/01_refs/frame/direction-brief.md",
-            "designs/<cycle>/01_refs/frame-alternative/direction-brief.md"])
+            "designs/01_refs/frame/direction-brief.md",
+            "designs/01_refs/frame-alternative/direction-brief.md"])
 
     def test_compute_execution_needs_live_only_on_the_part_catalog_rows(self):
         registry = TOPO.load_registry()

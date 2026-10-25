@@ -173,15 +173,23 @@ def _locator_error(path_value: Any) -> Optional[Tuple[str, str]]:
     if len(components) > _MAX_LOCATOR_COMPONENTS:
         return "locator-too-many-components", "too many components"
     component_re = _PAYLOAD_COMPONENT_RE if payload else _LOCATOR_COMPONENT_RE
-    for comp in components:
+    # The only angle-bracket compatibility spelling is the literal historical
+    # design cycle component. It is retained in sealed payload paths and must
+    # continue through collection/checkpoint/refresh without broadening the
+    # payload grammar or changing the physical locator.
+    legacy_design_cycle = (payload and len(components) >= 4
+                           and components[:2] == ["artifacts", "designs"]
+                           and components[2] == "<cycle>")
+    for index, comp in enumerate(components):
         if comp == "":
             return "locator-empty-component", "empty component"
         if comp in (".", ".."):
             return "locator-dot-segment", "dot segment"
         if comp.startswith(".") and not payload:
             return "locator-hidden-component", "hidden component"
-        if not component_re.fullmatch(comp) or (
-                payload and len(comp.encode("utf-8")) > _PAYLOAD_COMPONENT_MAX_BYTES):
+        invalid_component = not (legacy_design_cycle and index == 2) and not component_re.fullmatch(comp)
+        payload_component_too_long = payload and len(comp.encode("utf-8")) > _PAYLOAD_COMPONENT_MAX_BYTES
+        if invalid_component or payload_component_too_long:
             return "locator-invalid-component", "invalid component"
     if components[-1] in _LEGACY_RESERVED_LOCATOR_NAMES and not payload:
         return "locator-reserved-name", "reserved locator name"

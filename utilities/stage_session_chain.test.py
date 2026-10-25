@@ -14,6 +14,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 import dispatch_subsession_resume_record as RESUME  # noqa: E402
+import stage_session_contract as SSC  # noqa: E402
 
 PATH = Path(__file__).with_name("stage-session-chain.py")
 SPEC = importlib.util.spec_from_file_location("stage_session_chain", PATH)
@@ -89,13 +90,69 @@ class StageSessionChainStartTest(unittest.TestCase):
                                       "start", "owner", Path("/jobs.log"))
                     prompt = command[command.index("--prompt-text") + 1]
                     self.assertIn("Execute sub-session ss-live from phase brief /work/phase.md", prompt)
-                    self.assertIn("within the fixed files. Then verify only with:", prompt)
+                    self.assertIn("within the fixed files. Run the required narrow verify:", prompt)
+                    self.assertIn("Also run any additional checks required by the phase brief.", prompt)
                     self.assertNotIn("Run only:", prompt)
                     for flag, expected in (("--phase-brief", session["phase_brief"]),
                                            ("--narrow-verify", session["narrow_verify"]),
                                            ("--fixed-file", session["fixed_files"][0]),
                                            ("--stage-authority", "0")):
                         self.assertEqual(command[command.index(flag) + 1], expected)
+                    self.assertNotIn("--report-path", command)
+
+    def test_continuation_keeps_brief_report_identity_without_manifest_report_field(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            worktree = base / "worktree"
+            worktree.mkdir()
+            brief = base / "phase.md"
+            brief.write_text("phase work\n", encoding="utf-8")
+            route = {
+                "route_id": "rt-fixture", "route_hash": "sha256:fixture",
+                "cwd": str(worktree),
+                "nodes": [{"id": "execute", "completion_gate": "code-execute",
+                           "write_scope": ["source/**", "evidence/**"]}],
+            }
+            route_path = base / "route.json"
+            route_path.write_text(json.dumps(route), encoding="utf-8")
+            node = route["nodes"][0]
+            manifest_path = base / "chain.json"
+            manifest_path.write_text(json.dumps({
+                "schema_version": 1, "kind": "stage-session-chain",
+                "chain_id": "ssc-original", "mode": "serial",
+                "worktree": str(worktree), "route_file": str(route_path),
+                "route_id": route["route_id"], "route_hash": route["route_hash"],
+                "route_node": "execute", "completion_gate": "code-execute",
+                "sessions": [{
+                    "subsession_id": "ss-original-fix-a",
+                    "attempt_id": "att-original-fix-a", "adapter": "codex",
+                    "slug": "execute-fix-a", "phase_brief": str(brief),
+                    "fixed_files": [str(worktree / "source.py")],
+                    "narrow_verify": "python3 verify.py", "expected_round_trips": 1,
+                }],
+            }), encoding="utf-8")
+            self.assertNotIn("report_path", json.loads(manifest_path.read_text())["sessions"][0])
+            manifest = SSC.load_manifest(manifest_path, route=route, node=node)
+            source_report = manifest["sessions"][0]["report_path"]
+            self.assertEqual(source_report, "evidence/ss-original-fix-a/report.md")
+            continued = SSC.derive_continuation_manifest(
+                manifest, [1], notes={1: ["finished the independent edit"]},
+                brief_dir=base / "continuations",
+            )
+            session = continued["sessions"][0]
+            self.assertNotIn("report_path", session)
+            continued_path = base / "continuation.json"
+            continued_path.write_text(json.dumps(continued), encoding="utf-8")
+            continued_loaded = SSC.load_manifest(continued_path, route=route, node=node)
+            continued_session = continued_loaded["sessions"][0]
+            self.assertEqual(
+                SSC.report_path_from_brief(
+                    Path(continued_session["phase_brief"]).read_text(encoding="utf-8"),
+                    session_id=continued_session["continues"], route_node="execute", node=node,
+                ),
+                source_report,
+            )
+            self.assertEqual(continued_session["report_path"], source_report)
 
     def _manifest(self, base: Path, session_count: int = 3) -> dict:
         sessions = [

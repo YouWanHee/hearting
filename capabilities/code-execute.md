@@ -42,9 +42,9 @@ Apply this procedure to phase recovery, total failure, cascading errors, failed 
 
 ## Slice Mode
 
-A worker assigned a parallel sub-session slice (phase brief, fixed files, `stage_authority=0`) edits only its fixed files and runs only its verify command. It makes no git writes — no safety checkpoint, phase commit, checkout, restore, stash, reset or rollback — and leaves `checklist.md` and the dev log to the owner. A file outside the list stops the slice with a handoff to the owner.
+A worker assigned a parallel sub-session slice (phase brief, fixed files, `stage_authority=0`) completes all processable in-scope items, edits only its fixed worktree files, writes its report to the separately assigned artifact path, and runs the narrow verify command as a required check plus any additional checks named in the brief. It makes no git writes — no safety checkpoint, phase commit, checkout, restore, stash, reset or rollback — and leaves `checklist.md` and the dev log to the owner. If a needed source file is outside the list, finish independent in-scope work and report the exact path, change, and unfinished item to the owner without widening the fence.
 
-Assign known approved test files together in the initial `fixed_files`. A later simple scope omission stays in the same approved work: the slice stops with a bounded patch plus the exact-path handoff and the owner continues it. Such an omission needs no new user approval, no new owner, and no separate repair. This does not relax the runtime `fixed_files` union or the foreign-sibling fence, and does not authorize automatic scope expansion.
+Assign known approved test files together in the initial `fixed_files`. If a simple scope omission is discovered later, complete independent in-scope work first and report the exact missing path, change, and unfinished item; the owner may continue the same approved work with a bounded patch and exact-path handoff. Such an omission needs no new user approval, no new owner, and no separate repair. This does not relax the runtime `fixed_files` union or the foreign-sibling fence, and does not authorize automatic scope expansion.
 
 A commit-expected single-session stage commits all validated tracked source files it changed, including documentation and configuration examples. Source ownership follows the assigned scope and content, not filename extension. Add only exact owned paths; exclude artifact shadows, runtime state, and unrelated dirty files.
 
@@ -96,14 +96,16 @@ Adapters must preserve the portable invariants relevant to this capability:
 - resolve artifact root through `utilities/artifact-root.sh` or equivalent logic;
 - use DB memory paths, not runtime-native memory files.
 
+Portable procedure and reference documents are owned under `capabilities/code-execute/references/` when present. Claude, Codex, and OpenCode Skill bodies are generated projections of this capability and use the same logical procedure read-set.
+
 ## Adapter Realization
 
 | Adapter | Realization |
 |---|---|
-| Claude Code | `adapters/claude/skills/code-execute/SKILL.md` and `skills/code-execute/SKILL.md` are byte-identical (enforced by `check-adaptation-boundary.sh`'s `diff -qr`); the only difference is the runtime discovery path — Claude Code discovers `adapters/claude/skills/code-execute/SKILL.md`, while `skills/code-execute/SKILL.md` remains the compatibility reference kept for parity/drift checks. |
+| Claude Code | `adapters/claude/skills/code-execute/SKILL.md` and `skills/code-execute/SKILL.md` are byte-identical (enforced by `check-adaptation-boundary.sh`'s `diff -qr`); the only difference is the runtime discovery path — Claude Code discovers `adapters/claude/skills/code-execute/SKILL.md`, while `skills/code-execute/SKILL.md` remains a generated compatibility projection sourced from `capabilities/` and kept for parity/drift checks. |
 | Codex | Read this spec and run `adapters/codex/bin/preflight.sh capability-info code-execute`. Use `adapters/codex/skills/code-execute/SKILL.md` as the native Codex Skill projection; do not consume `skills/code-execute/SKILL.md` or Claude command files as native Codex configuration. |
 | OpenCode | Read this spec and run `adapters/opencode/bin/preflight.sh capability-info code-execute`. Use `adapters/opencode/skills/code-execute/SKILL.md` and `adapters/opencode/commands/code-execute.md` as native OpenCode projections; do not consume `skills/code-execute/SKILL.md` or Claude command files as native OpenCode configuration. |
 
 ## Compatibility Reference
 
-`skills/code-execute/SKILL.md` and `adapters/claude/skills/code-execute/SKILL.md` are byte-identical (enforced by `check-adaptation-boundary.sh`'s `diff -qr`); the only difference is the runtime discovery path — Claude Code discovers `adapters/claude/skills/code-execute/SKILL.md`, while `skills/code-execute/SKILL.md` remains the compatibility reference kept for parity/drift checks.
+`skills/code-execute/SKILL.md` and `adapters/claude/skills/code-execute/SKILL.md` are byte-identical (enforced by `check-adaptation-boundary.sh`'s `diff -qr`); the only difference is the runtime discovery path — Claude Code discovers `adapters/claude/skills/code-execute/SKILL.md`, while `skills/code-execute/SKILL.md` remains a generated compatibility projection sourced from `capabilities/` and kept for parity/drift checks.

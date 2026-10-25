@@ -55,7 +55,7 @@ class SubdivisionContractTest(unittest.TestCase):
             "registry_digest": "sha256:" + "2" * 64,
             "cwd": str(worktree),
         }
-        write_scope = ["checklist.md", "manifest.json"] if exact_scope else ["source/**", "dev_logs/**"]
+        write_scope = ["checklist.md", "manifest.json"] if exact_scope else ["source/**", "dev_logs/**", "evidence/**"]
         node = {
             "id": "execute", "dispatch_depth": 2, "completion_gate": "execute-complete",
             "kind": "pipeline-stage", "write_scope": write_scope,
@@ -599,6 +599,88 @@ class SubdivisionContractTest(unittest.TestCase):
                 )
             self.assertEqual(status["status"], "stage-gate-aggregated")
 
+    def test_unversioned_gate_allows_only_the_declared_artifact_report(self):
+        for add_rogue in (False, True):
+            with self.subTest(add_rogue=add_rogue), tempfile.TemporaryDirectory() as td:
+                worktree, route, node, manifest_path = self._fixture(td)
+                raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertNotIn("report_path", raw["sessions"][0])
+                route["source_commit"] = "unversioned"
+                manifest = SSC.load_manifest(manifest_path, route=route, node=node)
+                jobs_path = Path(td) / "jobs.log"
+                self._write_jobs(jobs_path, route, manifest)
+                output_dir = Path(td) / "cycle-output" / "artifacts"
+                output_dir.mkdir(parents=True)
+                evidence = Path(td) / "stage-evidence.md"
+                evidence.write_text("execute done\n", encoding="utf-8")
+                env = {
+                    "AGENT_DISPATCH_JOBS": str(jobs_path),
+                    "AGENT_ARTIFACT_OUTPUT_DIR": str(output_dir),
+                }
+                with mock.patch.dict(os.environ, env):
+                    self._admit(route, node, manifest)
+                    report = output_dir / manifest["sessions"][0]["report_path"]
+                    report.parent.mkdir(parents=True)
+                    report.write_text("slice report\n", encoding="utf-8")
+                    if add_rogue:
+                        rogue = output_dir / "evidence" / "unassigned" / "notes.md"
+                        rogue.parent.mkdir(parents=True)
+                        rogue.write_text("outside the declared report path\n", encoding="utf-8")
+                        with self.assertRaisesRegex(ValueError, "subdivision-scope-violation"):
+                            CR.complete_subsession_stage(
+                                route, node, "execute", evidence, manifest_path, jobs_path,
+                            )
+                    else:
+                        _marker, status = CR.complete_subsession_stage(
+                            route, node, "execute", evidence, manifest_path, jobs_path,
+                        )
+                        self.assertEqual(status["status"], "stage-gate-aggregated")
+
+    def test_unversioned_gate_rejects_a_symlinked_own_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            worktree, route, node, manifest_path = self._fixture(td)
+            route["source_commit"] = "unversioned"
+            manifest = SSC.load_manifest(manifest_path, route=route, node=node)
+            jobs_path = Path(td) / "jobs.log"
+            self._write_jobs(jobs_path, route, manifest)
+            output_dir = Path(td) / "cycle-output" / "artifacts"
+            output_dir.mkdir(parents=True)
+            evidence = Path(td) / "stage-evidence.md"
+            evidence.write_text("execute done\n", encoding="utf-8")
+            env = {
+                "AGENT_DISPATCH_JOBS": str(jobs_path),
+                "AGENT_ARTIFACT_OUTPUT_DIR": str(output_dir),
+            }
+            with mock.patch.dict(os.environ, env):
+                self._admit(route, node, manifest)
+                evidence_root = output_dir / "evidence"
+                target = evidence_root / "sibling"
+                target.mkdir(parents=True)
+                report_id = Path(manifest["sessions"][0]["report_path"]).parent.name
+                (evidence_root / report_id).symlink_to(target, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "subdivision-scope-violation"):
+                    CR.complete_subsession_stage(
+                        route, node, "execute", evidence, manifest_path, jobs_path,
+                    )
+
+    def test_report_requirement_is_absent_for_unbound_and_no_evidence_nodes(self):
+        with tempfile.TemporaryDirectory() as td:
+            _worktree, route, node, manifest_path = self._fixture(
+                td, mode="serial", exact_scope=True,
+            )
+            bound = SSC.load_manifest(manifest_path, route=route, node=node)
+            self.assertIsNone(bound["sessions"][0]["report_path"])
+            unbound = SSC.load_manifest(manifest_path)
+            self.assertIsNone(unbound["sessions"][0]["report_path"])
+
+    def test_phase_brief_report_cannot_escape_to_another_cycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            _worktree, route, node, manifest_path = self._fixture(td)
+            brief = Path(json.loads(manifest_path.read_text())["sessions"][0]["phase_brief"])
+            brief.write_text("report: ../other-cycle/evidence/ss-sub1/report.md\n", encoding="utf-8")
+            with self.assertRaisesRegex(SSC.StageSessionError, "report-path-invalid"):
+                SSC.load_manifest(manifest_path, route=route, node=node)
+
     def test_a13_three_slice_chain_writes_exactly_one_marker(self):
         # SD-119 A-13: a 3-slice SERIAL chain completes to exactly one
         # canonical marker + one history entry, `stage_authority=owner-chain`,
@@ -645,6 +727,11 @@ class SubdivisionContractTest(unittest.TestCase):
             self.assertEqual(loaded["mode"], "serial")
             self.assertEqual(
                 loaded["sessions"][0]["fixed_files"], failed["fixed_files"]
+            )
+            self.assertEqual(loaded["sessions"][0]["report_path"], failed["report_path"])
+            self.assertIn(
+                f"report: {failed['report_path']}",
+                Path(loaded["sessions"][0]["phase_brief"]).read_text(encoding="utf-8"),
             )
             self.assertEqual(
                 loaded["sessions"][0]["subsession_purpose"], SSC.GAP_RETRY_PURPOSE

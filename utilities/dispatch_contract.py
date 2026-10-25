@@ -10867,7 +10867,11 @@ def _review_source_registration_fence(jobs: Path, row_fields: list[str], metadat
             route = json.loads(route_path.read_text(encoding="utf-8"))
             node = next((item for item in route.get("nodes", [])
                          if item.get("id") == metadata.get("route_node")), None)
-            if node is not None and has_review_subject(route, node, jobs):
+            reviewed_input = None
+            if metadata.get("review_input_digest"):
+                from review_input import read_binding as read_review_input_binding
+                reviewed_input = read_review_input_binding(jobs, metadata)
+            if node is not None and has_review_subject(route, node, jobs, reviewed_input):
                 predecessor = (metadata.get("automatic_retry_of")
                                or metadata.get("replacement_original_attempt_id"))
                 if not predecessor and metadata.get("capacity_retry") == "1":
@@ -10875,7 +10879,8 @@ def _review_source_registration_fence(jobs: Path, row_fields: list[str], metadat
                 values = seal_attempt(jobs, route, node, metadata["attempt_id"],
                                       worktree=row_fields[3], predecessor_attempt_id=predecessor,
                                       expected_subject_digest=os.environ.get(
-                                          "AGENT_REVIEW_SOURCE_SUBJECT_DIGEST"))
+                                          "AGENT_REVIEW_SOURCE_SUBJECT_DIGEST"),
+                                      attempt_metadata=metadata)
                 for key, value in values.items():
                     prior = metadata.get(key)
                     if prior and prior != value:
@@ -11278,6 +11283,24 @@ def _updated_attempt_metadata(
     return ",".join(retained)
 
 
+def _settlement_metadata_pipe(pipe: str, values: dict[str, str]) -> str:
+    """Retire the known duplicated provenance without repairing authority seals."""
+    parts = pipe.split(",")
+    sources = [part for part in parts if part.startswith("model_source=")]
+    if (values.get("note", "").startswith("dead-")
+            and len(sources) > 1 and len(set(sources)) == 1):
+        seen = False
+        retained = []
+        for part in parts:
+            if part.startswith("model_source="):
+                if seen:
+                    continue
+                seen = True
+            retained.append(part)
+        pipe = ",".join(retained)
+    return pipe
+
+
 def close_attempt_row(
     jobs: Path,
     attempt_id: str,
@@ -11316,7 +11339,7 @@ def close_attempt_row(
             values.update(_delivery_intent_values(fields, {**metadata, **values}))
             try:
                 fields[5] = _updated_attempt_metadata(
-                    fields[5], values, terminal=True
+                    _settlement_metadata_pipe(fields[5], values), values, terminal=True
                 )
             except DispatchContractError:
                 return False
@@ -11721,6 +11744,7 @@ def close_attempt_row_if(
     *,
     evidence: dict[str, str] | None = None,
     teardown_claim: str | None = None,
+    write_error: dict[str, str] | None = None,
 ) -> bool:
     """Revalidate and close one exact attempt inside the SD-49 lock.
 
@@ -11728,8 +11752,11 @@ def close_attempt_row_if(
     heartbeat evidence.  A read-then-``close_attempt_row`` sequence leaves a
     race between the decision and mutation.  This primitive re-reads the row
     and invokes the caller's safety predicate while the canonical registry is
-    locked; a changed or newly-live row is therefore left untouched.
+    locked; a changed or newly-live row is therefore left untouched. An optional
+    write_error distinguishes terminal metadata failures from a safety veto.
     """
+    if write_error is not None:
+        write_error.clear()
     if not attempt_id or not note:
         raise DispatchContractError("attempt-close-invalid", "attempt_id and note are required")
     ensure_global_registry_writable(jobs)
@@ -11779,9 +11806,11 @@ def close_attempt_row_if(
         values.update(_delivery_intent_values(fields, {**metadata, **values}))
         try:
             fields[5] = _updated_attempt_metadata(
-                fields[5], values, terminal=True
+                _settlement_metadata_pipe(fields[5], values), values, terminal=True
             )
-        except DispatchContractError:
+        except DispatchContractError as exc:
+            if write_error is not None:
+                write_error.update(reason=exc.reason, detail=exc.detail)
             return False
         lines[index] = "\t".join(fields)
         _atomic_registry_replace(jobs, lines)

@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -1058,6 +1059,7 @@ def _validate_batch_peer(
     *,
     proof_manifest_digest: str | None = None,
     require_terminal_success: bool = False,
+    require_owner_closure: bool = False,
 ) -> dict[str, object]:
     """Prove one non-selected member before a one-leg recovery reservation."""
 
@@ -1238,6 +1240,12 @@ def _validate_batch_peer(
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"parallel batch peer marker unreadable: {exc}") from exc
+        if require_owner_closure and not (
+            isinstance(marker, dict)
+            and marker.get("review_gate_closure") == "owner-closure"
+            and marker.get("review_independence") == "owner-overridden"
+        ):
+            raise ValueError("legacy visual peer is not owner-overridden closure")
         if not isinstance(node, dict) or not completion_marker_is_current(
             route, node, marker_path, marker, jobs=jobs,
         ):
@@ -1303,20 +1311,29 @@ def _validate_batch_peers(
     supplied = [peer.get("attempt_id") if isinstance(peer, dict) else None for peer in peers]
     if len(set(supplied)) != len(supplied) or set(supplied) != expected:
         raise ValueError("parallel batch recovery peer membership mismatch")
-    proofs = [
-        _validate_batch_peer(
-            peer,
-            validation_manifest,
-            validation_digest,
-            validation_legs,
-            validation_selected,
-            proof_manifest_digest=(
-                manifest_digest if source_replacement is not None else None
-            ),
-            require_terminal_success=source_replacement is not None,
-        )
-        for peer in peers
-    ]
+    proofs = []
+    for peer in peers:
+        try:
+            proof = _validate_batch_peer(
+                peer,
+                validation_manifest,
+                validation_digest,
+                validation_legs,
+                validation_selected,
+                proof_manifest_digest=(
+                    manifest_digest if source_replacement is not None else None
+                ),
+                require_terminal_success=source_replacement is not None,
+            )
+        except ValueError as original_error:
+            if source_replacement is not None:
+                raise
+            try:
+                proof = _validate_legacy_visual_closure_peer(
+                    peer, manifest, manifest_digest, leg_digests, selected_attempt_ids)
+            except ValueError:
+                raise original_error
+        proofs.append(proof)
     normalized = sorted(
         (proof["batch_peer_proof"] for proof in proofs),
         key=lambda proof: str(proof["attempt_id"]),
@@ -1330,6 +1347,116 @@ def _validate_batch_peers(
     if int(manifest.get("schema_version", 1)) == 1 and len(proofs) == 1:
         result.update(proofs[0])
     return result
+
+
+def _validate_legacy_visual_closure_peer(
+    peer: object,
+    manifest: dict[str, object],
+    manifest_digest: str,
+    leg_digests: dict[str, str],
+    selected_attempt_ids: list[str],
+) -> dict[str, object]:
+    """Authenticate one old visual owner-closure as a peer of a fresh primary."""
+    required = {"agent_home", "attempt_id", "jobs", "route"}
+    if (not isinstance(peer, dict) or set(peer) != required
+            or len(selected_attempt_ids) != 1
+            or (manifest.get("parallel_group") or manifest.get("replica_group")) != "visual-verify"):
+        raise ValueError("legacy visual closure proof scope invalid")
+    paths = {key: Path(str(peer[key])).resolve(strict=False)
+             for key in ("agent_home", "jobs", "route")}
+    try:
+        route = json.loads(paths["route"].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("legacy visual closure route unreadable") from exc
+    if (not isinstance(route, dict) or route.get("capability") != "autopilot-design"
+            or route.get("route_id") != manifest.get("route_id")):
+        raise ValueError("legacy visual closure route identity invalid")
+
+    from dispatch_contract import parse_registry_metadata
+    jobs = paths["jobs"]
+    try:
+        with Path(f"{jobs}.lock").open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        raise ValueError("legacy visual closure registry unreadable") from exc
+    parsed_rows = []
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) == 6:
+            parsed_rows.append((fields, parse_registry_metadata(fields[5])))
+    peer_rows = [(fields, row) for fields, row in parsed_rows
+                 if row.get("attempt_id") == peer["attempt_id"]]
+    if len(peer_rows) != 1:
+        raise ValueError("legacy visual closure row is not unique")
+    _peer_fields, peer_row = peer_rows[0]
+    source_digest = peer_row.get("batch_manifest_sha256", "")
+    if (not re.fullmatch(r"sha256:[0-9a-f]{64}", source_digest)
+            or source_digest == manifest_digest):
+        raise ValueError("legacy visual closure source digest invalid")
+
+    from recovery_history import RecoveryHistoryError, read_batch_input
+    from replica_batch_contract import verify_manifest
+    group = str(manifest.get("parallel_group") or manifest.get("replica_group") or "")
+    node_ids = {str(node.get("id")) for node in route.get("nodes", [])
+                if isinstance(node, dict)
+                and (node.get("parallel_group") or node.get("replica_group")) == group}
+    source_rows = [row for _fields, row in parsed_rows
+                   if row.get("batch_manifest_sha256") == source_digest]
+    try:
+        payload = read_batch_input(jobs, source_rows, source_route=route, group=group,
+                                   complete=True, node_ids=node_ids)
+        source_manifest, verified_digest, source_leg_digests = verify_manifest(payload["manifest"])
+    except (RecoveryHistoryError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError("legacy visual closure input is not authenticated") from exc
+    if (verified_digest != source_digest
+            or source_manifest.get("route_id") != manifest.get("route_id")
+            or source_manifest.get("parent_attempt_id") != manifest.get("parent_attempt_id")
+            or (source_manifest.get("parallel_group") or source_manifest.get("replica_group")) != group
+            or source_manifest.get("declared_size") != manifest.get("declared_size")
+            or source_manifest.get("independence") != manifest.get("independence")):
+        raise ValueError("legacy visual closure batch identity differs")
+
+    source_members = {str(member["route_node"]): member
+                      for member in source_manifest.get("members", [])}
+    current_members = {str(member["route_node"]): member
+                       for member in manifest.get("members", [])}
+    current_by_attempt = {str(member["attempt_id"]): member
+                          for member in manifest.get("members", [])}
+    if set(source_members) != node_ids or set(current_members) != node_ids:
+        raise ValueError("legacy visual closure member census differs")
+    selected_member = current_by_attempt.get(str(selected_attempt_ids[0]))
+    peer_member = current_by_attempt.get(str(peer["attempt_id"]))
+    if (selected_member is None or peer_member is None
+            or selected_member["route_node"] == peer_member["route_node"]):
+        raise ValueError("legacy visual closure selected member invalid")
+    source_selected = source_members.get(str(selected_member["route_node"]))
+    source_peer = source_members.get(str(peer_member["route_node"]))
+    if (source_selected is None or source_peer is None
+            or source_peer.get("attempt_id") != peer["attempt_id"]
+            or source_peer != peer_member):
+        raise ValueError("legacy visual closure peer differs from sealed member")
+    for node_id, source_member in source_members.items():
+        if source_member.get("assignment_sha256") != current_members[node_id].get("assignment_sha256"):
+            raise ValueError("legacy visual closure request input changed")
+
+    proof = _validate_batch_peer(
+        peer, source_manifest, verified_digest, source_leg_digests,
+        [str(source_selected["attempt_id"])],
+        proof_manifest_digest=manifest_digest,
+        require_terminal_success=True,
+        require_owner_closure=True,
+    )
+    peer_proof = proof["batch_peer_proof"]
+    peer_proof.update({
+        "legacy_owner_closure": True,
+        "source_manifest_sha256": verified_digest,
+        "source_selected_attempt_id": str(source_selected["attempt_id"]),
+        "source_peer_leg_sha256": source_leg_digests[str(peer["attempt_id"])],
+    })
+    encoded = json.dumps(peer_proof, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    proof["batch_peer_proof_sha256"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return proof
 
 
 def reserve(

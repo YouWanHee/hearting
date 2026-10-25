@@ -13,7 +13,9 @@ import subprocess
 import sys
 
 import artifact_producer
-from stage_session_contract import is_glob_path, slice_files_sha256, slice_text_sha256
+from stage_session_contract import (
+    is_glob_path, report_path_from_brief, slice_files_sha256, slice_text_sha256,
+)
 from dispatch_contract import DispatchContractError, validate_attempt_metadata
 # The declaration judgment is a route authority one; `declared` stays for importers.
 from route_authority import declared_subsession as declared  # noqa: F401
@@ -31,7 +33,12 @@ def _artifact_fence(args, worktree: Path) -> tuple[list[str], list[str]] | None:
     route_file = getattr(args, "route_file", None)
     if not route_file:
         return None
-    route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return None
+    if not isinstance(route, dict):
+        return None
     import artifact_context
     if any(artifact_context.classify_scope(value) != "artifact"
            for value in (next((node.get("write_scope", []) for node in route.get("nodes", [])
@@ -120,6 +127,101 @@ def _artifact_fence(args, worktree: Path) -> tuple[list[str], list[str]] | None:
 def default_state_dir(artifact_root: Path, route_id: str) -> Path:
     """`<artifact-root>/.runtime/stage-sessions/<route_id>` (CORE §3 `C-RT`)."""
     return Path(artifact_root).joinpath(*STATE_BUCKET) / route_id
+
+
+def _resolve_report_output(args) -> str:
+    """Resolve the phase-brief report under this route node's exact cycle scope."""
+    route_file = getattr(args, "route_file", None)
+    if not route_file or not getattr(args, "phase_brief", None):
+        return ""
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return ""
+    if not isinstance(route, dict):
+        return ""
+    nodes = route.get("nodes")
+    if not isinstance(nodes, list):
+        return ""
+    node = next((item for item in nodes
+                 if isinstance(item, dict) and item.get("id") == args.route_node), None)
+    if node is None:
+        return ""
+    brief_text = Path(args.phase_brief).read_text(encoding="utf-8")
+    raw = report_path_from_brief(
+        brief_text,
+        session_id=args.subsession_id,
+        route_node=args.route_node,
+        node=node,
+    )
+    if not raw:
+        return ""
+    import artifact_context
+    from worker_bootstrap import _child_scope_environment, resolve_node_scope
+
+    # Reports belong to the sealed route's cycle. The wrapper separately
+    # validates the execution worktree and exact live parent before launch.
+    environ = _child_scope_environment(args, route, os.environ)
+    if route.get("cwd"):
+        environ["AGENT_DISPATCH_WORKTREE"] = str(route["cwd"])
+    scope = resolve_node_scope(
+        route, args.route_node, environ,
+        parent_attempt_id=getattr(args, "parent_attempt_id", None),
+        route_file=route_file,
+    )
+    if not scope.output_dir:
+        if not report_path_from_brief(
+                brief_text, session_id=args.subsession_id,
+                route_node=args.route_node, node=node, explicit_only=True):
+            return ""
+        raise DispatchContractError("subsession-report-cycle-output-missing", args.subsession_id)
+    output_dir = Path(scope.output_dir).resolve(strict=False)
+    candidate = output_dir / raw
+    resolved = candidate.resolve(strict=False)
+    if resolved != candidate:
+        raise DispatchContractError("subsession-report-path-symlink", str(candidate))
+    try:
+        relative = resolved.relative_to(output_dir).as_posix()
+    except ValueError as exc:
+        raise DispatchContractError("subsession-report-path-outside-cycle", str(resolved)) from exc
+    artifact_scopes = []
+    for value in scope.write_scope:
+        if artifact_context.classify_scope(value) != "artifact":
+            continue
+        path = Path(value)
+        if path.is_absolute():
+            try:
+                value = path.relative_to(output_dir).as_posix()
+            except ValueError:
+                continue
+        artifact_scopes.append(value)
+    if not artifact_context.scope_matches(relative, artifact_scopes):
+        raise DispatchContractError("subsession-report-path-outside-write-scope", relative)
+    verdict = artifact_producer.check_write(Path(route["artifact_root"]).resolve(), resolved)
+    if verdict.get("verdict") != "allow":
+        raise DispatchContractError(
+            "subsession-report-write-denied",
+            f"{verdict.get('reason')}: {resolved}",
+        )
+    return str(resolved)
+
+
+def _predecessor_handoff_path(args) -> str:
+    """Only a serial successor has a predecessor handoff to read."""
+    if (
+        getattr(args, "subsession_mode", None) != "serial"
+        or (getattr(args, "subsession_index", 0) or 0) < 2
+    ):
+        return ""
+    route_file = getattr(args, "route_file", None)
+    if not route_file or not getattr(args, "session_chain_id", None):
+        return ""
+    route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    import dispatch_subsession_handoff
+
+    return str(dispatch_subsession_handoff.handoff_path(
+        Path(route["artifact_root"]), route["route_id"], args.session_chain_id,
+    ))
 
 
 # SD-119 R3: a chain-scoped sub-session's worker contract obligation is that
@@ -221,6 +323,9 @@ def bind(args: argparse.Namespace, *, artifact_root: str | Path, action: str) ->
         # behavior if route loading or its scope resolver cannot complete.
         fence = None
     args.effective_fixed_files, args.readonly_input_files = fence or (args.fixed_file, [])
+    args.report_file = _resolve_report_output(args)
+    if args.report_file:
+        args.effective_fixed_files = sorted(set(args.effective_fixed_files) | {args.report_file})
     axes = {
         "attempt_schema_version": 2,
         "dispatch_depth": args.dispatch_depth,
@@ -315,6 +420,11 @@ def prompt_fragment(args: argparse.Namespace) -> str:
     readonly = getattr(args, "readonly_input_files", [])
     readonly_line = ("- declared worktree inputs are read-only (forbidden files):\n"
                      + "\n".join(f"  - {file}" for file in readonly) + "\n") if readonly else ""
+    report_line = (f"- artifact report: {args.report_file} (write the report here; this is separate from worktree fixed_files)\n"
+                   if getattr(args, "report_file", "") else "")
+    predecessor = _predecessor_handoff_path(args)
+    predecessor_line = (f"- read the predecessor chain handoff before editing: {predecessor}\n"
+                        if predecessor else "")
     context = (Path(__file__).resolve().parents[1] / "roles/worker-contexts/subsession.md").read_text(encoding="utf-8")
     return (
         context + "\n"
@@ -323,11 +433,14 @@ def prompt_fragment(args: argparse.Namespace) -> str:
         "- stage_authority: 0; never publish the route-node completion marker\n"
         f"- phase brief: {args.phase_brief}\n"
         f"- persistent compact anchor: {args.state_ledger}\n"
-        f"- narrow verify: {args.narrow_verify}\n"
+        f"- required narrow verify: {args.narrow_verify}\n"
+        "- also run any additional checks named in the phase brief\n"
         f"- final handoff: `artifact: {args.state_ledger}` (this ledger, never a source file you edited)\n"
+        f"{report_line}"
+        f"{predecessor_line}"
         "- fixed files (exhaustive; out-of-list work stops with a handoff):\n"
         f"{files}\n"
         f"{readonly_line}"
         f"- after at most three edits or one verify round trip, update: python3 {Path(__file__).resolve().parent / 'worker-state-ledger.py'} update --path {args.state_ledger} --attempt-id {args.attempt_id} ...\n"
-        "- read the phase brief, prior bounded handoff, and ledger; do not reload the full spec unless the brief names it\n\n"
+        "- read the phase brief and assigned ledger; do not reload the full spec unless the brief names it\n\n"
     )

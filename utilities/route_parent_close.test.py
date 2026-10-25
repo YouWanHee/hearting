@@ -901,11 +901,14 @@ class ParentCloseTest(unittest.TestCase):
             unknown_child = fixture.terminal_fail_stage(
                 parent="historical-final-owner", name="historical-unknown-child",
                 status="running", foreground=False, cleanup=False)
-            self.assertNotEqual(
-                DC.attempt_process_quiescence(unknown_child, terminal_receipt=True).state,
-                "quiescent")
             try:
-                self.assertIsNone(historical_context(), "unknown child execution blocks historical completion")
+                # Keep this namespace present but unobservable. A host observer
+                # may correctly prove the fabricated namespace extinct otherwise.
+                with mock.patch.object(DC, "namespace_gone", return_value="present"):
+                    self.assertNotEqual(
+                        DC.attempt_process_quiescence(unknown_child, terminal_receipt=True).state,
+                        "quiescent")
+                    self.assertIsNone(historical_context(), "unknown child execution blocks historical completion")
             finally:
                 fixture.jobs.write_bytes(jobs_before)
 

@@ -2,7 +2,7 @@
 """Compile, verify, and complete immutable capability routes."""
 from __future__ import annotations
 
-import argparse, base64, contextlib, fcntl, functools, hashlib, importlib.util, json, locale, os, re, shlex, shutil, subprocess, sys, tempfile, uuid
+import argparse, base64, contextlib, fcntl, functools, hashlib, importlib.util, json, locale, os, re, shlex, shutil, stat, subprocess, sys, tempfile, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -87,7 +87,7 @@ from dispatch_contract import (
     stable_state_root,
     validate_attempt_metadata,
 )
-from stage_session_contract import load_manifest
+from stage_session_contract import load_manifest, report_path_from_brief
 from dispatch_degradation import record_degradation  # noqa: E402
 from dispatch_completion_join import materialize_after_terminal_close  # noqa: E402
 from codex_dispatch_terminal import (  # noqa: E402
@@ -752,6 +752,29 @@ def _continuation_reused_evidence(route, node):
         marker=json.loads(marker_bytes)
     except (OSError,ValueError) as exc:
         raise ValueError(f"continuation-source-node-unverified:{node_id}:marker") from exc
+    import review_input
+    identified_input = False
+    if review_input.is_plan_review_node(node):
+        if review_input.has_plan_producer(route, node):
+            identified_input = (directory / "plan.json").is_file()
+        else:
+            try:
+                identified_input = review_input.sealed_plan_input(route, node) is not None
+            except DispatchContractError:
+                pass
+        if identified_input:
+            try:
+                identified_input = review_input.resolve_input(route, node, jobs) is not None
+            except DispatchContractError:
+                identified_input = False
+    if (identified_input
+            and not isinstance(marker.get("source_subject"), dict)
+            and marker.get("review_gate_closure") != "owner-closure"):
+        # Historical marker validity does not prove a continuation's reviewed
+        # input. Reuse needs the recorded subject; do not infer it from today.
+        raise ValueError(
+            f"continuation-source-node-unverified:{node_id}:completion-review-subject-unknown"
+        )
     if not completion_marker_is_current(route,node,marker_path,marker,jobs=jobs):
         raise ValueError(
             f"continuation-source-node-unverified:{node_id}:attempt-link"
@@ -5492,6 +5515,117 @@ def _entry_scope_legacy_registry(registry):
     return legacy
 
 
+def _authenticated_legacy_design_registry(route, basis, current_registry):
+    """Reconstruct the exact old design registry from today's flat registry.
+
+    The validated basis is route provenance, not a pointer we need to reopen:
+    exact inverse reconstruction plus both route-sealed registry digests prove
+    the old declaration. Current units remain independently pinned. This
+    keeps the bridge usable after a historical release has been pruned without
+    treating an embedded recipe or a basis path as authority.
+    """
+    if (route.get("capability") != "autopilot-design" or not isinstance(basis, dict)
+            or not isinstance(current_registry, dict)):
+        return None
+    try:
+        TOPO.validate_registry(current_registry)
+        if (not isinstance(route.get("registry_digest"), str)
+                or not isinstance(route.get("capability_registry_digest"), str)
+                or not isinstance(route.get("unit_catalog_digest"), str)):
+            return None
+        if unit_catalog_digest() != route.get("unit_catalog_digest"):
+            return None
+        # A pruned catalogue is optional; an available contradictory catalogue
+        # must not be silently replaced by inverse reconstruction.
+        historical_path = Path(basis["registry_root"]) / "capabilities" / "topologies.json"
+        try:
+            historical = TOPO.load_registry(historical_path)
+        except FileNotFoundError:
+            pass
+        else:
+            if TOPO.registry_digest(historical) != route["registry_digest"]:
+                return None
+
+        changed = False
+        invalid = object()
+
+        def restore_cycle_component(value):
+            nonlocal changed
+            if isinstance(value, str):
+                if "designs/<cycle>" in value:
+                    return invalid
+                if value == "designs":
+                    changed = True
+                    return "designs/<cycle>"
+                if value.startswith("designs/"):
+                    changed = True
+                    return "designs/<cycle>/" + value[len("designs/"):]
+                return value
+            if isinstance(value, list):
+                restored = [restore_cycle_component(item) for item in value]
+                return invalid if any(item is invalid for item in restored) else restored
+            if isinstance(value, dict):
+                restored = {}
+                for key, item in value.items():
+                    restored_value = restore_cycle_component(item)
+                    if restored_value is invalid:
+                        return invalid
+                    restored[key] = restored_value
+                return restored
+            return value
+
+        sealed = restore_cycle_component(current_registry)
+        if not changed or sealed is invalid or not isinstance(sealed, dict):
+            return None
+        TOPO.validate_registry(sealed)
+        design_recipe = next((item for item in sealed.get("recipes", [])
+                              if item.get("capability") == "autopilot-design"), None)
+        if not isinstance(design_recipe, dict) or "designs/<cycle>" not in json.dumps(
+                design_recipe, ensure_ascii=False):
+            return None
+
+        if TOPO.registry_digest(sealed) != route.get("registry_digest"):
+            # Main added route-local code authoring after these design routes
+            # were sealed. Undo only that exact unrelated declaration delta;
+            # the complete sealed registry digest must still match.
+            codes = [item for item in sealed.get("recipes", [])
+                     if item.get("capability") == "autopilot-code"]
+            if len(codes) != 1:
+                return None
+            quick = codes[0].get("quick") or {}
+            executes = [item for item in (codes[0].get("standard_plus") or {}).get("nodes", [])
+                        if item.get("id") == "execute"]
+            if (len(executes) != 1
+                    or quick.get("write_scope") != ["source-scoped", "plans/<cycle>/**", "spec/**"]
+                    or executes[0].get("write_scope") != [
+                        "source/**", "spec/**", "checklist.md", "dev_logs/**", "evidence/**"]
+                    or any(item.get("guard_preconditions") != ["artifact-order-prechecked"]
+                           for item in (quick, executes[0]))):
+                return None
+            for item in (quick, executes[0]):
+                item["write_scope"].remove("spec/**")
+                del item["guard_preconditions"]
+            TOPO.validate_registry(sealed)
+            if TOPO.registry_digest(sealed) != route.get("registry_digest"):
+                return None
+        if route.get("composed"):
+            recipe = route.get("composed_recipe")
+            if (not isinstance(recipe, dict)
+                    or not _versioned_subgraph(sealed, recipe)):
+                return None
+            extras = [recipe]
+        else:
+            if route.get("composed_recipe") is not None:
+                return None
+            extras = ()
+        if TOPO.capability_registry_digest(sealed, route["capability"], extras) != route.get(
+                "capability_registry_digest"):
+            return None
+        return sealed
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
 def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     """Verify a route for mutating/resume use.
 
@@ -5600,6 +5734,17 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
                 unit_catalog_root_now=ROOT, capability_digest_now=legacy_capability_digest)
             if classification["verdict"] == "current":
                 registry = legacy_registry
+    if classification["verdict"] != "current":
+        sealed_design = _authenticated_legacy_design_registry(route, basis, registry)
+        if sealed_design is not None:
+            # The original immutable release authenticates the old declaration;
+            # the current unit catalog and current launch checks remain active.
+            registry = sealed_design
+            classification = {
+                "registry": {"verdict": "authenticated-sealed-design", "message": None},
+                "unit_catalog": {"verdict": "current", "message": None},
+                "verdict": "current", "message": None, "basis_present": True,
+            }
     if classification["verdict"] != "current":
         if not allow_stale_registry:
             if gates_on():
@@ -7638,6 +7783,21 @@ def write_completion_marker(
     # the only `None` case) rather than the field being silently omitted.
     round_census=None
     census_subject=(source_subject or {}).get("digest")
+    if (census_subject is None and owner_override and node.get("kind") == "review-worker"
+            and jobs is not None):
+        reviewed_input = None
+        import review_input
+        if review_input.is_review_node(node):
+            try:
+                reviewed_input = review_input.resolve_input(route, node, jobs)
+            except DispatchContractError:
+                if (attempt_metadata or {}).get("review_input_digest"):
+                    raise
+        from review_source_subject import has_review_subject, observe
+        if has_review_subject(route, node, jobs, reviewed_input):
+            current_subject = observe(route, node, worktree=route.get("cwd"), jobs=jobs,
+                                     reviewed_input=reviewed_input)
+            census_subject = current_subject["digest"]
     if REVIEW_ROUND_CAP.is_round_capped_node(node):
         rows=()
         census_jobs=Path(jobs or _compose_default_jobs())
@@ -9592,30 +9752,39 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
     if rounds is None:
         rounds=_review_round_rows(lines,route["route_id"],node_id,jobs=jobs)
     source_subject_digest = None
-    from review_source_subject import SourceSubjectError, has_review_subject, observe, read_binding, source_epoch
-    if has_review_subject(route, node, jobs):
+    reviewed_input = None
+    if jobs is not None:
+        import review_input
+        if review_input.is_review_node(node):
+            try:
+                reviewed_input = review_input.resolve_input(route, node, jobs)
+            except DispatchContractError:
+                if row_metadata.get("review_input_digest"):
+                    raise
+    from review_source_subject import (SourceSubjectError, annotate_rows, has_review_subject,
+                                       observe, read_binding, source_epoch)
+    if has_review_subject(route, node, jobs, reviewed_input):
         try:
             binding = read_binding(jobs, row_metadata, required=False) if jobs else None
-            current = observe(route, node, worktree=route.get("cwd"), jobs=jobs)
-            epoch = source_epoch(route, node, current["digest"], completion_dir(route["route_id"], jobs=jobs))
+            current = observe(route, node, worktree=route.get("cwd"), jobs=jobs,
+                              reviewed_input=reviewed_input)
+            epoch = source_epoch(route, node, current["digest"],
+                                 completion_dir(route["route_id"], jobs=jobs),
+                                 family=current.get("family", "source"))
         except (SourceSubjectError, OSError, ValueError) as exc:
             refuse("source-subject-unverifiable", getattr(exc, "reason", str(exc)))
-        if binding is None:
-            refuse("source-subject-unknown", row_metadata.get("attempt_id", ""))
-        if (binding["subject_digest"] != current["digest"]
-                or binding["source_epoch"] != epoch):
+        if (binding is not None and (binding["subject_digest"] != current["digest"]
+                or binding.get("family", "source") != current.get("family", "source")
+                or binding["source_epoch"] != epoch)):
             refuse("source-subject-stale", row_metadata.get("attempt_id", ""))
-        source_subject_digest = binding["subject_digest"]
-        bound_rounds = []
-        for status, metadata in rounds:
-            try:
-                row_binding = read_binding(jobs, metadata, required=False)
-            except SourceSubjectError as exc:
-                refuse("source-subject-unverifiable", getattr(exc, "reason", str(exc)))
-            bound_rounds.append((status, metadata if row_binding is None else {
-                **metadata, "_review_subject_digest": row_binding["subject_digest"]
-            }))
-        rounds = bound_rounds
+        try:
+            rounds = annotate_rows(jobs, rounds, route=route, node=node,
+                                   family=current.get("family", "source"))
+        except SourceSubjectError as exc:
+            refuse("source-subject-unverifiable", getattr(exc, "reason", str(exc)))
+        if (binding is not None or current.get("family", "source") == "source"
+                or any(meta.get("_review_subject_digest") for _status, meta in rounds)):
+            source_subject_digest = current["digest"]
     choice = ROUTE_AUTHORITY.decide_continuation(route, action="owner-closure", node=node, rows=rounds,
         facts=({"source_subject_digest": source_subject_digest}
                if source_subject_digest is not None else None))
@@ -10848,14 +11017,40 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
     # A lineage-clean commit moves its files out of `git status` and into
     # history, so the audit has to add them back or accepting the commit would
     # silently blind the very measurement it just passed.
+    declared_artifact_outputs = set()
+    artifact_output_dir = None
     if unversioned:
-        output_dir = (baseline or {}).get("artifact_output_dir") or os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR")
-        if not output_dir:
+        artifact_output_dir = (
+            (baseline or {}).get("artifact_output_dir")
+            or os.environ.get("AGENT_ARTIFACT_OUTPUT_DIR")
+        )
+        if not artifact_output_dir:
             _refuse("subdivision-baseline-missing", "unversioned artifact output directory unavailable")
-        changed = _artifact_delta(baseline, output_dir)
+        output_root = Path(artifact_output_dir).resolve(strict=False)
+        for session in manifest["sessions"]:
+            report_identity = (
+                session.get("gap_retry_of") or session.get("continues")
+                or session["subsession_id"]
+            )
+            report_path = report_path_from_brief(
+                Path(session["phase_brief"]).read_text(encoding="utf-8"),
+                session_id=report_identity, route_node=node_id, node=node,
+            )
+            if not report_path:
+                continue
+            report = output_root / report_path
+            resolved_report = report.resolve(strict=False)
+            if resolved_report != report:
+                _refuse("subdivision-scope-violation", f"report path uses a symlink: {report_path}")
+            try:
+                resolved_report.relative_to(output_root)
+            except ValueError:
+                _refuse("subdivision-scope-violation", f"report path escaped cycle output: {report_path}")
+            declared_artifact_outputs.add(resolved_report)
+        changed = _artifact_delta(baseline, artifact_output_dir)
     else:
         changed = _git_changed_files(worktree, route=route) | committed
-    outside = changed - declared_union - preexisting
+    outside = changed - declared_union - declared_artifact_outputs - preexisting
     if outside:
         _refuse(
             "subdivision-scope-violation",

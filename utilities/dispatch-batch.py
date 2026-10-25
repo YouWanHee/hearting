@@ -662,6 +662,11 @@ def parallel_nodes(route: dict[str, object], group: str) -> list[dict[str, objec
     return nodes
 
 
+def pending_round_admission_nodes(nodes: list[dict], reusable_peers: dict[str, dict]) -> list[dict]:
+    """Only group members without a proven current completion owe admission."""
+    return [node for node in nodes if str(node.get("id")) not in reusable_peers]
+
+
 # One-window import compatibility. New callers and CLI diagnostics use parallel_nodes.
 replica_nodes = parallel_nodes
 
@@ -2175,6 +2180,95 @@ def existing_leg_result(
     }
 
 
+def current_completed_group_peers(jobs: Path, route: dict, nodes: list[dict], group: str,
+                                  agent_home: Path, prompt_text: str) -> dict[str, dict]:
+    """Find current legacy design owner-closures before charging pending legs."""
+    if route.get("capability") != "autopilot-design" or group != "visual-verify":
+        return {}
+    expected_assignment = "sha256:" + hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    try:
+        lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        raise BatchError("batch-registry-unreadable", str(exc)) from exc
+    rows_by_manifest: dict[str, list[tuple[list[str], dict[str, str]]]] = {}
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        metadata = parse_registry_metadata(fields[5])
+        if (metadata.get("route_id") == route.get("route_id")
+                and metadata.get("route_hash") == route.get("route_hash")
+                and metadata.get("batch_group") == group
+                and metadata.get("batch_manifest_sha256")):
+            rows_by_manifest.setdefault(metadata["batch_manifest_sha256"], []).append((fields, metadata))
+    if not rows_by_manifest:
+        return {}
+    node_ids = {str(node["id"]) for node in nodes}
+    from recovery_history import RecoveryHistoryError, read_batch_input
+    peers: dict[str, dict] = {}
+    roots = dispatch_state_roots(agent_home, jobs)
+    for digest, rows in rows_by_manifest.items():
+        try:
+            payload = read_batch_input(jobs, [metadata for _fields, metadata in rows],
+                source_route=route, group=group, complete=True, node_ids=node_ids)
+            manifest, verified_digest, leg_digests = verify_manifest(payload["manifest"])
+        except (RecoveryHistoryError, ReplicaBatchContractError, BatchError, KeyError, TypeError, ValueError):
+            continue
+        if verified_digest != digest or (manifest.get("parallel_group") or manifest.get("replica_group")) != group:
+            continue
+        if any(member.get("assignment_sha256") != expected_assignment
+               for member in manifest.get("members", [])):
+            continue
+        row_by_attempt: dict[str, list[tuple[list[str], dict[str, str]]]] = {}
+        for fields, metadata in rows:
+            row_by_attempt.setdefault(str(metadata.get("attempt_id", "")), []).append((fields, metadata))
+        for member in manifest.get("members", []):
+            node_id = str(member.get("route_node", ""))
+            attempt_id = str(member.get("attempt_id", ""))
+            exact = row_by_attempt.get(attempt_id, [])
+            if node_id not in node_ids or len(exact) != 1:
+                continue
+            fields, metadata = exact[0]
+            if fields[1] != "done" or metadata.get("note") != "completed-marker":
+                continue
+            node = next(item for item in nodes if str(item["id"]) == node_id)
+            marker_path = next((root / "completion" / str(route["route_id"]) / f"{node_id}.json"
+                                for root in roots
+                                if (root / "completion" / str(route["route_id"]) / f"{node_id}.json").is_file()),
+                               resolve_dispatch_state_root(agent_home, jobs)
+                               / "completion" / str(route["route_id"]) / f"{node_id}.json")
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if marker.get("attempt_id") != attempt_id:
+                continue
+            if not (
+                (marker.get("review_gate_closure") == "owner-closure"
+                 and marker.get("review_independence") == "owner-overridden")
+                or marker.get("stage_authority") == "owner-closure"
+            ):
+                continue
+            if not completion_marker_is_current(route, node, marker_path, marker, jobs=jobs):
+                continue
+            readiness = completion_attempt_readiness(route, node, marker, jobs, registry_lines=lines)
+            if readiness.state != "ready":
+                reason = {"draining": "prior-attempt-still-live",
+                          "unverifiable": "prior-attempt-unverifiable",
+                          "unsettled": "round-unsettled"}.get(readiness.state,
+                                                                    "prior-attempt-not-ready")
+                raise BatchError(reason, f"node={node_id}:attempt={attempt_id}:{readiness.reason}")
+            existing = peers.get(node_id)
+            candidate = {"attempt_id": attempt_id, "fields": fields, "metadata": metadata,
+                         "manifest": manifest, "member": member,
+                         "manifest_digest": verified_digest,
+                         "leg_digest": leg_digests[attempt_id]}
+            if existing and existing["attempt_id"] != attempt_id:
+                raise BatchError("batch-current-peer-ambiguous", node_id)
+            peers[node_id] = candidate
+    return peers
+
+
 def batch_receipt(
     *,
     args: argparse.Namespace,
@@ -2728,6 +2822,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.log_dir is not None:
             args.log_dir = validate_dispatch_log_dir(jobs, args.log_dir)
         args.review_inputs = {}
+        current_group_peers = (current_completed_group_peers(
+            jobs, route, nodes, args.parallel_group, agent_home, args.prompt_text)
+            if partial is None else {})
+        reusable_peers = current_group_peers
         # C-14: dispatch-node.py caps plan-check/impl-review/test rounds, but a
         # realized parallel_group leg bypasses that wrapper entirely -- check
         # every capped leg here too, before the atomic reservation, so one leg
@@ -2741,9 +2839,13 @@ def main(argv: list[str] | None = None) -> int:
         round_admissions = {}
         replay_budget_errors = []
         round_errors = {}
-        for capped_node in nodes:
+        for capped_node in pending_round_admission_nodes(nodes, reusable_peers):
             capped_node_id = str(capped_node["id"])
             if not DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(capped_node):
+                continue
+            if capped_node_id in reusable_peers:
+                # Exact current completion/readiness was proved above. It is
+                # already a completed group peer and owes no new verdict budget.
                 continue
             if partial is not None and capped_node_id != str(partial["gap_leg_id"]):
                 # The sealed PASS peers are historical inputs to the partial
@@ -2779,10 +2881,10 @@ def main(argv: list[str] | None = None) -> int:
                         or (budget.state == "exhausted" and admission.requires_next_round)):
                     raise error
                 round_errors[capped_node_id] = error
-        unfinished_input = None if partial is not None else unfinished_batch_input(
+        unfinished_input = (None if partial is not None or reusable_peers else unfinished_batch_input(
             jobs, route, nodes, args.parallel_group,
             os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""), args.prompt_text,
-            round_admissions, route_file=route_path)
+            round_admissions, route_file=route_path))
         for node_id, error in round_errors.items():
             admission = round_admissions[node_id]
             if unfinished_input is not None and args.action == "start":
@@ -2814,7 +2916,7 @@ def main(argv: list[str] | None = None) -> int:
                 frozenset() if next_generation else admission.current_attempt_ids)
             for admission in round_admissions.values()
         ))
-        prior_input = unfinished_input or (None if partial is not None else prior_batch_input(
+        prior_input = unfinished_input or (None if partial is not None or reusable_peers else prior_batch_input(
             jobs, route, nodes, args.parallel_group,
             os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""), args.prompt_text,
             prior_attempt_ids=historical_batch_attempts))
@@ -2872,6 +2974,31 @@ def main(argv: list[str] | None = None) -> int:
                     diagnostics = {**diagnostics, "allocation_source": "partial-gap-reassignment",
                                    "gap_excluded_harnesses": partial_lineage["excluded"],
                                    "gap_successor_step": partial_lineage["step"]}
+        elif reusable_peers and len(reusable_peers) == len(nodes):
+            assignments = [
+                (node, str(reusable_peers[str(node["id"])]["member"]["harness"]),
+                 str(reusable_peers[str(node["id"])]["member"]["fallback_hop"]),
+                 int(reusable_peers[str(node["id"])]["member"]["fallback_ordinal"]))
+                for node in nodes
+            ]
+            independence = str(reusable_peers[str(nodes[0]["id"])]["manifest"].get("independence")
+                               or "persona")
+            diagnostics = {"allocation_source": "current-completion-group-reuse",
+                           "degradation_cause": "", "sole_gate": "not-applicable",
+                           "allocation": {}, "capacity": {}}
+        elif reusable_peers:
+            fixed = {
+                node_id: (str(peer["member"]["harness"]),
+                          str(peer["member"]["fallback_hop"]),
+                          int(peer["member"]["fallback_ordinal"]))
+                for node_id, peer in reusable_peers.items()
+            }
+            assignments, independence, diagnostics = assign_harnesses(
+                route, nodes, allow_degraded=args.allow_degraded_independence,
+                parent_identity=parent_identity, jobs=jobs, recheck=args.action == "start",
+                fixed=fixed,
+            )
+            diagnostics = {**diagnostics, "allocation_source": "current-completion-peer-reuse"}
         else:
             assignments, independence, diagnostics = assign_harnesses(
                 route, nodes, allow_degraded=args.allow_degraded_independence,
@@ -3042,6 +3169,22 @@ def main(argv: list[str] | None = None) -> int:
                     leg[key] = member[key]
                 elif key in ("profile_selection", "profile_demand"):
                     leg.pop(key, None)
+        if node_id in reusable_peers:
+            peer = reusable_peers[node_id]
+            member = peer["member"]
+            leg.update({
+                "attempt_id": peer["attempt_id"],
+                "slug": peer["fields"][4],
+                "assignment_sha256": member["assignment_sha256"],
+                "model_profile": member["model_profile"],
+                "perspective": member["perspective"],
+                "parallel_leg_index": member["parallel_leg_index"],
+                "leg_class": member["leg_class"],
+                **({"auxiliary_check": member["auxiliary_check"]}
+                   if member.get("leg_class") == "auxiliary" else {}),
+                **({key: member[key] for key in ("profile_demand", "profile_selection")
+                    if key in member}),
+            })
         if manifest_sessions is not None:
             # G7: consume the validated SD-103 subdivision manifest instead of
             # discarding it -- each leg carries the exact sub-session identity
@@ -3209,8 +3352,18 @@ def main(argv: list[str] | None = None) -> int:
         return fail(exc.reason, 73, detail=exc.detail, admitted=0, spawned=0)
     results: list[dict[str, object]] = []
     pending_legs: list[dict[str, object]] = []
+    for leg in legs:
+        peer = reusable_peers.get(str(leg["node"]))
+        if peer is not None:
+            results.append({
+                **leg, "exit_code": 0, "registered": "0", "started": "0",
+                "child_spawned": "0", "duplicate_attempt": "1", "check": "ok",
+                "launch_state": "existing", "reason": "reused-current-completion",
+            })
     try:
         for leg in legs:
+            if str(leg["node"]) in reusable_peers:
+                continue
             if partial is not None and leg["node"] != partial["gap_leg_id"]:
                 results.append({
                     **leg,
@@ -3332,7 +3485,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         from dispatch_replacement_batch import seal_launch_input
-        if prior_input is None:
+        if prior_input is None and pending_legs:
             seal_launch_input(jobs, args, route, manifest, manifest_digest)
     except (DispatchContractError, ReplicaBatchContractError) as exc:
         return fail(getattr(exc, "reason", "replacement-batch-input-invalid"),

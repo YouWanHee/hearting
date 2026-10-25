@@ -53,11 +53,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Reader-facing report gates whose format is specified outside their stage contract.
 REPORT_CONTRACT_REFERENCES = {
-    "lab-report": ("skills/autopilot-lab/references/eval-procedure.md",
-                   "skills/autopilot-lab/references/data-contract.md"),
-    "research-report": ("skills/autopilot-research/references/report-generation.md",),
-    "draft-finalize": ("skills/autopilot-draft/references/pipeline-steps.md",),
-    "audit-report": ("skills/audit/references/report-and-autofix.md",),
+    "lab-report": ("capabilities/autopilot-lab/references/eval-procedure.md",
+                   "capabilities/autopilot-lab/references/data-contract.md"),
+    "research-report": ("capabilities/autopilot-research/references/report-generation.md",),
+    "draft-finalize": ("capabilities/autopilot-draft/references/pipeline-steps.md",),
+    "audit-report": ("capabilities/audit/references/report-and-autofix.md",),
 }
 
 # Vocabulary a unit may declare under its optional `bootstrap:` frontmatter block.
@@ -78,7 +78,8 @@ DELIVERABLE_EXEMPLARS = {
     "code-report": ((), ("final_report.md", "plans/*/final_report.md", "plans/final_report.md")),
     "research-report": (("report/*.html", "research/*/report/*.html"),
                         ("report/*.md", "research/*/report/*.md")),
-    "design-handoff": (("designs/*/05_handoff/*.html",), ("designs/*/05_handoff/*.md",)),
+    "design-handoff": (("designs/05_handoff/*.html", "designs/*/05_handoff/*.html"),
+                       ("designs/05_handoff/*.md", "designs/*/05_handoff/*.md")),
     "draft-finalize": (("documents/*/*.html",), ("documents/*/*.md",)),
     "audit-report": ((), ("reviews/audit-report.md",)),
 }
