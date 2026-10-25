@@ -2442,8 +2442,9 @@ class DispatchContractTest(unittest.TestCase):
      argv=["--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
            "/bin/sh","-c",f"printf yes > {__import__('shlex').quote(str(marker))}; exec sleep 10"]
      fence_path=str(Path(__file__).with_name("launch-fence.py"))
-     bootstrap=("import importlib.util as u; from pathlib import Path; p="+
-                repr(fence_path)+"; s=u.spec_from_file_location('fence_fixture',p); "+
+     bootstrap=("import importlib.util as u, sys; from pathlib import Path; p="+
+                repr(fence_path)+"; sys.path.insert(0,str(Path(p).parent)); "+
+                "s=u.spec_from_file_location('fence_fixture',p); "+
                 "m=u.module_from_spec(s); s.loader.exec_module(m); Path("+
                 repr(str(ready))+").touch(); raise SystemExit(m.cli("+
                 repr(argv)+"))")
