@@ -20,6 +20,7 @@ cycle and does not require this lock.
 - **Shared spec admission:** the first seed records its exact reference/base revision and seed completion in `artifacts/spec/_internal/shared-base.json`; retries retain that base and preserve edits and deletions after seed completion. Admission verifies the sealed candidate, its base, and latest under its lock. D-122 automatically merges changes to disjoint files/components or Markdown sections; overlapping changes require review with their locations. The sealed source stays immutable: the derived publication records all inputs, source inventory, merge policy and output proof, while publication/recovery retains the latest-revision CAS. Older/manual cycles without a receipt supply their actual base using `--base-revision <id>` (`none` for initial publication). Exact retries validate and reuse the published revision without rewinding latest; old journals lacking base/source proof stay unresolved for inspection.
 - **Spec stage order:** the shared producer owner `begin` finishes its spec seed after releasing admission's lock and before any standard+ research or review worker runs. It uses the spec lock and pins the chosen reference/revision in the existing receipt; `prd-transaction` reuses that receipt before applying the reviewed change. This is one runtime sequence for Claude, Codex, and OpenCode, without a separate agent seeding step. The later transaction still supports an already-open cycle whose begin predated this sequence.
 - **Route declaration:** a route that can touch any `spec/**` path declares `spec_touch=true`. Before lock acquisition the conductor runs §5.9 git-state checks. Missing declaration or a route/node scope mismatch is a structured failure tied to the route id.
+- **Code-route PRD updates:** when the plan or code owner classifies work as spec-significant, update the affected component PRD before implementation through the same `autopilot-code` route: run `spec-transaction --node execute` inside `code-execute` for standard+, use the one-shot transaction for quick, and apply it inline for direct. `spec_touch` remains scope-derived capacity. Only actual seeded PRD authoring changes publish through normal route completion; the code `final_report` remains cycle-local primary. The existing revision, CAS, transaction, and snapshot checks remain in force. An explicit user deferral is the sole exception; there is no separate spec route, mid-route publisher, re-confirmation, new flag, or added proof.
 - **Contention:** a nonblocking acquisition first reports `BLOCKED`, then waits. After acquiring it re-reads the latest spec and version chain and enters the next version. The chain is one per spec, not one per layout: the next `v{N}` is `max+1` over the current spec root, the legacy `spec/`, every cycle-held spec tree (`artifacts/spec` in both cycle layouts, symlinks followed, and the W7H residue home `artifacts/_internal/spec`), and every `shared/spec` revision of every reference; a component spec follows its own `<slug>/` chain, and a root that cannot be walked is a typed refusal (`version-chain-unenumerable`), never a low number. It never retries a previously computed `v{N}` and never overwrites an existing snapshot.
 
 Acquire immediately before `autopilot-spec` Step 3 or update mode, `autopilot-code` state/summary writes, or a spec-drift update. The helper holds the lock around the supplied transaction command, prepares and verifies the prior PRD bytes itself, and exports `AGENT_SPEC_NEXT_VERSION` only after the latest version is re-read under lock. The caller supplies only the transaction command:
@@ -973,7 +974,7 @@ A legacy hash collision is diagnostic
      A hand-written manifest names, per session, the leg it runs as, with `node` (the realized leg's route node id) or `leg_index`; a session that names neither is refused rather than matched by list position. A subdivision that cannot be proven disjoint and in-scope does not raise — the batch prints a typed receipt `{"state": "single-session-required", "reason": "subdivision-disjointness-unproven"}`, exits 0, leaves one SD-93 ledger row, and the owner then runs the node as one ordinary session. That state is the owner's signal to stop treating the stage as split; nothing else consumes it.
 
      Admission records a worktree baseline keyed by the manifest hash, and the stage gate measures against it. This is what makes the post-hoc diff-scope audit a statement about the slices rather than about the whole worktree, and it is why the same manifest can be re-admitted and re-completed idempotently. The gate refuses with `subdivision-baseline-missing` when no admission baseline exists, `subdivision-commit-attempted` when `HEAD` left the baseline commit's first-parent line or a lineage-clean commit carries a slice's `fixed_files` (parallel slices are no-commit workers), and `subdivision-scope-violation` when a change outside the declared union appeared after admission, whether it is still uncommitted or already in a commit. Each refusal writes an SD-93 ledger row and no marker. **The order is fixed: the owner closes the stage gate first and commits after.** Committing the slices' work before the gate is refused, because at the gate that commit is indistinguishable from a slice having committed; committing after it is ordinary, and replaying the same gate on the same manifest and evidence then resumes the published marker instead of re-auditing a worktree that has legitimately moved on. **Declared limit of that judgement:** the gate tells an owner commit from a slice commit by what the commit carries, so a pre-gate commit that carries no slice's `fixed_files` and leaves every file's content identical to the admission baseline is judged neither — not a slice commit, because it carries none of the declared union, and not a scope violation, because its content still matches the baseline — and it passes. In that one shape SD-103's no-commit rule is stated but not enforced. It is the accepted cost of not judging by HEAD movement alone, which refused the owner's own commit against a write-once baseline and an unrewindable HEAD, with no recovery path. After a failed slice, the owner derives the gap-retry chain from the failed slices alone (`stage_session_contract.derive_gap_retry_manifest`); it carries exactly those slices' `fixed_files` and their leg binding, and never re-opens a successful sibling's. When a serial chain stops, the runtime writes its rest itself (`dispatch_subsession_advance.chain_continuation`): a session that ran and did not pass runs again as a gap-retry whose brief adds how that attempt ended, what its handoff recorded as done and the leg's done-when items it left unmet, the never-started sessions follow, and a passed session is not repeated. The owner's chain notice names that manifest and the one `stage-session-chain.py start --manifest <file>` command (the owner is its own `--parent`).
-   - **Phase brief, state ledger, and scope stop:** each sub-session reads a compact phase brief plus the previous bounded handoff instead of reloading the full specification by default. The phase brief assigns the work; `narrow_verify` limits its verification command, not the execution of that work. A parallel slice's brief names the plan, the worktree, the fixed files, its verify command and the rule that it makes no git writes (no add/commit/checkout/restore/stash/reset/rollback; git reads run with `GIT_OPTIONAL_LOCKS=0`, which the launch also exports), leaving `checklist.md` and the dev log to the owner. It persists `_internal/state/<attempt_id>.md` with the current slice, completed items, exact next command, invariants, and forbidden files. The ledger is flushed at least every three material edits and after every verification round trip. Pre-compact must validate and flush it; post-compact must re-read it before another edit. A missing or stale required ledger fails closed. The fixed file list is an execution fence: discovering a necessary file outside it stops the session with a handoff to the owner, which may create another sub-session. For a bound artifact-only node, the effective fence is formed from the phase brief's in-scope outputs relative to the cycle output directory, while declared worktree files are read-only inputs. Wide mechanical edits use a codemod plus bounded diff verification instead of expanding an individual session ad hoc.
+   - **Phase brief, state ledger, and scope stop:** each sub-session reads its phase brief and assigned state ledger. Only a registered serial-chain session at index 2 or later reads the exact predecessor handoff named in its prompt; index 1, parallel slices, and a 1/1 gap-retry have no predecessor handoff. The phase brief assigns the work; its `narrow_verify` command is a required check, and the worker also runs any additional checks named in the brief. A generated parallel slice brief names the plan, worktree, source fixed files, required verify command, and its own report path relative to the cycle output directory as a separate artifact output. A bound execute session uses its in-scope brief report or, when its evidence scope permits, `evidence/<subsession-id>/report.md`; runtime resolves that path under the assigned cycle and adds it to the effective fence separately from source `fixed_files` and their hash. The slice makes no git writes (no add/commit/checkout/restore/stash/reset/rollback; git reads run with `GIT_OPTIONAL_LOCKS=0`, which the launch also exports), leaving `checklist.md` and the dev log to the owner. It persists `_internal/state/<attempt_id>.md` with the current slice, completed items, exact next command, invariants, and forbidden files. The ledger is flushed at least every three material edits and after every verification round trip. Pre-compact must validate and flush it; post-compact must re-read it before another edit. A missing or stale required ledger fails closed. The fixed file list is an execution fence: when a necessary file is outside it, finish independent in-scope work and report the exact path, change, and unfinished item to the owner without widening the list. For a bound artifact-only node, the effective fence is formed from the phase brief's in-scope outputs relative to the cycle output directory, while declared worktree files are read-only inputs. Wide mechanical edits use a codemod plus bounded diff verification instead of expanding an individual session ad hoc.
    - **Separability under SD-17:** dispatch is mandatory when the stage output contract is complete and its edit surface is not boundary-coupled through shared semantic anchors or sequential boundary assertions. A non-separable stage may run inline only if the reason is recorded in `plans/<slug>/_internal/metrics.md`; missing evidence is a contract violation. Parallelize separable census or independent file groups in-session. `hooks/stage-dispatch-reminder.sh` only reminds a dispatch-depth-1 conductor of this; it does not deny an in-session stage on any harness.
    - Dispatch-depth-2 review helpers are read-only by default. The code route opens framing at width two by default and for `standard+`; an explicit `quick`/`direct` frame may narrow to one only when no protected path, multiple adapter paths, or spec/ship hint is present. Strong opens width-two plan/implementation-review groups; `thorough+` adds declared third implementation-risk/failure-mode legs. Other capability groups stay at their registry-declared width. Every leg is a sibling under the same owner, has a sealed role/profile/perspective and disjoint write scope, and joins before continuation. No worker fan-out, undeclared breadth, or dispatch depth 3 is permitted. Stage-worker ownership remains disjoint: `code-plan` owns plan artifacts; `code-execute` alone mutates source; `code-test` owns test evidence while source stays read-only; `code-report` owns the final report and locked summary.
    - The number of concurrent workers is set by the model-worker governor's `dispatch` class limit (`utilities/model-worker-governor.py`, `CLASS_LIMITS`); there is no separate per-conductor process cap. Each stage pipeline is sequential, and in-session implementation-team workers do not count. Dispatches beyond the governor limit are queued or refused by the governor.
@@ -1515,13 +1516,24 @@ same bytes through an independent PASS. The runtime records the run identity,
 consumed file hashes, stage-marker hashes and independent gate in the existing
 workflow journal as downstream consumption, preserving the original FAIL,
 exit, resource registry, artifacts and scientific result. Owner wording or
-downstream PASS alone is insufficient. Missing or
-different bindings retain failure and return an executable continuation using
-the existing compose surface: a new resource attempt with a distinct `__a<N>`
-identity and output directory, followed by revalidation of its downstream
-stages. Old PASS markers are provenance, not authority for the new bytes.
-The same judgment serves owner settlement and workflow completion on all three
-harnesses, without another flag, required input or approval.
+downstream PASS alone is insufficient.
+
+When bindings are missing or differ, retry guidance follows the exact route
+and current owner receipt. A live owner, or an unanswered BLOCKED/FAIL owner,
+gets its existing `correction_command` with a same-route instruction for a new
+`__a<N>` resource attempt, a separate output directory and downstream
+revalidation. For BLOCKED owners, check `owner_report` before sending the
+prepared answer. Other open or unobservable states, including retained answers,
+human gates, cancellation and waits, use the route's existing
+`resume_command`. Cancellation remains protected even when its exact route
+closure exists. An ordinarily closed route uses the existing compose surface to
+open a new route. The agreed exception is a rejected settlement from an owner
+whose PASS is proven by the shared verdict reader: it keeps the existing
+compose guidance until same-route PASS-settlement recovery is implemented.
+An observation failure counts as neither closure nor PASS. Old PASS markers are
+provenance, not authority for new bytes. These choices add no flag, required
+input, gate or approval, and the same resource judgment serves owner settlement
+and workflow completion on all three harnesses.
 
 **Advance evidence is four-part and fail-closed.** Before a supervisor may
 start a successor it proves, for the predecessor: exact process identity
@@ -1754,12 +1766,17 @@ the cancelled row from its active set without granting successor readiness.
 (`utilities/verification-background-lease.py`) owns everything its command
 starts: it is the command's child subreaper and tags the command's environment,
 and when the command exits, expires or the lease is stopped it ends whatever is
-still in that scope, detached fixtures included. The scope's resident memory has
-one ceiling (16 GiB, or a quarter of host memory when smaller); past it the lease
-ends the scope and returns 125, so a leaking check ends instead of other work on
-a shared host. The test runner likewise reaps each suite's fixtures when that
-suite ends, and ends its running suites when it is stopped. A peer obligation
-runner whose state root was removed or replaced ends on its next pass.
+still in that scope, detached fixtures included. The scope's memory, measured as
+its proportional set size (shared pages counted once; resident size where that
+is unreadable), has one ceiling: 16 GiB, or a quarter of host memory when
+smaller, unless `--memory-budget SIZE` replaces it with the value an approved
+task or receipt names; the lease record and the 125 message name which one
+applied. Past it the lease ends the scope and returns 125, so a leaking check
+ends instead of other work on a shared host. The lease prints the scope's peak,
+its measure and sampling interval on every exit. The test runner likewise reaps
+each suite's fixtures when that suite ends, and ends its running suites when it
+is stopped. A peer obligation runner whose state root was removed or replaced
+ends on its next pass.
 
 **Exact reconcile stays attempt-scoped.** A normal `dispatch-reconcile
 --attempt <id> --apply` covers that attempt, its process drain, and its
@@ -2168,6 +2185,10 @@ code appears, the session gets one notice through its harness carrier
 Started by a registered owner or worker inside a route, the notice goes to the
 session that started that route's owner (its parent in the jobs registry),
 naming the launching attempt.
+A run with neither metadata nor an exit code has unknown launch state:
+`compute-hosts runs` shows it as `unknown`, including legacy empty run
+directories, without changing its files; metadata is recorded only after
+launch succeeds.
 
 ### §5.14. Peer-Session Steering (steward role)
 
@@ -2924,7 +2945,7 @@ result. `write_stdin` can confirm or preserve it for the exact matching handle
 and an ongoing structured response. The handle establishes native continuation,
 not OS process liveness. Command display may unwrap an exact native shell
 `-c`/`-lc` argv shape and the verification-lease delimiter
-`utilities/verification-background-lease.py --timeout N -- <argv>`, while
+`utilities/verification-background-lease.py --timeout N [--memory-budget SIZE] -- <argv>`, while
 retaining the original command. Outer `functions.exec` source and arbitrary
 script text provide no reliable inner command.
 

@@ -160,6 +160,25 @@ class TestRoute(unittest.TestCase):
   # recipe's declared bindings) -- assert that explicitly now that
   # autopilot-code's recipe declares a non-empty frame-review binding.
   self.assertEqual(a["human_gate_bindings"],[])
+ def test_code_spec_authoring_scope_flows_to_standard_quick_and_direct_routes(self):
+  standard=R.compile_route(**self.args(requested_intensity="standard",predicates=[],signals=[],
+   transport="headless",inline_reason=None,dispatch_evidence=self.dispatch(self.nested())))
+  execute=next(n for n in standard["nodes"] if n["id"]=="execute")
+  self.assertTrue(standard["spec_touch"])
+  self.assertIn("spec/**",execute["write_scope"])
+  self.assertEqual(execute["guard_preconditions"],["artifact-order-prechecked"])
+  R.verify_route(standard,R.ROOT)
+  quick=R.compile_route(**self.args(predicates=[],signals=[],transport=None,inline_reason=None,
+   registered_headless_evidence=self.registered_headless()))
+  owner=next(n for n in quick["nodes"] if n["id"]=="one-shot")
+  self.assertEqual(quick["effective_intensity"],"quick")
+  self.assertTrue(quick["spec_touch"])
+  self.assertIn("spec/**",owner["write_scope"])
+  R.verify_route(quick,R.ROOT)
+  direct=R.compile_route(**self.args())
+  self.assertTrue(direct["spec_touch"])
+  self.assertIn("spec/**",direct["nodes"][0]["write_scope"])
+  R.verify_route(direct,R.ROOT)
  def test_slug_is_canonicalized_and_sealed_while_legacy_absence_verifies(self):
   legacy=R.compile_route(**self.args())
   self.assertNotIn("slug",legacy)

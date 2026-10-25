@@ -23,8 +23,10 @@ whether new or existing; it detects the cwd automatically. It supports `dev`
 and branch by spec mode: app adds design critique, migration safety, and
 push/deploy handling; library checks public API consistency; CLI checks command
 and option consistency; research checks reproducibility, configs, and metrics.
-Non-code decisions such as PRDs, stack selection, skeletons, and ship setup
-belong to autopilot-spec.
+Non-code setup such as initial PRDs, stack selection, skeletons, and ship
+setup belongs to autopilot-spec. When code work is spec-significant, the plan
+or code owner updates the affected component PRD through the existing
+same-route spec transaction before implementation.
 
 Reusable evaluation drivers and HTML/report-generator bugs are code work.
 Experiment execution and result reporting belong to lab/eval, whose small
@@ -101,7 +103,7 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    Interrupted close retains PASS and its recovery duty; a later begin cannot
    be closed again by an older goal judgment. No new confirmation or required
    report field is introduced.
-5. **shared admission.** This capability's output is cycle-local; it is never admitted to `shared/` (only `spec`, `analysis`, and explicitly promoted `research` are shared kinds).
+5. **shared admission.** Code plans, logs, and `final_report.md` remain cycle-local. When the route's existing spec transaction produces a seeded spec authoring change, normal completion publishes that spec through the existing shared admission and revision/CAS checks. An unused or unchanged spec transaction creates no publication obligation; the code report remains the primary artifact.
 
 ## Role Requirements
 
@@ -132,7 +134,7 @@ Pipeline intensity is the primary ceremony selector. `direct` is inline and `qui
 
 Quick keeps its inline micro-plan, focused verification, and concise report. Those procedure defaults do not reduce the work: the original request, approved endpoint, and assigned scope determine the required results. Complete feasible remaining duties within that scope, preserve an approved report endpoint, and report genuinely unfinished assigned work with the existing verdict semantics. A bounded stage completes only its assigned part.
 
-Stage-local gates must not become full independent QA loops after every sub-stage. Keep plan-check small, concentrate expensive independent review in the selected risk point or final verification, and keep raw logs in artifacts rather than parent context. A stage remains one semantic gate even when the dispatch-depth-1 owner realizes it as several bounded sessions; those sub-sessions have no gate authority and return phase-brief/ledger/handoff evidence only. `code-plan`, `code-refine`, and `code-test` inherit the selected graph: `code-plan` is standard+ durable planning, `code-refine` is optional correction, and `code-test` is final concrete verification rather than hardcoded-thorough QA.
+Stage-local gates must not become full independent QA loops after every sub-stage. Keep plan-check small, concentrate expensive independent review in the selected risk point or final verification, and keep raw logs in artifacts rather than parent context. A stage remains one semantic gate even when the dispatch-depth-1 owner realizes it as several bounded sessions; those sub-sessions have no gate authority and return their assigned artifact report plus phase-brief/ledger/handoff evidence. `code-plan`, `code-refine`, and `code-test` inherit the selected graph: `code-plan` is standard+ durable planning, `code-refine` is optional correction, and `code-test` is final concrete verification rather than hardcoded-thorough QA.
 
 **Corrections are batched, never atomic.** A failed review gate (`plan-check`, `impl-review`, `test`) is followed by exactly one correction pass that closes every 🔴 finding of that round together, plus the follow-on gaps the review named; the owner never redispatches the full `plan` or `execute` node to fix a single finding. The plan correction runs through the `code-refine` boundary and the code correction re-enters the `execute` boundary as a bounded fix under the same node. A re-review of the same implementation source is a **closure check** under the review unit's Round Protocol — the assignment names the prior blocking review and asks whether its 🔴 items are closed and the delta is clean. A changed implementation source receives its own ordinary independent review budget and full independent review; a prior subject's PASS is historical and cannot satisfy it. Each same-subject correction consumes one unit of the `core/CONVENTIONS.md §1.1` retry budget. Owner-closure remains available only for an exhausted history with an eligible blocking review; an exhausted all-PASS history cannot be converted into owner-closure. When the existing writer admits owner-closure, the owner completes that exact blocking attempt with the evidence contract in `core/OPERATIONS.md §5.10`.
 
@@ -198,7 +200,7 @@ Adapters must preserve the portable invariants relevant to this capability:
 Additional code-entry gates:
 
 - before any code edit, classify the request against existing `spec/prd.md` when present and emit a one-line `spec-significance` verdict;
-- route `spec-significant` changes through `autopilot-spec` update before implementation unless the user explicitly defers;
+- for `spec-significant` changes, the plan or code owner updates the affected component PRD through the route's existing `spec-transaction` before implementation: run `spec-transaction --node execute` inside `code-execute` for standard+, use the one-shot transaction for quick, and apply it inline for direct. Only an explicit user deferral skips it;
 - detect whether `spec/pipeline_state.yaml` has changed since the last relevant plan and re-read newer spec/design artifacts before editing;
 - for app mode, treat design tokens and handoff artifacts as source contracts, not suggestions;
 - for destructive DB/schema/migration work, explain the command and risk, but do not auto-run destructive operations without explicit user approval;

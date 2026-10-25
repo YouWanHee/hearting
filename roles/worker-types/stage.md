@@ -21,8 +21,9 @@ missing authority, input or runtime state stopped you, or items stayed
 unfinished; name what remains on the blocker line.
 
 If the assignment is a declared sub-session, execute only its phase brief and
-fixed files, maintain the required state ledger, and use only its narrow verify
-command. Report a bounded handoff with completed and unfinished items. You have no
+fixed files, maintain the required state ledger, and run its narrow verify
+command as a required check along with any additional checks named in the brief.
+Report a bounded handoff with completed and unfinished items. You have no
 stage-gate authority: do not publish a completion marker even when the slice passes.
 
 If the assigned leg is `leg_class: auxiliary`, you run one closed narrow check

@@ -136,7 +136,7 @@ class NoSourceRegressionTest(SourceBase):
         self.assertEqual(text, (
             "capability: autopilot-code\ncapability_mode: dev\nintensity: standard\nunit: dev/backend\n"
             "inputs: task\noutputs: source-diff,dev_logs/**\n"
-            "write_scope: source/**,checklist.md,dev_logs/**,evidence/**\ncompletion_gate: code-execute\n"))
+            "write_scope: source/**,spec/**,checklist.md,dev_logs/**,evidence/**\ncompletion_gate: code-execute\n"))
         self.assertEqual(digest, "sha256:" + hashlib.sha256(
             (ADVANCE.BRIEF_TEMPLATE_ID + "\n" + text).encode("utf-8")).hexdigest())
 
@@ -397,7 +397,9 @@ class ParentOutputEnvTest(SourceBase):
                                   write_scope="source-scoped", completion_gate="quick-complete")
         seen = []
         OWNER = OWNER_T.OWNER
-        stale = {"AGENT_DISPATCH_JOBS": str(jobs), PARENT_VAR: "/stale/other-route/artifacts"}
+        # Keep the mocked version probe independent of the host's CLI path.
+        stale = {"AGENT_DISPATCH_JOBS": str(jobs), PARENT_VAR: "/stale/other-route/artifacts",
+                 "OPENCODE_BIN": "opencode"}
         with mock.patch.object(OWNER.subprocess, "run", side_effect=lambda cmd, **kw: (
                 seen.append((cmd, kw.get("env"))), SimpleNamespace(returncode=0))[1]), \
              mock.patch.object(OWNER, "_usage", return_value={"claude": "ok", "codex": "ok", "opencode": "ok"}), \

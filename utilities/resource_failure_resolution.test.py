@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Preserved nonzero exits can finish only through current same-byte verification."""
 import copy
+import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -89,6 +91,151 @@ class FailedOutputResolutionTest(FIX.WorkflowFixture):
         self.addCleanup(patch.stop)
         return route, path, jobs, registry, output, ledger, gates
 
+    def owner_fixture(self):
+        route, path, jobs, registry, _output = self._resume_fixture(ordinary=True)
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        data["runs"]["fixture-run"]["parent_attempt_id"] = "att-parent"
+        registry.write_text(json.dumps(data), encoding="utf-8")
+        ledger = SUP.ledger_for(route, jobs)
+        armed = json.loads((ledger.root / "armed/full-run.json").read_text(encoding="utf-8"))
+        return route, path, jobs, registry, ledger, armed
+
+    def owner_row(self, jobs, route, path, *, status="done", attempt="att-parent",
+                  note="", failure_class=""):
+        import dispatch_contract
+        lease = dispatch_contract.supervisor_lease_path(jobs, attempt)
+        metadata = [
+            "attempt_schema_version=2", "dispatch_depth=1", "transport=headless",
+            "execution_surface=registered-headless", "registered_worker=1",
+            "worker_type=owner", "harness=codex", "completion_delivery=app-server-supervised",
+            "supervisor_lease=flock-v1", f"supervisor_lease_file={lease}",
+            "supervisor_lease_nonce=" + "b" * 64, "launch_started=1",
+            f"attempt_id={attempt}", f"owner_route_id={route['route_id']}",
+            f"owner_route_hash={route['route_hash']}", f"owner_route_file={path}",
+            f"route_id={route['route_id']}", f"route_hash={route['route_hash']}",
+            f"route_file={path}",
+        ]
+        if note:
+            metadata.append(f"note={note}")
+        if failure_class:
+            metadata.append(f"failure_class={failure_class}")
+        jobs.write_text("\t".join(["2026-10-25T00:00:00Z", status,
+            route["cwd"], route["cwd"], "fixture-owner", ",".join(metadata)]) + "\n")
+        return lease
+
+    def advanced_replacement_owner_fixture(self):
+        import artifact_lifecycle
+        import dispatch_owner_input
+        import dispatch_replacement as DR
+        import owner_route_binding as ORB
+
+        root, _old_path, jobs, registry, ledger, _old_armed = self.owner_fixture()
+        root_path = artifact_lifecycle.canonical_route_path(self.base, root["route_id"])
+        root_path.parent.mkdir(parents=True, exist_ok=True)
+        root_path.write_text(json.dumps(root), encoding="utf-8")
+
+        parent_id = "att-parent"
+        node_id = root["nodes"][0]["id"]
+        logical = {"root_route_id": root["route_id"], "node": "__owner__"}
+        family = DR._digest(logical)
+        replacement_id = "att-" + hashlib.sha256(
+            ("replacement:" + family).encode()).hexdigest()[:48]
+        owner_id = replacement_id
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_ATTEMPT_ID": owner_id}):
+            active = SUP.route_module().build_continuation_route(
+                root, resume_from_node=node_id, requested_boundary=node_id,
+                reason="resource-failure", artifact_root=str(self.base))
+        active_path = artifact_lifecycle.canonical_route_path(self.base, active["route_id"])
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text(json.dumps(active), encoding="utf-8")
+
+        record = {"schema": DR.SCHEMA, "family_id": family, "logical_node": logical,
+                  "original_attempt_id": parent_id, "replacement_attempt_id": replacement_id,
+                  "ordinal": 1}
+        record_path = DR._record_path(jobs, family)
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+
+        parent_metadata = {
+            "attempt_schema_version": "2", "dispatch_depth": "1",
+            "registered_worker": "1", "execution_surface": "registered-headless",
+            "transport": "headless", "worker_type": "owner", "unit": "_kernel/owner",
+            "attempt_id": parent_id, "parent_sid": "fixture-parent-session",
+            "parent_attempt_id": "", "harness": "codex", "owner_harness": "codex",
+            "launch_started": "1", "capability": root["capability"],
+            "capability_mode": root["capability_mode"], "artifact_root": str(self.base),
+            "owner_route_file": str(root_path), "owner_route_id": root["route_id"],
+            "owner_route_hash": root["route_hash"], "route_file": str(root_path),
+            "route_id": root["route_id"], "route_hash": root["route_hash"],
+            "replacement_family_id": family, "replacement_attempt_id": replacement_id,
+            "replacement_claim_digest": DR._digest(record),
+        }
+        current_metadata = {
+            **parent_metadata, "attempt_id": owner_id, "automatic_retry_of": parent_id,
+            "replacement_original_attempt_id": parent_id,
+        }
+
+        def line(status, attempt, metadata):
+            return "\t".join(("2026-10-25T00:00:00Z", status, str(self.base),
+                              str(self.base), attempt, ",".join(
+                                  f"{key}={value}" for key, value in metadata.items())))
+
+        parent_metadata.update(note="dead-worker-blocked", failure_class="blocked")
+        jobs.write_text(line("done", parent_id, parent_metadata) + "\n"
+                        + line("open", owner_id, current_metadata) + "\n", encoding="utf-8")
+        dispatch_owner_input.initialize_owner_input(jobs, owner_id, "codex-active-turn")
+
+        source = ORB.OwnerRouteBinding(str(root_path), root["route_id"], root["route_hash"])
+        target = ORB.OwnerRouteBinding(str(active_path), active["route_id"], active["route_hash"])
+        ORB.publish_owner_route_advance(
+            jobs, owner_attempt_id=owner_id, source=source, target=target,
+            from_generation=0, to_generation=1,
+            route_family_key=active["route_family_key"])
+        child_metadata = {
+            "attempt_schema_version": "2", "dispatch_depth": "2",
+            "registered_worker": "1", "execution_surface": "registered-headless",
+            "attempt_id": "att-current-child", "parent_attempt_id": owner_id,
+            "worker_type": "stage", "route_node": node_id,
+            "route_file": str(active_path), "route_id": active["route_id"],
+            "route_hash": active["route_hash"], "capability": active["capability"],
+            "capability_mode": active["capability_mode"],
+            "artifact_root": active["artifact_root"], "launch_started": "1",
+        }
+        current_metadata.update(note="dead-worker-blocked", failure_class="blocked")
+        jobs.write_text(line("done", parent_id, parent_metadata) + "\n"
+                        + line("done", owner_id, current_metadata) + "\n"
+                        + line("open", "att-current-child", child_metadata) + "\n",
+                        encoding="utf-8")
+
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        data["runs"]["fixture-run"].update(route=str(active_path), parent_attempt_id=parent_id)
+        registry.write_text(json.dumps(data), encoding="utf-8")
+        armed = json.loads((ledger.root / "armed/full-run.json").read_text(encoding="utf-8"))
+        armed["route_file"] = str(active_path)
+        return root, root_path, active, active_path, jobs, registry, ledger, armed, owner_id
+
+    def close_route(self, route, path):
+        path.with_name(path.stem + ".outcome.json").write_text(json.dumps({
+            "route_id": route["route_id"], "route_hash": route["route_hash"],
+            "disposition": "fixture-closed",
+        }))
+
+    def run_correct_pipe(self, step, payload):
+        tokens = shlex.split(step["command"])
+        right = tokens[tokens.index("|") + 1:]
+        probe = '''import importlib.util, sys
+script = sys.argv[1]
+spec = importlib.util.spec_from_file_location("retry_correct_probe", script)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module._continue_after_answer = lambda _jobs, _attempt, result: result
+sys.argv = [script, *sys.argv[2:]]
+module.main()
+'''
+        return subprocess.run([right[0], "-c", probe, *right[1:],], input=payload,
+                              text=True, capture_output=True, timeout=30)
+
     def test_original_failure_blocks_then_same_bytes_close_without_rewriting_exit_or_artifacts(self):
         route, path, jobs, registry, output, ledger, gates = self.fixture()
         before = ledger.journal_path.read_bytes()
@@ -119,10 +266,243 @@ class FailedOutputResolutionTest(FIX.WorkflowFixture):
         self.assertEqual(result.reason, "resource-failure-unresolved")
         self.assertEqual(commits, 0)
         self.assertEqual((ledger.journal_path.read_bytes(), registry.read_bytes()), before)
-        self.assertIn("capability-route compose --start --shape staged", result.next_step["command"])
+        self.assertIn("capability-route.py start --route", result.next_step["command"])
         self.assertEqual(result.next_step["run_id"], "fixture-run__a1")
         self.assertEqual(result.next_step["revalidate_nodes"], ["metrics", "verify"])
-        self.assertIn("new cycle", result.next_step["command"])
+        self.assertEqual(result.next_step["continuation"], "resume")
+
+    def test_blocked_owner_gets_prefilled_correction_and_the_pipe_is_retained(self):
+        import dispatch_owner_input
+        import dispatch_replacement as DR
+
+        route, path, jobs, _registry, ledger, armed = self.owner_fixture()
+        self.owner_row(jobs, route, path, status="open")
+        dispatch_owner_input.initialize_owner_input(jobs, "att-parent", "codex-active-turn")
+        self.owner_row(jobs, route, path, status="done", note="dead-worker-blocked")
+        resource_row = json.loads(_registry.read_text())["runs"]["fixture-run"]
+        completion = SUP.route_module().completion_dir(route["route_id"], jobs=jobs)
+        protected = [path, jobs, _registry, Path(resource_row["sentinel"]),
+                     ledger.journal_path, *completion.glob("*.json"),
+                     dispatch_owner_input._path(jobs, "att-parent")]
+        before = {item: item.read_bytes() for item in protected}
+        with mock.patch.object(DR, "owner_parked_gate", return_value=None):
+            step = R.retry_step(route, armed, jobs, "changed output")
+        self.assertEqual({item: item.read_bytes() for item in protected}, before)
+        self.assertEqual(step["continuation"], "correct")
+        self.assertIn("correct --jobs", step["command"])
+        self.assertIn("--attempt-id att-parent --message-file /dev/stdin", step["command"])
+        self.assertIn("같은 route", step["meaning"])
+        payload = shlex.split(step["command"])[2]
+        result = self.run_correct_pipe(step, payload)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipt = json.loads(result.stdout)
+        self.assertTrue(receipt["retained"])
+        self.assertEqual(dispatch_owner_input.retained(jobs, "att-parent")[0]["text"], payload)
+
+    def test_live_owner_gets_correction_and_the_pipe_is_queued(self):
+        import dispatch_contract
+        import dispatch_owner_input
+        import dispatch_replacement as DR
+        import route_parent_close
+        from types import SimpleNamespace
+
+        route, path, jobs, _registry, ledger, armed = self.owner_fixture()
+        lease = self.owner_row(jobs, route, path, status="running")
+        dispatch_owner_input.initialize_owner_input(jobs, "att-parent", "codex-active-turn")
+        with dispatch_contract.hold_supervisor_lease(jobs, "att-parent", lease):
+            with mock.patch.object(DR, "owner_parked_gate", return_value=None), \
+                    mock.patch.object(route_parent_close, "owner_continuation_processes",
+                                      return_value=(SimpleNamespace(state="live", reason="fixture"), [])):
+                step = R.retry_step(route, armed, jobs, "changed output")
+            self.assertEqual(step["continuation"], "correct")
+            payload = shlex.split(step["command"])[2]
+            result = self.run_correct_pipe(step, payload)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipt = json.loads(result.stdout)
+        self.assertEqual(receipt["requests"][0]["state"], "queued")
+        self.assertEqual(dispatch_owner_input.retained(jobs, "att-parent")[0]["text"], payload)
+
+    def test_retained_answer_and_unobserved_owner_resume_the_open_route(self):
+        import dispatch_owner_input
+        import dispatch_replacement as DR
+
+        route, path, jobs, _registry, ledger, armed = self.owner_fixture()
+        self.owner_row(jobs, route, path, status="open")
+        dispatch_owner_input.initialize_owner_input(jobs, "att-parent", "codex-active-turn")
+        self.owner_row(jobs, route, path, status="done", note="dead-worker-blocked")
+        dispatch_owner_input.submit(jobs, "att-parent", "answer already stored", "fixture-answer")
+        with mock.patch.object(DR, "owner_parked_gate", return_value=None):
+            answered = R.retry_step(route, armed, jobs, "changed output")
+        self.assertEqual(answered["continuation"], "resume")
+        self.assertIn("capability-route.py start --route", answered["command"])
+
+        jobs.write_text("")
+        unobserved = R.retry_step(route, armed, jobs, "changed output")
+        self.assertEqual(unobserved["continuation"], "resume")
+        self.assertIn("capability-route.py start --route", unobserved["command"])
+
+    def test_other_owner_receipt_states_resume_and_checked_projection_selects_current_owner(self):
+        import dispatch_replacement as DR
+        import route_authority
+        from types import SimpleNamespace
+
+        route, path, jobs, _registry, ledger, armed = self.owner_fixture()
+        self.owner_row(jobs, route, path, status="running")
+        for state in ("continue", "wait", "blocked", "protected", "settle"):
+            with self.subTest(state=state), \
+                    mock.patch.object(route_authority, "decide_continuation",
+                                      return_value=SimpleNamespace(state=state)):
+                step = R.retry_step(route, armed, jobs, "changed output")
+                self.assertEqual(step["continuation"], "resume")
+                self.assertIn("capability-route.py start --route", step["command"])
+
+        self.owner_row(jobs, route, path, status="done", attempt="att-current",
+                       note="dead-worker-blocked")
+        with mock.patch.object(DR, "effective_attempts", return_value=({"att-current"}, [])) as project, \
+                mock.patch.object(DR, "owner_parked_gate", return_value=None):
+            current = R.retry_step(route, armed, jobs, "changed output")
+        self.assertEqual(project.call_args_list[0].args, (jobs, {"att-parent"}))
+        self.assertEqual(current["continuation"], "correct")
+        self.assertIn("--attempt-id att-current --message-file /dev/stdin", current["command"])
+
+    def test_route_path_falls_back_from_watch_to_failure_row_and_canonical_path(self):
+        import artifact_lifecycle
+
+        route, path, jobs, registry, _output, ledger, _gates = self.fixture()
+        armed = json.loads((ledger.root / "armed/full-run.json").read_text())
+        armed.pop("route_file", None)
+        from_failure = R.retry_step(route, armed, jobs, "changed output")
+        self.assertIn(str(path), from_failure["command"])
+
+        canonical = artifact_lifecycle.canonical_route_path(Path(route["artifact_root"]), route["route_id"])
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text(json.dumps(route))
+        data = json.loads(registry.read_text())
+        data["runs"]["fixture-run"]["route"] = ""
+        registry.write_text(json.dumps(data))
+        from_canonical = R.retry_step(route, armed, jobs, "changed output")
+        self.assertIn("--route " + route["route_id"], from_canonical["command"])
+        self.assertNotIn(str(path), from_canonical["command"])
+
+    def test_supplied_priority_route_mismatch_does_not_fall_back_to_closed_duplicate(self):
+        route, _path, jobs, registry, output, ledger, _gates = self.fixture()
+        armed = json.loads((ledger.root / "armed/full-run.json").read_text())
+        priority = output / "contradictory-route.json"
+        priority.write_text(json.dumps({"route_id": "rt-other", "route_hash": "sha256:other"}))
+        closed_fallback = output / "closed-fallback-route.json"
+        closed_fallback.write_text(json.dumps(route))
+        self.close_route(route, closed_fallback)
+        data = json.loads(registry.read_text())
+        data["runs"]["fixture-run"]["route"] = str(closed_fallback)
+        registry.write_text(json.dumps(data))
+        armed["route_file"] = str(priority)
+
+        step = R.retry_step(route, armed, jobs, "changed output")
+        self.assertEqual(step["continuation"], "resume-unobservable")
+        self.assertIn("capability-route.py start --route", step["command"])
+        self.assertNotIn("compose --start", step["command"])
+
+    def test_advanced_route_replacement_targets_unanswered_blocked_current_owner(self):
+        import dispatch_owner_input
+        import dispatch_replacement as DR
+        import owner_route_binding as ORB
+
+        root, root_path, active, active_path, jobs, registry, _ledger, armed, owner_id = \
+            self.advanced_replacement_owner_fixture()
+        effective, lineage = DR.effective_attempts(jobs, {"att-parent"})
+        self.assertEqual(effective, {owner_id})
+        self.assertEqual(lineage[0]["replacement_attempt_id"], owner_id)
+        self.assertEqual(dispatch_owner_input.retained(jobs, owner_id), [])
+        binding, binding_status = ORB.resolve_owner_route_lifecycle(
+            jobs, owner_attempt_id=owner_id)
+        self.assertEqual(binding_status, "owner-route-advance-current")
+        self.assertEqual((binding.route_id, binding.route_hash),
+                         (active["route_id"], active["route_hash"]))
+
+        for stored_route, stored_path in ((active, active_path), (root, root_path)):
+            with self.subTest(stored_route=stored_route["route_id"]):
+                armed["route_file"] = str(stored_path)
+                data = json.loads(registry.read_text(encoding="utf-8"))
+                data["runs"]["fixture-run"]["route"] = str(stored_path)
+                registry.write_text(json.dumps(data), encoding="utf-8")
+                step = R.retry_step(stored_route, armed, jobs, "changed output")
+                self.assertEqual(step["continuation"], "correct")
+                self.assertIn(f"--attempt-id {owner_id} --message-file /dev/stdin", step["command"])
+                self.assertIn(active["route_id"], shlex.split(step["command"])[2])
+
+        self.assertEqual(SUP.route_module()._current_owner_attempt(jobs, "att-parent"), owner_id)
+        payload = shlex.split(step["command"])[2]
+        result = self.run_correct_pipe(step, payload)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(json.loads(result.stdout)["retained"])
+
+    def test_exact_closed_route_composes_and_invalid_outcome_resumes(self):
+        route, path, jobs, _registry, ledger, armed = self.owner_fixture()
+        self.close_route(route, path)
+        closed = R.retry_step(route, armed, jobs, "changed output")
+        self.assertEqual(closed["continuation"], "closed-compose")
+        self.assertIn("capability-route compose --start --shape staged", closed["command"])
+
+        path.with_name(path.stem + ".outcome.json").write_text(json.dumps({
+            "route_id": route["route_id"], "route_hash": "sha256:wrong",
+        }))
+        invalid = R.retry_step(route, armed, jobs, "changed output")
+        self.assertEqual(invalid["continuation"], "resume-unobservable")
+        self.assertIn("capability-route.py start --route", invalid["command"])
+
+        path.with_name(path.stem + ".outcome.json").write_text("{")
+        malformed = R.retry_step(route, armed, jobs, "changed output")
+        self.assertEqual(malformed["continuation"], "resume-unobservable")
+        with mock.patch("dispatch_notice_state.closed_outcome", return_value={"finish_pending": True}):
+            pending = R.retry_step(route, armed, jobs, "changed output")
+        self.assertEqual(pending["continuation"], "resume")
+
+    def test_exact_cancelled_closure_resumes_with_and_without_an_owner(self):
+        route, path, jobs, registry, ledger, armed = self.owner_fixture()
+        outcome = path.with_name(path.stem + ".outcome.json")
+        outcome.write_text(json.dumps({
+            "route_id": route["route_id"], "route_hash": route["route_hash"],
+            "state": "cancelled", "disposition": "cancelled",
+            "terminal_gate_proven": False,
+        }))
+        for owner_state in ("missing", "blocked", "pass"):
+            with self.subTest(owner_state=owner_state):
+                jobs.write_text("")
+                if owner_state == "blocked":
+                    self.owner_row(jobs, route, path, note="dead-worker-blocked")
+                elif owner_state == "pass":
+                    self.owner_row(jobs, route, path, failure_class="pass")
+                protected = [path, jobs, registry, outcome, ledger.journal_path]
+                before = {item: item.read_bytes() for item in protected}
+
+                step = R.retry_step(route, armed, jobs, "changed output")
+
+                self.assertEqual(step["continuation"], "resume-protected")
+                self.assertIn("capability-route.py start --route", step["command"])
+                self.assertNotIn("compose --start", step["command"])
+                self.assertEqual({item: item.read_bytes() for item in protected}, before)
+
+    def test_only_a_proven_pass_settlement_uses_the_agreed_compose_exception(self):
+        import dispatch_replacement as DR
+        import route_parent_close
+        from types import SimpleNamespace
+
+        route, path, jobs, _registry, ledger, armed = self.owner_fixture()
+        self.owner_row(jobs, route, path, status="done", failure_class="pass")
+        with mock.patch.object(DR, "owner_parked_gate", return_value=None), \
+                mock.patch.object(route_parent_close, "owner_continuation_processes",
+                                  return_value=(SimpleNamespace(state="quiescent", reason="fixture"), [])):
+            passed = R.retry_step(route, armed, jobs, "changed output")
+        self.assertEqual(passed["continuation"], "pass-settlement-compose")
+        self.assertIn("capability-route compose --start --shape staged", passed["command"])
+
+        self.owner_row(jobs, route, path, status="done")
+        with mock.patch.object(DR, "owner_parked_gate", return_value=None), \
+                mock.patch.object(route_parent_close, "owner_continuation_processes",
+                                  return_value=(SimpleNamespace(state="quiescent", reason="fixture"), [])):
+            unknown_done = R.retry_step(route, armed, jobs, "changed output")
+        self.assertEqual(unknown_done["continuation"], "resume")
+        self.assertIn("capability-route.py start --route", unknown_done["command"])
 
     def test_independent_pass_and_current_marker_without_consumer_hash_are_insufficient(self):
         route, path, jobs, registry, output, ledger, gates = self.fixture()
@@ -142,6 +522,7 @@ class FailedOutputResolutionTest(FIX.WorkflowFixture):
 
     def test_retry_pipe_delivers_the_original_task_to_compose(self):
         route, path, jobs, registry, output, ledger, gates = self.fixture()
+        self.close_route(route, path)
         armed = json.loads((ledger.root / 'armed/full-run.json').read_text())
         tokens = shlex.split(R.retry_step(route, armed, jobs, 'changed output')['command'])
         separator = tokens.index('|')
@@ -171,12 +552,29 @@ module.main()
 
     def test_retry_recovery_shows_completed_compute_candidate_as_unverified(self):
         route, path, jobs, registry, output, ledger, gates = self.fixture()
+        self.close_route(route, path)
         armed = json.loads((ledger.root / 'armed/full-run.json').read_text())
         with mock.patch('route_parent_close.linked_resources', return_value=[
                 {"kind": "compute", "run_id": "compute-candidate", "state": "finished"}]) as scan:
             task = R.retry_step(route, armed, jobs, 'resource failed')['command']
         scan.assert_called_once()
         self.assertIn("compute-candidate", task)
+        self.assertIn("unverified", task)
+        self.assertIn("resource-runner start --compute-run compute-candidate", task)
+        self.assertNotIn("--compute-run latest", task)
+
+    def test_same_route_correction_keeps_completed_compute_candidate_unverified(self):
+        import dispatch_replacement as DR
+
+        route, path, jobs, _registry, _ledger, armed = self.owner_fixture()
+        self.owner_row(jobs, route, path, note="dead-worker-blocked")
+        with mock.patch.object(DR, "owner_parked_gate", return_value=None), \
+                mock.patch('route_parent_close.linked_resources', return_value=[
+                    {"kind": "compute", "run_id": "compute-candidate", "state": "finished"}]):
+            step = R.retry_step(route, armed, jobs, 'resource failed')
+        self.assertEqual(step["continuation"], "correct")
+        self.assertIn("--attempt-id att-parent --message-file /dev/stdin", step["command"])
+        task = shlex.split(step["command"])[2]
         self.assertIn("unverified", task)
         self.assertIn("resource-runner start --compute-run compute-candidate", task)
         self.assertNotIn("--compute-run latest", task)
@@ -259,7 +657,7 @@ module.main()
                 result, commits = self._settle_resource_owner(route, path, jobs)
                 self.assertEqual((result.reason, commits), ('resource-failure-unresolved', 0))
                 self.assertEqual(result.next_step['run_id'], 'fixture-run__a1')
-                self.assertIn('--graph full-run,metrics,verify', result.next_step['command'])
+                self.assertIn('capability-route.py start --route', result.next_step['command'])
                 self.assertEqual(ledger.journal_path.read_bytes(), before)
         armed.unlink()
         self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].reason, 'resource-failure-unresolved')
