@@ -24,6 +24,8 @@ formula. Cumulative total_token_usage is NOT context occupancy — it double-cou
 A per-tick cache (cwd → newest rollout path) is built from cheap line-1 reads of all rollouts
 (≈200 files); the expensive last-token-count parse touches only a 64 KB tail of the matched file.
 """
+import contextlib
+import contextvars
 import glob
 import json
 import os
@@ -72,6 +74,7 @@ _TURN_CONTEXT_CACHE_MAX = 512
 _TURN_CONTEXT_CACHE = OrderedDict()
 _TURN_CONTEXT_CACHE_EVICTIONS = 0
 _SUMMARY_BOUNDARY_SCAN = 1 << 20
+_TCP_UNKNOWN = object()
 _SYNTHETIC_NATIVE_TITLE_RE = re.compile(
     r"^(?:agents\.md\s*[-—:]\s*)?codex adapter bootstrap$", re.IGNORECASE
 )
@@ -90,6 +93,21 @@ class DaemonIdentityObservation:
         """Discard both snapshots after any identity evidence changes."""
         self.initial_scan.clear()
         self.recheck_scan.clear()
+
+
+_DAEMON_IDENTITY_SCOPE = contextvars.ContextVar("codex_daemon_identity_scope", default=None)
+
+
+@contextlib.contextmanager
+def daemon_identity_read_scope():
+    """Share live listener evidence only within one collection pass."""
+    active = _DAEMON_IDENTITY_SCOPE.get()
+    token = _DAEMON_IDENTITY_SCOPE.set(
+        active if active is not None else DaemonIdentityObservation())
+    try:
+        yield _DAEMON_IDENTITY_SCOPE.get()
+    finally:
+        _DAEMON_IDENTITY_SCOPE.reset(token)
 
 
 @dataclass
@@ -1413,21 +1431,40 @@ def _tcp_listener_snapshot(port, scan=None):
     snapshots together reuse a single walk of every process instead of one walk
     per port. A caller re-observing passes a fresh one.
     """
-    inodes = set()
-    try:
-        with open("/proc/net/tcp", encoding="ascii", errors="strict") as handle:
-            rows = handle.read().splitlines()[1:]
-    except (OSError, UnicodeError):
-        return None
-    for row in rows:
-        fields = row.split()
+    ports = scan.setdefault("ports", {}) if scan is not None else None
+    if ports is not None and port in ports:
+        return ports[port]
+    table = scan.get("tcp_table") if scan is not None else None
+    if table is None:
         try:
-            if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
-                inodes.add(fields[9])
-        except (IndexError, ValueError):
-            return None
+            with open("/proc/net/tcp", encoding="ascii", errors="strict") as handle:
+                rows = handle.read().splitlines()[1:]
+            parsed = {}
+            for row in rows:
+                fields = row.split()
+                try:
+                    if fields[3] == "0A":
+                        row_port = int(fields[1].rsplit(":", 1)[1], 16)
+                        parsed.setdefault(row_port, set()).add(fields[9])
+                except (IndexError, ValueError):
+                    parsed = _TCP_UNKNOWN
+                    break
+            table = (_TCP_UNKNOWN if parsed is _TCP_UNKNOWN else
+                     {row_port: frozenset(inodes) for row_port, inodes in parsed.items()})
+        except (OSError, UnicodeError):
+            table = _TCP_UNKNOWN
+        if scan is not None:
+            scan["tcp_table"] = table
+    if table is _TCP_UNKNOWN:
+        if ports is not None:
+            ports[port] = None
+        return None
+    inodes = table.get(port, frozenset())
     if not inodes:
-        return frozenset(), frozenset()
+        result = (frozenset(), frozenset())
+        if ports is not None:
+            ports[port] = result
+        return result
     if scan is not None and "owners" in scan:
         by_inode = scan["owners"]
     else:
@@ -1435,11 +1472,15 @@ def _tcp_listener_snapshot(port, scan=None):
         if scan is not None:
             scan["owners"] = by_inode
     if by_inode is None:
-        return None
-    owners = set()
-    for inode in inodes:
-        owners |= by_inode.get(inode, set())
-    return frozenset(inodes), frozenset(owners)
+        result = None
+    else:
+        owners = set()
+        for inode in inodes:
+            owners |= by_inode.get(inode, set())
+        result = frozenset(inodes), frozenset(owners)
+    if ports is not None:
+        ports[port] = result
+    return result
 
 
 def _daemon_endpoint_current(origins):
@@ -1574,6 +1615,8 @@ def session_id_of_process(pid, live_codex=None, *, observation=None):
         return None                     # procscan lists only `codex` itself as a runtime
     if procscan.invocation_mode("codex", procscan._read_argv(pid)) != "session":
         return None
+    if observation is None:
+        observation = _DAEMON_IDENTITY_SCOPE.get()
     return _daemon_session_for_process(pid, initial_env, observation=observation)
 
 

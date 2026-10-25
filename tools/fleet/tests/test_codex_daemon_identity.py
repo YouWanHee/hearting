@@ -1,4 +1,5 @@
 """Daemon-loaded Codex TUI identity fails closed on incomplete observations."""
+import io
 import os
 import sys
 import unittest
@@ -311,6 +312,49 @@ class CodexDaemonIdentityTest(unittest.TestCase):
         self.assertEqual(len(recheck), 5)
         self.assertIsNot(observation.initial_scan, observation.recheck_scan)
         self.assertEqual(walks, [observation.initial_scan, observation.recheck_scan])
+
+    def test_tcp_table_and_port_results_are_memoized_per_fresh_phase(self):
+        second_listener = (
+            "   1: 0100007F:A156 00000000:0000 0A 00000000:00000000 00:00000000 "
+            "00000000  1002        0 881133 1 0 100 0 0 10 0\n")
+        replacement = (
+            "   0: 0100007F:A155 00000000:0000 0A 00000000:00000000 00:00000000 "
+            "00000000  1002        0 992211 1 0 100 0 0 10 0\n")
+        tcp_header = TcpListenerSnapshotTest.TCP.splitlines()[0] + "\n"
+        initial_table = TcpListenerSnapshotTest.TCP + second_listener
+        recheck_table = tcp_header + replacement + second_listener
+        tables = iter((initial_table, recheck_table))
+        owners = {"881122": {PID}, "881133": {PID + 1}, "992211": {PID + 2}}
+        observation = codex.DaemonIdentityObservation()
+
+        def read_table(path, **_kwargs):
+            self.assertEqual(path, "/proc/net/tcp")
+            return io.StringIO(next(tables))
+
+        with mock.patch.object(codex, "open", side_effect=read_table, create=True) as table_read, \
+                mock.patch.object(codex, "_socket_owners_by_inode", return_value=owners) as owner_scan:
+            first = _REAL_LISTENER_SNAPSHOT(41301, observation.initial_scan)
+            self.assertIs(_REAL_LISTENER_SNAPSHOT(41301, observation.initial_scan), first)
+            other_port = _REAL_LISTENER_SNAPSHOT(41302, observation.initial_scan)
+            rechecked = _REAL_LISTENER_SNAPSHOT(41301, observation.recheck_scan)
+            recheck_port = _REAL_LISTENER_SNAPSHOT(41302, observation.recheck_scan)
+
+        self.assertEqual(first, (frozenset({"881122"}), frozenset({PID})))
+        self.assertNotEqual(rechecked, first)
+        self.assertEqual(other_port, (frozenset({"881133"}), frozenset({PID + 1})))
+        self.assertEqual(recheck_port, other_port)
+        self.assertEqual(table_read.call_count, 2)
+        self.assertEqual(owner_scan.call_count, 2)
+        self.assertIsNot(observation.initial_scan, observation.recheck_scan)
+
+    def test_daemon_identity_scope_is_nested_and_does_not_survive_the_pass(self):
+        with codex.daemon_identity_read_scope() as observation:
+            self.assertIs(codex._DAEMON_IDENTITY_SCOPE.get(), observation)
+            with codex.daemon_identity_read_scope() as nested:
+                self.assertIs(nested, observation)
+        self.assertIsNone(codex._DAEMON_IDENTITY_SCOPE.get())
+        with codex.daemon_identity_read_scope() as next_observation:
+            self.assertIsNot(next_observation, observation)
 
     def test_changed_listener_evidence_invalidates_shared_snapshots(self):
         observation = codex.DaemonIdentityObservation()
