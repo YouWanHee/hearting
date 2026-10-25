@@ -1722,45 +1722,109 @@ def validate_update(
     if historical_handoff_completion:
         before_routes = [row for row in previous.get("routes", []) or [] if isinstance(row, dict)]
         after_routes = [row for row in document.get("routes", []) or [] if isinstance(row, dict)]
-        suffix = [row for row in after_routes[len(before_routes):]]
+        route_suffix = after_routes[len(before_routes):]
         event_suffix = [row for row in (document.get("events") or [])[len(previous.get("events") or []):]
                         if isinstance(row, dict)]
         cycle_events = [row for row in event_suffix if row.get("event_type") == "cycle.completed"
                         and row.get("target_id") == after_cycle.get("cycle_id")]
-        terminal_events = [row for row in event_suffix
-                           if row.get("event_type") == "route.terminal.recorded"
-                           and row.get("target_id") == after_cycle.get("cycle_id")]
         cycle_event_rows = [row for row in event_suffix if row.get("event_type") == "cycle.completed"]
-        terminal_event_rows = [row for row in event_suffix
-                               if row.get("event_type") == "route.terminal.recorded"]
-        old_pending = (len(before_routes) == 1 and before_routes[0].get("terminal_marker") == "pending"
-                       and not before_routes[0].get("terminal_evidence_id"))
-        if (not old_pending or len(suffix) != 1 or len(cycle_events) != 1
-                or len(terminal_events) != 1 or len(cycle_event_rows) != 1
-                or len(terminal_event_rows) != 1
+        before_terminal_events = [row for row in (previous.get("events") or [])
+                                  if isinstance(row, dict)
+                                  and row.get("event_type") == "route.terminal.recorded"
+                                  and row.get("target_id") == before_cycle.get("cycle_id")]
+        all_before_terminal_events = [row for row in (previous.get("events") or [])
+                                      if isinstance(row, dict)
+                                      and row.get("event_type") == "route.terminal.recorded"]
+        after_terminal_events = [row for row in (document.get("events") or [])
+                                 if isinstance(row, dict)
+                                 and row.get("event_type") == "route.terminal.recorded"
+                                 and row.get("target_id") == after_cycle.get("cycle_id")]
+        all_after_terminal_events = [row for row in (document.get("events") or [])
+                                     if isinstance(row, dict)
+                                     and row.get("event_type") == "route.terminal.recorded"]
+        cycle_completion_before = [row for row in (previous.get("events") or [])
+                                   if isinstance(row, dict) and row.get("event_type") == "cycle.completed"]
+        cycle_completion_after = [row for row in (document.get("events") or [])
+                                  if isinstance(row, dict) and row.get("event_type") == "cycle.completed"]
+        pending_predecessor = (
+            bool(before_routes) and before_routes[0].get("terminal_marker") == "pending"
+            and not before_routes[0].get("terminal_evidence_id"))
+        pending_shape = (
+            len(before_routes) == 1 and pending_predecessor
+            and len(route_suffix) == 1 and len(before_terminal_events) == 0
+            and len(all_before_terminal_events) == 0
+            and len(after_terminal_events) == 1 and len(all_after_terminal_events) == 1)
+        recorded_leaf_shape = (
+            len(before_routes) == 2 and pending_predecessor and not route_suffix
+            and before_routes == after_routes and len(before_terminal_events) == 1
+            and len(all_before_terminal_events) == 1
+            and len(after_terminal_events) == 1 and len(all_after_terminal_events) == 1)
+        terminal_suffix = [row for row in event_suffix if row.get("event_type") == "route.terminal.recorded"]
+        if (not (pending_shape or recorded_leaf_shape) or len(cycle_events) != 1
+                or len(cycle_event_rows) != 1 or len(cycle_completion_before) != 0
+                or len(cycle_completion_after) != 1
                 or any(row.get("event_type") not in {
                     "artifact.revision.recorded", "cycle.completed", "route.terminal.recorded"}
                        for row in event_suffix)):
             violations.append(Violation(
                 "update-historical-completion-shape-invalid", "$.routes",
-                "historical completion appends one exact successor row and one completion event pair"))
-        elif (suffix[0].get("route_id") == before_routes[0].get("route_id")
-              or suffix[0].get("artifact_root_id") != previous.get("artifact_root_id")
-              or not suffix[0].get("route_hash") or not suffix[0].get("terminal_marker")
-              or not suffix[0].get("terminal_evidence_id")
-              or suffix[0].get("terminal_evidence_id") != terminal_events[0].get("event_id")):
-            violations.append(Violation(
-                "update-historical-completion-route-invalid", "$.routes",
-                "the appended successor keeps the old route and binds its exact terminal event"))
-        elif terminal_events[0].get("payload", {}).get("artifact_root_id") != previous.get("artifact_root_id") \
-                or terminal_events[0].get("payload", {}).get("route_id") != suffix[0].get("route_id") \
-                or terminal_events[0].get("payload", {}).get("route_hash") != suffix[0].get("route_hash") \
-                or terminal_events[0].get("payload", {}).get("terminal_marker_digest") != suffix[0].get("terminal_marker") \
-                or not re.fullmatch(r"sha256:[0-9a-f]{64}",
-                                    terminal_events[0].get("payload", {}).get("outcome_digest", "")):
-            violations.append(Violation(
-                "update-historical-completion-event-invalid", "$.events",
-                "the terminal event payload names the appended route and marker"))
+                "historical completion either appends one exact terminal row/event or reuses its exact prefix"))
+        elif pending_shape:
+            terminal_event = terminal_suffix[0] if len(terminal_suffix) == 1 else {}
+            successor = route_suffix[0]
+            if (successor.get("route_id") == before_routes[0].get("route_id")
+                    or successor.get("artifact_root_id") != previous.get("artifact_root_id")
+                    or not successor.get("route_hash") or not successor.get("terminal_marker")
+                    or not successor.get("terminal_evidence_id")
+                    or successor.get("terminal_evidence_id") != terminal_event.get("event_id")):
+                violations.append(Violation(
+                    "update-historical-completion-route-invalid", "$.routes",
+                    "the appended successor keeps the old route and binds its exact terminal event"))
+            elif (terminal_event.get("payload", {}).get("artifact_root_id") != previous.get("artifact_root_id")
+                  or terminal_event.get("payload", {}).get("route_id") != successor.get("route_id")
+                  or terminal_event.get("payload", {}).get("route_hash") != successor.get("route_hash")
+                  or terminal_event.get("payload", {}).get("terminal_marker_digest") != successor.get("terminal_marker")
+                  or terminal_event.get("provenance", {}).get("source_manifest_id") != previous.get("manifest_id")
+                  or terminal_event.get("provenance", {}).get("source_revision_id")
+                      != document.get("manifest_revision_id")
+                  or terminal_event.get("provenance", {}).get("producer_route_id") != successor.get("route_id")
+                  or not re.fullmatch(r"sha256:[0-9a-f]{64}",
+                                      terminal_event.get("provenance", {}).get("source_digest", ""))
+                  or not re.fullmatch(r"sha256:[0-9a-f]{64}",
+                                      terminal_event.get("payload", {}).get("outcome_digest", ""))):
+                violations.append(Violation(
+                    "update-historical-completion-event-invalid", "$.events",
+                    "the terminal event payload names the appended route and marker"))
+        else:
+            predecessor, successor = before_routes
+            terminal_event = before_terminal_events[0]
+            if (predecessor.get("artifact_root_id") != previous.get("artifact_root_id")
+                    or successor.get("artifact_root_id") != previous.get("artifact_root_id")
+                    or successor.get("route_id") == predecessor.get("route_id")
+                    or not successor.get("route_hash")
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}",
+                                        str(successor.get("terminal_marker") or ""))
+                    or not successor.get("terminal_evidence_id")
+                    or successor.get("terminal_evidence_id") != terminal_event.get("event_id")):
+                violations.append(Violation(
+                    "update-historical-completion-route-invalid", "$.routes",
+                    "the existing leaf keeps its exact terminal event reference"))
+            elif (terminal_event.get("payload", {}).get("artifact_root_id") != previous.get("artifact_root_id")
+                  or terminal_event.get("payload", {}).get("route_id") != successor.get("route_id")
+                  or terminal_event.get("payload", {}).get("route_hash") != successor.get("route_hash")
+                  or terminal_event.get("payload", {}).get("terminal_marker_digest") != successor.get("terminal_marker")
+                    or terminal_event.get("provenance", {}).get("source_manifest_id") != previous.get("manifest_id")
+                    or terminal_event.get("provenance", {}).get("source_revision_id")
+                        != previous.get("manifest_revision_id")
+                    or terminal_event.get("provenance", {}).get("producer_route_id") != successor.get("route_id")
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}",
+                                        terminal_event.get("provenance", {}).get("source_digest", ""))
+                  or not re.fullmatch(r"sha256:[0-9a-f]{64}",
+                                      terminal_event.get("payload", {}).get("outcome_digest", ""))
+                  or terminal_suffix):
+                violations.append(Violation(
+                    "update-historical-completion-event-invalid", "$.events",
+                    "the existing terminal event and route prefix stay exact"))
     relocation = document.get("relocation") or {}
     moving_root = (relocation.get("source_artifact_root_id") == previous.get("artifact_root_id")
                    and relocation.get("source_repository_id") == previous.get("repository_id")

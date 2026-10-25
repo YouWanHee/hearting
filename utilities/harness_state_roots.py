@@ -22,9 +22,9 @@ import sys
 from dispatch_contract import dispatch_state_root, state_root
 
 
-def spec_grounding_dir(args) -> Path:
+def spec_grounding_dir(args, environ=None) -> Path:
     """The release-independent spec-read marker directory shared by every adapter."""
-    return state_root(os.environ) / "spec-grounding"
+    return state_root(os.environ if environ is None else environ) / "spec-grounding"
 
 
 def core_grounding_dir(args) -> Path:

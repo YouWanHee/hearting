@@ -579,12 +579,13 @@ class ParentCloseTest(unittest.TestCase):
         finally:
             fixture.doCleanups()
 
-    def test_historical_two_hop_handoff_finishes_once_and_reuses_shared_admission(self):
+    def _prepare_historical_two_hop_fixture(self):
         import artifact_identity
         import artifact_manifest as MANIFEST
         import artifact_producer as PRODUCER
         import dispatch_terminal_commit as TERMINAL
         import route_authority as AUTH
+        import route_identity as ROUTE_IDENTITY
         from dispatch_completion_join import exact_attempt_row
 
         fixture = ParentCloseTest()
@@ -598,6 +599,42 @@ class ParentCloseTest(unittest.TestCase):
                 dispatch_evidence=fixture.route["dispatch_evidence"], parent_harness="codex",
                 work_request={"text": "Complete the same spec cycle after two owner handoffs",
                               "owner_harness": rotation[0]})
+            # These sealed digests and release split come from the real target's
+            # v3.47.0 route basis and v3.48.0 owner launch. Keep only compact
+            # provenance in this hermetic fixture; never depend on an installed
+            # release tree at test time.
+            old_registry_digest = "sha256:67471577db7a8f65d3c1ae24df920d33031882ae214c938db8d1a628b26bfc2a"
+            old_capability_digest = "sha256:bd146b5b0abf97788e9695cf9c70d5f956677d837712688c9fad811035495643"
+            old_unit_digest = "sha256:bbdaa2cef3e5759be7d71772c7baebe08d69e575d967973280a0ba9ad6760b5a"
+            historical_release_root = fixture.base / "sealed-release-v3.47.0"
+            historical_release_root.mkdir()
+            (historical_release_root / "release-provenance.json").write_text(json.dumps({
+                "version": "v3.47.0", "registry_digest": old_registry_digest,
+                "capability_registry_digest": old_capability_digest,
+                "unit_catalog_digest": old_unit_digest,
+                "unit_count": 34,
+                "topology_recipe_count": 29,
+                "route_schema_version": route["schema_version"],
+            }), encoding="utf-8")
+            owner_launch_root = fixture.base / "owner-launch-v3.48.0"
+            owner_launch_root.mkdir()
+            current_registry_digest = ROUTE.TOPO.registry_digest(ROUTE.TOPO.load_registry())
+            current_unit_digest = ROUTE.unit_catalog_digest()
+            self.assertNotEqual(old_registry_digest, current_registry_digest)
+            self.assertEqual(old_unit_digest, current_unit_digest)
+            route["validation_basis"] = {
+                "basis_version": 1,
+                "registry_root": str(historical_release_root),
+                "unit_catalog_root": str(historical_release_root),
+                "runtime_root": str(historical_release_root),
+                "runtime_root_validated": True,
+                "runtime_root_match": True,
+            }
+            route["registry_digest"] = old_registry_digest
+            route["capability_registry_digest"] = old_capability_digest
+            route["unit_catalog_digest"] = old_unit_digest
+            route["route_hash"] = ROUTE_IDENTITY.route_hash(route)
+            route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
             route_file = ROUTE.canonical_route_path(fixture.artifacts, route["route_id"])
             route_file.parent.mkdir(parents=True, exist_ok=True)
             route_file.write_text(json.dumps(route))
@@ -631,6 +668,12 @@ class ParentCloseTest(unittest.TestCase):
                     prd = cycle_dir / "artifacts" / "spec" / "prd.md"
                     prd.parent.mkdir(parents=True, exist_ok=True)
                     prd.write_text("# Historical handoff fixture PRD\n", encoding="utf-8")
+                    review = cycle_dir / "artifacts" / "spec" / "_internal" / "reviews" / "verdict.md"
+                    review.parent.mkdir(parents=True, exist_ok=True)
+                    review.write_text("fixture review passed\n", encoding="utf-8")
+                    owner_report = cycle_dir / "artifacts" / "spec" / "_internal" / "owner-report.md"
+                    owner_report.parent.mkdir(parents=True, exist_ok=True)
+                    owner_report.write_text("fixture terminal report\n", encoding="utf-8")
 
                 target = rotation[ordinal + 1]
                 for pin_target in ("owner", "worker"):
@@ -654,6 +697,7 @@ class ParentCloseTest(unittest.TestCase):
                     self.assertEqual(AUTH.sealed_pin_harness(successor_disk, worker_type="owner"), target,
                                      successor_disk.get("selection_pins"))
                     fixture.route = ROUTE.verify_route(json.loads(successor_path.read_text()))
+                    fixture.route.pop("_registry_current", None)
                     fixture.path = successor_path
 
             # Reopen the current continuation under its cancelled owner only long enough to
@@ -688,6 +732,7 @@ class ParentCloseTest(unittest.TestCase):
                 fixture.route, fixture.path, fixture.jobs, final_handoff)
             final_path = Path(prepared["successor_route"])
             final_route = ROUTE.verify_route(json.loads(final_path.read_text()))
+            final_route.pop("_registry_current", None)
             for edge_index, (predecessor_path, _original) in enumerate(route_bytes):
                 predecessor = json.loads(predecessor_path.read_text())
                 proof = CLOSE.verified_owner_pin_handoff_close(predecessor, jobs=fixture.jobs)
@@ -699,19 +744,14 @@ class ParentCloseTest(unittest.TestCase):
             final_owner_process = fixture.process("historical-final-owner")
             final_owner = fixture.row(
                 "historical-final-owner", process=final_owner_process, harness=rotation[2],
-                capability="autopilot-spec", capability_mode="update", intensity="standard")
+                capability="autopilot-spec", capability_mode="update", intensity="standard",
+                launch_home=str(owner_launch_root))
             binding = TERMINAL.publish_producer_binding(
                 artifact_root=fixture.artifacts, jobs=fixture.jobs, route_file=final_path,
                 owner_attempt_id=final_owner["attempt_id"], cycle_id=cycle_id, owner_begin=True)
             self.assertEqual(binding.status, "published")
             route_bytes.append((final_path, final_path.read_bytes()))
 
-            review = cycle_dir / "artifacts" / "spec" / "_internal" / "reviews" / "verdict.md"
-            review.parent.mkdir(parents=True, exist_ok=True)
-            review.write_text("fixture review passed\n", encoding="utf-8")
-            owner_report = cycle_dir / "artifacts" / "spec" / "_internal" / "owner-report.md"
-            owner_report.parent.mkdir(parents=True, exist_ok=True)
-            owner_report.write_text("fixture terminal report\n", encoding="utf-8")
             review_node = next(node for node in final_route["nodes"] if node["id"] == "review")
             child = fixture.row(
                 "historical-final-review", parent="historical-final-owner", harness="codex",
@@ -752,6 +792,27 @@ class ParentCloseTest(unittest.TestCase):
                 lines[index] = "\t".join(fields)
             fixture.jobs.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+        except BaseException:
+            fixture.doCleanups()
+            raise
+        return SimpleNamespace(**{key: value for key, value in locals().items() if key != "self"})
+
+    def test_historical_two_hop_handoff_finishes_once_and_reuses_shared_admission(self):
+        from dispatch_completion_join import exact_attempt_row
+        setup = self._prepare_historical_two_hop_fixture()
+        fixture = setup.fixture
+        PRODUCER, TERMINAL, MANIFEST = setup.PRODUCER, setup.TERMINAL, setup.MANIFEST
+        cycle_id, cycle_dir = setup.cycle_id, setup.cycle_dir
+        route_bytes, outcomes = setup.route_bytes, setup.outcomes
+        prior_manifest_path, prior_manifest_bytes = setup.prior_manifest_path, setup.prior_manifest_bytes
+        prior_document, prior_snapshot_bytes = setup.prior_document, setup.prior_snapshot_bytes
+        final_path, final_route, final_owner = setup.final_path, setup.final_route, setup.final_owner
+        binding, review, owner_report = setup.binding, setup.review, setup.owner_report
+        review_node = setup.review_node
+        live_review_lease_path = setup.live_review_lease_path
+        live_review_lease_bytes = setup.live_review_lease_bytes
+        read_manifest_snapshots = setup.read_manifest_snapshots
+        try:
             original_finalize = PRODUCER.finalize
             crash_once = {"remaining": True}
             def interrupt_historical_refresh(root, **kwargs):
@@ -964,6 +1025,381 @@ class ParentCloseTest(unittest.TestCase):
             self.assertEqual(completed_path.read_bytes(), completed_bytes)
         finally:
             fixture.doCleanups()
+    def _seed_historical_terminal_prefix(self, setup):
+        import artifact_admission
+        import artifact_lifecycle as LIFECYCLE
+        import artifact_producer as PRODUCER
+
+        fixture = setup.fixture
+        root = fixture.artifacts
+        record = PRODUCER.read_cycle_record(root, setup.cycle_id)
+        manifest_path = setup.cycle_dir / "manifest.json"
+        raw = manifest_path.read_bytes()
+        document = json.loads(raw)
+        leaf = PRODUCER._finalize_route(root, record)
+        self.assertEqual(leaf["route_id"], setup.final_route["route_id"])
+        self.assertTrue(PRODUCER.route_is_closed(root, leaf))
+        identity = LIFECYCLE.read_root_identity(root)
+        binding, sealed_route = LIFECYCLE.bind_existing_runtime_route(
+            root, ROUTE.canonical_route_path(root, leaf["route_id"]),
+            expected_root_id=identity.artifact_root_id)
+        gates = LIFECYCLE._load_capability_route().terminal_gate_observation(
+            sealed_route, jobs=fixture.jobs, exact_terminal=True)
+        self.assertTrue(ROUTE.terminal_gate_proven(gates))
+
+        allocator = setup.PRODUCER.artifact_identity.IdAllocator()
+        revision_id = allocator.allocate("manifest_revision")
+        excluded, excluded_symlinks = [], []
+        source_facts = PRODUCER._scan_cycle_facts(
+            setup.cycle_dir, excluded=excluded, excluded_symlinks=excluded_symlinks)
+        self.assertEqual(sorted(source_facts), sorted(
+            (row["locator"]["path"], row["content_digest"], row["byte_size"])
+            for row in document["artifact_revisions"]))
+        event = {
+            "event_id": allocator.allocate("event"),
+            "stream_id": allocator.allocate("stream"),
+            "stream_sequence": 1,
+            "event_type": "route.terminal.recorded",
+            "target_id": setup.cycle_id,
+            "actor": {"kind": "system", "id": "capability-route"},
+            "recorded_at": PRODUCER._rfc3339(time.time()),
+            "provenance": {
+                "source_manifest_id": document["manifest_id"],
+                "source_revision_id": revision_id,
+                "producer_route_id": leaf["route_id"],
+                "algorithm_version": PRODUCER.ALGORITHM_VERSION,
+                "schema_version": 1,
+                "source_digest": PRODUCER._digest(PRODUCER._canonical([
+                    [rel, digest] for rel, digest, _size in source_facts
+                ])),
+            },
+            "evidence_ids": [],
+            "payload": {},
+        }
+        candidate = json.loads(json.dumps(document))
+        candidate["manifest_revision_id"] = revision_id
+        candidate["routes"] = list(candidate.get("routes", [])) + [{
+            "artifact_root_id": identity.artifact_root_id,
+            "route_id": binding.route_id,
+            "route_hash": binding.route_hash,
+            "terminal_marker": "pending",
+            "terminal_evidence_id": event["event_id"],
+        }]
+        candidate["events"] = list(candidate.get("events", [])) + [event]
+        candidate = LIFECYCLE._derive_terminal_evidence(
+            candidate, binding, sealed_route, recorded_gates=gates)
+        report = setup.MANIFEST.validate_update(
+            candidate, preserved=PRODUCER._earlier_documents(root, setup.cycle_id, candidate),
+            previous=document)
+        self.assertTrue(report.ok, report.violations)
+
+        new_raw = setup.MANIFEST.canonical_bytes(candidate)
+        new_digest = setup.MANIFEST.manifest_digest(candidate)
+        fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT)
+        try:
+            latest_record = PRODUCER.read_cycle_record(root, setup.cycle_id)
+            index = artifact_admission.load_index(root)
+            identity = LIFECYCLE.read_root_identity(root)
+            self.assertEqual(latest_record["manifest_digest"], setup.MANIFEST.manifest_digest(document))
+            LIFECYCLE.preserve_manifest_snapshot(root, setup.cycle_id, raw)
+            PRODUCER._write_journal(
+                root, setup.cycle_id, state="refreshing", manifest_digest=new_digest,
+                previous_manifest_digest=latest_record["manifest_digest"],
+                cycle_path=os.path.relpath(str(setup.cycle_dir), str(root)),
+                manifest_revision_id=revision_id)
+            LIFECYCLE.preserve_manifest_snapshot(root, setup.cycle_id, new_raw)
+            PRODUCER._write_atomic(manifest_path, new_raw)
+            PRODUCER._commit_sealed(root, latest_record, candidate, new_digest,
+                                    now=time.time(), index=index,
+                                    previous_digest=latest_record["manifest_digest"])
+        finally:
+            artifact_admission._release_lock(root, fd)
+        return candidate
+
+    def _replace_historical_fixture_preimage(self, setup, document):
+        """Pair fixture-only current/snapshot bytes and advance its normal index/record."""
+        import artifact_admission
+        import artifact_lifecycle as LIFECYCLE
+        import artifact_producer as PRODUCER
+
+        root = setup.fixture.artifacts
+        manifest_path = setup.cycle_dir / "manifest.json"
+        snapshot_path = LIFECYCLE.manifest_snapshot_path(
+            root, setup.cycle_id, document["manifest_revision_id"])
+        raw = setup.MANIFEST.canonical_bytes(document)
+        snapshot_path.write_bytes(raw)
+        PRODUCER._write_atomic(manifest_path, raw)
+        fd = artifact_admission._acquire_lock(root, artifact_admission.LOCK_TIMEOUT_DEFAULT)
+        try:
+            record = PRODUCER.read_cycle_record(root, setup.cycle_id)
+            index = artifact_admission.load_index(root)
+            digest = setup.MANIFEST.manifest_digest(document)
+            PRODUCER._commit_sealed(root, record, document, digest, now=time.time(),
+                                    index=index, previous_digest=record["manifest_digest"])
+        finally:
+            artifact_admission._release_lock(root, fd)
+        return PRODUCER.read_cycle_record(root, setup.cycle_id)
+
+    def test_historical_terminal_provenance_digest_is_recomputed_before_finish(self):
+        from dispatch_completion_join import exact_attempt_row
+
+        setup = self._prepare_historical_two_hop_fixture()
+        fixture = setup.fixture
+        PRODUCER, TERMINAL = setup.PRODUCER, setup.TERMINAL
+        try:
+            owner_row = exact_attempt_row(fixture.jobs, setup.final_owner["attempt_id"])
+            request = TERMINAL._completion_request(fixture.jobs, "done", owner_row.metadata)
+            interrupted = TERMINAL.settle_terminal_commit(
+                request, TERMINAL.TerminalCommitServices(crash_after="close-after"))
+            self.assertEqual(interrupted.result, "recoverable", interrupted)
+            binding = TERMINAL.load_producer_binding(
+                artifact_root=fixture.artifacts, route_id=setup.final_route["route_id"],
+                owner_attempt_id=setup.final_owner["attempt_id"]).binding
+            preimage = self._seed_historical_terminal_prefix(setup)
+            source_facts = PRODUCER._scan_cycle_facts(
+                setup.cycle_dir, excluded=[], excluded_symlinks=[])
+            valid_digest = PRODUCER._digest(PRODUCER._canonical([
+                [rel, digest] for rel, digest, _size in source_facts
+            ]))
+            terminal = next(event for event in preimage["events"]
+                            if event.get("event_type") == "route.terminal.recorded")
+            self.assertEqual(terminal["provenance"]["source_digest"], valid_digest)
+            self.assertIsNotNone(PRODUCER._historical_handoff_completion_context(
+                fixture.artifacts, PRODUCER.read_cycle_record(fixture.artifacts, setup.cycle_id),
+                preimage, binding, jobs=fixture.jobs))
+
+            tampered = json.loads(json.dumps(preimage))
+            terminal = next(event for event in tampered["events"]
+                            if event.get("event_type") == "route.terminal.recorded")
+            terminal["provenance"]["source_digest"] = "sha256:" + "f" * 64
+            record = self._replace_historical_fixture_preimage(setup, tampered)
+            self.assertEqual((record["state"], record["cycle_state"]), ("sealed", "abandoned"))
+            tampered_context = PRODUCER._historical_handoff_completion_context(
+                fixture.artifacts, record, tampered, binding, jobs=fixture.jobs)
+
+            env = dict(os.environ)
+            env["AGENT_DISPATCH_JOBS"] = str(fixture.jobs)
+            command = [sys.executable, str(HERE / "dispatch_terminal_commit.py"),
+                       "finish", "--jobs", str(fixture.jobs),
+                       "--attempt", setup.final_owner["attempt_id"]]
+            shared_root = fixture.artifacts / "shared"
+            shared_before = sorted(path.relative_to(fixture.artifacts).as_posix()
+                                   for path in shared_root.rglob("*")) if shared_root.exists() else []
+            result = subprocess.run(command, cwd=HERE.parent, env=env,
+                                    capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(result.returncode, 0, result.stderr[-2000:])
+            self.assertIsNone(tampered_context, "paired manifest/snapshot provenance digest must be recomputed")
+            current = json.loads((setup.cycle_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(current["cycle"]["state"], "abandoned")
+            self.assertEqual(current, tampered)
+            self.assertEqual(len([event for event in current["events"]
+                                 if event.get("event_type") == "cycle.completed"]), 0)
+            self.assertEqual(PRODUCER.read_cycle_record(fixture.artifacts, setup.cycle_id)["manifest_digest"],
+                             setup.MANIFEST.manifest_digest(tampered))
+            shared_after = sorted(path.relative_to(fixture.artifacts).as_posix()
+                                  for path in shared_root.rglob("*")) if shared_root.exists() else []
+            self.assertEqual(shared_after, shared_before)
+
+            cases = (
+                ("source_manifest_id", PRODUCER.artifact_identity.IdAllocator().allocate("manifest")),
+                ("source_revision_id", PRODUCER.artifact_identity.IdAllocator().allocate("manifest_revision")),
+                ("producer_route_id", "rt-" + "f" * 16),
+                ("algorithm_version", PRODUCER.ALGORITHM_VERSION + "-other"),
+                ("schema_version", 2),
+            )
+            for field, bad_value in cases:
+                candidate = json.loads(json.dumps(tampered))
+                saved = next(event for event in candidate["events"]
+                             if event.get("event_type") == "route.terminal.recorded")
+                saved["provenance"][field] = bad_value
+                record = self._replace_historical_fixture_preimage(setup, candidate)
+                self.assertIsNone(PRODUCER._historical_handoff_completion_context(
+                    fixture.artifacts, record, candidate, binding,
+                    jobs=fixture.jobs), field)
+        finally:
+            fixture.doCleanups()
+
+    def test_historical_terminal_prefix_normal_finish_retry_keeps_explicit_jobs(self):
+        from dispatch_completion_join import exact_attempt_row
+
+        for first_ambient, retry_ambient in ((False, True), (True, False)):
+            with self.subTest(first_ambient=first_ambient, retry_ambient=retry_ambient):
+                setup = self._prepare_historical_two_hop_fixture()
+                fixture = setup.fixture
+                PRODUCER, TERMINAL = setup.PRODUCER, setup.TERMINAL
+                try:
+                    owner_row = exact_attempt_row(fixture.jobs, setup.final_owner["attempt_id"])
+                    request = TERMINAL._completion_request(fixture.jobs, "done", owner_row.metadata)
+                    interrupted = TERMINAL.settle_terminal_commit(
+                        request, TERMINAL.TerminalCommitServices(crash_after="close-after"))
+                    self.assertEqual(interrupted.result, "recoverable", interrupted)
+                    terminal_path = TERMINAL._commit_state_path(request)
+                    terminal_before = json.loads(terminal_path.read_text(encoding="utf-8"))
+                    self.assertEqual(terminal_before["state"], "route-closed")
+
+                    # Assemble the recorded B preimage from the exact closed route
+                    # and outcome, then publish it with the common snapshot/index writer.
+                    expected_binding = TERMINAL.load_producer_binding(
+                        artifact_root=fixture.artifacts, route_id=setup.final_route["route_id"],
+                        owner_attempt_id=setup.final_owner["attempt_id"]).binding
+                    binding_path = TERMINAL.producer_binding_path(
+                        fixture.artifacts, setup.final_route["route_id"], setup.final_owner["attempt_id"])
+                    binding_bytes_before = binding_path.read_bytes()
+                    self.assertEqual(expected_binding["route_id"], setup.final_route["route_id"])
+                    self.assertEqual(expected_binding["cycle_id"], setup.cycle_id)
+                    self.assertTrue(PRODUCER._binding_route_unrecorded(
+                        setup.cycle_dir / "manifest.json", expected_binding))
+                    preimage = self._seed_historical_terminal_prefix(setup)
+                    record = PRODUCER.read_cycle_record(fixture.artifacts, setup.cycle_id)
+                    self.assertEqual((record["state"], record["cycle_state"]), ("sealed", "abandoned"))
+                    manifest_path = setup.cycle_dir / "manifest.json"
+                    preimage_bytes = manifest_path.read_bytes()
+                    self.assertEqual(preimage["cycle"]["state"], "abandoned")
+                    self.assertEqual(len(preimage["routes"]), 2)
+                    self.assertEqual(preimage["routes"][0], setup.prior_document["routes"][0])
+                    leaf = preimage["routes"][-1]
+                    self.assertEqual(leaf["route_id"], setup.final_route["route_id"])
+                    self.assertTrue(leaf["terminal_evidence_id"])
+                    terminal_events = [event for event in preimage["events"]
+                                       if event.get("event_type") == "route.terminal.recorded"]
+                    self.assertEqual(len(terminal_events), 1)
+                    self.assertEqual(leaf["terminal_evidence_id"], terminal_events[0]["event_id"])
+                    self.assertEqual(preimage["events"][:-1], setup.prior_document["events"])
+                    self.assertEqual(terminal_events[0]["payload"]["route_id"], setup.final_route["route_id"])
+                    self.assertEqual(terminal_events[0]["payload"]["route_hash"], setup.final_route["route_hash"])
+                    preimage_snapshot_count = len(
+                        setup.read_manifest_snapshots(fixture.artifacts, setup.cycle_id))
+                    basis = setup.final_route["validation_basis"]
+                    self.assertEqual(Path(basis["runtime_root"]), setup.historical_release_root)
+                    self.assertNotEqual(Path(basis["runtime_root"]), HERE.parent.resolve())
+                    self.assertEqual(Path(owner_row.metadata["launch_home"]), setup.owner_launch_root)
+                    self.assertEqual(owner_row.metadata["owner_route_id"], setup.final_route["route_id"])
+                    self.assertEqual(owner_row.metadata["owner_route_hash"], setup.final_route["route_hash"])
+                    self.assertIsNotNone(PRODUCER._historical_handoff_completion_context(
+                        fixture.artifacts, record, setup.prior_document, expected_binding,
+                        jobs=fixture.jobs), "A context must accept the same explicit registry")
+                    source_facts = PRODUCER._scan_cycle_facts(
+                        setup.cycle_dir, excluded=[], excluded_symlinks=[])
+                    historical = PRODUCER._historical_handoff_completion_context(
+                        fixture.artifacts, record, preimage, expected_binding, jobs=fixture.jobs)
+                    self.assertIsNotNone(historical, "B preimage must pass the full historical verifier")
+                    projection = PRODUCER._provisional_completion_projection(
+                        fixture.artifacts, record, preimage,
+                        source_facts,
+                        revision_id=PRODUCER.artifact_identity.IdAllocator().allocate("manifest_revision"),
+                        allocator=PRODUCER.artifact_identity.IdAllocator(), now=time.time(),
+                        expected_binding=expected_binding, previous_document=preimage, jobs=fixture.jobs)
+                    self.assertIsNotNone(projection, "B first-completion projection must preserve the leaf prefix")
+
+                    ambient_jobs = fixture.base / "ambient-dispatch" / "jobs.log"
+                    ambient_jobs.parent.mkdir()
+                    ambient_jobs.write_bytes(b"")
+                    ambient_bytes = ambient_jobs.read_bytes()
+
+                    def run_finish(use_ambient):
+                        env = dict(os.environ)
+                        if use_ambient:
+                            env["AGENT_DISPATCH_JOBS"] = str(ambient_jobs)
+                        else:
+                            env.pop("AGENT_DISPATCH_JOBS", None)
+                        command = [sys.executable, str(HERE / "dispatch_terminal_commit.py"),
+                                   "finish", "--jobs", str(fixture.jobs),
+                                   "--attempt", setup.final_owner["attempt_id"]]
+                        result = subprocess.run(command, cwd=HERE.parent, env=env,
+                                                capture_output=True, text=True, timeout=120)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        return json.loads(result.stdout.strip().splitlines()[-1])
+
+                    first = run_finish(first_ambient)
+                    self.assertEqual(first["result"], "completed", first)
+                    self.assertEqual(first["shared_publication"]["status"], "admitted", first)
+                    completed_bytes = manifest_path.read_bytes()
+                    completed = json.loads(completed_bytes)
+                    self.assertEqual(completed["cycle"]["state"], "completed")
+                    self.assertEqual(completed["routes"], preimage["routes"])
+                    self.assertEqual(completed["events"][:len(preimage["events"])], preimage["events"])
+                    self.assertEqual(completed["events"][len(preimage["events"]):],
+                                     [event for event in completed["events"][len(preimage["events"]):]
+                                      if event.get("event_type") == "cycle.completed"])
+                    self.assertEqual(len(completed["events"]) - len(preimage["events"]), 1)
+                    self.assertEqual(len([event for event in completed["events"]
+                                         if event.get("event_type") == "route.terminal.recorded"]), 1)
+                    self.assertEqual(len(completed["artifact_revisions"]), len(preimage["artifact_revisions"]))
+                    self.assertEqual(len(setup.read_manifest_snapshots(fixture.artifacts, setup.cycle_id)),
+                                     preimage_snapshot_count + 1)
+                    self.assertTrue(setup.MANIFEST.validate_update(
+                        completed, preserved=[preimage], previous=preimage).ok)
+                    completion_binding, _sealed_route, historical_outcome, preserved, _gates = historical
+                    self.assertTrue(PRODUCER._evaluate_provisional_completion(
+                        fixture.artifacts, record, completed, completion_binding, historical_outcome,
+                        preserved=preserved, first_completion=True))
+
+                    changed_prefix = json.loads(completed_bytes)
+                    changed_prefix["routes"][0]["terminal_marker"] = "sha256:" + "f" * 64
+                    self.assertFalse(setup.MANIFEST.validate_update(
+                        changed_prefix, preserved=[preimage], previous=preimage).ok)
+                    changed_event = json.loads(completed_bytes)
+                    terminal_event_index = next(
+                        index for index, event in enumerate(changed_event["events"])
+                        if event.get("event_type") == "route.terminal.recorded")
+                    changed_event["events"][terminal_event_index]["payload"]["route_hash"] = "sha256:" + "e" * 64
+                    self.assertFalse(setup.MANIFEST.validate_update(
+                        changed_event, preserved=[preimage], previous=preimage).ok)
+                    duplicate_event = json.loads(completed_bytes)
+                    terminal_copy = dict(terminal_events[0])
+                    terminal_copy["event_id"] = "evt_" + "f" * 32
+                    duplicate_event["events"].append(terminal_copy)
+                    self.assertFalse(setup.MANIFEST.validate_update(
+                        duplicate_event, preserved=[preimage], previous=preimage).ok)
+
+                    missing_role = json.loads(completed_bytes)
+                    missing_role["artifacts"] = []
+                    missing_role["artifact_revisions"] = []
+                    self.assertFalse(PRODUCER._evaluate_provisional_completion(
+                        fixture.artifacts, record, missing_role, completion_binding, historical_outcome,
+                        preserved=preserved, first_completion=True))
+                    primary_revision = next(
+                        row for row in completed["artifact_revisions"]
+                        if row["locator"]["path"].endswith("spec/prd.md"))
+                    primary_payload = setup.cycle_dir / primary_revision["locator"]["path"]
+                    primary_bytes = primary_payload.read_bytes()
+                    try:
+                        primary_payload.write_bytes(primary_bytes + b" changed during historical finish\n")
+                        self.assertFalse(PRODUCER._evaluate_provisional_completion(
+                            fixture.artifacts, record, completed, completion_binding, historical_outcome,
+                            preserved=preserved, first_completion=True))
+                    finally:
+                        primary_payload.write_bytes(primary_bytes)
+                    self.assertEqual(ambient_jobs.read_bytes(), ambient_bytes)
+
+                    terminal_after = json.loads(terminal_path.read_text(encoding="utf-8"))
+                    binding_bytes = binding_path.read_bytes()
+                    self.assertEqual(binding_bytes, binding_bytes_before)
+                    self.assertEqual(terminal_after["terminal_commit_id"],
+                                     terminal_before["terminal_commit_id"])
+                    publication = first["shared_publication"]
+                    shared_revisions_path = (fixture.artifacts / "shared" / "spec" /
+                                             publication["shared_reference_id"] / "revisions")
+                    shared_revisions = sorted(path.name for path in shared_revisions_path.iterdir())
+                    self.assertEqual(len(shared_revisions), 1)
+                    snapshot_count = len(setup.read_manifest_snapshots(fixture.artifacts, setup.cycle_id))
+                    first_event_count = len(completed["events"])
+
+                    retry = run_finish(retry_ambient)
+                    self.assertEqual(retry["result"], "completed", retry)
+                    for key in ("shared_reference_id", "shared_reference_revision_id", "content_digest"):
+                        self.assertEqual(retry["shared_publication"].get(key), publication.get(key), key)
+                    self.assertEqual(json.loads(terminal_path.read_text(encoding="utf-8"))["terminal_commit_id"],
+                                     terminal_after["terminal_commit_id"])
+                    self.assertEqual(binding_path.read_bytes(), binding_bytes)
+                    self.assertEqual(manifest_path.read_bytes(), completed_bytes)
+                    self.assertEqual(len(json.loads(manifest_path.read_text())["events"]), first_event_count)
+                    self.assertEqual(len(setup.read_manifest_snapshots(fixture.artifacts, setup.cycle_id)),
+                                     snapshot_count)
+                    self.assertEqual(sorted(path.name for path in shared_revisions_path.iterdir()), shared_revisions)
+                    self.assertEqual(ambient_jobs.read_bytes(), ambient_bytes)
+                finally:
+                    fixture.doCleanups()
 
     def test_attached_then_advanced_owner_and_old_children_close_current_binding(self):
         import owner_route_binding as OWNER

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 
@@ -30,6 +31,53 @@ MAX_WIDTH = 4
 
 class ReplicaBatchContractError(ValueError):
     """Compatibility name for the portable parallel-batch contract error."""
+
+
+PEER_PROOF_KEYS = frozenset({
+    "agent_home", "attempt_id", "jobs", "manifest_sha256", "reason", "route", "state",
+})
+OWNER_CLOSURE_PROVENANCE_KEYS = frozenset({
+    "legacy_owner_closure", "source_manifest_sha256",
+    "source_selected_attempt_id", "source_peer_leg_sha256",
+})
+
+
+def verify_peer_proof(value: object, *, parallel_group: str) -> dict[str, Any]:
+    """Parse the governor's exact wire form; token/source authority stays upstream.
+
+    A legacy closure adds its complete authenticated provenance. It does not
+    replace the current launch manifest binding or promote the original verdict.
+    Writers and consumers use this same grammar without stripping extensions.
+    """
+    if not isinstance(value, dict) or set(value) not in (
+        PEER_PROOF_KEYS, PEER_PROOF_KEYS | OWNER_CLOSURE_PROVENANCE_KEYS,
+    ):
+        raise ReplicaBatchContractError("invalid peer proof fields")
+    for key in ("attempt_id", "reason"):
+        if not isinstance(value[key], str) or not value[key]:
+            raise ReplicaBatchContractError(f"invalid peer proof {key}")
+    for key in ("agent_home", "jobs", "route"):
+        if not isinstance(value[key], str) or not Path(value[key]).is_absolute():
+            raise ReplicaBatchContractError(f"peer proof {key} must be absolute")
+    if value["state"] not in ("active", "completed"):
+        raise ReplicaBatchContractError("invalid peer proof state")
+    if (not isinstance(value["manifest_sha256"], str)
+            or not DIGEST.fullmatch(value["manifest_sha256"])):
+        raise ReplicaBatchContractError("invalid peer proof manifest digest")
+    if "legacy_owner_closure" in value:
+        if (value["legacy_owner_closure"] is not True
+                or parallel_group != "visual-verify" or value["state"] != "completed"):
+            raise ReplicaBatchContractError("invalid legacy owner-closure proof scope")
+        for key in ("source_manifest_sha256", "source_peer_leg_sha256"):
+            if not isinstance(value[key], str) or not DIGEST.fullmatch(value[key]):
+                raise ReplicaBatchContractError(f"invalid peer proof {key}")
+        if value["source_manifest_sha256"] == value["manifest_sha256"]:
+            raise ReplicaBatchContractError("legacy owner-closure source must remain distinct")
+        source_selected = value["source_selected_attempt_id"]
+        if (not isinstance(source_selected, str) or not source_selected
+                or source_selected == value["attempt_id"]):
+            raise ReplicaBatchContractError("invalid peer proof source selected attempt")
+    return value
 
 
 def _digest(value: dict[str, Any]) -> str:

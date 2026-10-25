@@ -252,11 +252,19 @@ def _non_git_runtime_candidate(root: Path, values, source_root) -> str:
             return ""
 
         source = Path(source_root).expanduser().resolve(strict=False) if source_root else root.parent
+        configured_home = Path(values.get("HOME") or Path.home()).expanduser().resolve(strict=False)
+        home_source = source == configured_home and source != Path("/")
+        managed_home_state = state_root_real.is_relative_to(configured_home)
 
         def overlaps(left: Path, right: Path) -> bool:
             return (left == right or left.is_relative_to(right) or right.is_relative_to(left))
 
-        if overlaps(candidate, source) or overlaps(candidate, root):
+        source_overlap = overlaps(candidate, source)
+        home_default_exception = (home_source and managed_home_state
+                                  and candidate.is_relative_to(runtimes_root_real)
+                                  and candidate != runtimes_root_real)
+        if ((source_overlap and not home_default_exception)
+                or overlaps(candidate, root)):
             return ""
         if "releases" in candidate.parts or ".harness" in candidate.parts:
             return ""
@@ -724,7 +732,26 @@ def owner_inline_marker_prompt(args) -> str:
             f"still publishes its completion marker: `{command}` (route and attempt axes are derived; pass --evidence with a cycle-local file when the stage produced one or the route has no bound cycle). Without it the route never settles.\n\n")
 
 
-def plan_leg_prompt(route, node_id=None) -> str:
+def qa_primary_items_sidecar(route, node_id, primary_report):
+    """The exact required done-when sidecar for a bound QA primary report."""
+    if not primary_report:
+        return ""
+    node = next((item for item in route.get("nodes") or []
+                 if isinstance(item, dict) and item.get("id") == node_id), {})
+    if not str(node.get("unit") or "").startswith("qa/"):
+        return ""
+    import route_plan as RP
+    plan = RP.leg_plan(route)
+    if not ((plan or {}).get("leg") or {}).get("done_when"):
+        return ""
+    primary = Path(primary_report)
+    sidecar = Path(str(primary) + ".items.json")
+    if sidecar.resolve(strict=False) != sidecar:
+        return ""
+    return str(sidecar)
+
+
+def plan_leg_prompt(route, node_id=None, primary_report=None) -> str:
     """The approved plan for this leg, read from the sealed decision: what finishes it, what
     verification looks at, what it hands over, and the direction the person chose. Empty for a
     route made from no plan. A verification stage is also told where to record each item."""
@@ -756,9 +783,10 @@ def plan_leg_prompt(route, node_id=None) -> str:
     if not lines:
         return ""
     node = next((n for n in route.get("nodes") or [] if n.get("id") == node_id), {}) if node_id else {}
-    if leg.get("done_when") and str(node.get("unit") or "").startswith("qa/"):
+    sidecar = qa_primary_items_sidecar(route, node_id, primary_report)
+    if sidecar:
         lines.append(
-            "Record each done-when item beside your artifact as `<artifact>.items.json`: "
+            f"Record each done-when item in the required primary sidecar `{sidecar}`: "
             '{"schema": "leg_items_v1", "route_id": "' + str(route.get("route_id")) + '", "node": "'
             + str(node_id) + '", "attempt_id": "<your attempt id>", "items": [{"id": "d1", "state": '
             '"met|unmet|unknown", "note": "one line"}]} -- every sealed id once, no other id.')
@@ -886,7 +914,8 @@ def assignment_prompt(args, task: str, environ) -> str:
         from verification_runtime import assignment_hint
         return (f"Assignment:\n{task.rstrip()}\n\n{completion_scope_prompt()}"
                 f"{assignment_hint(route, getattr(args, 'route_node', None))}"
-                f"{plan_leg_prompt(route, getattr(args, 'route_node', None))}"
+                f"{plan_leg_prompt(route, getattr(args, 'route_node', None),
+                                   getattr(args, 'report_file', None))}"
                 f"{node_scope_prompt(scope)}{input_sources_prompt(route, getattr(args, 'route_node', None))}\n"
                 f"{automatic_consumer_prompt(route, getattr(args, 'route_node', None))}"
                 f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}")

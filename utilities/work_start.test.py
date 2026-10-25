@@ -2899,6 +2899,60 @@ class GroupContextStartTest(GF.fixture.ProducerTestBase):
         self.assertEqual(GF.P.prepare_route_artifact_env(path, start=False, jobs=self.jobs), result)
 
 
+class AdoptedOwnerSlotTest(unittest.TestCase):
+    def setUp(self):
+        from owner_route_binding import OwnerRouteBinding
+        self.route = {"route_id": "rt-" + "a" * 16, "route_hash": "sha256:" + "a" * 64,
+                      "owner_attempt_id": "att-adopted"}
+        self.binding = OwnerRouteBinding("/fixture/current.json", self.route["route_id"],
+                                         self.route["route_hash"])
+        self.jobs = Path("/fixture/jobs.log")
+        self.rows = {"att-adopted": ("done", {"worker_type": "owner", "owner_route_id": "rt-origin",
+                                             "owner_route_hash": "sha256:" + "b" * 64})}
+
+    def test_current_binding_reuses_the_existing_owner_on_all_harnesses(self):
+        for harness in ("codex", "claude", "opencode"):
+            with self.subTest(harness=harness):
+                self.rows["att-adopted"][1]["harness"] = harness
+                with mock.patch("owner_route_binding.resolve_owner_route_lifecycle",
+                                return_value=(self.binding, "owner-route-advance-current")) as resolve:
+                    self.assertEqual(W._slot(self.route, "owner", self.rows, self.jobs), "att-adopted")
+                    resolve.assert_called_once_with(self.jobs, owner_attempt_id="att-adopted")
+
+    def test_absent_or_different_binding_does_not_adopt_the_named_owner(self):
+        from owner_route_binding import OwnerRouteBinding
+        for binding in (None, OwnerRouteBinding("/fixture/other.json", "rt-other", self.binding.route_hash),
+                        OwnerRouteBinding(self.binding.route_file, self.binding.route_id, "sha256:" + "c" * 64)):
+            with self.subTest(binding=binding), mock.patch(
+                    "owner_route_binding.resolve_owner_route_lifecycle", return_value=(binding, "pending")):
+                self.assertEqual(W._slot(self.route, "owner", self.rows, self.jobs),
+                                 W.attempt_id(self.route, "owner"))
+
+    def test_registered_current_owner_keeps_precedence(self):
+        self.rows["att-current"] = ("done", {"worker_type": "owner",
+            "owner_route_id": self.route["route_id"], "owner_route_hash": self.route["route_hash"]})
+        with mock.patch("owner_route_binding.resolve_owner_route_lifecycle") as resolve:
+            self.assertEqual(W._slot(self.route, "owner", self.rows, self.jobs), "att-current")
+            resolve.assert_not_called()
+
+    def test_adoption_does_not_transfer_a_live_owner_to_another_parent(self):
+        self.rows["att-adopted"] = ("open", self.rows["att-adopted"][1])
+        with mock.patch("owner_route_binding.resolve_owner_route_lifecycle",
+                        return_value=(self.binding, "owner-route-advance-current")), \
+                mock.patch.object(W, "_current_parent_session_id", return_value="foreign"), \
+                mock.patch.object(W, "_owns", return_value=False):
+            with self.assertRaises(W.DispatchContractError) as caught:
+                W._slot(self.route, "owner", self.rows, self.jobs)
+            self.assertEqual(caught.exception.reason, "work-parent-recovery-required")
+
+    def test_unreadable_lifecycle_does_not_fall_through_to_a_fresh_owner(self):
+        from owner_route_binding import OwnerRouteBindingError
+        with mock.patch("owner_route_binding.resolve_owner_route_lifecycle",
+                        side_effect=OwnerRouteBindingError("owner-route-advance-child-evidence-invalid")):
+            with self.assertRaisesRegex(OwnerRouteBindingError, "owner-route-advance-child-evidence-invalid"):
+                W._slot(self.route, "owner", self.rows, self.jobs)
+
+
 class CorrectAnswerContinuationTest(unittest.TestCase):
     """`correct` to an owner that ended BLOCKED continues its route in the same call."""
 
@@ -3860,6 +3914,43 @@ class ModernNeverStartedOwnerNormalStartTest(NeverStartedReplacementNormalStartT
 
         with mock.patch.object(self.contract, "close_attempt_row", side_effect=close_after_fixture_carrier):
             return super()._controlled_runner(command, **kwargs)
+
+    def test_adopted_route_correct_delivers_the_retained_answer_before_replacement_work(self):
+        from owner_route_binding import OwnerRouteBinding, resolve_owner_route_lifecycle
+
+        owner = self._seed_initial_owner()
+        self._finish_blocked(owner)
+        answer = "Reuse primary PASS; start only the alternative with the pinned source."
+        # The launch row belongs to the predecessor; the lifecycle resolver
+        # proves that this owner adopted the route now being continued.
+        launch_route_id = self.route["route_id"]
+        first = self.route["nodes"][0]["id"]
+        self.route = self.route_module.build_continuation_route(
+            self.route, resume_from_node=first, requested_boundary=first,
+            reason="continue-with-retained-answer", artifact_root=self.reports)
+        self.assertIsNone(self.route["first_runnable_blocker"])
+        self.route["owner_attempt_id"] = owner
+        self.assertNotEqual(self.route["route_id"], launch_route_id)
+        self.path = self.path.with_name(self.route["route_id"] + ".json")
+        self.path.write_text(json.dumps(self.route))
+        current = OwnerRouteBinding(str(self.path), self.route["route_id"], self.route["route_hash"])
+
+        def lifecycle(jobs, *, owner_attempt_id, **kwargs):
+            if owner_attempt_id == owner:
+                return current, "owner-route-advance-current"
+            return resolve_owner_route_lifecycle(jobs, owner_attempt_id=owner_attempt_id, **kwargs)
+
+        with mock.patch("owner_route_binding.resolve_owner_route_lifecycle", side_effect=lifecycle):
+            receipt = self._cli_correct(owner, answer)
+            self.assertEqual(receipt["state"], "running", receipt)
+            replacement = receipt["owner_attempt_id"]
+            self.assertEqual(self.launches[0]["prior"], owner)
+            self.assertEqual(len(self.launches), 1)
+            self.assertIn(answer, self.delivered_prompts[replacement])
+            self.assertIn("Verified recovery context", self.delivered_prompts[replacement])
+            replay = self._cli_start()
+            self.assertEqual(replay["owner_attempt_id"], replacement)
+            self.assertEqual(len(self.launches), 1)
 
     def _build_legacy_claim_with_settled_attention(self):
         owner_a, owner_b, owner_c, _ = self._build_unstarted_chain(
