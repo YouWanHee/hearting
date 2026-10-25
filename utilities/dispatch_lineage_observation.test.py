@@ -351,7 +351,8 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
         before = [self.snapshot(path) for path in paths]
         self.assertEqual(self.counts()["no_recipient"], 2)
         real_read = Path.read_text
-        for bad in (PermissionError("fixture pending read"), "not-json", "[]"):
+        for bad in (PermissionError("fixture pending read"), "not-json", "[]", "{}",
+                    '{"state":[]}', '{"state":"unrecognized"}'):
             def read(path, *args, **kwargs):
                 if path == paths[0]:
                     if isinstance(bad, Exception):
@@ -365,6 +366,21 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
                 self.assertEqual(counts["pending"], 1)
             self.assertEqual(self.counts()["no_recipient"], 2)
             self.assertEqual([self.snapshot(path) for path in paths], before)
+
+    def test_legacy_terminal_rows_need_only_the_existing_state_discriminator(self):
+        notice = self.notice(sid="dead-A")
+        path = pending.record_path(self.tmp_root, "dead-A", notice["delivery_id"])
+        before = self.snapshot(path)
+        real = Path.read_text
+        for state in ("acked", "rejected", "expired"):
+            def read(candidate, *args, **kwargs):
+                return json.dumps({"state": state}) if candidate == path else real(candidate, *args, **kwargs)
+
+            with self.subTest(state=state), mock.patch.object(Path, "read_text", new=read):
+                counts = self.counts()
+                self.assertEqual(counts, dict(pending=0, expired=int(state == "expired"),
+                                             retained_batch_duties=0, no_recipient=0))
+            self.assertEqual(self.snapshot(path), before)
 
     def test_pending_empty_directory_and_failed_enumerations_are_distinct(self):
         root = self.tmp_root / "pending-delivery"

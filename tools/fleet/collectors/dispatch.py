@@ -4099,6 +4099,8 @@ def _pending_delivery_counts(paths, *, session_observation=None):
                         no_recipient += 1
             elif state == "expired":
                 expired += 1
+            elif not isinstance(state, str) or state not in {"acked", "rejected"}:
+                no_recipient_unknown = True
 
     unmaterialized = 0
     for _attempt_id, parent_sid, delivery_id in intent_rows:
