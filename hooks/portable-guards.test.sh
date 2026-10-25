@@ -60,7 +60,7 @@ unset AGENT_DISPATCH_PARENT_SESSION_ID AGENT_DISPATCH_OWNER_HARNESS CODEX_THREAD
 unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID \
   AGENT_SESSION_ROLE AGENT_DISPATCH_CHILD AGENT_DISPATCH_DEPTH \
   AGENT_DISPATCH_JOBS \
-  AGENT_ARTIFACT_ROOT AGENT_ROUTE_FILE AGENT_ROUTE_ID AGENT_ROUTE_NODE \
+  AGENT_ARTIFACT_ROOT AGENT_ARTIFACT_CYCLE_DIR AGENT_ROUTE_FILE AGENT_ROUTE_ID AGENT_ROUTE_NODE \
   AGENT_OWNER_ROUTE_FILE AGENT_OWNER_ROUTE_ID AGENT_OWNER_ROUTE_HASH \
   CLAUDE_CODE_CHILD_SESSION OPENCODE_DISPATCH_SLUG FLEET_TITLE_REFRESH \
   MEM_DISTILL CODEX_DISPATCH_SANDBOX_FORCE
@@ -99,7 +99,8 @@ SSNPROJ="$TMP/ssnproj"
 mkdir -p "$SSNPROJ/.agent_reports/spec"
 printf 'project_name: demo\nmode: [research]\n' > "$SSNPROJ/.agent_reports/spec/pipeline_state.yaml"
 printf '# Demo Spec\n- requirement: SD-31\n- schema_version=1\n- sample rate: 48 kHz\n- optimizer: Adam\n' > "$SSNPROJ/.agent_reports/spec/prd.md"
-printf 'schema_version=1\n' > "$SSNPROJ/train.py"
+# The PostToolUse fixture represents the file after the edit has completed.
+printf 'schema_version=2\n' > "$SSNPROJ/train.py"
 # ① removed value still described in spec → nudge surfaces the stale spec line
 if AGENT_HOME="$ROOT" bash "$SSN" --file "$SSNPROJ/train.py" --old 'schema_version=1' --new 'schema_version=2' --cwd "$SSNPROJ" >"$TMP/ssn.out" 2>"$TMP/ssn.err" \
   && grep -q 'spec/prd.md' "$TMP/ssn.out" && grep -q 'schema_version=1' "$TMP/ssn.out"; then
@@ -1927,18 +1928,19 @@ else
   bad "codex native prompt hook should expose capsule candidates and keep bodies private"
 fi
 mkdir -p "$TMP/repo/.agent_reports/spec" "$TMP/codex_marker_home"
+codex_marker_state="$TMP/codex_marker_state"
 printf 'prd\n' > "$TMP/repo/.agent_reports/spec/prd.md"
 if printf '{"tool_name":"Read","tool_input":{"file_path":"%s"},"session_id":"testsid","cwd":"%s"}\n' "$TMP/repo/.agent_reports/spec/prd.md" "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_read_hook.out" 2>"$TMP/codex_read_hook.err" \
-  && find "$TMP/codex_marker_home/.spec-grounding" -type f -name 'testsid__*' -print -quit | grep -q . \
+  | AGENT_HOME="$TMP/codex_marker_home" HARNESS_STATE_ROOT="$codex_marker_state" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_read_hook.out" 2>"$TMP/codex_read_hook.err" \
+  && find "$codex_marker_state/spec-grounding" -type f -name 'testsid__*' -print -quit | grep -q . \
   && ! grep -q 'adapters/claude\|claude_setting\|statusline.sh' "$TMP/codex_read_hook.out" "$TMP/codex_read_hook.err"; then
   ok "codex native hook projection records spec read markers"
 else
   bad "codex native hook projection should record spec read markers"
 fi
 if printf '{"tool_name":"Bash","tool_input":{"command":"cat .agent_reports/spec/prd.md"},"session_id":"shellreadsid","cwd":"%s"}\n' "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_shell_read_hook.out" 2>"$TMP/codex_shell_read_hook.err" \
-  && find "$TMP/codex_marker_home/.spec-grounding" -type f -name 'shellreadsid__*' -print -quit | grep -q .; then
+  | AGENT_HOME="$TMP/codex_marker_home" HARNESS_STATE_ROOT="$codex_marker_state" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_shell_read_hook.out" 2>"$TMP/codex_shell_read_hook.err" \
+  && find "$codex_marker_state/spec-grounding" -type f -name 'shellreadsid__*' -print -quit | grep -q .; then
   ok "codex native read hook marks obvious shell spec reads"
 else
   bad "codex native read hook should mark obvious shell spec reads"
@@ -1948,22 +1950,22 @@ shared_prd="$shared_repo/.agent_reports/shared/spec/ref_fixture/revisions/rrev_f
 mkdir -p "$(dirname "$shared_prd")"
 printf 'shared prd\n' > "$shared_prd"
 if printf '{"tool_name":"functions.exec_command","tool_input":{"cmd":"sed -n 1,120p %s"},"session_id":"shellsharedreadsid","cwd":"%s"}\n' "$shared_prd" "$shared_repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_shared_read_hook.out" 2>"$TMP/codex_shared_read_hook.err" \
-  && find "$TMP/codex_marker_home/.spec-grounding" -type f -name 'shellsharedreadsid__*' -print -quit | grep -q .; then
+  | AGENT_HOME="$TMP/codex_marker_home" HARNESS_STATE_ROOT="$codex_marker_state" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_shared_read_hook.out" 2>"$TMP/codex_shared_read_hook.err" \
+  && find "$codex_marker_state/spec-grounding" -type f -name 'shellsharedreadsid__*' -print -quit | grep -q .; then
   ok "codex native read hook marks shell reads of canonical shared spec revisions"
 else
   bad "codex native read hook should mark canonical shared spec revision reads"
 fi
 if printf '{"tool":{"name":"Read","input":{"path":"%s"}},"session_id":"nestedreadsid","cwd":"%s"}\n' "$TMP/repo/.agent_reports/spec/prd.md" "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_read_hook_nested.out" 2>"$TMP/codex_read_hook_nested.err" \
-  && find "$TMP/codex_marker_home/.spec-grounding" -type f -name 'nestedreadsid__*' -print -quit | grep -q .; then
+  | AGENT_HOME="$TMP/codex_marker_home" HARNESS_STATE_ROOT="$codex_marker_state" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_read_hook_nested.out" 2>"$TMP/codex_read_hook_nested.err" \
+  && find "$codex_marker_state/spec-grounding" -type f -name 'nestedreadsid__*' -print -quit | grep -q .; then
   ok "codex native read hook accepts nested tool input payloads"
 else
   bad "codex native read hook should accept nested tool input payloads"
 fi
 if printf '{"tool_name":"Read","tool_input":{"file_path":".agent_reports/spec/prd.md"},"session":{"id":"nestedctxreadsid"},"workspace":{"cwd":"%s"}}\n' "$TMP/repo" \
-  | AGENT_HOME="$TMP/codex_marker_home" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_read_hook_nested_context.out" 2>"$TMP/codex_read_hook_nested_context.err" \
-  && find "$TMP/codex_marker_home/.spec-grounding" -type f -name 'nestedctxreadsid__*' -print -quit | grep -q .; then
+  | AGENT_HOME="$TMP/codex_marker_home" HARNESS_STATE_ROOT="$codex_marker_state" HOME="$TMP/codex_hook_home" python3 "$TMP/codex_hook_home/.codex/hearting/adapters/codex/hooks/posttooluse-read-marker.py" >"$TMP/codex_read_hook_nested_context.out" 2>"$TMP/codex_read_hook_nested_context.err" \
+  && find "$codex_marker_state/spec-grounding" -type f -name 'nestedctxreadsid__*' -print -quit | grep -q .; then
   ok "codex native read hook resolves nested cwd/session payloads"
 else
   bad "codex native read hook should resolve nested cwd/session payloads"
@@ -3693,6 +3695,8 @@ drilltmp="$TMP/drill-runtime-failure"
 drilljobs="$drilltmp/jobs.log"
 fake_codex="$drilltmp/fake-codex"
 mkdir -p "$drilltmp/case/repo"
+mkdir -p "$drilltmp/agent-home"
+ln -s "$ROOT/utilities" "$drilltmp/agent-home/utilities"
 : > "$drilljobs"
 : > "$drilltmp/case/prompt.md"
 printf '%s\n' \

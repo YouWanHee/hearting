@@ -648,6 +648,7 @@ class SubAgent:
 class DispatchJob:
     """One headless dispatch job (autopilot-*/loops process, or jobs.log row)."""
     key: str                            # pipe key: autopilot-code / oncall / ...
+    interaction_observations: list = field(default_factory=list)
     stage: Optional[str] = None         # plan | exec | test | done (live_stage)
     residue_pids: Optional[list] = None  # tagged pids a finished worker left running (display only)
     mode: Optional[str] = None          # legacy overloaded --mode value (read-only)
@@ -819,9 +820,30 @@ class DispatchJob:
     _context_evidence: Optional[ContextEvidence] = field(default=None, repr=False, compare=False)
     _dispatch_context_owned: bool = field(default=False, repr=False, compare=False)
     _refresh_source: Optional[dict] = field(default=None, repr=False, compare=False)
+    # The runtime's row_is_registered_only verdict for this registry row: a pre-registered
+    # serial successor that has not launched yet (no process, no log).
+    _registered_only: bool = field(default=False, repr=False, compare=False)
 
     def to_dict(self):
         return _public_value(self)
+
+
+def current_attempt_rank(job):
+    """Order of one route node's attempts; the highest is the node's current attempt.
+
+    An attempt that has started outranks one that is only registered: a continuation or
+    planned serial chain registers every sub-session up front, so the last registered row
+    is not yet the running one. Among started (or among registered-only) attempts the
+    canonical registry, then the later registry row, then the shorter age wins."""
+    priority = getattr(job, "registry_priority", None)
+    order = getattr(job, "registry_order", None)
+    elapsed = getattr(job, "elapsed_min", None)
+    return (
+        not getattr(job, "_registered_only", False),
+        -(priority if priority is not None else 0),
+        order if order is not None else -1,
+        -(elapsed if elapsed is not None else 10**9),
+    )
 
 
 @dataclass
@@ -840,6 +862,11 @@ class ResourceJob:
     command: Optional[list] = None  # registry argv, display only; never ownership proof
     process_group: Optional[int] = None
     pid_namespace: Optional[str] = None
+    # Recorded attribution for a composed remote compute execution. Displaying
+    # this receipt does not authorize a fresh remote observation.
+    execution: Optional[dict] = None
+    compute_host: Optional[str] = None
+    compute_run_id: Optional[str] = None
     registry_status: Optional[str] = None
     registry_path: Optional[str] = None
     log_path: Optional[str] = None
@@ -872,9 +899,8 @@ class ResourceJob:
     state_evidence: Optional[dict] = None
     # The registry scanner emits these; a field it produces and this class does
     # not accept raises TypeError inside the collector's per-row try, so the row
-    # is dropped into diagnostics nobody reads and Fleet shows *no* resource
-    # runs at all. Five such fields had accumulated (2026-09-10).
-    # `resource_runs.test.py` now pins the two key sets together.
+    # is dropped into diagnostics nobody reads and Fleet can show no resource
+    # runs at all. A producer/consumer key-set test pins this boundary.
     artifact_root: Optional[str] = None
     route_file: Optional[str] = None
     route_hash: Optional[str] = None

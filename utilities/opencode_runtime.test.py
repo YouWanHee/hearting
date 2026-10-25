@@ -4,8 +4,11 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 
@@ -14,7 +17,149 @@ sys.path.insert(0, str(ROOT / "utilities"))
 import opencode_runtime as runtime
 
 
+def write_detached_version_cli(script: Path, pid_file: Path, *, hang: bool = False) -> None:
+    detached = (
+        "import os,pathlib,time\n"
+        "if os.fork(): os._exit(0)\n"
+        "os.setsid()\n"
+        "if os.fork(): os._exit(0)\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+    )
+    source = (
+        "#!/usr/bin/env python3\nimport pathlib,subprocess,sys,time\n"
+        f"subprocess.Popen([sys.executable,'-c',{detached!r}],env={{}})\n"
+        f"pid_file=pathlib.Path({str(pid_file)!r})\n"
+        "deadline=time.monotonic()+2\n"
+        "while not pid_file.exists() and time.monotonic()<deadline: time.sleep(.001)\n"
+        "print('opencode 2.0.32',flush=True)\n"
+        + ("time.sleep(30)\n" if hang else "")
+    )
+    script.write_text(source, encoding="utf-8")
+    script.chmod(0o700)
+
+
 class OpenCodeRunCodecTest(unittest.TestCase):
+    def test_launch_version_probe_uses_private_store_and_rejects_bad_versions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            script.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, pathlib, sys\n"
+                "assert pathlib.Path(os.environ['HOME']).is_relative_to(pathlib.Path(os.environ['TMPDIR']))\n"
+                "assert os.environ['XDG_DATA_HOME'] != '/user/data'\n"
+                "assert 'secret' not in os.environ\n"
+                "print('opencode 2.0.32')\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            version = runtime.probe_launch_version(
+                binary=str(script), cwd=temp, state_root=root,
+                environ={"PATH": os.environ.get("PATH", ""), "HOME": "/user",
+                         "XDG_DATA_HOME": "/user/data", "OPENAI_API_KEY": "secret"},
+            )
+            self.assertEqual(version, (2, 0, 32))
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_launch_version_probe_fails_closed_for_nonzero_or_malformed_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            for body in ("print('not a version')\n", "print('opencode 2.0.32')\nsys.exit(1)\n"):
+                script.write_text("#!/usr/bin/env python3\nimport sys\n" + body, encoding="utf-8")
+                script.chmod(0o700)
+                with self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                            "opencode-runtime-version-unavailable"):
+                    runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+
+    def test_launch_version_probe_rejects_truncation_and_caps_capture_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            script.write_text(
+                "#!/usr/bin/env python3\nimport os, pathlib, sys, time\n"
+                "target = pathlib.Path(os.environ['TMPDIR']) / 'version.out'\n"
+                "sys.stdout.write('opencode 2.0.32\\n'); sys.stdout.flush()\n"
+                "deadline = time.monotonic() + 1\n"
+                "while target.stat().st_size < 16 and time.monotonic() < deadline: time.sleep(.001)\n"
+                "sys.stdout.write('x' * (512 * 1024)); sys.stdout.flush()\n"
+                "deadline = time.monotonic() + 1\n"
+                "while target.stat().st_size < 32 and time.monotonic() < deadline: time.sleep(.001)\n"
+                "time.sleep(.02)\n"
+                "pathlib.Path.cwd().joinpath('capture-size.txt').write_text(str(target.stat().st_size))\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            with unittest.mock.patch.object(runtime, "VERSION_PROBE_OUTPUT_LIMIT", 32), \
+                    self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                           "opencode-runtime-version-unavailable"):
+                runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+            self.assertEqual(int((Path(temp) / "capture-size.txt").read_text()), 32)
+            script.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                "sys.stdout.write('x' * 64 + '\\nopencode 2.0.32\\n')\n",
+                encoding="utf-8",
+            )
+            with unittest.mock.patch.object(runtime, "VERSION_PROBE_OUTPUT_LIMIT", 32), \
+                    self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                           "opencode-runtime-version-unavailable"):
+                runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_launch_version_probe_reaps_double_fork_setsid_descendant_after_normal_exit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            pid_file = Path(temp) / "detached-pid"
+            script = Path(temp) / "opencode"
+            write_detached_version_cli(script, pid_file)
+            self.assertEqual(runtime.probe_launch_version(
+                binary=str(script), cwd=temp, state_root=root), (2, 0, 32))
+            pid = int(pid_file.read_text())
+            self.assertFalse(Path(f"/proc/{pid}").exists())
+            self.assertFalse(any(thread.name == "opencode-version-probe-output" and thread.is_alive()
+                                 for thread in threading.enumerate()))
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_launch_version_probe_timeout_reaps_double_fork_setsid_descendant(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            pid_file = Path(temp) / "timeout-detached-pid"
+            script = Path(temp) / "opencode"
+            write_detached_version_cli(script, pid_file, hang=True)
+            with self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                        "opencode-runtime-version-unavailable"):
+                runtime.probe_launch_version(binary=str(script), cwd=temp,
+                                             state_root=root, timeout=0.1)
+            pid = int(pid_file.read_text())
+            self.assertFalse(Path(f"/proc/{pid}").exists())
+            self.assertFalse(any(thread.name == "opencode-version-probe-output" and thread.is_alive()
+                                 for thread in threading.enumerate()))
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_launch_version_probe_rejects_valid_output_from_a_stopped_lease(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "dispatch"
+            root.mkdir()
+            script = Path(temp) / "opencode"
+            script.write_text(
+                "#!/usr/bin/env python3\nimport os,signal,time\n"
+                "print('opencode 2.0.32',flush=True)\n"
+                "os.kill(os.getppid(),signal.SIGTERM)\n"
+                "time.sleep(30)\n")
+            script.chmod(0o700)
+            with self.assertRaisesRegex(runtime.OpenCodeRuntimeError,
+                                        "opencode-runtime-version-unavailable"):
+                runtime.probe_launch_version(binary=str(script), cwd=temp, state_root=root)
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertFalse(any(thread.name == "opencode-version-probe-output" and thread.is_alive()
+                                 for thread in threading.enumerate()))
+
     def test_v1_flags_and_v2_provider_variant_are_separate(self):
         v1 = runtime.run_argv(binary="opencode", cwd="/work", agent="build",
                               model="opencode-go/model", variant="high", pure=True,
@@ -55,6 +200,147 @@ class OpenCodeRunCodecTest(unittest.TestCase):
                          "openai/gpt-6.1-sol")
         self.assertEqual(runtime.model_reference("opencode/model#old", "high"),
                          "opencode/model#high")
+
+
+    @staticmethod
+    def _cli(path, output="2.0.32", executable=True):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"#!/bin/sh\nprintf '{output}\\n'\n")
+        path.chmod(0o755 if executable else 0o644)
+        return path
+
+    def test_v2_cli_resolves_from_fixture_home_when_missing_from_path(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as empty_path:
+            binary = Path(home) / ".opencode" / "bin" / "opencode"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\nprintf '2.0.32\\n'\n")
+            binary.chmod(0o755)
+            env = {"HOME": home, "PATH": empty_path}
+            with unittest.mock.patch.dict(os.environ, {}, clear=True):
+                self.assertTrue(runtime.is_v2(environ=env))
+                self.assertEqual(runtime.resolve_binary(environ=env), str(binary))
+                self.assertFalse(runtime.is_v2(binary="injected-opencode", environ=env))
+                self.assertFalse(runtime.is_v2(environ=env, version=(1, 19, 0)))
+
+    def test_ambient_public_version_api_resolves_fixture_home_without_path_binary(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as empty_path:
+            binary = Path(home) / ".opencode" / "bin" / "opencode"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\nprintf '2.0.32\\n'\n")
+            binary.chmod(0o755)
+            runtime.runtime_version.cache_clear()
+            with unittest.mock.patch.dict(os.environ, {"HOME": home, "PATH": empty_path}, clear=True):
+                self.assertEqual(runtime.runtime_version(), (2, 0, 32))
+                runtime.runtime_version.cache_clear()
+                self.assertTrue(runtime.is_v2())
+            runtime.runtime_version.cache_clear()
+
+    def test_explicit_argument_wins_over_opencode_bin(self):
+        with tempfile.TemporaryDirectory() as temp:
+            chosen = self._cli(Path(temp) / "chosen" / "opencode", "1.19.0")
+            override = self._cli(Path(temp) / "override" / "opencode", "2.0.32")
+            env = {"HOME": temp, "PATH": "", "OPENCODE_BIN": str(override)}
+            self.assertEqual(runtime.resolve_binary(str(chosen), environ=env), str(chosen))
+
+    def test_opencode_bin_wins_over_path_and_home_and_is_probed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            path_dir = Path(temp) / "path"
+            local = self._cli(home / ".opencode/bin/opencode", "1.0.0")
+            on_path = self._cli(path_dir / "opencode", "1.0.0")
+            selected = self._cli(Path(temp) / "selected/opencode", "2.1.0")
+            env = {"HOME": str(home), "PATH": str(path_dir), "OPENCODE_BIN": str(selected)}
+            with unittest.mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(runtime.resolve_binary(environ=env), str(selected))
+                self.assertTrue(runtime.is_v2(environ=env))
+            self.assertTrue(local.is_file() and on_path.is_file())
+
+    def test_invalid_opencode_bin_does_not_fall_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            path_dir = Path(temp) / "path"
+            self._cli(home / ".opencode/bin/opencode")
+            self._cli(path_dir / "opencode")
+            missing = Path(temp) / "missing/opencode"
+            env = {"HOME": str(home), "PATH": str(path_dir), "OPENCODE_BIN": str(missing)}
+            with unittest.mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(runtime.resolve_binary(environ=env), str(missing))
+                self.assertFalse(runtime.is_v2(environ=env))
+
+    def test_path_precedes_home_and_home_requires_executable_regular_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            path_dir = Path(temp) / "path"
+            self._cli(home / ".opencode/bin/opencode", "1.0.0")
+            path_cli = self._cli(path_dir / "opencode", "2.0.0")
+            env = {"HOME": str(home), "PATH": str(path_dir)}
+            self.assertEqual(runtime.resolve_binary(environ=env), str(path_cli))
+            missing_env = {"HOME": str(Path(temp) / "missing-home"), "PATH": ""}
+            self.assertEqual(runtime.resolve_binary(environ=missing_env), "opencode")
+            self._cli(Path(missing_env["HOME"]) / ".opencode/bin/opencode", executable=False)
+            self.assertEqual(runtime.resolve_binary(environ=missing_env), "opencode")
+
+    def test_unknown_version_and_timeout_are_unknown_with_bounded_probe(self):
+        env = {"PATH": "", "HOME": ""}
+        with unittest.mock.patch.dict(os.environ, {}, clear=True), \
+             unittest.mock.patch.object(runtime.subprocess, "run", return_value=
+                                        unittest.mock.Mock(stdout="not a version", stderr="")) as run:
+            self.assertIsNone(runtime._runtime_version_for("opencode", env))
+            run.assert_called_once()
+            self.assertEqual(run.call_args.kwargs["timeout"], 3)
+            runtime.runtime_version.cache_clear()
+            run.side_effect = subprocess.TimeoutExpired(["opencode", "--version"], 3)
+            self.assertIsNone(runtime._runtime_version_for("opencode", env))
+
+    def test_custom_opencode_bin_name_is_never_probed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "executed"
+            wrapper = Path(temp) / "wrapper"
+            wrapper.write_text(f"#!/bin/sh\ntouch '{marker}'\nprintf '2.0.0\\n'\n")
+            wrapper.chmod(0o755)
+            # A basename other than opencode is not CLI evidence, even when
+            # selected through OPENCODE_BIN from the default is_v2() call.
+            env = {"PATH": "", "HOME": temp, "OPENCODE_BIN": str(wrapper)}
+            with unittest.mock.patch.dict(os.environ, {}, clear=True):
+                self.assertFalse(runtime.is_v2(environ=env))
+            self.assertFalse(marker.exists())
+
+    def test_v1_flags_and_v2_provider_variant_are_separate(self):
+        v1 = runtime.run_argv(binary="opencode", cwd="/work", agent="build",
+                              model="opencode-go/model", variant="high", pure=True,
+                              version=(1, 19, 0))
+        self.assertIn("--pure", v1)
+        self.assertIn("--dir", v1)
+        self.assertIn("--variant", v1)
+        v2 = runtime.run_argv(binary="opencode", cwd="/work", agent="build",
+                              model="opencode-go/model", variant="high", session="ses_exact",
+                              title="hearting-worker-att-x", pure=True, version=(2, 0, 32))
+        self.assertNotIn("--pure", v2)
+        self.assertNotIn("--standalone", v2)
+        self.assertNotIn("--dir", v2)
+        self.assertNotIn("--variant", v2)
+        self.assertEqual(v2[v2.index("--model") + 1], "opencode-go/model#high")
+        self.assertEqual(v2[v2.index("--session") + 1], "ses_exact")
+        self.assertEqual(v2[v2.index("--title") + 1], "hearting-worker-att-x")
+        private_v2 = runtime.run_argv(binary="opencode", model="fixture/model",
+                                      standalone=True, version=(2, 0, 32))
+        self.assertIn("--standalone", private_v2)
+        self.assertEqual(private_v2[private_v2.index("--model") + 1], "fixture/model")
+        self.assertNotIn("--standalone", runtime.run_argv(
+            binary="opencode", model="fixture/model", standalone=True, version=(1, 19, 0)))
+
+    def test_database_generation_never_selects_cli_generation(self):
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "1.19.0"}), \
+             unittest.mock.patch.object(runtime, "credential_store_present", return_value=True):
+            self.assertFalse(runtime.is_v2())
+        with unittest.mock.patch.dict(os.environ, {}, clear=True), \
+             unittest.mock.patch.object(runtime, "runtime_version", return_value=None), \
+             unittest.mock.patch.object(runtime, "credential_store_present", return_value=True):
+            self.assertFalse(runtime.is_v2())
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_RUNTIME_VERSION": "2.0.32"}):
+            self.assertTrue(runtime.is_v2())
+
 
 
 class OpenCodeFullPartsTest(unittest.TestCase):

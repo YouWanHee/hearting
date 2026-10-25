@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 import os
+from contextlib import chdir
+import hashlib
 import json
+import re
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
@@ -288,7 +293,10 @@ class RuntimeSnapshotTest(unittest.TestCase):
             current.write_text("before\n", encoding="utf-8")
             socket_path = managed / "app-server.sock"
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            listener.bind(str(socket_path))
+            # Bind the same real socket without spending AF_UNIX's path budget
+            # on the runner's potentially long temporary-directory prefix.
+            with chdir(root):
+                listener.bind(str(socket_path.relative_to(root)))
             try:
                 record = activation._copy_snapshot(
                     state, root / "backup", 0,
@@ -786,6 +794,469 @@ class LinkedReleaseBundleTest(unittest.TestCase):
 
 
 class RuntimeActivationOwnershipTest(unittest.TestCase):
+    def test_status_reports_tampered_owned_destination_as_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                activation.activate("codex", "linked", str(source))
+                state_path = activation._state_path("codex")
+                state = activation._load_json(state_path)
+                state["owned_paths"][0]["dest"] = str(root / "outside-runtime-home")
+                activation._atomic_json(state_path, state)
+
+                report = activation.status("codex")
+
+                self.assertEqual(report["freshness"], "missing")
+                self.assertEqual(report["user_changed"], [])
+
+    def test_prior_owned_drift_is_preservable_before_same_id_adoption(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "runtime-home"
+            source_root = root / "harness"
+            source_root.mkdir()
+
+            herdr_source = source_root / "integration.js"
+            herdr_source.write_text(
+                "// installed by herdr\n// HERDR_INTEGRATION_ID=opencode\n"
+                "// HERDR_INTEGRATION_VERSION=13\n",
+                encoding="utf-8",
+            )
+            herdr_dest = home / "plugins/integration.js"
+            herdr_dest.parent.mkdir(parents=True)
+            herdr_dest.write_text(
+                "// installed by herdr\n// HERDR_INTEGRATION_ID=opencode\n"
+                "// HERDR_INTEGRATION_VERSION=9\n",
+                encoding="utf-8",
+            )
+
+            link_dest = home / "skills/adopted-link"
+            link_dest.parent.mkdir(parents=True)
+            link_target = source_root / "alternate-target"
+            link_target.write_text("harness target\n", encoding="utf-8")
+            link_dest.symlink_to(link_target)
+
+            plugin_source = source_root / "plugin-source"
+            plugin_source.mkdir()
+            plugin_dest = home / "plugins/plugin-dir"
+            (plugin_dest / ".codex-plugin").mkdir(parents=True)
+
+            state = {"source_root": str(source_root), "active_root": str(source_root)}
+            cases = (
+                (
+                    {"dest": str(herdr_dest), "kind": "copy", "source": str(herdr_source)},
+                    {"dest": str(herdr_dest), "kind": "copy", "source": str(herdr_source)},
+                ),
+                (
+                    {"dest": str(link_dest), "kind": "symlink", "source": str(source_root / "expected")},
+                    {"dest": str(link_dest), "kind": "symlink", "source": str(source_root / "expected")},
+                ),
+                (
+                    {"dest": str(plugin_dest), "kind": "copytree", "source": str(plugin_source)},
+                    {"dest": str(plugin_dest), "kind": "copytree", "source": str(plugin_source)},
+                ),
+            )
+            for prior, desired in cases:
+                with self.subTest(kind=prior["kind"]):
+                    self.assertEqual(
+                        activation._preservable_user_changes(
+                            state, [desired], {prior["dest"]: prior}
+                        ),
+                        {prior["dest"]: prior},
+                    )
+
+    def test_same_id_user_copy_survives_repeated_refresh_and_removal_reports(self):
+        source_root = Path(__file__).resolve().parents[2]
+        old_bytes = (
+            b"// installed by herdr\n// HERDR_INTEGRATION_ID=opencode\n"
+            b"// HERDR_INTEGRATION_VERSION=12\n// old release\n"
+        )
+        user_bytes = (
+            b"// installed by herdr\n// HERDR_INTEGRATION_ID=opencode\n"
+            b"// HERDR_INTEGRATION_VERSION=9\n// user customization\n"
+        )
+
+        for removal in ("deactivate", "uninstall"):
+            with self.subTest(removal=removal), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with fixture_env.patched_environment(root / "fixture", source_root):
+                    home = activation.paths.runtime_home("opencode")
+                    dest = home / "plugins/herdr-agent-state.js"
+                    releases = []
+                    for version in (12, 13, 14):
+                        release = root / f"release-{version}" / "herdr-agent-state.js"
+                        release.parent.mkdir(parents=True, exist_ok=True)
+                        release.write_bytes(
+                            b"// installed by herdr\n// HERDR_INTEGRATION_ID=opencode\n"
+                            + f"// HERDR_INTEGRATION_VERSION={version}\n".encode()
+                            + f"// release {version}\n".encode()
+                        )
+                        releases.append(release)
+                    current = {"entry": None, "revision": "fixture-v12"}
+
+                    def desired(*_args, **_kwargs):
+                        return [current["entry"]]
+
+                    patches = (
+                        mock.patch.object(activation, "_desired_entries", side_effect=desired),
+                        mock.patch.object(activation, "_linked_entries", side_effect=desired),
+                        mock.patch.object(activation, "_discovered_harness_links", return_value=[]),
+                        mock.patch.object(activation, "_unexpected_harness_links", return_value=[]),
+                        mock.patch.object(activation, "duplicate_sources", return_value=[]),
+                        mock.patch.object(activation, "source_revision",
+                                          side_effect=lambda *_args: current["revision"]),
+                        mock.patch.object(activation, "_capture_replaced_installer_targets",
+                                          return_value={}),
+                        mock.patch.object(activation, "_activation_protected_paths", return_value=[]),
+                        mock.patch.object(activation, "_validate_source_symlinks"),
+                        mock.patch.object(activation, "_prepare_runtime_config", return_value=[]),
+                        mock.patch.object(activation.user_model_config, "seed_model_config",
+                                          return_value={}),
+                        mock.patch.object(activation.retired_memory_state, "retire"),
+                        mock.patch.object(activation.model_config, "resolve_config",
+                                          return_value=(None, SimpleNamespace(
+                                              source="fixture", reason="fixture"))),
+                    )
+                    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                         patches[5], patches[6], patches[7], patches[8], patches[9], \
+                         patches[10], patches[11], patches[12]:
+                        current["entry"] = {
+                            "dest": str(dest), "source": str(releases[0]), "kind": "copy",
+                            "surface": "herdr-fixture", "mode": 0o644,
+                        }
+                        activation.activate("opencode", "linked", str(source_root))
+                        state_path = activation._state_path("opencode")
+                        original_record = next(
+                            item for item in activation._load_json(state_path)["owned_paths"]
+                            if item["dest"] == str(dest)
+                        )
+                        dest.write_bytes(user_bytes)
+
+                        before = activation.status("opencode")
+                        self.assertEqual(before["user_changed"], [str(dest)])
+                        self.assertEqual(before["preserved"], [str(dest)])
+                        self.assertIn(f"preserved user-changed: {dest}", before["report_lines"])
+
+                        for version, release in zip((13, 14), releases[1:]):
+                            current["entry"] = {
+                                "dest": str(dest), "source": str(release), "kind": "copy",
+                                "surface": "herdr-fixture", "mode": 0o644,
+                            }
+                            current["revision"] = f"fixture-v{version}"
+                            refreshed = activation.refresh("opencode")
+                            self.assertEqual(dest.read_bytes(), user_bytes)
+                            self.assertIn(str(dest), refreshed["user_changed"])
+                            self.assertIn(str(dest), refreshed["preserved"])
+                            self.assertIn(f"preserved user-changed: {dest}", refreshed["report_lines"])
+                            carried = next(
+                                item for item in activation._load_json(state_path)["owned_paths"]
+                                if item["dest"] == str(dest)
+                            )
+                            self.assertEqual(carried, original_record)
+
+                        if removal == "deactivate":
+                            result = activation.deactivate("opencode")
+                            report_lines = result["report_lines"]
+                        else:
+                            args = installer.build_parser().parse_args(["uninstall", "opencode"])
+                            with mock.patch.object(
+                                installer.manifest, "load_ownership_manifest",
+                                return_value=(None, None),
+                            ):
+                                result = installer.cmd_uninstall(args)
+                            report_lines = result["lines"]
+                        preserved = result.get("preserved", [])
+                        preserved_paths = [
+                            item if isinstance(item, str) else item.get("path")
+                            for item in preserved
+                        ]
+                        self.assertIn(str(dest), preserved_paths)
+                        self.assertIn(f"preserved user-changed: {dest}", report_lines)
+                        self.assertEqual(dest.read_bytes(), user_bytes)
+
+    def test_fresh_same_id_adoption_keeps_snapshot_rollback_and_clean_updates(self):
+        source_root = Path(__file__).resolve().parents[2]
+        prefix = b"// installed by herdr\n// HERDR_INTEGRATION_ID=opencode\n"
+        old_bytes = prefix + b"// HERDR_INTEGRATION_VERSION=8\n// old Herdr copy\n"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with fixture_env.patched_environment(root / "fixture", source_root):
+                home = activation.paths.runtime_home("opencode")
+                dest = home / "plugins/herdr-agent-state.js"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(old_bytes)
+                releases = []
+                for version in (13, 14):
+                    release = root / f"release-{version}" / "herdr-agent-state.js"
+                    release.parent.mkdir(parents=True, exist_ok=True)
+                    release.write_bytes(prefix + f"// HERDR_INTEGRATION_VERSION={version}\n".encode()
+                                        + f"// release {version}\n".encode())
+                    releases.append(release)
+                current = {"entry": None, "revision": "fixture-v13"}
+
+                def desired(*_args, **_kwargs):
+                    return [current["entry"]]
+
+                patches = (
+                    mock.patch.object(activation, "_desired_entries", side_effect=desired),
+                    mock.patch.object(activation, "_linked_entries", side_effect=desired),
+                    mock.patch.object(activation, "_discovered_harness_links", return_value=[]),
+                    mock.patch.object(activation, "_unexpected_harness_links", return_value=[]),
+                    mock.patch.object(activation, "duplicate_sources", return_value=[]),
+                    mock.patch.object(activation, "source_revision",
+                                      side_effect=lambda *_args: current["revision"]),
+                    mock.patch.object(activation, "_capture_replaced_installer_targets",
+                                      return_value={}),
+                    mock.patch.object(activation, "_activation_protected_paths", return_value=[]),
+                    mock.patch.object(activation, "_validate_source_symlinks"),
+                    mock.patch.object(activation, "_prepare_runtime_config", return_value=[]),
+                    mock.patch.object(activation.user_model_config, "seed_model_config",
+                                      return_value={}),
+                    mock.patch.object(activation.retired_memory_state, "retire"),
+                    mock.patch.object(activation.model_config, "resolve_config",
+                                      return_value=(None, SimpleNamespace(
+                                          source="fixture", reason="fixture"))),
+                )
+                with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                     patches[5], patches[6], patches[7], patches[8], patches[9], \
+                     patches[10], patches[11], patches[12]:
+                    current["entry"] = {
+                        "dest": str(dest), "source": str(releases[0]), "kind": "copy",
+                        "surface": "herdr-fixture", "mode": 0o644,
+                    }
+                    with mock.patch.dict(os.environ, {"HARNESS_RUNTIME_FAIL_AFTER": "1"}):
+                        with self.assertRaisesRegex(activation.ActivationError,
+                                                    "injected failure after operation 1"):
+                            activation.activate("opencode", "linked", str(source_root))
+                    self.assertEqual(dest.read_bytes(), old_bytes)
+                    self.assertFalse(activation._state_path("opencode").exists())
+
+                    adopted = activation.activate("opencode", "linked", str(source_root))
+                    self.assertEqual(dest.read_bytes(), releases[0].read_bytes())
+                    self.assertEqual(adopted["preserved"], [])
+
+                    current["entry"] = {
+                        "dest": str(dest), "source": str(releases[1]), "kind": "copy",
+                        "surface": "herdr-fixture", "mode": 0o644,
+                    }
+                    current["revision"] = "fixture-v14"
+                    refreshed = activation.refresh("opencode")
+                    self.assertEqual(dest.read_bytes(), releases[1].read_bytes())
+                    self.assertEqual(refreshed["preserved"], [])
+                    owned = next(item for item in activation._load_json(
+                        activation._state_path("opencode"))["owned_paths"]
+                                 if item["dest"] == str(dest))
+                    self.assertEqual(owned["source"], str(releases[1]))
+                    self.assertEqual(owned["digest"], hashlib.sha256(releases[1].read_bytes()).hexdigest())
+
+    def test_shared_prior_owned_adoption_guard_covers_all_runtime_surfaces(self):
+        source_root = Path(__file__).resolve().parents[2]
+        markers = {"claude": "claude", "codex": "codex", "opencode": "opencode"}
+        for runtime, integration_id in markers.items():
+            with self.subTest(runtime=runtime), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with fixture_env.patched_environment(root / "fixture", source_root):
+                    home = activation.paths.runtime_home(runtime)
+                    prefix = "//" if runtime == "opencode" else "#"
+                    old = (f"{prefix} installed by herdr\n"
+                           f"{prefix} HERDR_INTEGRATION_ID={integration_id}\n"
+                           f"{prefix} HERDR_INTEGRATION_VERSION=8\nold\n").encode()
+                    user = (f"{prefix} installed by herdr\n"
+                            f"{prefix} HERDR_INTEGRATION_ID={integration_id}\n"
+                            f"{prefix} HERDR_INTEGRATION_VERSION=4\nuser edit\n").encode()
+                    source = root / "release" / f"{runtime}.js"
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.write_bytes((f"{prefix} installed by herdr\n"
+                                        f"{prefix} HERDR_INTEGRATION_ID={integration_id}\n"
+                                        f"{prefix} HERDR_INTEGRATION_VERSION=9\nnew\n").encode())
+                    dest = home / "plugins" / f"{runtime}.js"
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(user)
+                    entry = {"dest": str(dest), "source": str(source), "kind": "copy",
+                             "surface": "fake-shared-api", "mode": 0o644}
+                    prior = {"dest": str(dest), "source": str(source), "kind": "copy",
+                             "surface": "fake-shared-api",
+                             "digest": hashlib.sha256(old).hexdigest()}
+                    state = {"schema": activation.SCHEMA, "runtime": runtime,
+                             "mode": "linked", "scope": "global",
+                             "source_root": str(root / "release"),
+                             "active_root": str(root / "release"),
+                             "active_revision": "fixture-v8", "owned_paths": [prior],
+                             "managed_config": {}}
+                    state_path = activation._state_path(runtime)
+                    current = [entry]
+                    patches = (
+                        mock.patch.object(activation, "_desired_entries", return_value=current),
+                        mock.patch.object(activation, "_linked_entries", return_value=current),
+                        mock.patch.object(activation, "_discovered_harness_links", return_value=[]),
+                        mock.patch.object(activation, "_unexpected_harness_links", return_value=[]),
+                        mock.patch.object(activation, "duplicate_sources", return_value=[]),
+                        mock.patch.object(activation, "source_revision", return_value="fixture-v9"),
+                        mock.patch.object(activation.model_config, "resolve_config",
+                                          return_value=(None, SimpleNamespace(
+                                              source="fixture", reason="fixture"))),
+                        mock.patch.object(activation, "_claude_settings_health",
+                                          return_value=(False, [])),
+                        mock.patch.object(activation, "_codex_identity_health",
+                                          return_value=(False, [])),
+                    )
+                    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                         patches[5], patches[6], patches[7], patches[8]:
+                        activation._atomic_json(state_path, state)
+                        before = activation.status(runtime)
+                        self.assertEqual(before["user_changed"], [str(dest)])
+                        self.assertIn(f"preserved user-changed: {dest}", before["report_lines"])
+                        activation._apply_transaction(
+                            runtime, current, state, "linked", "global",
+                            source_roots=(source.parent,),
+                            commit_callback=lambda owned: activation._atomic_json(
+                                state_path, {**state, "owned_paths": owned}
+                            ),
+                        )
+                        self.assertEqual(dest.read_bytes(), user)
+                        self.assertEqual(activation._load_json(state_path)["owned_paths"], [prior])
+
+    def test_status_does_not_mark_carried_user_changed_stale_link_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                activation.activate("codex", "linked", str(source))
+                state_path = activation._state_path("codex")
+                state = activation._load_json(state_path)
+                dest = activation.paths.runtime_home("codex") / "skills/obsolete-skill"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                outside = root / "user-owned-target"
+                outside.write_text("user target\n", encoding="utf-8")
+                dest.symlink_to(outside)
+                state["owned_paths"].append({
+                    "dest": str(dest),
+                    "kind": "symlink",
+                    "source": str(Path(state["active_root"]) / "obsolete-skill"),
+                })
+                activation._atomic_json(state_path, state)
+
+                report = activation.status("codex")
+
+                self.assertEqual(report["freshness"], "duplicate")
+                self.assertIn(str(dest), report["user_changed"])
+                self.assertTrue(dest.is_symlink())
+                self.assertEqual(os.readlink(dest), str(outside))
+
+    def test_refresh_carries_user_replaced_projection_through_deactivate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                activation.activate("codex", "linked", str(source))
+                state_path = activation._state_path("codex")
+                state = activation._load_json(state_path)
+                owned = next(item for item in state["owned_paths"]
+                             if item.get("kind") == "symlink")
+                dest = Path(owned["dest"])
+                original_source = owned["source"]
+                # destructive-ok: reason=simulate a user replacing an activated link; boundary=dest leaf in this TemporaryDirectory's fixture HOME
+                dest.unlink()
+                user_bytes = b"user-owned replacement\n"
+                dest.write_bytes(user_bytes)
+
+                for _ in range(2):
+                    refreshed = activation.refresh("codex")
+                    self.assertEqual(dest.read_bytes(), user_bytes)
+                    self.assertIn(str(dest), refreshed["preserved"])
+                    self.assertIn(f"preserved user-changed: {dest}", refreshed["report_lines"])
+                    self.assertIn(f"user-changed:{dest.relative_to(activation.paths.runtime_home('codex'))}",
+                                  refreshed["duplicate_sources"])
+                    carried = next(item for item in activation._load_json(state_path)["owned_paths"]
+                                   if item["dest"] == str(dest))
+                    self.assertEqual(carried["source"], original_source)
+                    self.assertEqual(activation.status("codex")["user_changed"], [str(dest)])
+
+                result = activation.deactivate("codex")
+                self.assertIn(str(dest), result["preserved"])
+                self.assertEqual(dest.read_bytes(), user_bytes)
+
+    def test_refresh_preserves_repointed_and_dangling_owned_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                activation.activate("claude", "linked", str(source))
+                state = activation._load_json(activation._state_path("claude"))
+                owned = next(item for item in state["owned_paths"]
+                             if item.get("kind") == "symlink")
+                dest = Path(owned["dest"])
+                external = root / "outside-user-target"
+                external.write_text("user target\n", encoding="utf-8")
+                # destructive-ok: reason=repoint this test's activated link; boundary=dest leaf in this TemporaryDirectory's fixture HOME
+                dest.unlink()
+                dest.symlink_to(external)
+
+                for target in (external, root / "dangling-user-target"):
+                    if dest.is_symlink():
+                        # destructive-ok: reason=change this test's simulated user link target; boundary=dest leaf in this TemporaryDirectory's fixture HOME
+                        dest.unlink()
+                    dest.symlink_to(target)
+                    raw_target = os.readlink(dest)
+                    refreshed = activation.refresh("claude")
+                    self.assertTrue(dest.is_symlink())
+                    self.assertEqual(os.readlink(dest), raw_target)
+                    self.assertIn(str(dest), refreshed["preserved"])
+
+                result = activation.deactivate("claude")
+                self.assertIn(str(dest), result["preserved"])
+                self.assertTrue(dest.is_symlink())
+                self.assertEqual(os.readlink(dest), str(root / "dangling-user-target"))
+
+    def test_modified_copy_is_preserved_with_legacy_record_without_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                activation.activate("codex", "linked", str(source))
+                state_path = activation._state_path("codex")
+                state = activation._load_json(state_path)
+                owned = next(item for item in state["owned_paths"]
+                             if item.get("kind") == "copy")
+                dest = Path(owned["dest"])
+                legacy_item = dict(owned)
+                legacy_item.pop("digest", None)
+                state["owned_paths"] = [
+                    legacy_item if item["dest"] == owned["dest"] else item
+                    for item in state["owned_paths"]
+                ]
+                activation._atomic_json(state_path, state)
+                user_bytes = b"modified copied integration\n"
+                dest.write_bytes(user_bytes)
+
+                refreshed = activation.refresh("codex")
+                self.assertEqual(dest.read_bytes(), user_bytes)
+                self.assertIn(str(dest), refreshed["preserved"])
+                carried = next(item for item in activation._load_json(state_path)["owned_paths"]
+                               if item["dest"] == str(dest))
+                self.assertEqual(carried, legacy_item)
+                result = activation.deactivate("codex")
+                self.assertIn(str(dest), result["preserved"])
+                self.assertEqual(dest.read_bytes(), user_bytes)
+
+    def test_clean_refresh_replaces_all_owned_paths_without_preserving(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                first = activation.activate("codex", "linked", str(source))
+                before = activation._load_json(activation._state_path("codex"))["owned_paths"]
+                refreshed = activation.refresh("codex")
+                after = activation._load_json(activation._state_path("codex"))["owned_paths"]
+                self.assertEqual(first["preserved"], [])
+                self.assertEqual(refreshed["preserved"], [])
+                self.assertEqual(len(after), len(before))
+                self.assertTrue(all("digest" in item for item in after if item["kind"] == "copy"))
+                self.assertTrue(all(Path(item["dest"]).is_symlink()
+                                    for item in after if item["kind"] == "symlink"))
+
     def test_capture_excludes_runtime_local_harness_siblings(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1955,6 +2426,345 @@ class HerdrIntegrationAdoptionTest(unittest.TestCase):
                 with self.subTest(name):
                     with self.assertRaisesRegex(activation.ActivationError, "destination collision"):
                         activation._safe_existing_dest(dest, "copy", set(), [], src)
+
+class NativeAgentRenderTest(unittest.TestCase):
+    """Activation renders native agents from the runtime home's selected models.conf."""
+
+    DEEP_KEYS = {
+        "claude": ("CFG_TIER_DEEP_MODEL", "CFG_TIER_BALANCED_DEEP_MODEL"),
+        "codex": ("CFG_TIER_DEEP_MODEL",),
+        "opencode": ("CFG_TIER_BALANCED_DEEP_MODEL",),
+    }
+    EXT = {"claude": ".md", "codex": ".toml", "opencode": ".md"}
+    CATALOG = ("general-purpose", "light", "deep", "balanced")
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        patched = fixture_env.patched_environment(self.root / "fixture", REPO_ROOT)
+        patched.__enter__()
+        self.addCleanup(patched.__exit__, None, None, None)
+
+    # -- helpers -------------------------------------------------------------
+    def home(self, runtime):
+        return activation.paths.runtime_home(runtime)
+
+    def agent(self, runtime, name):
+        return self.home(runtime) / "agents" / f"{name}{self.EXT[runtime]}"
+
+    def shipped_conf(self, runtime):
+        return (REPO_ROOT / "adapters" / runtime / "config" / "models.conf").read_text(encoding="utf-8")
+
+    def write_conf(self, runtime, edits=None, text=None):
+        text = self.shipped_conf(runtime) if text is None else text
+        for key, value in (edits or {}).items():
+            line = f'{key}="{value}"' if " " in value else f"{key}={value}"
+            pattern = re.compile(rf"^{key}=.*$", re.M)
+            text = pattern.sub(lambda _m: line, text, count=1) if pattern.search(text) else text + f"\n{line}\n"
+        target = self.home(runtime) / "agent-config" / "models.conf"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def write_legacy_conf(self, runtime):
+        text = self.shipped_conf(runtime)
+        text = re.sub(r"^CFG_MODEL_PROFILE_(?:BALANCED|GRANULARITY_BALANCED)=.*\n", "", text, flags=re.M)
+        text = re.sub(r"\s*balanced:balanced(?=\s|\")", "", text)
+        self.write_conf(runtime, text=text)
+
+    def model_of(self, path):
+        match = re.search(r'^model\s*[=:]\s*"?([^"\n]+?)"?\s*$', path.read_text(encoding="utf-8"), re.M)
+        return match.group(1) if match else None
+
+    def shipped_snapshot(self):
+        return {
+            str(path): path.read_bytes()
+            for runtime in ("claude", "codex", "opencode")
+            for path in sorted((REPO_ROOT / "adapters" / runtime / "agents").rglob("*")) if path.is_file()
+        }
+
+    def user_models(self, runtime, deep="fixture-user-deep", light="fixture-user-light"):
+        edits = {key: deep for key in self.DEEP_KEYS[runtime]}
+        edits["CFG_TIER_LIGHT_MODEL"] = light
+        return edits
+
+    def shipped_models(self, runtime, tiers=None):
+        sys.path.insert(0, str(REPO_ROOT / "utilities"))
+        import model_profile
+        cfg = model_profile.load_config(REPO_ROOT / "adapters" / runtime / "config" / "models.conf")
+        keys = tiers or self.DEEP_KEYS[runtime] + ("CFG_TIER_LIGHT_MODEL",)
+        return sorted({cfg[key] for key in keys})
+
+    def installed_agents(self, runtime):
+        directory = self.home(runtime) / "agents"
+        return sorted(item.name for item in directory.iterdir()) if directory.is_dir() else []
+
+    def lines(self, report):
+        return "\n".join(report.get("report_lines", []))
+
+    # -- T1 / T6: the verify condition ---------------------------------------
+    def test_all_three_adapters_follow_the_user_models_and_never_touch_shipped_files(self):
+        before = self.shipped_snapshot()
+        for runtime in ("claude", "codex", "opencode"):
+            with self.subTest(runtime):
+                self.write_conf(runtime, self.user_models(runtime))
+                report = activation.activate(runtime, "linked", str(REPO_ROOT))
+                self.assertEqual(report["model_config_source"], "user")
+                self.assertEqual(report["freshness"], "fresh", report)
+                models = {}
+                for name in self.CATALOG:
+                    path = self.agent(runtime, name)
+                    self.assertTrue(path.is_file() and not path.is_symlink(), path)
+                    models[name] = self.model_of(path)
+                self.assertEqual(models["deep"], "fixture-user-deep")
+                self.assertEqual(models["light"], "fixture-user-light")
+                self.assertEqual(models["balanced"], "fixture-user-light")
+                if runtime == "codex":
+                    scout = self.agent(runtime, "memory-scout")
+                    self.assertFalse(scout.is_symlink())
+                    self.assertEqual(self.model_of(scout), "fixture-user-light")
+                if runtime == "claude":
+                    # The hand-written definition is not generated and stays a shipped link.
+                    self.assertTrue(self.agent(runtime, "memory-scout").is_symlink())
+        self.assertEqual(self.shipped_snapshot(), before)
+
+    # -- T2: a copy equal to the shipped file projects the shipped files ------
+    def test_a_user_copy_equal_to_shipped_keeps_shipped_links_and_the_old_digest(self):
+        for runtime in ("claude", "codex", "opencode"):
+            with self.subTest(runtime):
+                report = activation.activate(runtime, "linked", str(REPO_ROOT))
+                self.assertEqual(report["model_config_source"], "user")
+                desired = activation._desired_entries(runtime, "linked", REPO_ROOT, REPO_ROOT, "x", "global")
+                self.assertFalse([e for e in desired if e["kind"] == "render"])
+                agents = [e for e in desired if Path(e["dest"]).parent == self.home(runtime) / "agents"]
+                self.assertEqual(len(agents), 5)
+                for entry in agents:
+                    dest = Path(entry["dest"])
+                    self.assertTrue(dest.is_symlink(), dest)
+                    self.assertEqual(dest.resolve(), Path(entry["source"]).resolve())
+                self.assertEqual(report["projection_digest"],
+                                 activation._digest_paths(Path(e["source"]) for e in desired))
+
+    def test_legacy_user_copy_keeps_balanced_on_activate_and_refresh(self):
+        for runtime in ("claude", "codex", "opencode"):
+            with self.subTest(runtime):
+                self.write_legacy_conf(runtime)
+                activation.activate(runtime, "linked", str(REPO_ROOT))
+                report = activation.refresh(runtime)
+                balanced = self.agent(runtime, "balanced")
+                self.assertTrue(balanced.is_file(), balanced)
+                shipped = next((path for path in (REPO_ROOT / "adapters" / runtime / "agents").rglob(balanced.name)
+                                if path.is_file()), None)
+                if shipped is not None and balanced.read_bytes() == shipped.read_bytes():
+                    self.assertTrue(balanced.is_symlink(), balanced)
+                    self.assertEqual(balanced.resolve(), shipped.resolve())
+                else:
+                    self.assertFalse(balanced.is_symlink(), balanced)
+                self.assertFalse(any("balanced not-in-selected-catalog" in line
+                                     for line in report.get("report_lines", [])))
+
+    def test_refresh_failure_after_render_restores_the_prior_shipped_activation(self):
+        runtime = "opencode"
+        source = REPO_ROOT / "adapters" / runtime / "agents" / "deep" / f"deep{self.EXT[runtime]}"
+        source_bytes = source.read_bytes()
+        activation.activate(runtime, "linked", str(REPO_ROOT))
+        destination = self.agent(runtime, "deep")
+        self.assertTrue(destination.is_symlink())
+        shipped_target = os.readlink(destination)
+        state_path = activation._state_path(runtime)
+        prior_state = state_path.read_bytes()
+
+        self.write_conf(runtime, self.user_models(runtime))
+        desired = activation._desired_entries(
+            runtime, "linked", REPO_ROOT, REPO_ROOT, activation.source_revision(REPO_ROOT), "global"
+        )
+        first_render_index = next(
+            index for index, item in enumerate(desired, start=1) if item["kind"] == "render"
+        )
+        with mock.patch.dict(os.environ, {"HARNESS_RUNTIME_FAIL_AFTER": str(first_render_index)}):
+            with self.assertRaisesRegex(activation.ActivationError, "injected failure"):
+                activation.refresh(runtime)
+
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(os.readlink(destination), shipped_target)
+        self.assertEqual(source.read_bytes(), source_bytes)
+        self.assertEqual(state_path.read_bytes(), prior_state)
+        self.write_conf(runtime)
+        self.assertEqual(activation.status(runtime)["freshness"], "fresh")
+        for item in desired:
+            if item["kind"] == "render":
+                destination = Path(item["dest"])
+                self.assertTrue(destination.is_symlink(), destination)
+                self.assertEqual(destination.resolve(), Path(item["source"]).resolve())
+
+    # -- T3: known defect 1 --------------------------------------------------
+    def test_every_model_main_session_only_projects_no_agents_and_never_falls_back_to_shipped(self):
+        for runtime in ("codex", "claude"):
+            with self.subTest(runtime):
+                activation.activate(runtime, "linked", str(REPO_ROOT))
+                before = self.installed_agents(runtime)
+                self.assertIn(f"deep{self.EXT[runtime]}", before)
+                self.write_conf(runtime, {"CFG_MAIN_SESSION_ONLY_MODELS": " ".join(self.shipped_models(runtime))})
+                report = activation.refresh(runtime)
+                expected = ["memory-scout.md"] if runtime == "claude" else []
+                self.assertEqual(self.installed_agents(runtime), expected)
+                text = self.lines(report)
+                for name in self.CATALOG:
+                    self.assertIn(f"native agent {name} withheld", text)
+                if runtime == "codex":
+                    self.assertIn("native agent memory-scout withheld", text)
+                self.assertEqual(report["freshness"], "fresh", report)
+
+    # -- T3b: catalog entries removed from the selected config ---------------
+    def test_catalog_entries_missing_from_the_selected_config_leave_no_definition(self):
+        activation.activate("codex", "linked", str(REPO_ROOT))
+        self.assertTrue(self.agent("codex", "general-purpose").is_symlink())
+        self.write_conf("codex", {"CFG_NATIVE_AGENT_CATALOG": "deep:deep light:light"})
+        report = activation.refresh("codex")
+        self.assertEqual(self.installed_agents("codex"), ["deep.toml", "light.toml", "memory-scout.toml"])
+        text = self.lines(report)
+        for name in ("general-purpose", "balanced"):
+            self.assertIn(f"native agent {name} not-in-selected-catalog", text)
+        # memory-scout is a kernel helper: rendered whatever the catalog lists.
+        self.assertTrue(self.agent("codex", "memory-scout").exists())
+        self.assertEqual(report["freshness"], "fresh", report)
+
+    # -- T4: known defect 2 --------------------------------------------------
+    def reinstall_withholding_deep(self, how):
+        """Activate with deep rendered or shipped, then withhold the deep model on refresh."""
+        if how == "rendered":
+            edits, withheld = self.user_models("codex"), "fixture-user-deep"
+        else:
+            edits, withheld = {}, self.shipped_models("codex", ("CFG_TIER_DEEP_MODEL",))[0]
+        self.write_conf("codex", edits)
+        activation.activate("codex", "linked", str(REPO_ROOT))
+        self.assertEqual(self.agent("codex", "deep").is_symlink(), how == "shipped-link")
+        mine = self.agent("codex", "mine")
+        mine.write_text('name = "mine"\n', encoding="utf-8")
+        outside = self.root / "outside"
+        outside.mkdir()
+        theirs = self.agent("codex", "theirs")
+        theirs.symlink_to(outside)
+        self.write_conf("codex", {**edits, "CFG_MAIN_SESSION_ONLY_MODELS": withheld})
+        report = activation.refresh("codex")
+        for name in ("deep", "general-purpose"):  # both use the deep tier
+            path = self.agent("codex", name)
+            self.assertFalse(path.exists() or path.is_symlink(), path)
+        self.assertIn("native agent deep withheld", self.lines(report))
+        for name in ("light", "balanced", "memory-scout"):
+            self.assertTrue(self.agent("codex", name).exists(), name)
+        self.assertEqual(mine.read_text(encoding="utf-8"), 'name = "mine"\n')
+        self.assertTrue(theirs.is_symlink() and Path(os.readlink(theirs)) == outside)
+        activation.deactivate("codex")
+        self.assertEqual(self.installed_agents("codex"), ["mine.toml", "theirs.toml"])
+
+    def test_reinstall_that_newly_withholds_a_rendered_agent_removes_it(self):
+        self.reinstall_withholding_deep("rendered")
+
+    def test_reinstall_that_newly_withholds_a_shipped_link_removes_it(self):
+        self.reinstall_withholding_deep("shipped-link")
+
+    def edited_render_scenario(self):
+        self.write_conf("codex", self.user_models("codex"))
+        activation.activate("codex", "linked", str(REPO_ROOT))
+        deep = self.agent("codex", "deep")
+        deep.write_text(deep.read_text(encoding="utf-8") + "# my edit\n", encoding="utf-8")
+        return deep, deep.read_bytes()
+
+    def test_a_user_edited_rendered_file_is_kept_and_reported_when_its_model_is_withheld(self):
+        deep, edited = self.edited_render_scenario()
+        self.write_conf("codex", {**self.user_models("codex"), "CFG_MAIN_SESSION_ONLY_MODELS": "fixture-user-deep"})
+        report = activation.refresh("codex")
+        self.assertEqual(deep.read_bytes(), edited)
+        self.assertIn("deep.toml was edited after it was rendered", self.lines(report))
+        self.assertFalse(self.agent("codex", "general-purpose").exists())  # unedited: collected
+
+    def test_a_user_edited_rendered_file_is_never_overwritten_by_a_shipped_link(self):
+        deep, edited = self.edited_render_scenario()
+        self.write_conf("codex")  # the user config is back to the shipped one: desired is a link
+        with self.assertRaisesRegex(activation.ActivationError, "destination collision"):
+            activation.refresh("codex")
+        self.assertEqual(deep.read_bytes(), edited)
+        self.assertFalse(deep.is_symlink())
+
+    def test_refresh_preserves_a_user_edited_render_when_the_selected_model_changes(self):
+        deep, edited = self.edited_render_scenario()
+        self.write_conf("codex", {**self.user_models("codex"),
+                                  "CFG_TIER_DEEP_MODEL": "fixture-user-deep-2"})
+        report = activation.refresh("codex")
+        self.assertEqual(deep.read_bytes(), edited)
+        self.assertIn(str(deep), report["preserved"])
+
+    # -- T5 ------------------------------------------------------------------
+    def test_deactivate_removes_rendered_files_and_keeps_user_files(self):
+        for runtime in ("claude", "codex", "opencode"):
+            with self.subTest(runtime):
+                self.write_conf(runtime, self.user_models(runtime))
+                activation.activate(runtime, "linked", str(REPO_ROOT))
+                mine = self.home(runtime) / "agents" / "mine.txt"
+                mine.write_text("mine", encoding="utf-8")
+                activation.deactivate(runtime)
+                self.assertEqual(self.installed_agents(runtime), ["mine.txt"])
+
+    # -- T7 ------------------------------------------------------------------
+    def test_a_changed_models_conf_reads_stale_until_refresh(self):
+        self.write_conf("codex", self.user_models("codex"))
+        activation.activate("codex", "linked", str(REPO_ROOT))
+        self.assertEqual(activation.status("codex")["freshness"], "fresh")
+        self.write_conf("codex", self.user_models("codex", deep="fixture-user-deep-2"))
+        stale = activation.status("codex")
+        self.assertEqual(stale["freshness"], "cache-stale")
+        self.assertIn("harness runtime refresh", stale["next_action"])
+        activation.refresh("codex")
+        self.assertEqual(activation.status("codex")["freshness"], "fresh")
+        self.assertEqual(self.model_of(self.agent("codex", "deep")), "fixture-user-deep-2")
+
+    def test_a_source_without_the_renderer_keeps_the_shipped_links(self):
+        source = self.root / "old-source"
+        # An older release: adapters only, no utilities/native_agents.py.
+        shutil.copytree(REPO_ROOT / "adapters", source / "adapters", symlinks=True)
+        entries, lines = activation._native_agent_entries("codex", source, self.home("codex"))
+        self.assertEqual(lines, [])
+        self.assertEqual(sorted(Path(e["dest"]).name for e in entries),
+                         sorted(p.name for p in (source / "adapters/codex/agents").glob("*.toml")))
+        self.assertTrue(all(e["kind"] == "symlink" for e in entries))
+
+
+_TEST_HOME = None
+_TEST_ENVIRONMENT = None
+_PREVIOUS_TEMP_DIR = None
+
+
+def setUpModule():
+    """Run the complete module against an isolated default runtime home.
+
+    A few tests exercise public installer entry points without installing their
+    own fixture environment. Module-level setup keeps those tests safe under
+    both direct execution and unittest discovery.
+    """
+    global _TEST_HOME, _TEST_ENVIRONMENT, _PREVIOUS_TEMP_DIR
+    _TEST_HOME = tempfile.TemporaryDirectory(prefix="ra-")
+    _TEST_ENVIRONMENT = fixture_env.patched_environment(
+        Path(_TEST_HOME.name) / "f", REPO_ROOT
+    )
+    _TEST_ENVIRONMENT.__enter__()
+    temporary_root = Path(os.environ["HEARTING_FIXTURE_ROOT"]) / "t"
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    _PREVIOUS_TEMP_DIR = tempfile.tempdir
+    tempfile.tempdir = str(temporary_root)
+
+
+def tearDownModule():
+    global _TEST_HOME, _TEST_ENVIRONMENT, _PREVIOUS_TEMP_DIR
+    tempfile.tempdir = _PREVIOUS_TEMP_DIR
+    _PREVIOUS_TEMP_DIR = None
+    if _TEST_ENVIRONMENT is not None:
+        _TEST_ENVIRONMENT.__exit__(None, None, None)
+        _TEST_ENVIRONMENT = None
+    if _TEST_HOME is not None:
+        _TEST_HOME.cleanup()
+        _TEST_HOME = None
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -96,6 +96,12 @@ def _replacement_kind(status, meta, *, jobs=None, lines=None):
             and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')
             and DR._frame_rule_top(jobs, meta)):
         return DR.FRAME_CAPACITY
+    if (jobs is not None and meta.get('worker_type') == 'frame' and status == 'done'
+            and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')
+            and DR._frame_pair_rotation_verified(jobs, meta)):
+        # A verified rotated alternative uses ordinary capacity recovery; it
+        # does not claim the frame rule's top-to-deep transition.
+        return 'capacity'
     return None
 
 
@@ -624,6 +630,12 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                     raise _contract_error("owner-closure-intensity-unknown", "owner-closure-intensity-unknown:" + route["effective_intensity"])
                 raise
         worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
+        # Strict terminal no-start rows remain in the physical registry and in
+        # dispatch-node's lineage view, but are not launched rounds. Derive the
+        # exclusion from the same launch-fence proof used by retry admission.
+        from dispatch_contract import terminal_attempt_never_started
+        rows = [(status, meta) for status, meta in rows
+                if not terminal_attempt_never_started(status, meta)]
         kinds = [_ROUND.classify_round_row(s, m, worker_type=m.get("worker_type") or worker_type) for s, m in rows]
         source_digest = facts.get("source_subject_digest")
         source_aware = False
@@ -1727,6 +1739,17 @@ def resource_predecessor_finished(row):
         reboot_evidence,
     )
     from dispatch_resource_wait import supervisor
+    execution = row.get("execution") if isinstance(row, dict) else None
+    if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+        if (row.get("resource_policy") != "supervised-owner"
+                or row.get("cancel_requested") or row.get("parent_close_requested")
+                or row.get("status") not in {"failed", "succeeded"}):
+            return False
+        code = supervisor().runner().read_sentinel(row.get("sentinel"))
+        return (code is not None and row.get("exit_code") == code
+                and not (row.get("status") == "failed" and code == 0)
+                and not (row.get("status") == "succeeded" and code != 0)
+                and resource_process_group_quiescent(row))
     if resource_never_started(row):
         return True
     identity = classify_identity(row)
@@ -1753,12 +1776,21 @@ def resource_predecessor_finished(row):
                  or resource_process_group_quiescent(row)))
 
 
-def require_resource_predecessors(rows, candidate):
+def require_resource_predecessors(rows, candidate, *, observations=None):
     """Recheck execution and evidence-address protection within the existing reservation lock."""
     from dispatch_resource_wait import resource_evidence_paths_conflict
-    if any(not resource_predecessor_finished(row) or resource_evidence_paths_conflict(row, candidate)
-           for row in rows):
-        raise ValueError("resource-route-body-conflict")
+    observations = observations or {}
+    for row in rows:
+        execution = row.get("execution") if isinstance(row, dict) else None
+        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+            captured = observations.get(row.get("run_id"))
+            if (not captured or captured.get("row") != row
+                    or captured.get("state") != "quiescent"):
+                raise ValueError("resource-route-body-conflict")
+        elif not resource_predecessor_finished(row):
+            raise ValueError("resource-route-body-conflict")
+        if resource_evidence_paths_conflict(row, candidate):
+            raise ValueError("resource-route-body-conflict")
 
 
 # Same work, another launcher. Never-started work may be taken over by a launcher that runs

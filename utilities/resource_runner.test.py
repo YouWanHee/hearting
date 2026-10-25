@@ -3,8 +3,10 @@
 import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -37,6 +39,518 @@ assert spec and spec.loader
 spec.loader.exec_module(R)
 
 
+class ComputeRunAdoptionTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.route_file = self.root / "route.json"
+        self.jobs = self.root / "jobs.log"
+        self.jobs.write_text("")
+        self.registry = self.root / "resource-runs.json"
+        self.sentinel = self.root / "old.exit"
+        self.sentinel.write_text("1\n")
+        self.workflow = self.root / "workflow"
+        self.workflow.mkdir()
+        self.journal = self.workflow / "journal.jsonl"
+        self.journal.write_bytes(b'{"event":"prior-history"}\n')
+        self.marker = self.jobs.parent / "completion" / "rt-adopt" / "full-run.json"
+        self.marker.parent.mkdir(parents=True)
+        self.marker.write_bytes(b'{"marker":"prior"}\n')
+        self.claim = self.workflow / "claims" / "successor.json"
+        self.claim.parent.mkdir()
+        self.claim.write_bytes(b'{"claim":"prior"}\n')
+        self.output = self.root / "cycle"
+        self.output.mkdir()
+        (self.output / "run.json").write_text('{"existing":"science artifact"}\n')
+        self.compute_root = self.root / "compute"
+        self.compute_root.mkdir()
+        self.compute_run = self.compute_root / "compute-1"
+        self.compute_run.mkdir()
+        self.compute_config = self.root / "compute-hosts.yaml"
+        self.attestation = self.root / "smoke-attestation.json"
+        self.attestation.write_text('{"fixture":true}\n')
+        attestation_sha = hashlib.sha256(self.attestation.read_bytes()).hexdigest()
+        self.route = {"route_id": "rt-adopt", "route_hash": "sha256:route",
+                      "capability": "autopilot-lab", "artifact_root": str(self.root),
+                      "cwd": str(self.root), "nodes": [{"id": "full-run", "kind": "resource-runner",
+                          "outputs": ["run.json"], "continuation": {"kind": "supervised"}}]}
+        self.route_file.write_text(json.dumps(self.route))
+        self.sealed = {"command": ["compute-hosts", "run", "gpu", "--cwd", "/lab",
+                                    "--env", "env-a", "--", "python", "train.py"],
+                       "cwd": str(self.root), "config_ref": "cfg", "config_sha256": "c" * 64,
+                       "source_commit": "commit-a", "source_dirty": False,
+                       "source_git_state": "clean", "config_layout": "layout-a",
+                       "launch_request": {"smoke_attestation": str(self.attestation),
+                           "smoke_attestation_sha256": attestation_sha}}
+        self.original = {"run_id": "full-run", "route": str(self.route_file), "node": "full-run",
+                         "jobs": str(self.jobs), "resource_policy": "supervised-owner",
+                         "parent_attempt_id": "att-original", "status": "failed", "exit_code": 1,
+                         "sentinel": str(self.sentinel), "resource_binding": None, **self.sealed}
+        self.registry.write_text(json.dumps({"schema_version": 1, "runs": {"full-run": self.original}}))
+        self.owner_wait = {"parent_attempt_id": "att-owner", "session_id": "sid-owner",
+                           "route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+                           "jobs": str(self.jobs), "owner_pid": 123, "owner_start": "456"}
+        self.parent_contract = {"route_id": self.route["route_id"], "route_file": str(self.route_file),
+                                "route_hash": self.route["route_hash"], "node": "full-run",
+                                "run_id": "full-run", "attempt_id": "att-original", "sealed": self.sealed,
+                                "artifact_base": str(self.output), "declared_outputs": ["run.json"],
+                                "inputs": [{"name": "smoke_attestation", "path": str(self.attestation),
+                                    "sha256": attestation_sha, "verified": True}]}
+        self.provenance = {"run_id": "full-run", "registry": str(self.registry),
+                           "route_id": self.route["route_id"], "route_file": str(self.route_file),
+                           "route_hash": self.route["route_hash"], "node": "full-run",
+                           "parent_attempt_id": "att-original", "contract": self.parent_contract}
+        self.contract = {"command": ["python", "train.py"], "cwd": "/lab", "env": "env-a", "share": False,
+                         "resource_parent": self.parent_contract,
+                         "route": {"route_id": self.route["route_id"],
+                                   "route_file": str(self.route_file),
+                                   "route_hash": self.route["route_hash"]}}
+        self.execution = {"kind": "compute-hosts", "run_id": "compute-1",
+                          "run_root": str(self.root), "host": "gpu", "meta_sha256": "m" * 64,
+                          "exit_sha256": "e" * 64, "receipt_sha256": "r" * 64,
+                          "outputs_sha256": "o" * 64,
+                          "contract_sha256": "c" * 64, "contract": self.contract,
+                          "receipt_state": "finished", "identity": {"pid": 9},
+                          "outputs": [{"path": "run.json", "sha256": hashlib.sha256(
+                              (self.output / "run.json").read_bytes()).hexdigest(),
+                              "state": "present", "size": (self.output / "run.json").stat().st_size}],
+                          "provenance": self.provenance, "started_at": 1.0, "ended_at": 2.0}
+        self.armed = {"route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+                      "route_file": str(self.route_file), "node": "full-run",
+                      "predecessor_kind": "resource", "predecessor_id": "full-run",
+                      "resource_registry": str(self.registry), "jobs": str(self.jobs),
+                      "artifact_base": str(self.output), "resource_binding": "body"}
+
+    def _write_real_compute_fixture(self):
+        output_raw = (self.output / "run.json").read_bytes()
+        output_row = {"path": "run.json", "sha256": hashlib.sha256(output_raw).hexdigest(),
+                      "state": "present", "size": len(output_raw)}
+        self.compute_config.write_text(
+            f"schema_version: 1\nrun_root: {self.compute_root}\nhosts:\n"
+            "  gpu:\n    ssh_host: fixture-host\n")
+        self.compute_run.joinpath("meta.json").write_text(json.dumps({
+            "run_id": "compute-1", "host": "gpu", "execution_contract": self.contract,
+            "contract_sha256": hashlib.sha256(json.dumps(
+                self.contract, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "provenance": {"resource": self.provenance},
+        }))
+        self.compute_run.joinpath("exit_code").write_text("0\n")
+        self.compute_run.joinpath("launch-receipt.json").write_text(json.dumps({
+            "schema_version": 1, "run_id": "compute-1", "host": "fixture-host",
+            "state": "finished", "exit_code": 0,
+            "identity": {"pid": 9, "starttime": "11", "process_group": 9,
+                         "pid_namespace": "pid:[fixture]", "boot_id": "fixture-boot"},
+            "started_at": 1.0, "ended_at": 2.0,
+        }))
+        self.compute_run.joinpath("outputs.json").write_text(json.dumps({
+            "schema_version": 1, "run_id": "compute-1", "outputs": [output_row],
+        }))
+        execution_identity = "compute-hosts:compute-1:" + ":".join(
+            hashlib.sha256(self.compute_run.joinpath(name).read_bytes()).hexdigest()
+            for name in ("meta.json", "exit_code", "launch-receipt.json")) + ":" + json.loads(
+                self.compute_run.joinpath("meta.json").read_text())["contract_sha256"]
+        marker = json.dumps({"resource_execution_identity": execution_identity}) + "\n"
+        self.marker.write_text(marker)
+        self.claim.write_text(marker)
+
+    def _mutate_real_compute_output(self):
+        output_raw = b'{"changed":true}\n'
+        (self.output / "run.json").write_bytes(output_raw)
+        outputs = {"schema_version": 1, "run_id": "compute-1", "outputs": [{
+            "path": "run.json", "sha256": hashlib.sha256(output_raw).hexdigest(),
+            "state": "present", "size": len(output_raw),
+        }]}
+        self.compute_run.joinpath("outputs.json").write_text(json.dumps(outputs))
+
+    def _run_adoption(self, *, cwd="/lab", owner_status="open", target="target",
+                      route_closed=False, binding_conflict=False, replay=False,
+                      interrupt_before_arm=False, late_conflict=None,
+                      real_compute=False, mutate_outputs_before_replay=False,
+                      missing_outputs_hash=False):
+        import contextlib
+        import resource_run_registry as RR
+        import dispatch_resource_wait as OWNER_RESOURCE
+        fake_ledger = SimpleNamespace(lock=contextlib.nullcontext,
+                                      root=self.workflow,
+                                      state=lambda: ({"workflow_state": "CANCELLED",
+                                          "nodes": {"full-run": {"state": "READY"}}}
+                                          if late_conflict == "stage-state" else
+                                          {"workflow_state": "RUNNING",
+                                           "nodes": {"full-run": {"state": "RUNNING"}}}),
+                                      claims=lambda: {}, journal=lambda: [])
+        fake_ledger.root.mkdir(exist_ok=True)
+        armed_reads = 0
+        def read_armed(_ledger):
+            nonlocal armed_reads
+            armed_reads += 1
+            if late_conflict == "armed-row" and armed_reads > 1:
+                return {"full-run": {**self.armed, "route_hash": "changed-route-hash"}}
+            return {"full-run": self.armed}
+        def resource_predecessors(*_args):
+            if not real_compute:
+                return [(self.armed, self.original)]
+            row = json.loads(self.registry.read_text())["runs"].get(self.armed["predecessor_id"])
+            return [(self.armed, row)] if row is not None else []
+
+        fake_sup = SimpleNamespace(
+            ledger_for=lambda *_args: fake_ledger,
+            read_armed=read_armed,
+            resource_predecessors=resource_predecessors,
+            resource_continuation_cancelled=lambda *_args: route_closed,
+        )
+        fake_compute = SimpleNamespace(load_config=lambda: {"run_root": self.root, "hosts": {}})
+        def validate_fake_outputs(base, declared, rows):
+            expected_paths = list(declared)
+            actual_paths = ([row.get("path") for row in rows if isinstance(row, dict)]
+                            if isinstance(rows, list) else None)
+            if actual_paths != expected_paths:
+                return {"ok": False, "reason": "compute-run-output-membership-changed",
+                        "differences": [{"field": "outputs.paths", "expected": expected_paths,
+                                         "actual": actual_paths}], "retryable": False,
+                        "next_action": "verify the selected compute output set"}
+            for row in rows:
+                target = Path(base) / row["path"]
+                try:
+                    raw = target.read_bytes()
+                except OSError:
+                    return {"ok": False, "reason": "compute-run-output-missing",
+                            "differences": [{"field": "outputs." + row["path"],
+                                             "expected": "present", "actual": "missing"}],
+                            "retryable": False,
+                            "next_action": "verify the selected compute output files"}
+                actual = {"sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}
+                expected = {"sha256": row.get("sha256"), "size": row.get("size")}
+                if actual != expected:
+                    return {"ok": False, "reason": "compute-run-output-changed",
+                            "differences": [{"field": "outputs." + row["path"],
+                                             "expected": expected, "actual": actual}],
+                            "retryable": False,
+                            "next_action": "restore the original compute output before replaying"}
+            return {"ok": True}
+        fake_compute.validate_compute_outputs = validate_fake_outputs
+        def fake_execution_record(*_args):
+            execution = {**self.execution, "contract": {**self.contract, "cwd": cwd}}
+            if missing_outputs_hash:
+                execution.pop("outputs_sha256", None)
+            return {"state": "quiescent", "execution": execution,
+                    "run_dir": str(self.compute_run)}
+        fake_compute.execution_record = fake_execution_record
+        def run_snapshot_current(*_args):
+            if late_conflict == "publication":
+                current = json.loads(self.registry.read_text())
+                current["runs"]["full-run"]["exit_code"] = 7
+                self.registry.write_text(json.dumps(current))
+                self.raced_registry = self.registry.read_bytes()
+            return True
+        fake_compute.run_snapshot_current = run_snapshot_current
+        loader = SimpleNamespace(exec_module=lambda _module: None)
+        fake_inputs = SimpleNamespace(_locked=lambda *_args: contextlib.nullcontext(),
+                                      _target=lambda *_args: (SimpleNamespace(status=owner_status), target))
+        if binding_conflict:
+            self.armed["resource_binding"] = "wrong-binding"
+        fake_artifacts = SimpleNamespace(prepare_route_artifact_env=lambda *_args, **_kwargs: {
+            "AGENT_ARTIFACT_OUTPUT_DIR": str(self.output)})
+        if real_compute:
+            self._write_real_compute_fixture()
+            real_spec_from_file_location = importlib.util.spec_from_file_location
+            real_module_from_spec = importlib.util.module_from_spec
+            self.remote_call = mock.Mock(return_value=SimpleNamespace(
+                returncode=0, stdout='{"state":"empty","reason":"fixture-remote-empty"}\n'))
+            remote_call = self.remote_call
+
+            def real_compute_spec(name, location, *positional, **keywords):
+                spec = real_spec_from_file_location(name, location, *positional, **keywords)
+                if spec and Path(location).name == "compute-hosts.py":
+                    source_loader = spec.loader
+
+                    class ObserverBoundaryLoader:
+                        def create_module(self, module_spec):
+                            create = getattr(source_loader, "create_module", None)
+                            return create(module_spec) if create else None
+
+                        def exec_module(self, module):
+                            source_loader.exec_module(module)
+                            real_observer = module.observe_run_quiescence
+
+                            def observe_with_fixture_remote(config, run_id, expected=None):
+                                return real_observer(config, run_id, expected=expected,
+                                                     remote_call=remote_call)
+
+                            module.observe_run_quiescence = observe_with_fixture_remote
+
+                    spec.loader = ObserverBoundaryLoader()
+                return spec
+
+            spec_factory = mock.patch("importlib.util.spec_from_file_location",
+                                      side_effect=real_compute_spec)
+            module_factory = mock.patch("importlib.util.module_from_spec",
+                                        side_effect=real_module_from_spec)
+        else:
+            spec_factory = mock.patch("importlib.util.spec_from_file_location",
+                                      return_value=SimpleNamespace(loader=loader))
+            module_factory = mock.patch("importlib.util.module_from_spec", return_value=fake_compute)
+        patches = [
+            mock.patch.object(OWNER_RESOURCE, "start_binding", return_value=self.owner_wait),
+            mock.patch.object(OWNER_RESOURCE, "supervisor", return_value=fake_sup),
+            mock.patch.object(OWNER_RESOURCE, "resource_body_digest", return_value="body"),
+            mock.patch.object(OWNER_RESOURCE, "resource_evidence_paths_conflict",
+                              return_value=late_conflict == "evidence-path"),
+            mock.patch.object(RR, "classify_identity", return_value=("exited", None, "process-absent")),
+            mock.patch.object(RR, "resource_process_group_quiescent", return_value=True),
+            mock.patch("dispatch_owner_input._locked", side_effect=fake_inputs._locked),
+            mock.patch("dispatch_owner_input._target", side_effect=fake_inputs._target),
+            spec_factory,
+            module_factory,
+            mock.patch.dict(sys.modules, {"artifact_producer": fake_artifacts}),
+            mock.patch.object(R.subprocess, "run"),
+            mock.patch.object(R.subprocess, "Popen"),
+            mock.patch.object(R, "verify_launch_input"),
+            mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.jobs),
+                                         "AGENT_DISPATCH_COMPLETION_MODE": "supervised",
+                                         **({"COMPUTE_HOSTS_CONFIG": str(self.compute_config)}
+                                            if real_compute else {})}, clear=False),
+        ]
+        entered = [patcher.start() for patcher in patches]
+        self.addCleanup(lambda: [patcher.stop() for patcher in reversed(patches)])
+        arm_runner = entered[11]
+        process_spawn = entered[12]
+        arm_calls = 0
+        def run_arm(*args, **kwargs):
+            nonlocal arm_calls
+            arm_calls += 1
+            if interrupt_before_arm and arm_calls == 1:
+                raise subprocess.TimeoutExpired(args[0], 30)
+            if real_compute:
+                self.armed = {**self.armed, "predecessor_id": "full-run__a1"}
+            return subprocess.CompletedProcess(args[0], 0)
+        arm_runner.side_effect = run_arm
+        args = SimpleNamespace(jobs=str(self.jobs), parent_attempt_id="att-owner")
+        with mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
+            if interrupt_before_arm:
+                with self.assertRaises(SystemExit) as interrupted:
+                    R.adopt_compute_run(self.registry, args, self.route, self.route_file, "compute-1")
+                self.assertEqual(interrupted.exception.code, 65)
+                self.assertIn("resource-compute-binding-conflict", interrupted.exception.resource_message)
+            else:
+                R.adopt_compute_run(self.registry, args, self.route, self.route_file, "compute-1")
+            if replay or interrupt_before_arm:
+                self.pre_replay_registry = self.registry.read_bytes()
+                self.pre_replay_failed_row = json.loads(self.pre_replay_registry)["runs"]["full-run"]
+                self.pre_replay_sentinel = self.sentinel.read_bytes()
+                self.pre_replay_jobs = self.jobs.read_bytes()
+                self.pre_replay_workflow = {
+                    path.relative_to(self.workflow).as_posix(): path.read_bytes()
+                    for path in self.workflow.rglob("*") if path.is_file()
+                }
+                self.pre_replay_marker = self.marker.read_bytes()
+                self.pre_replay_claim = self.claim.read_bytes()
+                if mutate_outputs_before_replay:
+                    self._mutate_real_compute_output()
+                R.adopt_compute_run(self.registry, args, self.route, self.route_file, "compute-1")
+        if interrupt_before_arm or replay:
+            self.assertEqual(arm_calls, 1 if real_compute and not interrupt_before_arm else 2)
+        self.assertEqual(process_spawn.call_count, 0)
+        if real_compute:
+            self.assertGreaterEqual(self.remote_call.call_count, 1)
+        return json.loads(self.registry.read_text())["runs"]
+
+    def test_same_contract_adopts_one_retry_without_payload_spawn(self):
+        runs = self._run_adoption()
+        adopted = runs["full-run__a1"]
+        self.assertEqual(adopted["status"], "succeeded")
+        self.assertEqual(adopted["execution"]["kind"], "compute-hosts")
+        self.assertEqual(adopted["parent_attempt_id"], "att-owner")
+        self.assertEqual(runs["full-run"], self.original)
+        self.assertEqual(self.sentinel.read_text(), "1\n")
+
+    def test_repeat_compute_run_reuses_the_published_row(self):
+        runs = self._run_adoption(replay=True)
+        self.assertEqual(list(runs), ["full-run", "full-run__a1"])
+        self.assertEqual(runs["full-run__a1"]["execution"]["run_id"], "compute-1")
+
+    def test_changed_output_receipt_refuses_armed_replay_without_mutation(self):
+        with self.assertRaises(SystemExit) as caught:
+            self._run_adoption(real_compute=True, replay=True,
+                               mutate_outputs_before_replay=True)
+        self.assertEqual(caught.exception.code, 65)
+        refusal = json.loads(caught.exception.resource_message)
+        self.assertEqual(refusal["reason"], "resource-compute-evidence-changed")
+        self.assertEqual(refusal["differences"][0]["field"], "execution.outputs_sha256")
+        self.assertTrue(refusal["differences"][0]["expected"])
+        self.assertTrue(refusal["differences"][0]["actual"])
+        self.assertTrue(refusal["next_action"])
+        self.assertFalse(refusal["retryable"])
+        self.assertEqual(self.registry.read_bytes(), self.pre_replay_registry)
+        self.assertEqual(self.sentinel.read_bytes(), self.pre_replay_sentinel)
+        self.assertEqual(self.jobs.read_bytes(), self.pre_replay_jobs)
+        self.assertEqual({path.relative_to(self.workflow).as_posix(): path.read_bytes()
+                          for path in self.workflow.rglob("*") if path.is_file()},
+                         self.pre_replay_workflow)
+        self.assertEqual(self.marker.read_bytes(), self.pre_replay_marker)
+        self.assertEqual(self.claim.read_bytes(), self.pre_replay_claim)
+        self.assertEqual(json.loads(self.marker.read_bytes())["resource_execution_identity"],
+                         json.loads(self.claim.read_bytes())["resource_execution_identity"])
+        self.assertEqual(list(json.loads(self.registry.read_bytes())["runs"]),
+                         ["full-run", "full-run__a1"])
+        self.assertEqual(self.pre_replay_failed_row, self.original)
+
+    def test_publish_before_arm_changed_output_does_not_create_another_retry(self):
+        with self.assertRaises(SystemExit) as caught:
+            self._run_adoption(real_compute=True, interrupt_before_arm=True,
+                               mutate_outputs_before_replay=True)
+        self.assertEqual(caught.exception.code, 65)
+        refusal = json.loads(caught.exception.resource_message)
+        self.assertEqual(refusal["reason"], "resource-compute-evidence-changed")
+        self.assertFalse(refusal["retryable"])
+        self.assertEqual(self.registry.read_bytes(), self.pre_replay_registry)
+        self.assertEqual(list(json.loads(self.registry.read_bytes())["runs"]),
+                         ["full-run", "full-run__a1"])
+        self.assertEqual(self.sentinel.read_bytes(), self.pre_replay_sentinel)
+        self.assertEqual(self.marker.read_bytes(), self.pre_replay_marker)
+        self.assertEqual(self.claim.read_bytes(), self.pre_replay_claim)
+        self.assertEqual(self.jobs.read_bytes(), self.pre_replay_jobs)
+        self.assertEqual({path.relative_to(self.workflow).as_posix(): path.read_bytes()
+                          for path in self.workflow.rglob("*") if path.is_file()},
+                         self.pre_replay_workflow)
+        self.assertEqual(json.loads(self.registry.read_bytes())["runs"]["full-run"],
+                         self.original)
+
+    def test_real_execution_record_unchanged_replay_keeps_identity_and_registry_bytes(self):
+        runs = self._run_adoption(real_compute=True, replay=True)
+        self.assertEqual(list(runs), ["full-run", "full-run__a1"])
+        self.assertEqual(self.registry.read_bytes(), self.pre_replay_registry)
+        self.assertEqual(runs["full-run__a1"]["execution"]["outputs_sha256"],
+                         hashlib.sha256(self.compute_run.joinpath("outputs.json").read_bytes()).hexdigest())
+        self.assertEqual(runs["full-run__a1"]["execution"]["identity_key"],
+                         "compute-hosts:compute-1:" + ":".join(
+                             runs["full-run__a1"]["execution"][key] for key in
+                             ("meta_sha256", "exit_sha256", "receipt_sha256", "contract_sha256")))
+        self.assertEqual(self.marker.read_bytes(), self.pre_replay_marker)
+        self.assertEqual(self.claim.read_bytes(), self.pre_replay_claim)
+        self.assertEqual(self.jobs.read_bytes(), self.pre_replay_jobs)
+        self.assertEqual({path.relative_to(self.workflow).as_posix(): path.read_bytes()
+                          for path in self.workflow.rglob("*") if path.is_file()},
+                         self.pre_replay_workflow)
+
+    def test_real_publish_before_arm_interruption_reuses_identical_row(self):
+        runs = self._run_adoption(real_compute=True, interrupt_before_arm=True)
+        self.assertEqual(list(runs), ["full-run", "full-run__a1"])
+        self.assertEqual(self.registry.read_bytes(), self.pre_replay_registry)
+        self.assertEqual(runs["full-run__a1"]["execution"]["outputs_sha256"],
+                         hashlib.sha256(self.compute_run.joinpath("outputs.json").read_bytes()).hexdigest())
+        self.assertEqual(runs["full-run__a1"]["execution"]["identity_key"],
+                         "compute-hosts:compute-1:" + ":".join(
+                             runs["full-run__a1"]["execution"][key] for key in
+                             ("meta_sha256", "exit_sha256", "receipt_sha256", "contract_sha256")))
+        self.assertEqual(self.marker.read_bytes(), self.pre_replay_marker)
+        self.assertEqual(self.claim.read_bytes(), self.pre_replay_claim)
+        self.assertEqual(self.pre_replay_failed_row, self.original)
+
+    def test_missing_outputs_hash_fails_closed_without_selecting_local_failed_row(self):
+        before_registry = self.registry.read_bytes()
+        with self.assertRaises(SystemExit) as caught:
+            self._run_adoption(missing_outputs_hash=True)
+        self.assertEqual(caught.exception.code, 65)
+        refusal = json.loads(caught.exception.resource_message)
+        self.assertEqual(refusal["reason"], "resource-compute-output-missing")
+        self.assertEqual(refusal["differences"], [{"field": "execution.outputs_sha256",
+            "expected": "non-empty recorded evidence", "actual": None}])
+        self.assertFalse(refusal["retryable"])
+        self.assertEqual(self.registry.read_bytes(), before_registry)
+
+    def test_publish_then_arm_interruption_converges_on_one_row(self):
+        runs = self._run_adoption(interrupt_before_arm=True)
+        self.assertEqual(list(runs), ["full-run", "full-run__a1"])
+        self.assertEqual(runs["full-run__a1"]["execution"]["run_id"], "compute-1")
+
+    def test_contract_mismatch_refuses_before_registry_or_sentinel_changes(self):
+        prior_bytes = self.registry.read_bytes()
+        with self.assertRaises(SystemExit) as caught:
+            self._run_adoption(cwd="/changed")
+        self.assertEqual(caught.exception.code, 65)
+        self.assertEqual(self.registry.read_bytes(), prior_bytes)
+        self.assertEqual(self.sentinel.read_text(), "1\n")
+
+    def test_output_bytes_must_match_the_compute_completion_snapshot(self):
+        prior_bytes = self.registry.read_bytes()
+        (self.output / "run.json").write_text('{"changed":true}\n')
+        with self.assertRaises(SystemExit) as caught:
+            self._run_adoption()
+        self.assertEqual(caught.exception.code, 65)
+        self.assertEqual(self.registry.read_bytes(), prior_bytes)
+        self.assertEqual(self.sentinel.read_text(), "1\n")
+
+    def test_typed_refusals_preserve_registry_failed_row_sentinel_and_journal(self):
+        cases = (
+            ("binding", {"binding_conflict": True}, "resource-compute-binding-conflict"),
+            ("closed", {"route_closed": True}, "resource-compute-route-closed"),
+            ("owner-input", {"owner_status": "closed", "target": None},
+             "resource-compute-owner-input-unavailable"),
+        )
+        for name, options, reason in cases:
+            with self.subTest(name=name):
+                self.setUp()
+                if name == "binding":
+                    self.original["route"] = str(self.root / "foreign-route.json")
+                    self.registry.write_text(json.dumps({"schema_version": 1,
+                                                         "runs": {"full-run": self.original}}))
+                before_registry = self.registry.read_bytes()
+                before_failed = json.loads(before_registry)["runs"]["full-run"]
+                before_sentinel = self.sentinel.read_bytes()
+                before_jobs = self.jobs.read_bytes()
+                workflow = self.root / "workflow"
+                workflow.mkdir(exist_ok=True)
+                before_workflow = {path.relative_to(workflow).as_posix(): path.read_bytes()
+                                   for path in workflow.rglob("*") if path.is_file()}
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    with self.assertRaises(SystemExit) as caught:
+                        self._run_adoption(**options)
+                self.assertEqual(caught.exception.code, 65)
+                refusal = json.loads(caught.exception.resource_message)
+                self.assertEqual(refusal["reason"], reason)
+                self.assertTrue(refusal["differences"])
+                if name == "binding":
+                    self.assertIn("resource.route", {item["field"] for item in refusal["differences"]})
+                self.assertTrue(refusal["next_action"])
+                self.assertEqual(self.registry.read_bytes(), before_registry)
+                self.assertEqual(json.loads(self.registry.read_bytes())["runs"]["full-run"], before_failed)
+                self.assertEqual(self.sentinel.read_bytes(), before_sentinel)
+                self.assertEqual(self.jobs.read_bytes(), before_jobs)
+                self.assertEqual({path.relative_to(workflow).as_posix(): path.read_bytes()
+                                  for path in workflow.rglob("*") if path.is_file()}, before_workflow)
+                self.assertNotIn("full-run__a1", json.loads(self.registry.read_bytes())["runs"])
+
+    def test_late_binding_conflicts_include_field_differences_before_mutation(self):
+        for case in ("armed-row", "stage-state", "evidence-path", "publication"):
+            with self.subTest(case=case):
+                self.setUp()
+                before_registry = self.registry.read_bytes()
+                before_sentinel = self.sentinel.read_bytes()
+                before_jobs = self.jobs.read_bytes()
+                before_workflow = self.root / "workflow"
+                before_workflow.mkdir(exist_ok=True)
+                before_journal = {path.relative_to(before_workflow).as_posix(): path.read_bytes()
+                                  for path in before_workflow.rglob("*") if path.is_file()}
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        self._run_adoption(late_conflict=case)
+                self.assertEqual(caught.exception.code, 65)
+                refusal = json.loads(caught.exception.resource_message)
+                self.assertEqual(refusal["reason"], "resource-compute-binding-conflict")
+                self.assertTrue(refusal["differences"])
+                self.assertTrue(all({"field", "expected", "actual"} <= set(item)
+                                    for item in refusal["differences"]))
+                self.assertTrue(refusal["next_action"])
+                expected_registry = (self.raced_registry if case == "publication" else before_registry)
+                self.assertEqual(self.registry.read_bytes(), expected_registry)
+                self.assertEqual(self.sentinel.read_bytes(), before_sentinel)
+                self.assertEqual(self.jobs.read_bytes(), before_jobs)
+                self.assertEqual({path.relative_to(before_workflow).as_posix(): path.read_bytes()
+                                  for path in before_workflow.rglob("*") if path.is_file()}, before_journal)
+
+
 class TestProgressLaunch(unittest.TestCase):
     def test_main_assigns_one_path_and_replaces_inherited_run_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -55,7 +569,8 @@ class TestProgressLaunch(unittest.TestCase):
                 return child
             with mock.patch.object(R.subprocess, "run"), mock.patch.object(R, "register_registry"), \
                  mock.patch.object(R.subprocess, "Popen", side_effect=spawn), mock.patch("sys.stdout"), \
-                 mock.patch.dict(os.environ, {"AGENT_RESOURCE_PROGRESS_FILE": str(root / "foreign.json"),
+                 mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "",
+                                             "AGENT_RESOURCE_PROGRESS_FILE": str(root / "foreign.json"),
                                              "AGENT_RESOURCE_RUN_ID": "foreign", "AGENT_RESOURCE_NODE": "other"}):
                 R.main(["--registry", str(registry), "start", "--run-id", "auto", "--cwd", str(root),
                         "--log", str(log), "--route", str(route), "--node", "eval-run",
@@ -86,6 +601,58 @@ class PayloadSessionEnvironmentTest(unittest.TestCase):
 
 
 class TestRunner(unittest.TestCase):
+    def test_launch_release_pipe_supports_multidigit_fd_on_both_paths(self):
+        for verified in (False, True):
+            with self.subTest(verified=verified):
+                route = self._resume_route() if verified else json.loads(self.route.read_text())
+                route_path = self.resume_path if verified else self.route
+                jobs = self.jobs if verified else self.base / "plain-jobs.log"
+                jobs.parent.mkdir(parents=True, exist_ok=True)
+                jobs.write_text("")
+                run_id = "highfd-verified" if verified else "highfd-ordinary"
+                log = self.base / (run_id + ".log")
+                result_path = self.base / (run_id + ".json")
+                startup_marker = self.base / (run_id + ".startup-ran")
+                startup = self.base / (run_id + ".bash-env")
+                startup.write_text("printf startup > " + shlex.quote(str(startup_marker)) + "\n")
+                code = ("import json,os,sys; from pathlib import Path; Path(sys.argv[1]).write_text("
+                        "json.dumps({'args':sys.argv[2:], 'stdin':sys.stdin.read(), "
+                        "'bash_env':os.environ.get('BASH_ENV')}))")
+                args = ["start", "--run-id", run_id, "--cwd", str(self.repo), "--log", str(log),
+                        "--route", str(route_path), "--node", "resume-run" if verified else "full-run",
+                        "--jobs", str(jobs)]
+                command = [sys.executable, "-c", code, str(result_path), "payload-arg"]
+                if not verified:
+                    attestation = self.base / (run_id + ".smoke.json")
+                    subprocess.run([sys.executable, str(SMOKE), "attest", "--input",
+                        str(self.repo / "config"), "--cwd", str(self.repo), "--output",
+                        str(attestation), "--", *command], check=True, stdout=subprocess.DEVNULL,
+                        env=CLEAN_ENV)
+                    args.extend(["--smoke-attestation", str(attestation)])
+                args.extend(["--", *command])
+                held = []
+                try:
+                    for _ in range(6):
+                        held.extend(os.pipe())
+                    self.assertGreaterEqual(max(held), 10)
+                    outcome = self.cli(*args, pass_fds=tuple(held), extra_env={"BASH_ENV": str(startup)})
+                finally:
+                    for fd in held:
+                        os.close(fd)
+                self.assertEqual(outcome.returncode, 0, outcome.stdout + outcome.stderr)
+                row = json.loads(self.registry.read_text())["runs"][run_id]
+                sentinel = Path(row["sentinel"])
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not sentinel.exists():
+                    time.sleep(.02)
+                self.assertEqual(R.read_sentinel(sentinel), 0)
+                # Smoke attestation also runs the command. Judge the new launch
+                # after its own sentinel, rather than reading the smoke output.
+                self.assertTrue(result_path.exists(), outcome.stdout + outcome.stderr)
+                self.assertFalse(startup_marker.exists(), "wrapper sourced BASH_ENV before the release fence")
+                self.assertEqual(json.loads(result_path.read_text()),
+                                 {"args": ["payload-arg"], "stdin": "", "bash_env": str(startup)})
+
     def test_resource_run_probe_attributes_both_gpu_spawn_paths_to_route_parent(self):
         harness = textwrap.dedent(r"""
             import contextlib, hashlib, importlib.util, io, json, os, signal, subprocess, sys, time
@@ -93,7 +660,7 @@ class TestRunner(unittest.TestCase):
             from types import SimpleNamespace
             from unittest import mock
 
-            mode, base_arg, root_arg = sys.argv[1:]
+            mode, base_arg, root_arg, node_id = sys.argv[1:]
             base, root = Path(base_arg), Path(root_arg)
             utilities = root / "utilities"
             sys.path.insert(0, str(utilities))
@@ -132,13 +699,13 @@ class TestRunner(unittest.TestCase):
                              mock.patch.object(runner, "register_registry"):
                             runner.main(["--registry", str(registry), "start", "--run-id", run_id,
                                 "--cwd", str(base), "--log", str(log), "--route", str(route_file),
-                                "--node", "full-run", "--smoke-attestation", str(base / "unused-attestation"),
+                                "--node", node_id, "--smoke-attestation", str(base / "unused-attestation"),
                                 "--", *command])
                     else:
                         import artifact_producer
-                        args = SimpleNamespace(jobs=str(jobs), run_id=run_id, node="full-run", share=False)
+                        args = SimpleNamespace(jobs=str(jobs), run_id=run_id, node=node_id, share=False)
                         placeholder = {"run_id": run_id, "cwd": str(base), "log": str(log),
-                            "command": command, "route": str(route_file), "node": "full-run",
+                            "command": command, "route": str(route_file), "node": node_id,
                             "status": "launching", "workflow_state": "READY",
                             "sentinel": str(log) + ".exit", "progress_file": str(log) + ".progress.json",
                             "started_at": time.time()}
@@ -217,10 +784,13 @@ class TestRunner(unittest.TestCase):
                         "CODEX_SESSION_ID", "OPENCODE_SESSION_ID", "SSH_CONNECTION"}
         base_env = {key: value for key, value in CLEAN_ENV.items() if key not in session_keys}
 
-        for launch_path, dispatch_depth in (("main", "1"), ("verified", "1"), ("main", None)):
-            with self.subTest(launch_path=launch_path, dispatch_depth=dispatch_depth):
+        cases = [(node, part, launch, depth)
+                 for node, part in (("full-run", None), ("eval-borrowed", "autopilot-lab:eval-run"))
+                 for launch, depth in (("main", "1"), ("verified", "1"), ("main", None))]
+        for node_id, part, launch_path, dispatch_depth in cases:
+            with self.subTest(node=node_id, launch_path=launch_path, dispatch_depth=dispatch_depth):
                 depth_label = dispatch_depth or "missing-depth"
-                base = self.base / ("resource-probe-" + launch_path + "-" + depth_label)
+                base = self.base / ("resource-probe-" + node_id + "-" + launch_path + "-" + depth_label)
                 dispatch = base / "dispatch"
                 route_state = base / "route-chains"
                 dispatch.mkdir(parents=True)
@@ -235,10 +805,11 @@ class TestRunner(unittest.TestCase):
                 parent_ledger.write_text('{"event":"compose","sid":"route-parent"}\n',
                                          encoding="utf-8")
                 route_file = base / "route.json"
-                route_file.write_text(json.dumps({"capability": "autopilot-lab",
+                route_file.write_text(json.dumps({"capability": "autopilot-code" if part else "autopilot-lab",
                     "artifact_root": str(base), "route_id": "rt-resource-probe",
-                    "route_hash": "sha256:resource-probe", "nodes": [{"id": "full-run",
-                    "kind": "resource-runner", "resource_class": "gpu",
+                    "route_hash": "sha256:resource-probe", "nodes": [{"id": node_id,
+                    **({"part": part} if part else {}), "kind": "resource-runner",
+                    "resource_class": "gpu" if not part else "long-running",
                     "outputs": ["run.json"], "write_scope": ["run.json"],
                     "resource_transport": "detached-process"}]}), encoding="utf-8")
                 env = {**base_env, "AGENT_HOME": str(ROOT),
@@ -250,7 +821,7 @@ class TestRunner(unittest.TestCase):
                 if dispatch_depth is not None:
                     env["AGENT_DISPATCH_DEPTH"] = dispatch_depth
                 outcome = subprocess.run([sys.executable, "-c", harness, launch_path,
-                    str(base), str(ROOT)], text=True, capture_output=True, env=env, timeout=20)
+                    str(base), str(ROOT), node_id], text=True, capture_output=True, env=env, timeout=20)
                 self.assertEqual(outcome.returncode, 0, outcome.stderr)
                 result = json.loads(outcome.stdout)
                 lease_owner = result["row"]["gpu_lease"]["owner"]
@@ -456,6 +1027,7 @@ class TestRunner(unittest.TestCase):
                     spawn.assert_not_called()
                 failed = json.loads(registry.read_text())["runs"]["bridge"]
                 self.assertEqual(failed["launch_state"], "not-started")
+                self.assertEqual(failed["launch_request"], R.launch_request(args))
                 self.assertEqual(failed["launch_error"], {"type": "GPUUnavailable", "message": "Local GPU admission: in use"})
                 self.assertTrue(R.resource_never_started(failed))
                 self.assertFalse(marker.exists())
@@ -600,7 +1172,8 @@ class TestRunner(unittest.TestCase):
         row={"run_id":args.run_id,"cwd":str(self.repo),"log":str(self.log),"command":[sys.executable,"-c",f"open({str(self.launch)!r},'w').write('wrong')"],
              "route":str(route_file),"jobs":str(jobs),"node":"full-run","status":"launching","sentinel":str(self.log)+".exit",
              "parent_attempt_id":"att-parent","resource_policy":"supervised-owner","launch_state":"queued",
-             "owner_wait":{"session_id":"same-native","launch_scope":"codex-owner-controller"},"launch_request":{}}
+             "owner_wait":{"session_id":"same-native","launch_scope":"codex-owner-controller"},
+             "launch_request":R.launch_request(args)}
         self.registry.write_text(json.dumps({"schema_version":1,"runs":{args.run_id:row}}))
         checks=[]
         @contextlib.contextmanager
@@ -747,15 +1320,26 @@ class TestRunner(unittest.TestCase):
             "command": [sys.executable, "-c", f"open({str(self.launch)!r},'w').write('wrong')"],
             "status": "launching", "workflow_state": "READY"}
         original = subprocess.Popen
+        watch_spawn_calls = []
         def spawn(argv, **kwargs):
-            if "watch" in argv: raise OSError("synthetic watch spawn failure")
+            if "watch" in argv:
+                watch_spawn_calls.append(tuple(argv))
+                raise OSError("synthetic watch spawn failure")
             return original(argv, **kwargs)
         with mock.patch.dict(os.environ, {"AGENT_HOME": str(ROOT), "AGENT_WORKFLOW_ROOT": str(self.base/"workflow"),
-                                         "AGENT_RESOURCE_RUN_INDEX": str(self.index)}), \
+                                         "AGENT_RESOURCE_RUN_INDEX": str(self.index), "CUDA_VISIBLE_DEVICES": ""}), \
+             mock.patch.object(R.gpu_leases, "local_observation",
+                               side_effect=AssertionError("CPU fixture reached local GPU observer")) as observer, \
              mock.patch.object(R.subprocess, "Popen", side_effect=spawn):
             R.start_verified(self.registry, args, route, self.resume_path, placeholder)
+            observer.assert_not_called()
+        self.assertEqual(len(watch_spawn_calls), 1)
+        self.assertIn("watch", watch_spawn_calls[0])
         self.assertFalse(self.launch.exists())
-        self.assertEqual(json.loads(self.registry.read_text())["runs"]["resume"]["status"], "failed")
+        failed = json.loads(self.registry.read_text())["runs"]["resume"]
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["launch_error"],
+                         {"type": "OSError", "message": "synthetic watch spawn failure"})
         self.assertEqual(self.jobs.read_text(), "")
 
     def setUp(self):
@@ -868,12 +1452,12 @@ class TestRunner(unittest.TestCase):
                     break
                 time.sleep(0.02)
 
-    def cli(self, *args, cwd=None):
+    def cli(self, *args, cwd=None, pass_fds=(), input=None, extra_env=None):
         return subprocess.run([
             sys.executable, str(RUNNER), "--registry", str(self.registry), *args,
-        ], cwd=cwd, text=True, capture_output=True,
+        ], cwd=cwd, text=True, capture_output=True, pass_fds=pass_fds, input=input,
            env={**CLEAN_ENV, "AGENT_HOME": str(ROOT),
-                "AGENT_RESOURCE_RUN_INDEX": str(self.index)})
+                "AGENT_RESOURCE_RUN_INDEX": str(self.index), **(extra_env or {})})
 
     def start_args(self, route=None, node="full-run", smoke=None, run_id="case", config_manifest=None):
         return ("start", "--run-id", run_id, "--cwd", str(self.repo), "--log", str(self.log),

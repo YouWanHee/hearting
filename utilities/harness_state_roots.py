@@ -15,14 +15,16 @@ shell writes has nothing to open.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 
-from dispatch_contract import dispatch_state_root
+from dispatch_contract import dispatch_state_root, state_root
 
 
 def spec_grounding_dir(args) -> Path:
-    return Path(args.agent_home) / ".spec-grounding"
+    """The release-independent spec-read marker directory shared by every adapter."""
+    return state_root(os.environ) / "spec-grounding"
 
 
 def core_grounding_dir(args) -> Path:
@@ -56,6 +58,47 @@ def route_bound_worker_writable_dirs(args) -> tuple[Path, ...]:
         from fleet.route_chain import state_root
         paths.append(Path(state_root()).resolve())
     return tuple(paths)
+
+
+def nested_opencode_store_writable_dirs(args, environ=None) -> tuple[Path, ...]:
+    """Open only OpenCode's native V2 store to a child-spawning Codex owner."""
+    eligible = getattr(
+        args, "nested_headless_network_eligible",
+        getattr(args, "nested_headless_network", False),
+    )
+    if not eligible or getattr(args, "worker_type", None) != "owner":
+        return ()
+    import os
+    env = os.environ if environ is None else environ
+    home = Path(env.get("HOME") or Path.home())
+    roots = (
+        Path(env.get("XDG_DATA_HOME") or home / ".local/share") / "opencode",
+        Path(env.get("XDG_STATE_HOME") or home / ".local/state") / "opencode",
+        Path(env.get("XDG_CACHE_HOME") or home / ".cache") / "opencode",
+    )
+    config = (Path(env.get("XDG_CONFIG_HOME") or home / ".config") / "opencode")
+    config_paths = [config]
+    for name in ("OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG"):
+        if env.get(name):
+            config_paths.append(Path(env[name]))
+    protected = []
+    for path in config_paths:
+        selected = path.parent.expanduser().resolve(strict=False) / path.name
+        protected.extend((selected, selected.resolve(strict=False)))
+    native_home = home.expanduser().resolve(strict=False)
+    result = []
+    for path in roots:
+        # Resolve the selected XDG base, but keep the final app directory as
+        # a path component. Resolving it would follow an `opencode` symlink
+        # into a broader target such as ~/.config or another user directory.
+        base = path.parent.expanduser().resolve(strict=False)
+        candidate = base / path.name
+        overlaps_config = any(candidate.is_relative_to(path) or path.is_relative_to(candidate)
+                              for path in protected)
+        if (not candidate.is_symlink() and not overlaps_config
+                and not native_home.is_relative_to(candidate)):
+            result.append(candidate)
+    return tuple(result)
 
 
 def progress_writable_dirs(args) -> tuple[Path, ...]:

@@ -167,15 +167,23 @@ blocking or its identity becomes uncertain. An unrelated pane event alone
 must not restart the native readiness probes while completion is impossible.
 
 Long-lived observers may retain a bounded projection of an immutable result
-while every file generation it depended on remains current. The projection
-must name those dependencies, and a missing, unreadable, retargeted, or
-unstable input discards the prior result instead of turning it into authority.
-Mutable writer documents stay separate from historical read projections.
-Append-only reuse is limited to a continuously observed file whose supported
-writer appends records; a partial byte tail remains data, not a row, until its
-newline arrives. Replacements and uncertain writes rebuild the view. Reusing
-parsed bytes avoids I/O; reusing derived decisions additionally requires
-unchanged dependencies, while live recipients, leases, claims, processes, and
+while every file generation it depended on remains current. A retained open
+descriptor identifies the generation behind each cached registry view; path
+metadata is checked against that descriptor before reuse, and an atomic path
+replacement moves the cache to the new file generation. Append reuse is
+limited to the registry writer's append protocol and reads only the suffix
+through the retained descriptor. Scoped readers that already read current
+bytes compare their digest with the cached generation before reusing its
+indexes. Registry writers may append rows or atomically replace the file;
+arbitrary in-place truncation or rewrite is unsupported. A partial byte tail
+remains data, not a row, until its newline arrives. The projection must name
+its dependencies, and a missing, unreadable, retargeted, or unstable input
+discards the prior result instead of turning it into authority. Mutable writer
+documents stay separate from historical read projections. Reusing parsed
+segments avoids reparsing unchanged rows, while append reads incur only suffix
+I/O and scoped digest validation counts the bytes it reads.
+Reusing derived decisions additionally requires unchanged dependencies, while
+live recipients, leases, claims, processes, and
 state transitions remain fresh observations.
 
 Documentation explains behavior and preserves the reasons for decisions. Do not
@@ -213,19 +221,24 @@ review subject, fixed inputs, session scope and granted addresses remain bound;
 parent, owner and runtime selection follow their recorded lineage. A claim alone
 does not adopt a continuation. Process quiescence and terminal result availability
 are separate observations consumed by resume, reconciliation and settlement alike.
+Registered delivery expiry follows the exact attempt and recipient lineage:
+positive dead PID/start evidence can expire its one pending record, while an
+identity-matched closed route settles its bound duty without deleting that
+record. Unknown liveness and live successors remain protected; unchanged
+observations do not rewrite the duty.
 
 Exact comparison protects sealed evidence from tampering; it is not a reason to
 refuse the normal ways work moves. When a recovery path still refuses, the
 refusal names what differs and the supported next step. A state with no
 supported way forward is a defect in the path, not a task for the operator.
 
-An attempt registration is not work that reached the launch fence. Only a
-never-started registration closed as cancelled under the registry lock is
-withdrawn from round censuses. An open registration reserves its round until
-claimed or closed, and an actual pre-launch failure remains a verdict-less
-round. Timeout cleanup closes only that exact row while the never-started proof
-still holds under the registry lock; claimed, identified, started, and
-unobservable rows remain with reconciliation.
+An attempt registration is not work that reached the launch fence. A terminal
+row with the strict never-started proof is not work and does not consume a
+logical round, regardless of the terminal cancellation reason. An open
+registration reserves its round until claimed or closed; a claimed, identified,
+started, conflicting, or unobservable row remains in the census and follows
+reconciliation. A successor continues the same logical round and preserves the
+original row as history.
 
 A caller-identity refusal records who may not launch; it does not settle the
 existing recovery duty. An explicit start may re-enter the same exact claim
@@ -312,6 +325,26 @@ Pane display updates belong to the existing detail pass; assigning a live
 session's number must not wait for pane metadata writes before basic publication.
 Delayed display writes check the pane's current exact session identity and
 assigned number; a changed or unconfirmed target receives no old metadata.
+
+Answer waits are one read-only projection of existing sources: exact native
+interaction sidecars (S1), raised human gates (S2), ended owners whose result
+already waits for a person (S3), and explicitly marked final replies (S4).
+Display surfaces read only the private derived cache; one demand-driven producer
+refreshes it from the existing sources. A missing or expired cache is unknown,
+not a confirmed zero, and S4 on the current seat is read directly so an exact
+prompt close is visible. Each source closes only through its existing answer,
+gate, successor, or exact seat-input rule. S3 includes only route-bound BLOCKED
+owners without a later owner attempt on that same route. Every source is current
+for 72 hours, older through seven days, then omitted; `total` counts current
+items and `older` counts the older window. The private session projection may
+retain question text for its intended session and notification consumers. Fleet
+reads a separate derived projection whose schema contains no question, choices,
+recommendation, seat key, or free-form health reason. Incomplete health remains
+unknown in both projections, never a confirmed zero. Totals, session indexes and
+notifications count current items only. Unknown seat attribution remains in the
+global current total. Reading does not claim, resume, settle, or mutate a job.
+S4 signals and derived caches are observational, private state; folding never
+changes source state and adds no hook, gate, or user setting.
 
 Fleet's interactive view keeps shared status, usage, compute/GPU observations,
 and its controls outside the scrolling work-list viewport. The list body owns

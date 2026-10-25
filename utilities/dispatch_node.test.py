@@ -1168,7 +1168,8 @@ class ReviewRoundCapTest(unittest.TestCase):
         cells = (
             (rows("open", "att-live", ""), "blocked-live", 0, 0),
             (rows("done", "att-withdrawn", ",failure_class=cancelled"), "admit", 0, 0),
-            (rows("done", "att-failed", ""), "verdictless-bound", 0, 2),
+            (rows("done", "att-never-started", ",note=opencode-context-limit-unavailable"), "admit", 0, 0),
+            (rows("done", "att-failed", ",launch_claimed=1,launch_started=1,pid=424242,launch_outcome=started"), "verdictless-bound", 0, 2),
         )
         for registry, state, verdicts, streak in cells:
             with self.subTest(state=state), tempfile.TemporaryDirectory() as td:
@@ -1186,7 +1187,7 @@ class ReviewRoundCapTest(unittest.TestCase):
                                    exclude_attempt="att-live-exclusion-1").budget
             self.assertEqual(result.state, "blocked-live")
 
-    def test_real_adapter_close_failures_remain_verdictless_rounds(self):
+    def test_terminal_no_start_adapter_failures_do_not_spend_rounds(self):
         import dispatch_wrapper_common as wrapper_common
         import dispatch_contract as contract
 
@@ -1225,7 +1226,7 @@ class ReviewRoundCapTest(unittest.TestCase):
 
             admitted = N.admit_round(route, node, jobs, owner_attempt_id="att-parent").budget
             self.assertEqual((admitted.state, admitted.verdict_rounds,
-                              admitted.verdictless_streak), ("verdictless-bound", 0, 2))
+                              admitted.verdictless_streak, admitted.next_round), ("admit", 0, 0, 1))
 
     def test_exact_attempt_exclusion_keeps_older_rounds_with_the_same_slug(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1648,6 +1649,12 @@ class SubsessionWorktreeLaunchTest(unittest.TestCase):
             N.reject_generated_argument_overrides(["--", "--subsession-worktree", "/tmp/x"])
         self.assertEqual(ctx.exception.reason, "dispatch-generated-argument-override")
         self.assertEqual(ctx.exception.fields["flag"], "--subsession-worktree")
+
+    def test_pair_profile_cannot_be_overridden_in_adapter_arguments(self):
+        with self.assertRaises(N.DispatchNodeError) as ctx:
+            N.reject_generated_argument_overrides(["--", "--pair-model-profile", "light"])
+        self.assertEqual(ctx.exception.reason, "dispatch-generated-argument-override")
+        self.assertEqual(ctx.exception.fields["flag"], "--pair-model-profile")
 
     def test_non_subsession_launch_keeps_route_cwd(self):
         code, _printed, calls = self._launch(subsession=False)

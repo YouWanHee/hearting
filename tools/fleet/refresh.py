@@ -55,6 +55,7 @@ class LiveSnapshot:
     memory: object = None
     governor: object = None
     hearting: dict = None
+    answer_waits: object = None
 
     def __iter__(self):
         # Keep the existing sessions, jobs unpacking surface for CLI readers.
@@ -75,6 +76,43 @@ def as_snapshot(value):
         except Exception:
             pass
     return snapshot
+
+
+def fleet_answer_wait_view(result):
+    """Keep answer-wait identity and timing in Fleet, without private text."""
+    if not isinstance(result, dict):
+        return None
+    items = []
+    for item in result.get("items", ()) or ():
+        if not isinstance(item, dict):
+            continue
+        allowed = ("id", "source", "kind", "route_id", "node", "attempt_id", "since", "stale",
+                   "session_id", "harness", "pane_id")
+        row = {key: item[key] for key in allowed if key in item}
+        owner = item.get("owner") if isinstance(item.get("owner"), dict) else {}
+        for key in ("harness", "session_id"):
+            if key not in row and key in owner:
+                row[key] = owner[key]
+        if isinstance(row.get("stale"), bool):
+            row["stale"] = "older" if row["stale"] else "current"
+        items.append(row)
+        if "session_id" in row or "harness" in row:
+            items[-1]["owner"] = {key: row[key] for key in ("harness", "session_id")
+                                   if key in row}
+    health = []
+    for item in result.get("health", ()) or ():
+        if isinstance(item, dict):
+            health.append({key: item[key] for key in ("source", "state") if key in item})
+    return {
+        "items": items,
+        "by_session": dict(result.get("by_session", {}) or {}),
+        "unattributed": list(result.get("unattributed", ()) or ()),
+        "total": int(result.get("total", 0) or 0),
+        "older": int(result.get("older", 0) or 0),
+        "health": health,
+        "observed_at": result.get("observed_at"),
+        "complete": bool(result.get("complete", False)),
+    }
 
 
 # Measured normal tick = 10-12s (attach_projections 5.64s + dispatch.collect
@@ -114,12 +152,13 @@ class RefreshPump:
 
     def __init__(self, producer, interval, clock=time.monotonic,
                  thread_factory=threading.Thread, name="fleet-refresh",
-                 stall_after=None):
+                 stall_after=None, adaptive_cadence=False):
         self._producer = producer
         self._interval = max(0.1, float(interval))
         self._clock = clock
         self._thread_factory = thread_factory
         self._name = str(name)
+        self._adaptive_cadence = bool(adaptive_cadence)
         self._lock = threading.RLock()
         self._thread = None
         self._running = False
@@ -130,7 +169,9 @@ class RefreshPump:
         self._latest = None
         self._last_error = None
         self._started_at = None
+        self._last_duration = 0.0
         self._last_success_at = None
+        self._failure_streak = 0
         self._stall_after = (
             float(stall_after) if stall_after is not None
             else _resolve_stall_after(self._interval)
@@ -278,17 +319,29 @@ class RefreshPump:
             error = exc
 
         with self._lock:
+            finished_at = self._clock()
+            if self._started_at is not None:
+                self._last_duration = max(0.0, finished_at - self._started_at)
             if error is None:
                 self._latest = value
                 self._generation += 1
                 self._last_error = None
                 self._last_success_at = self._clock()
+                self._failure_streak = 0
             else:
                 self._last_error = error
+                self._failure_streak = min(3, self._failure_streak + 1)
             self._running = False
-            # Schedule from completion, not start. A slow producer therefore
-            # gets a real cooldown instead of immediately chasing elapsed ticks.
-            self._next_due = self._clock() + self._interval
+            if self._adaptive_cadence:
+                # Explorer snapshots leave an idle interval after slow reads
+                # and back off repeated failures, bounded at eight intervals.
+                cooldown = self._interval * (2 ** self._failure_streak)
+                adaptive_delay = max(self._interval, self._last_duration)
+                delay = max(cooldown, adaptive_delay)
+            else:
+                # Preserve the original shared-pump cadence for board callers.
+                delay = self._interval
+            self._next_due = finished_at + delay
             if self._pending and not self._stopped:
                 self._pending = False
                 self._running = True

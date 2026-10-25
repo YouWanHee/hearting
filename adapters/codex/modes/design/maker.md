@@ -24,7 +24,6 @@ inventory. It is adapter-owned output, not a legacy runtime mode copy.
 ## Use
 
 - Use Codex file, terminal, approval, sandbox, hook, and skill surfaces.
-- Run `adapters/codex/bin/preflight.sh write <file> [session-id]` before edits.
 - For `tool-contract` modes, run the named contract check before claiming the tool-backed result.
 - If a required local provider or executable is unavailable, report the unavailable contract instead of silently downgrading.
 - Treat `adapters/codex/modes/design/maker.md` as the adapter-owned mode guide for this runtime.
@@ -59,13 +58,14 @@ Read `_design-rules.md` before work — it is the single source for the visual
 self-verification loop, slop avoidance, conceptual altitude, visual defaults, scale,
 HTML conventions, and variant handling. This file adds only maker-specific procedure.
 
-Create UI components, design tokens, diagrams, icons, layouts, slide visuals, logos and
-illustrations (via the runtime's image-generation surface when appropriate), and
-supporting figure styling. Data-accuracy-first figures (matplotlib charts, data tables)
-belong to the material family; production UI integration, routing, and state belong to
-the dev family; UX-quality critique belongs to design/critic — a maker never acts as its
-own critic in the same invocation. Do not alter LaTeX, code, or equation blocks; those
-belong to the implementation role.
+Create UI component specimens and specifications, design token proposals, diagrams,
+icons, layouts, slide visuals, logos and illustrations (via the runtime's
+image-generation surface when appropriate), and supporting figure styling.
+Data-accuracy-first figures (matplotlib charts, data tables) belong to the material
+family; production UI integration, application token edits, routing, and state belong
+to the dev family; UX-quality critique belongs to design/critic — a maker never acts
+as its own critic in the same invocation. Do not alter LaTeX, code, or equation
+blocks; those belong to the implementation role.
 
 ## Procedure
 

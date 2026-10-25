@@ -183,6 +183,29 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         self.prompt.write_text("Review original implementation.")
         self.owner_slug = "owner"
 
+    def tearDown(self):
+        outcome = getattr(self, "_outcome", None)
+        result = getattr(outcome, "result", None)
+        failures = [tb for test, tb in (getattr(result, "failures", []) +
+                                       getattr(result, "errors", [])) if test is self]
+        if not failures:
+            return
+        target = Path('/tmp/hearting-review-batch-failures/outcomes')
+        target.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "test": self.id(),
+            "tracebacks": failures,
+            "jobs": self.jobs.read_text(encoding="utf-8", errors="replace"),
+            "batch_inputs": [
+                str(path) for path in (self.jobs.parent / "automatic-replacements" / "batch-inputs").glob("*.json")
+            ],
+            "partial_seals": [
+                str(path) for path in (self.jobs.parent / "recovery" / "partial-group").glob("*.json")
+            ],
+        }
+        filename = self.id().split(".")[-1] + ".json"
+        (target / filename).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
     def run_cmd(self, command, expected=0):
         for retry in range(3):
             stage_start = str(ROOT / 'utilities/stage-dispatch-fallback.py') in command
@@ -208,13 +231,14 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
 
     def failure_snapshot(self, command, result):
         """Keep raw refusal and immediate observations; never diagnose production."""
-        root = os.environ.get('REVIEW_BATCH_EVIDENCE_DIR')
-        if not root:
-            return
+        # The isolated suite deliberately filters caller environment. Keep a
+        # bounded diagnostic snapshot under /tmp when that opt-in is absent.
+        root = os.environ.get('REVIEW_BATCH_EVIDENCE_DIR') or '/tmp/hearting-review-batch-failures'
         target = Path(root) / self.id().split('.')[-1] / str(time.time_ns())
-        guard = Path(os.environ['AGENT_HOME']) / 'adapters/codex/bin/preflight.sh'
-        subprocess.run([str(guard), 'write', str(target / 'failure.json')], check=True)
         target.mkdir(parents=True)
+        if os.environ.get('REVIEW_BATCH_EVIDENCE_DIR'):
+            guard = Path(os.environ['AGENT_HOME']) / 'adapters/codex/bin/preflight.sh'
+            subprocess.run([str(guard), 'write', str(target / 'failure.json')], check=True)
         observations = []
         attempts = {command[index + 1] for index, value in enumerate(command[:-1])
                     if value == '--attempt-id'}
@@ -258,6 +282,58 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
 
     def _case_test_one_started_one_missing_admitted_resume(self):
         self.admitted_resume_scenario('off', 1)
+
+    def _case_test_terminal_no_start_reuses_group_start_for_the_exact_gap(self):
+        first = self.launch()
+        self.assertEqual((first['state'], first['newly_started']), ('launched', 2), first)
+        gap = next(leg for leg in first['legs'] if leg['node'] == 'impl-review')
+        peers = [leg for leg in first['legs'] if leg['node'] != 'impl-review']
+        self.settle(first)
+        completion = ROUTE.completion_dir(self.route['route_id'], jobs=self.jobs)
+        for path in completion.glob('impl-review.*.json'):
+            path.unlink()
+        (completion / 'impl-review.json').unlink(missing_ok=True)
+        ROUTE._attempt_completion_path(
+            self.route, gap['node'], gap['attempt_id'], jobs=self.jobs).unlink(missing_ok=True)
+        self.fixture_row(gap['attempt_id'], status='done',
+            # Counterfactual registration-only input: a previously settled
+            # transport is not evidence that this synthetic gap ran. Retaining
+            # its reap/group identity would correctly contradict no-start.
+            remove=('pid', 'pid_start', 'pid_scope', 'pid_host', 'pid_host_start',
+                    'pid_host_ns', 'pid_host_proof', 'pid_ns', 'pid_observer_ns',
+                    'pgid', 'pgid_host', 'launch_cgroup_b64', 'launch_cgroup_ns',
+                    'group_reap_proof', 'group_reap_pgid',
+                    'attempt_descendant_proof', 'attempt_descendant_observer_ns',
+                    'attempt_descendant_residue', 'attempt_descendant_residue_count',
+                    'attempt_descendant_residue_basis', 'attempt_descendant_residue_at',
+                    'reap_watch', 'reap_watch_pid', 'post_exit_receipt_substitute',
+                    'cleanup_receipt_b64', 'cleanup_receipt_digest',
+                    'process_exit', 'terminal_event', 'detected_by', 'failure_class',
+                    'completion_marker', 'completion_marker_history'),
+            launch_claimed='0', launch_started='0', launch_outcome='never-launched',
+            note='opencode-context-limit-unavailable')
+        peer_rows = {leg['attempt_id']: next(line for line in self.jobs.read_text().splitlines()
+            if 'attempt_id=' + leg['attempt_id'] + ',' in line) for leg in peers}
+        peer_markers = {leg['node']: (self.jobs.parent / 'completion' / self.route['route_id'] /
+            (leg['node'] + '.json')).read_bytes() for leg in peers}
+
+        resumed = self.launch()
+        # The existing partial receipt: the PASS peer is reused, only the gap starts.
+        self.assertEqual((resumed['state'], resumed['requested'], resumed['newly_started'],
+                          resumed['existing']), ('idempotent-mixed', 2, 1, 1), resumed)
+        relaunched = next(leg for leg in resumed['legs'] if leg['node'] == gap['node'])
+        self.assertNotEqual(relaunched['attempt_id'], gap['attempt_id'])
+        self.assertEqual(relaunched['adapter'], gap['adapter'])
+        self.assertEqual(relaunched['child_spawned'], '1')
+        for leg in resumed['legs']:
+            if leg['node'] != gap['node']:
+                self.assertEqual(leg['reason'], 'reused-successful-peer', resumed)
+        rows = self.jobs.read_text().splitlines()
+        for attempt, original in peer_rows.items():
+            self.assertIn(original, rows)
+        for node, original in peer_markers.items():
+            self.assertEqual((self.jobs.parent / 'completion' / self.route['route_id'] /
+                              (node + '.json')).read_bytes(), original)
 
     def _case_test_both_zero_admitted_resume_with_gates_on(self):
         self.admitted_resume_scenario('on', 2)
@@ -838,12 +914,17 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         bound = {**bound, 'attempt_id': attempt_id, 'note': 'dead-missing-result'}
         bound.pop('review_subject_digest', None)
         bound.pop('review_subject_binding_digest', None)
+        for key in ('batch_group', 'batch_manifest_sha256', 'batch_leg_sha256', 'batch_harness'):
+            bound.pop(key, None)
+        # This row models a launched, verdict-less attempt at the B=2 limit.
+        # Never-started rows are excluded from the round census by design.
         # Seal this attempt from the current source with the production writer;
         # never transfer another attempt's digest or sidecar.
         bound.update(SUBJECT.seal_attempt(
             self.jobs, self.route, node, attempt_id, worktree=self.repo))
-        bound.update(launch_claimed='0', launch_started='0', launch_outcome='never-launched')
-        for key in ('pid', 'pid_start', 'pgid', 'log_file', 'completion_marker'):
+        bound.update(launch_claimed='1', launch_started='1', pid='424242',
+                     launch_outcome='started')
+        for key in ('pid_start', 'pgid', 'log_file', 'completion_marker'):
             bound.pop(key, None)
         fields[5] = ','.join(k + '=' + v for k, v in bound.items())
         with self.jobs.open('a') as handle:

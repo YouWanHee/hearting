@@ -7483,8 +7483,95 @@ class FixtureRegistryGuardTest(unittest.TestCase):
         self.assertFalse(self._guard("/var/tmpish/jobs.log"))
 
 
+class ShapeIntensityDiagnosticTest(unittest.TestCase):
+ def setUp(self):
+  self.harness=TestRoute()
+  self.harness.setUp()
+ def tearDown(self):
+  self.harness.tearDown()
+ def compose(self,**kw):
+  h=self.harness
+  d=dict(capability="autopilot-code",capability_mode="dev",shape="staged",graph="execute,test,report",
+         slug="shape-intensity-fixture",cwd=R.ROOT,artifact_root=R.ROOT,
+         dispatch_evidence=h.dispatch(h.nested(parent="claude",child="claude"),
+                                      h.nested(parent="claude",child="codex")))
+  d.update(kw)
+  if d.get("campaign_key") is None and d.get("parent_cycle_id") is None and "unassigned" not in d:
+   d["unassigned"]=True
+  return R.compose_route(**d)
+
+ def test_cli_mismatch_names_allowed_values(self):
+  cases=(("direct", "standard", "direct"), ("solo", "standard", "quick"),
+         ("staged", "quick", "standard,strong,thorough,adversarial"))
+  for shape, intensity, allowed in cases:
+   with self.subTest(shape=shape):
+    with self.assertRaisesRegex(ValueError, rf"compose-shape-intensity-mismatch:{shape} .*allowed: {allowed}"):
+     self.compose(shape=shape,graph=None if shape != "staged" else "execute,test,report",intensity=intensity)
+
+
 class ComposeRouteTest(TestRoute):
  """SD-135: `compose` seals a preset-free shape/subgraph through the same sealer."""
+ def test_card_lists_sealed_nodes_for_default_explicit_and_single_node_routes(self):
+  cases=[
+   dict(capability="autopilot-research",capability_mode=mode,intensity="strong",graph=None)
+   for mode in ("market","academic","technology")
+  ]+[
+   dict(capability="autopilot-research",capability_mode="market",intensity="strong",
+        graph="retrieval,synthesis,report,claim-verify"),
+   dict(capability="autopilot-lab",capability_mode="eval",intensity="strong",graph=None),
+   dict(capability="analyze-project",capability_mode="code",intensity="strong",graph=None),
+   dict(shape="direct",graph=None),
+   dict(shape="framed",graph=None),
+  ]
+  for case in cases:
+   with self.subTest(**case):
+    route=self.compose(**case)
+    before=R.canonical(route)
+    ids=[node["id"] for node in route["nodes"]]
+    if case.get("capability")=="autopilot-research" and case["graph"] is None:
+     self.assertEqual(ids,["retrieval","retrieval-alternative","synthesis","report",
+                           "claim-verify","claim-verify-alternative"])
+     self.assertFalse(route.get("composed"))
+    headline=R.compose_card(route).splitlines()[0]
+    self.assertEqual(headline.split(" · ")[1].split(" ",1)[1],"→".join(ids))
+    self.assertEqual(R.canonical(route),before)
+    R.verify_route(route,R.ROOT)
+
+ def test_graphless_research_start_passes_the_exact_sealed_graph_to_owner(self):
+  import types, work_start
+  # The compiler and emitter must observe the same runtime root with gates on.
+  with tempfile.TemporaryDirectory() as tmp, \
+       mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT)}):
+   route=self.compose(capability="autopilot-research",capability_mode="market",
+                      intensity="strong",graph=None,artifact_root=tmp,
+                      work_request={"text":"Verify graph preservation","owner_harness":"codex"})
+   before=R.canonical(route)
+   with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+    path=R._emit_compiled_route(types.SimpleNamespace(command="compose",start=True),route,tmp)
+   observed=[]
+   def launch(command,**kwargs):
+    evidence=Path(command[command.index("--route-evidence")+1])
+    observed.append(json.loads(evidence.read_text()))
+    self.assertEqual(evidence,path)
+    self.assertEqual(observed[-1],route)
+    self.assertEqual(command[command.index("--prompt-text")+1],route["work_request"]["text"])
+    return types.SimpleNamespace(returncode=0,stdout="fixture-only\n",stderr="")
+   # Exercise the production launch-command boundary, substituting only transport.
+   work_start._start(route,path,Path(tmp)/"jobs.log","owner","codex",launch)
+   self.assertEqual(len(observed),1)
+   self.assertEqual([n["id"] for n in observed[0]["nodes"]],
+                    ["retrieval","retrieval-alternative","synthesis","report",
+                     "claim-verify","claim-verify-alternative"])
+   by_id={n["id"]:n for n in observed[0]["nodes"]}
+   self.assertEqual(by_id["synthesis"]["depends_on"],["retrieval","retrieval-alternative"])
+   self.assertEqual(by_id["report"]["depends_on"],["synthesis"])
+   for name in ("claim-verify","claim-verify-alternative"):
+    self.assertEqual(by_id[name]["depends_on"],["report"])
+   self.assertEqual(observed[0]["parallel_groups"],route["parallel_groups"])
+   self.assertEqual(R.canonical(route),before)
+   self.assertEqual(json.loads(path.read_text()),route)
+   R.verify_route(observed[0],R.ROOT)
+
  def test_framed_card_marks_only_sealed_single_or_supported_pins_as_same_harness(self):
   import copy
   route = self.compose(shape="framed", graph=None, intensity=None)
@@ -7506,12 +7593,12 @@ class ComposeRouteTest(TestRoute):
  def test_non_git_decision_is_single_and_conservative_classifier_is_purpose_based(self):
   cwd="/tmp/non-git-project"
   diagnosis={"state":"non-git","cwd":cwd,"detail":"fatal: not a git repository"}
-  direct=R._decide_non_git_compose(diagnosis,None,0,False,None)
+  direct=R._decide_non_git_compose(diagnosis,"direct",0,False,None)
   self.assertEqual(direct["kind"],"direct")
-  for request_shape,depth,attempt in (("framed",0,False),("solo",0,False),
-                                      (None,1,False),("direct",0,True)):
+  for request_shape,depth,attempt in ((None,0,False),("framed",0,False),("solo",0,False),
+                                      (None,1,False),("direct",1,False),("direct",0,True)):
    result=R._decide_non_git_compose(diagnosis,request_shape,depth,attempt,"autopilot-code")
-   expected = "worker-candidate" if request_shape in ("framed", "solo") else "refuse"
+   expected = "worker-candidate" if request_shape != "direct" else "refuse"
    self.assertEqual(result["kind"],expected)
    self.assertTrue(result["cause"].startswith("git 저장소 아님: "+cwd))
    if expected == "worker-candidate":
@@ -7588,7 +7675,7 @@ class ComposeRouteTest(TestRoute):
 
  def test_compose_start_with_empty_ancestor_git_marker_starts_direct(self):
   import work_start
-  exact="git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작"
+  exact="git 아닌 폴더 — 이 세션이 직접 진행. 작업자가 필요하면 --shape 없이 다시 시작(원본 수정은 git init 필요)"
   with tempfile.TemporaryDirectory(prefix="compose-ancestor-marker-") as tmp, \
        mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
    root=Path(tmp); parent=root/"parent"; cwd=parent/"project"
@@ -7631,7 +7718,7 @@ class ComposeRouteTest(TestRoute):
    self.assertIn("source=non-git-unresolved", "\n".join(R.compose_decision_lines(route)))
    decision={"kind":"direct","capability_unresolved":True}
    card=R.compose_card(route,non_git_decision=decision)
-   self.assertEqual(card.count("git 아닌 폴더 — 이 세션이 직접 진행. 작업자·독립 검토가 필요하면 git init 후 다시 시작"),1)
+   self.assertEqual(card.count("git 아닌 폴더 — 이 세션이 직접 진행. 작업자가 필요하면 --shape 없이 다시 시작(원본 수정은 git init 필요)"),1)
    self.assertEqual(card.count("작업 종류 미정 — `--capability`로 지정"),1)
    R.verify_route(route,R.ROOT)
 
@@ -8854,6 +8941,25 @@ class ComposeRouteTest(TestRoute):
   self.assertNotIn("frame-review",route["human_gates"])
   self.assertEqual(route["selection"]["shape"],"solo"); self.assertEqual(route["selection"]["route_origin"],"compose")
   R.verify_route(route,R.ROOT)
+ def test_solo_retains_request_and_complete_or_report_endpoint_without_done_when(self):
+  cands={"candidates":[
+   {"harness":"claude","transport":"headless","surface":"registered-headless","status":"supported","probe_source":"fixture","probe_time":"2026-09-07T00:00:00Z"},
+   {"harness":"codex","transport":"headless","surface":"registered-headless","status":"supported","probe_source":"fixture","probe_time":"2026-09-07T00:00:00Z"}]}
+  task="O1 calculate the first value; O2 compute all group totals; O3 inspect every file and report."
+  for endpoint in ("complete", "report"):
+   with self.subTest(endpoint=endpoint):
+    route=self.compose(shape="solo",graph=None,dispatch_evidence=None,
+                       registered_headless_evidence=cands,execution_scope=endpoint,
+                       work_request={"text":task,"owner_harness":"codex"},slug="solo-"+endpoint)
+    self.assertEqual(route["effective_intensity"],"quick")
+    self.assertEqual([n["id"] for n in route["nodes"]],["one-shot"])
+    self.assertEqual(route["entry_execution_scope"],endpoint)
+    self.assertIn(task,route["work_request"]["text"])
+    if endpoint == "report":
+     self.assertIn("Execution scope: report",route["work_request"]["text"])
+    self.assertFalse(any("done_when" in n for n in route["nodes"]))
+    self.assertNotIn("route_plan",route)
+    R.verify_route(route,R.ROOT)
  def test_staged_accepts_strong_and_expands_declared_groups(self):
   route=self.compose(graph="plan,plan-check,execute",intensity="strong")
   self.assertEqual(route["effective_intensity"],"strong")
@@ -9063,15 +9169,19 @@ class ComposeRouteTest(TestRoute):
    # an explicit --spec-read keeps the caller's provenance and needs no notice
    self.assertEqual(R.compose_spec_read(root,root,"read shared spec")["source"],"read shared spec")
    self.assertNotIn("공유 spec",R.compose_card(self.compose(artifact_root=root,spec_read="read shared spec")))
-   # a spec/prd.md next to a shared spec still refuses, on spec/prd.md alone
+   # The latest shared revision governs; an older legacy copy is not a marker gate.
    (root/"spec").mkdir(); (root/"spec"/"prd.md").write_text("# prd\n",encoding="utf-8")
-   with self.assertRaisesRegex(ValueError,"compose-spec-read-required:[^,]*spec/prd.md$") as ctx: R.compose_spec_read(root,root,"auto")
-   self.assertNotIn("shared",str(ctx.exception))
+   got=R.compose_spec_read(root,root,"auto")
+   self.assertTrue(got["satisfied"])
+   self.assertIn("rrev_02/prd.md",got["source"])
+   self.assertNotIn("spec/prd.md",got["source"])
    (root/"spec"/"prd.md").unlink()
-   # an unreadable reference.json is ignored: the plain no-spec record, no notice
+   # The artifact-cutover resolver falls back to the newest available revision.
    (ref/"reference.json").write_text("{not json",encoding="utf-8")
-   self.assertEqual(R.compose_spec_read(root,root,"auto")["source"],"compose-auto: no spec/prd.md under cwd or artifact root")
-   self.assertNotIn("공유 spec",R.compose_card(self.compose(artifact_root=root)))
+   got=R.compose_spec_read(root,root,"auto")
+   self.assertTrue(got["source"].startswith(R.SPEC_READ_SHARED_PREFIX))
+   self.assertIn("rrev_02/prd.md",got["source"])
+   self.assertIn("공유 spec",R.compose_card(self.compose(artifact_root=root)))
  def test_preset_compile_records_preset_origin_and_derived_shape(self):
   route=R.compile_route(**self.args())
   self.assertEqual(route["selection"]["route_origin"],"preset"); self.assertEqual(route["selection"]["shape"],"direct")
@@ -9393,6 +9503,20 @@ class EnvironmentAttemptDefaultTest(unittest.TestCase):
    with self.assertRaisesRegex(ValueError,"owner-closure-check-requires-exact-jobs-attempt-and-no-overrides"):
     self._main(["complete","--route",str(path),"--node",node["id"],"--evidence",str(evidence),
      "--check","--output",str(self.base/"out.json")],env)
+
+ def test_resource_check_is_not_applicable_without_jobs_or_attempt_and_shows_start_path(self):
+  t=TestRoute()
+  route=R.compile_route(**t.args(capability="autopilot-lab",capability_mode="setup",
+   artifact_root=self.base/"artifacts",requested_intensity="auto",predicates=[],signals=["resource-run"],
+   transport="headless",inline_reason=None,dispatch_evidence=t.dispatch(t.nested())))
+  node=next(n for n in route["nodes"] if n.get("kind")=="resource-runner")
+  path=Path(route["artifact_root"])/".runtime"/"routes"/(route["route_id"]+".json")
+  path.parent.mkdir(parents=True); path.write_text(json.dumps(route))
+  evidence=self.base/"artifacts"/"read-only.md"; evidence.write_text("none\n")
+  result,=self._main(["complete","--route",str(path),"--node",node["id"],
+   "--evidence",str(evidence),"--check"],{})
+  self.assertEqual(result["result"],"not-applicable")
+  self.assertIn("--compute-run <run-id>",result["next_action"])
 
 class ShipPackageOwnerCompletionTest(OwnerRegisteredCompletionTest):
  """The standard package owner uses existing registered completion and closure."""
@@ -10632,6 +10756,78 @@ class TerminalGateRegistrySnapshotTest(unittest.TestCase):
                     "owner absence checks must receive the full view, not its selected owner row")
 
 
+
+class SpecReadCandidateAlignmentTest(unittest.TestCase):
+ def auto_read(self,cwd,root):
+  try:
+   return R.compose_spec_read(cwd,root,"auto")
+  except ValueError as exc:
+   return {"satisfied":False,"source":str(exc)}
+
+ def test_shared_revision_supersedes_unmarkable_legacy_prd(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)/".agent_reports"
+   older=root/"shared"/"spec"/"ref_aaa"
+   latest=root/"shared"/"spec"/"ref_zzz"
+   for ref,rrevs in ((older,("rrev_01","rrev_02")),(latest,("rrev_03",))):
+    for rrev in rrevs:
+     (ref/"revisions"/rrev).mkdir(parents=True)
+     (ref/"revisions"/rrev/"prd.md").write_text(f"# {rrev}\n",encoding="utf-8")
+   (older/"reference.json").write_text(json.dumps({"latest_revision_id":"rrev_02","updated_on":"2025-01-01"}),encoding="utf-8")
+   (latest/"reference.json").write_text(json.dumps({"latest_revision_id":"rrev_03","updated_on":"2026-01-01"}),encoding="utf-8")
+   (root/"spec").mkdir(parents=True)
+   (root/"spec"/"prd.md").write_text("# stale legacy\n",encoding="utf-8")
+   try:
+    got=R.compose_spec_read(Path(tmp),root,"auto")
+   except ValueError as exc:
+    got={"satisfied":False,"source":str(exc)}
+   self.assertTrue(got["satisfied"],got)
+   self.assertEqual(got,{"satisfied":True,"source":R.SPEC_READ_SHARED_PREFIX+
+                         str(latest/"revisions"/"rrev_03"/"prd.md")})
+
+ def test_checkout_prd_outside_artifact_root_is_not_required(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)/"repo"/".agent_reports"
+   checkout=Path(tmp)/"repo"
+   (checkout/"spec").mkdir(parents=True)
+   (checkout/"spec"/"prd.md").write_text("# checkout\n",encoding="utf-8")
+   linked=Path(tmp)/"linked-checkout"
+   (linked/"spec").mkdir(parents=True)
+   (linked/"spec"/"prd.md").write_text("# linked checkout\n",encoding="utf-8")
+   for cwd in (checkout,linked):
+    with self.subTest(cwd=cwd.name):
+     self.assertTrue((cwd/"spec"/"prd.md").is_file())
+     result=self.auto_read(cwd,root)
+     self.assertTrue(result["satisfied"],result)
+     self.assertEqual(result["source"],
+                      "compose-auto: no governing artifact-root PRD; checkout spec/prd.md is informational")
+
+ def test_legacy_only_spec_keeps_session_and_mtime_guard(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   repo=Path(tmp)/"repo"; root=repo/".agent_reports"; prd=root/"spec"/"prd.md"
+   prd.parent.mkdir(parents=True); prd.write_text("# legacy\n",encoding="utf-8")
+   from types import SimpleNamespace
+   import harness_state_roots as STATE_ROOTS
+   home=Path(tmp)/"home"; state=Path(tmp)/"state"
+   env_patch=mock.patch.dict(os.environ,{"HARNESS_STATE_ROOT":str(state),"AGENT_HOME":str(home)})
+   env_patch.start(); self.addCleanup(env_patch.stop)
+   marker_dir=STATE_ROOTS.spec_grounding_dir(SimpleNamespace(agent_home=str(home)))
+   marker_dir.mkdir(parents=True)
+   key=str(root.parent).replace("/","_").replace(" ","_")
+   marker=marker_dir/f"sess-a__{key}"
+   with mock.patch.object(R,"resolve_agent_home",return_value=str(home)), \
+        mock.patch.object(R.ROUTE_AUTHORITY,"default_parent_session_id",return_value="sess-a"):
+    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"):
+     R.compose_spec_read(repo,root,"auto")
+    (marker_dir/f"sess-b__{key}").write_text(str(int(prd.stat().st_mtime)),encoding="utf-8")
+    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"):
+     R.compose_spec_read(repo,root,"auto")
+    marker.write_text(str(int(prd.stat().st_mtime)),encoding="utf-8")
+    self.assertEqual(R.compose_spec_read(repo,root,"auto")["source"],R.SPEC_READ_MARKER_PREFIX+str(prd))
+    os.utime(prd,(prd.stat().st_atime,prd.stat().st_mtime+5))
+    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"):
+     R.compose_spec_read(repo,root,"auto")
+
 class NonGitArtifactDeltaTest(unittest.TestCase):
  def test_artifact_snapshot_delta_tracks_create_modify_delete_and_skips_symlinks(self):
   with tempfile.TemporaryDirectory() as td:
@@ -10646,6 +10842,7 @@ class NonGitArtifactDeltaTest(unittest.TestCase):
    created=output/"created.md";created.write_text("new\n")
    delta=R._artifact_delta(baseline,output)
    self.assertEqual(delta,{changed,deleted,created})
+
 
 
 if __name__=="__main__": unittest.main()

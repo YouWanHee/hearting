@@ -196,6 +196,29 @@ class ExtractionTest(unittest.TestCase):
                 self.assertEqual(self.parse(f"{heading}\n\n```yaml\n{body}```\n")["legs"][0]["shape"], "direct")
         self.assertEqual(self.reason("## 80. Route proposal\n\nnone\n"), "section-missing")
 
+    def test_a_numbered_list_running_past_8_does_not_hide_section_8(self):
+        body = "route_proposal_v1:\n  summary: s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
+        risks = "## 6. Open Risks\n\n" + "".join(f"{n}. risk {n}\n" for n in range(1, 10))
+        listed = "## 8. Route proposal\n\n1. first read this\n9. then this\n\n```yaml\n" + body + "```\n"
+        for text in (risks + "\n## 7. Questions\n\nnone\n\n## 8. Route proposal\n\n```yaml\n" + body + "```\n",
+                     risks + "\n8) Route\n\n```yaml\n" + body + "```\n",
+                     listed):
+            with self.subTest(text[:40]):
+                self.assertEqual(self.parse(text)["legs"][0]["shape"], "direct")
+        self.assertEqual(self.reason(risks + "\n## 8. Route proposal\n\nnone\n"), "block-missing")
+
+    def test_numbered_risks_do_not_adopt_a_proposal_from_section_7(self):
+        body = "route_proposal_v1:\n  summary: actual section 8\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
+        risks = "## 6. Open Risks\n\n" + "".join(f"{n}. risk {n}\n" for n in range(1, 10))
+        elsewhere = (risks + "\n## 7. Questions\n\n```yaml\n"
+                     + body.replace("actual section 8", "wrong section 7") + "```\n\n")
+        for heading in ("## 8. Route proposal", "## 8. 경로 조립 제안",
+                        "**8. Route proposal**", "8) Route"):
+            with self.subTest(heading):
+                self.assertEqual(self.reason(elsewhere + heading + "\n\nnone\n"), "block-missing")
+                actual = elsewhere + heading + "\n\n```yaml\n" + body + "```\n"
+                self.assertEqual(self.parse(actual)["summary"], "actual section 8")
+
     def test_a_brief_with_no_section_8_heading_is_read_whole_and_says_so(self):
         body = "route_proposal_v1:\n  summary: s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
         proposal, _, notes = RP.parse_proposal_with_notes("## Route\n\n```yaml\n" + body + "```\n")
@@ -356,9 +379,48 @@ class ProposalValidationTest(ValidationBase):
         unit = self.evaluate([{"capability": "autopilot-code", "shape": "staged", "graph": ["execute:qa/ml-debug"]}])
         self.assertRegex(unit["reason"], r"^leg-invalid:0:compose-unit-not-in-choices")
         tier = self.evaluate([{"capability": "autopilot-code", "shape": "direct", "intensity": "strong"}])
-        self.assertRegex(tier["reason"], r"^leg-invalid:0:compose-shape-intensity-mismatch:direct")
+        self.assertEqual(tier["reason"], "valid")
+        self.assertEqual(tier["facts"]["legs"][0]["intensity"], "direct")
+        self.assertEqual(tier["read_notes"], ["ignored:legs[0].intensity:strong-for-direct"])
         for row in (bad_graph and self.evaluate([bad_graph]),):
             self.assertIsNone(row["proposal"])
+
+    def test_incompatible_proposal_intensities_use_shape_defaults_with_notes(self):
+        cases = (
+            ({"capability": "autopilot-code", "shape": "direct", "intensity": "standard"}, "direct",
+             "ignored:legs[0].intensity:standard-for-direct"),
+            ({"capability": "autopilot-code", "shape": "direct", "intensity": "strong"}, "direct",
+             "ignored:legs[0].intensity:strong-for-direct"),
+            ({"capability": "autopilot-code", "shape": "solo", "intensity": "standard"}, "quick",
+             "ignored:legs[0].intensity:standard-for-solo"),
+            ({"capability": "autopilot-code", "shape": "staged", "intensity": "quick", "graph": ["execute"]},
+             "standard", "ignored:legs[0].intensity:quick-for-staged"),
+            ({"capability": "autopilot-code", "shape": "staged", "intensity": "direct", "graph": ["execute"]},
+             "standard", "ignored:legs[0].intensity:direct-for-staged"),
+        )
+        for leg, effective, note in cases:
+            with self.subTest(shape=leg["shape"], intensity=leg["intensity"]):
+                row = self.evaluate([leg])
+                self.assertEqual(row["reason"], "valid", row)
+                self.assertEqual(row["facts"]["legs"][0]["intensity"], effective)
+                self.assertEqual(row["read_notes"], [note])
+        staged_strong = self.evaluate([{"capability": "autopilot-code", "shape": "staged", "intensity": "strong",
+                                        "graph": ["execute"]}])
+        self.assertEqual(staged_strong["reason"], "valid", staged_strong)
+        self.assertEqual(staged_strong["facts"]["legs"][0]["intensity"], "strong")
+        self.assertEqual(staged_strong.get("read_notes", []), [])
+        unknown = self.evaluate([{"capability": "autopilot-code", "shape": "direct", "intensity": "ultra"}])
+        self.assertRegex(unknown["reason"], r"^leg-invalid:0:invalid intensity")
+
+    def test_normalized_intensity_survives_interview_and_next_leg_compile(self):
+        row = self.evaluate([{"capability": "autopilot-code", "shape": "direct", "intensity": "strong"}])
+        normalized = row["proposal"]
+        self.assertEqual(normalized["legs"][0]["intensity"], "direct")
+        repeated = self.evaluate([{"capability": "autopilot-code", "shape": "direct", "intensity": "strong"}])
+        self.assertTrue(RP.same_proposal(normalized, repeated["proposal"]))
+        next_args = RP.leg_arguments(normalized["legs"][0])
+        compiled = self.compile(next_args)
+        self.assertEqual(compiled["effective_intensity"], "direct")
 
     def test_a_readiness_probe_that_fails_makes_the_leg_none_not_an_error(self):
         def broken():

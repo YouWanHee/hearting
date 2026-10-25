@@ -20,7 +20,6 @@ inventory. It is adapter-owned output, not a legacy runtime mode copy.
 ## Use
 
 - Use Codex file, terminal, approval, sandbox, hook, and skill surfaces.
-- Run `adapters/codex/bin/preflight.sh write <file> [session-id]` before edits.
 - For `tool-contract` modes, run the named contract check before claiming the tool-backed result.
 - If a required local provider or executable is unavailable, report the unavailable contract instead of silently downgrading.
 - Treat `adapters/codex/modes/plan/frame.md` as the adapter-owned mode guide for this runtime.
@@ -143,7 +142,7 @@ created: {YYYY-MM-DD}
          mode: eval              # only when the capability has several modes
          shape: staged           # direct | solo | staged
          graph: [eval-run, metrics, report]   # staged only; stage ids or capability:stage[:unit] from the catalogue; never a frame stage
-         intensity: standard     # optional
+         intensity: standard     # optional; direct fixes direct, solo fixes quick, and staged allows standard+
          cwd: /path/to/existing-worktree  # optional: use this worktree for this leg; relative to the frame's cwd
          why: "one sentence"
          done_when:              # optional, 1-5: what shows this leg is finished (a sentence or {text, check})
@@ -163,6 +162,8 @@ created: {YYYY-MM-DD}
    invalid has no proposal; it never blocks the brief.
 
 ## Constraints
+
+For GPU measurements or training in a code route, place the work in a borrowed compute part such as `autopilot-lab:smoke` or `autopilot-lab:full-run`.
 
 - **Produce the direction brief only** — no plan steps, no implementation, no
   source edits. Section 8 names which parts run in which order, not what each

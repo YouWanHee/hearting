@@ -116,7 +116,7 @@ Launching requires the route-start approval to include this environment and part
 
 **S3-2. Append one pending row before the run** to `<artifact-root>/experiments/_RUNLOG.md`, leaving the result as `—`. This makes in-flight work and duplicate setup visible during long queues and mirrors `pipeline_state.run: in_progress`.
 
-At the same point, create `experiments/{date}_{slug}/run.json` with `status: "running"`, `skill_mode: "setup"` from `pipeline_state.mode`, `parent`, current ISO 8601 `started_at`, scaffold config path in `config_ref`, and the expected best-checkpoint path in `ckpt_path`. Omit `best` and `ended_at` while running. E3-4 updates them on completion.
+At the same point, create `experiments/{date}_{slug}/run.json` with `status: "running"`, `skill_mode: "setup"` from `pipeline_state.mode`, `parent`, current ISO 8601 `started_at`, scaffold config path in `config_ref`, and the expected best-checkpoint path in `ckpt_path` under `$AGENT_RUNTIME_DIR/experiments/{slug}/runs/{run}/ckpt/`. Omit `best`, `ended_at`, `ckpt_sha256` and `ckpt_byte_size` while running. Once the checkpoint exists, record its optional SHA256 and byte size and verify its digest at handoff and parent evaluation. E3-4 updates completion fields.
 
 ```markdown
 | 2026-05-26 | lr_sweep | TF_Restormer base, lr 1e-3→3e-4 | ⏳ 대기 | — |
@@ -135,12 +135,14 @@ visibility. If the run predates automatic indexing, import its registry with
 `resource-runner index --registry <existing-resource-runs.json>` and repeat
 the visibility check.
 
-A run started on another host through `compute-hosts` is outside this check:
-it has no local PID, no registered attempt, and no Fleet row. Its equivalent
-evidence is the run id — record it in `run.json` next to `config_ref`, and
-verify with `compute-hosts runs` that the run exists and with
-`compute-hosts tail <run-id>` that the payload actually started. Substitute
-that evidence for the Fleet check; do not skip both.
+A run started on another host through `compute-hosts` has no local PID or Fleet
+row. Its run id is only a candidate. To connect it to a failed supervised
+resource, invoke the existing `resource-runner start --compute-run <run-id>`
+path from the same open route. That path checks the sealed contract, recorded
+route and input provenance, exact exit and outputs, and a fresh remote process
+group observation before the owner starts verification. Do not treat
+`compute-hosts runs` or `compute-hosts tail <run-id>` as a substitute for that
+handoff or for the independent verifier.
 
 **S3-4. Escalate convergence failures on user request.** For prompts such as `loss 가 안 떨어져`, `NaN`, or `수렴 이상`, dispatch the `qa/ml-debug` unit. Provide the experiment directory, symptom, available logs, and `experiment_spec.md`. Check data shape/range/NaN/balance, model initialization/freezing/gradient flow, loss scale/sign/stability, optimizer learning rate/weight decay/warmup, and batch/device/mixed precision. Return the one or two most likely causes plus commands that distinguish them.
 
