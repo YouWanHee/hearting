@@ -278,11 +278,39 @@ assert "--profile" not in row["next_action"], row
 assert f"--source {sys.argv[1]}" in row["next_action"], row
 PY
 
-# A reactivation reports and removes an untracked native link left by an older
-# all-capabilities installer, while preserving unrelated user entries. The
-# duplicate-source prefix is `unmanaged-extra:` (renamed from `profile-extra:`).
-ln -s "$ROOT/adapters/codex/agents/external-adversary.toml" \
+# A prior release declared this now-retired native agent in its real catalog.
+# Keep a full, private source snapshot so the ownership check can verify its
+# manifest, catalog, and canonical same-name TOML without touching the active
+# source. An alias to that agent is still user-owned.
+OLD_RELEASE="$TMP/old-release"
+cp -a "$PACKAGED_SOURCE" "$OLD_RELEASE"
+python3 - "$ROOT" "$OLD_RELEASE" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+current, old = map(Path, sys.argv[1:])
+name = "legacy-external"
+config = old / "adapters/codex/config/models.conf"
+source = config.read_text(encoding="utf-8")
+catalog = re.search(r'^CFG_NATIVE_AGENT_CATALOG="([^"]*)"$', source, re.M)
+assert catalog and not any(token.split(":", 1)[0] == name
+                           for token in catalog.group(1).split()), source
+assert name not in (current / "adapters/codex/config/models.conf").read_text(
+    encoding="utf-8"
+)
+config.write_text(source[:catalog.start(1)] + catalog.group(1) + f" {name}:deep" +
+                  source[catalog.end(1):], encoding="utf-8")
+agent = old / "adapters/codex/agents" / f"{name}.toml"
+template = (old / "adapters/codex/agents/deep.toml").read_text(encoding="utf-8")
+assert template.startswith('name = "deep"\n'), template
+agent.write_text(template.replace('name = "deep"\n', f'name = "{name}"\n', 1),
+                 encoding="utf-8")
+PY
+ln -s "$OLD_RELEASE/adapters/codex/agents/legacy-external.toml" \
   "$HOME/.codex/agents/legacy-external.toml"
+ln -s "$OLD_RELEASE/adapters/codex/agents/legacy-external.toml" \
+  "$HOME/.codex/agents/legacy-alias.toml"
 printf '%s\n' 'user-owned' > "$HOME/.codex/agents/user-owned.toml"
 harness runtime status --runtime codex --json > "$TMP/dup-extra.json" || true
 python3 - "$TMP/dup-extra.json" <<'PY'
@@ -290,6 +318,7 @@ import json, sys
 row = json.load(open(sys.argv[1]))
 assert row["freshness"] == "duplicate", row
 assert "unmanaged-extra:agents/legacy-external.toml" in row["duplicate_sources"], row
+assert "unmanaged-extra:agents/legacy-alias.toml" not in row["duplicate_sources"], row
 PY
 
 harness runtime activate --runtime codex --mode linked --source "$ROOT" --json > "$TMP/reactivate.json"
@@ -301,7 +330,14 @@ assert row["freshness"] == "fresh", row
 PY
 test ! -e "$HOME/.codex/agents/legacy-external.toml" \
   || fail "reactivation retained a legacy harness agent"
-test -f "$HOME/.codex/agents/user-owned.toml" \
+test ! -L "$HOME/.codex/agents/legacy-external.toml" \
+  || fail "reactivation retained a legacy harness agent link"
+test -L "$HOME/.codex/agents/legacy-alias.toml" \
+  || fail "reactivation removed a user-owned alias"
+test "$(readlink "$HOME/.codex/agents/legacy-alias.toml")" = \
+  "$OLD_RELEASE/adapters/codex/agents/legacy-external.toml" \
+  || fail "reactivation changed a user-owned alias"
+test "$(cat "$HOME/.codex/agents/user-owned.toml")" = user-owned \
   || fail "reactivation removed a user-owned agent"
 
 # [C6.6] Legacy activation state read-compat: an activation.json still
