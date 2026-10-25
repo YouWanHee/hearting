@@ -3128,6 +3128,9 @@ class DispatchContractTest(unittest.TestCase):
    with self.assertRaises(D.DispatchContractError) as caught:
     D.annotate_attempt_row(jobs,attempt,{"launch_started":"1"})
    self.assertEqual(caught.exception.reason,"attempt-immutable-metadata-duplicate")
+   with self.assertRaises(D.DispatchContractError):
+    D._updated_attempt_metadata(pipe,{"note":"completed-marker"},terminal=True)
+   self.assertFalse(D.close_attempt_row_if(jobs,attempt,"completed-marker",lambda _fields:True))
    self.assertEqual(jobs.read_text(),row)
    self.assertFalse(D.close_attempt_row_if(jobs,attempt,"dead-exact-pid",lambda _fields:False))
    self.assertEqual(jobs.read_text(),row)
@@ -3138,6 +3141,17 @@ class DispatchContractTest(unittest.TestCase):
    self.assertEqual(D.parse_registry_metadata(fields[5])["model_source"],"profile+diversity")
    self.assertEqual(D.parse_registry_metadata(fields[5])["attempt_id"],attempt)
    self.assertFalse(D.close_attempt_row_if(jobs,attempt,"dead-exact-pid",lambda _fields:True))
+
+ def test_identical_authority_duplicates_remain_refused_during_dead_settlement(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"; attempt="att-duplicate-authority"
+   row=(f"2026-07-16T00:00:00Z\topen\t/r\t/w\ts\t{CURRENT},"
+        f"route_id=r,route_id=r,route_node=n,attempt_id={attempt}\n")
+   jobs.write_text(row); error={}
+   self.assertFalse(D.close_attempt_row_if(jobs,attempt,"dead-exact-pid",lambda _fields:True,
+                                          write_error=error))
+   self.assertEqual(error,{"reason":"attempt-immutable-metadata-duplicate","detail":"route_id"})
+   self.assertEqual(jobs.read_text(),row)
 
  def test_conflicting_immutable_duplicates_report_writer_error_without_mutation(self):
   with tempfile.TemporaryDirectory() as td:

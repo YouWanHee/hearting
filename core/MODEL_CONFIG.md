@@ -4,9 +4,10 @@ Portable model roles and profiles describe work quality and budget; each adapter
 
 Registry model provenance has one writer: resolved model settings supply the
 single `model_source` field, including diversity selection, while profile
-receipts supply their selection observations. Terminal settlement can collapse
-identical repeated immutable fields in legacy rows without changing their
-meaning. Conflicting values retain their refusal. Reconciliation reports
+receipts supply their selection observations. Dead-attempt settlement can
+collapse identical repeated `model_source` provenance in legacy rows without
+changing its meaning. Conflicting values, other duplicated immutable fields,
+and completion-seal writes retain their refusal. Reconciliation reports
 terminal metadata write failures separately from process revalidation.
 
 ## Common context operating budget
