@@ -43,6 +43,7 @@ _agent_home = Path(os.environ.get("AGENT_HOME", SOURCE_ROOT)).expanduser().resol
 AGENT_HOME = _agent_home if (_agent_home / "core/CORE.md").is_file() else SOURCE_ROOT
 sys.path.insert(0, str(SOURCE_ROOT / "utilities"))
 from dispatch_contract import resolve_dispatch_state_root  # noqa: E402
+from git_repository import git_environment, inspect as inspect_git_repository  # noqa: E402
 DISPATCH_STATE_HOME = resolve_dispatch_state_root(AGENT_HOME)
 PATTERN_FILE = ".agent-build-residue"
 MAX_AUDIT_BYTES = 512 * 1024
@@ -90,6 +91,7 @@ def untracked_files(worktree: Path) -> list[str]:
         ["git", "-C", str(worktree), "ls-files", "--others", "--exclude-standard", "-z"],
         capture_output=True,
         check=True,
+        env=git_environment(),
     )
     return [part.decode("utf-8", "surrogateescape") for part in result.stdout.split(b"\0") if part]
 
@@ -134,10 +136,12 @@ def main() -> int:
     args = parser.parse_args()
 
     worktree = args.worktree.expanduser().resolve(strict=False)
-    if not (worktree / ".git").exists():
+    repository = inspect_git_repository(worktree, expected_root=worktree)
+    if repository["state"] != "git":
         print("status=failed")
         print(f"worktree={worktree}")
-        print("reason=not-a-git-worktree")
+        print("reason=not-a-git-worktree" if repository["state"] == "non-git"
+              else f"reason=git-observation-error:{repository['detail']}")
         return 2
 
     patterns = load_patterns(worktree, args.glob)

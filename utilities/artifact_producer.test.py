@@ -1768,6 +1768,8 @@ class SelfExclusionPayloadTest(ProducerTestBase):
             checkout = root / "source-tree"
             (checkout / ".git").mkdir(parents=True)
             self.assertFalse(artifact_payload.self_excluded_directory(checkout))
+            self.assertFalse(artifact_payload.self_excluded_directory(checkout, payload_root=root))
+            subprocess.run(["git", "init", "-q", str(checkout)], check=True)
             self.assertTrue(artifact_payload.self_excluded_directory(checkout, payload_root=root))
             env = root / "conda-env"
             (env / "conda-meta").mkdir(parents=True)
@@ -1926,6 +1928,7 @@ class SelfExclusionPayloadTest(ProducerTestBase):
         payload = cycle / "artifacts/dev_logs/runtime"
         checkout = payload / "speech-checkout"
         (checkout / ".git/objects/pack").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
         (checkout / ".git/objects/pack/huge.pack").write_bytes(b"must not scan")
         (checkout / "bad|locator.py").write_bytes(b"must not validate or hash")
         uv_venv = payload / "uv-venv"

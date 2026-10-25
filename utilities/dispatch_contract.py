@@ -1918,26 +1918,30 @@ def canonical_repository_identity(path: str | Path) -> str:
 
 def diagnose_repository_start(path: str | Path) -> dict[str, str]:
     """Distinguish a normal non-Git folder from a broken/unavailable Git probe."""
+    from git_repository import git_environment, inspect as inspect_git_repository
+    observed = inspect_git_repository(path)
+    if observed["state"] != "non-git":
+        return observed
+    # Preserve the start contract for bare repositories. Generic consumers
+    # classify those as non-worktrees and can skip Git; this diagnostic used to
+    # probe Git and report a bare repository as an error.
     candidate = Path(path).expanduser().resolve(strict=False)
-    env = os.environ.copy()
-    env["LC_ALL"] = "C"
-    env.pop("LANGUAGE", None)
-    try:
-        result = subprocess.run(["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
-                                text=True, capture_output=True, timeout=60, env=env)
-        if result.returncode == 0:
-            bare = subprocess.run(["git", "-C", str(candidate), "rev-parse", "--is-bare-repository"],
-                                  text=True, capture_output=True, timeout=60, env=env)
-            if bare.returncode or bare.stdout.strip() == "true":
-                return {"state": "error", "detail": (bare.stderr or "bare Git repository").strip()}
-            return {"state": "git", "root": result.stdout.strip()}
-    except (OSError, subprocess.SubprocessError) as exc:
-        return {"state": "error", "detail": f"{type(exc).__name__}: {exc}"}
-    stderr = result.stderr or ""
-    if ("not a git repository (or any" in stderr.lower()
-            and not os.path.lexists(candidate / ".git")):
-        return {"state": "non-git", "detail": stderr}
-    return {"state": "error", "detail": stderr or f"git exited {result.returncode}"}
+    if candidate.is_dir():
+        try:
+            if (stat.S_ISREG((candidate / "HEAD").lstat().st_mode)
+                    and stat.S_ISREG((candidate / "config").lstat().st_mode)
+                    and stat.S_ISDIR((candidate / "objects").lstat().st_mode)
+                    and stat.S_ISDIR((candidate / "refs").lstat().st_mode)):
+                result = subprocess.run(
+                    ["git", "-C", str(candidate), "rev-parse", "--is-bare-repository"],
+                    text=True, capture_output=True, timeout=5, check=False,
+                    env=git_environment(),
+                )
+                if result.returncode == 0 and result.stdout.strip() == "true":
+                    return {"state": "error", "detail": "bare Git repository"}
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return observed
 
 
 def validated_unversioned_route(path: str | Path, *, environ=None) -> dict | None:

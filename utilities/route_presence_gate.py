@@ -109,23 +109,13 @@ def _artifact_path(path: Path, top: Path, root: str = "") -> bool:
 
 
 def _work_tree(path: Path):
-    """The directory holding ``.git`` for ``path`` (which may not exist yet), or None."""
-    probe = path
-    while not probe.exists() and probe != probe.parent:
-        probe = probe.parent
-    if probe.is_file():
-        probe = probe.parent
-    for directory in (probe, *probe.parents):
-        marker = directory / ".git"
-        if (marker / "HEAD").is_file():
-            return directory
-        if marker.is_file():
-            try:
-                if marker.read_text(encoding="utf-8", errors="replace").startswith("gitdir:"):
-                    return directory
-            except OSError:
-                return None
-    return None
+    """Actual containing worktree for an existing or future path."""
+    try:
+        from git_repository import inspect as inspect_git_repository
+        result = inspect_git_repository(path)
+        return Path(result["root"]) if result["state"] == "git" else None
+    except (ImportError, OSError):
+        return None
 
 
 def _primary(top: Path):

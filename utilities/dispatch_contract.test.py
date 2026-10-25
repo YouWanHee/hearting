@@ -387,7 +387,11 @@ class DispatchContractTest(unittest.TestCase):
    with self.assertRaisesRegex(D.DispatchContractError,"non-git-route-identity-unbound"):
     D.work_root_identity(plain)
    broken=root/"broken";broken.mkdir();(broken/".git").mkdir()
+   (broken/".git"/"HEAD").write_text("ref: refs/heads/missing\n")
    self.assertEqual(D.diagnose_repository_start(broken)["state"],"error")
+   bare=root/"bare.git"
+   subprocess.run(["git","init","--bare","-q",str(bare)],check=True)
+   self.assertEqual(D.diagnose_repository_start(bare)["state"],"error")
 
  def test_access_observation_exempts_exiting_and_vanished_processes_only(self):
   entry=Path("/proc/4242")

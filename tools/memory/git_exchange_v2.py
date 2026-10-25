@@ -17,8 +17,14 @@ import re
 import secrets
 import stat
 import subprocess
+import sys
 from typing import Callable, Iterable, Mapping
 from urllib.parse import unquote, urlparse
+
+_UTILITIES = Path(__file__).resolve().parents[2] / "utilities"
+if str(_UTILITIES) not in sys.path:
+    sys.path.append(str(_UTILITIES))
+from git_repository import inspect as inspect_git_repository
 
 from protocol_v2 import (
     MAX_ENVELOPE_BYTES,
@@ -141,19 +147,13 @@ class GitExchange:
 
     @staticmethod
     def _git_worktree_ancestor(path: Path) -> Path | None:
-        """Return a containing Git worktree root without invoking Git."""
-        for candidate in (path, *path.parents):
-            marker = candidate / ".git"
-            try:
-                marker.lstat()
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                raise ExchangeError(
-                    f"cannot inspect synchronized project marker: {marker}"
-                ) from exc
-            return candidate
-        return None
+        """Return the actual containing worktree, or fail on probe uncertainty."""
+        observed = inspect_git_repository(path)
+        if observed["state"] == "git":
+            return Path(observed["root"])
+        if observed["state"] == "non-git":
+            return None
+        raise ExchangeError(f"cannot classify synchronized project: {observed['detail']}")
 
     def _validate_location(self) -> None:
         if not self.root.is_absolute():

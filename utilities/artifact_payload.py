@@ -7,6 +7,8 @@ import stat
 from pathlib import Path
 from typing import Any, Tuple
 
+from git_repository import inspect as inspect_git_repository
+
 CACHEDIR_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
 _MARKERS = ("CACHEDIR.TAG", "pyvenv.cfg", ".gitignore")
 _STRUCTURAL_CHILDREN = (".git", "conda-meta", "node_modules", "site-packages",
@@ -93,25 +95,6 @@ def _is_dir(info: Any) -> bool:
     return info is not None and stat.S_ISDIR(info.st_mode)
 
 
-def _git_pointer(fd: int, info: Any) -> bool:
-    if info is None or not stat.S_ISREG(info.st_mode):
-        return False
-    git_fd = None
-    try:
-        git_fd = os.open(".git", _LEAF_FLAGS, dir_fd=fd)
-        opened = os.fstat(git_fd)
-        if not stat.S_ISREG(opened.st_mode) or _identity(opened) != _identity(info):
-            return False
-        with os.fdopen(os.dup(git_fd), "rb") as stream:
-            prefix = stream.read(7)
-        return prefix == b"gitdir:"
-    except OSError:
-        return False
-    finally:
-        if git_fd is not None:
-            os.close(git_fd)
-
-
 def observe_directory(directory: Path, *, payload_root: Path | None = None) -> Tuple[bool, Any]:
     """Return `(self_excluded, snapshot)` using no-follow, regular-file-only reads.
 
@@ -169,7 +152,24 @@ def observe_directory(directory: Path, *, payload_root: Path | None = None) -> T
             if nested:
                 children = {name: _child_info(fd, name) for name in _STRUCTURAL_CHILDREN}
                 name = current_path.name
-                excluded = excluded or _is_dir(children[".git"]) or _git_pointer(fd, children[".git"])
+                git_before = children[".git"]
+                if git_before is not None:
+                    repo = inspect_git_repository(current_path)
+                    try:
+                        git_after = os.stat(".git", dir_fd=fd, follow_symlinks=False)
+                    except OSError:
+                        git_after = None
+                    stable_marker = (git_after is not None
+                                     and _identity(git_after) == _identity(git_before))
+                    try:
+                        current_after = os.stat(current_path, follow_symlinks=False)
+                    except OSError:
+                        current_after = None
+                    stable_directory = (current_after is not None
+                                        and _identity(current_after) == directory_id)
+                    excluded = excluded or (repo["state"] == "git"
+                                            and repo.get("root") == str(current_path.resolve())
+                                            and stable_marker and stable_directory)
                 excluded = excluded or _is_dir(children["conda-meta"])
                 excluded = excluded or name in {"node_modules", "site-packages", "dist-packages"}
                 if name.startswith(("models--", "datasets--")):

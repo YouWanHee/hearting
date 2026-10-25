@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from helpers import (
     canonical_bytes,
@@ -46,6 +47,113 @@ class BareGitExchangeTest(unittest.TestCase):
             record_id=record_id,
             body=body,
         )
+
+    def test_empty_git_marker_is_not_a_project_but_real_repo_is(self):
+        from git_exchange_v2 import GitExchange
+        ordinary = self.root / "ordinary"
+        ordinary.mkdir()
+        (ordinary / ".git").mkdir()
+        self.assertIsNone(GitExchange._git_worktree_ancestor(ordinary))
+        repo = self.root / "repo"
+        repo.mkdir()
+        git(repo, "init", "-q", str(repo))
+        self.assertEqual(GitExchange._git_worktree_ancestor(repo), repo.resolve())
+
+    def test_location_validation_rechecks_marker_after_equal_stat_population(self):
+        import git_exchange_v2
+
+        shared = self.root / "shared"
+        marker = shared / ".git"
+        marker.mkdir(parents=True)
+        root = shared / "exchange.git"
+        remote = shared / "remote.git"
+        original_inspect = git_exchange_v2.inspect_git_repository
+        original_lstat = Path.lstat
+        frozen_marker_stat = marker.lstat()
+        probes = []
+
+        def populate_after_first_observation(path):
+            observed = original_inspect(path)
+            probes.append(observed)
+            if len(probes) == 1:
+                git(shared, "init", "-q", str(shared))
+            return observed
+
+        def freeze_marker_stat(path):
+            if path == marker:
+                return frozen_marker_stat
+            return original_lstat(path)
+
+        with mock.patch.object(
+            git_exchange_v2, "inspect_git_repository", side_effect=populate_after_first_observation
+        ), mock.patch.object(Path, "lstat", freeze_marker_stat):
+            with self.assertRaises(git_exchange_v2.ExchangeError):
+                git_exchange_v2.GitExchange(root, str(remote), REF)
+
+        self.assertEqual(len(probes), 2)
+        self.assertEqual(probes[0]["state"], "non-git")
+        self.assertEqual(probes[1]["state"], "git")
+        self.assertEqual(Path(probes[1]["root"]), shared.resolve())
+
+    def test_location_validation_rechecks_outer_marker_behind_empty_inner_marker(self):
+        import git_exchange_v2
+
+        shared = self.root / "shared"
+        inner = shared / "inner"
+        (inner / ".git").mkdir(parents=True)
+        root = inner / "exchange.git"
+        remote = inner / "remote.git"
+        original_inspect = git_exchange_v2.inspect_git_repository
+        observations = []
+
+        def create_outer_repo_after_first_inspection(path):
+            observed = original_inspect(path)
+            observations.append(observed)
+            if len(observations) == 1:
+                git(shared, "init", "-q", str(shared))
+            return observed
+
+        with mock.patch.object(
+            git_exchange_v2,
+            "inspect_git_repository",
+            side_effect=create_outer_repo_after_first_inspection,
+        ):
+            with self.assertRaises(git_exchange_v2.ExchangeError):
+                git_exchange_v2.GitExchange(root, str(remote), REF)
+
+        self.assertEqual(len(observations), 2)
+        self.assertEqual(observations[0]["state"], "non-git")
+        self.assertEqual(observations[1]["state"], "git")
+        self.assertEqual(Path(observations[1]["root"]), shared.resolve())
+
+    def test_stable_negative_ancestry_avoids_git_subprocesses(self):
+        import git_repository
+        import git_exchange_v2
+
+        original_run = git_repository.subprocess.run
+        for marker_kind in ("absent", "empty"):
+            with self.subTest(marker_kind=marker_kind):
+                shared = self.root / f"ordinary-{marker_kind}"
+                shared.mkdir()
+                if marker_kind == "empty":
+                    (shared / "inner" / ".git").mkdir(parents=True)
+                    shared = shared / "inner"
+                git_processes = []
+
+                def count_git_processes(args, **kwargs):
+                    if args and args[0] and Path(args[0][0]).name == "git":
+                        git_processes.append(args[0])
+                    return original_run(args, **kwargs)
+
+                with mock.patch.object(
+                    git_repository.subprocess, "run", side_effect=count_git_processes
+                ):
+                    exchange = git_exchange_v2.GitExchange(
+                        shared / "exchange.git", str(shared / "remote.git"), REF
+                    )
+
+                self.assertEqual(git_processes, [])
+                self.assertEqual(exchange.root, shared / "exchange.git")
 
     def test_two_writers_form_immutable_union_with_fast_forward_tips(self):
         op_a = self._op(REPLICA_A, "record-a", "alpha")

@@ -55,6 +55,13 @@ replacing a tracked directory with a symlink.
 
 ### §5.9. Git Working-State Preflight
 
+Runtime checks classify a worktree from Git's read-only `rev-parse` result,
+with repository-selecting `GIT_*` variables removed. A valid `.git` directory
+or gitfile identifies its actual worktree; an empty placeholder is non-Git,
+while a broken nonempty marker or an unavailable observation remains an error.
+Consumers that act on one candidate also verify the returned root matches that
+candidate before treating it as repository evidence.
+
 The §5.8 lock protects only artifact writes. It does not detect an active merge or rebase, dirty files, detached HEAD, or the same branch in another worktree. A code-mutating capability, canonically `autopilot-code`, checks once before editing and again before every commit or write-back.
 
 Dispatch requires a branch in every route worktree, including spec-only
