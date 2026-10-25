@@ -613,8 +613,10 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
                           for name in ('hooks.json', 'config.toml')})
         values['HEARTING_CODEX_HOOK_SOURCES'] = json.dumps(origins)
         # Disabled plugin entries still sync their payloads unless the global feature is off.
-        overrides = ['features.apps=false', 'features.plugins=false', 'features.multi_agent=false',
-                     'features.default_mode_request_user_input=false', 'agents.enabled=false']
+        overrides = ['features.apps=false', 'features.plugins=false',
+                     'features.default_mode_request_user_input=false']
+        if worker_type != 'owner':
+            overrides += ['features.multi_agent=false', 'agents.enabled=false']
         def toml_value(value):
             if isinstance(value, bool):
                 return 'true' if value else 'false'
@@ -627,6 +629,13 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
             if isinstance(value, dict):
                 return '{' + ','.join(json.dumps(key) + '=' + toml_value(item) for key, item in value.items()) + '}'
             raise ValueError('unsupported worker config value')
+        if worker_type == 'owner':
+            # Preserve native policy/defaults without loading the parent's
+            # unrelated custom-role catalog. Assigned fallbacks use the native
+            # default agent with their explicitly resolved model/profile.
+            owner_agents = {name: value for name, value in config.get('agents', {}).items()
+                            if not isinstance(value, dict)}
+            overrides.append('agents=' + toml_value(owner_agents))
         # CLI dotted-key overrides do not parse quoted path components. Replace
         # the whole table so IDs containing dots/@ retain their exact identity.
         for field in ('mcp_servers', 'plugins'):

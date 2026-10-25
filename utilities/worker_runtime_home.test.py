@@ -346,11 +346,70 @@ class WorkerHomes(unittest.TestCase):
             self.assertEqual((home / 'agent-config/models.conf').read_text(), 'user-model-policy')
             args = codex_worker_arguments(env)
             self.assertIn('features.plugins=false', args)
-            self.assertIn('features.multi_agent=false', args)
+            if typ == 'owner':
+                self.assertNotIn('features.multi_agent=false', args)
+                self.assertNotIn('agents.enabled=false', args)
+            else:
+                self.assertIn('features.multi_agent=false', args)
+                self.assertIn('agents.enabled=false', args)
             self.assertIn('features.default_mode_request_user_input=false', args)
             self.assertIn('mcp_servers={"external"={"command"="true","enabled"=false}}', args)
             self.assertTrue(any('test-skill' in arg for arg in args))
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.source.iterdir() if p.is_file()})
+
+    def test_codex_owner_retains_native_policy_without_main_agent_catalog(self):
+        (self.source / 'agents').mkdir()
+        helper = self.source / 'agents/general-purpose.toml'
+        helper.write_text('name="general-purpose"\nmodel="user-selected-model"\n')
+        (self.source / 'agents/unrelated.toml').write_text('name="unrelated"\n')
+        (self.source / 'config.toml').write_text(
+            '[features]\nmulti_agent=true\n[agents]\nenabled=true\nmax_threads=2\n'
+            'default_subagent_model="user-native-model"\ndefault_subagent_reasoning_effort="medium"\n'
+            '[agents.unrelated]\nconfig_file="unrelated.toml"\n')
+        env = prepare_worker_home(ROOT, 'codex', 'owner', 'native-fallback',
+                                  env={**self.env, 'CODEX_HOME': str(self.source)})
+        home = Path(env['CODEX_HOME'])
+        self.assertFalse((home / 'agents').exists())
+        self.assertEqual(helper.read_text(), 'name="general-purpose"\nmodel="user-selected-model"\n')
+        self.assertFalse((home / 'agents/unrelated.toml').exists())
+        self.assertFalse((home / 'agents/deep.toml').exists())  # withheld/missing stays missing
+        self.assertFalse((home / 'plugins').exists())
+        self.assertEqual((home / 'config.toml').resolve(), self.source / 'config.toml')
+        self.assertNotIn('features.multi_agent=false', codex_worker_arguments(env))
+        self.assertNotIn('agents.enabled=false', codex_worker_arguments(env))
+        native = next(v for v in json.loads(env['HEARTING_CODEX_WORKER_OVERRIDES'])
+                      if v.startswith('agents='))
+        override = self.base / 'native-override.toml'
+        override.write_text(native)
+        agents = worker_runtime_home._builder.read_worker_toml(override)['agents']
+        self.assertTrue(agents['enabled'])
+        self.assertEqual(agents['max_threads'], 2)
+        self.assertEqual(agents['default_subagent_model'], 'user-native-model')
+        self.assertEqual(agents['default_subagent_reasoning_effort'], 'medium')
+        self.assertNotIn('general-purpose', agents)
+        self.assertNotIn('unrelated', agents)
+        # Nested owner projection also keeps native policy and masks the catalog.
+        nested = prepare_worker_home(ROOT, 'codex', 'owner', 'nested-native-fallback',
+                                     env={**self.env, **env})
+        self.assertFalse((Path(nested['CODEX_HOME']) / 'agents').exists())
+        self.assertNotIn('features.multi_agent=false', codex_worker_arguments(nested))
+
+    def test_codex_owner_preserves_explicit_native_disablement_and_user_bytes(self):
+        config = self.source / 'config.toml'
+        original = '[features]\nmulti_agent=false\n[agents]\nenabled=false\n'
+        config.write_text(original)
+        env = prepare_worker_home(ROOT, 'codex', 'owner', 'native-disabled',
+                                  env={**self.env, 'CODEX_HOME': str(self.source)})
+        self.assertEqual((Path(env['CODEX_HOME']) / 'config.toml').read_text(), original)
+        self.assertEqual(config.read_text(), original)
+        args = codex_worker_arguments(env)
+        self.assertNotIn('features.multi_agent=true', args)
+        self.assertNotIn('agents.enabled=true', args)
+        native = next(v for v in json.loads(env['HEARTING_CODEX_WORKER_OVERRIDES'])
+                      if v.startswith('agents='))
+        override = self.base / 'native-disabled-override.toml'
+        override.write_text(native)
+        self.assertFalse(worker_runtime_home._builder.read_worker_toml(override)['agents']['enabled'])
 
     def test_nested_codex_owner_uses_plugin_feature_override_and_is_destination(self):
         (self.source / 'auth.json').write_text('{}')
