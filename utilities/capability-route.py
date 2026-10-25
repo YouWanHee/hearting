@@ -5512,6 +5512,16 @@ def _authenticated_legacy_design_registry(route, basis, current_registry):
             return None
         if unit_catalog_digest() != route.get("unit_catalog_digest"):
             return None
+        # A pruned catalogue is optional; an available contradictory catalogue
+        # must not be silently replaced by inverse reconstruction.
+        historical_path = Path(basis["registry_root"]) / "capabilities" / "topologies.json"
+        try:
+            historical = TOPO.load_registry(historical_path)
+        except FileNotFoundError:
+            pass
+        else:
+            if TOPO.registry_digest(historical) != route["registry_digest"]:
+                return None
 
         changed = False
         invalid = object()
