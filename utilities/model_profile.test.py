@@ -7,6 +7,7 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import shlex
 import sys
 import tempfile
 import unittest
@@ -488,7 +489,8 @@ class ModelProfileTest(unittest.TestCase):
         wrapper = WRAPPERS["opencode"]
 
         def command_for(resolved):
-            with tempfile.TemporaryDirectory() as temp_dir:
+            with tempfile.TemporaryDirectory() as temp_dir, \
+                 mock.patch.dict("os.environ", {"OPENCODE_RUNTIME_VERSION": "1.19.0"}):
                 return wrapper.shell_command(
                     argparse.Namespace(
                         resolved_model_settings=resolved,
@@ -506,6 +508,32 @@ class ModelProfileTest(unittest.TestCase):
         # `runtime-default` (a user copy that declares no variant) is still omitted.
         command = command_for({**resolved, "variant": "runtime-default"})
         self.assertIn("--model", command)
+        self.assertNotIn("--variant", command)
+
+    def test_opencode_v2_encodes_a_declared_variant_and_omits_runtime_default(self):
+        wrapper = WRAPPERS["opencode"]
+
+        def command_for(variant):
+            with tempfile.TemporaryDirectory() as temp_dir, \
+                 mock.patch.dict("os.environ", {"OPENCODE_RUNTIME_VERSION": "2.0.32"}):
+                command = wrapper.shell_command(
+                    argparse.Namespace(
+                        resolved_model_settings={"source": "profile", "model": "fixture/model",
+                                                 "variant": variant},
+                        worktree=temp_dir,
+                        agent="build",
+                    ),
+                    Path(temp_dir) / "prompt.txt",
+                    Path(temp_dir) / "worker.log",
+                )
+                return shlex.split(command)
+
+        command = command_for("xhigh")
+        self.assertIn("fixture/model#xhigh", command)
+        self.assertNotIn("--variant", command)
+        command = command_for("runtime-default")
+        self.assertIn("fixture/model", command)
+        self.assertNotIn("fixture/model#runtime-default", command)
         self.assertNotIn("--variant", command)
 
 
