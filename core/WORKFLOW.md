@@ -964,13 +964,13 @@ evidence or a complete empty-group observation can establish execution end.
 Exact inspection reads the worker's result; requesting more failure detail is
 optional and cannot become a second completion gate.
 
-A completed `compute-hosts` execution can enter a supervised resource retry
-through `resource-runner start --compute-run <run-id>`. This is an explicit
-same-route handoff: the runtime checks the armed resource contract, recorded
-inputs and provenance, exit evidence, outputs, and a fresh remote process-group
-observation before it creates the next resource row. The prior failure row and
-its sentinel stay intact. The normal owner start then admits verification; a
-compute exit never supplies a verifier verdict or completes the workflow.
+On the same OPEN route, the current owner may start a new supervised resource
+retry with `resource-runner start --compute-run <run-id>` after a completed
+`compute-hosts` execution. Before creating the retry row, the runtime checks
+the sealed command, inputs and provenance, exit evidence, output receipts, and
+fresh remote process-group quiescence; it preserves the prior failure row and
+sentinel. The owner's normal start admits verification separately; compute
+exit is execution evidence only.
 The runtime acknowledges a delivered notification after its receiving turn
 finishes. Delivery does not restrict the owner's tools or prove stage success;
 launch dependencies, write authorization and terminal cleanup scopes own those
