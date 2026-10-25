@@ -349,6 +349,13 @@ def sweep_deliver(
                "opencode" if recipient_kind.startswith("opencode") else "")
     legacy_bindings_by_evidence: dict[int, tuple[dict, dict]] = {}
 
+    def currently_addressed(record, storage_key):
+        from dispatch_seat_handover import record_for_session, storage_recipients
+        scopes = dict(storage_recipients(session_id, harness=harness))
+        return storage_key in scopes and record_for_session(
+            record, scopes[storage_key], session=session_id, harness=harness,
+            storage_key=storage_key)
+
     def settle_observed(record):
         evidence = native_evidence
         if receipt_observer is not None:
@@ -391,6 +398,8 @@ def sweep_deliver(
         storage_key = current[STORAGE_KEY]
         delivery_id = current["delivery_id"]
         if settle_observed(current)["received"]:
+            continue
+        if not currently_addressed(current, storage_key):
             continue
         state = current.get("state")
         if state in {"claimed", "sent-ambiguous"}:
@@ -445,6 +454,13 @@ def sweep_deliver(
         if (final is None or pending_delivery.received_ack_identity(
                 final, storage_key, delivery_id) != expected_identity
                 or final.get("claim_owner") != claim_owner):
+            continue
+        if not currently_addressed(final, storage_key):
+            try:
+                pending_delivery.release_claim(root, storage_key, delivery_id,
+                                               claim_owner=claim_owner)
+            except (OSError, pending_delivery.PendingDeliveryError):
+                pass  # The original lease remains available to normal recovery.
             continue
         # An answer another session sent: this session is the parent, so its carrier continues the route.
         from dispatch_supervision import CONTINUED_KEY, continue_for_parent

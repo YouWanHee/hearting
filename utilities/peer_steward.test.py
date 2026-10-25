@@ -10357,6 +10357,411 @@ class RetireTerminalFollowupRegressionTest(_TmpRootMixin, unittest.TestCase):
         self.assertNotIn(duty["id"], {row["id"] for row in store.list()})
 
 
+class SessionNoticeIntegrationCorrectionTest(_TmpRootMixin, unittest.TestCase):
+    def notice(self, harness="claude", sid="A", key="correction"):
+        import session_notice
+        return session_notice.notify(harness, sid, key=key, subject="integration notice",
+                                     text="immutable completion", jobs=self.jobs_path)
+
+    def edge(self, harness, origin, target):
+        import session_tidy as tidy
+        seat = tidy.Seat("pane", "integration-" + harness, pane="w1:pIntegration", harness=harness)
+        tidy._append_ledger_entry(seat, {"event": "succession", "source": "tidy-clear",
+            "harness": harness, "sid": target, "from": {"harness": harness, "sid": origin}, "ts": 1})
+        return seat
+
+    def store(self):
+        return peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+
+    def duties(self):
+        return self.store().list(kinds={"session-notice"})
+
+    @contextlib.contextmanager
+    def transport(self, sid="B", *, readiness=None):
+        """Real courier and peer preparation/claims; only native observations/I/O are fake."""
+        inventory = {"result": {"agents": [{"agent": "claude",
+            "agent_session": {"value": sid}, "pane_id": "w1:pLive"}]}}
+        resolved = {"pane": "w1:pLive", "harness": "claude", "session_id": sid,
+                    "name": "fixture", "state": "idle"}
+        with mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=0, stdout=json.dumps(inventory))), \
+             mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", sid, "fixture")), \
+             mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(peer_steward, "_resolve_prompt_target", return_value=(resolved, None, [])), \
+             mock.patch.object(peer_steward, "_pane_readiness",
+                 side_effect=readiness or (lambda *a, **kw: SimpleNamespace(state="ready"))), \
+             mock.patch.object(peer_steward, "_claude_idle_prompt_guard", return_value=(None, {})), \
+             mock.patch.object(peer_steward, "_herdr_prompt", return_value=(0, {})) as native:
+            yield native
+
+    def test_predecessor_own_key_is_not_current_after_confirmed_clear(self):
+        import dispatch_session_sweep as sweep
+        import dispatch_seat_handover as handover
+        import dispatch_pending_delivery as pending
+        for harness, carrier in [("claude", "claude-parent-runtime"),
+                                 ("codex", "codex-native-queue"), ("opencode", "opencode-turn")]:
+            with self.subTest(harness=harness):
+                from harness_capabilities import parent_completion
+                carrier = parent_completion(harness)["carrier"]
+                old, new = harness + "-A", harness + "-B"
+                n = self.notice(harness, old, "own-" + harness)
+                seat = self.edge(harness, old, new)
+                before = pending.read(self.tmp_root, old, n["delivery_id"])
+                with mock.patch.object(handover, "pane_seat", return_value=seat):
+                    self.assertEqual(sweep.sweep_deliver(self.tmp_root, carrier, old)[0], [])
+                self.assertEqual(pending.read(self.tmp_root, old, n["delivery_id"]), before)
+
+    def test_stale_inherited_scope_cannot_override_a_new_fork(self):
+        import dispatch_session_sweep as sweep
+        import dispatch_seat_handover as handover
+        n = self.notice()
+        seat = self.edge("claude", "A", "B")
+        original = handover.storage_recipients
+        def enumerate_then_fork(*args, **kwargs):
+            found = original(*args, **kwargs)
+            self.edge("claude", "A", "C")
+            return found
+        with mock.patch.object(handover, "pane_seat", return_value=seat), \
+             mock.patch.object(handover, "storage_recipients", side_effect=enumerate_then_fork):
+            self.assertEqual(sweep.addressed_records(self.tmp_root, "claude-parent-runtime", "B")[0], [])
+        self.assertIsNone(handover.record_recipient(n, "A", harness="claude"))
+
+    def test_legacy_exact_attempt_binding_cannot_override_a_changed_current_chain(self):
+        import dispatch_seat_handover as handover
+        record = {"attempt_ids": ["legacy-attempt"]}
+        allowed = frozenset({"legacy-attempt"})
+        self.assertTrue(handover.record_for_session(record, allowed, session="B",
+                                                    harness="claude", storage_key="A"))
+        self.assertTrue(handover.record_for_session(record, allowed))
+        self.assertFalse(handover.record_for_session(
+            {"attempt_ids": ["legacy-attempt", "foreign-attempt"]}, allowed))
+        self.edge("claude", "A", "B")
+        self.edge("claude", "B", "C")
+        self.assertFalse(handover.record_for_session(record, allowed, session="B",
+                                                     harness="claude", storage_key="A"))
+        self.assertFalse(handover.record_for_session(record, None, session="A",
+                                                     harness="claude", storage_key="A"))
+
+    def test_sweep_rechecks_after_both_native_observations_and_releases_only_its_claim(self):
+        import dispatch_session_sweep as sweep
+        import dispatch_seat_handover as handover
+        import dispatch_pending_delivery as pending
+        for move_on in (1, 2):
+            with self.subTest(move_on=move_on):
+                old, new, end = ("old-" + str(move_on), "new-" + str(move_on), "end-" + str(move_on))
+                n = self.notice(sid=old, key="observation-" + str(move_on))
+                seat = self.edge("claude", old, new)
+                calls = []
+                def observe(*args):
+                    calls.append(True)
+                    if len(calls) == move_on:
+                        self.edge("claude", new, end)
+                    return None
+                with mock.patch.object(handover, "pane_seat", return_value=seat):
+                    self.assertEqual(sweep.sweep_deliver(self.tmp_root, "claude-parent-runtime", new,
+                                                         receipt_observer=observe)[0], [])
+                stored = pending.read(self.tmp_root, old, n["delivery_id"])
+                self.assertEqual(stored["state"], "pending")
+                self.assertIsNone(stored["claim_owner"])
+
+    def test_courier_rechecks_after_claim_before_calling_the_real_consumer(self):
+        import dispatch_pending_delivery as pending
+        n = self.notice()
+        self.edge("claude", "A", "B")
+        claim = pending.claim
+        def claim_then_move(*args, **kwargs):
+            result = claim(*args, **kwargs)
+            self.edge("claude", "B", "C")
+            return result
+        with self.transport() as native, mock.patch.object(pending, "claim", side_effect=claim_then_move):
+            peer_steward._resume_session_notice_obligations(self.duties(), self.store())
+        native.assert_not_called()
+        self.assertEqual(pending.read(self.tmp_root, "A", n["delivery_id"])["state"], "pending")
+
+    def test_common_preparation_rechecks_after_native_readiness(self):
+        import dispatch_pending_delivery as pending
+        n = self.notice()
+        self.edge("claude", "A", "B")
+        def ready_then_move(*args, **kwargs):
+            self.edge("claude", "B", "C")
+            return SimpleNamespace(state="ready")
+        with self.transport(readiness=ready_then_move) as native:
+            peer_steward._resume_session_notice_obligations(self.duties(), self.store())
+        native.assert_not_called()
+        self.assertEqual(pending.read(self.tmp_root, "A", n["delivery_id"])["state"], "pending")
+        self.assertFalse((self.duties()[0].get("observation") or {}).get("transfer_ref"))
+
+    def test_common_preparation_keeps_runtime_schema_sender_and_reference_validation(self):
+        import dispatch_pending_delivery as pending
+        n = self.notice()
+        duty = self.duties()[0]
+        pending.claim(self.tmp_root, "A", n["delivery_id"], claim_owner="retained-rewake:" + duty["id"],
+                      lease_seconds=30, require_generation_proof=False, jobs=self.jobs_path)
+        recipient = {"harness": "claude", "session_id": "A"}
+        runtime = {"harness": "runtime", "session_id": None, "name": "Hearting runtime"}
+        refs = [duty["id"], n["delivery_id"]]
+        producer = {"schema": "session-notice-runtime-v1", "duty_id": duty["id"],
+            "jobs": str(self.jobs_path), "records": [{"duty_id": duty["id"], "storage_sid": "A",
+                "delivery_id": n["delivery_id"], "receipt_digest": n["receipt_digest"]}],
+            "recipient": recipient}
+        invalid = [({"harness": "claude", "session_id": "ordinary-peer", "name": "peer"}, producer, refs),
+                   (runtime, dict(producer, schema="unknown-producer"), refs),
+                   (runtime, producer, [duty["id"]])]
+        for sender, binding, selected_refs in invalid:
+            with self.subTest(sender=sender, schema=binding["schema"], refs=selected_refs), \
+                 self.assertRaises(ValueError):
+                peer_steward.peer_message.prepare_peer_message("notice", sender, recipient, defer=True,
+                    refs=selected_refs, producer_binding=binding)
+
+    def test_route_free_missing_registry_delivers_receives_and_acks_original_identity(self):
+        import dispatch_pending_delivery as pending
+        self.jobs_path.unlink()  # This fixture's empty registry only.
+        n = self.notice()
+        self.edge("claude", "A", "B")
+        # Writer retries keep the same duty; old-writer discovery restores it.
+        self.assertEqual(self.notice()["delivery_id"], n["delivery_id"])
+        duty = self.duties()[0]
+        (self.store().root / (duty["id"] + ".json")).unlink()
+        peer_steward._discover_session_notice_duties(self.store())
+        self.assertEqual([d["id"] for d in self.duties()], [duty["id"]])
+        with self.transport() as native:
+            peer_steward._resume_session_notice_obligations(self.duties(), self.store())
+        native.assert_called_once()
+        row = pending.read(self.tmp_root, "A", n["delivery_id"])
+        self.assertEqual(row["state"], "sent-ambiguous")
+        self.assertEqual(row["receipt_digest"], n["receipt_digest"])
+        ref = self.duties()[0]["observation"]["transfer_ref"]
+        transfer = peer_steward.peer_message._read_pending(ref)
+        self.assertEqual(transfer["state"], "queued")
+        self.assertEqual(peer_steward.peer_message.prompt_origin(
+            transfer["text"], "claude", "B")["producer_binding"], transfer["producer_binding"])
+        self.edge("claude", "B", "C")  # Receipt from historical B is still exact.
+        peer_steward.peer_message.receive_peer_message(
+            transfer["text"], {"harness": "claude", "session_id": "B"})
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
+        self.assertEqual(pending.read(self.tmp_root, "A", n["delivery_id"])["state"], "acked")
+        self.assertEqual(self.store().get(duty["id"])["state"], "complete")
+        self.assertIsNone(pending.read(self.tmp_root, "B", n["delivery_id"]))
+        self.assertFalse(self.jobs_path.exists())
+
+    def test_exact_receipt_ack_failure_is_retried_without_resubmission_even_after_fork(self):
+        import dispatch_pending_delivery as pending
+        n = self.notice()
+        self.edge("claude", "A", "B")
+        with self.transport() as native:
+            peer_steward._resume_session_notice_obligations(self.duties(), self.store())
+        native.assert_called_once()
+        ref = self.duties()[0]["observation"]["transfer_ref"]
+        transfer = peer_steward.peer_message._read_pending(ref)
+        with mock.patch.object(pending, "ack_received", side_effect=OSError("fake ACK write failure")):
+            peer_steward.peer_message.receive_peer_message(
+                transfer["text"], {"harness": "claude", "session_id": "B"})
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
+        self.assertNotEqual(pending.read(self.tmp_root, "A", n["delivery_id"])["state"], "acked")
+        self.edge("claude", "A", "C")
+        with mock.patch.object(peer_steward, "cmd_prompt") as send:
+            peer_steward._resume_session_notice_obligations(self.duties(), self.store())
+        send.assert_not_called()
+        self.assertEqual(pending.read(self.tmp_root, "A", n["delivery_id"])["state"], "acked")
+
+    def test_census_errors_stay_unknown_instead_of_escaping_reconciliation(self):
+        self.notice()
+        errors = [OSError("fake census"), subprocess.TimeoutExpired(["fake-herdr"], 5),
+                  SimpleNamespace(returncode=1, stdout=""),
+                  SimpleNamespace(returncode=0, stdout="{"),
+                  SimpleNamespace(returncode=0, stdout="[]"),
+                  SimpleNamespace(returncode=0, stdout='{"result":{"agents":{}}}'),
+                  SimpleNamespace(returncode=0, stdout='{"result":{"agents":[7]}}')]
+        for error in errors:
+            with self.subTest(error=str(error)), \
+                 mock.patch.object(peer_steward, "_HERDR_SESSION", "original-endpoint"), \
+                 mock.patch.object(peer_steward, "cmd_prompt") as send:
+                kwargs = {"side_effect": error} if isinstance(error, Exception) else {"return_value": error}
+                with mock.patch.object(peer_steward.subprocess, "run", **kwargs):
+                    peer_steward._reconcile_obligations(self.store(), self.duties(), retry_state={})
+                send.assert_not_called()
+                self.assertEqual(peer_steward._HERDR_SESSION, "original-endpoint")
+                duty = self.duties()[0]
+                self.assertEqual((duty["state"], duty["observation"]["reason"]),
+                                 ("unknown", "observer-unavailable"))
+
+    def test_expired_unsubmitted_claim_recovers_after_interruption_with_original_keys(self):
+        import dispatch_pending_delivery as pending
+        n = self.notice()
+        self.edge("claude", "A", "B")
+        claim = pending.claim(self.tmp_root, "A", n["delivery_id"], claim_owner="interrupted-owner",
+                              lease_seconds=1, require_generation_proof=False, jobs=self.jobs_path)
+        before = pending.received_ack_identity(claim, "A", n["delivery_id"])
+        with mock.patch.object(pending.time, "monotonic_ns", return_value=claim["claim_deadline_ns"] + 1), \
+             self.transport() as native:
+            peer_steward._resume_session_notice_obligations(self.duties(), self.store())
+        native.assert_called_once()
+        after = pending.read(self.tmp_root, "A", n["delivery_id"])
+        self.assertEqual(pending.received_ack_identity(after, "A", n["delivery_id"]), before)
+        self.assertEqual(after["attempts"], claim["attempts"] + 1)
+        self.assertEqual(after["claim_owner"], "retained-rewake:" + self.duties()[0]["id"])
+        self.assertEqual(after["state"], "sent-ambiguous")
+
+    def test_real_runner_continues_after_census_error_with_readiness_lease_and_context_intact(self):
+        self.notice(sid="A-blocked", key="loop-first")
+        self.notice(sid="Z-live", key="loop-later")
+        store = self.store()
+        registered = store.create("registered-batch-loop-control", "registered-batch",
+                                  {"session_id": "registered-control"}, {})
+        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
+        started, stopped = threading.Event(), threading.Event()
+        worker = peer_steward._runner_readiness_loop
+        workers, passes, registered_calls = [], [], []
+        def readiness(root, fd, incarnation, stop):
+            workers.append((threading.current_thread(), incarnation))
+            self.assertTrue(peer_steward._runner_lock_current(store, fd))
+            started.set()
+            try:
+                worker(root, fd, incarnation, stop)
+            finally:
+                stopped.set()
+        def registered_resume(duty, current_store, **kwargs):
+            registered_calls.append(duty["id"])
+            current_store.update(duty["id"], state="complete", cleanup="complete")
+        def wait(_delay):
+            passes.append(_delay)
+            self.assertEqual(peer_steward._HERDR_SESSION, "runner-endpoint")
+            if len(passes) == 4:
+                lock_path.unlink()  # Only this local fake's normal replaced-root exit.
+        inventory = {"result": {"agents": [{"agent": "claude",
+            "agent_session": {"value": "Z-live"}, "pane_id": "w1:pLive"}]}}
+        census_calls = []
+        def census(*args, **kwargs):
+            self.assertTrue(started.wait(3), "the actual readiness worker started")
+            census_calls.append(True)
+            if len(census_calls) == 1:
+                raise OSError("first recipient census unavailable")
+            return SimpleNamespace(returncode=0, stdout=json.dumps(inventory))
+        with lock_path.open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with self.transport("Z-live") as native, \
+                 mock.patch.object(peer_steward.subprocess, "run", side_effect=census), \
+                 mock.patch.object(peer_steward, "_HERDR_SESSION", "runner-endpoint"), \
+                 mock.patch.object(peer_steward, "_runner_readiness_loop", side_effect=readiness), \
+                 mock.patch.object(peer_steward, "_resume_registered_obligation", side_effect=registered_resume), \
+                 mock.patch.object(peer_steward, "_external_obligation_snapshot", return_value={}), \
+                 mock.patch.object(peer_steward, "_external_obligation_signature", return_value=()), \
+                 mock.patch.object(peer_steward, "_external_obligation_snapshot_unchanged", return_value=True), \
+                 mock.patch.object(peer_steward, "_reconcile_external_obligations"), \
+                 mock.patch.object(peer_steward, "_publish_watch_readiness"), \
+                 mock.patch.object(peer_steward, "_runner_readiness_fds", return_value=[]), \
+                 mock.patch.object(peer_steward.time, "sleep", side_effect=wait):
+                self.assertEqual(peer_steward.cmd_obligation_runner(SimpleNamespace(
+                    state_root=self.tmp_root, lock_fd=lock.fileno())), 0)
+            native.assert_called_once()
+        self.assertEqual(len(passes), 4)
+        self.assertEqual(registered_calls, [registered["id"]])
+        self.assertTrue(stopped.is_set())
+        self.assertEqual(len(workers), 1)
+        self.assertTrue(workers[0][1])
+        self.assertFalse(workers[0][0].is_alive(), "readiness worker joined on ordinary runner exit")
+
+    def test_live_claim_is_not_stolen(self):
+        import dispatch_pending_delivery as pending
+        n = self.notice()
+        claim = pending.claim(self.tmp_root, "A", n["delivery_id"], claim_owner="live-owner",
+                              lease_seconds=30, require_generation_proof=False, jobs=self.jobs_path)
+        with mock.patch.object(pending.time, "monotonic_ns", return_value=claim["claim_deadline_ns"] - 1), \
+             self.transport("A") as native, mock.patch.object(pending, "reclaim", wraps=pending.reclaim) as reclaim:
+            peer_steward._resume_session_notice_obligations(self.duties(), self.store())
+        native.assert_not_called()
+        reclaim.assert_not_called()
+        self.assertEqual(pending.read(self.tmp_root, "A", n["delivery_id"]), claim)
+
+    def test_prepared_queued_unverified_and_missing_transfers_never_create_a_new_send(self):
+        import dispatch_pending_delivery as pending
+        for state in ("pending", "queued", "unverified", "missing"):
+            with self.subTest(state=state):
+                n = self.notice(sid=state, key=state)
+                duty = next(d for d in self.duties() if d["intent"]["identity"]["storage_sid"] == state)
+                owner = "retained-rewake:" + duty["id"]
+                claim = pending.claim(self.tmp_root, state, n["delivery_id"], claim_owner=owner,
+                    lease_seconds=1, require_generation_proof=False, jobs=self.jobs_path)
+                self.store().update(duty["id"], observation={"transfer_ref": "f" * 32})
+                message = None if state == "missing" else {"state": state}
+                with mock.patch.object(pending.time, "monotonic_ns",
+                                       return_value=claim["claim_deadline_ns"] + 1), \
+                     mock.patch.object(peer_steward.peer_message, "_read_pending", return_value=message), \
+                     mock.patch.object(peer_steward, "_schedule_message_obligation") as schedule, \
+                     self.transport(state) as native:
+                    peer_steward._resume_session_notice_obligations([self.store().get(duty["id"])], self.store())
+                native.assert_not_called()
+                self.assertEqual(schedule.call_count, int(state == "pending"))
+                self.assertEqual(pending.read(self.tmp_root, state, n["delivery_id"]), claim)
+
+    def test_native_queue_fence_precedes_expired_claim_recovery(self):
+        import dispatch_pending_delivery as pending
+        n = self.notice()
+        claim = pending.claim(self.tmp_root, "A", n["delivery_id"], claim_owner="old-queue",
+                              lease_seconds=1, require_generation_proof=False, jobs=self.jobs_path)
+        identity = pending.submission_fence_identity(claim, "A")
+        fence = pending.prepare_submission_fence(self.tmp_root, "A", n["delivery_id"],
+                                                 claim_owner="old-queue", expected_identity=identity)
+        with mock.patch.object(pending.time, "monotonic_ns", return_value=claim["claim_deadline_ns"] + 1), \
+             self.transport("A") as native, mock.patch.object(pending, "reclaim", wraps=pending.reclaim) as reclaim:
+            peer_steward._resume_session_notice_obligations(self.duties(), self.store())
+        native.assert_not_called()
+        reclaim.assert_not_called()
+        self.assertEqual(pending.read_submission_fence(self.tmp_root, "A", n["delivery_id"],
+                                                       expected_identity=identity), fence)
+        self.assertEqual(pending.read(self.tmp_root, "A", n["delivery_id"]), claim)
+
+    def test_claim_followed_by_observer_error_releases_before_preparation(self):
+        import dispatch_pending_delivery as pending
+        n = self.notice()
+        self.edge("claude", "A", "B")
+        with self.transport(), \
+             mock.patch.object(peer_steward.peer_message, "_valid_session_notice_producer_binding",
+                               side_effect=OSError("fake post-claim observer outage")):
+            peer_steward._reconcile_obligations(self.store(), self.duties())
+        row = pending.read(self.tmp_root, "A", n["delivery_id"])
+        self.assertEqual(row["state"], "pending")
+        self.assertIsNone(row["claim_owner"])
+        self.assertEqual(self.duties()[0]["observation"]["reason"], "observer-unavailable")
+
+    def test_route_free_retention_and_ack_reject_foreign_root_symlink_and_wrong_storage(self):
+        import dispatch_pending_delivery as pending
+        n = self.notice()
+        duty = self.duties()[0]
+        foreign = self.tmp_root / "foreign"
+        foreign.mkdir()
+        self.assertFalse(peer_steward.peer_obligations.retain_session_notice(
+            foreign / "jobs.log", "claude", "A", n))
+        link = self.tmp_root / "linked.log"
+        link.symlink_to(self.jobs_path)
+        self.assertFalse(peer_steward.peer_obligations.retain_session_notice(link, "claude", "A", n))
+        self.assertFalse(peer_steward.peer_obligations.retain_session_notice(self.jobs_path, "claude", "B", n))
+        with self.transport("A") as native:
+            peer_steward._resume_session_notice_obligations([duty], self.store())
+        native.assert_called_once()
+        transfer = peer_steward.peer_message._read_pending(self.duties()[0]["observation"]["transfer_ref"])
+        exact = dict(transfer, state="received", receipt="exact-peer-ref")
+        for jobs in (str(link), str(foreign / "jobs.log")):
+            altered = dict(exact, producer_binding=dict(exact["producer_binding"], jobs=jobs))
+            self.assertFalse(peer_steward.peer_obligations.acknowledge_session_notice_delivery(
+                altered, roots=[self.tmp_root]))
+        self.assertNotEqual(pending.read(self.tmp_root, "A", n["delivery_id"])["state"], "acked")
+
+    def test_missing_registry_and_missing_recipient_keep_the_original_notice(self):
+        import dispatch_pending_delivery as pending
+        self.jobs_path.unlink()
+        n = self.notice()
+        before = pending.read(self.tmp_root, "A", n["delivery_id"])
+        with mock.patch.object(peer_steward.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout='{"result":{"agents":[]}}')), \
+             mock.patch.object(peer_steward, "cmd_prompt") as send:
+            peer_steward._resume_session_notice_obligations(self.duties(), self.store())
+        send.assert_not_called()
+        self.assertEqual(pending.read(self.tmp_root, "A", n["delivery_id"]), before)
+        self.assertEqual(self.duties()[0]["observation"]["reason"], "recipient-unavailable")
+        self.assertFalse(self.jobs_path.exists())
+
+
 class RegisteredUnknownRetryTest(_TmpRootMixin, unittest.TestCase):
     def test_unknown_notice_rechecks_new_successor_without_duty_change(self):
         import dispatch_pending_delivery as pending

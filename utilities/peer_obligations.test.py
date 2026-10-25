@@ -890,7 +890,7 @@ class ObligationStoreTest(unittest.TestCase):
                 "agent_session": {"value": "sid-notice"}, "pane_id": "pane-notice"}]}}
             with mock.patch.object(peer_steward, "_herdr_argv", return_value=["herdr"]), \
                  mock.patch.object(peer_steward.subprocess, "run",
-                    return_value=SimpleNamespace(stdout=json.dumps(inventory))), \
+                    return_value=SimpleNamespace(returncode=0, stdout=json.dumps(inventory))), \
                  mock.patch.object(peer_steward, "_resolve_target",
                     return_value=("claude", "sid-notice", "notice")), \
                  mock.patch.object(peer_steward, "cmd_prompt", side_effect=courier):

@@ -192,7 +192,9 @@ def _unknown_sender(endpoint):
 
 
 def _valid_runtime_producer_binding(binding, sender, recipient=None, refs=None):
-    """Validate the existing registered completion lineage carried by a runtime sender."""
+    """Validate the existing registered or route-free runtime producer schema."""
+    if isinstance(binding, dict) and binding.get("schema") == _SESSION_NOTICE_PRODUCER_SCHEMA:
+        return _valid_session_notice_producer_binding(binding, sender, recipient, refs)
     keys = {"schema", "duty_id", "jobs", "attempt_id", "carrier", "delivery_id",
             "receipt_digest", "recipient", "route_id", "route_node"}
     if (not isinstance(binding, dict) or set(binding) != keys
@@ -265,9 +267,6 @@ def _valid_session_notice_producer_binding(binding, sender, recipient=None, refs
 def _valid_transfer_sender(endpoint, producer_binding=None, recipient=None, refs=None):
     # An external shell has no session to attribute; the recipient remains exact.
     if isinstance(endpoint, dict) and endpoint.get("harness") == "runtime":
-        if isinstance(producer_binding, dict) and producer_binding.get("schema") == _SESSION_NOTICE_PRODUCER_SCHEMA:
-            return _valid_session_notice_producer_binding(
-                producer_binding, endpoint, recipient, refs)
         return _valid_runtime_producer_binding(producer_binding, endpoint, recipient, refs)
     if producer_binding is not None:
         return False
@@ -355,6 +354,12 @@ def _prepare_peer_message(body, sender, recipient, *, include_trailer=True,
     if producer_binding is not None and not _valid_runtime_producer_binding(
             producer_binding, sender, recipient, list(refs)):
         raise ValueError("peer-runtime-producer-binding-invalid")
+    if (producer_binding is not None
+            and producer_binding.get("schema") == _SESSION_NOTICE_PRODUCER_SCHEMA):
+        from peer_obligations import session_notice_submission_current
+        if not session_notice_submission_current({"producer_binding": producer_binding,
+                "from": sender, "to": recipient, "refs": list(refs)}):
+            raise ValueError("peer-notice-recipient-changed")
     if sender.get("harness") == "runtime" and producer_binding is None:
         raise ValueError("peer-runtime-producer-binding-required")
     if producer_binding is not None and not include_trailer:
@@ -2228,8 +2233,10 @@ def acknowledge_message_obligations(received, *, pending_lock_held=False):
 def _ack_registered_delivery(received, *, message_obligation=True):
     registered = False
     try:
-        from peer_obligations import acknowledge_registered_delivery
+        from peer_obligations import (acknowledge_registered_delivery,
+                                      acknowledge_session_notice_delivery)
         registered = acknowledge_registered_delivery(received)
+        registered = acknowledge_session_notice_delivery(received) or registered
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         pass  # The retained courier retries the same receipt, never another send.
     if message_obligation:

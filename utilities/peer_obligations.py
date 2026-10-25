@@ -881,14 +881,23 @@ def retain_session_notice(jobs, harness, storage_sid, record):
     import dispatch_pending_delivery as pending
     import session_notice
 
-    jobs = Path(jobs).resolve(strict=True)
-    root = jobs.parent.resolve(strict=True)
     try:
+        jobs = Path(jobs)
+        if (not jobs.is_absolute() or jobs.is_symlink()
+                or (jobs.exists() and not jobs.is_file())):
+            return False
+        root = jobs.parent.resolve(strict=True)
         receipt = session_notice.validate_pending_record(record)
         carrier = parent_completion(harness).get("carrier")
         if (not storage_sid or not carrier or record.get("recipient_kind") != carrier
                 or not isinstance(record.get("delivery_id"), str)
-                or not isinstance(record.get("receipt_digest"), str)):
+                or not isinstance(record.get("receipt_digest"), str)
+                or record.get("recipient_digest") != pending.recipient_digest(storage_sid)):
+            return False
+        stored = pending.read(root, storage_sid, record["delivery_id"])
+        if (not stored or stored.get("state") not in pending.OPEN_STATES
+                or pending.received_ack_identity(stored, storage_sid, record["delivery_id"])
+                   != pending.received_ack_identity(record, storage_sid, record["delivery_id"])):
             return False
         # Resolve once to reject a malformed or ambiguous storage lineage. The
         # recipient remains mutable and is deliberately absent from the duty id.
@@ -1065,10 +1074,11 @@ def _session_notice_delivery_bindings(message, roots=None, *, received_only=Fals
             binding, sender, recipient, message.get("refs")):
         return
     jobs = Path(binding["jobs"])
-    if not jobs.is_absolute() or jobs.is_symlink() or not jobs.is_file():
+    if (not jobs.is_absolute() or jobs.is_symlink()
+            or (jobs.exists() and not jobs.is_file())):
         return
     try:
-        root = jobs.resolve(strict=True).parent
+        root = jobs.parent.resolve(strict=True)
         if roots is not None and root not in {Path(path).resolve() for path in roots}:
             return
         store = ObligationStore(root)
@@ -1100,6 +1110,25 @@ def _session_notice_delivery_bindings(message, roots=None, *, received_only=Fals
             yield store, duty, record, root, storage, delivery_id
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return
+
+
+def session_notice_submission_current(message):
+    """Fresh authority for a new notice transfer, using its existing duty binding.
+
+    Historical prepared transfers and receipts use the immutable binding reader
+    directly; a later lineage change cannot erase their receipt evidence.
+    """
+    from dispatch_seat_handover import record_recipient
+    binding = message.get("producer_binding") or {}
+    recipient = message.get("to") or {}
+    matches = list(_session_notice_delivery_bindings(message))
+    if not matches or len(matches) != len(binding.get("records") or ()):
+        return False
+    return all(record.get("state") == "claimed"
+               and record.get("claim_owner") == "retained-rewake:" + duty["id"]
+               and record_recipient(record, storage, harness=recipient.get("harness"))
+                   == recipient.get("session_id")
+               for _store, duty, record, _root, storage, _delivery in matches)
 
 
 def registered_delivery_settled(message, *, roots=None, read_context=None):

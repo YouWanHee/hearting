@@ -1375,18 +1375,30 @@ def _chain_to(rows: list, session: str) -> list:
 
 def record_for_session(record: dict, allowed: Optional[frozenset], *, session=None, harness=None,
                        storage_key=None, read_context=None) -> bool:
-    """Whether a record found under a storage key may be delivered to the taker: every attempt
-    of it is one the handover bound (or the key is the session's own)."""
+    """Apply current recipient authority, including records under the taker's own key.
+
+    The attempt-only form remains available for legacy exact binding callers.
+    A discovery scope is never authority over a currently unresolved recipient.
+    """
     if session is not None and storage_key is not None:
-        if allowed is None and storage_key == session:
-            return True
         resolved = record_recipient(record, storage_key, harness=str(harness or ""),
                                     read_context=read_context)
         if resolved is not None:
             return resolved == session
-        # Preserve the legacy exact binding proof when old records have no current
-        # registry row. It cannot authorize an inherited key that storage_recipients
-        # did not already expose; malformed route-free notices still fail below.
+        receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
+        end, state = chain_end(str(harness or ""), storage_key, read_context=read_context)
+        if (receipt.get("kind") == "notice" or state == "unresolved"
+                or (state == "successor" and end != session)):
+            return False
+        # Old registered receipts may predate retained registry rows. Only that
+        # missing-row case may use the existing exact attempt binding fallback.
+        ids = record.get("attempt_ids") or []
+        jobs = _default_jobs()
+        registered = latest_rows(jobs) if jobs is not None else {}
+        if any(attempt in registered for attempt in ids):
+            return False
+        if allowed is None:
+            return storage_key == session and end == session
     if allowed is None:
         return True
     receipt = record.get("receipt") if isinstance(record, dict) else None

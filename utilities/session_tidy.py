@@ -730,8 +730,12 @@ def prompt_state(seat: Seat) -> Optional[dict]:
 
 def session_summary(seat: Seat) -> dict[tuple[str, str], dict]:
     """Fold the ledger: ``(harness, sid) -> first_seen, last_seen, epoch, transcript, cwd, ...``."""
+    return _summarize_sessions(_read_ledger_lines(seat))
+
+
+def _summarize_sessions(rows) -> dict[tuple[str, str], dict]:
     out: dict[tuple[str, str], dict] = {}
-    for item in _read_ledger_lines(seat):
+    for item in rows:
         if item.get("event") in {"handover", "succession", "steward-release", "tidy-claim", "real-prompt"}:
             # Relations, revocation and prompt provenance are not session activity.
             continue
@@ -903,25 +907,55 @@ def _lineage_transcript(harness: str, sid: str, hint: str) -> dict:
 
 
 def seat_lineage(seat: Seat, *, harness=None, sid=None) -> list[dict]:
-    """Read bounded session cards and the shared normalized lineage across all ledgers."""
-    directory = state_root() / "sessions"
-    ledger_seats = {seat.key: seat}
+    """Project this seat's history and confirmed relatives from the shared graph."""
+    graph = None
     try:
-        for path in sorted(directory.glob("*.jsonl")):
-            if path.is_file() and not path.is_symlink():
-                ledger_seats.setdefault(path.stem, Seat("pane", path.stem))
-    except OSError:
+        import dispatch_seat_handover
+        graph = dispatch_seat_handover.lineage_graph()
+    except Exception:  # noqa: BLE001 - keep the requested seat's local history
         pass
+    ledgers = dict(graph.ledger_rows) if graph is not None else {}
+    if seat.key not in ledgers:
+        ledgers[seat.key] = _read_ledger_lines(seat)
     rows, sessions, session_seats = [], {}, {}
-    for ledger_seat in ledger_seats.values():
-        ledger_rows = _read_ledger_lines(ledger_seat)
+    own_sessions = _summarize_sessions(ledgers[seat.key])
+    for ledger_key, ledger_rows in ledgers.items():
+        ledger_seat = seat if ledger_key == seat.key else Seat("pane", ledger_key)
         rows.extend(ledger_rows)
-        for session_key, summary in session_summary(ledger_seat).items():
+        for session_key, summary in _summarize_sessions(ledger_rows).items():
             current = sessions.get(session_key)
             if current is None or float(summary.get("last_seen", 0) or 0) >= float(
                     current.get("last_seen", 0) or 0):
                 sessions[session_key] = summary
                 session_seats[session_key] = ledger_seat
+    related = {key for key in own_sessions if not harness or key[0] == harness}
+    current_sid = sid or seat.sid
+    if not current_sid:
+        current = max((summary for key, summary in own_sessions.items()
+                       if not harness or key[0] == harness),
+                      key=lambda summary: float(summary.get("last_seen", 0) or 0), default=None)
+        current_sid = current.get("sid") if current else None
+    if current_sid:
+        related.update(key for key in sessions if key[1] == current_sid
+                       and (not harness or key[0] == harness))
+    if graph is not None:
+        adjacent = {}
+        for name, origin, target in graph.edges:
+            left, right = (name, origin), (name, target)
+            if left in graph.unresolved or right in graph.unresolved:
+                continue
+            adjacent.setdefault(left, set()).add(right)
+            adjacent.setdefault(right, set()).add(left)
+        remaining = list(related)
+        while remaining:
+            for key in adjacent.get(remaining.pop(), ()):
+                if key not in related:
+                    related.add(key)
+                    remaining.append(key)
+    # Filter before any card or transcript lookup. The graph is global; a
+    # history/focus view must not open unrelated seats' native files.
+    sessions = {key: summary for key, summary in sessions.items() if key in related}
+    rows = [row for row in rows if (row.get("harness"), row.get("sid")) in related]
     cards, locations = {}, {}
     for key, summary in sessions.items():
         name, session = key
@@ -966,13 +1000,8 @@ def seat_lineage(seat: Seat, *, harness=None, sid=None) -> list[dict]:
             cards[key] = ([{"generation": max(generations), "path": None, "status": "expired"}]
                           if generations else [])
         locations[key] = _lineage_transcript(name, session, str(summary.get("transcript") or ""))
-    graph = None
-    try:
-        import dispatch_seat_handover
-        graph = dispatch_seat_handover.lineage_graph()
-    except Exception:  # noqa: BLE001 - card remains a read-only best-effort projection
-        pass
-    return _project_seat_lineage(rows, cards, locations, harness=harness, sid=sid, graph=graph)
+    return _project_seat_lineage(rows, cards, locations, harness=harness,
+                                 sid=current_sid, graph=graph)
 
 
 def _confirmed_predecessor(lineage: list[dict], harness: str, sid: str) -> Optional[dict]:
