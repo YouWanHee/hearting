@@ -854,6 +854,8 @@ class ResourceJob:
     project: str = "(unknown)"
     job_type: str = "resource"
     resource_class: str = "lab"
+    resource_policy: Optional[str] = None
+    observer_of: Optional[str] = None
     elapsed_min: Optional[int] = None
     liveness: str = "stale"
     pid: Optional[int] = None

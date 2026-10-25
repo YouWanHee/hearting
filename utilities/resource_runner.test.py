@@ -1557,7 +1557,9 @@ class TestRunner(unittest.TestCase):
         stop = self.cli("stop", "--run-id", "case")
         self.assertEqual(stop.returncode, 0, stop.stderr)
         for _ in range(50):
-            if not R.proc_identity(run["pid"]):
+            # Empty zombie cmdline loses identity before the subreaper removes
+            # /proc. Wait for the disappearance asserted below (2026-10-25).
+            if not Path(f"/proc/{run['pid']}").exists():
                 break
             time.sleep(0.02)
         self.assertFalse(R.proc_identity(run["pid"]))

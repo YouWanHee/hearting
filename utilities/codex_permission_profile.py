@@ -15,6 +15,8 @@ PROFILE_NAME = "hearting_linked_commit"
 OWNER_OBSERVE_PROFILE_NAME = "hearting_owner_observe"
 OWNER_COMMIT_NO_NETWORK_PROFILE_NAME = "hearting_linked_commit_no_network"
 RECORDISH_PROFILE_NAME = "hearting_non_git_record"
+LOCAL_VERIFICATION_PROFILE_NAME = "hearting_local_verification"
+LOCAL_VERIFICATION_MIN_VERSION = (0, 163, 0)
 TURN_PERMISSIONS_MIN_VERSION = (0, 160, 0)
 
 
@@ -51,6 +53,64 @@ def turn_permissions_available(command: list[str] | None = None) -> bool:
         return version >= TURN_PERMISSIONS_MIN_VERSION
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
+
+
+@lru_cache(maxsize=1)
+def local_verification_available() -> bool:
+    """Known native profile/proxy support; older clients retain checked fallback."""
+    if not named_profiles_available():
+        return False
+    try:
+        version = subprocess.run(["codex", "--version"], capture_output=True,
+                                 text=True, timeout=10)
+        match = re.search(r"\b(0\.\d+\.\d+)\b", version.stdout)
+        if (version.returncode or match is None
+                or tuple(map(int, match[1].split("."))) < LOCAL_VERIFICATION_MIN_VERSION):
+            return False
+        features = subprocess.run(["codex", "features", "list"], capture_output=True,
+                                  text=True, timeout=10)
+        if features.returncode or not any(
+                line.split()[:1] == ["network_proxy"] for line in features.stdout.splitlines()):
+            return False
+        server = subprocess.run(["codex", "app-server", "--help"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        return server.returncode == 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def verification_profile_config(worktree: str, writable_roots: list[str],
+                                route_file: str | None, node_id: str | None, *,
+                                environ=None, parent_attempt_id=None) -> dict | None:
+    """Keep source read-only and activate a localhost-only native command proxy."""
+    if not route_file or not node_id:
+        return None
+    try:
+        from verification_runtime import lab_browser_node
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        if lab_browser_node(route, node_id) is None or not local_verification_available():
+            return None
+        wt = Path(worktree).resolve()
+        artifact = Path(route["artifact_root"]).resolve()
+        if wt == artifact:
+            return None  # Never turn source into an artifact write root.
+        from verification_runtime import review_scope, scoped_write_roots
+        scope = review_scope(route, node_id, route_file, environ, parent_attempt_id)
+        filesystem = {root: "write" for root in scoped_write_roots(scope, writable_roots, environ)}
+        filesystem[str(wt)] = "read"
+        filesystem.update({root: "read" for root in scope["read_only_roots"] if Path(root).exists()})
+        return {"default_permissions": LOCAL_VERIFICATION_PROFILE_NAME,
+                "features": {"network_proxy": True},
+                "permissions": {LOCAL_VERIFICATION_PROFILE_NAME: {
+                    "extends": ":read-only", "filesystem": filesystem,
+                    "network": {"enabled": True,
+                                "domains": {"localhost": "allow", "127.0.0.1": "allow", "::1": "allow"},
+                                "allow_local_binding": True, "allow_upstream_proxy": False,
+                                "enable_socks5_udp": False,
+                                "proxy_url": "http://127.0.0.1:0", "socks_url": "http://127.0.0.1:0"},
+                }}}
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
 
 
 # Entries inside a primary `.git` that stay read-only so a commit-capable
@@ -193,9 +253,9 @@ def _profile(filesystem: dict, network: bool) -> dict:
 
 def _toml(value) -> str:
     if isinstance(value, dict):
-        return "{" + ",".join(json.dumps(key) + "=" + _toml(item)
+        return "{" + ",".join(json.dumps(key, ensure_ascii=False) + "=" + _toml(item)
                                for key, item in value.items()) + "}"
-    return json.dumps(value)
+    return json.dumps(value, ensure_ascii=False)
 
 
 def config_arguments(config: dict) -> list[str]:
@@ -204,4 +264,6 @@ def config_arguments(config: dict) -> list[str]:
     arguments = ["-c", "default_permissions=" + _toml(config["default_permissions"])]
     for name, profile in config["permissions"].items():
         arguments.extend(("-c", "permissions." + name + "=" + _toml(profile)))
+    for name, value in config.get("features", {}).items():
+        arguments.extend(("-c", "features." + name + "=" + _toml(value)))
     return arguments

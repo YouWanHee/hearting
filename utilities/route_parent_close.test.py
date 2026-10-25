@@ -141,6 +141,53 @@ class ParentCloseTest(unittest.TestCase):
     def close(self, **kwargs):
         return CLOSE.close(self.route, self.path, jobs=self.jobs, **kwargs)
 
+    def _explicit_jobs_handoff(self):
+        import artifact_identity
+        import artifact_producer as PRODUCER
+        import route_authority as AUTH
+
+        ambient = self.base / "ambient-dispatch" / "jobs.log"
+        ambient.parent.mkdir()
+        ambient.write_text("")
+        os.environ["AGENT_DISPATCH_JOBS"] = str(ambient)
+        ids = artifact_identity.IdAllocator()
+        PRODUCER.activate(self.artifacts, repository_id=ids.allocate("repository"),
+                          artifact_root_id=ids.allocate("artifact_root"),
+                          w7={"campaign_id": ids.allocate("campaign")})
+        owner = self.row("explicit-owner", harness="codex")
+        begun = PRODUCER.begin(
+            self.artifacts, route_file=self.path, capability=self.route["capability"],
+            intensity=self.route["effective_intensity"], jobs=self.jobs,
+            owner_attempt_id=owner["attempt_id"])
+        for target in ("owner", "worker"):
+            AUTH.record_pin_change(
+                self.route, target=target,
+                pin={"harness": "claude", "model": None, "effort": None},
+                by={"harness": "codex", "session_id": "fixture-parent"},
+                source="probe", tuples=[], candidates=[])
+        outcome = CLOSE.close(self.route, self.path, jobs=self.jobs,
+                              summary=work_start.PIN_HANDOFF_SUMMARY)
+        record = PRODUCER.read_cycle_record(self.artifacts, begun["cycle_id"])
+        self.assertEqual(outcome["state"], "cancelled", outcome)
+        self.assertEqual(CLOSE._rows(self.jobs)[owner["attempt_id"]][1]["failure_class"], "cancelled")
+        self.assertNotIn(owner["attempt_id"], CLOSE._rows(ambient))
+        self.assertEqual(record["state"], "open", record)
+        self.assertIsNotNone(CLOSE.verified_owner_pin_handoff_close(self.route, jobs=self.jobs))
+        return begun["cycle_id"], outcome, ambient
+
+    def test_explicit_jobs_handoff_stays_open_on_fresh_close(self):
+        cycle_id, _outcome, _ambient = self._explicit_jobs_handoff()
+        import artifact_producer as PRODUCER
+        self.assertEqual(PRODUCER.read_cycle_record(self.artifacts, cycle_id)["state"], "open")
+
+    def test_explicit_jobs_handoff_stays_open_on_settled_replay(self):
+        cycle_id, outcome, _ambient = self._explicit_jobs_handoff()
+        replay = CLOSE.close(self.route, self.path, jobs=self.jobs,
+                             summary=work_start.PIN_HANDOFF_SUMMARY)
+        self.assertEqual(replay, outcome)
+        import artifact_producer as PRODUCER
+        self.assertEqual(PRODUCER.read_cycle_record(self.artifacts, cycle_id)["state"], "open")
+
     def terminal_fail_stage(self, *, parent="att-owner", name="att-terminal-fail",
                             status="done", foreground=True, cleanup=True,
                             invalid_foreground=False, cleanup_overrides=None,
@@ -386,6 +433,537 @@ class ParentCloseTest(unittest.TestCase):
                     self.assertIsNone(resource.poll())
                 finally:
                     child.doCleanups()
+
+    def test_two_owner_pin_handoffs_keep_the_same_cycle_open_across_harness_rotation(self):
+        import artifact_identity
+        import artifact_producer as PRODUCER
+        import route_authority as AUTH
+
+        rotations = (("codex", "claude", "codex"),
+                     ("claude", "opencode", "claude"),
+                     ("opencode", "codex", "opencode"))
+        for rotation in rotations:
+            with self.subTest(rotation=rotation):
+                fixture = ParentCloseTest()
+                fixture.setUp()
+                try:
+                    initial = ROUTE.compose_route(
+                        capability="autopilot-code", capability_mode="debug", shape="staged",
+                        graph="execute,test,report", slug="two-hop-pin-handoff", cwd=fixture.base,
+                        artifact_root=fixture.artifacts, spec_read="fixture", unassigned=True,
+                        dispatch_evidence=fixture.route["dispatch_evidence"], parent_harness="codex",
+                        work_request={"text": "Continue the same task through two owner handoffs",
+                                      "owner_harness": rotation[0]})
+                    path = ROUTE.canonical_route_path(fixture.artifacts, initial["route_id"])
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(json.dumps(initial))
+                    fixture.route, fixture.path = initial, path
+
+                    ids = artifact_identity.IdAllocator()
+                    PRODUCER.activate(fixture.artifacts, repository_id=ids.allocate("repository"),
+                                      artifact_root_id=ids.allocate("artifact_root"),
+                                      w7={"campaign_id": ids.allocate("campaign")})
+                    cycle_id = None
+                    route_bytes = []
+                    for ordinal, harness in enumerate(rotation):
+                        owner = fixture.process(f"handoff-owner-{ordinal}")
+                        metadata = fixture.row(f"handoff-owner-{ordinal}", process=owner, harness=harness,
+                                               capability_mode=fixture.route.get("capability_mode", "dev"))
+                        begun = PRODUCER.begin(
+                            fixture.artifacts, route_file=fixture.path,
+                            capability=fixture.route["capability"],
+                            intensity=fixture.route["effective_intensity"],
+                            jobs=fixture.jobs, owner_attempt_id=metadata["attempt_id"])
+                        if cycle_id is None:
+                            cycle_id = begun["cycle_id"]
+                        self.assertEqual(begun["cycle_id"], cycle_id)
+                        route_bytes.append((fixture.path, fixture.path.read_bytes()))
+                        if ordinal == len(rotation) - 1:
+                            break
+
+                        target = rotation[ordinal + 1]
+                        for pin_target in ("owner", "worker"):
+                            AUTH.record_pin_change(
+                                fixture.route, target=pin_target,
+                                pin={"harness": target, "model": None, "effort": None},
+                                by={"harness": "codex", "session_id": "fixture-parent"},
+                                source="fixture", tuples=[], candidates=[])
+                        outcome = CLOSE.close(fixture.route, fixture.path, jobs=fixture.jobs,
+                                              summary=work_start.PIN_HANDOFF_SUMMARY)
+                        self.assertEqual(outcome["state"], "cancelled", outcome)
+                        proof = CLOSE.verified_owner_pin_handoff_close(fixture.route, jobs=fixture.jobs)
+                        self.assertIsNotNone(proof, {
+                            "intent": CLOSE.intent(fixture.route, fixture.jobs),
+                            "result": CLOSE.settled_result(fixture.route,
+                                WS.WorkflowLedger(fixture.route["route_id"], fixture.route["route_hash"],
+                                                  jobs=fixture.jobs)),
+                            "owner": CLOSE._rows(fixture.jobs).get(metadata["attempt_id"]),
+                            "pins": AUTH.pin_changes(fixture.route),
+                        })
+                        record = PRODUCER.read_cycle_record(fixture.artifacts, cycle_id)
+                        self.assertEqual(record["state"], "open", record)
+                        self.assertFalse((Path(begun["cycle_dir"]) / "manifest.json").exists())
+                        if owner.poll() is None:
+                            owner.terminate()
+                            owner.wait(timeout=5)
+                        predecessor = fixture.route
+                        prepared = work_start.pin_handoff_continuation(
+                            fixture.route, fixture.path, fixture.jobs, outcome)
+                        self.assertTrue(prepared.get("successor_route"), prepared)
+                        successor_path = Path(prepared["successor_route"])
+                        successor = ROUTE.verify_route(json.loads(successor_path.read_text()))
+                        self.assertEqual(successor["source_route_id"], fixture.route["route_id"])
+                        self.assertEqual(successor["reason"],
+                                         f"owner-pin-handoff:{metadata['attempt_id']}:{target}")
+                        self.assertEqual(AUTH.sealed_pin_harness(successor, worker_type="owner"), target)
+                        prepared_proof = CLOSE.verified_owner_pin_handoff_close(
+                            predecessor, jobs=fixture.jobs)
+                        self.assertEqual((prepared_proof or {}).get("successor", {}).get("route_id"),
+                                         successor["route_id"])
+                        pin_path = AUTH.pin_changes_path(predecessor)
+                        pin_bytes = pin_path.read_bytes()
+                        pin_rows = [json.loads(line) for line in pin_bytes.splitlines()]
+                        owner_pin = next(row for row in pin_rows if row.get("target") == "owner")
+                        owner_pin["route_hash"] = "sha256:" + "0" * 64
+                        pin_path.write_text("\n".join(json.dumps(row, sort_keys=True)
+                                                       for row in pin_rows) + "\n")
+                        self.assertIsNone(CLOSE.verified_owner_pin_handoff_close(
+                            predecessor, jobs=fixture.jobs))
+                        pin_path.write_bytes(pin_bytes)
+                        successor_bytes = successor_path.read_bytes()
+                        tampered_successor = json.loads(successor_bytes)
+                        tampered_successor["source_route_hash"] = "sha256:" + "0" * 64
+                        successor_path.write_text(json.dumps(tampered_successor))
+                        self.assertIsNone(CLOSE.verified_owner_pin_handoff_close(
+                            predecessor, jobs=fixture.jobs))
+                        successor_path.write_bytes(successor_bytes)
+                        fixture.route, fixture.path = successor, successor_path
+
+                    record = PRODUCER.read_cycle_record(fixture.artifacts, cycle_id)
+                    self.assertEqual(record["state"], "open", record)
+                    self.assertFalse((Path(begun["cycle_dir"]) / "manifest.json").exists())
+                    for route_path, original in route_bytes:
+                        self.assertEqual(route_path.read_bytes(), original)
+                finally:
+                    fixture.doCleanups()
+
+    def test_owner_pin_handoff_summary_without_recorded_pin_move_is_not_authority(self):
+        import artifact_identity
+        import artifact_producer as PRODUCER
+
+        fixture = ParentCloseTest()
+        fixture.setUp()
+        try:
+            ids = artifact_identity.IdAllocator()
+            PRODUCER.activate(fixture.artifacts, repository_id=ids.allocate("repository"),
+                              artifact_root_id=ids.allocate("artifact_root"),
+                              w7={"campaign_id": ids.allocate("campaign")})
+            process = fixture.process("spoofed-handoff-owner")
+            fixture.row("spoofed-handoff-owner", process=process, harness="codex")
+            begun = PRODUCER.begin(fixture.artifacts, route_file=fixture.path,
+                capability=fixture.route["capability"], intensity=fixture.route["effective_intensity"],
+                jobs=fixture.jobs)
+            payload = Path(begun["cycle_dir"]) / "artifacts" / "plans" / "handoff-summary-fixture.md"
+            payload.parent.mkdir(parents=True, exist_ok=True)
+            payload.write_text("ordinary close remains abandoned\n", encoding="utf-8")
+            outcome = CLOSE.close(fixture.route, fixture.path, jobs=fixture.jobs,
+                                  summary=work_start.PIN_HANDOFF_SUMMARY)
+            self.assertEqual(outcome["state"], "cancelled", outcome)
+            record = PRODUCER.read_cycle_record(fixture.artifacts, begun["cycle_id"])
+            self.assertEqual(PRODUCER._published_cycle_state(fixture.artifacts, record), "abandoned")
+            document = json.loads((Path(begun["cycle_dir"]) / "manifest.json").read_text())
+            abandoned = next(event for event in document["events"]
+                             if event["event_type"] == "cycle.abandoned")
+            self.assertEqual(abandoned["payload"]["abandon_reason"], "operator-decision")
+            self.assertIsNone(CLOSE.verified_owner_pin_handoff_close(fixture.route, jobs=fixture.jobs))
+        finally:
+            fixture.doCleanups()
+
+    def test_historical_two_hop_handoff_finishes_once_and_reuses_shared_admission(self):
+        import artifact_identity
+        import artifact_manifest as MANIFEST
+        import artifact_producer as PRODUCER
+        import dispatch_terminal_commit as TERMINAL
+        import route_authority as AUTH
+        from dispatch_completion_join import exact_attempt_row
+
+        fixture = ParentCloseTest()
+        fixture.setUp()
+        try:
+            rotation = ("codex", "claude", "codex")
+            route = ROUTE.compose_route(
+                capability="autopilot-spec", capability_mode="update", shape="staged",
+                graph="review,prd-transaction", slug="historical-owner-pin-handoff",
+                cwd=fixture.base, artifact_root=fixture.artifacts, spec_read="fixture", unassigned=True,
+                dispatch_evidence=fixture.route["dispatch_evidence"], parent_harness="codex",
+                work_request={"text": "Complete the same spec cycle after two owner handoffs",
+                              "owner_harness": rotation[0]})
+            route_file = ROUTE.canonical_route_path(fixture.artifacts, route["route_id"])
+            route_file.parent.mkdir(parents=True, exist_ok=True)
+            route_file.write_text(json.dumps(route))
+            fixture.route, fixture.path = route, route_file
+            ids = artifact_identity.IdAllocator()
+            PRODUCER.activate(fixture.artifacts, repository_id=ids.allocate("repository"),
+                              artifact_root_id=ids.allocate("artifact_root"),
+                              w7={"campaign_id": ids.allocate("campaign")})
+
+            cycle_id = None
+            cycle_dir = None
+            outcomes = []
+            route_bytes = []
+            for ordinal, harness in enumerate(rotation[:2]):
+                current_route_bytes = fixture.path.read_bytes()
+                process = fixture.process(f"historical-owner-{ordinal}")
+                metadata = fixture.row(
+                    f"historical-owner-{ordinal}", process=process, harness=harness,
+                    capability="autopilot-spec", capability_mode="update", intensity="standard")
+                begun = PRODUCER.begin(
+                    fixture.artifacts, route_file=fixture.path, capability="autopilot-spec",
+                    intensity="standard", jobs=fixture.jobs, owner_attempt_id=metadata["attempt_id"])
+                cycle_id = cycle_id or begun["cycle_id"]
+                cycle_dir = Path(begun["cycle_dir"])
+                self.assertEqual(begun["cycle_id"], cycle_id)
+                if ordinal == 1:
+                    self.assertEqual(fixture.path.read_bytes(), current_route_bytes,
+                                     "owner begin changed the immutable continuation route")
+                route_bytes.append((fixture.path, current_route_bytes))
+                if ordinal == 0:
+                    prd = cycle_dir / "artifacts" / "spec" / "prd.md"
+                    prd.parent.mkdir(parents=True, exist_ok=True)
+                    prd.write_text("# Historical handoff fixture PRD\n", encoding="utf-8")
+
+                target = rotation[ordinal + 1]
+                for pin_target in ("owner", "worker"):
+                    AUTH.record_pin_change(
+                        fixture.route, target=pin_target,
+                        pin={"harness": target, "model": None, "effort": None},
+                        by={"harness": "codex", "session_id": "fixture-parent"},
+                        source="fixture", tuples=[], candidates=[])
+                outcome = CLOSE.close(fixture.route, fixture.path, jobs=fixture.jobs,
+                                      summary=work_start.PIN_HANDOFF_SUMMARY)
+                self.assertEqual(outcome["state"], "cancelled", outcome)
+                outcomes.append(outcome)
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+                if ordinal == 0:
+                    prepared = work_start.pin_handoff_continuation(
+                        fixture.route, fixture.path, fixture.jobs, outcome)
+                    successor_path = Path(prepared["successor_route"])
+                    successor_disk = json.loads(successor_path.read_text())
+                    self.assertEqual(AUTH.sealed_pin_harness(successor_disk, worker_type="owner"), target,
+                                     successor_disk.get("selection_pins"))
+                    fixture.route = ROUTE.verify_route(json.loads(successor_path.read_text()))
+                    fixture.path = successor_path
+
+            # Reopen the current continuation under its cancelled owner only long enough to
+            # retain the same cycle; the second close is the historical preimage boundary.
+            final_handoff = outcomes[-1]
+            self.assertEqual(PRODUCER.read_cycle_record(fixture.artifacts, cycle_id)["state"], "open")
+            live_review_lease_path = PRODUCER._review_lease_path(
+                fixture.artifacts, cycle_id, "historical-live-review")
+            PRODUCER.review_lease_acquire(
+                fixture.artifacts, cycle_id=cycle_id, attempt_id="historical-live-review")
+            live_review_lease_bytes = live_review_lease_path.read_bytes()
+            PRODUCER.review_lease_release(
+                fixture.artifacts, cycle_id=cycle_id, attempt_id="historical-live-review")
+            abandoned = PRODUCER.finalize(
+                fixture.artifacts, cycle_id=cycle_id, state="abandoned",
+                abandon_reason="operator-decision")
+            self.assertEqual(abandoned["cycle_state"], "abandoned")
+            prior_manifest_path = cycle_dir / "manifest.json"
+            prior_manifest_bytes = prior_manifest_path.read_bytes()
+            prior_document = json.loads(prior_manifest_bytes)
+            from artifact_lifecycle import read_manifest_snapshots
+            prior_snapshot_bytes = next(raw for raw, saved in read_manifest_snapshots(
+                fixture.artifacts, cycle_id) if saved.get("manifest_revision_id") ==
+                prior_document.get("manifest_revision_id"))
+            self.assertEqual(prior_document["routes"][0]["route_id"], fixture.route["route_id"])
+            self.assertEqual(prior_document["routes"][0]["terminal_marker"], "pending")
+
+            # This is fixture construction for the recorded legacy state: the old close had
+            # sealed the second route before publishing its exact third successor.
+            # The source routes, outcomes and close journals remain production-generated.
+            prepared = work_start.pin_handoff_continuation(
+                fixture.route, fixture.path, fixture.jobs, final_handoff)
+            final_path = Path(prepared["successor_route"])
+            final_route = ROUTE.verify_route(json.loads(final_path.read_text()))
+            for edge_index, (predecessor_path, _original) in enumerate(route_bytes):
+                predecessor = json.loads(predecessor_path.read_text())
+                proof = CLOSE.verified_owner_pin_handoff_close(predecessor, jobs=fixture.jobs)
+                self.assertIsNotNone(proof, predecessor["route_id"])
+                expected_successor = (route_bytes[edge_index + 1][0].stem
+                                      if edge_index + 1 < len(route_bytes) else final_route["route_id"])
+                self.assertEqual(proof["successor"]["route_id"], expected_successor)
+            fixture.route, fixture.path = final_route, final_path
+            final_owner_process = fixture.process("historical-final-owner")
+            final_owner = fixture.row(
+                "historical-final-owner", process=final_owner_process, harness=rotation[2],
+                capability="autopilot-spec", capability_mode="update", intensity="standard")
+            binding = TERMINAL.publish_producer_binding(
+                artifact_root=fixture.artifacts, jobs=fixture.jobs, route_file=final_path,
+                owner_attempt_id=final_owner["attempt_id"], cycle_id=cycle_id, owner_begin=True)
+            self.assertEqual(binding.status, "published")
+            route_bytes.append((final_path, final_path.read_bytes()))
+
+            review = cycle_dir / "artifacts" / "spec" / "_internal" / "reviews" / "verdict.md"
+            review.parent.mkdir(parents=True, exist_ok=True)
+            review.write_text("fixture review passed\n", encoding="utf-8")
+            owner_report = cycle_dir / "artifacts" / "spec" / "_internal" / "owner-report.md"
+            owner_report.parent.mkdir(parents=True, exist_ok=True)
+            owner_report.write_text("fixture terminal report\n", encoding="utf-8")
+            review_node = next(node for node in final_route["nodes"] if node["id"] == "review")
+            child = fixture.row(
+                "historical-final-review", parent="historical-final-owner", harness="codex",
+                route_node=review_node["id"], capability="autopilot-spec", capability_mode="update",
+                artifact_root=str(fixture.artifacts), intensity="standard", failure_class="pass",
+                launch_outcome="reaped-before-publish")
+            ROUTE.complete_node(final_route, review_node, review_node["id"], review,
+                                attempt_id=child["attempt_id"], jobs=fixture.jobs)
+
+            native_text = f"artifact: {owner_report}\nverdict: PASS\nblocker: none"
+            native_log = fixture.jobs.parent / "historical-owner.jsonl"
+            native_rows = {
+                "codex": [{"type": "item.completed", "item": {"type": "agent_message", "text": native_text}},
+                          {"type": "turn.completed"}],
+                "claude": [{"type": "result", "subtype": "success", "is_error": False,
+                            "result": native_text}],
+                "opencode": [{"type": "text", "sessionID": "ses_fixture",
+                              "part": {"type": "text", "text": native_text}},
+                             {"type": "step_finish", "sessionID": "ses_fixture",
+                              "part": {"type": "step-finish", "reason": "stop"}}],
+            }[rotation[2]]
+            native_log.write_text("\n".join(json.dumps(row) for row in native_rows) + "\n")
+            final_owner_process.terminate()
+            final_owner_process.wait(timeout=5)
+            lines = fixture.jobs.read_text(encoding="utf-8").splitlines()
+            for index, line in enumerate(lines):
+                fields = line.split("\t")
+                current = DC.parse_registry_metadata(fields[5])
+                if current.get("attempt_id") != final_owner["attempt_id"]:
+                    continue
+                current.update(attempt_schema_version="2", execution_surface="registered-headless",
+                    transport="headless", fallback_hop="same-harness-headless", failure_class="pass",
+                    note="completed-supervisor", workflow_completion="runtime-v1",
+                    launch_outcome="reaped-before-publish", parent_sid="fixture-parent",
+                    parent_completion_delivery="codex-managed-gateway", log_file=str(native_log))
+                fields[1] = "done"
+                fields[5] = ",".join(f"{key}={value}" for key, value in current.items())
+                lines[index] = "\t".join(fields)
+            fixture.jobs.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            original_finalize = PRODUCER.finalize
+            crash_once = {"remaining": True}
+            def interrupt_historical_refresh(root, **kwargs):
+                if crash_once["remaining"] and kwargs.get("expected_binding") is not None:
+                    crash_once["remaining"] = False
+                    kwargs["crash_after_manifest"] = True
+                return original_finalize(root, **kwargs)
+            with mock.patch.object(PRODUCER, "finalize", side_effect=interrupt_historical_refresh):
+                interrupted = TERMINAL.settle_owner_completion(
+                    fixture.jobs, "done", exact_attempt_row(fixture.jobs, final_owner["attempt_id"]).metadata)
+            self.assertEqual(interrupted.result, "recoverable", interrupted)
+            self.assertTrue(PRODUCER.journal_path(fixture.artifacts, cycle_id).exists())
+
+            # Probe the real historical completion context while the exact finish is
+            # stopped after manifest publication. These checks use the same abandoned
+            # snapshot and immutable terminal binding as the production retry below.
+            historical_record = PRODUCER.read_cycle_record(fixture.artifacts, cycle_id)
+            exact_binding = TERMINAL.load_producer_binding(
+                artifact_root=fixture.artifacts, route_id=final_route["route_id"],
+                owner_attempt_id=final_owner["attempt_id"]).binding
+            def historical_context(expected=exact_binding):
+                return PRODUCER._historical_handoff_completion_context(
+                    fixture.artifacts, historical_record, prior_document, expected)
+
+            historical = historical_context()
+            self.assertIsNotNone(historical, "baseline historical handoff proof must remain valid")
+            completion_binding, _sealed_route, historical_outcome, preserved, _gates = historical
+            completed_path = cycle_dir / "manifest.json"
+            completed_candidate = json.loads(completed_path.read_text())
+            self.assertTrue(PRODUCER._evaluate_provisional_completion(
+                fixture.artifacts, historical_record, completed_candidate, completion_binding,
+                historical_outcome, preserved=preserved, first_completion=True))
+
+            missing_role = json.loads(json.dumps(completed_candidate))
+            missing_role["artifacts"] = []
+            missing_role["artifact_revisions"] = []
+            self.assertFalse(PRODUCER._evaluate_provisional_completion(
+                fixture.artifacts, historical_record, missing_role, completion_binding,
+                historical_outcome, preserved=preserved, first_completion=True),
+                "first historical completion must retain the required-role check")
+
+            primary_revision = next(
+                row for row in completed_candidate["artifact_revisions"]
+                if (row.get("locator") or {}).get("path", "").endswith("spec/prd.md"))
+            primary_payload = cycle_dir / primary_revision["locator"]["path"]
+            primary_bytes = primary_payload.read_bytes()
+            try:
+                primary_payload.write_bytes(primary_bytes + b" changed during historical finish\n")
+                self.assertFalse(PRODUCER._evaluate_provisional_completion(
+                    fixture.artifacts, historical_record, completed_candidate, completion_binding,
+                    historical_outcome, preserved=preserved, first_completion=True),
+                    "first historical completion must verify current payload bytes")
+            finally:
+                primary_payload.write_bytes(primary_bytes)
+
+            foreign_binding = dict(exact_binding)
+            foreign_binding["cycle_id"] = "cyc_" + "f" * 32
+            self.assertIsNone(historical_context(foreign_binding),
+                              "a foreign cycle binding cannot prove this history")
+            foreign_binding = dict(exact_binding)
+            foreign_binding["owner_attempt_id"] = fixture.aid("foreign-owner")
+            self.assertIsNone(historical_context(foreign_binding),
+                              "a foreign owner binding cannot prove this history")
+
+            # A canonical, correctly hashed sibling continuation is a real fork
+            # candidate; it must make the abandoned history ineligible.
+            import route_identity as ROUTE_IDENTITY
+            fork = json.loads(final_path.read_text())
+            current_pin = fork["selection_pins"]["owner"]["harness"]
+            fork["selection_pins"]["owner"]["harness"] = (
+                "opencode" if current_pin != "opencode" else "claude")
+            fork["route_hash"] = ROUTE_IDENTITY.route_hash(fork)
+            fork["route_id"] = ROUTE_IDENTITY.route_id_from_hash(fork["route_hash"])
+            fork_path = ROUTE.canonical_route_path(fixture.artifacts, fork["route_id"])
+            self.assertNotEqual(fork_path, final_path)
+            fork_path.write_text(json.dumps(fork), encoding="utf-8")
+            PRODUCER._ROUTE_EDGES.clear()
+            try:
+                fork_admission = PRODUCER.cycle_route_admission(
+                    fixture.artifacts, historical_record, final_route,
+                    finalize=True, validation_only=True)
+                self.assertEqual(fork_admission.reason,
+                                 "cycle-route-binding-mismatch:lineage-fork")
+                self.assertIsNone(historical_context(), "a forked continuation cannot take the cycle")
+            finally:
+                fork_path.unlink()
+                PRODUCER._ROUTE_EDGES.clear()
+
+            # Missing and contradictory parent-close history both reject the
+            # same real historical consumer; restore exact journal bytes after each probe.
+            predecessor = json.loads(route_bytes[-2][0].read_text())
+            close_ledger = WS.WorkflowLedger(
+                predecessor["route_id"], predecessor["route_hash"], jobs=fixture.jobs)
+            journal_before = close_ledger.journal_path.read_bytes()
+            journal_lines = journal_before.decode("utf-8").splitlines(keepends=True)
+            missing_result_lines = []
+            removed_results = 0
+            for line in journal_lines:
+                entry = json.loads(line)
+                evidence = entry.get("evidence") or {}
+                if isinstance(evidence.get("parent_close_result"), dict):
+                    removed_results += 1
+                else:
+                    missing_result_lines.append(line)
+            self.assertGreater(removed_results, 0)
+            try:
+                close_ledger.journal_path.write_text("".join(missing_result_lines), encoding="utf-8")
+                self.assertIsNone(historical_context(), "missing close result history must fail closed")
+            finally:
+                close_ledger.journal_path.write_bytes(journal_before)
+
+            contradictory_lines = []
+            changed_results = 0
+            for line in journal_lines:
+                entry = json.loads(line)
+                evidence = entry.get("evidence") or {}
+                close_result = evidence.get("parent_close_result")
+                if isinstance(close_result, dict):
+                    close_result["owner_attempt_id"] = fixture.aid("foreign-owner")
+                    changed_results += 1
+                    line = json.dumps(entry, ensure_ascii=False) + "\n"
+                contradictory_lines.append(line)
+            self.assertGreater(changed_results, 0)
+            try:
+                close_ledger.journal_path.write_text("".join(contradictory_lines), encoding="utf-8")
+                self.assertIsNone(historical_context(), "contradictory close result history must fail closed")
+            finally:
+                close_ledger.journal_path.write_bytes(journal_before)
+
+            # The exact owner and children must be quiescent. Exercise both a
+            # live child and an unobservable namespace using real registry rows.
+            jobs_before = fixture.jobs.read_bytes()
+            live_process = fixture.process("historical-live-child")
+            fixture.row(
+                "historical-live-child", parent="historical-final-owner", process=live_process,
+                route_node=review_node["id"], capability="autopilot-spec", capability_mode="update",
+                artifact_root=str(fixture.artifacts), intensity="standard")
+            try:
+                self.assertIsNone(historical_context(), "a live child blocks historical completion")
+            finally:
+                if live_process.poll() is None:
+                    live_process.terminate()
+                    live_process.wait(timeout=5)
+                fixture.jobs.write_bytes(jobs_before)
+
+            jobs_before = fixture.jobs.read_bytes()
+            unknown_child = fixture.terminal_fail_stage(
+                parent="historical-final-owner", name="historical-unknown-child",
+                status="running", foreground=False, cleanup=False)
+            try:
+                # Keep this namespace present but unobservable. A host observer
+                # may correctly prove the fabricated namespace extinct otherwise.
+                with mock.patch.object(DC, "namespace_gone", return_value="present"):
+                    self.assertNotEqual(
+                        DC.attempt_process_quiescence(unknown_child, terminal_receipt=True).state,
+                        "quiescent")
+                    self.assertIsNone(historical_context(), "unknown child execution blocks historical completion")
+            finally:
+                fixture.jobs.write_bytes(jobs_before)
+
+            live_review_lease_path.write_bytes(live_review_lease_bytes)
+            try:
+                self.assertIsNone(historical_context(), "a live review lease blocks historical completion")
+            finally:
+                live_review_lease_path.unlink()
+            unknown_lease_path = PRODUCER._review_lease_path(
+                fixture.artifacts, cycle_id, "historical-unknown-review")
+            unknown_lease_path.write_text("{not-json", encoding="utf-8")
+            try:
+                self.assertIsNone(historical_context(), "an unreadable review lease blocks historical completion")
+            finally:
+                unknown_lease_path.unlink()
+
+            first = TERMINAL.settle_owner_completion(
+                fixture.jobs, "done", exact_attempt_row(fixture.jobs, final_owner["attempt_id"]).metadata)
+            self.assertEqual(first.result, "completed", first)
+            self.assertEqual(first.shared_publication["status"], "admitted", first.shared_publication)
+            completed_bytes = completed_path.read_bytes()
+            completed = json.loads(completed_bytes)
+            self.assertEqual(completed["cycle"]["state"], "completed")
+            self.assertEqual(completed["routes"][:len(prior_document["routes"])], prior_document["routes"])
+            self.assertEqual(completed["events"][:len(prior_document["events"])], prior_document["events"])
+            self.assertEqual(completed["routes"][-1]["route_id"], final_route["route_id"])
+            self.assertTrue(MANIFEST.validate_update(
+                completed, preserved=[prior_document], previous=prior_document).ok)
+            self.assertNotEqual(prior_manifest_path.read_bytes(), prior_manifest_bytes)
+            self.assertIn(prior_snapshot_bytes, [raw for raw, _saved in
+                                                read_manifest_snapshots(fixture.artifacts, cycle_id)])
+            for route_path, original in route_bytes:
+                self.assertEqual(route_path.read_bytes(), original)
+            for outcome in outcomes:
+                path = Path(outcome["route_file"]).with_suffix(".outcome.json")
+                self.assertEqual(json.loads(path.read_text())["state"], "cancelled")
+
+            terminal_state_path = TERMINAL.terminal_slot(
+                fixture.artifacts, final_route["route_id"], final_owner["attempt_id"]) / "terminal-commit.json"
+            first_terminal = json.loads(terminal_state_path.read_text())
+            first_publication = first.shared_publication
+            first_event_count = len(completed["events"])
+            retry = TERMINAL.settle_owner_completion(
+                fixture.jobs, "done", exact_attempt_row(fixture.jobs, final_owner["attempt_id"]).metadata)
+            self.assertEqual(retry.result, "completed", retry)
+            self.assertEqual(retry.shared_publication["status"], "admitted", retry.shared_publication)
+            for identity_key in ("shared_reference_id", "shared_reference_revision_id", "content_digest"):
+                self.assertEqual(retry.shared_publication.get(identity_key),
+                                 first_publication.get(identity_key), identity_key)
+            self.assertEqual(json.loads(terminal_state_path.read_text())["terminal_commit_id"],
+                             first_terminal["terminal_commit_id"])
+            self.assertEqual(len(json.loads(completed_path.read_text())["events"]), first_event_count)
+            self.assertEqual(completed_path.read_bytes(), completed_bytes)
+        finally:
+            fixture.doCleanups()
 
     def test_attached_then_advanced_owner_and_old_children_close_current_binding(self):
         import owner_route_binding as OWNER
