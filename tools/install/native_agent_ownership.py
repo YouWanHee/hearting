@@ -12,8 +12,14 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 
 import safe_fs
+
+TOOLS_ROOT = Path(__file__).resolve().parents[1]
+if str(TOOLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(TOOLS_ROOT))
+import harness_manifest
 
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[^/\\]+\.toml\Z")
@@ -95,8 +101,48 @@ def legacy_payload(home: Path, name: str, target: Path) -> bool:
         return False
 
 
+def _declared_codex_agent(root: Path, name: str, target: Path) -> bool:
+    """Check the release identity and the agent it declares for Codex."""
+    manifest = root / harness_manifest.MANIFEST_NAME
+    if manifest.is_symlink() or not manifest.is_file():
+        return False
+    try:
+        core = root / "core/CORE.md"
+        if core.is_symlink() or not core.is_file():
+            return False
+        release = harness_manifest.load(manifest)
+        if "adapters/codex/agents/*.toml" not in release["ownership"]["generated"]:
+            return False
+        canonical = root / "adapters/codex/agents" / name
+        mirror = root / "codex_setting/codex-agents" / name
+        if (target not in (canonical, mirror) or canonical.is_symlink()
+                or not canonical.is_file()):
+            return False
+        if target == mirror and mirror.read_bytes() != canonical.read_bytes():
+            return False
+        if name[:-5] in release["kernel"]["agents"]:
+            return True
+        config_path = root / "adapters/codex/config/models.conf"
+        if config_path.is_symlink():
+            return False
+        config = config_path.read_text(encoding="utf-8")
+        for line in config.splitlines():
+            if not line.strip().startswith("CFG_NATIVE_AGENT_CATALOG="):
+                continue
+            raw = line.split("=", 1)[1].strip().strip('"').strip("'")
+            for token in raw.split():
+                agent, separator, profile = token.partition(":")
+                if agent == name[:-5] and separator and profile:
+                    return True
+            return False
+    except (harness_manifest.ManifestError, OSError, UnicodeError, ValueError,
+            KeyError, TypeError, RuntimeError):
+        return False
+    return False
+
+
 def shipped_target(name: str, target: Path) -> bool:
-    """Recognize the canonical shipped projection of any intact release root."""
+    """Recognize an agent declared by an intact source release."""
     if not target.is_absolute() or not _NAME.fullmatch(name):
         return False
     try:
@@ -104,10 +150,8 @@ def shipped_target(name: str, target: Path) -> bool:
         if not resolved.is_file() or resolved.name != name:
             return False
         for root in resolved.parents:
-            manifest = root / "harness-manifest.json"
-            if manifest.is_file() and not manifest.is_symlink():
-                return resolved in (root / "adapters/codex/agents" / name,
-                                    root / "codex_setting/codex-agents" / name)
+            if _declared_codex_agent(root, name, resolved):
+                return True
     except (OSError, RuntimeError):
         pass
     return False

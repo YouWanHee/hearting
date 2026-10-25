@@ -49,6 +49,26 @@ class NativeAgentOwnershipTest(unittest.TestCase):
     def dest(self, name="deep.toml"):
         return self.home / "agents" / name
 
+    def release_fixture(self, name="deep.toml", *, catalog=None):
+        old_root = self.root / "fixture" / "old-release"
+        old_agent = old_root / "adapters/codex/agents" / name
+        old_agent.parent.mkdir(parents=True)
+        old_agent.write_bytes(self.source("deep.toml").read_bytes())
+        shutil.copy2(ROOT / "harness-manifest.json", old_root / "harness-manifest.json")
+        (old_root / "core").mkdir()
+        shutil.copy2(ROOT / "core/CORE.md", old_root / "core/CORE.md")
+        shutil.copytree(ROOT / "capabilities", old_root / "capabilities")
+        shutil.copytree(ROOT / "roles/units", old_root / "roles/units")
+        config = old_root / "adapters/codex/config/models.conf"
+        config.parent.mkdir(parents=True)
+        source_config = (ROOT / "adapters/codex/config/models.conf").read_text()
+        if catalog is not None:
+            source_config = re.sub(r'^CFG_NATIVE_AGENT_CATALOG=.*$',
+                                   f'CFG_NATIVE_AGENT_CATALOG="{catalog}"',
+                                   source_config, flags=re.M)
+        config.write_text(source_config)
+        return old_agent
+
     def old_payload(self, name="deep.toml", body=b'model = "old-user-model"\n', extra=None):
         contents = {name: body, **(extra or {})}
         identity = {
@@ -135,16 +155,168 @@ class NativeAgentOwnershipTest(unittest.TestCase):
                 self.assertEqual(os.readlink(leaf) if leaf.is_symlink() else leaf.read_bytes(), prior)
 
     def test_prior_shipped_release_link_updates_to_current_release(self):
-        old_root = self.root / "fixture" / "old-release"
-        old_agent = old_root / "adapters/codex/agents/deep.toml"
-        old_agent.parent.mkdir(parents=True)
-        old_agent.write_bytes(self.source().read_bytes())
-        shutil.copy2(ROOT / "harness-manifest.json", old_root / "harness-manifest.json")
+        old_agent = self.release_fixture()
         self.dest().symlink_to(old_agent)
         self.assertEqual(self.driver(dry_run=True)["status"], "planned")
         self.assertEqual(os.readlink(self.dest()), str(old_agent))
         self.assertEqual(self.driver()["status"], "updated")
         self.assertEqual(os.readlink(self.dest()), str(self.source()))
+
+    def test_prior_shipped_mirror_and_removed_catalog_agent_remain_owned(self):
+        old_agent = self.release_fixture("obsolete.toml", catalog="obsolete:deep")
+        mirror_dir = old_agent.parents[3] / "codex_setting/codex-agents"
+        mirror_dir.parent.mkdir(parents=True)
+        mirror_dir.symlink_to("../adapters/codex/agents", target_is_directory=True)
+        mirror = mirror_dir / old_agent.name
+        dest = self.dest("obsolete.toml")
+        dest.symlink_to(mirror)
+        self.assertTrue(ownership.owned_link(self.home, dest))
+        registry = manifest._manifest_path("codex", "global")
+        manifest._write_manifest(registry, {"schema": 1, "runtime": "codex", "scope": "global",
+                                            "version": "old", "timestamp": "fixture", "files": {}})
+        args = Namespace(runtimes=["codex"], target="codex", scope="global", dry_run=True)
+        with (mock.patch.object(installer.projector, "plan", return_value={"codex": []}),
+              mock.patch.object(installer.codex_launcher, "capture_snapshot", return_value=None),
+              mock.patch.object(installer.codex_launcher, "uninstall", return_value={"status": "unchanged"})):
+            preview = installer.cmd_uninstall(args)
+            self.assertTrue(any(f"remove symlink {dest}" in line for line in preview["lines"]))
+            args.dry_run = False
+            actual = installer.cmd_uninstall(args)
+        self.assertEqual(actual["exit"], 0, actual)
+        self.assertFalse(dest.is_symlink())
+        self.assertEqual(old_agent.read_bytes(), self.source().read_bytes())
+
+    def test_public_driver_preserves_marker_only_external_agent(self):
+        external = self.root / "external"
+        target = external / "adapters/codex/agents/deep.toml"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b'model = "user-owned"\n')
+        (external / "harness-manifest.json").write_text("{}")
+        self.dest().symlink_to(target)
+        self.assertEqual(self.driver(dry_run=True)["status"], "preserved")
+        self.assertEqual(self.driver()["status"], "preserved")
+        self.assertEqual(os.readlink(self.dest()), str(target))
+        self.assertEqual(target.read_bytes(), b'model = "user-owned"\n')
+
+    def test_public_driver_rejects_invalid_release_evidence(self):
+        old_agent = self.release_fixture()
+        root = old_agent.parents[3]
+        marker = root / "harness-manifest.json"
+        original = marker.read_bytes()
+        config = root / "adapters/codex/config/models.conf"
+        original_config = config.read_text()
+        core = root / "core/CORE.md"
+        original_core = core.read_bytes()
+        cases = ("empty-object", "empty-bytes", "malformed", "unrelated",
+                 "wrong-runtime", "missing-root", "missing-projection", "wrong-projection")
+        for case in cases:
+            with self.subTest(case=case):
+                marker.write_bytes(original)
+                config.write_text(original_config)
+                core.write_bytes(original_core)
+                if case == "empty-object":
+                    marker.write_text("{}")
+                elif case == "empty-bytes":
+                    marker.write_bytes(b"")
+                elif case == "malformed":
+                    marker.write_text('{"schema_version":')
+                else:
+                    data = json.loads(original)
+                    if case == "unrelated":
+                        data = {"schema_version": 4, "product": {"id": "other"}}
+                    elif case == "wrong-runtime":
+                        data["product"]["runtimes"] = ["claude", "opencode"]
+                    elif case == "missing-root":
+                        core.unlink()
+                    elif case == "missing-projection":
+                        data["ownership"]["generated"].remove("adapters/codex/agents/*.toml")
+                    elif case == "wrong-projection":
+                        config.write_text(re.sub(r'^CFG_NATIVE_AGENT_CATALOG=.*$',
+                                                 'CFG_NATIVE_AGENT_CATALOG="light:light"',
+                                                 original_config, flags=re.M))
+                    marker.write_text(json.dumps(data))
+                dest = self.dest()
+                if dest.is_symlink():
+                    dest.unlink()
+                dest.symlink_to(old_agent)
+                before = old_agent.read_bytes()
+                self.assertEqual(self.driver(dry_run=True)["status"], "preserved")
+                self.assertEqual(self.driver()["status"], "preserved")
+                self.assertEqual(os.readlink(dest), str(old_agent))
+                self.assertEqual(old_agent.read_bytes(), before)
+
+    def test_public_uninstall_preserves_marker_only_external_agent(self):
+        external = self.root / "external"
+        target = external / "adapters/codex/agents/obsolete.toml"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b'model = "user-owned"\n')
+        (external / "harness-manifest.json").write_bytes(b"")
+        dest = self.dest("obsolete.toml")
+        dest.symlink_to(target)
+        known_root = self.root / "known-external"
+        known = known_root / "adapters/codex/agents/deep.toml"
+        known.parent.mkdir(parents=True)
+        known.write_bytes(b'model = "another-user"\n')
+        (known_root / "harness-manifest.json").write_text("{}")
+        self.dest().symlink_to(known)
+        registry = manifest._manifest_path("codex", "global")
+        manifest._write_manifest(registry, {"schema": 1, "runtime": "codex", "scope": "global",
+                                            "version": "old", "timestamp": "fixture", "files": {}})
+        args = Namespace(runtimes=["codex"], target="codex", scope="global", dry_run=True)
+        row = {"action": "symlink", "dest": str(self.dest()),
+               "source": str(self.source()), "native_agent": True}
+        with (mock.patch.object(installer.projector, "plan", return_value={"codex": [row]}),
+              mock.patch.object(installer.codex_launcher, "capture_snapshot", return_value=None),
+              mock.patch.object(installer.codex_launcher, "uninstall", return_value={"status": "unchanged"})):
+            preview = installer.cmd_uninstall(args)
+            self.assertEqual(preview["exit"], 0, preview)
+            self.assertFalse(any(f"remove symlink {dest}" in line for line in preview["lines"]))
+            self.assertFalse(any(f"remove symlink {self.dest()}" in line for line in preview["lines"]))
+            args.dry_run = False
+            actual = installer.cmd_uninstall(args)
+        self.assertEqual(actual["exit"], 0, actual)
+        self.assertEqual(os.readlink(dest), str(target))
+        self.assertEqual(target.read_bytes(), b'model = "user-owned"\n')
+        self.assertEqual(os.readlink(self.dest()), str(known))
+        self.assertEqual(known.read_bytes(), b'model = "another-user"\n')
+
+    def test_activation_discovery_and_refresh_preserve_false_release_marker(self):
+        external = self.root / "external"
+        target = external / "adapters/codex/agents/deep.toml"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b'model = "user-owned"\n')
+        (external / "harness-manifest.json").write_text("{}")
+        dest = self.dest()
+        dest.symlink_to(target)
+        self.assertNotIn(dest, activation._discovered_harness_links("codex"))
+        with self.assertRaisesRegex(activation.ActivationError, "foreign native agent"):
+            activation.activate("codex", "linked", str(ROOT))
+        self.assertEqual(os.readlink(dest), str(target))
+
+        dest.unlink()
+        report = activation.activate("codex", "linked", str(ROOT))
+        self.assertEqual(report["freshness"], "fresh", report)
+        dest.unlink()
+        dest.symlink_to(target)
+        self.assertNotIn(dest, activation._discovered_harness_links("codex"))
+        activation.refresh("codex")
+        self.assertEqual(os.readlink(dest), str(target))
+
+        config = self.home / "agent-config/models.conf"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        shipped = (ROOT / "adapters/codex/config/models.conf").read_text()
+        config.write_text(re.sub(r'^CFG_MAIN_SESSION_ONLY_MODELS=.*$',
+                                 f'CFG_MAIN_SESSION_ONLY_MODELS="{" ".join(self._shipped_models())}"',
+                                 shipped, flags=re.M))
+        activation.refresh("codex")
+        self.assertEqual(os.readlink(dest), str(target))
+
+        config.write_text(re.sub(r'^CFG_NATIVE_AGENT_CATALOG=.*$',
+                                 'CFG_NATIVE_AGENT_CATALOG="light:light"',
+                                 shipped, flags=re.M))
+        activation.refresh("codex")
+        self.assertEqual(os.readlink(dest), str(target))
+        self.assertEqual(target.read_bytes(), b'model = "user-owned"\n')
 
     def test_project_installer_keeps_shipped_agent_with_user_model_config(self):
         project = self.root / "fixture" / "project"
@@ -247,8 +419,11 @@ class NativeAgentOwnershipTest(unittest.TestCase):
     def test_complete_shell_projection_imports_helper_and_preserves_entries(self):
         old = self.old_payload()
         self.dest().symlink_to(old)
-        foreign = self.root / "foreign.toml"
+        external = self.root / "external"
+        foreign = external / "adapters/codex/agents/light.toml"
+        foreign.parent.mkdir(parents=True)
         foreign.write_bytes(b"foreign")
+        (external / "harness-manifest.json").write_text("{}")
         self.dest("light.toml").symlink_to(foreign)
         self.dest("balanced.toml").write_bytes(b"user")
         result = subprocess.run(["sh", str(ROOT / "adapters/codex/bin/install-runtime-projection.sh")],
