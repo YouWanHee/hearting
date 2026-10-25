@@ -792,11 +792,16 @@ def _admission_decisions(documents):
                                       ensure_ascii=False, allow_nan=False)
             except (TypeError, ValueError):
                 identity = repr(sorted(value.keys()))
-            rows.append({"sample_id": hashlib.sha256(identity.encode("utf-8")).hexdigest(),
-                         "state": state, "at": _admission_timestamp(value),
-                         "reasons": _admission_reasons(value),
-                         "priority_blockers": _admission_blockers(value)})
-    unique = {row["sample_id"]: row for row in rows}
+            sample = {"sample_id": hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+                      "state": state, "at": _admission_timestamp(value),
+                      "reasons": _admission_reasons(value),
+                      "priority_blockers": _admission_blockers(value)}
+            row_ids = frozenset(value[key] for key in
+                ("row_id", "row_key", "arm_id", "arm")
+                if isinstance(value.get(key), str))
+            rows.append((sample, row_ids))
+    unique = {sample["sample_id"]: (sample, row_ids)
+              for sample, row_ids in rows}
     return [unique[key] for key in sorted(unique)]
 
 
@@ -1059,9 +1064,6 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                            if isinstance(obj.get("run_id"), str)}
                 if run_id not in run_ids:
                     continue
-                row_ids = {obj.get(key) for obj in objects
-                           for key in ("row_id", "row_key", "arm_id", "arm")
-                           if isinstance(obj.get(key), str)}
                 generation_fields = [{key: obj.get(key) for key in
                     ("run_id", "started_at", "pid", "starttime", "command_hash",
                      "config_sha256", "row_id", "row_key") if key in obj}
@@ -1071,14 +1073,28 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     separators=(",", ":"), ensure_ascii=False, default=str)
                 bundle_generation = hashlib.sha256(
                     (root_generation + generation_material).encode("utf-8")).hexdigest()[:24]
-                if run_ids != {run_id} or (row_key and str(row_key) != "run"
-                                           and row_ids != {str(row_key)}):
+                if run_ids != {run_id}:
                     candidates.append({"ambiguous": True, "generation": bundle_generation,
                                        "samples": [], "path": str(bundle)})
                     continue
                 decisions = _admission_decisions(documents)
                 if not decisions:
                     continue
+                if row_key and str(row_key) != "run":
+                    requested_row = str(row_key)
+                    scoped_decisions = []
+                    for decision, decision_row_ids in decisions:
+                        if decision_row_ids == {requested_row}:
+                            scoped_decisions.append(decision)
+                        elif not decision_row_ids or requested_row in decision_row_ids:
+                            # A run-wide or internally conflicting decision has
+                            # no exact row authority. Keep it visible as unknown
+                            # without attributing its reason to this row.
+                            scoped_decisions.append({**decision, "state": "unknown",
+                                "reasons": [], "priority_blockers": []})
+                    decisions = scoped_decisions
+                else:
+                    decisions = [decision for decision, _row_ids in decisions]
                 current_rows = []
                 for row in decisions:
                     stamp = row.get("at")

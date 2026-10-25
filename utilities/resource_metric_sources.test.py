@@ -158,6 +158,7 @@ class MetricSourcesTest(unittest.TestCase):
         (bundle / "execution-record.data").write_text(json.dumps({
             "run_id": "run-a", "started_at": 50, "row_id": "row-a"}))
         admission = {
+            "row_id": "row-a",
             "admitted": False,
             "snapshot": {"t": 100},
             "first_snapshot": {"t": 20},
@@ -183,6 +184,62 @@ class MetricSourcesTest(unittest.TestCase):
             registry_path=registry, started_at=50, now=111, cursor=result["cursor"])
         self.assertEqual(replay["samples"], [])
         self.assertEqual(replay["latest"]["sample_id"], sample["sample_id"])
+
+    def test_row_query_does_not_inherit_run_wide_decision_from_execution_record(self):
+        root = self.root / "row-with-run-wide-decision"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "execution.json").write_text(json.dumps({
+            "run_id": "run-1", "row_id": "row-1", "started_at": 0}))
+        (bundle / "admission.json").write_text(json.dumps({
+            "run_id": "run-1", "admitted": False, "snapshot": {"t": 20},
+            "reasons": ["run-wide capacity"]}))
+
+        row = metrics.read_admission_sources([root], run_id="run-1", row_key="row-1",
+            started_at=0, now=21)
+        self.assertEqual(row["coverage"], "observed")
+        self.assertEqual(row["latest"]["state"], "unknown")
+        self.assertEqual([sample["state"] for sample in row["samples"]], ["unknown"])
+        self.assertEqual(row["latest"]["reasons"], [])
+
+        run = metrics.read_admission_sources([root], run_id="run-1", started_at=0, now=21)
+        self.assertEqual(run["coverage"], "observed")
+        self.assertEqual(run["latest"]["state"], "denied")
+        self.assertEqual([sample["state"] for sample in run["samples"]], ["denied"])
+        self.assertEqual(run["latest"]["reasons"], ["run-wide capacity"])
+
+    def test_row_query_accepts_decision_with_its_own_exact_row_identity(self):
+        root = self.root / "exact-row-decision"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "admission.json").write_text(json.dumps({
+            "run_id": "run-1", "row_id": "row-1", "admitted": False,
+            "snapshot": {"t": 20}}))
+
+        row = metrics.read_admission_sources([root], run_id="run-1", row_key="row-1",
+            started_at=0, now=21)
+        self.assertEqual(row["coverage"], "observed")
+        self.assertEqual(row["latest"]["state"], "denied")
+        self.assertEqual(len(row["samples"]), 1)
+
+    def test_row_queries_select_each_decision_identity_from_one_bundle(self):
+        root = self.root / "multiple-row-decisions"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "admissions.json").write_text(json.dumps([
+            {"run_id": "run-1", "row_id": "row-1", "admitted": False,
+             "snapshot": {"t": 20}},
+            {"run_id": "run-1", "row_id": "row-2", "admitted": True,
+             "snapshot": {"t": 21}},
+        ]))
+
+        first = metrics.read_admission_sources([root], run_id="run-1", row_key="row-1",
+            started_at=0, now=22)
+        second = metrics.read_admission_sources([root], run_id="run-1", row_key="row-2",
+            started_at=0, now=22)
+        self.assertEqual((first["latest"]["state"], len(first["samples"])), ("denied", 1))
+        self.assertEqual((second["latest"]["state"], len(second["samples"])), ("admitted", 1))
+        self.assertNotEqual(first["latest"]["sample_id"], second["latest"]["sample_id"])
 
     def test_admission_reader_rejects_wrong_foreign_and_ambiguous_bindings(self):
         wrong = self.root / "wrong"
