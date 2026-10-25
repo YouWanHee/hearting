@@ -198,12 +198,40 @@ def retry_step(route, armed, jobs, reason):
     while f"{base}__a{ordinal}" in runs:
         ordinal += 1
     retry = f"{base}__a{ordinal}"
+    compute_hint = ""
+    try:
+        import route_parent_close
+        route_file = armed.get("route_file") or route.get("_route_file")
+        failed_row = runs.get(run_id) if isinstance(runs, dict) else {}
+        attempts = {value for value in (
+            armed.get("parent_attempt_id"),
+            (armed.get("owner_wait") or {}).get("parent_attempt_id"),
+            (failed_row.get("owner_wait") or {}).get("parent_attempt_id"),
+            failed_row.get("parent_attempt_id"),
+        ) if isinstance(value, str) and value}
+        if route_file and attempts:
+            candidates = route_parent_close.linked_resources(
+                route, Path(route_file), jobs, attempts)
+            ids = sorted({row["run_id"] for row in candidates
+                          if row.get("kind") == "compute" and row.get("state") == "finished"
+                          and isinstance(row.get("run_id"), str)})
+            if ids:
+                compute_hint = (
+                    "\nCompleted compute-hosts run candidates (unverified; choose explicitly): "
+                    + ", ".join(f"{run_id}: resource-runner start --compute-run {shlex.quote(run_id)}"
+                                 for run_id in ids)
+                    + "."
+                )
+    except Exception:
+        # An advisory discovery failure never hides the original recovery.
+        compute_hint = ""
     task = (f"Continue the approved task from {route['route_id']}. Resource {run_id} remains failed: {reason}. "
             f"Retain its registry, sentinel, outputs and all historical PASS/FAIL records unchanged. "
             f"Reuse its checked configuration and smoke inputs, run a distinct resource attempt {retry} "
             "in this new cycle's output directory, and revalidate every selected downstream stage against "
             "the new output bytes. Historical PASS markers do not complete this leg. Original task:\n"
-            + str((route.get("work_request") or {}).get("text") or route.get("slug", "")))
+            + str((route.get("work_request") or {}).get("text") or route.get("slug", ""))
+            + compute_hint)
     argv = ["hearting", "run", "capability-route", "compose", "--start", "--shape", "staged",
             "--capability", route["capability"], "--capability-mode", route["capability_mode"],
             "--intensity", route["effective_intensity"], "--graph", ",".join(nodes),
@@ -221,7 +249,8 @@ def retry_step(route, armed, jobs, reason):
             "meaning": "원본 실패를 보존하고 새 실행의 산출물로 후속 단계를 다시 검증합니다."}
 
 
-def prove(route, ledger, armed, failure, gates, jobs, module, *, snapshots=None):
+def prove(route, ledger, armed, failure, gates, jobs, module, *, snapshots=None,
+          compute_observations=None):
     snapshot = Snapshot()
     observed_armed, _ = snapshot.document(ledger.root / "armed" / f"{armed['node']}.json")
     if observed_armed != armed:
@@ -237,11 +266,22 @@ def prove(route, ledger, armed, failure, gates, jobs, module, *, snapshots=None)
     row = registry["runs"][armed["predecessor_id"]]
     sentinel, _ = snapshot.read(row["sentinel"])
     identity = f"{row['run_id']}:{row.get('pid')}:{row.get('starttime')}:{row.get('exit_code')}"
+    execution = row.get("execution") if isinstance(row, dict) else None
+    if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+        # The caller captures this before writer locks; require exact armed and
+        # row identity here, then the snapshot digest is checked before append.
+        captured = (compute_observations or {}).get(node_id)
+        if not captured or captured.get("armed") != armed or captured.get("row") != row:
+            raise ValueError("compute-resource-observation-changed")
+        observation = captured.get("observation") or {}
+        identity_finished = observation.get("state") == "quiescent"
+    else:
+        identity_finished = RR.classify_identity(row)[0] == "exited"
     if (row.get("route") != armed.get("route_file") or row.get("node") != node_id
             or row.get("jobs") != armed.get("jobs") or row.get("status") != "failed"
             or type(row.get("exit_code")) is not int or row["exit_code"] == 0
             or row.get("cancel_requested") or row.get("parent_close_requested")
-            or RR.classify_identity(row)[0] != "exited"
+            or not identity_finished
             or sentinel.decode().strip() != str(row["exit_code"])
             or failure.get("identity") != identity
             or failure.get("resource_sha256") != resource_resume.row_digest(row)
@@ -348,7 +388,7 @@ def prove(route, ledger, armed, failure, gates, jobs, module, *, snapshots=None)
             "stage_chain": proofs, "independent_nodes": independent}
 
 
-def reconcile(route, ledger, gates, jobs, module):
+def reconcile(route, ledger, gates, jobs, module, *, compute_observations=None):
     """Validate all candidates first; append only legal, restartable transitions."""
     current = ledger.state()
     if current["workflow_state"] not in {"CREATED", "READY", "RUNNING", "FAILED_RETRYABLE"}:
@@ -379,7 +419,13 @@ def reconcile(route, ledger, gates, jobs, module):
                 retry_armed['resource_registry'] = armed['resource_registry']
             if armed.get("predecessor_kind") != "resource":
                 raise ValueError('resource-watch-binding-mismatch')
-            planned[node_id] = prove(route, ledger, armed, failure, gates, jobs, module, snapshots=snapshots)
+            if compute_observations and node_id in compute_observations:
+                planned[node_id] = prove(route, ledger, armed, failure, gates, jobs, module,
+                                         snapshots=snapshots,
+                                         compute_observations=compute_observations)
+            else:
+                planned[node_id] = prove(route, ledger, armed, failure, gates, jobs, module,
+                                         snapshots=snapshots)
             retries[node_id] = retry_armed
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise UnresolvedResource(node_id, str(exc), retry_step(route, retry_armed, jobs, str(exc))) from exc

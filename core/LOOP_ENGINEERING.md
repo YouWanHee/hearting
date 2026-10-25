@@ -167,15 +167,23 @@ blocking or its identity becomes uncertain. An unrelated pane event alone
 must not restart the native readiness probes while completion is impossible.
 
 Long-lived observers may retain a bounded projection of an immutable result
-while every file generation it depended on remains current. The projection
-must name those dependencies, and a missing, unreadable, retargeted, or
-unstable input discards the prior result instead of turning it into authority.
-Mutable writer documents stay separate from historical read projections.
-Append-only reuse is limited to a continuously observed file whose supported
-writer appends records; a partial byte tail remains data, not a row, until its
-newline arrives. Replacements and uncertain writes rebuild the view. Reusing
-parsed bytes avoids I/O; reusing derived decisions additionally requires
-unchanged dependencies, while live recipients, leases, claims, processes, and
+while every file generation it depended on remains current. A retained open
+descriptor identifies the generation behind each cached registry view; path
+metadata is checked against that descriptor before reuse, and an atomic path
+replacement moves the cache to the new file generation. Append reuse is
+limited to the registry writer's append protocol and reads only the suffix
+through the retained descriptor. Scoped readers that already read current
+bytes compare their digest with the cached generation before reusing its
+indexes. Registry writers may append rows or atomically replace the file;
+arbitrary in-place truncation or rewrite is unsupported. A partial byte tail
+remains data, not a row, until its newline arrives. The projection must name
+its dependencies, and a missing, unreadable, retargeted, or unstable input
+discards the prior result instead of turning it into authority. Mutable writer
+documents stay separate from historical read projections. Reusing parsed
+segments avoids reparsing unchanged rows, while append reads incur only suffix
+I/O and scoped digest validation counts the bytes it reads.
+Reusing derived decisions additionally requires unchanged dependencies, while
+live recipients, leases, claims, processes, and
 state transitions remain fresh observations.
 
 Documentation explains behavior and preserves the reasons for decisions. Do not
@@ -213,6 +221,11 @@ review subject, fixed inputs, session scope and granted addresses remain bound;
 parent, owner and runtime selection follow their recorded lineage. A claim alone
 does not adopt a continuation. Process quiescence and terminal result availability
 are separate observations consumed by resume, reconciliation and settlement alike.
+Registered delivery expiry follows the exact attempt and recipient lineage:
+positive dead PID/start evidence can expire its one pending record, while an
+identity-matched closed route settles its bound duty without deleting that
+record. Unknown liveness and live successors remain protected; unchanged
+observations do not rewrite the duty.
 
 Exact comparison protects sealed evidence from tampering; it is not a reason to
 refuse the normal ways work moves. When a recovery path still refuses, the

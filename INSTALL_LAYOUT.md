@@ -307,6 +307,9 @@ code copy under the shared `run_root` for the payload; it does not install into
 the remote home or change the installer's `current`/activation. Self hosts keep
 their pinned release path. Unmanaged checkouts are forwarded as-is.
 
+Fleet shows this machine's read-only compute observation even without inventory.
+Remote hosts and detached runs still require inventory configuration.
+
 ## User-owned config registry — `harness config status`
 
 Every user-owned configuration file the harness reads is registered in

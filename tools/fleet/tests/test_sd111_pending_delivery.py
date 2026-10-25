@@ -461,17 +461,34 @@ class PendingDeliveryCountsTest(unittest.TestCase):
 
     def test_render_and_overview_show_known_count_but_never_unknown_as_zero(self):
         from fleet import render
-        from fleet.explorer.overview import build_overview
-        known = {"pending": 2, "expired": 0, "no_recipient": 1}
-        with mock.patch.object(render, "_PROCESS_VIEW", False):
-            lines = render._delivery_pending_rows(known)
-            text = "\n".join(segment[0] for line in lines for segment in line)
-        self.assertIn("받을 세션 없음 1", text)
-        overview = "\n".join(build_overview({"pending_delivery": known}))
-        self.assertIn("받을 세션 없음 1", overview)
-        unknown = {"pending": 2, "expired": 0, "no_recipient": None}
-        self.assertNotIn("no recipient", str(render._delivery_pending_rows(unknown)))
-        self.assertNotIn("받을 세션 없음", "\n".join(build_overview({"pending_delivery": unknown})))
+        from fleet.explorer.live import build_view_model
+        from fleet.explorer.grid import CellGrid
+        from fleet.explorer.resources import draw_system
+        from fleet.explorer.chrome import draw_chrome
+        from fleet.explorer.state import NavState
+
+        # The current explorer displays delivery in SYSTEM, replacing overview.py.
+        for count in (1, 0, None, True, "0"):
+            with self.subTest(no_recipient=count):
+                counts = {"pending": 2, "expired": 0, "no_recipient": count}
+                snapshot = {"sessions": [], "pending_delivery": counts}
+                before = json.dumps(snapshot, sort_keys=True)
+                vm = build_view_model(snapshot, now=0)
+                grid = CellGrid(168, 44)
+                draw_system(grid, vm)
+                body = "\n".join(grid.rows_text())
+                draw_chrome(grid, vm, NavState(view="SYSTEM"))
+                footer = grid.rows_text()[-1]
+                classic = str(render._delivery_pending_rows(counts))
+                if isinstance(count, int) and not isinstance(count, bool):
+                    for text in (body, footer, classic):
+                        self.assertIn(f"받을 세션 없음 {count}", text)
+                    self.assertEqual(vm.system["peer_delivery"]["no_recipient"], count)
+                else:
+                    for text in (body, footer, classic):
+                        self.assertNotIn("받을 세션 없음", text)
+                    self.assertNotIn("no_recipient", vm.system["peer_delivery"])
+                self.assertEqual(json.dumps(snapshot, sort_keys=True), before)
 
 
 if __name__ == "__main__":
