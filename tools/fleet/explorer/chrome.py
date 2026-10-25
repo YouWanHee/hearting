@@ -118,6 +118,40 @@ def _clip_part(parts, index, width):
     parts[index] = (_clip(text, max(0, width)), key)
 
 
+def _minimum_compact_width(parts, version_index, count_indexes, extra_indexes,
+                           method_index, freshness_index):
+    minimum = list(parts)
+    _clip_part(minimum, version_index, 2)       # keep the version separator and a visible ellipsis
+    for index in (*count_indexes, *extra_indexes):
+        _clip_part(minimum, index, 1)           # keep each observed marker and mark a clipped value
+    _clip_part(minimum, method_index, 1)
+    if freshness_index is not None and 0 <= freshness_index < len(minimum):
+        text, key = minimum[freshness_index]
+        raw = str(text).lstrip(" ")
+        if len(raw) >= 5 and raw[2] == ":" and raw[:2].isdigit() and raw[3:5].isdigit():
+            minimum[freshness_index] = (" " + raw[:5], key)
+        else:
+            minimum[freshness_index] = (_clip(text, 1), key)
+    return _parts_width(minimum)
+
+
+def _clip_freshness(text, width):
+    raw = str(text).lstrip(" ")
+    if len(raw) < 5 or raw[2] != ":" or not raw[:2].isdigit() or not raw[3:5].isdigit():
+        return _clip(text, width)
+    clock = raw[:5]
+    tail = raw[5:].lstrip(" ")
+    if not tail:
+        return _clip(" " + clock, width)
+    if width >= 8:
+        room = width - 7
+        suffix = _clip(tail, room)
+        return " " + clock + " " + suffix
+    if width >= 6:
+        return clock + "…"
+    return _clip(clock, width)
+
+
 def _join_compact_groups(groups):
     parts, starts = [], []
     for group in groups:
@@ -143,6 +177,8 @@ def _fit_compact_host(hosts, width):
     prefix, name = parts[0], parts[1]
     suffix = parts[2] if len(parts) > 2 else None
     prefix_width = cell_width(prefix[0])
+    if width < prefix_width + 1:
+        return [(_clip("".join(text for text, _key in parts), width), prefix[1])]
     suffix_width = cell_width(suffix[0]) if suffix else 0
     name_width = max(0, width - prefix_width - suffix_width)
     fitted_name = (_clip(name[0], name_width), name[1]) if name_width else ("", name[1])
@@ -222,36 +258,39 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
         if compact_host and right_width <= width and host_width + right_width + 1 > width:
             compact_host = _fit_compact_host(hosts, max(0, width - right_width - 1))
             host_width = _parts_width(compact_host)
-        if compact_host and _parts_width(right_parts) > width and host_width > max(20, width // 4):
-            compact_host = _fit_compact_host(hosts, max(6, width // 4))
+        if (compact_host and right_width > width and
+                host_width + 1 + _minimum_compact_width(
+                    right_parts, version_index, count_indexes, extra_indexes, method_index, freshness_start) > width):
+            compact_host = _fit_compact_host(hosts, 2)
             host_width = _parts_width(compact_host)
         group_budget = max(0, width - host_width - (1 if compact_host else 0))
 
         overflow = _parts_width(right_parts) - group_budget
         if overflow > 0:
             current = cell_width(right_parts[version_index][0]) if version_index is not None else 0
-            _clip_part(right_parts, version_index, max(0, current - overflow))
+            _clip_part(right_parts, version_index, max(2, current - overflow))
         for index in count_indexes:
             overflow = _parts_width(right_parts) - group_budget
             if overflow <= 0:
                 break
             current = cell_width(right_parts[index][0])
-            _clip_part(right_parts, index, max(0, current - overflow))
+            _clip_part(right_parts, index, max(1, current - overflow))
         for index in extra_indexes:
             overflow = _parts_width(right_parts) - group_budget
             if overflow <= 0:
                 break
             current = cell_width(right_parts[index][0])
-            _clip_part(right_parts, index, max(0, current - overflow))
+            _clip_part(right_parts, index, max(1, current - overflow))
         if _parts_width(right_parts) > group_budget and method_index is not None:
             overflow = _parts_width(right_parts) - group_budget
             current = cell_width(right_parts[method_index][0])
-            _clip_part(right_parts, method_index, max(0, current - overflow))
+            _clip_part(right_parts, method_index, max(1, current - overflow))
         if _parts_width(right_parts) > group_budget and freshness_start is not None:
             clock_index = freshness_start
             overflow = _parts_width(right_parts) - group_budget
             current = cell_width(right_parts[clock_index][0])
-            _clip_part(right_parts, clock_index, max(0, current - overflow))
+            fitted = _clip_freshness(right_parts[clock_index][0], max(1, current - overflow))
+            right_parts[clock_index] = (fitted, right_parts[clock_index][1])
         if _parts_width(right_parts) > group_budget:
             right_parts = [(_clip("".join(text for text, _key in right_parts), group_budget), "dim")]
 

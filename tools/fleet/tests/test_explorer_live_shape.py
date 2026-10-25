@@ -384,6 +384,30 @@ class CensusHeaderTests(unittest.TestCase):
         self.assertLessEqual(cell_width(row), 80)
         self.assertEqual(ef.frame_violations(frame, trace, 80, 45), [])
 
+    def test_ultranarrow_rows_keep_visible_clips_for_identity_and_clock(self):
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.grid import cell_width
+        from tools.fleet.explorer.state import NavState
+        from tools.fleet.explorer.view_model import ExplorerViewModel
+
+        host_name, version, freshness = "trainer-west-gpu-node-01", "v" + "x" * 100, "02:38"
+        vm = self._header_vm(session_states=["working"] * 15 + ["idle"] * 2 + ["blocked"],
+                             hosts=[{"mark": "⌂", "name": host_name}],
+                             version=version, freshness=freshness)
+        for width in (40, 32):
+            with self.subTest(width=width):
+                frame, trace = ef.trace_draw(draw, vm, NavState(view="OVERVIEW", scope="-"), width, 24)
+                row = frame.text_rows()[0]
+                self.assertIn("…", row)
+                self.assertIn("⠏…", row)
+                self.assertIn("●…", row)
+                self.assertIn("hearting …", row)
+                self.assertTrue(row.rstrip().endswith(freshness), row)
+                self.assertEqual(cell_width(row), width)
+                self.assertEqual(vm.hearting["version"], version)
+                self.assertEqual(vm.hosts[0]["name"], host_name)
+                self.assertFalse([item for item in trace if item[0] == "clip" and item[2] == 0])
+
     def test_missing_install_metadata_uses_existing_unknown_unmanaged_fallbacks(self):
         from tools.fleet.explorer.frame import draw
         from tools.fleet.explorer.state import NavState
