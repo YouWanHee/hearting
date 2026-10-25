@@ -215,10 +215,16 @@ def activate(root: Path, recipient_kind: str, session_id: str, *,
              request_recovery: bool = True) -> list[dict]:
     """Retain this session's duties and request maintenance from its existing runner."""
     records, _ = addressed_records(root, recipient_kind, session_id)
-    from peer_obligations import retain_registered_completion
+    from peer_obligations import retain_ordinary_notice, retain_registered_completion
     for record in records:
         jobs = record_jobs(root, record)
         if jobs is None:
+            continue
+        if (record.get("receipt") or {}).get("kind") == "notice":
+            try:
+                retain_ordinary_notice(jobs, record)
+            except (OSError, ValueError, RuntimeError):
+                continue
             continue
         for attempt in record.get("attempt_ids") or []:
             try:
@@ -261,6 +267,22 @@ def record_jobs(root: Path, record: dict, *, observed_jobs=None) -> Path | None:
     receipt = record.get("receipt") or {}
     raw = receipt.get("job_registry")
     try:
+        if (record.get("receipt") or {}).get("kind") == "notice":
+            state_root = Path(root).resolve(strict=True)
+            import session_notice
+            for value in record.get("lineage", []):
+                if not isinstance(value, str) or not value.startswith(session_notice.LINEAGE_PREFIX):
+                    continue
+                try:
+                    stored = json.loads(value[len(session_notice.LINEAGE_PREFIX):])
+                    raw_jobs = stored.get("jobs") if isinstance(stored, dict) else None
+                    candidate = Path(raw_jobs).expanduser() if isinstance(raw_jobs, str) else None
+                    if (candidate and candidate.is_absolute() and not candidate.is_symlink()
+                            and candidate.resolve(strict=False).parent == state_root):
+                        return candidate.resolve(strict=False)
+                except (OSError, ValueError, TypeError):
+                    continue
+            return state_root / "jobs.log"
         if isinstance(raw, str) and raw:
             jobs = Path(raw).expanduser()
         else:
@@ -574,7 +596,8 @@ def sweep_deliver(
 
 NOTICE_DELIVERY_HEADER = (
     "Hearting notice about work you started (a paused route resumed, a remote run ended). "
-    "Tell the user in one line; act only where a line's required_action asks for it. "
+    "Report observed metrics, trend, and elapsed or ETA against the criteria and plan; state when unavailable. "
+    "Act only where a line's required_action asks for it. "
     "Do not start Monitor, dispatch-wait, or a polling loop."
 )
 

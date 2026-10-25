@@ -63,11 +63,23 @@ class _TmpRootMixin:
         self.jobs_path.touch()
         self._old_environ = dict(os.environ)
         for key in tuple(os.environ):
-            if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_", "AGENT_THREAD_",
-                               "AGENT_HERDR_", "HERDR_", "OPENCODE_", "CLAUDE_", "CODEX_")):
+            if key.startswith(("AGENT_", "HERDR_", "OPENCODE_", "CLAUDE_", "CODEX_", "XDG_")):
                 os.environ.pop(key, None)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
         os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
+        artifacts = self.tmp_root / "artifacts"
+        cycle_dir = artifacts / "cycle"
+        output_dir = cycle_dir / "artifacts"
+        runtime_dir = self.tmp_root / "runtime"
+        for path in (output_dir, runtime_dir):
+            path.mkdir(parents=True, exist_ok=True)
+        os.environ["AGENT_ARTIFACT_ROOT"] = str(artifacts)
+        os.environ["AGENT_ARTIFACT_CYCLE_DIR"] = str(cycle_dir)
+        os.environ["AGENT_ARTIFACT_OUTPUT_DIR"] = str(output_dir)
+        os.environ["AGENT_ARTIFACT_CAMPAIGN_ID"] = "campaign-fixture"
+        os.environ["AGENT_ARTIFACT_CYCLE_ID"] = "cycle-fixture"
+        os.environ["AGENT_ARTIFACT_PRODUCER_ID"] = "producer-fixture"
+        os.environ["AGENT_RUNTIME_DIR"] = str(runtime_dir)
         fixture_store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
         self.assertTrue(fixture_store.ensure_directory(),
                         "fixture starts with an existing obligations root")
@@ -82,7 +94,7 @@ class _TmpRootMixin:
         os.environ["XDG_CONFIG_HOME"] = str(self.tmp_root / "home" / ".config")
         os.environ["XDG_DATA_HOME"] = str(self.tmp_root / "home" / ".local" / "share")
         os.environ["XDG_CACHE_HOME"] = str(self.tmp_root / "home" / ".cache")
-        os.environ.pop("XDG_STATE_HOME", None)
+        os.environ["XDG_STATE_HOME"] = str(self.tmp_root / "home" / ".local" / "state")
         os.environ.pop("HARNESS_STATE_ROOT", None)
         os.environ.pop("CODEX_HOME", None)
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
@@ -3827,6 +3839,71 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         self._release()
 
 
+    def test_rearm_waits_for_a_concurrent_observer_to_publish_its_generation(self):
+        dead = self._arm(target="peer-dead", mode="held")
+        self._wait_for_wait_calls(1)
+        paths = peer_steward._watch_paths(dead["watch_id"], self.watch_root)
+        arm = peer_steward._read_json(paths.arm)
+        os.kill(int(dead["pid"]), signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while (peer_steward._pid_identity_ok(int(dead["pid"]), dead["pid_start"])
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+        self.assertFalse(peer_steward._watcher_present(arm))
+
+        ctx = multiprocessing.get_context("fork")
+        spawned, publish = ctx.Event(), ctx.Event()
+        real_popen = peer_steward.subprocess.Popen
+
+        def restart():
+            def delayed_publication(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                spawned.set()
+                if not publish.wait(15):
+                    raise RuntimeError("fixture did not release observer publication")
+                return process
+
+            with mock.patch.dict(os.environ, self._env("held")), \
+                 mock.patch.object(peer_steward.subprocess, "Popen",
+                                   side_effect=delayed_publication):
+                if not peer_steward._spawn_watch_observer(dead["watch_id"], arm):
+                    raise RuntimeError("fixture observer restart failed")
+
+        contender = ctx.Process(target=restart)
+        contender.start()
+        finished = threading.Event()
+        release = threading.Thread(target=lambda: (finished.wait(1), publish.set()))
+        try:
+            self.assertTrue(spawned.wait(10), "first observer was not spawned")
+            self.assertEqual(peer_steward._read_json(paths.arm)["observer_generation"], 1)
+            release.start()
+            try:
+                with mock.patch.dict(os.environ, self._env("held")), \
+                     mock.patch("builtins.print") as output:
+                    result = peer_steward.cmd_rearm(SimpleNamespace(watch_id=dead["watch_id"]))
+                observed = peer_steward._read_json(paths.arm)
+            finally:
+                finished.set()
+            self.assertEqual(result, 0)
+            self.assertEqual(observed["observer_generation"], 2)
+            self.assertNotEqual(observed["watcher"]["pid"], int(dead["pid"]))
+            self.assertTrue(peer_steward._watcher_present(observed))
+            self.assertIn("state=rearmed", output.call_args_list[0].args[0])
+            self.assertEqual(len(self._wait_calls()), 1,
+                             "both restart callers retain the one native wait")
+        finally:
+            publish.set()
+            finished.set()
+            if release.ident is not None:
+                release.join(3)
+            contender.join(10)
+            if contender.is_alive():
+                contender.kill()
+                contender.join(3)
+        self.assertEqual(contender.exitcode, 0)
+        self._release()
+
+
 class WatchMessageTransportSettlementTest(_WatchMixin, unittest.TestCase):
     def _watch(self, target):
         import session_tidy
@@ -5573,6 +5650,309 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertIn("elif t_harness == \"claude\"", prompt)
         self.assertIn("_claude_idle_prompt_guard", prompt)
         self.assertNotIn("--no-verify", peer_steward.build_parser().format_help())
+
+
+class RetainedRunNoticeCarrierTest(_TmpRootMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.sid = "fixture-owner-session"
+        self.pane = "w1:p-notice"
+        self.ident = {"pane": self.pane, "harness": "claude", "session_id": self.sid,
+                      "pid": os.getpid(), "pid_start": peer_steward._proc_start_ticks(os.getpid()),
+                      "pid_namespace": os.readlink("/proc/self/ns/pid")}
+
+    def _notice(self, harness, key="checkpoint:run-1:slot-1"):
+        import session_notice
+        with mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner",
+                               return_value=False), \
+                mock.patch.object(peer_steward.peer_obligations,
+                                  "request_dispatch_reconciliation", return_value=False):
+            return session_notice.notify(harness, self.sid, key=key,
+                subject="experiment checkpoint", text="run=run-1; ETA total 2h",
+                route_id="route-fixture", jobs=self.jobs_path)
+
+    def _run_notice_duty(self, harness, duty, *, fail_ack=False, forget_binding=False,
+                         target_state="idle", target_sid=None,
+                         queue_accept_only=False):
+        import dispatch_pending_delivery as pending_delivery
+        target_sid = target_sid or self.sid
+        target_ident = {**self.ident, "harness": harness, "session_id": target_sid}
+        store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        agents = {"result": {"agents": [{"agent": harness,
+            "agent_session": {"value": target_sid}, "pane_id": self.pane}]}}
+        resolved = {"pane": self.pane, "harness": harness, "session_id": target_sid,
+                    "name": "fixture-owner", "state": target_state, "_identity": target_ident}
+        sends = []
+        def native_receive(_pane, body, *, wait, timeout_ms):
+            self.assertFalse(wait)
+            sends.append(body)
+            if fail_ack:
+                with mock.patch.object(pending_delivery, "ack_received",
+                                       side_effect=OSError("fixture ack failure")):
+                    rc = peer_steward.peer_message.receive_peer_message(
+                        body, {"harness": harness, "session_id": target_sid})
+            elif forget_binding:
+                with mock.patch.object(peer_steward.peer_message, "_ack_registered_delivery",
+                                       return_value=False):
+                    rc = peer_steward.peer_message.receive_peer_message(
+                        body, {"harness": harness, "session_id": target_sid})
+            else:
+                rc = peer_steward.peer_message.receive_peer_message(
+                    body, {"harness": harness, "session_id": target_sid})
+            self.assertEqual(rc, 0)
+            return 0, {}
+        def native_queue(ref, *, timeout=1.0):
+            row = peer_steward.peer_message._read_pending(ref)
+            self.assertIsNotNone(row)
+            sends.append(row["text"])
+            if queue_accept_only:
+                with peer_steward.peer_message.pending_lock(ref):
+                    current = peer_steward.peer_message._read_pending(ref)
+                    peer_steward.peer_message._save_pending(dict(
+                        current, state="queued", receipt="native-queue-accepted"))
+                return {"status": "queued", "reason": "fixture-native-queue-accepted"}
+            rc = peer_steward.peer_message.receive_peer_message(
+                row["text"], {"harness": harness, "session_id": target_sid})
+            self.assertEqual(rc, 0)
+            return {"status": "received", "reason": "fixture-exact-native-history"}
+        result = subprocess.CompletedProcess([], 0, json.dumps(agents), "")
+        ready = (SimpleNamespace(state="ready", reason="")
+                 if target_state == "idle" or harness == "codex"
+                 else SimpleNamespace(state="unknown", reason="native-state-working"))
+        with mock.patch.object(peer_steward.subprocess, "run", return_value=result), \
+                mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                mock.patch.object(peer_steward, "_resolve_target",
+                                  return_value=(harness, target_sid, "fixture-owner")), \
+                mock.patch.object(peer_steward, "_resolve_prompt_target",
+                                  return_value=(resolved, None, [])), \
+                mock.patch.object(peer_steward, "_pane_readiness", return_value=ready), \
+                mock.patch.object(peer_steward, "_prompt_current_candidate",
+                                  return_value=({"state": "idle", "_identity": target_ident}, None)), \
+                mock.patch.object(peer_steward, "_current_session_identity",
+                                  return_value=("fixture-steward", "claude")), \
+                mock.patch.object(peer_steward, "_from_name", return_value="fixture-steward"), \
+                mock.patch.object(peer_steward, "_project_of", return_value=str(self.tmp_root)), \
+                mock.patch.object(peer_steward, "_claude_idle_prompt_guard",
+                                  return_value=(None, "fixture-foreground-proof")), \
+                mock.patch.object(peer_steward, "_claude_prompt_foreground_proof",
+                                  return_value={"pid": os.getpid(), "start": "fixture-start",
+                                      "pid_namespace": self.ident["pid_namespace"],
+                                      "session_id": target_sid}), \
+                mock.patch.object(peer_steward, "_read_screen",
+                                  return_value=peer_steward._screen_lines(CLAUDE_SUGGESTION)), \
+                mock.patch.object(peer_steward, "_herdr_prompt", side_effect=native_receive), \
+                mock.patch.object(peer_steward.peer_message, "deliver_pending_codex",
+                                  side_effect=native_queue), \
+                mock.patch.object(peer_steward.peer_obligations,
+                    "_ordinary_notice_target",
+                    return_value=(harness, target_sid, self.sid)):
+            peer_steward._reconcile_obligations(
+                store, duties=peer_steward._runner_duties(store, [duty]))
+        return store, sends
+
+    def _resume_claude_message_duty(self, duty, store):
+        ready = SimpleNamespace(state="ready", reason="")
+        def receive(_pane, body, *, wait, timeout_ms):
+            self.assertFalse(wait)
+            self.assertEqual(peer_steward.peer_message.receive_peer_message(
+                body, {"harness": "claude", "session_id": self.sid}), 0)
+            return 0, {}
+        resolved = {"pane": self.pane, "harness": "claude", "session_id": self.sid,
+                    "name": "fixture-owner", "state": "idle", "_identity": self.ident}
+        with mock.patch.object(peer_steward.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, "{}", "")), \
+                mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                mock.patch.object(peer_steward, "_retire_target",
+                                  return_value=("idle", self.ident, 0, None)), \
+                mock.patch.object(peer_steward, "_resolve_target",
+                                  return_value=("claude", self.sid, "fixture-owner")), \
+                mock.patch.object(peer_steward, "_resolve_prompt_target",
+                                  return_value=(resolved, None, [])), \
+                mock.patch.object(peer_steward, "_prompt_current_candidate",
+                                  return_value=({"state": "idle", "_identity": self.ident}, None)), \
+                mock.patch.object(peer_steward, "_pane_readiness", return_value=ready), \
+                mock.patch.object(peer_steward, "_claude_idle_prompt_guard",
+                                  return_value=(None, "fixture-foreground-proof")), \
+                mock.patch.object(peer_steward, "_claude_prompt_foreground_proof",
+                                  return_value={"pid": os.getpid(), "start": "fixture-start",
+                                      "pid_namespace": self.ident["pid_namespace"],
+                                      "session_id": self.sid}), \
+                mock.patch.object(peer_steward, "_read_screen",
+                                  return_value=peer_steward._screen_lines(CLAUDE_SUGGESTION)), \
+                mock.patch.object(peer_steward, "_herdr_prompt", side_effect=receive):
+            peer_steward._resume_message_obligation(duty, store)
+
+    def test_claude_and_codex_native_receipts_ack_the_same_retained_notice(self):
+        for harness in ("claude", "codex"):
+            with self.subTest(harness=harness):
+                notice = self._notice(harness, key="checkpoint:" + harness)
+                self.assertEqual(notice["attempt_ids"], [])
+                duplicate = self._notice(harness, key="checkpoint:" + harness)
+                self.assertEqual(duplicate["delivery_id"], notice["delivery_id"])
+                store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+                duty, = [item for item in store.list(kinds={"run-notice"})
+                         if item["intent"]["delivery_id"] == notice["delivery_id"]]
+                store, sends = self._run_notice_duty(harness, duty)
+                import dispatch_pending_delivery as pending_delivery
+                current = pending_delivery.read(
+                    self.tmp_root, self.sid, notice["delivery_id"])
+                self.assertEqual(current["state"], "acked")
+                self.assertEqual(len(sends), 1)
+                self.assertEqual(store.get(duty["id"])["state"], "complete")
+
+    def test_codex_queue_acceptance_stays_unacked_until_exact_native_receipt(self):
+        import dispatch_pending_delivery as pending_delivery
+        notice = self._notice("codex", key="checkpoint:queue-then-receipt")
+        store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        duty, = store.list(kinds={"run-notice"})
+        store, sends = self._run_notice_duty("codex", duty, queue_accept_only=True,
+                                             target_state="working")
+        current = pending_delivery.read(self.tmp_root, self.sid, notice["delivery_id"])
+        self.assertEqual(current["state"], "sent-ambiguous")
+        transfer_ref = store.get(duty["id"])["observation"]["transfer_ref"]
+        transfer = peer_steward.peer_message._read_pending(transfer_ref)
+        self.assertEqual(transfer["state"], "queued")
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(peer_steward.peer_message.receive_peer_message(
+            transfer["text"], {"harness": "codex", "session_id": self.sid}), 0)
+        refreshed = store.get(duty["id"])
+        peer_steward._reconcile_obligations(
+            store, duties=peer_steward._runner_duties(store, [refreshed]))
+        self.assertEqual(pending_delivery.read(
+            self.tmp_root, self.sid, notice["delivery_id"])["state"], "acked")
+        self.assertEqual(store.get(duty["id"])["state"], "complete")
+
+    def test_ack_retry_preserves_consumed_receipt_without_resending(self):
+        notice = self._notice("claude", key="attention:run-1:nan")
+        store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        duty, = store.list(kinds={"run-notice"})
+        store, sends = self._run_notice_duty("claude", duty, fail_ack=True)
+        import dispatch_pending_delivery as pending_delivery
+        transfer_ref = store.get(duty["id"])["observation"]["transfer_ref"]
+        transfer = peer_steward.peer_message._read_pending(transfer_ref)
+        self.assertEqual(transfer["state"], "received")
+        pending_before = pending_delivery.read(
+            self.tmp_root, self.sid, notice["delivery_id"])
+        self.assertEqual(pending_before["state"], "sent-ambiguous")
+        refreshed = store.get(duty["id"])
+        with mock.patch.object(peer_steward.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, "{}", "")):
+            peer_steward._reconcile_obligations(
+                store, duties=peer_steward._runner_duties(store, [refreshed]))
+        pending_after = pending_delivery.read(
+            self.tmp_root, self.sid, notice["delivery_id"])
+        self.assertEqual(pending_after["state"], "acked")
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(store.get(duty["id"])["state"], "complete")
+
+    def test_busy_claude_recipient_is_delivered_by_the_existing_runner_when_idle(self):
+        import dispatch_pending_delivery as pending_delivery
+        notice = self._notice("claude", key="checkpoint:busy-then-idle")
+        store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        duty, = store.list(kinds={"run-notice"})
+        store, sends = self._run_notice_duty("claude", duty, target_state="working")
+        self.assertEqual(sends, [])
+        self.assertEqual(pending_delivery.read(
+            self.tmp_root, self.sid, notice["delivery_id"])["state"], "sent-ambiguous")
+        transfer_ref = store.get(duty["id"])["observation"]["transfer_ref"]
+        message_duty = store.get("message-" + transfer_ref)
+        self.assertIsNotNone(message_duty)
+        self._resume_claude_message_duty(message_duty, store)
+        self.assertEqual(pending_delivery.read(
+            self.tmp_root, self.sid, notice["delivery_id"])["state"], "acked")
+        self.assertEqual(store.get(duty["id"])["state"], "complete")
+
+    def test_received_but_unbound_history_is_not_resent(self):
+        notice = self._notice("claude", key="checkpoint:unknown-history")
+        store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        duty, = store.list(kinds={"run-notice"})
+        store, sends = self._run_notice_duty("claude", duty, forget_binding=True)
+        current = store.get(duty["id"])
+        transfer_ref = current["observation"]["transfer_ref"]
+        transfer = peer_steward.peer_message._read_pending(transfer_ref)
+        self.assertEqual((transfer["state"], transfer["receipt"]),
+                         ("received", "exact-peer-ref"))
+        observation = dict(current["observation"])
+        observation["transfer_bindings"] = {}
+        current = store.update(duty["id"], observation=observation)
+        peer_steward._reconcile_obligations(
+            store, duties=peer_steward._runner_duties(store, [current]))
+        self.assertEqual(store.get(duty["id"])["observation"]["reason"],
+                         "received-notice-history-unbound")
+        self.assertEqual(len(sends), 1)
+        import dispatch_pending_delivery as pending_delivery
+        self.assertEqual(pending_delivery.read(
+            self.tmp_root, self.sid, notice["delivery_id"])["state"], "sent-ambiguous")
+
+    def test_parent_handover_refreshes_recipient_without_rekeying_notice(self):
+        import dispatch_completion_join as join
+        import dispatch_pending_delivery as pending_delivery
+        import dispatch_seat_handover as handover
+        import session_notice
+        original_sid, successor_sid = "sid-parent-old", "sid-parent-new"
+        lineage = {"kind": "attempt-parent", "attempt_id": "att-owner",
+                   "harness": "claude", "session_id": original_sid}
+        with mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner",
+                               return_value=False), \
+                mock.patch.object(peer_steward.peer_obligations,
+                                  "request_dispatch_reconciliation", return_value=False):
+            notice = session_notice.notify("claude", original_sid, key="final:handover",
+                subject="experiment final", text="run=run-3; completed",
+                jobs=self.jobs_path, lineage=lineage)
+        identity = {"jobs": str(self.jobs_path), "storage_recipient": original_sid,
+                    "recipient_harness": "claude", "recipient_session_id": original_sid,
+                    "lineage": lineage}
+        row = SimpleNamespace(status="running", metadata={
+            "parent_sid": original_sid, "parent_completion_delivery": "claude-parent-runtime"})
+        with mock.patch.object(join, "current_attempt_row", return_value=row), \
+                mock.patch.object(handover, "effective_parent",
+                                  side_effect=[original_sid, successor_sid]), \
+                mock.patch.object(handover, "effective_parent_harness", return_value="claude"):
+            first = peer_steward.peer_obligations._ordinary_notice_target(
+                identity, "claude-parent-runtime")
+            second = peer_steward.peer_obligations._ordinary_notice_target(
+                identity, "claude-parent-runtime")
+        before = pending_delivery.read(self.tmp_root, original_sid, notice["delivery_id"])
+        frozen = pending_delivery.received_ack_identity(before, original_sid, notice["delivery_id"])
+        after = pending_delivery.read(self.tmp_root, original_sid, notice["delivery_id"])
+        self.assertEqual(first, ("claude", original_sid, original_sid))
+        self.assertEqual(second, ("claude", successor_sid, original_sid))
+        self.assertEqual(after["delivery_id"], notice["delivery_id"])
+        self.assertEqual(after["receipt_digest"], notice["receipt_digest"])
+        self.assertEqual(pending_delivery.received_ack_identity(
+            after, original_sid, notice["delivery_id"]), frozen)
+
+    def test_handover_send_uses_successor_session_and_acks_under_original_storage_key(self):
+        import dispatch_pending_delivery as pending_delivery
+        import session_notice
+        original_sid, successor_sid = "sid-parent-old", "sid-parent-new"
+        self.sid = original_sid
+        self.ident = {**self.ident, "session_id": original_sid}
+        lineage = {"kind": "attempt-parent", "attempt_id": "att-owner",
+                   "harness": "claude", "session_id": original_sid}
+        with mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner",
+                               return_value=False), \
+                mock.patch.object(peer_steward.peer_obligations,
+                                  "request_dispatch_reconciliation", return_value=False):
+            notice = session_notice.notify("claude", original_sid, key="checkpoint:handed-over",
+                subject="experiment checkpoint", text="run=run-4; ETA total 3h",
+                jobs=self.jobs_path, lineage=lineage)
+        before = pending_delivery.read(self.tmp_root, original_sid, notice["delivery_id"])
+        frozen = pending_delivery.received_ack_identity(before, original_sid, notice["delivery_id"])
+        store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
+        duty, = store.list(kinds={"run-notice"})
+        store, sends = self._run_notice_duty("claude", duty, target_sid=successor_sid)
+        after = pending_delivery.read(self.tmp_root, original_sid, notice["delivery_id"])
+        self.assertEqual(len(sends), 1)
+        transfer_ref = store.get(duty["id"])["observation"]["transfer_ref"]
+        transfer = peer_steward.peer_message._read_pending(transfer_ref)
+        self.assertEqual(transfer["to"]["session_id"], successor_sid)
+        self.assertEqual(after["state"], "acked")
+        self.assertEqual(after["delivery_id"], notice["delivery_id"])
+        self.assertEqual(after["receipt_digest"], notice["receipt_digest"])
+        self.assertEqual(pending_delivery.received_ack_identity(
+            after, original_sid, notice["delivery_id"]), frozen)
+        self.assertEqual(store.get(duty["id"])["state"], "complete")
 
 
 class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):

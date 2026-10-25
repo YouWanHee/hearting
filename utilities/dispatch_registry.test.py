@@ -282,6 +282,42 @@ class RegistryTest(RegistryFixtureTestCase):
    result=module.observed_status_rows([row],args)
   self.assertEqual(result["rows"][0]["state"],"working")
   self.assertEqual(result["rows"][0]["route_id"],"rt-owner")
+ def test_reconcile_settles_identical_duplicate_source_through_real_writer(self):
+  self.jobs.write_text(self.jobs.read_text().replace("attempt_id=att-dead000001,",
+   "attempt_id=att-dead000001,model_source=profile+diversity,model_source=profile+diversity,"))
+  self.assertEqual(self.jobs.read_text().count("model_source="),2)
+  result=self.invoke("reconcile","--attempt","att-dead000001","--only-exact-dead","--apply")
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  record=json.loads(result.stdout)
+  self.assertEqual(record["closed"],1,record)
+  row=next(line for line in self.jobs.read_text().splitlines() if "attempt_id=att-dead000001," in line)
+  self.assertEqual(row.count("model_source="),1)
+  self.assertEqual(row.split("\t")[1],"done")
+
+ def test_identical_duplicates_do_not_make_a_live_attempt_settleable(self):
+  self.jobs.write_text(self.jobs.read_text().replace("attempt_id=att-active0001,",
+   "attempt_id=att-active0001,model_source=profile+diversity,model_source=profile+diversity,"))
+  before=self.jobs.read_bytes()
+  result=self.invoke("reconcile","--attempt","att-active0001","--only-exact-dead","--apply")
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  record=json.loads(result.stdout)
+  self.assertEqual(record["closed"],0)
+  self.assertEqual(self.jobs.read_bytes(),before)
+
+ def test_reconcile_names_metadata_write_error_instead_of_process_veto(self):
+  self.jobs.write_text(self.jobs.read_text().replace("attempt_id=att-dead000001,",
+   "attempt_id=att-dead000001,model_source=profile,model_source=explicit,"))
+  before=self.jobs.read_bytes()
+  self.assertEqual(self.jobs.read_text().count("model_source="),2)
+  result=self.invoke("reconcile","--attempt","att-dead000001","--only-exact-dead","--apply")
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  record=json.loads(result.stdout); decision=record["decisions"][0]
+  self.assertEqual(record["closed"],0)
+  self.assertTrue(decision["revalidated"])
+  self.assertEqual(decision["reason"],"attempt-immutable-metadata-duplicate")
+  self.assertEqual(decision["detail"],"model_source")
+  self.assertEqual(self.jobs.read_bytes(),before)
+
  def test_reconcile_closes_only_selected_exact_dead(self):
   before=self.jobs.read_text();dry=self.invoke("reconcile","--attempt","att-dead000001");self.assertEqual(json.loads(dry.stdout)["closed"],0);self.assertEqual(self.jobs.read_text(),before)
   applied=self.invoke("reconcile","--attempt","att-dead000001","--apply");self.assertEqual(json.loads(applied.stdout)["closed"],1)

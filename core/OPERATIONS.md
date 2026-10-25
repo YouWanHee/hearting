@@ -2067,6 +2067,10 @@ row uses the existing stalled-age warning rather than forcing fresh-age or
 basis explanations onto it. Original phase/metric names are preserved, and
 combined arm totals, ETA, speed and epoch-mean loss are not inferred.
 
+Detached training, CPU scoring, and inference receive declaration-free checkpoints
+from fixed metric paths: first min(10% plan, 2h), then 25/50/75% or 12h; without a
+plan, 2h then 12h. Missing data is explicit; exit, sentinel, and approval stay unchanged.
+
 `run` and GPU `resource-runner start` automatically reserve their devices in
 one host-local `gpu-leases.json` beside the canonical dispatch registry. All
 launchers targeting that host share the same locked selection and publication;
@@ -2551,8 +2555,8 @@ acceptance and actual receipt are separate facts:
 
 | Runtime | Transport and acceptance | Exact native receipt | Wake and limits |
 |---|---|---|---|
-| Claude | `peer-steward.py prompt` stores/reuses a ref bound to sender, recipient session and body digest; existing hook context carries the sealed message. | The exact receiving callback acknowledges the bound ref. Context output alone is not receipt. | Plain interactive TUI has no supported wake; its pending ref remains for the next native callback. No pane send or composer read. |
-| Codex | The freshly proven exact thread/client queue accepts one sealed ref and returns its `client_message_id`; a legitimate TUI process restart may continue the same exact thread. | The exact message in the bound thread history confirms consumption. | Uses the existing queue and hook path; no pane typing or transcript inference. |
+| Claude | `peer-steward.py prompt` stores/reuses a ref bound to sender, recipient session and body digest; existing hook context carries the sealed message. | The exact receiving callback acknowledges the bound ref. Context output alone is not receipt. | Plain interactive TUI has no supported wake; its pending ref remains for the next native callback. |
+| Codex | The freshly proven exact thread/client queue accepts one sealed ref and returns its `client_message_id`; a legitimate TUI process restart may continue the same exact thread. | The exact message in the bound thread history confirms consumption. | Uses the existing queue and hook path; no transcript inference. |
 | OpenCode | The plugin saves one `noReply` user message through its current client at the exact selected root SID. Its native ID marks it queued. | Only an error-free completed assistant message whose `parentID` is that ID in the same SID marks it received. | On a verified idle root, `promptAsync` continues the persisted message by ID. Busy, question, permission, child, ambiguous history or SID change cannot consume it. |
 
 Queue acceptance never means delivery or consumption. A pending retry of the same
@@ -2761,7 +2765,7 @@ pane-only sidless first-input path, and a queued carrier result remains
 distinct from exact receiver evidence.
 
 Clear and retire retain their checked foreground/form/draft and successor safety.
-Claude peer submission uses `herdr agent prompt` only for the guarded idle plain-TUI
+For Claude peers, `peer-steward.py prompt` uses `herdr agent prompt` for the guarded idle plain-TUI
 case above; busy Claude delivery waits for its existing callback. Neither a helper
 return nor a status flip is a receive receipt. Continue retains its existing native
 carrier and booking checks. The memory handoff channel is pull-only (next prompt's
@@ -2775,9 +2779,9 @@ directly); `SendMessage` is secondary.
 `state=armed` line carrying the next-action field `parent_next` (§5.10a).
 The exact server/pane/session obligation remains stored when a bounded observer
 times out, loses herdr, or exits; the existing startup/reconnect path replaces
-only that observer and continues the same watch id. `join`/`status`/`ack` report
-the stored obligation and its current observation; a fulfilled duty may be
-followed by an explicit new watch. A tab is a location hint, not identity.
+only that observer under its existing claim, publishing its identity and generation
+before reporting reattachment. `join`/`status`/`ack` report the stored duty and
+observation; a fulfilled duty allows a new watch. A tab is a location hint, not identity.
 The existing obligation runner may share a narrow, target-bound readiness
 observation across watchers after their native results arrive. Each watcher
 retains its own native result, deadline, receipt, and ack; the shared observation
