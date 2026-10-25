@@ -147,8 +147,9 @@ def _resolve_report_output(args) -> str:
                  if isinstance(item, dict) and item.get("id") == args.route_node), None)
     if node is None:
         return ""
+    brief_text = Path(args.phase_brief).read_text(encoding="utf-8")
     raw = report_path_from_brief(
-        Path(args.phase_brief).read_text(encoding="utf-8"),
+        brief_text,
         session_id=args.subsession_id,
         route_node=args.route_node,
         node=node,
@@ -156,19 +157,23 @@ def _resolve_report_output(args) -> str:
     if not raw:
         return ""
     import artifact_context
-    from worker_bootstrap import (
-        _child_scope_environment, _linked_slice_source_worktree, resolve_node_scope,
-    )
+    from worker_bootstrap import _child_scope_environment, resolve_node_scope
 
-    source_worktree = _linked_slice_source_worktree(args, route)
-    environ = _child_scope_environment(args, route, os.environ, source_worktree)
+    # Reports belong to the sealed route's cycle. The wrapper separately
+    # validates the execution worktree and exact live parent before launch.
+    environ = _child_scope_environment(args, route, os.environ)
+    if route.get("cwd"):
+        environ["AGENT_DISPATCH_WORKTREE"] = str(route["cwd"])
     scope = resolve_node_scope(
         route, args.route_node, environ,
         parent_attempt_id=getattr(args, "parent_attempt_id", None),
-        route_file=route_file, source_worktree=source_worktree,
-        source_worktree_verified=source_worktree is not None,
+        route_file=route_file,
     )
     if not scope.output_dir:
+        if not report_path_from_brief(
+                brief_text, session_id=args.subsession_id,
+                route_node=args.route_node, node=node, explicit_only=True):
+            return ""
         raise DispatchContractError("subsession-report-cycle-output-missing", args.subsession_id)
     output_dir = Path(scope.output_dir).resolve(strict=False)
     candidate = output_dir / raw

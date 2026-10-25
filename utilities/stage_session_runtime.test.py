@@ -142,6 +142,25 @@ class StageSessionStateDirTests(unittest.TestCase):
         self.assertEqual(args.effective_fixed_files, [str(self.fixed)])
         resolve.assert_not_called()
 
+    def test_implicit_report_does_not_require_a_cycle_for_registration(self):
+        route_file = self._route_file()
+        args = _args(self.worktree, self.brief, self.fixed, route_file=str(route_file))
+        scope = mock.Mock(output_dir=None, write_scope=("source/**", "evidence/**"))
+        with mock.patch("worker_bootstrap.resolve_node_scope", return_value=scope):
+            runtime.bind(args, artifact_root=self.root, action="dry-run")
+        self.assertEqual(args.report_file, "")
+        self.assertEqual(args.effective_fixed_files, [str(self.fixed)])
+
+    def test_explicit_report_still_requires_a_cycle(self):
+        route_file = self._route_file()
+        self.brief.write_text("report: evidence/slice-a/report.md\n")
+        args = _args(self.worktree, self.brief, self.fixed, route_file=str(route_file))
+        scope = mock.Mock(output_dir=None, write_scope=("source/**", "evidence/**"))
+        with mock.patch("worker_bootstrap.resolve_node_scope", return_value=scope), \
+                self.assertRaises(DispatchContractError) as caught:
+            runtime.bind(args, artifact_root=self.root, action="dry-run")
+        self.assertEqual(caught.exception.reason, "subsession-report-cycle-output-missing")
+
     def test_explicit_report_outside_evidence_scope_is_refused(self):
         route_file = self._route_file(write_scope=("source/**", "evidence/allowed/report.md"))
         self.brief.write_text("report: evidence/slice-a/report.md\n")

@@ -29,6 +29,7 @@ class StageSessionError(ValueError):
 
 def report_path_from_brief(
     brief_text: str, *, session_id: str, route_node: str | None, node,
+    explicit_only: bool = False,
 ) -> str | None:
     """Interpret the session's own in-scope report from its existing phase brief."""
     if not isinstance(node, dict):
@@ -57,6 +58,8 @@ def report_path_from_brief(
     explicit = bool(found)
     if explicit:
         value = found[0]
+    elif explicit_only:
+        return None
     elif route_node == "execute":
         value = f"evidence/{session_id.lower()}/report.md"
     else:
