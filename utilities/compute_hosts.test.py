@@ -741,6 +741,41 @@ class ComputeRunQuiescenceTest(unittest.TestCase):
         self.assertEqual(self.observe({"state": "populated"})["state"], "not-quiescent")
         self.assertEqual(self.observe({"state": "unknown"})["state"], "unknown")
 
+    def test_cancelled_execution_needs_no_exit_or_outputs_but_still_observes_group(self):
+        (self.run_dir / "exit_code").unlink()
+        (self.run_dir / "outputs.json").unlink()
+        self.module._record_stop(self.run_dir)
+        for remote_state, expected in (("empty", "quiescent"), ("populated", "not-quiescent"),
+                                       ("unknown", "unknown")):
+            with self.subTest(remote_state=remote_state):
+                call = mock.Mock(return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps({"state": remote_state, "reason": "fixture-group"}), ""))
+                result = self.module.observe_run_quiescence(
+                    self.config, self.run_id, expected=self.expected,
+                    cancelled=True, remote_call=call)
+                self.assertEqual(result["state"], expected)
+                call.assert_called_once()
+                self.assertIn(self.identity["pid_namespace"], call.call_args.args[1])
+        self.assertNotEqual(self.observe({"state": "empty"})["state"], "quiescent")
+
+    def test_cancelled_observation_keeps_identity_and_running_receipts_protected(self):
+        path = self.run_dir / "launch-receipt.json"
+        original = path.read_bytes()
+        for change in ({"state": "running"}, {"identity": {}}, {"run_id": "other"}):
+            with self.subTest(change=change):
+                path.write_text(json.dumps({**json.loads(original), **change}))
+                expected = {**self.expected, "receipt_sha256":
+                            self.module.hashlib.sha256(path.read_bytes()).hexdigest()}
+                call = mock.Mock()
+                result = self.module.observe_run_quiescence(
+                    self.config, self.run_id, expected=expected, cancelled=True, remote_call=call)
+                self.assertEqual(result["state"], "not-quiescent")
+                call.assert_not_called()
+        path.write_bytes(original + b" ")
+        self.assertEqual(self.module.observe_run_quiescence(
+            self.config, self.run_id, expected=self.expected, cancelled=True)["reason"],
+            "compute-run-evidence-changed")
+
     def test_changed_exit_bytes_invalidate_the_observation(self):
         (self.run_dir / "exit_code").write_text("1\n")
         result = self.observe({"state": "empty"})
@@ -999,6 +1034,31 @@ class ComputeHostsTest(unittest.TestCase):
             args = (*args[:2], "--gpus", "", *args[2:])
         return subprocess.run([sys.executable, str(TOOL), *args],
                               text=True, capture_output=True, env=env or self.env)
+
+    def test_compute_run_view_reads_the_stable_public_observation(self):
+        import resource_progress
+        module = load_module()
+        run_id = "view-run-1"
+        artifact = self.root / "artifact"
+        artifact.mkdir()
+        route = artifact / "route.json"
+        route.write_text(json.dumps({"route_id": "route-view", "artifact_root": str(artifact)}))
+        run_dir = self.run_root / run_id
+        run_dir.mkdir(parents=True)
+        meta = {"run_id": run_id, "provenance": {"route": {
+            "route_id": "route-view", "route_file": str(route)}}}
+        (run_dir / "meta.json").write_text(json.dumps(meta))
+        record = {"schema_version": 1, "run_id": run_id, "route_id": "route-view",
+                  "metrics": [{"format": "epochs-jsonl", "path": "/nas/logs/epochs.jsonl",
+                               "keys": ["L_se"]}],
+                  "metric_summary": {"metric": "L_se", "latest": {"value": -8.7}}}
+        resource_progress.write_public_run_record(artifact, run_id, record)
+        expected = resource_progress.read_public_run_record(artifact, run_id)
+        config = module.load_config(str(self.config))
+        view = module._run_state(config, run_id)
+        self.assertEqual(view["experiment_observation"], expected)
+        self.assertEqual(view["experiment_record_path"],
+                         str(artifact / "resource-runs" / f"{run_id}.json"))
 
     def test_missing_inventory_is_a_typed_failure(self):
         env = {**os.environ, "COMPUTE_HOSTS_CONFIG": str(self.root / "absent.yaml")}
@@ -2820,6 +2880,16 @@ class CompletionWatchTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
+        self._runtime_env = mock.patch.dict(os.environ, {
+            "AGENT_ARTIFACT_ROOT": str(self.root / "artifacts"),
+            "HARNESS_STATE_ROOT": str(self.root / "state"),
+        })
+        self._runtime_env.start()
+        self.addCleanup(self._runtime_env.stop)
+        runner = mock.patch("peer_obligations.ensure_normal_runner", return_value=False)
+        recovery = mock.patch("peer_obligations.request_dispatch_reconciliation", return_value=False)
+        runner.start(); recovery.start()
+        self.addCleanup(runner.stop); self.addCleanup(recovery.stop)
         self.run_dir = self.root / "runs" / "here-1"
         self.run_dir.mkdir(parents=True)
         self.meta = {"run_id": "here-1", "host": "here",
@@ -2861,8 +2931,71 @@ class CompletionWatchTest(unittest.TestCase):
         self.assertEqual(slept, [module.COMPLETION_POLL_SECONDS])
         self.assertEqual(len(claimed), 1)
         text = sweep.delivery_context([(state / "dispatch", claimed)])
-        self.assertIn("run here-1 on here ended with exit 3; read it with: compute-hosts tail here-1", text)
+        self.assertIn("run here-1 on here ended with exit 3; 마지막 지표 없음", text)
+        self.assertIn(str(self.root / "artifacts" / "resource-runs" / "here-1.json"), text)
         self.assertEqual(claimed[0]["route_id"], "rt-0123456789abcdef")
+
+    def test_watch_polls_metrics_and_terminal_notice_names_public_record(self):
+        module = load_module()
+        import resource_progress
+        metrics_root = self.root / "experiment"
+        (metrics_root / "logs").mkdir(parents=True)
+        (metrics_root / "logs" / "epochs.jsonl").write_text(
+            '{"epoch":1,"split":"valid","losses":{"L_se":-8.77}}\n')
+        self.meta.update(started_at="1970-01-01T00:00:00+00:00", output_dir=str(metrics_root))
+        (self.run_dir / "meta.json").write_text(json.dumps(self.meta))
+        clock, sleeps, notices = [0.0], [0], []
+        def sleep(_seconds):
+            sleeps[0] += 1
+            clock[0] += 7200
+            if sleeps[0] == 2:
+                (self.run_dir / "exit_code").write_text("0\n")
+        state_file = self.root / "runtime" / "observation.json"
+        state_file.parent.mkdir()
+        def note(*args, **kwargs):
+            notices.append(kwargs)
+            return {"state": "pending"}
+        with mock.patch.object(resource_progress, "_observation_state_path", return_value=state_file), \
+                mock.patch("session_notice.notify", side_effect=note):
+            module.cmd_watch_run(SimpleNamespace(run_dir=str(self.run_dir)),
+                                 sleep=sleep, now=lambda: clock[0])
+        self.assertEqual(sleeps[0], 2)
+        self.assertTrue(any(str(item.get("subject", "")).startswith("experiment checkpoint")
+                            for item in notices))
+        completion = next(item for item in notices if item.get("subject") == "compute run")
+        self.assertIn("L_se=-8.77@1", completion["text"])
+        self.assertIn(str(self.root / "artifacts" / "resource-runs" / "here-1.json"),
+                      completion["text"])
+        record = resource_progress.read_public_run_record(
+            self.root / "artifacts", "here-1")
+        self.assertEqual(record["status"], "finished")
+
+    def test_remote_observation_uses_only_declared_namespace_reverse_mapping(self):
+        module = load_module()
+        import resource_progress
+        source = self.root / "nas-source" / "experiment"
+        (source / "logs").mkdir(parents=True)
+        (source / "logs" / "epochs.jsonl").write_text(
+            '{"epoch":1,"split":"valid","losses":{"L_se":-8.0}}\n')
+        target = "/host-ns/output"
+        mapping = {target: str(self.root / "nas-source")}
+        state = self.root / "runtime" / "state.json"
+        state.parent.mkdir()
+        meta = {"run_id": "remote-metrics-run", "host": "remote",
+                "host_is_local": False, "run_root": "/shared/runs",
+                "output_dir": target + "/experiment", "path_namespace": mapping,
+                "started_at": "1970-01-01T00:00:00+00:00",
+                "provenance": {"route": {"route_id": "route-remote"}}}
+        with mock.patch.object(resource_progress, "_observation_state_path", return_value=state):
+            result = module._observe_compute_experiment(meta, self.run_dir, 7200)
+        self.assertEqual(result["metric_root"], str(source))
+        self.assertEqual(result["record_path"],
+                         str(self.root / "artifacts" / "resource-runs" / "remote-metrics-run.json"))
+        meta["run_id"] = "unmapped-remote-run"
+        meta["output_dir"] = "/host-only/private/output"
+        with mock.patch.object(resource_progress, "_observation_state_path", return_value=state.with_name("other.json")):
+            unmapped = module._observe_compute_experiment(meta, self.run_dir, 7200)
+        self.assertIsNone(unmapped["metric_root"])
 
     def test_a_run_a_worker_starts_in_a_route_tells_the_routes_parent_session(self):
         module = load_module()

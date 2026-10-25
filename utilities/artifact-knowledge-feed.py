@@ -295,6 +295,11 @@ def d23_cycles(root: Path, selection: str) -> list[Cycle]:
         for base in _bucket_bases(root, name, optional=name in DECLARED_OPTIONAL_BUCKETS):
             base_locator = _locator(root, base, directory=True)
             excluded = {"_scratch"} if name == "plans" else {"_internal"} if name == "spec" else set()
+            if name == "designs" and artifact_reader.is_flat_design_layout(base):
+                # The producer cycle already owns the boundary; its numbered
+                # anchors are payload sections, not separate feed cycles.
+                cycles.append(Cycle(base_locator, name, base, False, ()))
+                continue
             for directory in _real_directories(base, excluded=excluded):
                 cycles.append(
                     Cycle(
@@ -540,6 +545,11 @@ def _atomic_write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
 def _candidate_files(cycle: Cycle) -> list[Path]:
     if cycle.fallback:
         return list(cycle.members)
+    if cycle.bucket == "designs":
+        handoff = cycle.physical_dir / "05_handoff"
+        if handoff.is_dir():
+            return [Path(entry.path) for entry in _scan_directory(handoff)
+                    if _is_regular_nofollow(Path(entry.path))]
     return [Path(entry.path) for entry in _scan_directory(cycle.physical_dir)]
 
 

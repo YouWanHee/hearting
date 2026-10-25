@@ -629,7 +629,10 @@ def append_job(jobs: Path, args: argparse.Namespace, *, harness: str, runtime_sa
     pipe += workflow_completion_receipt(args)
     settings = args.resolved_model_settings
     for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
-        pipe += f",{key}={value}"
+        # The resolved selection below owns model_source. A diversity receipt
+        # also describes it, but appending both poisons later registry writes.
+        if key != "model_source":
+            pipe += f",{key}={value}"
     pipe += (
         f",model_source={settings['source']},model_role={settings['role']}"
         f",model_profile={settings['profile']},model_tier={settings['tier']}"
@@ -714,8 +717,10 @@ def append_job(jobs: Path, args: argparse.Namespace, *, harness: str, runtime_sa
             route = json.loads(Path(args.route_file).read_text(encoding="utf-8"))
             node = next((item for item in route.get("nodes", [])
                          if item.get("id") == args.route_node), None)
-            if node is not None and has_review_subject(route, node, jobs):
-                observed = observe(route, node, worktree=args.worktree, jobs=jobs)
+            reviewed_input = getattr(args, "review_input_candidate", None)
+            if node is not None and has_review_subject(route, node, jobs, reviewed_input):
+                observed = observe(route, node, worktree=args.worktree, jobs=jobs,
+                                   reviewed_input=reviewed_input)
                 expected = os.environ.get("AGENT_REVIEW_SOURCE_SUBJECT_DIGEST")
                 if expected and observed["digest"] != expected:
                     raise SourceSubjectError("review-source-admission-subject-changed", args.attempt_id)

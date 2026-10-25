@@ -35,6 +35,251 @@ DISPATCH_NODE = _load("dispatch_node_source_subject_fixture", "utilities/dispatc
 
 
 class SourceSubjectIntegrationTest(unittest.TestCase):
+    def test_design_review_subject_budget_and_marker_currentness_follow_build_content(self):
+        import artifact_producer
+
+        build = {"id": "build", "kind": "pipeline-stage", "unit": "design/maker",
+                 "completion_gate": "design-build", "dispatch_depth": 2,
+                 "write_scope": ["designs/02_tokens/**", "designs/03_components/**",
+                                 "spec/design/02_tokens/**", "spec/design/03_components/**"],
+                 "depends_on": []}
+        visual = {"id": "visual-verify", "kind": "review-worker", "unit": "design/verifier",
+                  "completion_gate": "design-verify", "dispatch_depth": 2,
+                  "write_scope": ["designs/04_review/verify/**"], "depends_on": ["build"]}
+        critic = {"id": "critic-review", "kind": "review-worker", "unit": "design/critic",
+                  "completion_gate": "design-critic", "dispatch_depth": 2,
+                  "write_scope": ["designs/04_review/critic/**"], "depends_on": ["build"]}
+        self.route = {"schema_version": 2, "dispatch_contract_version": 3,
+            "registry_digest": ROUTE_WRITER.TOPO.registry_digest(ROUTE_WRITER.TOPO.load_registry()),
+            "capability": "autopilot-design", "capability_mode": "ui",
+            "effective_intensity": "standard", "continuation_budget": {"review_round_cap": 2},
+            "cwd": str(self.repo), "artifact_root": str(self.artifact_root),
+            "nodes": [build, visual, critic]}
+        self.route["route_hash"] = route_hash(self.route)
+        self.route["route_id"] = route_id_from_hash(self.route["route_hash"])
+        self.review_node = visual
+        self.route_file.write_text(json.dumps(self.route, sort_keys=True), encoding="utf-8")
+        cycle_dir = self.base / "design-cycle"
+        output = cycle_dir / "artifacts"
+        for relative, data in (("designs/02_tokens/tokens.json", b'{"color":"blue"}\n'),
+                               ("designs/03_components/card.html", b"<article>Card</article>\n")):
+            path = output / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        cycle = {"campaign_id": "camp_fixture", "cycle_id": "cyc_fixture",
+                 "route_id": self.route["route_id"]}
+        with mock.patch.object(artifact_producer, "route_cycle_for", return_value=cycle), \
+             mock.patch.object(artifact_producer, "cycle_dir", return_value=cycle_dir):
+            _first_meta, first = self.complete_review("att-design-A1")
+            self.complete_review("att-design-A2")
+            same = self.admission()
+            self.assertEqual((same.budget.state, same.budget.verdict_rounds), ("exhausted", 2))
+            (output / "designs/02_tokens/tokens.json").write_bytes(b'{"color":"green"}\n')
+            b_candidate = self.prepare_review("att-design-B-no-marker")
+            self.assertEqual(b_candidate["review_subject_digest"],
+                             SUBJECT.read_binding(self.jobs, b_candidate)["subject_digest"])
+            (output / "designs/02_tokens/tokens.json").write_bytes(b'{"color":"blue"}\n')
+            a_again = self.admission()
+            self.assertEqual(a_again.budget.verdict_rounds, 2)
+            self.assertEqual(a_again.budget.state, "exhausted")
+            self.assertEqual(self.currency(first).state, "superseded")
+            legacy_closure = {"review_gate_closure": "owner-closure",
+                              "review_independence": "owner-overridden"}
+            self.assertIsNone(SUBJECT.marker_currency(
+                self.route, self.review_node, legacy_closure,
+                ROUTE_WRITER.completion_dir(self.route["route_id"], jobs=self.jobs),
+                jobs=self.jobs))
+            legacy_pass = {"reviewer_kind": "registered-worker", "verdict": "PASS"}
+            self.assertEqual(SUBJECT.marker_currency(
+                self.route, self.review_node, legacy_pass,
+                ROUTE_WRITER.completion_dir(self.route["route_id"], jobs=self.jobs),
+                jobs=self.jobs), ("superseded", "completion-review-subject-unknown"))
+
+    def test_plan_review_binds_exact_existing_input_and_preserves_aba_budget(self):
+        import review_input as INPUT
+        review = {"id": "plan-check", "kind": "review-worker", "unit": "qa/plan-review",
+                  "completion_gate": "code-plan-check", "dispatch_depth": 2,
+                  "write_scope": ["_internal/reviews/plan-check/**"], "depends_on": []}
+        self.route = {"schema_version": 2, "dispatch_contract_version": 3,
+            "registry_digest": ROUTE_WRITER.TOPO.registry_digest(ROUTE_WRITER.TOPO.load_registry()),
+            "capability": "autopilot-code", "capability_mode": "debug",
+            "effective_intensity": "standard", "continuation_budget": {"review_round_cap": 2},
+            "cwd": str(self.repo), "artifact_root": str(self.artifact_root),
+            "nodes": [review]}
+        self.route["route_hash"] = route_hash(self.route)
+        self.route["route_id"] = route_id_from_hash(self.route["route_hash"])
+        self.review_node = review
+        self.route_file.write_text(json.dumps(self.route, sort_keys=True), encoding="utf-8")
+        a = self.base / "plan-A.md"
+        b = self.base / "plan-B.md"
+        a.write_text("Plan A\n", encoding="utf-8")
+        b.write_text("Plan B\n", encoding="utf-8")
+
+        def register(attempt, evidence, *, note="completed-review-blocking"):
+            candidate = INPUT.resolve_input(self.route, review, self.jobs, evidence)
+            metadata = self._metadata(review, attempt, "review")
+            metadata[INPUT.KEY] = INPUT.seal_binding(self.jobs, metadata, candidate)
+            values = SUBJECT.seal_attempt(self.jobs, self.route, review, attempt,
+                worktree=self.repo, expected_subject_digest=None, attempt_metadata=metadata)
+            metadata.update(values)
+            self._row(metadata, status="done", note=note)
+            marker_subject = SUBJECT.marker_subject(self.route, review, attempt_id=attempt,
+                attempt_metadata=metadata, jobs=self.jobs, worktree=self.repo,
+                completion_dir=ROUTE_WRITER.completion_dir(self.route["route_id"], jobs=self.jobs))
+            return metadata, {"attempt_id": attempt, "source_subject": marker_subject}
+
+        self.assertFalse(SUBJECT.has_review_subject(self.route, review, self.jobs))
+        _meta_a1, marker_a1 = register("att-plan-A1", a)
+        _meta_a2, marker_a2 = register("att-plan-A2", a)
+        self.assertEqual(DISPATCH_NODE.admit_round(self.route, review, self.jobs,
+            reviewed_evidence=str(a), record_auto_revisions=False).budget.verdict_rounds, 2)
+        register("att-plan-B-no-marker", b, note="dead-worker-blocked")
+        a_again = DISPATCH_NODE.admit_round(self.route, review, self.jobs,
+            reviewed_evidence=str(a), record_auto_revisions=False)
+        self.assertEqual((a_again.budget.state, a_again.budget.verdict_rounds), ("exhausted", 2))
+        completion = ROUTE_WRITER.completion_dir(self.route["route_id"], jobs=self.jobs)
+        self.assertEqual(SUBJECT.marker_currency(self.route, review, marker_a1, completion,
+                                                 jobs=self.jobs),
+                         ("superseded", "completion-review-source-stale"))
+        self.assertEqual(SUBJECT.marker_currency(self.route, review, marker_a2, completion,
+                                                 jobs=self.jobs),
+                         ("superseded", "completion-review-source-stale"))
+
+    def test_plan_execute_test_consumes_checklist_progress_and_keeps_plan_identity(self):
+        import review_input as INPUT
+
+        plan = {"id": "plan", "kind": "pipeline-stage", "unit": "plan/plan-author",
+                "completion_gate": "code-plan", "dispatch_depth": 2,
+                "outputs": ["plan.md", "checklist.md"],
+                "write_scope": ["plan.md", "checklist.md"], "depends_on": []}
+        review = {"id": "plan-check", "kind": "review-worker", "unit": "qa/plan-review",
+                  "completion_gate": "code-plan-check", "dispatch_depth": 2,
+                  "inputs": ["plan.md", "checklist.md"],
+                  "write_scope": ["_internal/reviews/plan-check/**"], "depends_on": ["plan"]}
+        execute = {"id": "execute", "kind": "pipeline-stage", "unit": "dev/backend",
+                   "completion_gate": "code-execute", "dispatch_depth": 2,
+                   "write_scope": ["source/**", "checklist.md", "dev_logs/**", "evidence/**"],
+                   "depends_on": ["plan-check"]}
+        test = {"id": "test", "kind": "pipeline-stage", "unit": "qa/test",
+                "completion_gate": "code-test", "dispatch_depth": 2,
+                "write_scope": ["test_logs/**"], "depends_on": ["execute"]}
+        self.route = {
+            "schema_version": 2, "dispatch_contract_version": 3,
+            "registry_digest": ROUTE_WRITER.TOPO.registry_digest(ROUTE_WRITER.TOPO.load_registry()),
+            "capability": "autopilot-code", "capability_mode": "debug",
+            "effective_intensity": "standard", "continuation_budget": {"review_round_cap": 2},
+            "cwd": str(self.repo), "artifact_root": str(self.artifact_root),
+            "nodes": [plan, review, execute, test],
+        }
+        self.route["route_hash"] = route_hash(self.route)
+        self.route["route_id"] = route_id_from_hash(self.route["route_hash"])
+        self.route_file.write_text(json.dumps(self.route, sort_keys=True), encoding="utf-8")
+        self.review_node = review
+        self.test_node = test
+
+        plan_path = self.artifact_root / "plan.md"
+        checklist_path = self.artifact_root / "checklist.md"
+
+        def publish_plan(attempt, text, checklist):
+            plan_path.write_text(text, encoding="utf-8")
+            checklist_path.write_text(checklist, encoding="utf-8")
+            return ROUTE_WRITER._publish_completion_locked(
+                self.route, plan, "plan", plan_path, jobs=self.jobs,
+                attempt_id=attempt, attempt_metadata=self._inline_metadata(plan, attempt),
+            )
+
+        def finish_plan_review(attempt):
+            candidate = INPUT.resolve_input(self.route, review, self.jobs)
+            metadata = self._metadata(review, attempt, "review")
+            metadata[INPUT.KEY] = INPUT.seal_binding(self.jobs, metadata, candidate)
+            metadata.update(SUBJECT.seal_attempt(
+                self.jobs, self.route, review, attempt, worktree=self.repo,
+                expected_subject_digest=None, attempt_metadata=metadata,
+            ))
+            self._row(metadata, extra={"launch_outcome": "reaped-before-publish"})
+            evidence = self.artifact_root / f"{attempt}.md"
+            evidence.write_text("independent plan review: PASS\n", encoding="utf-8")
+            marker = ROUTE_WRITER._publish_completion_locked(
+                self.route, review, review["id"], evidence, jobs=self.jobs,
+                attempt_id=attempt, attempt_metadata=metadata,
+            )
+            return candidate, metadata, marker
+
+        publish_plan("att-plan-A", "Plan A\n", "- [ ] implement\n")
+        admission_a = DISPATCH_NODE.admit_round(
+            self.route, review, self.jobs, record_auto_revisions=False)
+        candidate_a, metadata_a, _marker_a = finish_plan_review("att-plan-check-A")
+        digest_a = SUBJECT.read_binding(self.jobs, metadata_a)["subject_digest"]
+        self.assertEqual(admission_a.source_subject_digest, digest_a)
+
+        # A substantive plan update gets its own content budget before execute.
+        publish_plan("att-plan-B", "Plan B changes the API contract\n", "- [ ] implement\n")
+        admission_b = DISPATCH_NODE.admit_round(
+            self.route, review, self.jobs, record_auto_revisions=False)
+        candidate_b, metadata_b, marker_b = finish_plan_review("att-plan-check-B")
+        digest_b = SUBJECT.read_binding(self.jobs, metadata_b)["subject_digest"]
+        self.assertNotEqual(candidate_a["sha256"], candidate_b["sha256"])
+        self.assertNotEqual(digest_a, digest_b)
+        self.assertEqual(admission_b.source_subject_digest, digest_b)
+        self.assertEqual(admission_b.budget.verdict_rounds, 0)
+
+        # Execute consumes the current plan-check, then records routine progress
+        # in the companion checklist. Test depends directly on execute.
+        self.assertIsNone(DC.completion_marker_gate(
+            str(self.route_file), "execute", "start", self.agent_home, self.jobs))
+        checklist_path.write_text("- [x] implement\n", encoding="utf-8")
+        execute_evidence = self.artifact_root / "execute-after-plan.md"
+        execute_evidence.write_text("execute completed\n", encoding="utf-8")
+        ROUTE_WRITER._publish_completion_locked(
+            self.route, execute, "execute", execute_evidence, jobs=self.jobs,
+            attempt_id="att-execute-after-plan",
+            attempt_metadata=self._inline_metadata(execute, "att-execute-after-plan"),
+        )
+        completion = ROUTE_WRITER.completion_dir(self.route["route_id"], jobs=self.jobs)
+        self.assertEqual(SUBJECT.marker_currency(
+            self.route, review, marker_b, completion, jobs=self.jobs),
+            ("superseded", "completion-review-source-stale"))
+        self.assertIsNone(DC.completion_marker_gate(
+            str(self.route_file), "test", "start", self.agent_home, self.jobs))
+
+    def test_handoff_consumer_requires_both_critic_group_completions(self):
+        visual = {"id": "visual-verify", "kind": "review-worker", "depends_on": [],
+                  "completion_gate": "design-verify", "parallel_group": "visual-verify"}
+        visual_alt = {"id": "visual-verify-alternative", "kind": "review-worker", "depends_on": [],
+                      "completion_gate": "design-verify", "parallel_group": "visual-verify"}
+        critic = {"id": "critic-review", "kind": "review-worker", "depends_on": [],
+                  "completion_gate": "design-critic", "parallel_group": "critic-review"}
+        critic_alt = {"id": "critic-review-alternative", "kind": "review-worker", "depends_on": [],
+                      "completion_gate": "design-critic", "parallel_group": "critic-review"}
+        handoff = {"id": "handoff", "kind": "pipeline-stage", "completion_gate": "design-handoff",
+                   "depends_on": [visual["id"], visual_alt["id"], critic["id"], critic_alt["id"]]}
+        route = {"dispatch_contract_version": 3, "route_id": "rt-design-handoff-consumer",
+                 "route_hash": "sha256:" + "d" * 64, "nodes": [visual, visual_alt, critic, critic_alt, handoff]}
+        route_file = self.base / "design-handoff-route.json"
+        route_file.write_text(json.dumps(route), encoding="utf-8")
+        completion = self.state / "completion" / route["route_id"]
+        completion.mkdir(parents=True)
+        for node in (visual, visual_alt, critic, critic_alt):
+            (completion / f"{node['id']}.json").write_text(json.dumps({
+                "route_id": route["route_id"], "route_hash": route["route_hash"],
+                "node_id": node["id"], "attempt_id": "att-" + node["id"],
+            }), encoding="utf-8")
+        with mock.patch.object(DC, "dispatch_state_roots", return_value=[self.state]), \
+             mock.patch.object(DC, "completion_marker_is_current", return_value=True), \
+             mock.patch.object(DC, "completion_attempt_readiness",
+                 return_value=DC.AttemptReadiness("ready", "fixture-settled", "att-peer")), \
+             mock.patch.object(DC, "_frame_pair_attempt_gate"), \
+             mock.patch.object(DC, "_human_gate_entry_fence"), \
+             mock.patch.object(DC, "_auxiliary_arbitration_gate"), \
+             mock.patch.object(DC, "_sibling_attempt_gate"):
+            DC.completion_marker_gate(str(route_file), "handoff", "dry-run", self.agent_home, self.jobs)
+            (completion / "critic-review-alternative.json").unlink()
+            with self.assertRaises(DC.DispatchContractError) as missing:
+                DC.completion_marker_gate(str(route_file), "handoff", "dry-run",
+                                          self.agent_home, self.jobs)
+        self.assertEqual((missing.exception.reason, missing.exception.detail),
+                         ("completion-marker-" + "missing", "critic-review-alternative"))
+
     def test_replacement_reruns_inline_review_and_consumes_fresh_completion(self):
         import artifact_producer
         import dispatch_replacement as replacement

@@ -296,10 +296,8 @@ def _validate_bucket_anchor(recipe, registry, scopes, node_kind, node_id, *, req
 
     `require_anchor_tail` (F4) is set only by the post-parallel-leg-expansion
     re-check: a realized leg must always land on a *sibling* of its base scope
-    inside the same anchor, never overwrite the anchor's own wildcard segment
-    (`_parallel_path` suffixing `designs/<cycle>/**` directly would otherwise
-    produce `designs/<cycle>-alternative/**`, which escapes the owning cycle
-    entirely). The base (non-leg) call sites never pass this, because a scope
+    inside the same anchor, never overwrite the anchor itself. The base
+    (non-leg) call sites never pass this, because a scope
     that terminates exactly at its anchor (tail == "") is a legitimate write
     to the cycle root itself.
     """
@@ -317,7 +315,7 @@ def _validate_bucket_anchor(recipe, registry, scopes, node_kind, node_id, *, req
     map_anchor = artifact_scope.get("map_anchor")
     review_anchor = artifact_scope.get("review_anchor")
     # `literal`: the write_scope string itself carries the bucket prefix
-    # (design's `designs/<cycle>/01_refs/**`, spec's `spec/_internal/research/**`)
+    # (design's `designs/01_refs/**`, spec's `spec/_internal/research/**`)
     # -- required whenever a scope is genuinely ambiguous without it (a design
     # scope has to say which of two owning buckets it belongs to). `implicit`:
     # the bucket is applied externally by the caller and the scope string
@@ -1323,7 +1321,7 @@ def _validate_recipe(recipe, registry, standard_plus_owner_profile):
             # anchor as its base scope. `_parallel_path` is the exact function that
             # expands a route's write_scope for a realized leg, so re-running D-1's
             # containment check against every non-anchor leg's expanded scopes is the
-            # only way to catch an escape like `designs/<cycle>/**` -> a leg that
+            # only way to catch an escape like `designs/**` -> a leg that
             # would, once expanded, resolve one level *above* the owning cycle.
             for leg in legs[1:]:
                 expanded = [_parallel_path(scope, leg["suffix"]) for scope in target["write_scope"]]

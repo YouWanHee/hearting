@@ -650,7 +650,15 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                     rows = annotate_rows(jobs, rows)
                     kinds = [_ROUND.classify_round_row(s, m,
                         worker_type=m.get("worker_type") or worker_type) for s, m in rows]
-                if source_digest is not None:
+                from review_source_subject import is_implementation_review, is_source_test, is_deploy_review
+                known_history = any(meta.get("_review_subject_digest") or meta.get("review_subject_digest")
+                                    for _status, meta in rows)
+                from review_input import is_review_node
+                resolved_content = (is_implementation_review(route, node) or is_source_test(node)
+                                    or is_deploy_review(route, node) or not is_review_node(node))
+                # Only a legacy document review needs its old node count when
+                # no historical selected input can identify the reviewed bytes.
+                if source_digest is not None and (not rows or known_history or resolved_content):
                     source_aware = True
                     budget_rows = [(status, meta) for status, meta in rows
                                    if meta.get("_review_subject_digest") == source_digest
@@ -1732,7 +1740,7 @@ def _recorded_pid_reused(row, identity):
     return observed > recorded
 
 
-def resource_predecessor_finished(row):
+def resource_predecessor_finished(row, *, observation=None):
     """A resource's exact ended execution, independent of its scientific verdict."""
     from resource_run_registry import (
         classify_identity, resource_never_started, resource_process_group_quiescent,
@@ -1740,16 +1748,34 @@ def resource_predecessor_finished(row):
     )
     from dispatch_resource_wait import supervisor
     execution = row.get("execution") if isinstance(row, dict) else None
-    if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+    compute = isinstance(execution, dict) and execution.get("kind") == "compute-hosts"
+    if row.get("cancel_requested"):
+        if (row.get("cancel_requested") is not True
+                or row.get("resource_policy") not in {"verified-resume", "supervised-owner"}
+                or row.get("status") != "failed" or row.get("ended_at") is None
+                or row.get("parent_close_requested")
+                or row.get("launch_state") in {"queued", "claimed", "launching"}):
+            return False
+        if compute:
+            return (row.get("resource_policy") == "supervised-owner"
+                    and (observation.get("state") == "quiescent" if observation is not None
+                         else resource_process_group_quiescent(row)))
+        # Cancellation may leave no sentinel. Require positive group evidence;
+        # the legacy PID-only fallback cannot prove that children were reaped.
+        return (bool(row.get("pid_namespace")) and row.get("process_group") is not None
+                and classify_identity(row)[0] == "exited"
+                and resource_process_group_quiescent(row))
+    if compute:
         if (row.get("resource_policy") != "supervised-owner"
-                or row.get("cancel_requested") or row.get("parent_close_requested")
+                or row.get("parent_close_requested")
                 or row.get("status") not in {"failed", "succeeded"}):
             return False
         code = supervisor().runner().read_sentinel(row.get("sentinel"))
         return (code is not None and row.get("exit_code") == code
                 and not (row.get("status") == "failed" and code == 0)
                 and not (row.get("status") == "succeeded" and code != 0)
-                and resource_process_group_quiescent(row))
+                and (observation.get("state") == "quiescent" if observation is not None
+                     else resource_process_group_quiescent(row)))
     if resource_never_started(row):
         return True
     identity = classify_identity(row)
@@ -1785,7 +1811,7 @@ def require_resource_predecessors(rows, candidate, *, observations=None):
         if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
             captured = observations.get(row.get("run_id"))
             if (not captured or captured.get("row") != row
-                    or captured.get("state") != "quiescent"):
+                    or not resource_predecessor_finished(row, observation=captured)):
                 raise ValueError("resource-route-body-conflict")
         elif not resource_predecessor_finished(row):
             raise ValueError("resource-route-body-conflict")

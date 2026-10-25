@@ -96,7 +96,8 @@ class WrapperPreviewTest(unittest.TestCase):
       self.assertIn('child_spawned=0',out.getvalue())
      self.assertEqual(before_jobs,f.jobs.read_bytes())
      self.assertEqual(before,{str(p):p.read_bytes() for p in marker.parent.iterdir() if p.is_file()})
-   self.assertEqual(fixture.R.gate_currency(route,next(n for n in route['nodes'] if n['id']=='plan'),marker).state,'revised-unrecorded')
+   self.assertEqual(fixture.R.gate_currency(route,next(n for n in route['nodes'] if n['id']=='plan'),marker,
+                                            observe=True,jobs=f.jobs).state,'revised-unrecorded')
 
  def test_all_three_mains_prove_changed_plan_without_publishing(self):
   self._changed_plan_preview(prior_quiescent=True)

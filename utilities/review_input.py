@@ -30,8 +30,11 @@ def is_review_node(node):
 
 
 def is_plan_review_node(node):
-    return (isinstance(node, dict) and node.get("unit") == "qa/plan-review"
-            and node.get("kind") == "review-worker")
+    return (isinstance(node, dict) and node.get("kind") == "review-worker"
+            and (node.get("unit") == "qa/plan-review"
+                 or (node.get("completion_gate") == "code-plan-check"
+                     and node.get("unit") in {"qa/simplicity-check", "qa/assumption-check",
+                         "qa/failure-mode-check", "qa/edge-case-check", "qa/test-gap-check"})))
 
 
 def is_spec_review_node(node):
@@ -67,10 +70,38 @@ def _placed(path):
 
 def _file(path):
     try:
-        resolved = _placed(path).resolve(strict=True)
-        if not stat.S_ISREG(resolved.stat().st_mode):
+        candidate = _placed(path)
+        absolute = candidate.absolute()
+        current = Path(absolute.anchor)
+        for part in absolute.parts[1:-1]:
+            current = current / part
+            if stat.S_ISLNK(current.lstat().st_mode):
+                raise OSError("symlink parent")
+        before = absolute.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
             raise OSError("not a regular file")
-        data = resolved.read_bytes()
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(absolute, flags)
+        try:
+            opened = os.fstat(fd)
+            key = lambda item: (item.st_dev, item.st_ino, item.st_mode, item.st_size,
+                                item.st_mtime_ns, item.st_ctime_ns)
+            if not stat.S_ISREG(opened.st_mode) or key(before) != key(opened):
+                raise OSError("file changed")
+            chunks = []
+            while True:
+                block = os.read(fd, 1024 * 1024)
+                if not block:
+                    break
+                chunks.append(block)
+            after_fd = os.fstat(fd)
+        finally:
+            os.close(fd)
+        after = absolute.lstat()
+        if key(opened) != key(after_fd) or key(after_fd) != key(after):
+            raise OSError("file changed")
+        resolved = absolute.resolve(strict=True)
+        data = b"".join(chunks)
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
         raise DC.DispatchContractError("reviewed-evidence-unreadable", str(path)) from exc
     return {"path": str(resolved), "sha256": hashlib.sha256(data).hexdigest()}
