@@ -1236,7 +1236,7 @@ def _owner_route_binding_module():
     return _OWNER_ROUTE_BINDING_MOD or None
 
 
-def _owner_route_advance_binding(entity, owner_binding=None):
+def _owner_route_advance_binding(entity, owner_binding=None, verification_cache=None):
     """Resolve the owner's verified current route, if a durable advance exists.
 
     Returns ``(binding_dict_or_None, status)``. ``status`` is one of
@@ -1256,8 +1256,11 @@ def _owner_route_advance_binding(entity, owner_binding=None):
         anchor = (orb.OwnerRouteBinding(
             owner_binding["route_file"], owner_binding["route_id"], owner_binding["route_hash"],
         ) if owner_binding else None)
+        options = {}
+        if verification_cache is not None:
+            options["verification_cache"] = verification_cache
         current, resolved_status = orb.resolve_owner_route_lifecycle(
-            jobs_path, owner_attempt_id=attempt_id, sealed_binding=anchor,
+            jobs_path, owner_attempt_id=attempt_id, sealed_binding=anchor, **options
         )
     except orb.OwnerRouteBindingError as exc:
         if str(exc) in {"owner-route-jobs-unreadable", "owner-route-owner-row-not-unique"}:
@@ -1296,7 +1299,8 @@ def _owner_route_advance_for_pass(entity, owner_binding=None, scope=None):
         key = (None, None, attempt_id, _owner_anchor_key(owner_binding))
         return scope.memoized(
             "owner-route-lifecycle", key,
-            lambda: _owner_route_advance_binding(entity, owner_binding),
+            lambda: _owner_route_advance_binding(
+                entity, owner_binding, scope._verified_routes),
         )
     path = os.path.abspath(os.fspath(jobs_path))
 
@@ -1312,7 +1316,8 @@ def _owner_route_advance_for_pass(entity, owner_binding=None, scope=None):
     key = (path, generation, attempt_id, _owner_anchor_key(owner_binding))
     return scope.memoized(
         "owner-route-lifecycle", key,
-        lambda: _owner_route_advance_binding(entity, owner_binding),
+        lambda: _owner_route_advance_binding(
+            entity, owner_binding, scope._verified_routes),
     )
 
 

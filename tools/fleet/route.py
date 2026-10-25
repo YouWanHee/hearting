@@ -338,6 +338,7 @@ class RoundScope:
     jobs: tuple = ()
     _memo: dict = field(default_factory=dict)
     _pass_memo: dict = field(default_factory=dict)
+    _verified_routes: dict = field(default_factory=dict)
 
     def memoized(self, namespace, key, producer):
         """Return a defensive copy of one result cached only for this observation pass."""

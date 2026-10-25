@@ -89,6 +89,7 @@ class RegistrySnapshotMemoTest(unittest.TestCase):
         self.assertIsNone(M._SNAPSHOT_MEMO)
         self.assertEqual(len(M._registry_snapshot(self.jobs)), 2)
 
+
     def test_a_memo_hit_takes_no_jobs_lock(self):
         M._registry_snapshot(self.jobs)
         with mock.patch.object(M, "_jobs_lock", side_effect=AssertionError("locked")):
@@ -117,6 +118,52 @@ class RegistrySnapshotMemoTest(unittest.TestCase):
         with self.assertRaises(M.OwnerRouteBindingError) as caught:
             M._registry_snapshot(self.jobs)
         self.assertEqual(str(caught.exception), "owner-route-jobs-unreadable")
+
+
+class VerifiedRoutePassCacheTest(unittest.TestCase):
+    def test_unit_digest_snapshot_is_reused_only_within_one_pass_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            units = Path(td) / "units"
+            package = units / "dev"
+            package.mkdir(parents=True)
+            profile = package / "backend.md"
+            profile.write_text("---\nname: backend\n---\nfirst body\n", encoding="utf-8")
+            first_pass = {}
+            first_digest = M.ROUTE._unit_catalog_digest_for_pass(first_pass, units)
+
+            profile.write_text("---\nname: backend-v2\n---\nsecond body\n", encoding="utf-8")
+            self.assertEqual(M.ROUTE._unit_catalog_digest_for_pass(first_pass, units),
+                             first_digest)
+            self.assertNotEqual(M.ROUTE._unit_catalog_digest_for_pass({}, units),
+                                first_digest)
+
+    def test_route_verification_reuses_only_the_same_file_generation(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "route.json"
+            path.write_text("{}", encoding="utf-8")
+            binding = M.OwnerRouteBinding(str(path), "rt-cache", "sha256:cache")
+            verified = {"route_id": "rt-cache", "route_hash": "sha256:cache"}
+            cache = {}
+            def verify(raw, expected_cwd=None, *, _unit_catalog_cache=None):
+                M.ROUTE._unit_catalog_digest_for_pass(_unit_catalog_cache)
+                return verified
+            with mock.patch.object(M.ROUTE, "unit_catalog_digest",
+                                   return_value="sha256:units") as units_digest, \
+                    mock.patch.object(M.ROUTE, "verify_route", side_effect=verify) as verified_call:
+                first = M._verified_binding(binding, verification_cache=cache)
+                second = M._verified_binding(binding, verification_cache=cache)
+                self.assertEqual(verified_call.call_count, 1)
+                self.assertEqual(units_digest.call_count, 1)
+                self.assertIs(first[0], second[0])
+
+                path.write_text('{"changed":true}', encoding="utf-8")
+                third = M._verified_binding(binding, verification_cache=cache)
+                fourth = M._verified_binding(binding, verification_cache=cache)
+                self.assertEqual(verified_call.call_count, 2)
+                self.assertEqual(units_digest.call_count, 1)
+                self.assertEqual(third[0], {"changed": True})
+                self.assertIs(third[0], fourth[0])
+            self.assertLessEqual(len(cache), 128)
 
 
 class OwnerRouteBindingTest(unittest.TestCase):

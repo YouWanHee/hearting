@@ -1,6 +1,7 @@
 """Row-local evidence checks used by any later detail continuation."""
 
 import unittest
+from types import SimpleNamespace
 
 from tools.fleet import details
 from tools.fleet.model import DispatchJob, Session, WorkProjection
@@ -34,6 +35,62 @@ def _completed_detail(snapshot, source_key=None):
 
 
 class Fleet2DetailContinuationBoundaryTests(unittest.TestCase):
+    def test_optional_steward_detail_merges_by_exact_session_identity(self):
+        basic_session = Session(harness="codex", pid=302, session_id="session-steward",
+                                cwd="/repo", proc_start="start-302", liveness="working",
+                                title="current title")
+        basic = LiveSnapshot(
+            sessions=[basic_session],
+            observations={"basic": {"state": "ok", "generation_identity": "basic-1"}},
+        )
+        detail_session = Session(harness="codex", pid=302, session_id="session-steward",
+                                  cwd="/repo", proc_start="start-302", liveness="working",
+                                  title="current title", title_ts=123.0)
+        detail_session.steward = True
+        detail = details.DetailSnapshot(
+            details.state_key(basic),
+            LiveSnapshot(sessions=[detail_session], observations=basic.observations),
+        )
+
+        merged = details.merge(basic, detail)
+
+        self.assertTrue(merged.sessions[0].steward)
+        self.assertFalse(basic.sessions[0].steward)
+        self.assertEqual(merged.sessions[0].title_ts, 123.0)
+        self.assertIsNone(basic.sessions[0].title_ts)
+
+    def test_required_detail_copy_isolates_mutable_rows_and_reuses_resources_read_only(self):
+        resource = SimpleNamespace(parent_attempt_id="attempt-route-1", display_title=None)
+        job = _job("route-1")
+        job.resource_children = [resource]
+        job.state_evidence = {"inputs": {"observed_liveness": {"state": "working"}}}
+        session = Session(harness="codex", pid=301, session_id="session-1", liveness="working",
+                          state_evidence={"inputs": {"observed_liveness": {"state": "working"}}})
+        evidence = {"route-1": {"execute": {"state": "open"}}}
+        original = LiveSnapshot(
+            sessions=[session], jobs=[job], resources=[resource],
+            route_entities=[_job("route-2")], node_evidence=evidence,
+            observations={"basic": {"state": "ok", "generation_identity": "basic-1"}},
+            tag_metadata=[{"agent": "codex"}],
+        )
+
+        copied = details._copy_for_enrichment(original, required_only=True)
+
+        self.assertIsNot(copied, original)
+        self.assertIsNot(copied.sessions[0], session)
+        self.assertIsNot(copied.jobs[0], job)
+        self.assertIsNot(copied.route_entities[0], original.route_entities[0])
+        self.assertIs(copied.resources, original.resources)
+        self.assertIs(copied.jobs[0].resource_children[0], resource)
+        self.assertIs(copied.node_evidence, evidence)
+        self.assertIsNot(copied.observations, original.observations)
+
+        copied.jobs[0].state_evidence["inputs"]["observed_liveness"]["state"] = "changed"
+        copied.observations["required-details"] = {"state": "ok"}
+        self.assertEqual(job.state_evidence["inputs"]["observed_liveness"]["state"], "working")
+        self.assertNotIn("required-details", original.observations)
+        self.assertIsNone(resource.display_title)
+
     def test_changed_or_missing_neighbourhood_proof_rejects_the_row(self):
         previous = _snapshot({"route-1": {"execute": {"revision": 1}}})
         current = _snapshot({"route-1": {"execute": {"revision": 2}}})

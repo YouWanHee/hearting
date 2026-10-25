@@ -6,11 +6,11 @@ enricher never drops backbone rows (PRD §1: enrichment fills fields; it does no
 """
 import importlib
 import copy
-from dataclasses import replace
 import os
 from pathlib import Path
 import sys
 import time as _time
+from types import SimpleNamespace
 
 from . import procscan
 from ..refresh import LiveSnapshot
@@ -19,6 +19,20 @@ from ..refresh import LiveSnapshot
 _JOB_OBSERVATIONS = {}
 _OBSERVATION_SUCCESSES = {}
 FIRST_FRAME_USAGE_WAIT = 5.0
+
+
+def _copy_job_observation_fallback(jobs, node_evidence, degradations,
+                                  pending_delivery, malformed):
+    """Keep only the fields used to preserve jobs after a failed registry read."""
+    copied_jobs, copied_degradations, copied_pending = copy.deepcopy(
+        (jobs, degradations, pending_delivery))
+    return SimpleNamespace(
+        # node_evidence was copied at dispatch's collector boundary and is
+        # immutable after publication, so the fallback snapshot can share it.
+        jobs=copied_jobs, node_evidence=node_evidence,
+        degradations=copied_degradations, pending_delivery=copied_pending,
+        malformed=malformed,
+    )
 
 
 def _observation_health(key, source, error=None):
@@ -32,6 +46,17 @@ def _observation_health(key, source, error=None):
     success = _OBSERVATION_SUCCESSES.get(cache_key)
     return {"state": "failed" if error else "idle", "last_error": error,
             "last_success_at": success, "age": None if success is None else now - success}
+
+
+def _enrich_steward(sessions, *, fast_first=False):
+    """Keep the optional steward badge out of the fast required observation."""
+    if fast_first:
+        return
+    try:
+        from . import steward
+        steward.enrich(sessions)
+    except Exception:
+        pass
 
 
 def _usage_cache_observation(snapshot, *, refresh_pending=False):
@@ -533,12 +558,9 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
     except Exception:
         pass
 
-    # F-100c: steward flag — exact (harness, session_id) join on the ledger's markers.
-    try:
-        from . import steward as _steward
-        _steward.enrich(sessions)
-    except Exception:
-        pass
+    # F-100c: the badge is optional for first-screen readiness. The detail
+    # worker attaches it after the required screen has completed.
+    _enrich_steward(sessions, fast_first=fast_first)
 
     # F-51d: JSON telemetry projection — cache-only lookup (never schedules a background
     # `git rev-list`; the live render path's own ahead_behind() calls are what populate the
@@ -833,8 +855,9 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
         # This joins already observed exact child fields without further IO.
         # NOW/context/exec must be available in the basic snapshot too.
         _adopt_child_titles(sessions, jobs)
-        from .. import titles
-        titles.annotate(sessions + jobs)
+        if not fast_first:
+            from .. import titles
+            titles.annotate(sessions + jobs)
     except Exception:
         pass
 
@@ -967,8 +990,8 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
         all_new=details_ready, observed_at=_time.time())
     if job_error is None:
         # Cache projected rows, not a reference later mutated by another reader.
-        _JOB_OBSERVATIONS[job_key] = copy.deepcopy(replace(
-            snapshot, sessions=[], jobs=dispatch_rows, resources=[], usage_snapshots={}, tag_metadata=[]))
+        _JOB_OBSERVATIONS[job_key] = _copy_job_observation_fallback(
+            dispatch_rows, node_evidence, degradations, pending_delivery, malformed)
         if len(_JOB_OBSERVATIONS) > 16:
             _JOB_OBSERVATIONS.pop(next(iter(_JOB_OBSERVATIONS)))
     return snapshot

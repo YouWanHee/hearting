@@ -272,7 +272,7 @@ def _contained_regular_release_file(root, relative):
         resolved.relative_to(root)
         if not candidate.is_file():
             return None
-    except (OSError, RuntimeError, ValueError):
+    except OSError:
         return None
     return candidate
 
@@ -2725,6 +2725,44 @@ def unit_catalog_digest(units_root=None):
         match=re.match(r"\A---\n.*?\n---\n", path.read_text(encoding="utf-8"), re.DOTALL)
         if match: blocks.append(f"{path.relative_to(units_root)}\n{match.group(0)}")
     return "sha256:"+hashlib.sha256("\n".join(blocks).encode()).hexdigest()
+
+
+def _unit_catalog_source_signature(units_root=None):
+    """Cheap source key for a pass-local digest reuse; file edits change the key."""
+    units_root = Path(units_root) if units_root else ROOT/"roles"/"units"
+    try:
+        rows = []
+        for path in sorted(units_root.glob("*/*.md")):
+            if path.name.startswith("_"):
+                continue
+            info = path.stat()
+            rows.append((path.relative_to(units_root).as_posix(), str(path.resolve()),
+                         info.st_mode, info.st_dev, info.st_ino, info.st_size,
+                         info.st_mtime_ns, info.st_ctime_ns))
+        return str(units_root.resolve()), tuple(rows)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _unit_catalog_digest_for_pass(cache, units_root=None):
+    if cache is None:
+        return unit_catalog_digest(units_root)
+    root = Path(units_root) if units_root else ROOT/"roles"/"units"
+    key = ("unit-catalog-digest", str(root.resolve()))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached[1]
+    if len(cache) >= 128:
+        return unit_catalog_digest(units_root)
+    before = _unit_catalog_source_signature(root)
+    if before is None:
+        return unit_catalog_digest(units_root)
+    digest = unit_catalog_digest(root)
+    if _unit_catalog_source_signature(root) == before:
+        # The caller owns this dictionary for one projection pass. A new pass
+        # starts with a new cache, so current unit files are observed each tick.
+        cache[key] = (before, digest)
+    return digest
 
 def compile_route(capability, capability_mode, requested_intensity, cwd, artifact_root,
                   predicates=(), signals=(), transport=None,
@@ -5491,7 +5529,8 @@ def _entry_scope_legacy_registry(registry):
     return legacy
 
 
-def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
+def verify_route(route, expected_cwd=None, *, allow_stale_registry=False,
+                 _unit_catalog_cache=None):
     """Verify a route for mutating/resume use.
 
     `allow_stale_registry` exists for one caller: closing a route. A registry or unit
@@ -5563,9 +5602,10 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     if isinstance(route.get("capability_registry_digest"), str) and isinstance(route.get("capability"), str):
         extra=[route["composed_recipe"]] if route.get("composed") and isinstance(route.get("composed_recipe"), dict) else ()
         capability_digest_now=TOPO.capability_registry_digest(registry, route["capability"], extra)
+    units_digest_now = _unit_catalog_digest_for_pass(_unit_catalog_cache)
     classification=classify_validation_basis(
         route, registry_digest_now=TOPO.registry_digest(registry),
-        units_digest_now=unit_catalog_digest(),
+        units_digest_now=units_digest_now,
         registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
         capability_digest_now=capability_digest_now,
     )
@@ -5583,7 +5623,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             registry = legacy_registry
             classification = classify_validation_basis(
                 route, registry_digest_now=TOPO.registry_digest(registry),
-                units_digest_now=unit_catalog_digest(),
+                units_digest_now=units_digest_now,
                 registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
             )
     if (classification["registry"]["verdict"] != "current"
@@ -5595,7 +5635,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
                                        if route.get("capability_registry_digest") is not None else None)
             classification = classify_validation_basis(
                 route, registry_digest_now=TOPO.registry_digest(legacy_registry),
-                units_digest_now=unit_catalog_digest(), registry_root_now=TOPO.ROOT,
+                units_digest_now=units_digest_now, registry_root_now=TOPO.ROOT,
                 unit_catalog_root_now=ROOT, capability_digest_now=legacy_capability_digest)
             if classification["verdict"] == "current":
                 registry = legacy_registry

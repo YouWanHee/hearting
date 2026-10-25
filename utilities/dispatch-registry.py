@@ -130,12 +130,15 @@ def parse_meta(pipe):
     return dict(part.split("=", 1) for part in pipe.split(",") if "=" in part)
 
 
-def _row_from_fields(order, fields, *, meta=None):
+def _row_from_fields(order, fields, *, meta=None, meta_owned=False):
     """Build the established row contract from an already split six-field line."""
     if len(fields) != 6:
         return None
     if meta is None:
         meta = parse_meta(fields[5])
+    elif meta_owned:
+        if type(meta) is not dict:
+            raise TypeError("owned registry metadata must be a dict")
     else:
         meta = dict(meta)
     raw_schema = meta.get("attempt_schema_version")

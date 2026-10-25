@@ -152,7 +152,8 @@ class InheritedCanonicalOwnerRouteTest(unittest.TestCase):
                     self.route_file, self.route_id, self.route_hash = route_file, route_id, route_hash
             class OwnerRouteState:
                 OwnerRouteBinding = Binding
-                def resolve_owner_route_lifecycle(self, path, *, owner_attempt_id, sealed_binding=None):
+                def resolve_owner_route_lifecycle(self, path, *, owner_attempt_id,
+                                                  sealed_binding=None, verification_cache=None):
                     self.asserted_path = str(path)
                     if Path(path).read_text(encoding="utf-8") == "":
                         raise AssertionError("canonical registry was not read")

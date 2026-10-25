@@ -18,7 +18,7 @@ from .refresh import _observation_identity, required_details_complete, set_requi
 
 _METADATA = ("campaign_label", "location_kind", "location_wt", "location_repo",
              "branch", "worktree_count", "branch_ahead", "branch_behind", "qa", "qa_source",
-             "peer_last_recv", "peer_last_sent")
+             "peer_last_recv", "peer_last_sent", "steward")
 
 
 def identity(row):
@@ -536,13 +536,28 @@ def _strip_report_verification(snapshot):
             row.work_projection = replace(work, report_verification=None)
 
 
+def _copy_for_enrichment(snapshot, *, required_only):
+    """Copy only the mutable required-detail graph for the first completion pass."""
+    if not required_only:
+        return copy.deepcopy(snapshot)
+    value = copy.copy(snapshot)
+    # Required projection reads resource rows and attaches them to copied jobs,
+    # but does not mutate the resource observations. Keep those immutable rows
+    # shared so a large host census is not deep-copied just to enrich a few jobs.
+    memo = {id(resource): resource for resource in (snapshot.resources or ())}
+    value.sessions, value.jobs, value.route_entities = copy.deepcopy(
+        (snapshot.sessions, snapshot.jobs, snapshot.route_entities), memo)
+    value.observations = dict(snapshot.observations or {})
+    return value
+
+
 def _enrich(snapshot, *, include_report_verification=True, required=True,
             required_only=False):
     """Fill copied rows with display detail; never rescan or reclassify work."""
-    from .collectors import dispatch, _adopt_child_titles, apply_peer_rows
+    from .collectors import dispatch, _adopt_child_titles, _enrich_steward, apply_peer_rows
     from . import projection, route_chain, titles
     source_key = state_key(snapshot)
-    value = copy.deepcopy(snapshot)
+    value = _copy_for_enrichment(snapshot, required_only=required_only)
     sessions, jobs = value.sessions, value.jobs
     dispatch._fill_locations(jobs)
     if not required_only:
@@ -620,6 +635,7 @@ def _enrich(snapshot, *, include_report_verification=True, required=True,
                 dispatch._candidate_jobs_paths())
         except Exception:
             value.pending_delivery = None
+        _enrich_steward(sessions)
         try:
             from .collectors import peer_messages
             peer = peer_messages.collect()
@@ -733,6 +749,9 @@ def merge(basic, detail):
             if not getattr(current, "title", None):
                 current.title = getattr(previous, "title", None)
                 current.title_ts = getattr(previous, "title_ts", None)
+            elif (current.title == getattr(previous, "title", None)
+                  and getattr(previous, "title_ts", None) is not None):
+                current.title_ts = previous.title_ts
             # Enrichment can advance its bounded native read (or fill summary
             # timestamps). Compare with the captured input as well as output,
             # so an unchanged basic tick does not reject its own detail result.

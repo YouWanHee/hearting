@@ -85,8 +85,9 @@ _LOOP_KEYS = ("oncall", "note", "study", "drill", "runtime-watch")
 _DRILL_LOG_PATH = re.compile(r"(/[^\s'\";]*drill[^\s'\";]*\.log)")
 _DRILL_CASE_LINE = re.compile(r"^▶\s+(.+?)\s+\(work=", re.MULTILINE)
 _REGISTRY_METADATA_WHITESPACE_RE = re.compile(r"\s")
-_REGISTRY_METADATA_LEGACY_RE = re.compile(
-    r"(?:^|,)[^=,]*\s[^=,]*=|=\s|\s+[^\s,]*=")
+_REGISTRY_METADATA_MISSING_EQUALS_RE = re.compile(r"(?:^|,)[^=,]*(?:,|$)")
+_REGISTRY_METADATA_INTERNAL_NAME_RE = re.compile(r"(?:^|,)_name=")
+_REGISTRY_METADATA_WHITESPACE_RUN_RE = re.compile(r"\s+")
 _MODE = re.compile(r"(?:^|\s)--mode(?:=|\s+)([a-z][a-z0-9-]*(?:/[a-z][a-z0-9-]*)?)")
 _CAPABILITY_MODE = re.compile(r"(?:^|\s)--capability-mode(?:=|\s+)([a-z][a-z0-9-]*)")
 _WORKER_MODE = re.compile(r"(?:^|\s)--worker-mode(?:=|\s+)([a-z][a-z0-9-]*/[a-z][a-z0-9-]*)")
@@ -274,21 +275,45 @@ def _orphan_registry_rows(path, registry):
     """Adapt parsed rows to dispatch-registry's established row contract."""
     parsed = parsed_registry_rows(path)
     _raise_registry_read_error(path, ignore_missing=True)
+    raw_records = iter(())
+    if _dispatch_registry_cache.registry_scope_active():
+        try:
+            view = _dispatch_registry_cache.current_registry_view(Path(path))
+            if view._prefix_reuse_eligible:
+                raw_records = iter(view.records)
+        except (OSError, ValueError):
+            pass
+    record = next(raw_records, None)
     rows = []
     for physical_order, fields, parsed_meta in parsed:
+        while record is not None and record.order < physical_order:
+            record = next(raw_records, None)
+        if (record is not None and record.order == physical_order
+                and record.fields == fields):
+            # The registry record exposes the exact comma parser values before
+            # Fleet's display normalization. Transfer its fresh dict directly;
+            # _row_from_fields still owns schema validation and row construction.
+            raw_meta = record.completion_metadata()
+            row = registry._row_from_fields(
+                physical_order, fields, meta=raw_meta, meta_owned=True)
+            record = next(raw_records, None)
+            if row is not None:
+                rows.append(row)
+            continue
         raw_meta = fields[5] or ""
         eq_pos, colon_pos = raw_meta.find("="), raw_meta.find(":")
         simple = (not _REGISTRY_METADATA_WHITESPACE_RE.search(raw_meta)
                   and "(" not in raw_meta and eq_pos >= 0
                   and (colon_pos < 0 or colon_pos > eq_pos)
-                  and all("=" in part for part in raw_meta.split(","))
-                  and not any(part.split("=", 1)[0] == "_name"
-                              for part in raw_meta.split(",")))
+                  and not _REGISTRY_METADATA_MISSING_EQUALS_RE.search(raw_meta)
+                  and not _REGISTRY_METADATA_INTERNAL_NAME_RE.search(raw_meta))
         meta = None
         if simple:
             meta = dict(parsed_meta)
             meta.pop("_name", None)
-        row = registry._row_from_fields(physical_order, fields, meta=meta)
+        row = registry._row_from_fields(
+            physical_order, fields, meta=meta, meta_owned=simple,
+        )
         if row is not None:
             rows.append(row)
     return rows
@@ -343,26 +368,55 @@ def _remember_parsed_registry_rows(path, generation, rows, complete_count,
     return result
 
 
-def _registry_metadata_needs_legacy_parser(raw):
-    """Skip the detailed legacy spacing scan when metadata has no whitespace."""
+def _registry_metadata_analysis(raw):
+    """Classify legacy metadata and find only canonical values needing cleanup."""
     eq_pos, colon_pos = raw.find("="), raw.find(":")
     if ("(" in raw or eq_pos < 0
             or (colon_pos >= 0 and colon_pos < eq_pos)):
-        return True
-    if any("=" not in part for part in raw.split(",")):
-        return True
-    return bool(_REGISTRY_METADATA_WHITESPACE_RE.search(raw)
-                and _REGISTRY_METADATA_LEGACY_RE.search(raw))
+        return True, ()
+    if _REGISTRY_METADATA_MISSING_EQUALS_RE.search(raw):
+        return True, ()
+    whitespace_keys = set()
+    for match in _REGISTRY_METADATA_WHITESPACE_RUN_RE.finditer(raw):
+        start, end = match.span()
+        field_start = raw.rfind(",", 0, start) + 1
+        field_end = raw.find(",", start)
+        if field_end < 0:
+            field_end = len(raw)
+        field_eq = raw.find("=", field_start, field_end)
+        if field_eq < 0 or start < field_eq or start == field_eq + 1:
+            return True, ()
+        next_eq = raw.find("=", end, field_end)
+        if (next_eq >= 0
+                and not _REGISTRY_METADATA_WHITESPACE_RE.search(raw, end, next_eq)):
+            return True, ()
+        whitespace_keys.add(raw[field_start:field_eq])
+    return False, tuple(whitespace_keys)
+
+
+def _registry_metadata_shape(raw):
+    """Boolean-shape oracle retained for boundary tests and diagnostic callers."""
+    needs_legacy, whitespace_keys = _registry_metadata_analysis(raw)
+    has_whitespace = (bool(_REGISTRY_METADATA_WHITESPACE_RE.search(raw))
+                      if needs_legacy else bool(whitespace_keys))
+    return needs_legacy, has_whitespace
+
+
+def _registry_metadata_needs_legacy_parser(raw):
+    """Keep the established boolean predicate for parser-oracle callers."""
+    return _registry_metadata_analysis(raw)[0]
 
 
 def _registry_record_metadata(record):
     """Reuse the pinned registry's parsed key/value metadata when formats agree."""
     raw = record.fields[5] or ""
-    if _registry_metadata_needs_legacy_parser(raw):
+    needs_legacy, whitespace_keys = _registry_metadata_analysis(raw)
+    if needs_legacy:
         return _parse_pipe_meta(raw)
     metadata = record.completion_metadata()
-    for key, value in metadata.items():
-        if _REGISTRY_METADATA_WHITESPACE_RE.search(value):
+    for key in whitespace_keys:
+        value = metadata.get(key)
+        if value is not None:
             metadata[key] = " ".join(value.split())
     metadata["_name"] = _strip_autopilot_prefix(metadata.get("capability"))
     return metadata
@@ -3089,20 +3143,24 @@ def _scan_registry_evidence(paths):
             # Avoid copying every key/value in the large registry for this pass.
             meta = parsed_meta
             ts, status, _repo, _worktree, slug, pipe = fields
-            attempt_contract = _attempt_contract(meta)
             route_id = meta.get("route_id")
             route_node = meta.get("route_node")
             attempt_id = meta.get("attempt_id")
+            if not attempt_id and (not route_id or not route_node):
+                continue
+            attempt_contract = _attempt_contract(meta)
+            harness = None
             if attempt_id:
                 # Latest row for this exact attempt wins inside one registry, even if
                 # the later row is non-terminal. This prevents an earlier terminal row
                 # from hiding a subsequently reopened/malformed attempt.
+                harness = _infer_harness(meta, slug)
                 path_attempts[attempt_id] = {
                     "attempt_id": attempt_id,
                     "status": status,
                     "route_id": route_id,
                     "route_node": route_node,
-                    "harness": _infer_harness(meta, slug),
+                    "harness": harness,
                     "slug": slug,
                     "registry_order": registry_order,
                     **attempt_contract,
@@ -3110,13 +3168,15 @@ def _scan_registry_evidence(paths):
             if not route_id or not route_node:
                 continue
             pid_s = meta.get("pid")
+            pid = int(pid_s) if (pid_s or "").isdigit() else None
+            attention_reason = _attempt_attention(meta)
             node_evidence = path_result.setdefault(route_id, {}).setdefault(
                 route_node, {}
             )
             node_evidence.setdefault("attempt_history", []).append({
                 "attempt_id": attempt_id,
                 "status": status,
-                "pid": int(pid_s) if (pid_s or "").isdigit() else None,
+                "pid": pid,
                 "dispatch_depth": attempt_contract["dispatch_depth"],
                 "transport": attempt_contract["transport"],
                 "execution_surface": attempt_contract["execution_surface"],
@@ -3126,7 +3186,7 @@ def _scan_registry_evidence(paths):
                 "parent_attempt_id": meta.get("parent_attempt_id"),
                 "note": meta.get("note"),
                 "registry_order": registry_order,
-                "attention_reason": _attempt_attention(meta),
+                "attention_reason": attention_reason,
             })
             # route_file/route_hash/parent name WHERE the sealed record lives and who the
             # conductor is — raw registry fields, independent of whether this particular
@@ -3151,7 +3211,7 @@ def _scan_registry_evidence(paths):
                 # when resolving a terminal-only route's completion markers.
                 "_registry_path": path,
                 "attempt_id": attempt_id,
-                "attention_reason": (_attempt_attention(meta)
+                "attention_reason": (attention_reason
                                      if attempt_contract["attempt_contract_status"] == "current"
                                      else None),
             })
@@ -3159,8 +3219,8 @@ def _scan_registry_evidence(paths):
                 continue
             node_evidence.update({
                 "status": status, "slug": slug, "ts": _iso_to_epoch(ts),
-                "pid": int(pid_s) if (pid_s or "").isdigit() else None,
-                "harness": _infer_harness(meta, slug),
+                "pid": pid,
+                "harness": harness if harness is not None else _infer_harness(meta, slug),
                 "model": meta.get("model"),
                 "effort": meta.get("effort") or meta.get("reasoning"),
                 "completion_gate": meta.get("completion_gate"),
@@ -3897,6 +3957,19 @@ def _retain_dead_terminal_owners(jobs, now, jobs_path=None, *, orphan_rows_cache
     from pathlib import Path as _Path
     rows_by_path = {}
     rows_by_attempt = {}
+    route_lineage_by_source = {}
+
+    def route_lineage_for(route_id, route_file):
+        key = (route_id, route_file)
+        cached = route_lineage_by_source.get(key)
+        if cached is not None:
+            return cached
+        value = frozenset(_route_lineage(route_id, route_file))
+        # This memo belongs to one retention pass and stays small even if the
+        # registry contains a large number of distinct historical routes.
+        if len(route_lineage_by_source) < 256:
+            route_lineage_by_source[key] = value
+        return value
 
     def _rows_for(path):
         if path not in rows_by_path:
@@ -3934,7 +4007,7 @@ def _retain_dead_terminal_owners(jobs, now, jobs_path=None, *, orphan_rows_cache
             and r["meta"].get("worker_type") == "owner"
             and r["meta"].get("attempt_id") not in (None, "", j.attempt_id)
             and (
-                route_id in _route_lineage(
+                route_id in route_lineage_for(
                     r["meta"].get("owner_route_id") or r["meta"].get("route_id"),
                     r["meta"].get("owner_route_file") or r["meta"].get("route_file"),
                 )
