@@ -26,6 +26,11 @@ levels include the fail-closed figure semantic verifier against its manifest
 and report. Missing exact 48 kHz full-band metadata, range-compatible claims,
 shared-scale evidence, or a hash-current visual review is a failed level.
 
+For a planned QA leg with sealed `done_when` items, its `<primary-report>.items.json`
+is a derived output of that exact primary report. The existing report scope,
+sub-session fence, state ledger, and continuation carry the sidecar with the
+primary; no separate path input is needed.
+
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 Put pytest basetemp and tool scratch data under the supplied `runtime_dir` or
