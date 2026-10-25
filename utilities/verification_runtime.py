@@ -160,7 +160,11 @@ def scoped_write_roots(scope, supplied, environ=None):
     for candidate in candidates:
         if any(candidate == root or root in candidate.parents for root in available):
             result.add(candidate)
-    result.update(root for root in available if root.name in {".core-grounding", ".spec-grounding"})
+    from harness_state_roots import spec_grounding_dir
+    marker = (spec_grounding_dir(None, env).resolve()
+              if any(env.get(key) for key in ("HARNESS_STATE_ROOT", "XDG_STATE_HOME", "HOME")) else None)
+    result.update(root for root in available
+                  if root.name in {".core-grounding", ".spec-grounding"} or root == marker)
     return [str(p) for p in sorted(result)]
 
 
@@ -256,6 +260,10 @@ def verification_command(command, environ=None):
     if (grant.runtime in {"codex-exec", "codex-app-server"}
             and scope.get("projection") == "native-profile"):
         return command, env  # Already inside that exact attempt's native profile.
+    from harness_state_roots import spec_grounding_dir
+    marker = spec_grounding_dir(None, env).resolve()
+    if marker in grant.writable_roots:
+        marker.mkdir(parents=True, exist_ok=True)
     from codex_permission_profile import (verification_profile_config, config_arguments,
                                           LOCAL_VERIFICATION_PROFILE_NAME)
     resolved = review_scope(bound["route"], bound["node_id"], env["AGENT_ROUTE_FILE"], env)
