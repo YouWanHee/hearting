@@ -8,7 +8,6 @@ oversize fixture below is generated at test time above the 512 KiB tail bound â€
 fixture under that threshold cannot catch this regression.
 """
 
-import builtins
 import json
 import os
 import sys
@@ -75,32 +74,38 @@ class F82CodexAttemptHeadTest(unittest.TestCase):
         _write_oversize_log(large_path, "thread-b", 6_000_000)
 
         budget = d._CLAUDE_SUPERVISOR_HEAD_BYTES + d._CLAUDE_STREAM_TAIL_BYTES
-        real_open = open
         reads = {"small": 0, "large": 0}
+        opened = {"small": 0, "large": 0}
+        fd_paths = {}
+        real_open, real_read = os.open, os.read
 
-        def _tracking_open(path, *args, **kwargs):
-            handle = real_open(path, *args, **kwargs)
-            if path == small_path:
+        def _tracking_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == small_path:
                 key = "small"
-            elif path == large_path:
+            elif os.fspath(path) == large_path:
                 key = "large"
             else:
-                return handle
-            orig_read = handle.read
+                return fd
+            opened[key] += 1
+            fd_paths[fd] = key
+            return fd
 
-            def _read(size=-1, *a, **kw):
-                data = orig_read(size, *a, **kw)
+        def _tracking_read(fd, size):
+            data = real_read(fd, size)
+            key = fd_paths.get(fd)
+            if key:
                 reads[key] += len(data)
-                return data
-            handle.read = _read
-            return handle
+            return data
 
-        with mock.patch.object(builtins, "open", side_effect=_tracking_open):
+        with mock.patch.object(d.os, "open", side_effect=_tracking_open), \
+                mock.patch.object(d.os, "read", side_effect=_tracking_read):
             d._CODEX_ATTEMPT_CACHE.clear()
             d._parse_codex_attempt_tail(small_path)
             d._CODEX_ATTEMPT_CACHE.clear()
             d._parse_codex_attempt_tail(large_path)
 
+        self.assertEqual(opened, {"small": 1, "large": 1})
         self.assertLessEqual(reads["small"], budget)
         self.assertLessEqual(reads["large"], budget)
 
@@ -131,17 +136,26 @@ class F82CodexAttemptHeadTest(unittest.TestCase):
         with open(path, "w") as fh:
             fh.write(_line({"type": "thread.started", "thread_id": "thread-small"}))
             fh.write(_line({"type": "turn.completed"}))
-        real_open = open
-        calls = []
+        real_open, real_read = os.open, os.read
+        opened, reads = [], []
 
-        def _tracking_open(p, *args, **kwargs):
-            if p == path:
-                calls.append(1)
-            return real_open(p, *args, **kwargs)
+        def _tracking_open(p, flags, *args, **kwargs):
+            fd = real_open(p, flags, *args, **kwargs)
+            if os.fspath(p) == path:
+                opened.append(fd)
+            return fd
 
-        with mock.patch.object(builtins, "open", side_effect=_tracking_open):
+        def _tracking_read(fd, size):
+            data = real_read(fd, size)
+            if fd in opened:
+                reads.append(len(data))
+            return data
+
+        with mock.patch.object(d.os, "open", side_effect=_tracking_open), \
+                mock.patch.object(d.os, "read", side_effect=_tracking_read):
             parsed = d._parse_codex_attempt_tail(path)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(reads, [os.path.getsize(path)])
         self.assertEqual(parsed["thread_id"], "thread-small")
 
 

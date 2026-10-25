@@ -2070,11 +2070,11 @@ def _parse_codex_attempt_tail(path):
               "activity": activity if len(thread_ids) == 1 else None,
               "exec_tool": next(reversed(open_commands.values())) if open_commands else None}
     _CODEX_ATTEMPT_CACHE[path] = (cache_key, parsed)
-    parse_cache.save(disk_key, parsed, path, cache_key,
-                     source_is_current=lambda: _attempt_file_view(
-                         path, _CLAUDE_SUPERVISOR_HEAD_BYTES, _CLAUDE_STREAM_TAIL_BYTES,
-                         read_whole_below=_CLAUDE_SUPERVISOR_HEAD_BYTES + _CLAUDE_STREAM_TAIL_BYTES)[3]
-                     == cache_key)
+    # The cache key includes a digest of the exact bytes just parsed. A later
+    # append or same-size rewrite therefore selects another key on the next
+    # read; re-reading the log here only to validate this disposable old key
+    # duplicates bounded I/O without making a cached value authoritative.
+    parse_cache.save(disk_key, parsed, path, cache_key)
     if len(_CODEX_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _CODEX_ATTEMPT_CACHE.pop(next(iter(_CODEX_ATTEMPT_CACHE)))
     return parsed
