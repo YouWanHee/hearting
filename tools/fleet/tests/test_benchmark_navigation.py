@@ -2,6 +2,7 @@
 """Deterministic harness checks for production PTY measurement contracts."""
 import importlib.util
 import ast
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -339,28 +340,6 @@ class BenchmarkProductionContractTest(unittest.TestCase):
         self.assertTrue(result["shutdown"]["telemetry_eof_seen"])
         self.assertGreater(result["telemetry_raw"]["bytes"], 262144)
 
-    def test_missing_or_unpainted_keys_are_retained_as_samples(self):
-        sent = [
-            {"sample": 0, "parent_write_ns": 100},
-            {"sample": 1, "parent_write_ns": 200},
-            {"sample": 2, "parent_write_ns": 300, "write_error": "OSError"},
-            {"sample": 3, "parent_write_ns": 400},
-        ]
-        events = [
-            {"kind": "input-decoded", "input_id": 1, "time_ns": 150},
-            {"kind": "flush", "input_id": 1, "time_ns": 250},
-            {"kind": "input-decoded", "input_id": 2, "time_ns": 270},
-            {"kind": "input-decoded", "input_id": 4, "time_ns": 450},
-            {"kind": "flush", "input_id": 4, "time_ns": 500},
-        ]
-        samples = benchmark._match_production_keys(sent, events)
-        self.assertEqual(len(samples), len(sent))
-        self.assertEqual([row["status"] for row in samples], [
-            "painted", "decoded-no-flush", "write-error", "painted",
-        ])
-        self.assertEqual(samples[0]["end_to_flush_ms"], 0.00015)
-        self.assertIsNone(samples[1]["end_to_flush_ms"])
-
     def test_cache_validation_requires_private_complete_all_new_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "cache.json"
@@ -403,6 +382,281 @@ class BenchmarkProductionContractTest(unittest.TestCase):
         self.assertEqual([row["phase"] for row in other], ["install", "selection"])
         cadence = [row for row in samples if row["phase"] == "start"][-1]
         self.assertEqual(cadence["observed_cadence_seconds"], 2)
+
+
+class BenchmarkInputCorrelationTest(unittest.TestCase):
+
+    @staticmethod
+    def _sample(stream, sample, key, start, write_ns):
+        payload = b"\x1b[A" if key == "up" else b"\x1b[B"
+        stream.update(payload)
+        return {
+            "sample": sample, "key": key, "parent_write_ns": write_ns,
+            "bytes_requested": len(payload), "bytes_written": len(payload),
+            "byte_start": start, "byte_end": start + len(payload),
+            "stream_prefix_sha256": stream.hexdigest(), "write_error": None,
+        }
+
+    @staticmethod
+    def _decoded(input_id, kind, row, time_ns, *, count=None, digest=None,
+                 start=None, end=None, proven=True):
+        return {
+            "kind": "input-decoded", "input_id": input_id,
+            "input_kind": kind, "time_ns": time_ns,
+            "source_byte_start": row["byte_start"] if start is None else start,
+            "source_byte_end": row["byte_end"] if end is None else end,
+            "source_byte_proven": proven,
+            "child_byte_count": row["byte_end"] if count is None else count,
+            "child_stream_sha256": (row["stream_prefix_sha256"]
+                                    if digest is None else digest),
+        }
+
+    @staticmethod
+    def _raw(start, end):
+        return [{"kind": "input-raw-byte", "byte_offset": offset}
+                for offset in range(start, end)]
+
+    def test_unknown_and_quit_interleaving_do_not_shift_navigation_matches(self):
+        stream = hashlib.sha256()
+        down = self._sample(stream, 0, "down", 0, 100)
+        stream.update(b"x")
+        unknown_digest = stream.hexdigest()
+        up = self._sample(stream, 1, "up", 4, 200)
+        stream.update(b"q")
+        quit_digest = stream.hexdigest()
+        events = [
+            *self._raw(0, 8),
+            self._decoded(1, "down", down, 120),
+            {"kind": "input-decoded", "input_id": 2, "input_kind": None,
+             "time_ns": 130, "source_byte_start": 3, "source_byte_end": 4,
+             "source_byte_proven": True, "child_byte_count": 4,
+             "child_stream_sha256": unknown_digest},
+            self._decoded(3, "up", up, 230),
+            {"kind": "input-decoded", "input_id": 4, "input_kind": "quit",
+             "time_ns": 300, "source_byte_start": 7, "source_byte_end": 8,
+             "source_byte_proven": True, "child_byte_count": 8,
+             "child_stream_sha256": quit_digest},
+            {"kind": "flush", "input_id": 1, "time_ns": 160},
+            {"kind": "flush", "input_id": 3, "time_ns": 260},
+            {"kind": "flush", "input_id": 4, "time_ns": 310},
+        ]
+
+        samples = benchmark._match_production_keys([down, up], events)
+
+        self.assertEqual([row["status"] for row in samples], ["painted", "painted"])
+        self.assertEqual([row["input_id"] for row in samples], [1, 3])
+        self.assertEqual([row["end_to_flush_ms"] for row in samples], [0.00006, 0.00006])
+        self.assertNotIn(4, [row["input_id"] for row in samples])
+        self.assertEqual(sum(item.get("kind") == "input-decoded" for item in events), 4)
+        self.assertEqual(sum(item.get("input_kind") in ("up", "down")
+                             for item in events if item.get("kind") == "input-decoded"), 2)
+        self.assertEqual(sum(item.get("kind") == "flush" for item in events), 3)
+
+    def test_missing_and_repeated_arrow_decodes_fail_closed(self):
+        stream = hashlib.sha256()
+        first = self._sample(stream, 0, "down", 0, 100)
+        second = self._sample(stream, 1, "up", 3, 200)
+        events = [
+            *self._raw(0, 6),
+            self._decoded(2, "up", second, 300),
+            self._decoded(3, "up", second, 301),
+            {"kind": "flush", "input_id": 2, "time_ns": 400},
+            {"kind": "flush", "input_id": 3, "time_ns": 401},
+        ]
+
+        samples = benchmark._match_production_keys([first, second], events)
+
+        self.assertEqual([row["status"] for row in samples],
+                         ["missing-decode", "ambiguous-decode"])
+        self.assertTrue(all(row["end_to_flush_ms"] is None for row in samples))
+
+        repeated_stream = hashlib.sha256()
+        first = self._sample(repeated_stream, 0, "down", 0, 100)
+        second = self._sample(repeated_stream, 1, "up", 3, 200)
+        actual_repeated = hashlib.sha256(b"\x1b[B\x1b[B").hexdigest()
+        repeated_events = [
+            *self._raw(0, 6),
+            self._decoded(1, "down", first, 150),
+            self._decoded(2, "down", second, 250, digest=actual_repeated),
+            {"kind": "flush", "input_id": 1, "time_ns": 160},
+            {"kind": "flush", "input_id": 2, "time_ns": 260},
+        ]
+        repeated = benchmark._match_production_keys(
+            [first, second], repeated_events)
+        self.assertEqual([row["status"] for row in repeated],
+                         ["painted", "ambiguous-read"])
+        self.assertIsNone(repeated[1]["end_to_flush_ms"])
+
+    def test_unknown_arrow_span_and_stream_digest_mismatch_are_not_latencies(self):
+        stream = hashlib.sha256()
+        sample = self._sample(stream, 0, "down", 0, 100)
+        unknown = self._decoded(1, None, sample, 120)
+        unknown["input_kind"] = None
+        events = [*self._raw(0, 3), unknown,
+                  {"kind": "flush", "input_id": 1, "time_ns": 130}]
+        outcome = benchmark._match_production_keys([sample], events)
+        self.assertEqual(outcome[0]["status"], "unknown-decode")
+        self.assertIsNone(outcome[0]["end_to_flush_ms"])
+
+        mismatched = self._decoded(2, "down", sample, 140,
+                                   digest=hashlib.sha256(b"\x1b[A").hexdigest())
+        mismatch = benchmark._match_production_keys(
+            [sample], [*self._raw(0, 3), mismatched,
+                       {"kind": "flush", "input_id": 2, "time_ns": 150}])
+        self.assertEqual(mismatch[0]["status"], "ambiguous-read")
+        self.assertIsNone(mismatch[0]["end_to_flush_ms"])
+
+    def test_partial_write_and_write_failure_keep_exact_ranges(self):
+        stream = hashlib.sha256()
+        partial, next_offset = benchmark._write_pty_input(
+            7, b"\x1b[B", 0, stream, write=lambda _fd, _data: 2,
+            monotonic_ns=iter((10, 20)).__next__)
+        self.assertEqual((partial["byte_start"], partial["byte_end"]), (0, 2))
+        self.assertEqual(partial["bytes_written"], 2)
+        self.assertEqual(next_offset, 2)
+        self.assertEqual(partial["stream_prefix_sha256"],
+                         hashlib.sha256(b"\x1b[").hexdigest())
+
+        def fail_write(_fd, _data):
+            raise OSError("closed PTY")
+
+        failed, unchanged_offset = benchmark._write_pty_input(
+            7, b"\x1b[A", next_offset, stream, write=fail_write,
+            monotonic_ns=iter((30, 40)).__next__)
+        self.assertEqual(failed["write_error"], "OSError")
+        self.assertEqual((failed["byte_start"], failed["byte_end"]), (2, 2))
+        self.assertEqual(failed["bytes_written"], 0)
+        self.assertEqual(unchanged_offset, 2)
+        self.assertEqual(failed["stream_prefix_sha256"], partial["stream_prefix_sha256"])
+        outcomes = benchmark._match_production_keys([partial, failed], [])
+        self.assertEqual([row["status"] for row in outcomes], ["partial-write", "write-error"])
+
+    def test_coalesced_source_span_cannot_paint_two_scheduled_samples(self):
+        stream = hashlib.sha256()
+        first = self._sample(stream, 0, "down", 0, 100)
+        second = self._sample(stream, 1, "up", 3, 200)
+        event = self._decoded(1, "down", second, 300, start=0, end=6, count=6)
+        event["child_stream_sha256"] = second["stream_prefix_sha256"]
+        events = [*self._raw(0, 6), event, {"kind": "flush", "input_id": 1,
+                                             "time_ns": 400}]
+
+        samples = benchmark._match_production_keys([first, second], events)
+
+        self.assertEqual([row["status"] for row in samples],
+                         ["coalesced-decode", "coalesced-decode"])
+        self.assertTrue(all(row["end_to_flush_ms"] is None for row in samples))
+
+    def test_delayed_flush_is_measured_and_duplicate_flush_is_ambiguous(self):
+        stream = hashlib.sha256()
+        sample = self._sample(stream, 0, "down", 0, 100)
+        decoded = self._decoded(8, "down", sample, 200)
+        raw = self._raw(0, 3)
+        delayed = benchmark._match_production_keys(
+            [sample], [*raw, decoded, {"kind": "flush", "input_id": 8,
+                                      "time_ns": 1_000_000_100}])
+        self.assertEqual(delayed[0]["status"], "painted")
+        self.assertEqual(delayed[0]["end_to_flush_ms"], 1000.0)
+
+        duplicate = benchmark._match_production_keys(
+            [sample], [*raw, decoded,
+                       {"kind": "flush", "input_id": 8, "time_ns": 300},
+                       {"kind": "flush", "input_id": 8, "time_ns": 400}])
+        self.assertEqual(duplicate[0]["status"], "ambiguous-flush")
+        self.assertIsNone(duplicate[0]["end_to_flush_ms"])
+
+        missing = benchmark._match_production_keys([sample], [*raw, decoded])
+        self.assertEqual(missing[0]["status"], "decoded-no-flush")
+
+        reversed_time = benchmark._match_production_keys(
+            [sample], [*raw, self._decoded(9, "down", sample, 99),
+                       {"kind": "flush", "input_id": 9, "time_ns": 300}])
+        self.assertEqual(reversed_time[0]["status"], "ambiguous-read")
+        self.assertIsNone(reversed_time[0]["end_to_flush_ms"])
+
+    def test_source_offsets_survive_partial_pending_reads_and_ready_bytes(self):
+        import curses
+        from tools.fleet.render import _CursesInput
+
+        observer_nodes = ast.parse(benchmark._observer_source()).body
+        observer_class = next(node for node in observer_nodes
+                              if isinstance(node, ast.ClassDef)
+                              and node.name == "WindowRefreshObserver")
+        install = next(node for node in observer_nodes
+                       if isinstance(node, ast.FunctionDef) and node.name == "install")
+        source_function = next(node for node in ast.walk(install)
+                               if isinstance(node, ast.FunctionDef)
+                               and node.name == "source_bytes")
+        namespace = {"state": {"reader_bytes": {}}}
+        exec(compile(ast.Module(body=[observer_class, source_function], type_ignores=[]),
+                     "production-input-observer", "exec"), namespace)
+        source_bytes = namespace["source_bytes"]
+
+        class Screen:
+            def __init__(self):
+                self.values = []
+                self.delay = 100
+
+            def feed(self, data):
+                self.values.extend(data)
+
+            def getch(self):
+                return self.values.pop(0) if self.values else curses.ERR
+
+            def timeout(self, value):
+                self.delay = value
+
+        def run_case(data, *, expected_kind=None):
+            reader = _CursesInput(curses)
+            screen = Screen()
+            offset = 0
+            event_id = 0
+
+            def observe(value):
+                nonlocal offset, event_id
+                if 0 <= value <= 255:
+                    event_id += 1
+                    namespace["state"]["reader_bytes"].setdefault(id(reader), []).append(
+                        {"offset": offset, "value": value, "event_id": event_id})
+                    offset += 1
+
+            proxy_type = namespace["WindowRefreshObserver"]
+            proxy = proxy_type(screen, lambda: None, lambda _ok: None, observe)
+            result = None
+            source = None
+            for part in data:
+                screen.feed(part)
+                started_at = event_id + 1
+                result = reader.read(proxy)
+                code = result[0]
+                if code not in (curses.ERR, getattr(curses, "KEY_RESIZE", -999999)):
+                    kind = {curses.KEY_UP: "up", curses.KEY_DOWN: "down"}.get(code)
+                    source = source_bytes(reader, code, kind, started_at)
+                    if kind:
+                        self.assertEqual(kind, expected_kind)
+                        break
+            return reader, result, source, proxy
+
+        reader, result, source, proxy = run_case(
+            [[27], [ord("[")], [ord("B")]], expected_kind="down")
+        self.assertEqual(result[0], curses.KEY_DOWN)
+        self.assertEqual(bytes(reader.pending), b"")
+        self.assertEqual(source, {"source_byte_start": 0, "source_byte_end": 3,
+                                  "source_byte_proven": True})
+
+        reader, result, source, proxy = run_case([[27, ord("x")]])
+        self.assertEqual(result[0], 27)
+        self.assertEqual(reader.ready, [(ord("x"), None)])
+        self.assertEqual(source, {"source_byte_start": 0, "source_byte_end": 1,
+                                  "source_byte_proven": True})
+        started_at = 1
+        next_result = reader.read(proxy)
+        next_source = source_bytes(reader, next_result[0], None, started_at)
+        self.assertEqual(next_result[0], ord("x"))
+        self.assertEqual(next_source, {"source_byte_start": 1, "source_byte_end": 2,
+                                      "source_byte_proven": True})
+
+    def test_lower_order_p95_estimator_is_explicit_and_retained(self):
+        self.assertEqual(benchmark._percentile(list(range(1, 101)), 0.95), 95)
 
 
 if __name__ == "__main__":

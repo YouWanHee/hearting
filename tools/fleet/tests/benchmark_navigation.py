@@ -96,28 +96,128 @@ def _percentile(values, percentile):
     return ordered[min(len(ordered) - 1, int((len(ordered) - 1) * percentile))]
 
 
+def _write_pty_input(master, payload, byte_offset, stream_hash, *,
+                     write=os.write, monotonic_ns=time.monotonic_ns):
+    """Write once and retain the accepted PTY byte range and timing."""
+    started_ns = monotonic_ns()
+    error = None
+    try:
+        written = write(master, payload)
+    except OSError as exc:
+        written = 0
+        error = type(exc).__name__
+    finished_ns = monotonic_ns()
+    if not isinstance(written, int) or written < 0 or written > len(payload):
+        written = 0
+        error = "InvalidWriteCount"
+    accepted = payload[:written]
+    stream_hash.update(accepted)
+    return ({"write_start_ns": started_ns, "parent_write_ns": started_ns,
+             "write_finish_ns": finished_ns, "bytes_requested": len(payload),
+             "bytes_written": written, "byte_start": byte_offset,
+             "byte_end": byte_offset + written,
+             "input_bytes_sha256": hashlib.sha256(payload).hexdigest(),
+             "stream_byte_count": byte_offset + written,
+             "stream_prefix_sha256": stream_hash.hexdigest(),
+             "write_error": error}, byte_offset + written)
+
+
 def _match_production_keys(sent, events):
-    decoded = {item.get("input_id"): item for item in events
-               if item.get("kind") == "input-decoded"}
-    painted = {}
-    for item in events:
-        if item.get("kind") == "flush" and item.get("input_id") is not None:
-            painted.setdefault(item["input_id"], item)
+    """Use exact PTY ranges, child stream prefixes, decoded keys, and flush IDs."""
+    decoded = [item for item in events if item.get("kind") == "input-decoded"]
+    raw_bytes = [item for item in events if item.get("kind") == "input-raw-byte"]
+    unproven_reads = [item for item in events
+                      if item.get("kind") == "input-raw-unproven"]
+    flushes = [item for item in events
+               if item.get("kind") == "flush" and item.get("input_id") is not None]
     matched = []
     for row in sent:
-        input_id = row["sample"] + 1
-        decode, paint = decoded.get(input_id), painted.get(input_id)
         if row.get("write_error"):
             status = "write-error"
-        elif decode is None:
-            status = "missing-decode"
-        elif paint is None:
-            status = "decoded-no-flush"
+        elif row.get("bytes_written") != row.get("bytes_requested"):
+            status = "partial-write"
         else:
-            status = "painted"
-        latency = (max(0, paint["time_ns"] - row["parent_write_ns"]) / 1e6
-                   if paint else None)
-        matched.append({**row, "input_id": input_id,
+            decode = paint = None
+            start, end = row.get("byte_start"), row.get("byte_end")
+            same_span = [item for item in decoded
+                         if item.get("source_byte_start") == start
+                         and item.get("source_byte_end") == end]
+            overlapping = [item for item in decoded
+                           if isinstance(item.get("source_byte_start"), int)
+                           and isinstance(item.get("source_byte_end"), int)
+                           and item["source_byte_start"] < end
+                           and item["source_byte_end"] > start]
+            covering_samples = [candidate for candidate in sent
+                                if isinstance(candidate.get("byte_start"), int)
+                                and isinstance(candidate.get("byte_end"), int)
+                                and candidate["byte_start"] < end
+                                and candidate["byte_end"] > start]
+            decode = same_span[0] if len(same_span) == 1 else None
+            raw_counts = {}
+            for item in raw_bytes:
+                offset = item.get("byte_offset")
+                if isinstance(offset, int):
+                    raw_counts[offset] = raw_counts.get(offset, 0) + 1
+            raw_coverage = (isinstance(start, int) and isinstance(end, int)
+                            and all(raw_counts.get(offset) == 1
+                                    for offset in range(start, end)))
+            prefix_proven = bool(
+                decode and decode.get("source_byte_proven") is True
+                and decode.get("child_byte_count") == end
+                and decode.get("child_stream_sha256") == row.get("stream_prefix_sha256")
+                and raw_coverage
+            )
+            expected_kind = row.get("key")
+            if len(same_span) > 1:
+                status, decode = "ambiguous-decode", None
+            elif len(covering_samples) > 1 or any(
+                    item.get("source_byte_start", start) <= start
+                    and item.get("source_byte_end", end) >= end
+                    and (item.get("source_byte_start") != start
+                         or item.get("source_byte_end") != end)
+                    for item in overlapping):
+                status, decode = "coalesced-decode", None
+            elif decode and decode.get("input_kind") not in ("up", "down"):
+                status = "unknown-decode"
+            elif decode and not prefix_proven:
+                status = "ambiguous-read"
+            elif decode and (not isinstance(decode.get("time_ns"), int)
+                             or decode["time_ns"] < row.get("parent_write_ns", 0)):
+                status = "ambiguous-read"
+            elif decode and decode.get("input_kind") != expected_kind:
+                status = "ambiguous-decode"
+            elif not decode:
+                if any(item.get("input_kind") is None for item in overlapping):
+                    status = "unknown-decode"
+                elif overlapping:
+                    status = "ambiguous-read"
+                elif any(item.get("child_byte_count", 0) <= end
+                         for item in unproven_reads):
+                    status = "ambiguous-read"
+                else:
+                    status = "missing-decode"
+            else:
+                linked = [item for item in flushes
+                          if item.get("input_id") == decode.get("input_id")]
+                if len(linked) > 1:
+                    status, decode, paint = "ambiguous-flush", None, None
+                elif not linked:
+                    status, paint = "decoded-no-flush", None
+                else:
+                    paint = linked[0]
+                    if (not isinstance(paint.get("time_ns"), int)
+                            or paint["time_ns"] < decode.get("time_ns", 0)
+                            or paint["time_ns"] < row.get("parent_write_ns", 0)):
+                        status, decode, paint = "ambiguous-flush", None, None
+                    else:
+                        status = "painted"
+            latency = ((paint["time_ns"] - row["parent_write_ns"]) / 1e6
+                       if status == "painted" else None)
+        if row.get("write_error") or row.get("bytes_written") != row.get("bytes_requested"):
+            decode = paint = None
+            latency = None
+        matched.append({**row,
+                        "input_id": decode.get("input_id") if decode else None,
                         "decoded_ns": decode.get("time_ns") if decode else None,
                         "painted_ns": paint.get("time_ns") if paint else None,
                         "end_to_flush_ms": latency, "status": status})
@@ -366,10 +466,11 @@ def _required_detail_diagnostics(snapshot):
 
 class WindowRefreshObserver:
     """Observe the completed refresh used by production renderers."""
-    def __init__(self, window, before_refresh, after_refresh):
+    def __init__(self, window, before_refresh, after_refresh, getch_observer=None):
         self._window = window
         self._before_refresh = before_refresh
         self._after_refresh = after_refresh
+        self._getch_observer = getch_observer
 
     def refresh(self, *args, **kwargs):
         self._before_refresh()
@@ -380,6 +481,12 @@ class WindowRefreshObserver:
             raise
         self._after_refresh(True)
         return result
+
+    def getch(self, *args, **kwargs):
+        value = self._window.getch(*args, **kwargs)
+        if self._getch_observer is not None:
+            self._getch_observer(value)
+        return value
 
     def __getattr__(self, name):
         return getattr(self._window, name)
@@ -492,18 +599,83 @@ def install():
         dispatch.parsed_registry_rows = parsed_registry
 
         state = {"input_id": 0, "pending_input": None, "flush_id": 0,
-                 "refresh_depth": 0}
+                 "refresh_depth": 0, "child_byte_count": 0,
+                 "child_stream": hashlib.sha256(), "active_reader": None,
+                 "reader_bytes": {}, "raw_event_id": 0}
+
+        def observe_getch(value):
+            state["raw_event_id"] += 1
+            if isinstance(value, int) and 0 <= value <= 255:
+                offset = state["child_byte_count"]
+                state["child_byte_count"] += 1
+                state["child_stream"].update(bytes((value,)))
+                reader = state["active_reader"]
+                if reader is not None:
+                    state["reader_bytes"].setdefault(id(reader), []).append(
+                        {"offset": offset, "value": value,
+                         "event_id": state["raw_event_id"]})
+                emit({"kind": "input-raw-byte", "byte_offset": offset,
+                      "time_ns": time.monotonic_ns(),
+                      "child_byte_count": state["child_byte_count"],
+                      "child_stream_sha256": state["child_stream"].hexdigest()})
+            elif value not in (curses.ERR, getattr(curses, "KEY_RESIZE", -999999)):
+                emit({"kind": "input-raw-unproven", "value_kind": type(value).__name__,
+                      "time_ns": time.monotonic_ns(),
+                      "child_byte_count": state["child_byte_count"]})
+
+        def source_bytes(reader, code, input_kind, read_started_at):
+            queue = state["reader_bytes"].setdefault(id(reader), [])
+            if input_kind in ("up", "down"):
+                expected = (27, 91, 65 if input_kind == "up" else 66)
+                if len(queue) < 3:
+                    return None
+                tail = queue[-3:]
+                if (tuple(item["value"] for item in tail) != expected
+                        or any(right["offset"] != left["offset"] + 1
+                               for left, right in zip(tail, tail[1:]))
+                        or not any(item["event_id"] >= read_started_at for item in tail)):
+                    return None
+                source = {"source_byte_start": tail[0]["offset"],
+                          "source_byte_end": tail[-1]["offset"] + 1,
+                          "source_byte_proven": True}
+                del queue[:]
+                return source
+            for index, item in enumerate(queue):
+                if item["value"] == code:
+                    if index != 0:
+                        return None
+                    del queue[0]
+                    return {"source_byte_start": item["offset"],
+                            "source_byte_end": item["offset"] + 1,
+                            "source_byte_proven": True}
+            return None
+
         original_read = render._CursesInput.read
         def read(reader, *args, **kwargs):
-            value = original_read(reader, *args, **kwargs)
+            read_started_at = state["raw_event_id"] + 1
+            state["active_reader"] = reader
+            try:
+                value = original_read(reader, *args, **kwargs)
+            finally:
+                state["active_reader"] = None
             ch = value[0] if isinstance(value, tuple) else value
             if ch not in (curses.ERR, getattr(curses, "KEY_RESIZE", -999999)):
                 state["input_id"] += 1
                 state["pending_input"] = state["input_id"]
                 input_kind = {ord("q"): "quit", ord("Q"): "quit",
                               curses.KEY_UP: "up", curses.KEY_DOWN: "down"}.get(ch)
+                source = source_bytes(reader, ch, input_kind, read_started_at)
                 emit({"kind": "input-decoded", "input_id": state["input_id"],
-                      "input_kind": input_kind, "time_ns": time.monotonic_ns()})
+                      "input_kind": input_kind, "time_ns": time.monotonic_ns(),
+                      **(source or {"source_byte_proven": False}),
+                      "child_byte_count": state["child_byte_count"],
+                      "child_stream_sha256": state["child_stream"].hexdigest()})
+            elif (not reader.pending and not reader.ready
+                  and not getattr(reader, "discarding_sgr", False)):
+                # The decoder may intentionally discard an inert escape sequence.
+                # Its bytes remain in the stream hash, but cannot be mistaken for
+                # a later decoded key's source token.
+                state["reader_bytes"].setdefault(id(reader), []).clear()
             return value
         render._CursesInput.read = read
 
@@ -536,7 +708,8 @@ def install():
                     if succeeded:
                         record_flush("stdscr.refresh")
                 try:
-                    result = func(WindowRefreshObserver(stdscr, before_refresh, after_refresh),
+                    result = func(WindowRefreshObserver(
+                                      stdscr, before_refresh, after_refresh, observe_getch),
                                   *call_args, **call_kwargs)
                 except BaseException as error:
                     emit({"kind": "tui-loop-exception",
@@ -579,7 +752,9 @@ def install():
             emit({"kind": "process-exit", "time_ns": time.monotonic_ns(),
                   "telemetry_fd_open": telemetry_fd_open,
                   "sigterm_handler": _signal_handler_name(signal.SIGTERM),
-                  "process_times": _times(), "observer_emit_ns": _emit_ns})
+                  "process_times": _times(), "observer_emit_ns": _emit_ns,
+                  "input_stream": {"child_byte_count": state["child_byte_count"],
+                                   "child_stream_sha256": state["child_stream"].hexdigest()}})
         atexit.register(record_process_exit)
     except Exception as error:
         emit({"kind": "observer-error", "component": "fleet-hooks",
@@ -830,6 +1005,11 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
     parent_actions = []
     eof_descriptors = set()
     telemetry_parse_errors = 0
+    parent_input_stream = hashlib.sha256()
+    parent_input_byte_count = 0
+    nav_input_byte_count = 0
+    nav_input_stream_sha256 = hashlib.sha256().hexdigest()
+    quit_write = None
     selector = selectors.DefaultSelector()
     state_home = env.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
     stderr_log_path = Path(state_home) / "agent-fleet" / "fleet-stderr.log"
@@ -922,17 +1102,13 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
                     drain(min(0.1, remaining))
                     sample_process()
                 value = b"\x1b[B" if index % 2 == 0 else b"\x1b[A"
-                write_ns = time.monotonic_ns()
-                try:
-                    os.write(master, value)
-                    write_error = None
-                except OSError as error:
-                    write_error = type(error).__name__
+                write, parent_input_byte_count = _write_pty_input(
+                    master, value, parent_input_byte_count, parent_input_stream)
                 key_raw.append({"sample": index, "scheduled_offset_seconds": offset,
-                                "parent_write_ns": write_ns,
                                 "key": "down" if index % 2 == 0 else "up",
-                                "input_bytes_sha256": hashlib.sha256(value).hexdigest(),
-                                "write_error": write_error})
+                                **write})
+            nav_input_byte_count = parent_input_byte_count
+            nav_input_stream_sha256 = parent_input_stream.hexdigest()
             end_ns = launch_start_ns + int(duration * 1e9)
             while time.monotonic_ns() < end_ns:
                 remaining = max(0.0, (end_ns - time.monotonic_ns()) / 1e9)
@@ -950,12 +1126,11 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
         exit_after_q = None
         if proc is not None and proc.poll() is None:
             q_write_ns = time.monotonic_ns()
-            try:
-                q_bytes = os.write(master, b"q")
-            except OSError as error:
-                q_bytes = 0
-                q_write_error = type(error).__name__
-            parent_actions.append({"action": "write-q", "time_ns": q_write_ns,
+            quit_write, parent_input_byte_count = _write_pty_input(
+                master, b"q", parent_input_byte_count, parent_input_stream)
+            q_bytes = quit_write["bytes_written"]
+            q_write_error = quit_write["write_error"]
+            parent_actions.append({"action": "write-q", **quit_write,
                                    "bytes": q_bytes, "error": q_write_error,
                                    "process_alive": proc.poll() is None})
             closeout = _production_closeout(proc, q_write_ns, drain, sample_process)
@@ -1006,6 +1181,11 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
         times = [item for item in events if item.get("kind") == "process-exit"]
         process_exit_times = times[-1].get("process_times") if times else None
         flushes = [item for item in events if item.get("kind") == "flush"]
+        decoded_inputs = [item for item in events if item.get("kind") == "input-decoded"]
+        raw_input_bytes = [item for item in events
+                           if item.get("kind") == "input-raw-byte"]
+        child_stream = next((item.get("input_stream") for item in reversed(events)
+                             if item.get("kind") == "process-exit"), None)
         first_flush = next((item for item in flushes if item.get("frame_present")), None)
         replay = next((item for item in flushes if item.get("replay")
                        and item.get("frame_present")), None)
@@ -1036,9 +1216,30 @@ def _production_run(role, tree, cache_home, observer_dir, runtime_dir,
             "screen_flushes": len(flushes), "key_count": len(key_samples),
             "key_painted_count": sum(item["status"] == "painted" for item in key_samples),
             "key_missing_count": sum(item["status"] != "painted" for item in key_samples),
+            "navigation_decode_count": sum(item.get("input_kind") in ("up", "down")
+                                            for item in decoded_inputs),
+            "decoded_input_event_count": len(decoded_inputs),
+            "raw_input_byte_count": len(raw_input_bytes),
+            "raw_input_byte_offset_duplicates": (
+                len(raw_input_bytes) - len({item.get("byte_offset")
+                                            for item in raw_input_bytes})),
+            "parent_input_stream": {
+                "scheduled_navigation_byte_count": nav_input_byte_count,
+                "scheduled_navigation_sha256": nav_input_stream_sha256,
+                "total_accepted_byte_count": parent_input_byte_count,
+                "total_accepted_sha256": parent_input_stream.hexdigest(),
+                "quit_write": quit_write,
+                "child_stream": child_stream,
+                "complete_stream_match": bool(
+                    child_stream
+                    and child_stream.get("child_byte_count") == parent_input_byte_count
+                    and child_stream.get("child_stream_sha256")
+                    == parent_input_stream.hexdigest()),
+            },
             "key_latency_ms": {"count": len(latencies), "raw": latencies,
                                "p50": statistics.median(latencies) if latencies else None,
                                "p95": _percentile(latencies, 0.95),
+                               "p95_estimator": "lower-order statistic: sorted[floor((n-1)*p)]",
                                "max": max(latencies) if latencies else None},
             "key_samples": key_samples, "rss_unit": "KiB", "rss_samples": rss_samples,
             "rss_sampling_interval_seconds": 1,
@@ -1312,7 +1513,9 @@ def _production_campaign(args):
         result["groups"][key]["key_latency_ms"] = {
             "count": len(latencies), "raw": latencies,
             "p50": statistics.median(latencies) if latencies else None,
-            "p95": _percentile(latencies, 0.95), "max": max(latencies) if latencies else None}
+            "p95": _percentile(latencies, 0.95),
+            "p95_estimator": "lower-order statistic: sorted[floor((n-1)*p)]",
+            "max": max(latencies) if latencies else None}
     failures = [run for run in result["runs"]
                 if run.get("status") in ("failed", "nonzero-exit")]
     result["status"] = "failed" if failures or result["state_errors"] else "complete"
