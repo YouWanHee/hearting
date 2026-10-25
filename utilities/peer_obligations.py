@@ -1454,7 +1454,8 @@ def _retained_submission_current(message, members):
     hook_context_recovery = (message.get("state") == "queued"
         and message.get("receipt") == "hook-context-emitted"
         and recipient.get("harness") == "claude"
-        and (message.get("producer_binding") or {}).get("schema") != "session-notice-runtime-v1")
+        and (message.get("producer_binding") or {}).get("schema") not in {
+            "session-notice-runtime-v1", "retained-runtime-notice-v1"})
     if message.get("state") != "pending" and not hook_context_recovery:
         return False
     for record, root, storage, owner, jobs in members:

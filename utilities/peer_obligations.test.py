@@ -2877,6 +2877,23 @@ class CanonicalNoticeJoinTest(unittest.TestCase):
                             with mock.patch.object(pending, "renew_unsubmitted_claim", return_value=original) if mutation == "lease" else contextlib.nullcontext():
                                 self.assertEqual(self._native_first_write(ref, recipient, before=change), [])
 
+    def test_queued_notice_context_never_grants_another_first_write(self):
+        peer = peer_steward.peer_message
+        for old_schema in (False, True):
+            for state, reason in (("queued", "hook-context-emitted"), ("queued", "native-queue-accepted"),
+                                  ("unverified", "native-inflight")):
+                with self.subTest(old_schema=old_schema, state=state, reason=reason):
+                    ref, recipient, records, duties = self.transfer(sid="queued-" + str(old_schema) + reason,
+                        old_schema=old_schema)
+                    row = peer._read_pending(ref)
+                    peer._save_pending(dict(row, state=state, receipt=reason))
+                    reservation = peer.reserve_pending_herdr(ref, recipient, receipt="hook-context-inflight",
+                        allow_hook_context_recovery=True)
+                    if reservation is not None:
+                        self.assertIsNone(peer.begin_pending_write(reservation, recipient=recipient,
+                            receipt="hook-context-inflight"))
+                    self.assertFalse(obligations.registered_submission_current(peer._read_pending(ref)))
+
     def test_retained_single_notice_schema_uses_the_same_first_write_guard(self):
         import dispatch_pending_delivery as pending
         for harness in ("claude", "codex"):
