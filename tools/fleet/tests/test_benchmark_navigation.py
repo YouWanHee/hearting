@@ -158,23 +158,52 @@ class BenchmarkProductionContractTest(unittest.TestCase):
             ["base", "candidate", "legacy"],
         ])
 
-    def test_production_argv_uses_real_shell_entry_points(self):
+    def test_production_legacy_launcher_supports_current_and_historical_trees(self):
         with tempfile.TemporaryDirectory() as tmp:
-            trees = {}
-            for role, launcher in (("base", "fleet2.sh"),
-                                   ("candidate", "fleet2.sh"),
-                                   ("legacy", "fleet-monitor.sh")):
-                tree = Path(tmp) / role
-                path = tree / "tools/fleet" / launcher
-                path.parent.mkdir(parents=True)
-                path.write_text("#!/bin/sh\n", encoding="utf-8")
-                trees[role] = tree
-            for role, launcher in (("base", "fleet2.sh"),
-                                   ("candidate", "fleet2.sh"),
-                                   ("legacy", "fleet-monitor.sh")):
-                self.assertEqual(benchmark._production_argv(role, trees), [
-                    str(trees[role].resolve() / "tools/fleet" / launcher)
-                ])
+            for legacy_layout, expected_legacy in (
+                    ("current", "fleet-monitor.sh"),
+                    ("historical", "fleet.sh")):
+                with self.subTest(legacy_layout=legacy_layout):
+                    fixture_root = Path(tmp) / legacy_layout
+                    trees = {}
+                    for role in ("base", "candidate"):
+                        tree = fixture_root / role
+                        path = tree / "tools/fleet/fleet2.sh"
+                        path.parent.mkdir(parents=True)
+                        path.write_text("#!/bin/sh\n", encoding="utf-8")
+                        trees[role] = tree
+
+                    legacy_tree = fixture_root / "legacy"
+                    legacy_dir = legacy_tree / "tools/fleet"
+                    legacy_dir.mkdir(parents=True)
+                    legacy_names = (["fleet-monitor.sh", "fleet.sh"]
+                                    if legacy_layout == "current" else ["fleet.sh"])
+                    for launcher in legacy_names:
+                        (legacy_dir / launcher).write_text("#!/bin/sh\n", encoding="utf-8")
+                    trees["legacy"] = legacy_tree
+
+                    self.assertEqual(benchmark._production_argv("legacy", trees), [
+                        str((legacy_dir / expected_legacy).resolve())
+                    ])
+                    for role in ("base", "candidate"):
+                        self.assertEqual(benchmark._production_argv(role, trees), [
+                            str((trees[role] / "tools/fleet/fleet2.sh").resolve())
+                        ])
+
+                    argv = [
+                        "benchmark_navigation.py", "--mode", "production",
+                        "--source-tree", str(trees["candidate"]),
+                        "--base-tree", str(trees["base"]),
+                        "--legacy-tree", str(trees["legacy"]),
+                        "--runtime-dir", str(fixture_root / "runtime"),
+                        "--evidence-dir", str(fixture_root / "evidence"),
+                    ]
+                    with mock.patch("sys.argv", argv), \
+                            mock.patch.object(benchmark, "_production_campaign",
+                                              return_value={"status": "complete"}) as campaign, \
+                            mock.patch("builtins.print"):
+                        self.assertEqual(benchmark.main(), 0)
+                    campaign.assert_called_once()
 
     def test_environment_preserves_live_registry_and_xdg_but_clears_worker_overrides(self):
         with tempfile.TemporaryDirectory() as tmp:
