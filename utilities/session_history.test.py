@@ -201,6 +201,36 @@ class HistoryTests(unittest.TestCase):
             actual, pane, socket = viewer._identity(Namespace(harness=None, session_id=None))
         self.assertEqual((actual.key, pane, socket), (expected.key, "workspace:active", "/tmp/herdr.sock"))
 
+    def test_exact_native_query_ignores_a_different_inherited_pane_and_reads_confirmed_lineage(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            env = {"XDG_STATE_HOME": str(state), "CODEX_THREAD_ID": "native-current",
+                   "HERDR_ACTIVE_PANE_ID": "unrelated-pane", "HERDR_SOCKET_PATH": "/tmp/other.sock"}
+            with patch.dict("os.environ", env, clear=True), \
+                 patch.object(viewer.session_tidy, "codex_pane_for_session", return_value=""), \
+                 patch.object(viewer.session_tidy, "_lineage_transcript",
+                              return_value={"path": None, "status": "missing"}):
+                logical = viewer.session_tidy.Seat(
+                    "project", "project-key", harness="codex", sid="native-current")
+                with viewer.session_tidy.session_state_lock(logical):
+                    viewer.session_tidy.record_event(logical, "codex", "native-current", "start",
+                                                     source="clear", now=200)
+                    viewer.session_tidy._append_ledger_entry(logical, {
+                        "ts": 201, "harness": "codex", "sid": "native-current",
+                        "event": "handover", "from": "native-predecessor", "source": "clear"})
+                args = Namespace(harness="codex", session_id="native-current")
+                actual, pane, socket = viewer._identity(args)
+                rows = viewer.session_tidy.seat_lineage(actual)
+
+            self.assertEqual((actual.harness, actual.sid, pane, socket),
+                             ("codex", "native-current", "", ""))
+            self.assertEqual(viewer.session_tidy.seat_state_key(actual),
+                             viewer.session_tidy._digest("native-session", "codex", "native-current"))
+            self.assertEqual(viewer.session_tidy._confirmed_predecessor(
+                rows, "codex", "native-current")["sid"], "native-predecessor")
+
 
 if __name__ == "__main__":
     unittest.main()
