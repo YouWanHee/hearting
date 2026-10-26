@@ -925,7 +925,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                          "row_id", "row_key"}
         identity_objects = [obj for obj in objects
             if isinstance(obj.get("run_id"), str)
-            and any(key in obj for key in identity_keys)]
+            and (obj is document or any(key in obj for key in identity_keys))]
         run_ids = {obj.get("run_id") for obj in identity_objects}
         if identity_objects:
             state["target_seen"] = state.get("target_seen") is True or run_id in run_ids

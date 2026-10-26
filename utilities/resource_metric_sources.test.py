@@ -241,10 +241,10 @@ class MetricSourcesTest(unittest.TestCase):
         self.assertEqual((second["latest"]["state"], len(second["samples"])), ("admitted", 1))
         self.assertNotEqual(first["latest"]["sample_id"], second["latest"]["sample_id"])
 
-    def test_admission_reader_rejects_wrong_foreign_and_ambiguous_bindings(self):
+    def test_admission_reader_rejects_missing_nested_and_foreign_bindings(self):
         wrong = self.root / "wrong"
         (wrong / "bundle").mkdir(parents=True)
-        (wrong / "bundle" / "record.json").write_text('{"run_id":"other"}')
+        (wrong / "bundle" / "record.json").write_text('{"started_at":0}')
         (wrong / "bundle" / "admission.json").write_text(
             '{"admitted":false,"snapshot":{"t":10}}')
         result = metrics.read_admission_sources([wrong], run_id="target", now=20)
@@ -252,13 +252,23 @@ class MetricSourcesTest(unittest.TestCase):
         self.assertIsNone(result["latest"])
         self.assertEqual(result["samples"], [])
 
-        ambiguous = self.root / "ambiguous"
-        (ambiguous / "bundle").mkdir(parents=True)
-        (ambiguous / "bundle" / "record.json").write_text(
-            '{"run_id":"target","other":{"run_id":"other"}}')
-        (ambiguous / "bundle" / "admission.json").write_text(
+        nested_reference = self.root / "nested-reference"
+        (nested_reference / "bundle").mkdir(parents=True)
+        (nested_reference / "bundle" / "record.json").write_text(
+            '{"other":{"run_id":"target"}}')
+        (nested_reference / "bundle" / "admission.json").write_text(
             '{"admitted":false,"snapshot":{"t":10}}')
-        result = metrics.read_admission_sources([ambiguous], run_id="target", now=20)
+        result = metrics.read_admission_sources([nested_reference], run_id="target", now=20)
+        self.assertEqual(result["coverage"], "unknown")
+        self.assertIsNone(result["latest"])
+        self.assertEqual(result["samples"], [])
+
+        foreign = self.root / "foreign"
+        (foreign / "bundle").mkdir(parents=True)
+        (foreign / "bundle" / "record.json").write_text('{"run_id":"other"}')
+        (foreign / "bundle" / "admission.json").write_text(
+            '{"admitted":false,"snapshot":{"t":10}}')
+        result = metrics.read_admission_sources([foreign], run_id="target", now=20)
         self.assertEqual(result["coverage"], "unknown")
         self.assertIsNone(result["latest"])
         self.assertEqual(result["samples"], [])
@@ -572,11 +582,10 @@ class MetricSourcesTest(unittest.TestCase):
             '{"padding":"' + "x" * (metrics.MAX_ADMISSION_RECORD_BYTES + 64) + '"}')
         for index in range(320):
             (target / f"decision-{index:03d}.json").write_text(json.dumps({
-                "row_id": "exact-row", "admitted": index >= 9,
+                "admitted": index >= 9,
                 "snapshot": {"t": 1000 + index}}))
-        (target / "zz-identity.data").write_text(json.dumps({
-            "run_id": "exact-run", "row_id": "exact-row", "started_at": 1,
-            "config_sha256": "a" * 64}))
+        (target / "zz-arbitrary-run-record.data").write_text(
+            json.dumps({"run_id": "exact-run"}))
         root_info = root.lstat()
         old_cursor = {"schema_version": 3,
             "root_generations": {str(root): f"{root_info.st_dev}:{root_info.st_ino}"},
@@ -592,8 +601,7 @@ class MetricSourcesTest(unittest.TestCase):
                 changing.write_text(json.dumps({"admitted": False,
                     "snapshot": {"t": 1500 + turn}}))
                 result = metrics.read_admission_sources([root], run_id="exact-run",
-                    row_key="exact-row", registry_path=registry, started_at=1,
-                    now=2000, cursor=cursor)
+                    registry_path=registry, started_at=1, now=2000, cursor=cursor)
                 self.assertLessEqual(result["bytes"], 12 * 1024)
                 self.assertLessEqual(result["entries"], metrics.MAX_ADMISSION_ENTRIES)
                 cursor = result["cursor"]
@@ -601,10 +609,42 @@ class MetricSourcesTest(unittest.TestCase):
                 if result["coverage"] == "observed":
                     break
         self.assertEqual(len(accumulated), 320)
+        self.assertEqual(sum(row["state"] == "denied" for row in accumulated.values()), 9)
+        self.assertEqual(sum(row["state"] == "admitted" for row in accumulated.values()), 311)
+        self.assertEqual({row["state"] for row in accumulated.values()}, {"denied", "admitted"})
         self.assertEqual((result["latest"]["state"], result["latest"]["at"]),
                          ("admitted", 1319.0))
         self.assertNotIn("admission-binding-summary-limit", result["warnings"])
+        self.assertNotIn("admission-run-binding-missing", result["warnings"])
         self.assertNotIn("root_blocked_generation", cursor["scan"][str(root)])
+
+    def test_rootless_direct_run_declaration_without_optional_keys_has_no_row_authority(self):
+        root = self.root / "registry-parent-direct-run-declaration"
+        bundle = root / "arbitrary-child-name"
+        bundle.mkdir(parents=True)
+        registry = root / "resource-runs.json"
+        registry.write_text("{}\n")
+        (bundle / "00-execution-manifest.data").write_text(
+            json.dumps({"run_id": "direct-run"}))
+        (bundle / "unrelated-admission-name.data").write_text(json.dumps({
+            "admitted": False, "snapshot": {"t": 10}, "reasons": ["capacity"]}))
+
+        run = metrics.read_admission_sources([root], run_id="direct-run",
+            registry_path=registry, started_at=5, now=20)
+        self.assertEqual(run["coverage"], "observed")
+        self.assertEqual((run["latest"]["state"], run["latest"]["at"]),
+                         ("denied", 10.0))
+        binding = (run["cursor"]["scan"][str(root)]["bundle_cursors"]
+                   [bundle.name]["binding_state"])
+        self.assertTrue(binding["target_seen"])
+        self.assertEqual(binding["generation_fields"], [{"run_id": "direct-run"}])
+
+        row = metrics.read_admission_sources([root], run_id="direct-run", row_key="row-a",
+            registry_path=registry, started_at=5, now=20)
+        self.assertEqual(row["coverage"], "observed")
+        self.assertEqual(row["latest"]["state"], "unknown")
+        self.assertEqual(row["latest"]["reasons"], [])
+        self.assertEqual([sample["state"] for sample in row["samples"]], ["unknown"])
 
     def test_validated_target_continues_without_broad_root_listing(self):
         root = self.root / "root-with-unrelated-siblings"

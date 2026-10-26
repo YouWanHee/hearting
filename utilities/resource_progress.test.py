@@ -698,7 +698,7 @@ class ExperimentObservationTest(unittest.TestCase):
             registry = registry_dir / "resource-runs.json"
             registry.write_text("{}\n")
             (bundle / "execution-record.json").write_text(json.dumps({
-                "run_id": "generic-run", "started_at": 0}))
+                "run_id": "generic-run"}))
             admission_path = bundle / "any-file-name.json"
             admission_path.write_text(json.dumps({"admitted": False,
                 "snapshot": {"t": 900}, "first_snapshot": {"t": 800},
