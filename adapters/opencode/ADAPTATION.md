@@ -200,7 +200,12 @@ The legacy hook table below describes the V1 `server()` entrypoint. V2 loads
 uses the Promise API `setup(ctx)` and registers `ctx.tool`, `ctx.shell`,
 `ctx.session`, and `ctx.event` hooks. The flat `hearting-guards.js` file keeps
 the V1 `server()` export. The global installer projects both paths so OpenCode
-V2's package-directory discovery can find the V2 entrypoint.
+V2's package-directory discovery can find the V2 entrypoint. OpenCode V2 skips a
+package whose entry resolves outside the package directory, so runtime
+activation writes `plugins/hearting-guards/index.ts` as an owned regular file
+that imports the activated bundle's `hearting-guards.js` by absolute path,
+rather than a link into the bundle. Plugins load in the OpenCode server; a
+TUI relaunch alone does not attach a plugin the server has not loaded.
 
 V2 worker sessions are identified from their exact native session title/agent;
 the shared service process environment is not treated as worker identity.
