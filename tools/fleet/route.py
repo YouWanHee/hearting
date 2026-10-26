@@ -1240,6 +1240,18 @@ def _node_state(node_id, route_jobs, ev_by_node, now, completion_marked=False, d
 
     live = [j for j in route_jobs if getattr(j, "route_node", None) == node_id]
     active = [j for j in live if j.liveness == "working"]
+    stalled = [j for j in live
+               if isinstance(getattr(j, "stall_observation", None), dict)
+               and not _is_reconciling_attempt(j)]
+    if stalled and (active or not completion_marked):
+        current = _best(stalled)
+        observation = {**current.stall_observation, "observed_at": now}
+        reason = observation.get("reason") or "attempt-stalled"
+        return {"state": "attention", "elapsed_min": current.elapsed_min,
+                "model": current.model, "harness": current.harness,
+                "effort": current.effort, "pid": None,
+                "note": reason, "job": current,
+                "stall_observation": observation}
     if active:
         j = _best(active)
         return {"state": "active", "elapsed_min": j.elapsed_min, "model": j.model,

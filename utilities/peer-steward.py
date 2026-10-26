@@ -7827,6 +7827,16 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                     pending.release_claim(jobs.parent, storage_recipient,
                         acquired["delivery_id"], claim_owner=claim_owner)
                 return
+            member_receipt = (stored_member.get("receipt") or {})
+            stall_notice = (member_receipt.get("kind") == "supervision"
+                            and member_receipt.get("reason") == "attempt-stalled")
+            if stall_notice:
+                from dispatch_supervision import notice_is_current
+                if not notice_is_current(stored_member):
+                    for acquired in claimed_members:
+                        pending.release_claim(jobs.parent, storage_recipient,
+                            acquired["delivery_id"], claim_owner=claim_owner)
+                    return
             attempt_ids = list(stored_member.get("attempt_ids") or [])
             if not attempt_ids and member_id == delivery_id:
                 attempt_ids = [row.attempt_id]
@@ -7835,9 +7845,14 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                                    for aid in attempt_ids])
             seed_notice = bool(notice_id and len(claimed_members) == 1
                                and member_id == delivery_id)
-            matching_rows = [candidate for candidate in matching_rows
-                             if candidate is not None and candidate.status == "done"
-                             and (seed_notice or candidate.metadata.get("delivery_id") == member_id)]
+            if stall_notice:
+                matching_rows = [candidate for candidate in matching_rows
+                    if candidate is not None and candidate.status in {"open", "running"}
+                    and candidate.attempt_id == member_receipt.get("owner_attempt_id")]
+            else:
+                matching_rows = [candidate for candidate in matching_rows
+                    if candidate is not None and candidate.status == "done"
+                    and (seed_notice or candidate.metadata.get("delivery_id") == member_id)]
             if len(matching_rows) != 1:
                 for acquired in claimed_members:
                     pending.release_claim(jobs.parent, storage_recipient,
@@ -7940,6 +7955,20 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                 *[item for member in transfer_members for item in (
                     "--ref", member["duty_id"], "--ref", member["attempt_id"],
                     "--ref", member["delivery_id"]) ]])
+            from dispatch_supervision import notice_is_current
+            for member in transfer_members:
+                receipt = (member["record"].get("receipt") or {})
+                if receipt.get("kind") == "supervision" and receipt.get("reason") == "attempt-stalled":
+                    latest_row = current_attempt_row(jobs, member["attempt_id"],
+                                                     read_context=read_context)
+                    if (not notice_is_current(member["record"]) or latest_row is None
+                            or latest_row.status not in {"open", "running"}
+                            or effective_parent(latest_row.metadata, jobs,
+                                                read_context=read_context) != recipient_sid):
+                        for pending_member in transfer_members:
+                            pending.release_claim(jobs.parent, storage_recipient,
+                                pending_member["delivery_id"], claim_owner=claim_owner)
+                        return
             code = cmd_prompt(args, expected_recipient=(recipient_harness, recipient_sid),
                               on_prepared=bind_transfer, producer_binding=producer_binding)
         current = [pending.read(jobs.parent, storage_recipient, member["delivery_id"])

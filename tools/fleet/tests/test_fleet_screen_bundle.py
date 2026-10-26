@@ -51,6 +51,29 @@ class BundleTest(unittest.TestCase):
         return render._build_lines(sessions, list(jobs), "both", False, 0,
                                    layout=render._layout_mode(width), term_width=width, **kw)
 
+    def test_current_stall_row_is_visible_on_default_board_widths(self):
+        parent = session("stall-parent")
+        parent.liveness = "idle"
+        job = DispatchJob(key="code", slug="stall-worker", cwd=parent.cwd,
+            parent_sid=parent.session_id, is_child=True, depth=2, worker_type="stage",
+            harness="codex", route_id="rt-stall", route_node="execute",
+            attempt_id="att-stall", stage="execute", status="open", liveness="working",
+            stall_observation={"state": "stalled", "observed_at": 700.0,
+                               "last_progress_at": 100.0})
+        for width in (100, 140, 168):
+            with self.subTest(width=width):
+                rows = text(self.build([parent], [job], width))
+                self.assertTrue(any("! stalled" in line or "! check" in line for line in rows), rows)
+                if width in (100, 168):
+                    self.assertTrue(any("! stalled 10m" in line for line in rows), rows)
+                self.assertTrue(all(render._dw(line) <= width for line in rows), rows)
+                job.stall_observation = None
+                recovered = text(self.build([parent], [job], width))
+                self.assertFalse(any("! stalled" in line or "! check" in line
+                                     for line in recovered), recovered)
+                job.stall_observation = {"state": "stalled", "observed_at": 700.0,
+                                         "last_progress_at": 100.0}
+
     def test_mixed_owner_capabilities_share_main_routing_column(self):
         main = session("aa", model="Opus 5.5", effort="xhigh", steward=True)
         main.route_chain = {"visible": True, "nodes": [{"label": "MAINROUTE", "state": "open"},

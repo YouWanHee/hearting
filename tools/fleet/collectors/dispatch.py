@@ -1206,6 +1206,61 @@ def _attempt_terminal_observation(job):
     }
 
 
+def _attempt_stall_attention(job):
+    """Read an exact retained advisory; Fleet never advances its observer."""
+    value = _attempt_state_record(job, "watchdog")
+    stall = value.get("stall_observation") if isinstance(value, dict) else None
+    route_id = getattr(job, "route_id", None) or getattr(job, "owner_route_id", None)
+    route_node = getattr(job, "route_node", None) or ("_owner" if getattr(job, "worker_type", None) == "owner" else None)
+    if (not isinstance(stall, dict) or stall.get("state") not in {"stalled", "unknown"}
+            or stall.get("attempt_id") != getattr(job, "attempt_id", None)
+            or stall.get("route_id") != route_id
+            or stall.get("route_node") != route_node):
+        return None
+    delivery_id = stall.get("delivery_id")
+    digest = stall.get("notice_digest")
+    owner_attempt_id = stall.get("delivery_owner_attempt_id")
+    storage = stall.get("delivery_recipient_thread_id")
+    recipient_digest = stall.get("delivery_recipient_digest")
+    recipient_kind = stall.get("delivery_recipient_kind")
+    registry = Path(getattr(job, "_registry_path", ""))
+    if (not all(isinstance(value, str) and value for value in (
+            delivery_id, digest, owner_attempt_id, storage, recipient_digest, recipient_kind))
+            or not re.fullmatch(r"delivery-[0-9a-f]{64}", delivery_id)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+            or not re.fullmatch(r"[0-9a-f]{64}", recipient_digest)
+            or len(storage) > 512 or any(ord(char) < 32 for char in storage)
+            or not registry.is_absolute()):
+        return None
+    try:
+        import dispatch_pending_delivery as pending
+        record = pending.read(registry.parent, storage, delivery_id)
+        receipt = (record or {}).get("receipt")
+        if (not record or not isinstance(receipt, dict)
+                or record.get("delivery_id") != delivery_id
+                or record.get("receipt_digest") != digest
+                or record.get("recipient_digest") != recipient_digest
+                or recipient_digest != pending.recipient_digest(storage)
+                or record.get("recipient_kind") != recipient_kind
+                or receipt.get("owner_attempt_id") != owner_attempt_id
+                or receipt.get("recipient_thread_id") != storage
+                or receipt.get("pending_delivery_id") != delivery_id
+                or receipt.get("reason") != "attempt-stalled"
+                or job.attempt_id not in (receipt.get("monitored_attempt_ids") or [])):
+            return None
+        import dispatch_supervision
+        if not dispatch_supervision.notice_is_current(record):
+            return None
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        return None
+    result = {key: stall.get(key) for key in (
+        "state", "reason", "attempt_id", "route_id", "route_node",
+        "execution_state", "execution_reason", "last_progress_at", "quiet_windows",
+        "observed_at", "episode_id", "delivery_id", "notice_digest")}
+    result["observed_at"] = time.time()
+    return result
+
+
 def _parent_extinction_rows(paths):
     """Read one bounded registry snapshot for exact parent-proof lookups.
 
@@ -3732,6 +3787,10 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
         job._registered_only = row_is_registered_only(status, meta)
         job._context_execution_started_at = _iso_to_epoch(ts)
         job.attention_reason = _attempt_attention(meta)
+        job.stall_observation = _attempt_stall_attention(job)
+        if job.stall_observation and not job.attention_reason:
+            job.attention_reason = ("attempt-stalled" if job.stall_observation.get("state") == "stalled"
+                                    else "attempt-check")
         job._registry_repo = repo
         job._registry_worktree = cwd
         jobs.append(job)

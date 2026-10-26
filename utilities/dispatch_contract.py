@@ -990,6 +990,15 @@ class ProcessGroupObservation:
 
 
 @dataclass(frozen=True)
+class AttemptExecutionObservation:
+    """Execution-only evidence, kept separate from governed cleanup liveness."""
+
+    state: str  # active / absent / unknown
+    reason: str = ""
+    identities: tuple[tuple[int, str, str], ...] = ()
+
+
+@dataclass(frozen=True)
 class QuiescenceProof:
     """Attempt-bound evidence that both cancellation process sets are empty."""
 
@@ -3638,6 +3647,87 @@ def attempt_tagged_descendants(
     if access_reason:
         return ProcessGroupObservation('unverifiable', (), access_reason)
     return ProcessGroupObservation("empty")
+
+
+_ATTEMPT_RUNTIME_NAMES = {"claude": "claude", "codex": "codex", "opencode": "opencode"}
+_ATTEMPT_INTERPRETERS = {"python", "node", "nodejs", "bun"}
+_ATTEMPT_CARRIER_SCRIPTS = frozenset({
+    "codex-managed-completion.py", "dispatch-attempt-ready.py",
+    "dispatch-orphan-watch.py", "dispatch-progress.py", "dispatch-reap-watch.py",
+    "dispatch-session-sweep.py", "dispatch-owner-rewake.py", "peer-steward.py",
+})
+
+
+def attempt_execution_observation(metadata: dict[str, str]) -> AttemptExecutionObservation:
+    """Separate a surviving dispatch carrier from the attempt's runtime.
+
+    The complete exact attempt tag census remains the authority for absence.
+    Every positive identity is rechecked by PID and start time while its
+    bounded command identity is read. Known carrier scripts count as helpers;
+    an unclassified process, PID reuse, access failure, or partial census is
+    unknown. The result is advisory input only and never narrows cleanup's
+    process set.
+    """
+
+    attempt_id = metadata.get("attempt_id", "")
+    harness = metadata.get("harness", "")
+    if not attempt_id or harness not in _ATTEMPT_RUNTIME_NAMES:
+        return AttemptExecutionObservation("unknown", "attempt-or-harness-unbound")
+    tagged = attempt_tagged_descendants(metadata)
+    if tagged.state == "unverifiable":
+        return AttemptExecutionObservation("unknown", tagged.reason)
+    if tagged.state == "empty":
+        return AttemptExecutionObservation("absent", "attempt-tag-census-empty")
+
+    active = []
+    helpers = []
+    unclassified = []
+    uncertain = tagged.reason
+    for pid, expected_start, _state in tagged.members:
+        if process_start_ticks(pid) != expected_start:
+            uncertain = uncertain or "attempt-process-identity-changed"
+            continue
+        proc = Path("/proc") / str(pid)
+        try:
+            raw = (proc / "cmdline").read_bytes()[:8192]
+            comm = (proc / "comm").read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            uncertain = uncertain or "attempt-process-disappeared-during-observation"
+            continue
+        except OSError as exc:
+            uncertain = uncertain or f"attempt-command-unreadable:{exc.errno or 'error'}"
+            continue
+        if process_start_ticks(pid) != expected_start:
+            uncertain = uncertain or "attempt-process-identity-changed"
+            continue
+        argv = [os.fsdecode(part) for part in raw.rstrip(b"\0").split(b"\0") if part]
+        if not argv:
+            uncertain = uncertain or "attempt-command-empty"
+            continue
+        first = Path(argv[0]).name.lower()
+        is_runtime = first == harness
+        if (not is_runtime and first in _ATTEMPT_INTERPRETERS and len(argv) > 1):
+            is_runtime = Path(argv[1]).name.lower() == harness
+        if is_runtime or comm.lower() == harness:
+            active.append((pid, expected_start, harness))
+            continue
+        script = next((Path(arg).name for arg in argv[1:3]
+                       if Path(arg).name in _ATTEMPT_CARRIER_SCRIPTS), "")
+        if script:
+            helpers.append((pid, expected_start, script))
+            continue
+        unclassified.append((pid, expected_start,
+                             "unclassified:" + (comm or first)[:96]))
+        uncertain = uncertain or "attempt-process-role-unclassified"
+
+    if active:
+        return AttemptExecutionObservation("active", "runtime-command-live", tuple(active))
+    if uncertain:
+        return AttemptExecutionObservation("unknown", uncertain,
+                                           tuple((*helpers, *unclassified)))
+    if helpers:
+        return AttemptExecutionObservation("absent", "carrier-only", tuple(helpers))
+    return AttemptExecutionObservation("unknown", "attempt-execution-unclassified")
 
 
 def _foreground_reap_receipt(metadata: dict[str, str]) -> bool:

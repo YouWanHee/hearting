@@ -302,6 +302,28 @@ completion is `exited`, not workflow success; missing evidence is unknown.
 Large snapshots name their sampled scope, so a bounded display never implies
 that omitted jobs have ended.
 
+Execution presence is an additive observation separate from the governed
+process set used for quiescence, cleanup, and terminal decisions. It may call
+an open attempt absent only when the attempt's exact PID/start identities,
+recorded namespace, helper census, and runtime/command lineage prove that no
+work process remains; a surviving carrier does not prove execution, and an
+incomplete or reused identity remains unknown. The existing watchdog's
+two-window observation (300 seconds per window by default) may likewise create
+an `attempt-stalled` advisory when no comparable tool, declared-file, or result
+progress occurs; the same advisory may identify an exact terminal result whose
+existing route settlement or completion marker remains pending. Normal long
+commands, verification leases, explicit human waits, and uncertain process or
+progress evidence are not declared stalled.
+
+`attempt-stalled` uses the existing supervision receipt, retained duty, and
+carrier path to reach the current effective parent. The exact storage recipient,
+delivery digest, claim, receipt, and ACK identities stay bound to their original
+records. Currentness is rechecked before delivery; queued or accepted is not
+receipt, and ACK is not recovery. This advisory grants no start, retry, signal,
+gate-release, row-close, marker, or cleanup authority. The older `no-progress`
+reason retains its existing resultless-replacement meaning and parent-resume
+behavior.
+
 Dispatch same-work identity gates are opt-in: only `HEARTING_GATES=on`
 enforces sealed-versus-current route, parent, lineage, runtime and review
 bindings. Otherwise `utilities/hearting_gates.py` emits `hearting: gate-off`
