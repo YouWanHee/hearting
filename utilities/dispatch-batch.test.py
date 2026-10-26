@@ -447,7 +447,8 @@ class DispatchBatchTest(unittest.TestCase):
         ]
         return contextlib.ExitStack(), assignments
 
-    def legs(self, assignments=None, prompt=None, parent_attempt="att-parent-fixture"):
+    def legs(self, assignments=None, prompt=None, parent_attempt="att-parent-fixture",
+             producer_generation=None):
         assignments = assignments or self.common_patches()[1]
         legs = []
         for node, adapter, hop, ordinal in assignments:
@@ -466,6 +467,7 @@ class DispatchBatchTest(unittest.TestCase):
                     parent_attempt,
                     adapter,
                     ordinal,
+                    producer_generation=producer_generation,
                 ),
                 "assignment_sha256": "sha256:" + __import__("hashlib").sha256(
                     (BATCH.DEFAULT_PROMPT if prompt is None else prompt).encode("utf-8")
@@ -605,15 +607,125 @@ class DispatchBatchTest(unittest.TestCase):
         }
         return manifest, continuation, partial
 
-    def seal_original_input(self, parent_attempt="att-parent-fixture"):
+    def seal_original_input(self, parent_attempt="att-parent-fixture", *, prompt=None, source_legs=None):
         from dispatch_replacement_batch import seal_launch_input
+        source_legs = source_legs or self.legs(parent_attempt=parent_attempt, prompt=prompt)
         manifest, _continuation, _partial = self.partial_continuation(
-            self.legs(parent_attempt=parent_attempt), parent_attempt=parent_attempt)
+            source_legs, parent_attempt=parent_attempt)
         _checked, digest, _legs = BATCH.verify_manifest(manifest)
         args = SimpleNamespace(continuation=None, route=self.route_path, parallel_group="plan",
-            slug_prefix="fixture", parent="owner", prompt_text=BATCH.DEFAULT_PROMPT,
+            slug_prefix="fixture", parent="owner", prompt_text=prompt or BATCH.DEFAULT_PROMPT,
             qa=None, log_dir=None, allow_degraded_independence=False)
         seal_launch_input(self.jobs, args, self.route, manifest, digest)
+
+    def test_producer_revision_completed_batch_opens_approved_generation(self):
+        token = "rev-" + "a" * 64
+        old_prompt = "first approved correction"
+        next_prompt = "current approved replay-boundary correction"
+        for node in self.route["nodes"]:
+            node["unit"] = "plan/plan-author"
+        self.route_path.write_text(json.dumps(self.route), encoding="utf-8")
+        self.jobs.touch()
+        old_legs = self.legs(prompt=old_prompt)
+        self.seal_original_input(prompt=old_prompt, source_legs=old_legs)
+        for leg in old_legs:
+            self.write_existing(leg, status="done", note="completed-marker", live_identity=False,
+                                all_legs=old_legs)
+
+        output = io.StringIO()
+        created = []
+
+        class FakeProcess:
+            returncode = 0
+            pid = 12001
+
+            def __init__(self, command, **kwargs):
+                self.command = command
+                created.append(self)
+
+            def communicate(self):
+                return success_receipt(self.command), ""
+
+            def poll(self):
+                return 0
+
+        with contextlib.ExitStack() as stack:
+            for name, value in (("load_route", self.route), ("resolve_agent_home", self.base),
+                                ("resolve_global_registry", SimpleNamespace(path=self.jobs)),
+                                ("assign_harnesses", (self.common_patches()[1], "cross-harness", {})),
+                                ("reserve_batch", ["a" * 32, "b" * 32])):
+                stack.enter_context(mock.patch.object(BATCH, name, return_value=value))
+            stack.enter_context(mock.patch.object(BATCH.ROUTE_MODULE, "producer_revision_admission",
+                return_value={"managed": True, "generation": token, "pending": True,
+                              "current_attempt_ids": {}}))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_live_parent_attempt"))
+            stack.enter_context(mock.patch.object(BATCH, "completion_marker_gate"))
+            stack.enter_context(mock.patch.object(BATCH, "cancel_unclaimed"))
+            stack.enter_context(mock.patch.object(BATCH.subprocess, "check_output", return_value=str(self.base)))
+            stack.enter_context(mock.patch.object(BATCH.subprocess, "Popen", side_effect=FakeProcess))
+            stack.enter_context(mock.patch.dict(os.environ, {
+                "AGENT_DISPATCH_SELF_SLUG": "owner", "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture",
+                "AGENT_DISPATCH_CURRENT_HARNESS": "codex", "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
+                "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write"}))
+            with contextlib.redirect_stdout(output):
+                result = BATCH.main(self.argv() + ["--prompt-text", next_prompt])
+
+        self.assertEqual(result, 0, output.getvalue())
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(receipt["newly_started"], 2)
+        new_ids = {leg["attempt_id"] for leg in receipt["legs"]}
+        self.assertTrue(new_ids.isdisjoint(leg["attempt_id"] for leg in old_legs))
+        self.assertEqual(len(created), 2)
+        for leg in receipt["legs"]:
+            expected = BATCH.stable_attempt_id(self.route,
+                next(node for node in self.route["nodes"] if node["id"] == leg["node"]),
+                "changed-display", "changed-owner", "att-parent-fixture",
+                leg["adapter"], leg["ordinal"], producer_generation=token)
+            self.assertEqual(leg["attempt_id"], expected)
+        payloads = list((self.jobs.parent / "automatic-replacements" / "batch-inputs").glob("*.json"))
+        self.assertTrue(any(json.loads(path.read_text())["options"]["prompt_text"] == next_prompt
+                            for path in payloads))
+
+    def test_producer_revision_zero_row_replay_and_unapproved_prompt_drift(self):
+        token = "rev-" + "b" * 64
+        prompt = "approved producer revision input"
+        for node in self.route["nodes"]:
+            node["unit"] = "plan/plan-author"
+        self.route_path.write_text(json.dumps(self.route), encoding="utf-8")
+        self.jobs.touch()
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_SELF_SLUG": "owner"}):
+            legs = self.legs(prompt=prompt, producer_generation=token)
+            self.seal_original_input(prompt=prompt, source_legs=legs)
+            exact = BATCH.unfinished_batch_input(
+                self.jobs, self.route, self.route["nodes"], "plan", "att-parent-fixture",
+                prompt, {}, route_file=self.route_path, producer_managed=True,
+                producer_generation=token, current_attempt_ids={},
+            )
+            self.assertIsNotNone(exact)
+            self.assertEqual({member["attempt_id"] for member in exact["manifest"]["members"]},
+                             {leg["attempt_id"] for leg in legs})
+            self.assertEqual(exact["options"]["prompt_text"], prompt)
+            with self.assertRaises(BATCH.BatchError) as drift:
+                BATCH.unfinished_batch_input(
+                    self.jobs, self.route, self.route["nodes"], "plan", "att-parent-fixture",
+                    "unapproved changed prompt", {}, route_file=self.route_path,
+                    producer_managed=True, producer_generation=token,
+                    current_attempt_ids={},
+                )
+        self.assertEqual(drift.exception.reason, "replacement-batch-source-drift")
+
+    def test_producer_revision_live_unknown_and_unsettled_prior_generations_refuse(self):
+        rows = [(["now", "open", "repo", "cwd", "slug", ""],
+                 {"attempt_id": "att-prior-generation"})]
+        for state, expected in (("live", "prior-attempt-still-live"),
+                                ("unverifiable", "prior-attempt-unverifiable"),
+                                ("quiescent", "round-unsettled")):
+            with self.subTest(state=state), mock.patch.object(
+                    BATCH, "attempt_process_quiescence",
+                    return_value=SimpleNamespace(state=state, reason="fixture-observation")):
+                with self.assertRaises(BATCH.BatchError) as caught:
+                    BATCH._refuse_unfinished_prior_producer_generation(rows, group="plan")
+                self.assertEqual(caught.exception.reason, expected)
 
     def test_sd160_partial_legacy_rows_without_whole_manifest_refuse(self):
         self.write_existing(self.legs()[0])
