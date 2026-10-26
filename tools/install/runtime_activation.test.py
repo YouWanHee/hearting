@@ -2535,15 +2535,20 @@ class NativeAgentRenderTest(unittest.TestCase):
                 report = activation.activate(runtime, "linked", str(REPO_ROOT))
                 self.assertEqual(report["model_config_source"], "user")
                 desired = activation._desired_entries(runtime, "linked", REPO_ROOT, REPO_ROOT, "x", "global")
-                self.assertFalse([e for e in desired if e["kind"] == "render"])
+                # No agent is rendered; OpenCode's V2 plugin entry always is.
+                renders = [e for e in desired if e["kind"] == "render"]
+                self.assertEqual([Path(e["dest"]).relative_to(self.home(runtime)).as_posix() for e in renders],
+                                 ["plugins/hearting-guards/index.ts"] if runtime == "opencode" else [])
                 agents = [e for e in desired if Path(e["dest"]).parent == self.home(runtime) / "agents"]
                 self.assertEqual(len(agents), 5)
                 for entry in agents:
                     dest = Path(entry["dest"])
                     self.assertTrue(dest.is_symlink(), dest)
                     self.assertEqual(dest.resolve(), Path(entry["source"]).resolve())
-                self.assertEqual(report["projection_digest"],
-                                 activation._digest_paths(Path(e["source"]) for e in desired))
+                self.assertEqual(report["projection_digest"], activation._projection_digest(desired))
+                if runtime != "opencode":
+                    self.assertEqual(report["projection_digest"],
+                                     activation._digest_paths(Path(e["source"]) for e in desired))
 
     def test_legacy_user_copy_keeps_balanced_on_activate_and_refresh(self):
         for runtime in ("claude", "codex", "opencode"):
@@ -2579,7 +2584,8 @@ class NativeAgentRenderTest(unittest.TestCase):
             runtime, "linked", REPO_ROOT, REPO_ROOT, activation.source_revision(REPO_ROOT), "global"
         )
         first_render_index = next(
-            index for index, item in enumerate(desired, start=1) if item["kind"] == "render"
+            index for index, item in enumerate(desired, start=1)
+            if item["kind"] == "render" and item["surface"] == "agent"
         )
         with mock.patch.dict(os.environ, {"HARNESS_RUNTIME_FAIL_AFTER": str(first_render_index)}):
             with self.assertRaisesRegex(activation.ActivationError, "injected failure"):
@@ -2592,7 +2598,7 @@ class NativeAgentRenderTest(unittest.TestCase):
         self.write_conf(runtime)
         self.assertEqual(activation.status(runtime)["freshness"], "fresh")
         for item in desired:
-            if item["kind"] == "render":
+            if item["kind"] == "render" and item["surface"] == "agent":
                 destination = Path(item["dest"])
                 self.assertTrue(destination.is_symlink(), destination)
                 self.assertEqual(destination.resolve(), Path(item["source"]).resolve())
