@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Regression tests for installer-owned PATH launchers and the memory store."""
 
+import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from argparse import Namespace
@@ -181,6 +184,166 @@ class LauncherMigrationTest(unittest.TestCase):
         self.assertEqual(removed["fleet2"]["status"], "preserved-foreign")
         self.assertEqual(self._target("fleet-monitor").resolve(), foreign.resolve())
         self.assertEqual(self._target("fleet2").read_text(encoding="utf-8"), "user command\n")
+
+    def _managed_update_fixture(self):
+        data_home = self.root / "xdg-data"
+        state_home = self.root / "xdg-state"
+        data_root = data_home / "hearting"
+        old_root = data_root / "releases" / "v1.0.0"
+        bin_dir = self.home / ".local" / "bin"
+        old_root.mkdir(parents=True)
+        bin_dir.mkdir(parents=True)
+
+        # This pre-fleet release knew only the two older common tool launchers.
+        # The next archive carries the complete launcher inventory.
+        old_inventory = {
+            "mem": "tools/memory/mem.py",
+            "compute-hosts": "utilities/compute-hosts",
+        }
+        for relative in ("tools/install/harness.sh", *old_inventory.values()):
+            source = old_root / relative
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text("#!/bin/sh\n", encoding="utf-8")
+        (data_root / "current").symlink_to(old_root)
+        for name, relative in old_inventory.items():
+            (bin_dir / name).symlink_to(old_root / relative)
+
+        foreign = bin_dir / "user-command"
+        foreign.write_text("user-owned command\n", encoding="utf-8")
+        old_state = {
+            "schema": distribution.STATE_SCHEMA,
+            "repository": distribution.DEFAULT_REPOSITORY,
+            "version": "v1.0.0",
+            "archive_sha256": "a" * 64,
+            "release_root": str(old_root),
+            "runtimes": ["codex"],
+            "channel": "stable",
+        }
+        state_path = state_home / "hearting" / "distribution.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps(old_state), encoding="utf-8")
+        old_state_bytes = state_path.read_bytes()
+
+        package = self.root / "new-release" / "hearting"
+        for relative in distribution.REQUIRED_RELEASE_FILES:
+            path = package / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = (
+                "v2.0.0\n"
+                if relative == "RELEASE_VERSION"
+                else f"new release: {relative}\n"
+            )
+            path.write_text(content, encoding="utf-8")
+        archive = self.root / "hearting-v2.0.0.tar.gz"
+        with tarfile.open(archive, "w:gz") as bundle:
+            bundle.add(package, arcname="hearting")
+        archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        return {
+            "data_home": data_home,
+            "state_home": state_home,
+            "bin_dir": bin_dir,
+            "old_root": old_root,
+            "old_state_bytes": old_state_bytes,
+            "foreign": foreign,
+            "archive": archive,
+            "archive_digest": archive_digest,
+            "old_inventory": old_inventory,
+        }
+
+    def _run_managed_update(self, fixture, *, fail_state_commit=False):
+        env = {
+            "HOME": str(self.home),
+            "XDG_DATA_HOME": str(fixture["data_home"]),
+            "XDG_STATE_HOME": str(fixture["state_home"]),
+            "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
+            "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
+            "CODEX_HOME": str(self.root / "codex"),
+            "HARNESS_BIN_DIR": str(fixture["bin_dir"]),
+            "HEARTING_FIXTURE_ROOT": str(self.root),
+        }
+        release = {
+            "version": "v2.0.0",
+            "assets": {
+                distribution.ARCHIVE_NAME: "https://fixture.invalid/hearting.tar.gz",
+                distribution.CHECKSUM_NAME: "https://fixture.invalid/hearting.tar.gz.sha256",
+            },
+            "metadata_url": "https://fixture.invalid/releases/v2.0.0",
+        }
+        activate_result = {"runtimes": ["codex"], "session_action": {}}
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, env))
+            stack.enter_context(mock.patch.object(
+                distribution, "_release_metadata", return_value=release
+            ))
+            stack.enter_context(mock.patch.object(
+                distribution, "_expected_checksum", return_value=fixture["archive_digest"]
+            ))
+
+            def download(_url, destination, expected):
+                self.assertEqual(expected, fixture["archive_digest"])
+                shutil.copyfile(fixture["archive"], destination)
+
+            stack.enter_context(mock.patch.object(
+                distribution, "_download_archive", side_effect=download
+            ))
+            stack.enter_context(mock.patch.object(
+                distribution, "_migration_m0_preflight", return_value={}
+            ))
+            stack.enter_context(mock.patch.object(
+                distribution, "_activate_release", return_value=activate_result
+            ))
+            stack.enter_context(mock.patch.object(distribution, "_cleanup_releases"))
+            stack.enter_context(mock.patch.object(distribution, "_succeed_dispatch_state", return_value=True))
+            stack.enter_context(mock.patch.object(distribution, "run_dispatch_state_migration"))
+            if fail_state_commit:
+                stack.enter_context(mock.patch.object(
+                    distribution,
+                    "_write_distribution_state",
+                    side_effect=distribution.DistributionError("injected state-write failure"),
+                ))
+            return distribution.update(version="v2.0.0", runtimes=["codex"])
+
+    def test_old_client_update_restores_fleet_launchers_and_preserves_foreign_entry(self):
+        fixture = self._managed_update_fixture()
+        result = self._run_managed_update(fixture)
+
+        self.assertEqual(result["status"], "updated")
+        new_root = Path(result["release_root"])
+        self.assertEqual(new_root.name, "v2.0.0")
+        for name, relative in distribution.TOOL_LAUNCHERS:
+            target = fixture["bin_dir"] / name
+            self.assertTrue(target.is_symlink(), name)
+            self.assertEqual(target.resolve(), new_root / relative, name)
+        for name in ("fleet", "fleet-monitor", "fleet2"):
+            self.assertNotIn(name, fixture["old_inventory"])
+            self.assertTrue((new_root / dict(distribution.TOOL_LAUNCHERS)[name]).is_file())
+        self.assertEqual(
+            fixture["foreign"].read_text(encoding="utf-8"),
+            "user-owned command\n",
+        )
+
+    def test_old_client_update_rolls_back_launchers_after_state_commit_failure(self):
+        fixture = self._managed_update_fixture()
+        with self.assertRaisesRegex(distribution.DistributionError, "injected state-write failure"):
+            self._run_managed_update(fixture, fail_state_commit=True)
+
+        current = fixture["data_home"] / "hearting" / "current"
+        self.assertEqual(current.readlink(), fixture["old_root"])
+        for name, relative in fixture["old_inventory"].items():
+            target = fixture["bin_dir"] / name
+            self.assertTrue(target.is_symlink(), name)
+            self.assertEqual(target.resolve(), fixture["old_root"] / relative, name)
+        for name in ("fleet", "fleet-monitor", "fleet2"):
+            target = fixture["bin_dir"] / name
+            self.assertFalse(target.exists() or target.is_symlink(), name)
+        self.assertEqual(
+            (fixture["state_home"] / "hearting" / "distribution.json").read_bytes(),
+            fixture["old_state_bytes"],
+        )
+        self.assertEqual(
+            fixture["foreign"].read_text(encoding="utf-8"),
+            "user-owned command\n",
+        )
 
 
 class InstallerCollisionExitTest(unittest.TestCase):
