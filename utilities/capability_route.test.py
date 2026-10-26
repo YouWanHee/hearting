@@ -5019,7 +5019,7 @@ class TestValidationBasis(unittest.TestCase):
     sys.modules["hearting_gates"]._REPORTED.clear()
     with mock.patch.dict(os.environ,{"HEARTING_GATES":"off"}), contextlib.redirect_stderr(io.StringIO()) as err:
      verified=R.verify_route(route,R.ROOT)
-    self.assertIn("route-registry-stale",err.getvalue())
+    self.assertEqual(err.getvalue(),"")
     self.assertIs(verified["_registry_current"],False)
  def test_route_without_capability_digest_keeps_whole_registry_comparison(self):
   route=R.compile_route(**self.args())
@@ -5067,16 +5067,24 @@ class TestValidationBasis(unittest.TestCase):
    msg=str(exc)
    self.assertIn(skewed["registry_digest"],msg)
    self.assertIn(R.TOPO.registry_digest(R.TOPO.load_registry()),msg)
-   # SD-OPEN-47 (H7-d): the operator is told which root to re-run through.
-   self.assertIn("re-run via the tooling under /tmp/b2-fixture-other-registry-root",msg)
+   # Report the two roots without prescribing an unverified old runtime.
+   self.assertNotIn("re-run via the tooling",msg)
    self.assertIn("/tmp/b2-fixture-other-registry-root",msg)
    self.assertIn(str(R.TOPO.ROOT),msg)
+  with mock.patch.dict(os.environ,{"HEARTING_GATES":"off"}), contextlib.redirect_stderr(io.StringIO()) as err:
+   verified=R.verify_route(skewed,R.ROOT)
+  self.assertEqual(err.getvalue(),"")
+  self.assertIs(verified["_registry_current"],False)
   skewed=json.loads(json.dumps(route))
   skewed["validation_basis"]["unit_catalog_root"]="/tmp/b2-fixture-other-unit-root"
   skewed["unit_catalog_digest"]="sha256:"+"1"*64
   skewed=self._reseal(skewed)
   with self.assertRaisesRegex(ValueError,r"^unit-catalog-digest-skew\(compiled="):
    R.verify_route(skewed,R.ROOT)
+  with mock.patch.dict(os.environ,{"HEARTING_GATES":"off"}), contextlib.redirect_stderr(io.StringIO()) as err:
+   verified=R.verify_route(skewed,R.ROOT)
+  self.assertEqual(err.getvalue(),"")
+  self.assertIs(verified["_registry_current"],False)
  def test_validation_classifier_does_not_read_immutable_release_content(self):
   route={
    "registry_digest":"sha256:"+"1"*64,
@@ -10939,6 +10947,69 @@ class LegacyDesignBasisVerifyTest(unittest.TestCase):
   self.assertFalse(any("designs/<cycle>" in str(node) for node in route["nodes"]))
   R.verify_route(route,expected_cwd=R.ROOT)
 
+
+
+class ProducerRevisionAdmissionTest(unittest.TestCase):
+ def test_producer_revision_approved_fail_excludes_verdictless_sibling_and_invalid_basis_refuses(self):
+  from types import SimpleNamespace
+  route_id="rt-producer-generation-fixture"
+  route_hash="sha256:"+"c"*64
+  route={"route_id":route_id,"route_hash":route_hash,"nodes":[
+   {"id":"plan","unit":"plan/plan-author","parallel_group":"plan"},
+   {"id":"plan-alternative","unit":"plan/plan-author","parallel_group":"plan"},
+   {"id":"plan-check","kind":"review-worker","worker_type":"review","depends_on":["plan"]},
+   {"id":"plan-check-alternative","kind":"review-worker","worker_type":"review","depends_on":["plan-alternative"]},
+  ]}
+  with tempfile.TemporaryDirectory() as td:
+   baseline=R.producer_revision_admission(route,route["nodes"][:2],Path(td)/"missing/jobs.log")
+   self.assertEqual(baseline["generation"],"1")
+   self.assertFalse(baseline["pending"])
+   jobs=Path(td)/"dispatch/jobs.log"
+   jobs.parent.mkdir(parents=True); jobs.touch()
+   jobs.write_text("".join(
+    f"now\tdone\t{td}\t{td}\t{slug}\troute_id={route_id},route_hash={route_hash},"
+    f"route_node={node},worker_type=review,note={note},attempt_id={attempt}\n"
+    for node,slug,note,attempt in (
+     ("plan-check","primary","completed-review-blocking","att-primary-fail"),
+     ("plan-check-alternative","alternative","serverOverloaded","att-alt-overloaded"),
+    )),encoding="utf-8")
+   directory=R.completion_dir(route_id,jobs=jobs)
+   directory.mkdir(parents=True)
+   old={"schema_version":2,"route_id":route_id,"route_hash":route_hash,
+        "node_id":"plan","sequence":1,"attempt_id":"att-plan-first",
+        "registered_worker":True,"completion_gate":"code-plan",
+        "evidence":{"path":str(Path(td)/"plan.md"),"sha256":"1"*64}}
+   old_bytes=(json.dumps(old,sort_keys=True)+"\n").encode()
+   (directory/"plan.1.json").write_bytes(old_bytes)
+   revision={"of_sequence":1,"of_marker_sha256":hashlib.sha256(old_bytes).hexdigest(),
+     "of_evidence_sha256":"1"*64,"evidence_sha256":"2"*64,
+     "basis":"review-findings","answers":["att-primary-fail"],"direction":None,
+     "reason":None,"author_attempt_id":"att-owner","recorded_by":"owner"}
+   revised={**old,"sequence":2,"stage_authority":"revision",
+            "evidence":{"path":str(Path(td)/"plan.md"),"sha256":"2"*64},
+            "revision":revision}
+   revised_bytes=(json.dumps(revised,sort_keys=True)+"\n").encode()
+   (directory/"plan.2.json").write_bytes(revised_bytes)
+   (directory/"plan.json").write_bytes(revised_bytes)
+   with mock.patch.object(R,"gate_currency",return_value=SimpleNamespace(state="current",reason="")):
+    first=R.producer_revision_admission(route,route["nodes"][:2],jobs)
+    again=R.producer_revision_admission(route,route["nodes"][:2],jobs)
+    self.assertTrue(first["managed"])
+    self.assertTrue(first["pending"])
+    self.assertEqual(first["generation"],again["generation"])
+    self.assertTrue(first["generation"].startswith("rev-"))
+    self.assertEqual(first["basis"][0]["answers"],["att-primary-fail"])
+    self.assertEqual(first["current_attempt_ids"],{})
+   self.assertEqual(R.REVIEW_ROUND_CAP.classify_round_row("done",{
+     "note":"serverOverloaded","worker_type":"review"},worker_type="review"),"verdict-less")
+
+   bad={**revised,"revision":{**revision,"answers":["att-alt-overloaded"]}}
+   bad_bytes=(json.dumps(bad,sort_keys=True)+"\n").encode()
+   (directory/"plan.2.json").write_bytes(bad_bytes)
+   (directory/"plan.json").write_bytes(bad_bytes)
+   with mock.patch.object(R,"gate_currency",return_value=SimpleNamespace(state="current",reason="")), \
+        self.assertRaisesRegex(ValueError,"producer-revision-basis-unverified"):
+    R.producer_revision_admission(route,route["nodes"][:2],jobs)
 
 
 if __name__=="__main__": unittest.main()

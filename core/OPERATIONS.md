@@ -327,7 +327,10 @@ behavior.
 Dispatch same-work identity gates are opt-in: only `HEARTING_GATES=on`
 enforces sealed-versus-current route, parent, lineage, runtime and review
 bindings. Otherwise `utilities/hearting_gates.py` emits `hearting: gate-off`
-and execution uses current inputs. Input/schema errors, missing files, path
+and execution uses current inputs. With gates off, permitted registry or
+unit-catalog drift continues silently with currentness metadata preserved and
+no instruction to run an old release; other identity-gate diagnostics remain
+unchanged. Input/schema errors, missing files, path
 and symlink safety, lock ownership and process-liveness checks remain enforced.
 Historical records are preserved; bypassing identity comparisons does not
 rewrite them or turn a live process into completed work.
@@ -339,6 +342,13 @@ review whose PASS is source-stale or legacy source-unbound, continuation cuts
 the prefix at that review and schedules the ordinary independent review there.
 The old marker remains historical, and legacy source is not inferred from
 `launch_head`.
+
+A verdict-less child may retry under the original owner's verified, launched
+replacement on the same route. Admission reads the existing immutable owner
+replacement chain and both owners' current route bindings; a claim or an
+unlaunched reservation alone does not transfer the child. The retry retains its
+predecessor link, exact route and node, and the existing process-quiescence,
+semantic-result and single-successor checks. No original row or verdict changes.
 
 Completion evidence has two moments. First close proves the current readable
 evidence for the exact route, owner/attempt and terminal claim; an unreadable
@@ -2138,6 +2148,20 @@ wait duration requires measured boundaries. Stagnation uses the same comparable
 counter or metric stream: only a strict increase moves the last actual increase
 anchor; equal fresh samples update freshness, not that anchor. Without a progress
 signal, stagnation and ETA remain unknown.
+
+The normal observer may also accept bounded optional `source_bindings` metadata
+for a separately written raw counter. Each binding proves an exact target run
+and row independently from its writer identity, and names the source path,
+timestamp/counter JSON pointers, comparison eligibility, and bounded exact-value
+proof files. The shared reader revalidates that proof on later polls and after
+reattachment; legacy reader cursors resume through the normal reader. A partial
+listing or time slice remains resumable, while an unrelated sibling change
+leaves a still-valid exact binding intact. The raw name, value, scope, writer,
+target, timestamp, and freshness remain optional source observations. A counter marked
+non-comparable does not supply canonical progress, unit, total, rate, ETA,
+stagnation, or completion. Invalid or stale proof makes only that observation
+unknown. Existing public record, lifecycle, recipient, outbox, and receipt
+authority remain unchanged.
 
 `run` and GPU `resource-runner start` automatically reserve their devices in
 one host-local `gpu-leases.json` beside the canonical dispatch registry. All

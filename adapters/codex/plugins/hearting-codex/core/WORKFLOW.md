@@ -379,9 +379,12 @@ a next leg that could not be prepared is named in `plan_advance` beside it. The
 main session may still change the plan or stop; §0.4 says when a card comes first.
 A replayed `start` of the closed frame route answers for the furthest leg already
 started from its decision, so after the last leg it reports that leg's completion
-and no `next_leg`. A leg's optional `done_when` (sealed as `d1`, `d2`…), `verify`
-and `hands_over`, and the brief whose route the person chose, reach the owner and
-every stage worker of that leg from the sealed decision; a `qa/*` stage records
+and no `next_leg`. A leg's optional `done_when` (sealed as `d1`, `d2`…), `verify`,
+`hands_over` and approved `parallel` slices, and the brief whose route the person
+chose, reach the owner and every stage worker of that leg from the sealed decision.
+The owner may use `parallel` to assign workers or permitted sub-sessions; these
+notes are owner guidance, not route nodes or parallel groups, and a slice without
+a result is unfinished. A `qa/*` stage records
 each item beside its artifact as `<artifact>.items.json` (`leg_items_v1`, read by
 `route_plan.read_leg_items`). A leg may name its existing worktree with optional
 `cwd`; validation, first launch, later legs and the printed compose command use
@@ -832,7 +835,15 @@ owner-closure procedure — and `검증` should say so by that name (SD-153 rule
 SD-134 A75-9).
 
 For dispatched work, the parent follows the runtime's next-action receipt and
-checks the completed artifact before reporting. Normal success needs no harvest.
+reads the completed artifact to accept the results, limits, and remaining duties.
+Reuse valid verification and independent-review results; a stage, person, folder,
+or interruption change alone does not require another audit or suite. Check only
+uncovered integration changes, unresolved failures, or required unknowns. A broad
+rerun needs a concrete broad impact not covered by existing results. Current
+stage judgments still apply to their current subject; an old PASS marker does
+not become current through evidence reuse. When the requested outcome has
+sufficient evidence, advance to the authorized handoff, integration, or closure.
+Normal success needs no harvest.
 A process exit or intermediate stage verdict alone is not task completion.
 Read-only orientation and status replies use concise prose instead.
 

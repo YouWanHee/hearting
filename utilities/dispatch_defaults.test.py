@@ -259,6 +259,10 @@ class DispatchDefaultsV3Tests(unittest.TestCase):
         self.assertEqual(D.validate(config, capmap), [])
         self.assertEqual(D.policy_warnings(config), [])
         self.assertEqual(D.normalize_policy(config), config)
+        self.assertEqual(D.query_owners(config), ["opencode"])
+        for profile in ("deep", "balanced-deep", "balanced", "light", "mini"):
+            with self.subTest(profile=profile):
+                self.assertEqual(D.query_profile_policy(config, profile)["primary"], ["opencode"])
 
     def test_recommendation_findings_are_normalized_not_rejected(self):
         capmap = D.load_topology_capabilities(D.default_topology_path())

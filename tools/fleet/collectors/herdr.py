@@ -257,27 +257,30 @@ def list_agents(runner=subprocess.run, which=shutil.which):
     return [a for a in agents if isinstance(a, dict)]
 
 
-def list_panes(runner=subprocess.run, which=shutil.which, *, wait_timeout=0.0):
-    """``[pane dict, ...]`` from ``herdr pane list``; ``None`` on any failure."""
+def list_panes(runner=subprocess.run, which=shutil.which, *, wait_timeout=0.0,
+               with_observation=False):
+    """Return pane dicts, or their paired observation when ``with_observation`` is set."""
     try:
         observation = _observation_module()
         if runner is subprocess.run and which is shutil.which:
             view = (observation_view(wait_timeout=wait_timeout)
                     if wait_timeout > 0 else observation_view())
             if view is not None:
-                return [dict(pane) for pane in view.panes]
+                panes = [dict(pane) for pane in view.panes]
+                return (panes, view) if with_observation else panes
             if observation.socket_path_for_endpoint():
-                return None
+                return (None, None) if with_observation else None
         census = observation.pane_census(runner=runner, which=which)
-        return list(census.panes) if census is not None else None
+        panes = list(census.panes) if census is not None else None
+        return (panes, None) if with_observation else panes
     except Exception:
-        return None
+        return (None, None) if with_observation else None
 
 
 class PaneEvidence(tuple):
     """Unpackable PID evidence with negative completeness and fresh-pane provenance."""
     def __new__(cls, values, complete=True, errors=(), fresh_shells=None,
-                fresh_foreground=None):
+                fresh_foreground=None, pane_infos=None):
         result = super().__new__(cls, values)
         result.complete, result.errors = complete, tuple(errors)
         shells = result[0] if len(result) > 0 else set()
@@ -287,6 +290,7 @@ class PaneEvidence(tuple):
         result.fresh_foreground = set(
             (foreground if complete else ())
             if fresh_foreground is None else fresh_foreground)
+        result.pane_infos = {str(pane): dict(info) for pane, info in (pane_infos or {}).items()}
         return result
 
 
@@ -300,6 +304,7 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
     shells, fg = set(), set()
     fresh_shells, fresh_fg = set(), set()
     identities = {}
+    pane_infos = {}
     errors = []
     selected = [pane for pane in panes or [] if pane.get("agent")]
 
@@ -356,6 +361,7 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
             if not future.done():
                 raise TimeoutError("process-info deadline")
             info, fresh = future.result()
+            pane_infos[str(pane_id)] = dict(info)
             if info.get("shell_pid"):
                 shell_pid = int(info["shell_pid"])
                 shells.add(shell_pid)
@@ -383,7 +389,7 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None, observation=None)
                                     if len(sids) == 1}),
                         complete=panes is not None and not errors and observation_complete,
                         errors=errors, fresh_shells=fresh_shells,
-                        fresh_foreground=fresh_fg)
+                        fresh_foreground=fresh_fg, pane_infos=pane_infos)
 
 
 def pane_pids(panes, runner=subprocess.run, bindings=None, observation=None):
@@ -394,11 +400,12 @@ def pane_pids(panes, runner=subprocess.run, bindings=None, observation=None):
     return PaneEvidence((shells, fg), complete=getattr(evidence, "complete", True),
                         errors=getattr(evidence, "errors", ()),
                         fresh_shells=getattr(evidence, "fresh_shells", None),
-                        fresh_foreground=getattr(evidence, "fresh_foreground", None))
+                        fresh_foreground=getattr(evidence, "fresh_foreground", None),
+                        pane_infos=getattr(evidence, "pane_infos", None))
 
 
 def codex_pane_sessions(sessions, panes=None, runner=subprocess.run, *, force_current=False,
-                        wait_timeout=0.0):
+                        wait_timeout=0.0, observation=None):
     """Process identities for Codex TUIs currently foreground in herdr panes.
 
     Pane metadata is not thread proof. The live foreground PID's
@@ -421,12 +428,27 @@ def codex_pane_sessions(sessions, panes=None, runner=subprocess.run, *, force_cu
         found = _CODEX_PANE_CACHE["identities"]
     else:
         if panes is None:
-            panes = list_panes(wait_timeout=wait_timeout)
+            observed_panes = getattr(observation, "panes", None)
+            if observed_panes is not None:
+                panes = [dict(pane) for pane in observed_panes]
+            elif runner is subprocess.run:
+                listed = list_panes(wait_timeout=wait_timeout, with_observation=True)
+                if isinstance(listed, tuple) and len(listed) == 2:
+                    panes, pane_observation = listed
+                    if observation is None:
+                        observation = pane_observation
+                else:  # a direct test or adapter wrapper may still provide the legacy list
+                    panes = listed
+            else:
+                panes = list_panes(runner=runner, wait_timeout=wait_timeout)
         cwds = {os.path.realpath(s.cwd or "") for s in targets.values()}
         selected = [p for p in panes or []
                     if p.get("agent") == "codex"
                     and os.path.realpath(p.get("cwd") or "") in cwds]
-        _shells, foreground, _metadata = pane_evidence(selected, runner=runner)
+        pane_bindings = {}
+        evidence = pane_evidence(selected, runner=runner, bindings=pane_bindings,
+                                 observation=observation)
+        _shells, foreground, _metadata = evidence
         utilities = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "utilities"))
         if utilities not in sys.path:
             sys.path.insert(0, utilities)
@@ -436,14 +458,14 @@ def codex_pane_sessions(sessions, panes=None, runner=subprocess.run, *, force_cu
             for pid, session in targets.items():
                 if pid not in foreground or procscan.read_proc_start(pid) != session.proc_start:
                     continue
-                for pane in selected:
-                    pane_id = pane.get("pane_id")
-                    if not pane_id:
-                        continue
-                    sid = current_codex_thread(str(pane_id), pid)
-                    if sid:
-                        found[pid] = sid
-                        break
+                bound_panes = pane_bindings.get(pid, set())
+                if len(bound_panes) != 1:
+                    continue
+                pane_id = next(iter(bound_panes))
+                pane_info = getattr(evidence, "pane_infos", {}).get(str(pane_id))
+                sid = current_codex_thread(str(pane_id), pid, process_info=pane_info)
+                if sid:
+                    found[pid] = sid
         except Exception:
             found = {}
         if runner is subprocess.run:
@@ -612,9 +634,13 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
     bindings = {} if pane_bindings is None else pane_bindings
     if pids is None:
         if panes is None:
-            panes = list_panes()
-        if panes is not None and observation is None:
-            observation = observation_view()
+            listed = list_panes(with_observation=True)
+            if isinstance(listed, tuple) and len(listed) == 2:
+                panes, pane_observation = listed
+                if observation is None:
+                    observation = pane_observation
+            else:
+                panes = listed
         pids = pane_pids(panes, bindings=bindings, observation=observation) if panes is not None else None
     if panes is None:
         _lineage_attachment(sessions, lineage)

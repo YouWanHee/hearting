@@ -697,7 +697,8 @@ def _canonical_jobs():
 def _audit(
     status, adapter, source, configured, explicit, states, *, allocation=None,
     counts=None, rejected=(), fallback=None, reason="none", capacity=None,
-    quality_band=None, relief_promoted=False, capacity_sources=None, top_excluded=(),
+    quality_band=None, relief_promoted=False, capacity_sources=None,
+    capacity_freshness=None, top_excluded=(),
 ):
     lines = [
         f"status={status}", f"adapter={adapter or '-'}", f"selection_source={source}",
@@ -730,6 +731,21 @@ def _audit(
                 # taps | manual | active-limit | unknown:<reason> — says why an
                 # unknown gauge is unknown and how old a reused reading is.
                 lines.append(f"capacity_source.{harness}={capacity_sources[harness]}")
+            detail = (capacity_freshness or {}).get(harness)
+            if (harness == "claude" and capacity_sources
+                    and capacity_sources.get(harness) == "taps"
+                    and isinstance(detail, dict)
+                    and detail.get("basis") == "file-mtime"
+                    and detail.get("observation_time") == "unknown"):
+                age = detail.get("age_seconds")
+                stale_after = detail.get("stale_after_seconds")
+                if (isinstance(age, (int, float)) and not isinstance(age, bool)
+                        and isinstance(stale_after, (int, float)) and not isinstance(stale_after, bool)):
+                    lines.append(
+                        "capacity_freshness.claude="
+                        f"basis:file-mtime;age-seconds:{age:.1f};"
+                        f"stale-after-seconds:{stale_after};observation-time:unknown"
+                    )
     if quality_band:
         lines.append(f"quality_band={quality_band}")
     if top_excluded:
@@ -925,6 +941,7 @@ def main(argv):
         capacity_report = _capacity.capacity_report()
         capacity = capacity_report["scores"]
         capacity_sources = capacity_report["sources"]
+        capacity_freshness = capacity_report.get("freshness") or {}
 
         def automatically_available(harness):
             score = capacity.get(harness)
@@ -984,7 +1001,9 @@ def main(argv):
             print("\n".join(_audit(
                 "unavailable", None, "none", configured, requested, states,
                 allocation=allocation, counts=counts, rejected=rejected,
-                capacity=capacity, relief_promoted=relief_promoted, top_excluded=top_excluded,
+                capacity=capacity, capacity_sources=capacity_sources,
+                capacity_freshness=capacity_freshness,
+                relief_promoted=relief_promoted, top_excluded=top_excluded,
             )))
             if dropped and not configured:
                 # Every candidate was left out for not declaring `top`; say that
@@ -1090,6 +1109,7 @@ def main(argv):
                                       rejected=rejected if source != "explicit" else (),
                                       fallback=selected if source == "eligibility-fallback" else None,
                                       reason=reason, capacity=capacity, capacity_sources=capacity_sources,
+                                      capacity_freshness=capacity_freshness,
                                       quality_band=quality_band,
                                       relief_promoted=relief_promoted, top_excluded=top_excluded)))
             print("check=failed\nreason=wrapper-unavailable\nchild_spawned=0")
@@ -1099,6 +1119,7 @@ def main(argv):
                                   rejected=rejected if source != "explicit" else (),
                                   fallback=selected if source == "eligibility-fallback" else None,
                                   reason=reason, capacity=capacity, capacity_sources=capacity_sources,
+                                  capacity_freshness=capacity_freshness,
                                   quality_band=quality_band,
                                   relief_promoted=relief_promoted, top_excluded=top_excluded)), flush=True)
         if pair_model_reason != "not-applicable":

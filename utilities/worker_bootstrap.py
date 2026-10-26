@@ -770,7 +770,8 @@ def plan_leg_prompt(route, node_id=None, primary_report=None) -> str:
     for row in (plan or {}).get("handed_over") or []:
         lines.append(f"Handed over by leg {row['leg']}: " + "; ".join(row["items"]))
     if leg.get("parallel"):
-        lines.append("Parallel slices the plan suggests: " + "; ".join(leg["parallel"]))
+        lines.append("Approved slices: use these when assigning workers or permitted sub-sessions; "
+                     "report slices without results as unfinished: " + "; ".join(leg["parallel"]))
     added = {(n.get("plan_stage") or {}).get("id"): n["id"] for n in route.get("nodes") or [] if n.get("plan_stage")}
     for stage in leg.get("extra_stages") or []:
         if stage["id"] in added:
@@ -899,8 +900,17 @@ def assignment_prompt(args, task: str, environ) -> str:
     if getattr(args, "worker_type", None) != "frame":
         route_file = getattr(args, "route_file", None)
         if not route_file:
+            plan_prompt = ""
+            binding = getattr(args, "owner_route_binding", None)
+            bound_route_file = getattr(binding, "route_file", None)
+            if getattr(args, "worker_type", None) == "owner" and bound_route_file:
+                try:
+                    route = json.loads(Path(bound_route_file).read_text(encoding="utf-8"))
+                    plan_prompt = plan_leg_prompt(route)
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    pass
             return (f"Assignment:\n{task.rstrip()}\n\n{completion_scope_prompt()}"
-                    f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}")
+                    f"{plan_prompt}{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}")
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
         source_worktree = _linked_slice_source_worktree(args, route)
         scope_environment = _child_scope_environment(args, route, environ, source_worktree)

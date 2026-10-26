@@ -239,6 +239,7 @@ def _parse_pipe_meta_uncached(pipe):
 _parse_pipe_meta_cached = functools.lru_cache(maxsize=8192)(_parse_pipe_meta_uncached)
 
 _PARSED_REGISTRY_ROWS = OrderedDict()
+_PARSED_REGISTRY_INDEXES = OrderedDict()
 _PARSED_REGISTRY_LINE_COUNTS = {}
 _PARSED_REGISTRY_SEGMENTS = {}
 _PARSED_REGISTRY_DIAGNOSTICS = OrderedDict()
@@ -368,6 +369,7 @@ def _remember_parsed_registry_rows(path, generation, rows, complete_count,
     _PARSED_REGISTRY_ROWS.move_to_end(key)
     while len(_PARSED_REGISTRY_ROWS) > _PARSED_REGISTRY_ROWS_LIMIT:
         evicted, _value = _PARSED_REGISTRY_ROWS.popitem(last=False)
+        _PARSED_REGISTRY_INDEXES.pop(evicted, None)
         _PARSED_REGISTRY_LINE_COUNTS.pop(evicted, None)
         _PARSED_REGISTRY_SEGMENTS.pop(evicted, None)
     _remember_registry_diagnostics(path, generation, None, malformed)
@@ -434,6 +436,52 @@ def _index_registry_rows_by_attempt(rows):
     for row in rows:
         indexed.setdefault(row["meta"].get("attempt_id"), row)
     return indexed
+
+
+def _registry_derived_index(path, rows):
+    """Reuse immutable row indexes only while their parsed generation is retained."""
+    absolute = os.path.abspath(os.fspath(path))
+    key = next((candidate for candidate in reversed(_PARSED_REGISTRY_ROWS)
+                if candidate[0] == absolute and _PARSED_REGISTRY_ROWS[candidate] is rows), None)
+    if key is None:
+        return _build_registry_derived_index(rows)
+    cached = _PARSED_REGISTRY_INDEXES.get(key)
+    if cached is not None:
+        _PARSED_REGISTRY_INDEXES.move_to_end(key)
+        return cached
+    index = _build_registry_derived_index(rows)
+    _PARSED_REGISTRY_INDEXES[key] = index
+    _PARSED_REGISTRY_INDEXES.move_to_end(key)
+    while len(_PARSED_REGISTRY_INDEXES) > _PARSED_REGISTRY_ROWS_LIMIT:
+        _PARSED_REGISTRY_INDEXES.popitem(last=False)
+    return index
+
+
+def _build_registry_derived_index(rows):
+    """Build lookup views without changing the parser's row order or duplicate rules."""
+    latest_jobs = {}
+    job_order = []
+    all_by_attempt = {}
+    latest_by_attempt = {}
+    for registry_order, fields, metadata in rows:
+        attempt_id = metadata.get("attempt_id")
+        if attempt_id:
+            all_by_attempt.setdefault(attempt_id, []).append((fields, metadata))
+            latest_by_attempt[attempt_id] = (registry_order, fields, metadata)
+        if not "\t".join(fields).strip():
+            continue
+        slug = fields[4]
+        key = attempt_id or slug
+        if key not in latest_jobs:
+            job_order.append(key)
+        latest_jobs[key] = (registry_order, fields, metadata)
+    return MappingProxyType({
+        "job_order": tuple(job_order),
+        "latest_jobs": MappingProxyType(latest_jobs),
+        "all_by_attempt": MappingProxyType(
+            {attempt: tuple(items) for attempt, items in all_by_attempt.items()}),
+        "latest_by_attempt": MappingProxyType(latest_by_attempt),
+    })
 
 
 def _parse_registry_view(path, view, generation):
@@ -543,6 +591,7 @@ def parsed_registry_rows(path):
             path, generation, None, prefix_malformed + suffix_malformed)
         while len(_PARSED_REGISTRY_ROWS) > _PARSED_REGISTRY_ROWS_LIMIT:
             evicted, _value = _PARSED_REGISTRY_ROWS.popitem(last=False)
+            _PARSED_REGISTRY_INDEXES.pop(evicted, None)
             _PARSED_REGISTRY_LINE_COUNTS.pop(evicted, None)
             _PARSED_REGISTRY_SEGMENTS.pop(evicted, None)
             _PARSED_REGISTRY_DIAGNOSTICS.pop(evicted, None)
@@ -1270,18 +1319,13 @@ def _parent_extinction_rows(paths):
     """
     rows = {}
     for path in paths:
-        per_path = {}
         try:
             parsed = parsed_registry_rows(path)
         except OSError:
             continue
-        for _order, fields, parsed_meta in parsed:
-            meta = dict(parsed_meta)
-            attempt_id = meta.get("attempt_id")
-            if attempt_id:
-                per_path.setdefault(attempt_id, []).append((fields, meta))
+        per_path = _registry_derived_index(path, parsed)["all_by_attempt"]
         for attempt_id, evidence in per_path.items():
-            rows.setdefault(attempt_id, evidence)
+            rows.setdefault(attempt_id, tuple((fields, dict(meta)) for fields, meta in evidence))
     return tuple(item for evidence in rows.values() for item in evidence)
 
 
@@ -3199,6 +3243,7 @@ def _scan_registry_evidence(paths):
         path_result = {}
         path_attempts = {}
         rows = parsed_registry_rows(path)
+        derived = _registry_derived_index(path, rows)
         for registry_order, fields, parsed_meta in rows:
             # Parsed metadata is immutable and every consumer below is read-only.
             # Avoid copying every key/value in the large registry for this pass.
@@ -3210,22 +3255,7 @@ def _scan_registry_evidence(paths):
             if not attempt_id and (not route_id or not route_node):
                 continue
             attempt_contract = _attempt_contract(meta)
-            harness = None
-            if attempt_id:
-                # Latest row for this exact attempt wins inside one registry, even if
-                # the later row is non-terminal. This prevents an earlier terminal row
-                # from hiding a subsequently reopened/malformed attempt.
-                harness = _infer_harness(meta, slug)
-                path_attempts[attempt_id] = {
-                    "attempt_id": attempt_id,
-                    "status": status,
-                    "route_id": route_id,
-                    "route_node": route_node,
-                    "harness": harness,
-                    "slug": slug,
-                    "registry_order": registry_order,
-                    **attempt_contract,
-                }
+            harness = _infer_harness(meta, slug) if attempt_id else None
             if not route_id or not route_node:
                 continue
             pid_s = meta.get("pid")
@@ -3287,6 +3317,19 @@ def _scan_registry_evidence(paths):
                 "completion_gate": meta.get("completion_gate"),
                 "note": meta.get("note"),
             })
+        for attempt_id, (registry_order, fields, meta) in derived["latest_by_attempt"].items():
+            _ts, status, _repo, _worktree, slug, _pipe = fields
+            attempt_contract = _attempt_contract(meta)
+            path_attempts[attempt_id] = {
+                "attempt_id": attempt_id,
+                "status": status,
+                "route_id": meta.get("route_id"),
+                "route_node": meta.get("route_node"),
+                "harness": _infer_harness(meta, slug),
+                "slug": slug,
+                "registry_order": registry_order,
+                **attempt_contract,
+            }
         # Candidate paths are precedence-ordered (canonical first). Preserve
         # last-occurrence-wins inside each file, but never let a later legacy
         # registry overwrite canonical terminal evidence or attempt identity.
@@ -3546,18 +3589,15 @@ def _validated_split_registry_paths(canonical_paths, observed=None, session_rows
         real = os.path.realpath(raw_path)
         if real in canonical or not _registry_file(raw_path):
             continue
-        latest = {}
         parsed = parsed_registry_rows(raw_path)
         error, _malformed = _registry_diagnostics(raw_path)
         if isinstance(error, FileNotFoundError):
             continue
         if error is not None:
             raise error
-        for _order, _fields, parsed_meta in parsed:
-            meta = dict(parsed_meta)
-            attempt = meta.get("attempt_id")
-            if attempt in attempts:
-                latest[attempt] = meta
+        derived = _registry_derived_index(raw_path, parsed)
+        latest = {attempt: meta for attempt, (_order, _fields, meta)
+                  in derived["latest_by_attempt"].items() if attempt in attempts}
         matched = {attempt for attempt, meta in latest.items()
                    if (meta.get("parent_sid") or meta.get("parent_session_id")) in parent_ids}
         if matched:
@@ -3599,29 +3639,22 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
     # zombie forever at its running timestamp. A slug appears running→done chronologically
     # (append order), so last-occurrence wins. (Bug: an `open/running`-first filter let a later
     # `done` never cancel the running row — 290h phantom jobs. User report 2026-07-01.)
-    latest = {}
-    order = []
-    for registry_order, fields, parsed_meta in rows:
-        if not "\t".join(fields).strip():
+    # F-97e (2026-09-02): identity is the ATTEMPT, not the slug. An owner and its
+    # dispatch-depth-2 children share one jobs.log slug, so slug-keyed latest-wins
+    # DESTROYED the open depth-1 owner row before any liveness or render logic ran
+    # (measured: rows 331/335/338/339/341 of jobs.log, owner att-c981df61 vanished).
+    # The 290h phantom fix above needs last-occurrence-wins WITHIN one job, which
+    # attempt_id satisfies exactly: it is stable across a job's running→done rows and
+    # distinct between jobs. Rows predating attempt_id fall back to the slug, so their
+    # behaviour is byte-identical.
+    derived = _registry_derived_index(path, rows)
+    latest = derived["latest_jobs"]
+    for key in derived["job_order"]:
+        registry_order, fields, parsed_meta = latest[key]
+        if (allowed_attempt_ids is not None
+                and parsed_meta.get("attempt_id") not in allowed_attempt_ids):
             continue
-        row_meta = dict(parsed_meta)
-        slug = fields[4]
-        if allowed_attempt_ids is not None and row_meta.get("attempt_id") not in allowed_attempt_ids:
-            continue
-        # F-97e (2026-09-02): identity is the ATTEMPT, not the slug. An owner and its
-        # dispatch-depth-2 children share one jobs.log slug, so slug-keyed latest-wins
-        # DESTROYED the open depth-1 owner row before any liveness or render logic ran
-        # (measured: rows 331/335/338/339/341 of jobs.log, owner att-c981df61 vanished).
-        # The 290h phantom fix above needs last-occurrence-wins WITHIN one job, which
-        # attempt_id satisfies exactly: it is stable across a job's running→done rows and
-        # distinct between jobs. Rows predating attempt_id fall back to the slug, so their
-        # behaviour is byte-identical.
-        key = row_meta.get("attempt_id") or slug
-        if key not in latest:
-            order.append(key)
-        latest[key] = (registry_order, fields, row_meta)
-    for key in order:
-        registry_order, fields, meta = latest[key]
+        meta = dict(parsed_meta)
         ts, status, repo, worktree, slug, pipe = fields
         row_age_min = _iso_elapsed_min(ts)
         afterglow = False
