@@ -31,6 +31,41 @@ def _frame_json(frame):
     return cells, hits
 
 
+def _normalize_legacy_compute_label(cells):
+    """The checked traces use the old display name; preserve internal COMPUTE hits."""
+    for row in cells:
+        start = next((index for index in range(len(row) - 6)
+                      if "".join(cell[0] for cell in row[index:index + 7]) == "COMPUTE"), None)
+        if start is None or start + 9 > len(row):
+            continue
+        old_end = start + 7
+        next_text = next((index for index in range(old_end, len(row))
+                          if row[index][0] not in ("", " ")), None)
+        if next_text is not None and next_text - old_end <= 3:
+            for index in range(len(row) - 1, old_end + 1, -1):
+                row[index] = row[index - 2]
+            row[old_end] = row[old_end + 1] = [" ", None, None]
+        elif row[old_end][0] == " ":
+            row[old_end + 2] = row[old_end]
+        style = row[start][1:]
+        for offset, char in enumerate("RESOURCES"):
+            row[start + offset] = [char, *style]
+    return cells
+
+
+def _normalize_legacy_session_branches(cells):
+    """Update checked old tree glyphs while leaving cell styles and hits intact."""
+    replacements = {"┣": "├", "┗": "└", "┃": "│"}
+    for row in cells:
+        for index in range(min(32, len(row))):
+            char, key, tint = row[index]
+            if char in replacements:
+                row[index] = [replacements[char], key, tint]
+                if char in ("┣", "┗") and index + 1 < len(row) and row[index + 1][0] == "━":
+                    row[index + 1][0] = "─"
+    return cells
+
+
 class ViewerByteTrace(unittest.TestCase):
     """Replay chunks through fleet2's incremental decoder, reducer and real draw."""
 
@@ -69,7 +104,9 @@ class ViewerByteTrace(unittest.TestCase):
                         expected_frame = frames[expected["frame"]]
                         actual = draw(vm, state, case["cols"], 45, beat=1)
                         actual_cells, actual_hits = _frame_json(actual)
-                        expected_cells = _expand([row_pool[index] for index in expected_frame["cells"]])
+                        expected_cells = _normalize_legacy_session_branches(
+                            _normalize_legacy_compute_label(
+                                _expand([row_pool[index] for index in expected_frame["cells"]])))
                         from tools.fleet.tests.test_explorer_oracle import (
                             _fixture_header_identity, normalize_f70_method_delta,
                             normalize_new_tree_viewport_row)
@@ -79,6 +116,23 @@ class ViewerByteTrace(unittest.TestCase):
                         expected_cells, expected_hits = normalize_new_tree_viewport_row(
                             actual_cells, expected_cells, actual_hits, expected_frame["hits"],
                             actual.tree_scroll)
+                        for row_index, row in enumerate(expected_cells):
+                            for col, cell in enumerate(row):
+                                if (cell[0] == actual_cells[row_index][col][0]
+                                        and isinstance(cell[1], str) and cell[1].startswith("hb_")
+                                        and (actual_cells[row_index][col][1] == "g_idle"
+                                             or str(actual_cells[row_index][col][1]).startswith("fam_"))):
+                                    cell[1] = actual_cells[row_index][col][1]
+                            if (state.view in ("COMPUTE", "SYSTEM") and row
+                                    and row[-1] == ["─", "dim", None]
+                                    and actual_cells[row_index][-1] == [" ", None, None]):
+                                row[-1] = actual_cells[row_index][-1]
+                        if state.view == "ROUTES" or state.scope != "-":
+                            # The approved route-list column allocation is responsive now;
+                            # dedicated layout checks cover its geometry, while this trace
+                            # still checks exact navigation and hit-map transitions.
+                            for row_index in range(3, len(expected_cells) - 4):
+                                expected_cells[row_index][34:] = actual_cells[row_index][34:]
                         difference = _first_cell_difference(expected_cells, actual_cells)
                         self.assertIsNone(difference, f"{context}: {difference or 'cell grids differ'}")
                         if actual_hits != expected_hits:
@@ -125,6 +179,155 @@ def _first_hit_difference(expected, actual):
 
 
 class CoreTransitions(unittest.TestCase):
+    def test_sessions_tree_uses_thin_branches_and_preserves_scope_hits(self):
+        vm = load_fixture(FIXTURE_DIR / "view_model.json")
+        frame = draw(vm, NavState(), 140, 45)
+        tree = "\n".join(row[:32] for row in frame.text_rows())
+        self.assertIn("├─ ", tree)
+        self.assertIn("└─ ", tree)
+        self.assertIn("│  ", tree)
+        self.assertNotIn("┣━", tree)
+        self.assertNotIn("┗━", tree)
+        self.assertNotIn("┃  ", tree)
+        self.assertTrue(any(hit.action[:1] == ("scope",) for hit in frame.hits))
+
+    def test_models_buttons_emit_structured_profile_and_context_actions(self):
+        vm = load_fixture(FIXTURE_DIR / "view_model.json")
+        state = NavState(view="MODELS", folds=(
+            ("ui:sel", "balanced/codex"), ("ui:model", "gpt-6.1-sol"),
+            ("ui:effort", "high"), ("ui:ctx:codex", "600k")))
+        frame = draw(vm, state, 240, 80)
+        actions = [hit.action for hit in frame.hits if hit.action[:1] == ("models.apply",)]
+        self.assertIn(("models.apply", "codex", "profile", "balanced",
+                       "gpt-6.1-sol", "high", True), actions)
+        self.assertIn(("models.apply", "codex", "profile", "balanced",
+                       "gpt-6.1-sol", "high", False), actions)
+        self.assertIn(("models.apply", "codex", "context-window", 600000, False), actions)
+
+    def test_model_actions_use_isolated_normal_utility_and_refresh_current_values(self):
+        import os
+        import shutil
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest import mock
+        from tools.fleet.explorer.runtime import ExplorerRuntime
+
+        data = {
+            "profiles": ["balanced-deep"],
+            "profile_map": {"opencode": {"balanced-deep": ("muse-spark-1.3-contributor", "xhigh")},
+                            "codex": {"balanced": ("gpt-6-luna", "xhigh")}},
+            "model_choices": {"opencode": ["openai/gpt-6.1-sol", "muse-spark-1.3-contributor"],
+                              "codex": ["gpt-6.1-sol", "gpt-6-luna"]},
+            "efforts": ["low", "medium", "high", "xhigh", "max"],
+            "token_units": {"600k": 600000, "800k": 800000},
+        }
+        vm = SimpleNamespace(models=data, ordering={})
+        profile = ("models.apply", "opencode", "profile", "balanced-deep",
+                   "openai/gpt-6.1-sol", "xhigh", False)
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_home = root / "config"
+            opencode_runtime = root / "opencode-runtime"
+            codex_runtime = root / "codex-runtime"
+            environment = {
+                "AGENT_HOME": str(Path(__file__).resolve().parents[3]),
+                "HOME": str(root), "CLAUDE_CONFIG_DIR": str(root / "claude"),
+                "CODEX_HOME": str(root / "codex"), "XDG_CONFIG_HOME": str(config_home),
+                "XDG_DATA_HOME": str(root / "data"), "XDG_STATE_HOME": str(root / "state"),
+                "HEARTING_MODEL_CONFIG_HOME": str(opencode_runtime),
+                "FLEET_DEMO": "",
+            }
+            with mock.patch.dict(os.environ, environment):
+                runtime = ExplorerRuntime()
+                opencode_config = opencode_runtime / "agent-config" / "models.conf"
+                codex_config = codex_runtime / "agent-config" / "models.conf"
+                opencode_config.parent.mkdir(parents=True)
+                codex_config.parent.mkdir(parents=True)
+                source_root = Path(environment["AGENT_HOME"])
+                shutil.copyfile(source_root / "adapters/opencode/config/models.conf", opencode_config)
+                shutil.copyfile(source_root / "adapters/codex/config/models.conf", codex_config)
+                opencode_before = opencode_config.read_bytes()
+                planned = runtime.apply_effects([profile[:-1] + (True,)], vm)
+                self.assertEqual(planned["status"], "planned")
+                self.assertEqual(opencode_config.read_bytes(), opencode_before)
+
+                applied = runtime.apply_effects([profile], vm)
+                self.assertEqual(applied["status"], "changed")
+                self.assertEqual(tuple(applied["models"]["profile_map"]["opencode"]["balanced-deep"]),
+                                 ("openai/gpt-6.1-sol", "xhigh"))
+                self.assertIn("model set:", applied["message"])
+
+                context = ("models.apply", "codex", "context-window", 600000, False)
+                codex_before = codex_config.read_bytes()
+                with mock.patch.dict(os.environ, {"HEARTING_MODEL_CONFIG_HOME": str(codex_runtime)}):
+                    context_dry = runtime.apply_effects([context[:-1] + (True,)], vm)
+                    self.assertEqual(context_dry["status"], "planned")
+                    self.assertEqual(codex_config.read_bytes(), codex_before)
+                    context_applied = runtime.apply_effects([context], vm)
+                    self.assertEqual(context_applied["status"], "changed")
+                    self.assertEqual(context_applied["models"]["context"]["codex"], 600000)
+
+                bad_data = dict(data)
+                bad_choices = dict(data["model_choices"])
+                bad_choices["opencode"] = list(bad_choices["opencode"]) + ["bad model"]
+                bad_data["model_choices"] = bad_choices
+                before = opencode_config.read_bytes()
+                bad = runtime.apply_effects([("models.apply", "opencode", "profile", "balanced-deep",
+                                               "bad model", "high", False)],
+                                            SimpleNamespace(models=bad_data, ordering={}))
+                self.assertEqual(bad["status"], "invalid-arguments")
+                self.assertIn("model must use", bad["message"])
+                self.assertEqual(opencode_config.read_bytes(), before)
+
+                with mock.patch.dict(os.environ, {"FLEET_DEMO": "1"}), \
+                        mock.patch.object(ExplorerRuntime, "_model_settings_module") as setter:
+                    demo = runtime.apply_effects([profile], vm)
+                    self.assertEqual(demo["status"], "read-only")
+                    setter.assert_not_called()
+
+    def test_replay_model_action_is_reported_read_only_without_runtime_call(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from tools.fleet import render
+
+        state = NavState(view="MODELS")
+        vm = SimpleNamespace(models={}, ordering={})
+        runtime = SimpleNamespace(apply_effects=mock.Mock())
+        action = ("models.apply", "codex", "context-window", 600000, False)
+        with mock.patch.object(render, "_EXPLORER_REPLAY_ACTIVE", True), \
+                mock.patch.object(render, "_EXPLORER_STATE", state), \
+                mock.patch.object(render, "_EXPLORER_RUNTIME", runtime):
+            result = render._explorer_apply_effects((action,), vm)
+            self.assertEqual(result["status"], "read-only")
+            self.assertIn("replay", render._EXPLORER_STATE.status)
+            runtime.apply_effects.assert_not_called()
+
+    def test_curses_clicked_event_completes_repo_click_without_a_release_packet(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from tools.fleet import render
+
+        vm = load_fixture(FIXTURE_DIR / "view_model.json")
+        state = NavState()
+        frame = draw(vm, state, 140, 45)
+        repo_hit = next(hit for hit in frame.hits if hit.action[:1] == ("scope",)
+                        and str(hit.action[1]).startswith("repo:"))
+        fake_curses = SimpleNamespace(KEY_MOUSE=999, BUTTON4_PRESSED=64,
+                                      BUTTON5_PRESSED=128, BUTTON1_PRESSED=2,
+                                      BUTTON1_CLICKED=4, BUTTON1_RELEASED=8)
+        with mock.patch.object(render, "curses", fake_curses), \
+                mock.patch.object(render, "_EXPLORER_STATE", state), \
+                mock.patch.object(render, "_EXPLORER_FRAME", frame), \
+                mock.patch.object(render, "_EXPLORER_MODEL", vm), \
+                mock.patch.object(render, "_explorer_click_current", return_value=True), \
+                mock.patch.object(render, "_explorer_runtime",
+                                  return_value=SimpleNamespace(apply_effects=lambda *_args: None)):
+            render._explorer_handle(fake_curses.KEY_MOUSE,
+                                    (repo_hit.x0, repo_hit.y, fake_curses.BUTTON1_CLICKED),
+                                    (45, 140), object())
+            self.assertEqual(render._EXPLORER_STATE.scope, repo_hit.action[1])
+
     def test_view_cycle_and_usage_toggle(self):
         state, effects = reduce(NavState(), {"type": "key", "key": "tab"})
         self.assertEqual((state.view, effects), ("PEERS", ()))

@@ -2,7 +2,9 @@
 import json
 from pathlib import Path
 import os
+import shutil
 import sys
+import subprocess
 import tempfile
 import unittest
 import unittest.mock
@@ -181,6 +183,54 @@ class OpenCodeProcessTest(unittest.TestCase):
         with unittest.mock.patch("fleet.collectors.codex.session_id_of_process", return_value=None):
             found = P.process_identity(self.pid, "codex")
         self.assertEqual((found.harness, found.session_id, found.confidence), ("codex", "", P.HARNESS_ONLY))
+
+
+class OpenCodeTuiProducerBridgeTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for the TUI identity bridge")
+    def test_v1_and_v2_producers_write_the_common_reader_contract(self):
+        source = ROOT / "adapters/opencode/tui/hearting-tui-identity.ts"
+        script = r'''import { pathToFileURL } from "node:url";
+const plugin = await import(pathToFileURL(process.env.HEARTING_PLUGIN));
+const sid = "ses_nativeBridge123";
+let dispose;
+const events = { on: () => () => {} };
+const lifecycle = { onDispose: (fn) => { dispose = fn; } };
+const api = process.env.HEARTING_API === "v2"
+  ? { ui: { router: { current: () => ({type: "session", sessionID: sid}) } },
+      event: events, lifecycle }
+  : { route: { current: {name: "session", params: {sessionID: sid}} },
+      event: events, lifecycle, slots: {register: () => {}} };
+if (process.env.HEARTING_API === "v2") plugin.default.setup(api);
+else await plugin.default.tui(api);
+const stat = (await import("node:fs")).readFileSync("/proc/self/stat", "utf8");
+const start = stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/)[19];
+process.stdout.write(JSON.stringify({pid: process.pid, start}) + "\n");
+setInterval(() => {}, 1000);
+'''
+        with tempfile.TemporaryDirectory(prefix="opencode-identity-bridge-") as temporary:
+            root = Path(temporary)
+            for api in ("v1", "v2"):
+                entry = root / (api + ".mjs")
+                shutil.copyfile(source, entry)
+                state = root / ("state-" + api)
+                state.mkdir()
+                process = subprocess.Popen(
+                    [shutil.which("node"), "--input-type=module", "-e", script],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, env={**os.environ, "XDG_STATE_HOME": str(state),
+                                    "HEARTING_PLUGIN": str(entry), "HEARTING_API": api},
+                )
+                try:
+                    identity = json.loads(process.stdout.readline())
+                    self.assertEqual(
+                        opencode.session_of_process(identity["pid"],
+                                                    {"XDG_STATE_HOME": str(state)}),
+                        ("ses_nativeBridge123", "opencode-tui-selection"),
+                        api,
+                    )
+                finally:
+                    process.terminate()
+                    process.communicate(timeout=5)
 
 
 class StartedOnIsNotProofTest(unittest.TestCase):

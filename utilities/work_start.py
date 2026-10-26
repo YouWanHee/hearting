@@ -1938,7 +1938,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             timeout=_wait_budget(result) if wait else 0, recover=True, observe_only=not wait)
         result["observation"] = joined
         from dispatch_replacement import advance_batch
-        effective, lineage, attention = advance_batch(jobs, attempts, run=run)
+        # Match explicit owner start; existing capacity checks still guard launch.
+        effective, lineage, attention = advance_batch(jobs, attempts, run=run, resume_capacity=True)
         if lineage and effective != attempts:
             result["replacement_lineage"] = lineage
             return _advance(route, path, jobs, result, wait=wait and _wait_budget(result) > 0, interview=interview,

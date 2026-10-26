@@ -61,7 +61,12 @@ def _model_cell(grid, x, y, harness, value, shown, effort_keys, room, limit=None
         return _write(grid, x, y, "— not set", "dim", limit=edge)
     model, effort = (tuple(value) + (None, None))[:2]
     name = shown.get(str(model), model)
-    cursor = _write(grid, x, y, clip_cells(str(name), room - 9), "hb_" + harness, limit=limit)
+    try:
+        from .. import render
+        model_key = render._model_key(model)
+    except Exception:
+        model_key = "fam_other"
+    cursor = _write(grid, x, y, clip_cells(str(name), room - 9), model_key, limit=limit)
     cursor = _write(grid, cursor, y, " · ", "dim", limit=limit)
     return _write(grid, cursor, y, effort or "·", effort_keys.get(effort, "dim"), limit=edge)
 
@@ -92,6 +97,8 @@ def _draw_context(grid, data, state, x, y, width):
     cmds, warnings = [], []
     for harness in ("claude", "codex", "opencode"):
         selected = state.fold_map().get("ui:ctx:" + harness)
+        if selected not in units:
+            selected = None
         window = units.get(selected, context.get(harness))
         grid.put(x + 1, y, harness, "hb_" + harness)
         cutoff1, cutoff2 = ((t1 or 0) / 1e6, (t2 or 0) / 1e6)
@@ -115,7 +122,9 @@ def _draw_context(grid, data, state, x, y, width):
         if source_text:
             grid.put(chip_end + 1, y, clip_cells(source_text, x + width - chip_end - 2), "dim", limit=right)
         if selected:
-            cmds.append(f"hearting model set {harness} context-window {units.get(selected, 0)}")
+            amount = units[selected]
+            cmds.append((harness, amount,
+                         f"hearting model set {harness} context-window {amount}"))
         if window is not None and t2 is not None and t2 >= window:
             warnings.append(harness)
         y += 2
@@ -127,15 +136,16 @@ def _draw_context(grid, data, state, x, y, width):
     grid.put(x + 3, y, "urgent", "label")
     _chips(grid, bx, y, ("600K", "650K", "700K", "750K"), "700K", chosen2, "tidy2", right - 1)
     y += 1
-    grid.put(x + 3, y, "세 하네스 공통 · 설정 변경은 실행되지 않습니다", "dim", limit=right)
+    grid.put(x + 3, y, "세 하네스 공통 · 설정은 Apply로 변경", "dim", limit=right)
     y += 1
     if warnings:
         grid.put(x + 3, y, "tidy point meets or exceeds window: " + ", ".join(warnings), "g_blocked", limit=right)
         y += 1
-    for command in cmds:
+    for harness, amount, command in cmds:
         cursor = grid.put(x + 3, y, "$ " + command, "soft", limit=right - 14)
         grid.put(cursor + 2, y, "[ apply ]", "chip_on", limit=right)
-        grid.add_hit(y, cursor + 2, cursor + 11, ("ui", "apply", "적용: " + command + " (시안이라 실행 안 함)"))
+        grid.add_hit(y, cursor + 2, cursor + 11,
+                     ("models.apply", harness, "context-window", amount, False))
         y += 1
 
 
@@ -273,10 +283,14 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
         # the two buttons follow the command on its row; the box's border cuts what runs past it
         dry_x = box_left + 5 + cell_width(command) + 3
         grid.put(dry_x, y + 6, "[ dry-run ]", "title_dim", limit=edge)
-        grid.add_hit(y + 6, dry_x, dry_x + 11, ("ui", "apply", "dry-run: " + command + " --dry-run (시안이라 실행 안 함)"))
+        grid.add_hit(y + 6, dry_x, dry_x + 11,
+                     ("models.apply", harness, "profile", profile, model_choice,
+                      effort_choice, True))
         apply_x = dry_x + 11 + 2
         grid.put(apply_x, y + 6, "[ apply ]", "chip_on", limit=edge)
-        grid.add_hit(y + 6, apply_x, apply_x + 9, ("ui", "apply", "적용: " + command + " (시안이라 실행 안 함)"))
+        grid.add_hit(y + 6, apply_x, apply_x + 9,
+                     ("models.apply", harness, "profile", profile, model_choice,
+                      effort_choice, False))
     y += 10
     if slim:
         grid.put(box_left + 3, box_top + 7, "pool", "label")

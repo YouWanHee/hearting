@@ -152,7 +152,7 @@ class ClaudeWiringTest(WiringFixture):
         self.assertEqual(len(entries), 1)
         self.assertEqual(set(entries[0]["matcher"].split("|")),
                          {"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"})
-        self.assertIn('"$HOME/.claude/hooks/run-hook.sh" python3 route-presence-gate.py',
+        self.assertIn('"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/run-hook.sh" python3 route-presence-gate.py',
                       entries[0]["hooks"][0]["command"])
         link = ROOT / "adapters/claude/hooks/route-presence-gate.py"
         self.assertTrue(link.is_symlink())

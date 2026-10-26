@@ -4179,6 +4179,118 @@ class ClosedNativeFrameCapacityRecoveryTest(unittest.TestCase):
                     **D.parse_registry_metadata(digest_field)}
         return history, candidate, metadata
 
+    def _public_start(self, launches):
+        import work_start as W
+
+        def join(**kwargs):
+            rows = self.rows()
+            ready = all(rows[aid][0][1] == "done" for aid in kwargs["expected_attempts"])
+            return {"state": "ready" if ready else "timeout", "children": []}
+
+        def launch(command, **kwargs):
+            launches.append(command)
+            source = self.rows()["att-source"][1]
+            binding = R.source_binding(self.jobs, source)
+            record = R._read(R._record_path(self.jobs, binding[0]))
+            _, _, metadata = self._candidate_input(record)
+            metadata.update(launch_claimed="1", launch_started="1")
+            self.assertEqual(R.admission(self.jobs, self.jobs.read_text().splitlines(), metadata), record)
+            row = (f"now\trunning\t{self.root}\t{self.root}\tframe\t"
+                   + ",".join(f"{key}={value}" for key, value in metadata.items()))
+            self.assertTrue(D.claim_attempt_row(self.jobs, metadata["attempt_id"], row, launch=True))
+            return subprocess.CompletedProcess(command, 0, "registered=1\nstarted=1\nchild_spawned=1\n", "")
+
+        # Reuse the existing sealed-input/authority/claim fixture. Only the
+        # request, observation and native launcher are stand-ins; the public
+        # start, batch, capacity decision and replacement admission are real.
+        with mock.patch.dict(os.environ, ReplacementTest.parent_env(self, "parent", "codex"), clear=True), \
+             mock.patch.object(W, "continuation_work_request", return_value={"text": "the raw task"}), \
+             mock.patch.object(W, "join_selected_attempts", side_effect=join), \
+             mock.patch("capacity_auto_resume.arm", return_value=None), \
+             mock.patch("start_receipt.save", side_effect=lambda result, _jobs: result):
+            return W.start_work(self.route, self.path, self.jobs, run=launch)
+
+    @contextlib.contextmanager
+    def _current_capacity(self, headroom):
+        source = "unknown:no-fresh-taps" if headroom is None else "fixture-headroom"
+        report = {"scores": {"claude": headroom, "codex": headroom, "opencode": 0},
+                  "sources": {"claude": source, "codex": source}}
+        # A released quota does not imply fresh headroom. Control both inputs
+        # instead of borrowing the developer's real taps outside the fixture.
+        capacity = R._capacity_reader()
+        with mock.patch("dispatch_capacity_evidence.harness_hold", return_value=None), \
+             mock.patch("dispatch_capacity_evidence.usage_states", return_value={
+                 harness: "unknown" if headroom is None else "ok"
+                 for harness in ("claude", "codex", "opencode")}), \
+             mock.patch.object(R, "_capacity_reader", return_value=capacity), \
+             mock.patch.object(capacity, "capacity_report", return_value=report):
+            yield
+
+    def test_public_start_resumes_released_capacity_once_and_preserves_successful_peer(self):
+        before = self.jobs.read_bytes()
+        peer = self.rows()["att-peer"][0]
+        terminal = self.log_path.read_bytes()
+        launches = []
+        with self._current_capacity(80):
+            result = self._public_start(launches)
+            self.assertEqual(result["state"], "preparing", result)
+            self.assertEqual(len(launches), 1)
+            replacement = next(aid for aid in result["frame_attempts"] if aid != "att-peer")
+            self.assertNotEqual(replacement, "att-source")
+            self.assertEqual(self.rows()[replacement][1]["harness"], "codex")
+            self.assertEqual(self.rows()[replacement][1]["automatic_retry_of"], "att-source")
+            replay = self._public_start(launches)
+        self.assertEqual(replay["frame_attempts"], result["frame_attempts"])
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(len(list((R._directory(self.jobs) / "claims").glob("*.json"))), 1)
+        self.assertEqual(self.rows()["att-peer"][0], peer)
+        self.assertEqual(self.log_path.read_bytes(), terminal)
+        self.assertNotEqual(self.jobs.read_bytes(), before)
+
+    def test_public_start_keeps_pinned_limited_frame_waiting_with_reset_without_claim(self):
+        import route_authority
+        route_authority.record_pin_change(self.route, target="frame", pin={"harness": "claude"},
+            by={"harness": "codex", "session_id": "parent"}, source="fixture", tuples=[], candidates=[])
+        before = self.jobs.read_bytes()
+        hold = {"label": "five-hour", "until_epoch": 4102444800}
+        launches = []
+        with mock.patch("dispatch_capacity_evidence.harness_hold", return_value=hold):
+            result = self._public_start(launches)
+        self.assertEqual((result["state"], result["reason"]),
+                         ("waiting-capacity", "owner-capacity-wait"), result)
+        self.assertEqual(result["retry_at"], "2100-01-01T00:00:00Z")
+        self.assertEqual(result["source_attempt_id"], "att-source")
+        self.assertEqual(launches, [])
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertFalse((R._directory(self.jobs) / "claims").exists())
+
+    def test_passive_batch_keeps_capacity_wait_without_claim_after_limit_clears(self):
+        before = self.jobs.read_bytes()
+        run = mock.Mock(side_effect=AssertionError("passive batch launched a frame"))
+        with self._current_capacity(80):
+            effective, lineage, attention = R.advance_batch(
+                self.jobs, {"att-source", "att-peer"}, run=run)
+        self.assertEqual(effective, {"att-source", "att-peer"})
+        self.assertEqual(lineage, [])
+        self.assertEqual([(item["source_attempt_id"], item["reason"]) for item in attention],
+                         [("att-source", "replacement-capacity-wait")])
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertFalse((R._directory(self.jobs) / "claims").exists())
+        run.assert_not_called()
+
+    def test_public_start_keeps_unknown_headroom_waiting_without_claim(self):
+        before = self.jobs.read_bytes()
+        launches = []
+        with self._current_capacity(None):
+            result = self._public_start(launches)
+        self.assertEqual((result["state"], result["usage_state"]),
+                         ("waiting-capacity", "allocation-usage-gate"), result)
+        self.assertEqual(result["replacement_attention"][0]["capacity_source"], "unknown:no-fresh-taps")
+        self.assertNotIn("retry_at", result)
+        self.assertEqual(launches, [])
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertFalse((R._directory(self.jobs) / "claims").exists())
+
     def test_closed_row_reuses_exact_capacity_raw_and_successful_peer_without_mutation(self):
         from review_round_cap import logical_round_records
         source_fields_before, source_meta_before = self.rows()["att-source"]
