@@ -359,13 +359,26 @@ def assert_expected(auth: Authority, expected: PathState | None = None) -> PathS
     return current
 
 
-def _lock_root() -> Path:
+# macOS ships /tmp as a system symlink to /private/tmp; Linux has a real /tmp.
+# Named here so the platform assumption is explicit and testable.
+_POSIX_TEMP_ROOT = "/tmp"
+
+
+def _system_temp_root() -> Path:
     # The lock namespace must not vary with HOME, CODEX_HOME, ZDOTDIR, or a
     # fixture-specific TMPDIR.  Otherwise two installers can lock different
-    # inodes while mutating the same external path.
+    # inodes while mutating the same external path.  Resolve the temp root to
+    # its real directory so a system symlink such as macOS's /tmp ->
+    # /private/tmp yields a real lock parent instead of being rejected as an
+    # unsafe symlink parent; realpath is a no-op where the temp root is already
+    # a real directory (e.g. Linux's /tmp), so the namespace is unchanged there.
+    raw = _POSIX_TEMP_ROOT if os.name == "posix" else tempfile.gettempdir()
+    return Path(os.path.realpath(raw))
+
+
+def _lock_root() -> Path:
     uid = os.geteuid() if hasattr(os, "geteuid") else 0
-    system_temp = Path("/tmp") if os.name == "posix" else Path(tempfile.gettempdir())
-    base = system_temp / f"hearting-path-locks-{uid}"
+    base = _system_temp_root() / f"hearting-path-locks-{uid}"
     parent = base.parent
     parent_info = os.lstat(parent)
     if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
