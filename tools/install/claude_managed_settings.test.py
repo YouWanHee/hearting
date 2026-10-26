@@ -15,6 +15,7 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import fixture_env  # noqa: E402
 import runtime_activation  # noqa: E402
 
 HOOKS = {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}]}
@@ -263,13 +264,18 @@ class ClaudeHookRootHealthTests(unittest.TestCase):
                 **source,
                 "hooks": source["hooks"],
             }), encoding="utf-8")
-            with mock.patch.dict(os.environ, {
-                "HOME": str(root / "default home"),
-                "CLAUDE_CONFIG_DIR": str(custom_home),
-            }), mock.patch.object(runtime_activation, "_config_path", return_value=settings_path):
+            default_home = root / "default home"
+            with fixture_env.patched_environment(root, HERE.parents[1]), \
+                    mock.patch.dict(os.environ, {
+                        "HOME": str(default_home),
+                        "ZDOTDIR": str(default_home),
+                        "CLAUDE_CONFIG_DIR": str(custom_home),
+                    }), \
+                    mock.patch.object(runtime_activation, "_config_path", return_value=settings_path):
                 self.assertEqual(runtime_activation._claude_settings_health(active_root), (False, []))
                 for path in files:
                     before = path.read_bytes()
+                    # destructive-ok: reason=simulate one missing managed hook target for health detection; boundary=one item returned by _files under custom_home in this TemporaryDirectory
                     path.unlink()
                     self.assertTrue(runtime_activation._claude_settings_health(active_root)[0], path)
                     path.write_bytes(before)
@@ -290,7 +296,12 @@ class ClaudeHookRootHealthTests(unittest.TestCase):
                         )
             settings_path = claude_home / "settings.json"
             settings_path.write_text(json.dumps({**source, "hooks": old_hooks}), encoding="utf-8")
-            with mock.patch.dict(os.environ, {"HOME": str(home), "CLAUDE_CONFIG_DIR": ""}), \
+            with fixture_env.patched_environment(root, HERE.parents[1]), \
+                    mock.patch.dict(os.environ, {
+                        "HOME": str(home),
+                        "ZDOTDIR": str(home),
+                        "CLAUDE_CONFIG_DIR": "",
+                    }), \
                     mock.patch.object(runtime_activation, "_config_path", return_value=settings_path):
                 self.assertEqual(runtime_activation._claude_settings_health(active_root), (False, []))
 
