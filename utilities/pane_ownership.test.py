@@ -352,6 +352,26 @@ class PaneOwnershipTest(unittest.TestCase):
                 "wB:p3N", foreground.pid, executable=str(self.herdr)), "")
         native.assert_called_once()
 
+    def test_current_codex_thread_reuses_the_collection_daemon_observation(self):
+        from fleet.collectors import codex
+
+        pid = 43123
+        sid = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+        record = (pid, 1, 77, 4, 77, "778899")
+        info = {"foreground_process_group_id": 77,
+                "foreground_processes": [{"pid": pid}]}
+        with codex.daemon_identity_read_scope() as observation, \
+                mock.patch.object(po, "_pane_process_info", return_value=info), \
+                mock.patch.object(po, "_process", return_value=record), \
+                mock.patch.object(po, "_runtime", return_value=("codex", False)), \
+                mock.patch.object(po, "_registered_worker", return_value=False), \
+                mock.patch.object(po, "_native_session", return_value=sid) as native, \
+                mock.patch.object(po, "_read_codex_footer_threads", return_value=set()):
+            self.assertEqual(po.current_codex_thread("w:p1", pid, executable="/fake/herdr"), sid)
+        self.assertEqual(native.call_count, 2)
+        self.assertTrue(all(call.kwargs["codex_observation"] is observation
+                            for call in native.call_args_list))
+
     def test_yolo_tui_proves_its_thread_and_refuses_a_foreign_one(self):
         from fleet.collectors import codex, procscan
         foreground = self.runtime("codex", "--yolo")
