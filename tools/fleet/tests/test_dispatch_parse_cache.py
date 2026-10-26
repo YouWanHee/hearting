@@ -267,6 +267,24 @@ class PinnedRegistryParityTest(unittest.TestCase):
                       dispatch._parent_extinction_rows([missing]))
         self.assertEqual(pinned, unpinned)
 
+    def test_derived_indexes_are_reused_only_for_their_parsed_generation(self):
+        path = str(self.jobs)
+        first_rows = dispatch.parsed_registry_rows(path)
+        first = dispatch._registry_derived_index(path, first_rows)
+        self.assertIs(dispatch._registry_derived_index(path, first_rows), first)
+        self.assertEqual(first["latest_by_attempt"]["att-a"][1][1], "done")
+        self.assertEqual(len(first["all_by_attempt"]["att-a"]), 2)
+
+        with self.jobs.open("ab") as stream:
+            stream.write(b"\n2026-10-20T00:00:05Z\topen\t/repo\t/wt\tslug-a\t"
+                         b"attempt_id=att-a,route_id=rt-a,route_node=execute\n")
+        second_rows = dispatch.parsed_registry_rows(path)
+        second = dispatch._registry_derived_index(path, second_rows)
+        self.assertIsNot(second, first)
+        self.assertEqual(second["latest_by_attempt"]["att-a"][1][1], "open")
+        self.assertEqual(len(second["all_by_attempt"]["att-a"]), 3)
+        self.assertEqual(first["latest_by_attempt"]["att-a"][1][1], "done")
+
 
 if __name__ == "__main__":
     unittest.main()

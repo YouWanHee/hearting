@@ -296,7 +296,16 @@ def _footer_proves_current_thread(pane, session_id, pid, process_record, group, 
                 and current[4] == group)
 
 
-def current_codex_thread(pane, pid=None, *, executable=None, server=None, socket_path=None):
+def _codex_identity_observation(codex_collector, observation=None):
+    if observation is not None:
+        return observation
+    scoped = codex_collector._DAEMON_IDENTITY_SCOPE.get()
+    return (scoped if isinstance(scoped, codex_collector.DaemonIdentityObservation)
+            else codex_collector.DaemonIdentityObservation())
+
+
+def current_codex_thread(pane, pid=None, *, executable=None, server=None, socket_path=None,
+                         process_info=None, codex_observation=None):
     """Return process_identity's thread when its TUI is foreground in this pane.
 
     The footer is an optional confirmation. A readable, nonempty footer that
@@ -309,8 +318,9 @@ def current_codex_thread(pane, pid=None, *, executable=None, server=None, socket
     if not executable or pid is not None and _registered_worker(pid):
         return ""
     try:
-        info = _pane_process_info(pane, executable=executable, server=server,
-                                  socket_path=socket_path)
+        info = (process_info if isinstance(process_info, dict) else
+                _pane_process_info(pane, executable=executable, server=server,
+                                   socket_path=socket_path))
         group = int((info or {}).get("foreground_process_group_id") or 0)
         foreground_pids = {int(item.get("pid"))
                            for item in (info or {}).get("foreground_processes") or []
@@ -322,7 +332,7 @@ def current_codex_thread(pane, pid=None, *, executable=None, server=None, socket
     candidates = sorted(foreground_pids if pid is None else foreground_pids & {int(pid)})
     current_ids = set()
     from fleet.collectors import codex as codex_collector
-    codex_observation = codex_collector.DaemonIdentityObservation()
+    codex_observation = _codex_identity_observation(codex_collector, codex_observation)
     for candidate in candidates:
         record = _process(candidate)
         kind, service = _runtime(candidate)
@@ -406,7 +416,8 @@ def _loader_verified_pane(pane, session_id, owner_pid, owner_start, *,
                     and _native_session(owner_pid, "codex", codex_observation=codex_observation) == session_id) else ""
 
 
-def codex_tui_process_bindings(session_id, *, pane_hint=None, executable=None):
+def codex_tui_process_bindings(session_id, *, pane_hint=None, executable=None,
+                               codex_observation=None):
     """Return exact live Codex TUI PID/start bindings for one native thread."""
     if not _THREAD_ID_RE.fullmatch(session_id or ""):
         return []
@@ -421,7 +432,7 @@ def codex_tui_process_bindings(session_id, *, pane_hint=None, executable=None):
         return []
     candidates = {}
     from fleet.collectors import codex as codex_collector
-    codex_observation = codex_collector.DaemonIdentityObservation()
+    codex_observation = _codex_identity_observation(codex_collector, codex_observation)
     for owner_pid in process_ids:
         try:
             kind, service = _runtime(owner_pid)
@@ -454,15 +465,17 @@ def codex_tui_process_bindings(session_id, *, pane_hint=None, executable=None):
     return [candidates[key] for key in sorted(candidates)]
 
 
-def codex_tui_pane_endpoint(session_id, *, pane_hint=None, executable=None):
+def codex_tui_pane_endpoint(session_id, *, pane_hint=None, executable=None,
+                            codex_observation=None):
     """Return the unique proven ``(pane, socket_path)`` for a current Codex thread."""
     bindings = codex_tui_process_bindings(
-        session_id, pane_hint=pane_hint, executable=executable)
+        session_id, pane_hint=pane_hint, executable=executable,
+        codex_observation=codex_observation)
     endpoints = {(item["pane"], item["socket_path"]) for item in bindings}
     return next(iter(endpoints)) if len(endpoints) == 1 else None
 
 
-def codex_tui_processes_for_session(session_id):
+def codex_tui_processes_for_session(session_id, *, codex_observation=None):
     """Return exact live native Codex TUI process identities for a thread."""
     if not _THREAD_ID_RE.fullmatch(session_id or ""):
         return []
@@ -472,7 +485,7 @@ def codex_tui_processes_for_session(session_id):
         return []
     found = []
     from fleet.collectors import codex as codex_collector
-    codex_observation = codex_collector.DaemonIdentityObservation()
+    codex_observation = _codex_identity_observation(codex_collector, codex_observation)
     for pid in process_ids:
         try:
             kind, service = _runtime(pid)
@@ -500,7 +513,8 @@ def _same_socket_endpoint(owner_socket, requested_socket, server):
     return os.path.realpath(owner_socket) == os.path.realpath(requested)
 
 
-def verified_pane(pane, harness, sid=None, *, pid=None, executable=None, server=None, socket_path=None):
+def verified_pane(pane, harness, sid=None, *, pid=None, executable=None, server=None,
+                  socket_path=None, codex_observation=None):
     """Return the hinted pane only with a live physical or exact session binding.
 
     Tools and hooks may have pipes for stdio; their nearest runtime must be the
@@ -534,7 +548,7 @@ def verified_pane(pane, harness, sid=None, *, pid=None, executable=None, server=
                 return ""
             pair = codex_tui_pane_endpoint(
                 target_sid, pane_hint=str(pane or "").strip() or None,
-                executable=executable)
+                executable=executable, codex_observation=codex_observation)
             if not pair or not _same_socket_endpoint(pair[1], socket_path, server):
                 return ""
             return pair[0]
