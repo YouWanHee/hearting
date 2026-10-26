@@ -473,6 +473,12 @@ class DaemonCodexSeatTest(TidyCase):
 
     def setUp(self):
         super().setUp()
+        # These fixtures describe Herdr's pane/SID observations. The test
+        # runner itself can be launched below a real shared daemon, which is
+        # unrelated ancestry and must not erase the fake seat being tested.
+        caller = mock.patch.object(pane_ownership, "_caller_runtime", return_value=(None, False))
+        caller.start()
+        self.addCleanup(caller.stop)
         self.fake_herdr = self.iso.root / "fake-herdr"
         self.agents_file = self.iso.root / "agents.json"
         self.calls = self.iso.root / "herdr-calls.txt"
@@ -3720,6 +3726,12 @@ class SeatHandoverTest(TidyCase):
 
     def setUp(self):
         super().setUp()
+        # Cross-harness seat fixtures supply their own native observations;
+        # the test process's real daemon ancestry is covered by
+        # utilities/pane_ownership.test.py instead.
+        caller = mock.patch.object(pane_ownership, "_caller_runtime", return_value=(None, False))
+        caller.start()
+        self.addCleanup(caller.stop)
         self.jobs = self.iso.root / "dispatch" / "jobs.log"
         self.jobs.parent.mkdir()
         self.rows = []

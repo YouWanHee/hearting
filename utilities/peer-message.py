@@ -863,7 +863,7 @@ def bind_pending_recipient(ref, recipient, *, process_proof=None):
                 or recipient.get("pane_id") != original.get("pane_id")):
             return None
         expected = pending_first_input_process(row)
-        if (expected is None or not first_input_process_matches(expected, process_proof)):
+        if expected is None or not first_input_process_matches(expected, process_proof):
             return None
         bound = row.get("bound_to")
         proposed = {"harness": recipient["harness"], "session_id": recipient["session_id"],
@@ -872,6 +872,28 @@ def bind_pending_recipient(ref, recipient, *, process_proof=None):
                                      for key in ("harness", "session_id", "pane_id")):
             return None
         updated = dict(row, bound_to=proposed)
+        context = row.get("handoff")
+        if isinstance(context, dict):
+            if not _first_input_process_is_current(expected, recipient.get("session_id")):
+                return None
+            successor = context.get("successor")
+            requester = context.get("requester")
+            if isinstance(successor, dict) and isinstance(requester, dict):
+                foreground = successor.get("foreground") or {}
+                if ((successor.get("harness"), successor.get("pane"))
+                        == (proposed["harness"], proposed["pane_id"])
+                        and successor.get("session_id") in (None, "", "-", proposed["session_id"])
+                        and (requester.get("harness"), requester.get("pane"), requester.get("server"))
+                            == (successor.get("harness"), successor.get("pane"), successor.get("server"))
+                        and requester.get("session_id") in (None, "", "-", proposed["session_id"])
+                        and (foreground.get("pid"), str(foreground.get("start") or ""))
+                            == (expected["pid"], expected["start"])):
+                    updated_context = dict(context)
+                    updated_successor = dict(successor, session_id=proposed["session_id"])
+                    updated_requester = dict(requester, session_id=proposed["session_id"])
+                    updated_context["successor"] = updated_successor
+                    updated_context["requester"] = updated_requester
+                    updated["handoff"] = updated_context
         _save_pending(updated)
         return updated
 
@@ -2574,6 +2596,8 @@ def receiver_guidance(text="", recipient=None, *, cwd=None):
         # validator below remains authoritative for context, seat, and lifetime.
         context = row.get("handoff")
         original_from, original_to = row.get("from"), row.get("to")
+        pane_bound = _valid_pane_bound_endpoint(original_to)
+        current_recipient = pending_delivery_recipient(row)
         predecessor = context.get("predecessor") if isinstance(context, dict) else None
         successor = context.get("successor") if isinstance(context, dict) else None
         requester = context.get("requester") if isinstance(context, dict) else None
@@ -2584,13 +2608,17 @@ def receiver_guidance(text="", recipient=None, *, cwd=None):
                 or not isinstance(successor, dict)
                 or not isinstance(requester, dict)
                 or not _valid_transfer_endpoint(original_from)
-                or not _valid_transfer_endpoint(original_to)
-                or (original_to.get("harness"), original_to.get("session_id"))
+                or not (_valid_transfer_endpoint(original_to) or pane_bound)
+                or not isinstance(current_recipient, dict)
+                or not _valid_transfer_endpoint(current_recipient)
+                or (current_recipient.get("harness"), current_recipient.get("session_id"))
                    != (recipient["harness"], recipient["session_id"])
                 or (predecessor.get("harness"), predecessor.get("session_id"))
                    != (original_from.get("harness"), original_from.get("session_id"))
                 or (successor.get("harness"), successor.get("session_id"))
                    != (recipient["harness"], recipient["session_id"])
+                or (pane_bound and (successor.get("pane") != original_to.get("pane_id")
+                                    or current_recipient.get("pane_id") != original_to.get("pane_id")))
                 or (requester.get("harness"), requester.get("session_id"))
                    != (successor.get("harness"), successor.get("session_id"))):
             return guidance
