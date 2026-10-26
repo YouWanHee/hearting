@@ -2,7 +2,7 @@
  "capability_registry_digest": {
   "analyze-project": "sha256:d0faea20e4c62c2d4465541d82aeba6b8ad6dd8ee5236d982fa78cde5c7a0f54",
   "analyze-user": "sha256:4fb46a83a6f9e595c440b61eb52206b11e38683c82f65a95eb176348e907162d",
-  "audit": "sha256:3d6278291d2e9ad796b3500bcaae924ad89c042b1b8b6c58426aab926fa05139",
+  "audit": "sha256:a4b0b221e08be996692d398ce336c2dba655a3b274ba8fd475f87f9952563f7f",
   "autopilot-apply": "sha256:ab4c98a0e93c7b34fafc323d456f0332676db09d7ca258449bcc2ac6f32900e4",
   "autopilot-code": "sha256:9fc6f29048ae130a7206f5a552324d81b61baa85938e1b833635d24515eccabd",
   "autopilot-design": "sha256:b8cb9abe5c1ced6024e07296597c6b4ad77b67938735445474f0eb9cb93c9410",
@@ -91,11 +91,11 @@
   "full:audit:default": {
    "briefs": {
     "inspect": "826d2ab829f2208d6091",
-    "report": "b5a57dc06512246abdf7"
+    "report": "7b60af3133bb5f5805ad"
    },
    "card": "[경로] audit · staged(standard) inspect→report · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
    "completion_gates": "dce35550d538e4b1de2b",
-   "composed_recipe": "a0103f366e636f4adeac",
+   "composed_recipe": "57dddc65c2998e422391",
    "conditional_extensions": "4f53cda18c2baa0c0354",
    "human_gate_bindings": "4f53cda18c2baa0c0354",
    "human_gates": "4f53cda18c2baa0c0354",
@@ -106,7 +106,7 @@
    ],
    "nodes": {
     "inspect": "908eb16ba2481635f38f",
-    "report": "49e037a8770a45805e2c"
+    "report": "49943ad2e68b8618213d"
    },
    "parallel_groups": "4f53cda18c2baa0c0354",
    "resume_retry_boundaries": "1bdc158c3622d3f9ceb0",
@@ -496,11 +496,11 @@
   "partial:audit:default:inspect,report:standard": {
    "briefs": {
     "inspect": "826d2ab829f2208d6091",
-    "report": "b5a57dc06512246abdf7"
+    "report": "7b60af3133bb5f5805ad"
    },
    "card": "[경로] audit · staged(standard) inspect→report · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
    "completion_gates": "dce35550d538e4b1de2b",
-   "composed_recipe": "a0103f366e636f4adeac",
+   "composed_recipe": "57dddc65c2998e422391",
    "conditional_extensions": "4f53cda18c2baa0c0354",
    "human_gate_bindings": "4f53cda18c2baa0c0354",
    "human_gates": "4f53cda18c2baa0c0354",
@@ -511,7 +511,7 @@
    ],
    "nodes": {
     "inspect": "908eb16ba2481635f38f",
-    "report": "49e037a8770a45805e2c"
+    "report": "49943ad2e68b8618213d"
    },
    "parallel_groups": "4f53cda18c2baa0c0354",
    "resume_retry_boundaries": "1bdc158c3622d3f9ceb0",
@@ -829,7 +829,7 @@
   "preset:audit:default:standard": {
    "briefs": {
     "inspect": "826d2ab829f2208d6091",
-    "report": "b5a57dc06512246abdf7"
+    "report": "7b60af3133bb5f5805ad"
    },
    "card": "[경로] audit · staged(standard) inspect→report · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
    "completion_gates": "dce35550d538e4b1de2b",
@@ -843,7 +843,7 @@
    ],
    "nodes": {
     "inspect": "bd882fff56751a5a92f4",
-    "report": "1537553f69c055d0fa87"
+    "report": "2fd63d92ada1c8e90c75"
    },
    "parallel_groups": "4f53cda18c2baa0c0354",
    "resume_retry_boundaries": "5ab21a055924dad5241e",
@@ -852,7 +852,7 @@
   "preset:audit:default:strong": {
    "briefs": {
     "inspect": "048019ff412baa403efa",
-    "report": "13c9db1a6e3cf840c910"
+    "report": "f33868415a40f590ea9c"
    },
    "card": "[경로] audit · staged(strong) inspect→report · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
    "completion_gates": "dce35550d538e4b1de2b",
@@ -866,7 +866,7 @@
    ],
    "nodes": {
     "inspect": "bd882fff56751a5a92f4",
-    "report": "1537553f69c055d0fa87"
+    "report": "2fd63d92ada1c8e90c75"
    },
    "parallel_groups": "4f53cda18c2baa0c0354",
    "resume_retry_boundaries": "5ab21a055924dad5241e",
@@ -875,7 +875,7 @@
   "preset:audit:default:thorough": {
    "briefs": {
     "inspect": "d814bcd28444635e379e",
-    "report": "d5cfc647ac2ad3539f8e"
+    "report": "5fd84304b9eec0b41b33"
    },
    "card": "[경로] audit · staged(thorough) inspect→report · route <rt> · origin compose · 사람 게이트 없음\n  cwd <ROOT> · slug sd165\n  캠페인 미배정 (_unassigned, degraded) · 활성 캠페인 0개",
    "completion_gates": "dce35550d538e4b1de2b",
@@ -889,7 +889,7 @@
    ],
    "nodes": {
     "inspect": "bd882fff56751a5a92f4",
-    "report": "1537553f69c055d0fa87"
+    "report": "2fd63d92ada1c8e90c75"
    },
    "parallel_groups": "4f53cda18c2baa0c0354",
    "resume_retry_boundaries": "5ab21a055924dad5241e",
