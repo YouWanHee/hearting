@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -4077,6 +4078,198 @@ class FrameTopCapacityTest(unittest.TestCase):
         self.write({**self.meta,'note':'dead-exact-pid','failure_class':'contract'})
         self.assertIsNone(W._frame_downgrade_summary(self.route,self.jobs))
 
+
+
+class ClosedNativeFrameCapacityRecoveryTest(unittest.TestCase):
+    """A closed invalid-envelope row may recover only from its exact native quota log."""
+
+    harness = "claude"
+    write = ReplacementTest.write
+    claim = ReplacementTest.claim
+    bind_fixture_route = ReplacementTest.bind_fixture_route
+    rows = FrameTopCapacityTest.rows
+    kind = FrameTopCapacityTest.kind
+
+    def set_route(self, **changes):
+        policy = {"primary": ["codex", "claude"], "relief": ["opencode"],
+                  "last_resort": [], "promote_relief_below": 25}
+        self.node.update(role="deep maker", harness_policy=policy)
+        peer = {"id": "frame-alternative", "worker_type": "frame", "dispatch_depth": 1,
+                "role": "deep maker", "model_profile": "top", "harness_policy": dict(policy)}
+        self.route.update(effective_intensity="standard", nodes=[self.node, peer],
+            profile_selection_contract_version=1,
+            dispatch_evidence={"tuples": [{"status": "supported", "child_harness": harness}
+                                            for harness in ("claude", "codex", "opencode")]},
+            dispatch_allocation={"strategy": "capacity-aware", "window": 30,
+                "harness_order": ["codex", "claude", "opencode"],
+                "usage_gate_used_percent": 90}, **changes)
+        self.bind_fixture_route()
+
+    def _native_result(self, *, status=429):
+        reset = int(time.time()) + 3600
+        self.log_path.write_text("".join(json.dumps(value) + "\n" for value in (
+            {"type": "rate_limit_event", "session_id": "sid-capacity", "rate_limit_info": {
+                "status": "rejected", "rateLimitType": "five_hour", "resetsAt": reset,
+                "unifiedWindows": {"five_hour": {"utilization": 1}}, "isUsingOverage": False}},
+            {"type": "result", "session_id": "sid-capacity", "is_error": True,
+             "subtype": "success", "terminal_reason": "api_error", "api_error_status": status},
+        )), encoding="utf-8")
+        return reset
+
+    def setUp(self):
+        FrameTopCapacityTest.setUp(self)
+        self.args.model_role = "deep maker"
+        self.args.worker_type = "frame"
+        self.args.dispatch_depth = 1
+        self.args.model_profile = "top"
+        self.args.model = "m-top"
+        self.args.resolved_model_settings = {"profile": "top", "role": "deep maker",
+                                             "model": "m-top", "effort": "max"}
+        source_input = R._directory(self.jobs) / "inputs" / "att-source.json"
+        source_input.unlink()
+        self.log_path = self.root / "frame.att-source.claude.jsonl"
+        self._native_result()
+        self.meta.update(model_role="deep maker", model_profile="top", harness="claude",
+            note="dead-invalid-envelope", failure_class="invalid-envelope",
+            classifier_source="completion-join-invalid-envelope-v1",
+            reconcile_reason="terminal-invalid:claude-result-capacity", log_file=str(self.log_path),
+            route_file=str(self.path), route_node="frame")
+        self.meta.update(D.parse_registry_metadata(
+            R.seal_launch_input(self.args, "claude", "the raw task")))
+        self.write(self.meta)
+        self.peer = {key: value for key, value in self.meta.items()
+                     if key not in {"replacement_input_digest", "launch_outcome"}}
+        self.peer.update(attempt_id="att-peer", route_node="frame-alternative", harness="codex",
+                         model="gpt-6.1-sol", note="completed-marker", failure_class="pass",
+                         log_file=str(self.root / "peer.att-peer.codex.jsonl"))
+        self.write(self.peer, append=True)
+
+    def _candidate_input(self, record):
+        source = self.rows()["att-source"][1]
+        history = R.launch_input(self.jobs, "att-source", source)
+        args = SimpleNamespace(**history["resolved"])
+        args.attempt_id = record["replacement_attempt_id"]
+        args.jobs_path = self.jobs
+        args.worktree = str(self.root)
+        args.route_id = self.route["route_id"]
+        args.route_hash = self.route["route_hash"]
+        args.route_file = str(self.path)
+        args.route_node = "frame"
+        args.model_role = "deep maker"
+        args.model_profile = "top"
+        args.model = "gpt-6.1-sol"
+        args.resolved_model_settings = {"profile": "top", "role": "deep maker",
+                                       "model": "gpt-6.1-sol", "effort": "high"}
+        args.replacement_input_argv = list(history["argv"])
+        args.launch_lifecycle = (history.get("applied_permissions") or {}).get("launch_lifecycle", "detached")
+        digest_field = R.seal_launch_input(args, "codex", history["task"])
+        digest = D.parse_registry_metadata(digest_field)["replacement_input_digest"]
+        candidate = R.launch_input(self.jobs, record["replacement_attempt_id"], {
+            "attempt_id": record["replacement_attempt_id"],
+            "replacement_input_digest": digest,
+            "jobs": str(self.jobs.resolve()),
+        })
+        metadata = {**source, "attempt_id": record["replacement_attempt_id"],
+                    "automatic_retry_of": "att-source", "harness": "codex",
+                    "model": "gpt-6.1-sol", "model_role": "deep maker", "model_profile": "top",
+                    "note": "", "failure_class": "", "launch_outcome": "",
+                    **D.parse_registry_metadata(digest_field)}
+        return history, candidate, metadata
+
+    def test_closed_row_reuses_exact_capacity_raw_and_successful_peer_without_mutation(self):
+        from review_round_cap import logical_round_records
+        source_fields_before, source_meta_before = self.rows()["att-source"]
+        peer_raw = self.rows()["att-peer"][0]
+        terminal_raw = self.log_path.read_bytes()
+        rounds_before = [meta["attempt_id"] for _, meta in
+                         logical_round_records(list(self.rows().values()), jobs=self.jobs)]
+        self.assertEqual(R.death_kind(*self.rows()["att-source"], jobs=self.jobs), "capacity")
+
+        record = self.claim()
+        self.assertEqual(self.claim(), record)
+        self.assertEqual(record["proof"]["death_kind"], "capacity")
+        self.assertNotIn("profile_transition", record)
+        self.assertEqual(len(list((R._directory(self.jobs) / "claims").glob("*.json"))), 1)
+
+        command = R._command(self.jobs, record, self.rows()["att-source"][1],
+                             R.launch_input(self.jobs, "att-source", self.rows()["att-source"][1]))
+        self.assertTrue(command[1].endswith("utilities/dispatch-owner.py"), command)
+        self.assertEqual(command[command.index("--route-node") + 1], "frame")
+        self.assertEqual(command[command.index("--automatic-retry-of") + 1], "att-source")
+        self.assertNotIn("--adapter", command)
+        self.assertNotIn("--model-profile", command)  # selector reads the sealed top profile and role
+        self.assertEqual(self.route["nodes"][0]["role"], "deep maker")
+        self.assertEqual(self.route["nodes"][0]["model_profile"], "top")
+
+        history, candidate, metadata = self._candidate_input(record)
+        import route_authority as RA
+        self.assertEqual(R.admission(self.jobs, self.jobs.read_text().splitlines(), metadata), record)
+        for field, value in (("model_profile", "deep"), ("model_role", "fast reviewer")):
+            changed = {**candidate, "resolved": {**candidate["resolved"], field: value}}
+            with self.subTest(field=field), self.assertRaises(D.DispatchContractError):
+                RA.require_recovery_work(changed, history, route=self.route, worker_type="frame")
+
+        current = self.rows()
+        source_fields_after, source_meta_after = current["att-source"]
+        self.assertEqual(source_fields_after[:5], source_fields_before[:5])
+        for key, value in source_meta_before.items():
+            self.assertEqual(source_meta_after.get(key), value, key)
+        self.assertLessEqual(set(source_meta_after) - set(source_meta_before), {
+            "replacement_family_id", "replacement_attempt_id", "replacement_claim_digest",
+            "replacement_ordinal"})
+        self.assertEqual(current["att-peer"][0], peer_raw)
+        self.assertEqual(self.log_path.read_bytes(), terminal_raw)
+        self.assertEqual(len(current), 2)  # no peer row or replacement process was registered
+        self.assertEqual([meta["attempt_id"] for _, meta in
+                          logical_round_records(list(current.values()), jobs=self.jobs)], rounds_before)
+
+    def test_source_capacity_hold_yields_only_when_the_existing_selector_picks_the_peer(self):
+        capacity = R._capacity_reader()
+        selected_rows = []
+        real_select = capacity.select
+        def select(*args, **kwargs):
+            selected = real_select(*args, **kwargs)
+            selected_rows.append(selected)
+            return selected
+        with mock.patch("dispatch_capacity_evidence.harness_hold", return_value={"label": "limited"}), \
+             mock.patch("dispatch_capacity_evidence.usage_states",
+                        return_value={"claude": "limited(now)", "codex": "ok", "opencode": "limited"}), \
+             mock.patch("model_config.resolve_config", return_value=({}, "fixture")), \
+             mock.patch("model_profile.resolve_profile_values",
+                        side_effect=lambda harness, _config, profile: {"model": f"{harness}-{profile}"}), \
+             mock.patch.object(R, "_capacity_reader", return_value=capacity), \
+             mock.patch.object(capacity, "capacity_report", return_value={
+                "scores": {"claude": 0, "codex": 80, "opencode": 0}, "sources": {}}), \
+             mock.patch.object(capacity, "select", side_effect=select) as select_call, \
+             mock.patch("dispatch_allocation.attempt_counts", return_value={"claude": 0, "codex": 0,
+                                                                             "opencode": 0}):
+            self.assertIsNone(R._capacity_hold(self.jobs, self.meta, allow_frame_peer=True))
+            self.assertEqual(select_call.call_args.args[1]["claude"], "limited(limited)")
+            self.assertEqual(selected_rows[0][0], "codex")
+            self.assertIsNotNone(R._capacity_hold(self.jobs, self.meta, allow_frame_peer=False))
+
+    def test_wrong_raw_identity_auth_runtime_and_non_capacity_results_are_refused(self):
+        self.assertIsNone(self.kind(reconcile_reason="terminal-invalid:claude-result-auth"))
+        self.assertIsNone(self.kind(note="dead-worker-fail", failure_class="fail"))
+        self.assertIsNone(self.kind(note="dead-worker-blocked", failure_class="blocked"))
+
+        wrong_path = self.root / "frame.att-other.claude.jsonl"
+        self._native_result()
+        self.assertIsNone(self.kind(log_file=str(wrong_path)))
+        for status in (401, 503):
+            self._native_result(status=status)
+            self.assertIsNone(self.kind())
+        self.log_path.write_text("not-json\n", encoding="utf-8")
+        self.assertIsNone(self.kind())
+
+    def test_live_or_unknown_process_proof_never_creates_a_claim(self):
+        for state in ("live", "unverifiable"):
+            with self.subTest(state=state), \
+                 mock.patch.object(D, "attempt_process_quiescence",
+                    return_value=SimpleNamespace(state=state, reason="fixture-" + state)), \
+                 self.assertRaises(D.DispatchContractError):
+                self.claim()
+        self.assertFalse((R._directory(self.jobs) / "claims").exists())
 
 
 class FrameCapacityFlow:
