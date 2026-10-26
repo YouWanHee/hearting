@@ -832,9 +832,17 @@ owner-closure procedure — and `검증` should say so by that name (SD-153 rule
 SD-134 A75-9).
 
 For dispatched work, the parent follows the runtime's next-action receipt and
-checks the completed artifact before reporting. Normal success needs no harvest.
-A process exit or intermediate stage verdict alone is not task completion.
-Read-only orientation and status replies use concise prose instead.
+reads the completed artifact to accept the results, limits, and remaining duties.
+Reuse valid verification and independent-review results; a stage, person, folder,
+or interruption change alone does not require another audit or suite. Check only
+uncovered integration changes, unresolved failures, or required unknowns. A broad
+rerun needs a concrete broad impact not covered by existing results. Current
+stage judgments still apply to their current subject; an old PASS marker does
+not become current through evidence reuse. When the requested outcome has
+sufficient evidence, advance to the authorized handoff, integration, or closure.
+Normal success needs no harvest. A process exit or intermediate stage verdict
+alone is not task completion. Read-only orientation and status replies use
+concise prose instead.
 
 New registered owners carry `workflow_completion=runtime-v1`. Their completion
 controller owns the exact workflow/route/cycle closing transaction after PASS

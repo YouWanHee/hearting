@@ -2,7 +2,7 @@
 
 Select the stage graph from `--intensity` before QA. `direct` performs produce plus sanity/report without this durable pipeline. `quick` uses one registered-headless dispatch-depth-1 one-shot conductor with an inline micro-plan, plan-check-lite, and focused verification. standard+ follows the durable pipeline below.
 
-The compiled standard+ route always carries the `plan-check` review node; select its unit by risk axis: UI or visual risk → the `design/critic` unit; research or domain risk → the `research/plan-review` unit; construction quality (the compiled default) → the `qa/plan-review` unit. Each runs as a sibling review node dispatched by the owner per the compiled route.
+The default standard+ route carries the `plan-check` review node; execute it only when selected by the compiled graph. When selected, choose its unit by risk axis: UI or visual risk → the `design/critic` unit; research or domain risk → the `research/plan-review` unit; construction quality (the compiled default) → the `qa/plan-review` unit. Each selected review runs as a sibling node dispatched by the owner. Do not add a review node omitted by the explicit graph.
 
 ### Standard+ Stage Dispatch
 
@@ -306,9 +306,9 @@ arbitrates.
 
 ### Step 2: plan-check and Optional Refinement
 
-Only durable standard+ graphs use this step. direct has none; quick already completed plan-check-lite.
+Only graphs that select this step use it. direct has none; quick already completed plan-check-lite.
 
-The compiled standard+ route contains the `plan-check` review node unconditionally (default unit `qa/plan-review`, completion gate `code-plan-check`); `execute` is record-bound to its completion marker and cannot start without it. Intensity scales the review's depth and reviewer role/family, never whether the node runs.
+The default standard+ route contains the `plan-check` review node (default unit `qa/plan-review`, completion gate `code-plan-check`). When selected, `execute` is record-bound to its completion marker and cannot start without it. Intensity scales the selected review's depth and reviewer role/family; the compiled graph determines whether the node runs.
 
 At `strong` and above `plan-check` is additionally the plan arbiter: it is
 record-bound to every declared plan leg, reads their suffix-isolated plan/checklist
@@ -383,9 +383,10 @@ Read plan frontmatter after harvest:
 - `partial` → impl-review, then Step 4 for completed work;
 - `failed` → execute did not complete successfully; recovery may be partial when some edits were ambiguous. Write a failed `pipeline_summary.md` with the remaining state and stop before test or report.
 
-The compiled route also contains the `impl-review` review node unconditionally (unit
-`qa/code-review`, completion gate `code-impl-review`) between `execute` and `test`; `test`
-is record-bound to its completion marker. After publishing execute's completion, run the
+The default route contains the `impl-review` review node (unit
+`qa/code-review`, completion gate `code-impl-review`) between `execute` and `test`.
+When selected by the compiled graph, `test` is record-bound to its completion
+marker. After publishing execute's completion, run the selected
 route-bound dispatch transaction with `NODE_ID=impl-review`: it reads the plan, source
 diff, and dev logs, writes `_internal/dev_reviews/phase_review.md`, and stays read-only.
 Publish its exact completion, read only the memo verdict, and route blocking findings
@@ -404,8 +405,11 @@ verdict is read and the merge is recorded.
 
 For standard+, run the route-bound dispatch transaction with `NODE_ID=test`; its route node
 selects `assigned_contract=code-test` and the reviewer role. strong+ may select a deeper reviewer.
-Pass plan verification and checklist paths, retain the emitted attempt ID, yield for the typed receipt, and publish exact
-completion from `test_logs/test_report.md`. code-test is read-only and never hotfixes.
+Pass plan verification, checklist, dev-log, and selected implementation-review paths so
+code-test can assess existing results against the current target. It runs only missing or
+invalidated relevant checks; preserve known failures and required unknowns. Retain the emitted
+attempt ID, yield for the typed receipt, and publish exact completion from
+`test_logs/test_report.md`. code-test is read-only and never hotfixes.
 
 quick reports verify-lite failure without retry. Other graphs may open at most one pipeline-level retry:
 
@@ -417,9 +421,9 @@ quick reports verify-lite failure without retry. Other graphs may open at most o
    <!-- memo: [테스트 실패] code-test 실패. 상세: test_logs/test_report.md, _internal/test_reviews/. 대안 필요. -->
    ```
 
-4. Reset checklist marks to `[ ]`.
+4. Reopen only checklist items affected by the fix and their dependent work; retain unrelated completed marks and evidence.
 5. Pause for explicit user refine, or invoke one bounded code-refine.
-6. Redispatch code-execute, then code-test.
+6. Redispatch the selected `execute → impl-review → test` sequence. Do not skip a selected independent review after a source fix; later nodes consume applicable prior evidence and run only checks affected by the delta or still required.
 7. On pass, continue. On a second failure, apply the shared content-ownership recovery procedure in `capabilities/code-execute.md#portable-procedure` to the implementation edits recorded across the attempts. Reverse only clearly attributable edits; preserve unrelated or ambiguous contents, including same-file, staged, and untracked changes. Write a failed summary noting both attempts, recovered and remaining edits, the reason for any uncertainty, the observed index/worktree state, and checks skipped because of that state; stop before code-report.
 
 ### Step 5: code-report
@@ -431,7 +435,7 @@ from the final report. Use the closed fallback when needed.
 
 ### Merge-preparation projection gate
 
-Run `python3 tools/generate.py`, then the projected/deferred census, then `python3 tools/generate.py --check`, then `./tools/check-adaptation-boundary.sh`, in that order. On failure return to source. Update both harness lists in `tools/check-adaptation-boundary.sh`; `skills/` is canonical and `adapters/claude/skills/` plus the plugin tree are generated by `generate.py`. Never edit generated projections manually.
+After source integration, run `python3 tools/generate.py`, update the projected/deferred census when adding a utility/tool, then run `python3 tools/generate.py --check` and `./tools/check-adaptation-boundary.sh`, in that order. Carry these results through review, test, report, and publication; rerun only when relevant source or projection changes invalidate them. On failure return to the affected source. Preserve normal commit/push hooks. Portable capabilities and roles are canonical; `skills/`, adapter counterparts, and plugin trees are generated projections. Never edit generated projections manually.
 
 The boundary run is a separate step because `tools/sync-missing-projections.py` (the `generate.py` member that fills Claude counterparts) covers `loops/`, `scaffolds/`, `tools/memory`, `tools/install`, `tools/integrations`, and `tools/fleet` — **not** top-level `tools/`. A new `tools/<file>` therefore needs its `adapters/claude/tools/<file>` symlink (`../../../tools/<file>`) created by hand until that domain is automated; `generate.py --check` will not tell you, but `pre-push` and CI will.
 
