@@ -327,7 +327,10 @@ behavior.
 Dispatch same-work identity gates are opt-in: only `HEARTING_GATES=on`
 enforces sealed-versus-current route, parent, lineage, runtime and review
 bindings. Otherwise `utilities/hearting_gates.py` emits `hearting: gate-off`
-and execution uses current inputs. Input/schema errors, missing files, path
+and execution uses current inputs. With gates off, permitted registry or
+unit-catalog drift continues silently with currentness metadata preserved and
+no instruction to run an old release; other identity-gate diagnostics remain
+unchanged. Input/schema errors, missing files, path
 and symlink safety, lock ownership and process-liveness checks remain enforced.
 Historical records are preserved; bypassing identity comparisons does not
 rewrite them or turn a live process into completed work.
