@@ -92,6 +92,49 @@ class DirectoryBundleTests(unittest.TestCase):
             # Historical verification without a candidate callback is unchanged.
             self.assertEqual(B.select_outermost(artifacts), ("artifacts/raw-results",))
 
+    def test_candidate_symlinks_fall_back_without_changing_historical_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "artifacts"
+            raw = artifacts / "raw-results"
+            raw.mkdir(parents=True)
+            (raw / "result.csv").write_bytes(b"kept\n")
+            external = root / "external"
+            external.mkdir()
+            (raw / "cache").symlink_to(external, target_is_directory=True)
+            (raw / "missing").symlink_to(root / "absent")
+            self.assertEqual(B.select_outermost(artifacts, prune_directory=lambda _path: False), ())
+            self.assertEqual(B.select_outermost(artifacts), ("artifacts/raw-results",))
+            with self.assertRaises(B.DirectoryBundleError) as caught:
+                B.scan_tree(root, "artifacts/raw-results")
+            self.assertEqual(caught.exception.code, "tree-symlink-forbidden")
+
+            (artifacts / "nested").mkdir()
+            (artifacts / "nested" / "raw-results").symlink_to(external, target_is_directory=True)
+            self.assertEqual(B.select_outermost(artifacts, prune_directory=lambda _path: False), ())
+            with self.assertRaises(B.DirectoryBundleError) as caught:
+                B.select_outermost(artifacts)
+            self.assertEqual(caught.exception.code, "raw-results-symlink")
+
+    def test_published_descriptor_still_rejects_a_later_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / "artifacts" / "raw-results"
+            raw.mkdir(parents=True)
+            (raw / "result.csv").write_bytes(b"kept\n")
+            tree = B.scan_tree(root, "artifacts/raw-results")
+            descriptor = root / "artifacts" / "bundle.json"
+            descriptor.write_bytes(tree.descriptor)
+            row = {"media_type": B.MEDIA_TYPE, "byte_size": len(tree.descriptor),
+                   "content_digest": tree.descriptor_digest}
+            self.assertEqual(B.verify_coverage(root, "artifacts/bundle.json", row),
+                             ("artifacts/raw-results/result.csv",))
+            (raw / "cache").symlink_to(root / "absent")
+            with self.assertRaises(B.DirectoryBundleError) as caught:
+                B.verify_coverage(root, "artifacts/bundle.json", row)
+            self.assertEqual(caught.exception.code, "tree-symlink-forbidden")
+            self.assertEqual(descriptor.read_bytes(), tree.descriptor)
+
     def test_tree_digest_unicode_order_same_size_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "artifacts" / "raw-results"
