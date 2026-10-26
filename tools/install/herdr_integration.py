@@ -21,7 +21,7 @@ import safe_fs
 
 
 VERSIONS = {"claude": 11, "codex": 10, "opencode": 13}
-CLAUDE_SESSION_COMMAND = 'bash "$HOME/.claude/hooks/herdr-agent-state.sh" session'
+CLAUDE_SESSION_COMMAND = 'bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/herdr-agent-state.sh" session'
 CODEX_SESSION_COMMAND = (
     'bash "${CODEX_HOME:-$HOME/.codex}/herdr-agent-state.sh" session'
 )
@@ -642,7 +642,8 @@ def _owned_state_hook(command: Any) -> bool:
     if not isinstance(command, str) or "herdr-agent-state.sh" not in command:
         return False
     return any(token in command for token in (
-        "/.claude/hooks/", "/adapters/codex/hooks/", "$AGENT_HOME/",
+        "/.claude/hooks/", "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/",
+        "/adapters/codex/hooks/", "$AGENT_HOME/",
         "${AGENT_HOME}/", "$root/adapters/codex/hooks/", "/.codex/herdr-agent-state.sh",
         "${CODEX_HOME:-$HOME/.codex}/herdr-agent-state.sh", "$CODEX_HOME/",
     ))

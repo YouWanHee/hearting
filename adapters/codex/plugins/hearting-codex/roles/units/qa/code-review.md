@@ -34,9 +34,10 @@ Scope: static review of a git diff, changed files, or execution step logs.
 1. **Read the specified step log files** to see exact old/new for each edit. Use the
    `Decision:` field to understand why each change was made.
 2. **Read the changed source files** to verify correctness in full context.
-3. **Run verification checks** on changed files:
-   - Syntax check: `python -c "import ast; ast.parse(open('<file>').read())"`
-   - Import check: `python -c "from <module> import <class>"` for modified modules
+3. **Assess verification evidence** for changed files. Reuse applicable execution,
+   test, and CI results; run a syntax or import check only when relevant evidence
+   is missing or invalidated by the change. Judge the current diff and its
+   interactions independently; command execution is not a required second audit.
 4. **Write the review report to file** in the log directory specified in the prompt.
    Use the exact file name given; otherwise `phase_{NN}.md` for phase reviews or
    `test_review.md` for test reviews. Re-review after a fix appends `_fix{M}` to the
@@ -51,10 +52,17 @@ this itself; it receives no caller mode signal.
 
 ## Round Protocol
 
+Applicable command results must cover the reviewed paths, inputs, dependencies,
+and execution conditions. A new source subject still requires an ordinary independent judgment,
+and reusing command evidence never substitutes for that judgment or makes a
+historical PASS current.
+
 For implementation reviews, the runtime binds the reviewed source content at
 registration and verifies it at launch. A different content subject starts an
-ordinary independent review with its own verdict budget; read earlier findings
-for context, but do not treat the new subject as a same-source closure check.
+ordinary independent review with its own verdict budget. Assess the changed
+source and its interactions using applicable prior findings and verification;
+this is not a full audit of unchanged material or a restart of command checks.
+Do not treat the new subject as a same-source closure check.
 Returning to earlier content reuses that subject's existing budget. Reports,
 marker sequence, timestamps, staging alone, and identical-content commits do
 not create a new subject. A PASS remains attached to the content it reviewed
@@ -86,7 +94,8 @@ gate must converge, not peel one layer per pass.
 - **A verdict-less prior attempt is history only.** The dispatch assignment may
   render it as `판정 없음(<reason>)` — a crashed, capacity-dead, or invalid-envelope
   attempt that never completed a review. If no substantive verdict exists for the
-  current review subject, perform the full first review; there is no prior 🔴 list
+  current review subject, make the first independent judgment of its changes and
+  interactions, using applicable existing evidence; there is no prior 🔴 list
   to close. If a substantive verdict exists for this subject, read the nearest one
   as the prior round even when verdict-less attempts follow it, and use the closure
   questions for that finding set plus the delta.

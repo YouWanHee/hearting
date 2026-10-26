@@ -51,8 +51,9 @@ aliases: {}
 
 # Unit: qa/test
 
-Run graduated dynamic verification with **stop-on-failure** semantics. **Read-only with
-respect to source** — never fix code in this unit. The absence of a failing signal is
+Assess graduated dynamic verification with **stop-on-failure** semantics. **Read-only with
+respect to source** — never fix code in this unit. Run only checks whose relevant evidence
+is missing or invalidated; the absence of a failing signal is
 not proof of correctness: prefer the input, path, or state most likely to break the
 changed behavior, and when the evidence cannot confirm the surface works, return
 BLOCKED or FAIL rather than PASS. A PASS asserts observed-correct, not merely
@@ -69,7 +70,15 @@ not-observed-wrong.
 - **No target given**: use recent Git changes only when the task requests changed-code
   verification; otherwise report the missing input instead of inventing a target.
 
-## Levels (execute in order; stop at the first failure)
+Before selecting checks, read available execution logs, independent review, prior test, and
+CI evidence. Reuse a result only when its source, target and scope, relevant inputs and
+dependencies, and execution conditions still match. A stage, person, worktree, or
+interruption change alone does not invalidate it. Identify changed behavior, unresolved
+failures, and required dimensions not covered by the existing evidence. The evidence
+supports the current assessment but does not transfer a historical test-gate PASS or
+change source-subject binding and verdict-budget rules.
+
+## Levels (assess applicable evidence; execute missing or invalidated checks in order)
 
 Browser verification keeps screenshots, console/network logs and its verdict
 in the assigned output folder. A persistent Chromium user-data directory is
@@ -127,8 +136,9 @@ claim, a declared `stft` window that violates the confirmed per-rate law
 ## Rules
 
 - Do NOT modify any code; read-only verification only.
-- Stop at the first failing level unless the parent contract explicitly requests
-  independent later checks.
+- Stop at the first failing newly executed level unless the parent contract explicitly
+  requests independent later checks. Preserve an unresolved known FAIL; after a relevant
+  fix, rerun only the affected check and any dependent check whose evidence is invalidated.
 - Keep test commands short-lived outside the integration level; if a level 1–4 command
   hangs beyond ~60 s, kill it and report the timeout. The integration level may use a
   long (e.g. 10-minute) timeout intentionally — do not run full training or evaluation
@@ -140,8 +150,10 @@ claim, a declared `stft` window that violates the confirmed per-rate law
 
 ## Report
 
-State target and trigger, report each executed level with its captured evidence, then
-summarize: levels passed (N/M), first failure, and recommended action. Return per the
+State target and trigger, report applicable levels as executed, supported by reused evidence,
+skipped, or blocked, then summarize which levels are satisfied (N/M), the first failure, and
+recommended action. Cite reused evidence in the existing report body by artifact path,
+command, target/scope, and verdict; do not add a new report field or manifest. Return per the
 dual return switch (`io.return`). Verdict tokens: `✅ All N levels passed`,
 `❌ Failed at Level N: {reason}`.
 

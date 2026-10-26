@@ -96,6 +96,40 @@ class ExtractionTest(unittest.TestCase):
         self.assertEqual(RP.parse_proposal_with_notes(brief([{**DIRECT, "done_when": "one line"}]))[0]
                          ["legs"][0]["done_when"], [{"id": "d1", "text": "one line"}])
 
+    def test_parallel_keeps_all_valid_items_and_notes_only_malformed_indexes(self):
+        for count in (8, 9, 16, 32):
+            with self.subTest(count=count):
+                values = [f"slice {index:02d}" for index in range(count)]
+                proposal, _, notes = RP.parse_proposal_with_notes(brief([{**DIRECT, "parallel": values}]))
+                self.assertEqual(proposal["legs"][0]["parallel"], values)
+                self.assertEqual(notes, [])
+
+        values = [" first ", {}, "  ", "last", "x" * 201]
+        proposal, _, notes = RP.parse_proposal_with_notes(brief([{**DIRECT, "parallel": values}]))
+        self.assertEqual(proposal["legs"][0]["parallel"], ["first", "last"])
+        self.assertEqual(notes, ["ignored:legs[0].parallel[1]", "ignored:legs[0].parallel[2]",
+                                 "ignored:legs[0].parallel[4]"])
+
+        proposal, _, notes = RP.parse_proposal_with_notes(brief([{**DIRECT, "parallel": "one slice"}]))
+        self.assertEqual(proposal["legs"][0]["parallel"], ["one slice"])
+        self.assertEqual(notes, [])
+        proposal, _, notes = RP.parse_proposal_with_notes(brief([{**DIRECT, "parallel": ["x" * 200]}]))
+        self.assertEqual(proposal["legs"][0]["parallel"], ["x" * 200])
+        self.assertEqual(notes, [])
+
+        proposal, _, notes = RP.parse_proposal_with_notes(brief([{**DIRECT, "parallel": [{}, " "]}]))
+        self.assertNotIn("parallel", proposal["legs"][0])
+        self.assertEqual(notes, ["ignored:legs[0].parallel[0]", "ignored:legs[0].parallel[1]"])
+        proposal, _, notes = RP.parse_proposal_with_notes(brief([{**DIRECT, "parallel": []}]))
+        self.assertNotIn("parallel", proposal["legs"][0])
+        self.assertEqual(notes, ["ignored:legs[0].parallel"])
+
+        proposal, _, notes = RP.parse_proposal_with_notes(brief([{**DIRECT, "hands_over": [f"h{i}" for i in range(9)],
+                                                                   "parallel": [f"p{i}" for i in range(16)]}]))
+        self.assertNotIn("hands_over", proposal["legs"][0])
+        self.assertEqual(proposal["legs"][0]["parallel"], [f"p{i}" for i in range(16)])
+        self.assertEqual(notes, ["ignored:legs[0].hands_over"])
+
     def approvals_of(self, *questions, key="full-run"):
         rows = "".join(f"    - {{key: {key}, leg: 0, question: {q}}}\n" for q in questions)
         text = ("route_proposal_v1:\n  summary: s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
@@ -723,6 +757,50 @@ class RoutePlanCompileTest(PlanFixture):
         self.assertEqual(json.loads(plain.stdout)["route_id"], json.loads(bad.stdout)["route_id"])
         self.assertNotIn("경로 계획을 읽지 못함", plain.stderr)
         self.assertEqual(bad.stderr.count("경로 계획을 읽지 못함"), 1)
+
+    def test_route_plan_compose_card_bounds_preview_and_keeps_the_full_current_leg(self):
+        parallel = [f"slice {index:02d}" for index in range(16)]
+        record = RP.read_record(self.decision_path)
+        decision = record["decision"]
+        for proposal in [decision["proposal"], *(row.get("proposal") for row in decision["proposals"]
+                                                   if isinstance(row, dict) and isinstance(row.get("proposal"), dict))]:
+            proposal["legs"][0]["parallel"] = parallel
+            proposal["legs"][1]["parallel"] = ["later leg only"]
+        self.decision_path.write_bytes(RP.render(RP.build_record(decision, record.get("first_leg"))))
+        binding = self.binding(0)
+        self.assertEqual(binding["leg"]["parallel"], parallel)
+
+        common = [sys.executable, str(HERE / "capability-route.py"), "compose", "--shape", "direct", "--slug",
+                  "cli-parallel", "--capability", "autopilot-code", "--cwd", str(R.ROOT), "--artifact-root",
+                  str(self.root), "--campaign-key", "framed-key", "--spec-read", "fixture", "--explain",
+                  "--route-plan", f"{self.decision_path}#0"]
+        env = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_DISPATCH_")}
+        result = subprocess.run(common, text=True, capture_output=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        route = json.loads(result.stdout)
+        self.assertEqual(route["route_plan"], RP.sealed_form(binding))
+        card_line, = [line.strip() for line in result.stderr.splitlines()
+                      if line.strip().startswith("승인된 분할:")]
+        self.assertIn("slice 00 · slice 01 · slice 02", card_line)
+        self.assertIn("외 13개(route·owner 지시문에 전부)", card_line)
+        self.assertNotIn("slice 03", card_line)
+        self.assertNotIn("later leg only", card_line)
+
+        later = self.leg(graph="execute,test,report", route_plan=self.binding(1))
+        later_card = R.compose_card(later)
+        self.assertIn("승인된 분할: later leg only", later_card)
+        self.assertNotIn("slice 00", later_card)
+
+        for values in (parallel[:1], parallel[:3]):
+            decision = RP.read_record(self.decision_path)["decision"]
+            for proposal in [decision["proposal"], *(row.get("proposal") for row in decision["proposals"]
+                                                       if isinstance(row, dict) and isinstance(row.get("proposal"), dict))]:
+                proposal["legs"][0]["parallel"] = values
+            current = RP.build_record(decision)
+            self.decision_path.write_bytes(RP.render(current))
+            card = R.compose_card(self.leg(shape="direct", route_plan=self.binding(0)))
+            self.assertIn("승인된 분할: " + " · ".join(values), card)
+            self.assertNotIn("외 ", card)
 
     def test_fleet_plan_is_the_legs_capability_order_and_not_sealed(self):
         ns = mock.Mock(plan=None, campaign_key="k", parent_cycle=None)

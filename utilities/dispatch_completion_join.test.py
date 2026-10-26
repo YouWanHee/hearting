@@ -3046,6 +3046,66 @@ class FinishedChildClosure(unittest.TestCase):
         self.assertEqual(current.metadata["note"], "dead-worker-fail")
         success.assert_not_called()
 
+    def test_native_claude_capacity_settlement_preserves_reason_and_quota_without_rewriting_raw(self):
+        child = self.child(quiescent=True, attempt_id="att-native-capacity")
+        log = self.base / f"frame.{child.attempt_id}.claude.jsonl"
+        reset = int(time.time()) + 3600
+        log.write_text("".join(json.dumps(value) + "\n" for value in (
+            {"type": "rate_limit_event", "session_id": "sid-capacity", "rate_limit_info": {
+                "status": "rejected", "rateLimitType": "five_hour", "resetsAt": reset,
+                "unifiedWindows": {"five_hour": {"utilization": 1}}, "isUsingOverage": False}},
+            {"type": "result", "session_id": "sid-capacity", "is_error": True,
+             "subtype": "success", "terminal_reason": "api_error", "api_error_status": 429},
+        )), encoding="utf-8")
+        meta = {**child.metadata, "worker_type": "frame", "route_id": "rt-capacity",
+                "route_hash": "sha256:" + "a" * 64, "route_node": "frame",
+                "model_role": "deep maker", "model_profile": "top", "harness": "claude",
+                "log_file": str(log)}
+        fields = child.raw.rstrip("\n").split("\t")
+        fields[5] = ",".join(f"{key}={value}" for key, value in meta.items())
+        child = JOIN.ChildRow(order=child.order, status=child.status, slug=child.slug,
+                              attempt_id=child.attempt_id, raw="\t".join(fields), metadata=meta)
+        self.jobs.write_text(child.raw + "\n", encoding="utf-8")
+        raw_before = log.read_bytes()
+
+        for observed, process in (("wait", "live"), ("recover", "unverifiable")):
+            with self.subTest(process=process), mock.patch.object(
+                    JOIN, "observed_attempt_liveness",
+                    return_value=SimpleNamespace(state=observed, process_state=process)):
+                self.assertEqual(JOIN.close_finished_child(child, jobs=self.jobs), "typed-capacity")
+            self.assertEqual(JOIN.exact_attempt_row(self.jobs, child.attempt_id).status, "open")
+
+        with mock.patch.object(JOIN, "run_route_completion") as completion, \
+             mock.patch.object(JOIN, "observed_attempt_liveness",
+                return_value=SimpleNamespace(state="reconcile-needed", process_state="quiescent")):
+            result = JOIN.close_finished_child(child, jobs=self.jobs)
+
+        self.assertEqual(result, "")
+        completion.assert_not_called()
+        settled = JOIN.exact_attempt_row(self.jobs, child.attempt_id)
+        self.assertEqual(settled.status, "done")
+        self.assertEqual(settled.metadata["note"], "dead-capacity")
+        self.assertEqual(settled.metadata["failure_class"], "capacity")
+        self.assertEqual(settled.metadata["reconcile_reason"],
+                         "terminal-invalid:claude-result-capacity")
+        self.assertEqual(settled.metadata["capacity_log"], str(log))
+        self.assertEqual(int(settled.metadata["reset"]), reset)
+        self.assertEqual(settled.metadata["quota_window"], "five_hour")
+        self.assertEqual(settled.metadata["quota_model_scope"], "all")
+        self.assertEqual(log.read_bytes(), raw_before)
+
+        settled_row_bytes = self.jobs.read_bytes()
+        self.assertFalse(D.close_attempt_row(
+            self.jobs, child.attempt_id, "dead-capacity",
+            evidence={"quota_window": "five_hour", "quota_model_scope": "all"},
+        ))
+        for key, value in (("quota_window", "one_minute"),
+                           ("quota_model_scope", "another-model")):
+            with self.subTest(immutable_key=key), self.assertRaises(D.DispatchContractError) as caught:
+                D.annotate_attempt_row(self.jobs, child.attempt_id, {key: value})
+            self.assertEqual(caught.exception.reason, "attempt-immutable-metadata-mutation")
+        self.assertEqual(self.jobs.read_bytes(), settled_row_bytes)
+
     def test_a_receipt_settles_only_an_open_stage_child_that_finished_with_a_readable_pass(self):
         """A1 F17: the runtime, not the parent, closes a finished PASS still open at delivery."""
         cases = {

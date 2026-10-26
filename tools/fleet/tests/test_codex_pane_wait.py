@@ -76,43 +76,93 @@ class CodexPaneWaitTest(unittest.TestCase):
         sid = "01a0c233-96b3-7cf3-871b-7beb1fc71679"
         session = SimpleNamespace(pid=123, proc_start="start-1", cwd="/work")
         panes = [{"pane_id": "w1:p1", "agent": "codex", "cwd": "/work"}]
-        evidence = herdr.PaneEvidence((set(), {123}, {}), complete=True)
-        with mock.patch.object(herdr, "list_panes", return_value=panes) as pane_list, \
-             mock.patch.object(herdr, "pane_evidence", return_value=evidence), \
+        process_info = {"foreground_process_group_id": 123,
+                        "foreground_processes": [{"pid": 123, "name": "codex"}]}
+        evidence = herdr.PaneEvidence((set(), {123}, {}), complete=True,
+                                      pane_infos={"w1:p1": process_info})
+        observation = SimpleNamespace(generation=7)
+
+        def observed(*_args, bindings=None, **_kwargs):
+            bindings[123] = {"w1:p1"}
+            return evidence
+
+        with mock.patch.object(herdr, "list_panes", return_value=(panes, observation)) as pane_list, \
+             mock.patch.object(herdr, "pane_evidence", side_effect=observed) as read_panes, \
              mock.patch.object(procscan, "read_proc_start", return_value="start-1"), \
-             mock.patch.object(pane_ownership, "current_codex_thread", return_value=sid):
+             mock.patch.object(pane_ownership, "current_codex_thread", return_value=sid) as current:
             self.assertEqual(herdr.codex_pane_sessions(
                 [session], force_current=True, wait_timeout=0.2), {123: sid})
-        pane_list.assert_called_once_with(wait_timeout=0.2)
+        pane_list.assert_called_once_with(wait_timeout=0.2, with_observation=True)
+        self.assertIs(read_panes.call_args.kwargs["observation"], observation)
+        current.assert_called_once_with("w1:p1", 123, process_info=process_info)
 
-        with mock.patch.object(herdr, "list_panes", return_value=panes), \
-             mock.patch.object(herdr, "pane_evidence", return_value=evidence), \
+        with mock.patch.object(herdr, "list_panes", return_value=(panes, None)), \
+             mock.patch.object(herdr, "pane_evidence", side_effect=observed), \
              mock.patch.object(procscan, "read_proc_start", return_value="reused-start"), \
              mock.patch.object(pane_ownership, "current_codex_thread", return_value=sid):
             self.assertEqual(herdr.codex_pane_sessions([session], force_current=True), {})
 
         no_foreground = herdr.PaneEvidence((set(), set(), {}), complete=True)
-        with mock.patch.object(herdr, "list_panes", return_value=panes), \
-             mock.patch.object(herdr, "pane_evidence", return_value=no_foreground), \
+        def no_binding(*_args, bindings=None, **_kwargs):
+            return no_foreground
+        with mock.patch.object(herdr, "list_panes", return_value=(panes, None)), \
+             mock.patch.object(herdr, "pane_evidence", side_effect=no_binding), \
              mock.patch.object(procscan, "read_proc_start", return_value="start-1"), \
              mock.patch.object(pane_ownership, "current_codex_thread", return_value=sid):
             self.assertEqual(herdr.codex_pane_sessions([session], force_current=True), {})
+
+    def test_current_thread_uses_only_the_exact_pane_candidate(self):
+        import pane_ownership
+
+        sid = "01a0c233-96b3-7cf3-871b-7beb1fc71679"
+        session = SimpleNamespace(pid=123, proc_start="start-1", cwd="/work")
+        panes = [{"pane_id": "w1:p1", "agent": "codex", "cwd": "/work"},
+                 {"pane_id": "w1:p2", "agent": "codex", "cwd": "/work"}]
+        process_info = {"foreground_process_group_id": 123,
+                        "foreground_processes": [{"pid": 123, "name": "codex"}]}
+        evidence = herdr.PaneEvidence((set(), {123}, {}), complete=True,
+                                      pane_infos={"w1:p2": process_info})
+
+        def observed(*_args, bindings=None, **_kwargs):
+            bindings[123] = {"w1:p2"}
+            return evidence
+
+        with mock.patch.object(herdr, "list_panes", return_value=(panes, None)), \
+             mock.patch.object(herdr, "pane_evidence", side_effect=observed), \
+             mock.patch.object(procscan, "read_proc_start", return_value="start-1"), \
+             mock.patch.object(pane_ownership, "current_codex_thread", return_value=sid) as current:
+            self.assertEqual(herdr.codex_pane_sessions([session], force_current=True), {123: sid})
+        current.assert_called_once_with("w1:p2", 123, process_info=process_info)
+
+        def ambiguous(*_args, bindings=None, **_kwargs):
+            bindings[123] = {"w1:p1", "w1:p2"}
+            return evidence
+        with mock.patch.object(herdr, "list_panes", return_value=panes), \
+             mock.patch.object(herdr, "observation_view", return_value=None), \
+             mock.patch.object(herdr, "pane_evidence", side_effect=ambiguous), \
+             mock.patch.object(procscan, "read_proc_start", return_value="start-1"), \
+             mock.patch.object(pane_ownership, "current_codex_thread") as current:
+            self.assertEqual(herdr.codex_pane_sessions([session], force_current=True), {})
+        current.assert_not_called()
 
     def test_warm_fast_tick_reuses_sid_without_a_second_pane_read(self):
         sid = "01a0c233-96b3-7cf3-871b-7beb1fc71679"
         session = SimpleNamespace(pid=123, proc_start="start-1", cwd="/work")
         panes = [{"pane_id": "w1:p1", "agent": "codex", "cwd": "/work"}]
         evidence = herdr.PaneEvidence((set(), {123}, {}), complete=True)
+        def observed(*_args, bindings=None, **_kwargs):
+            bindings[123] = {"w1:p1"}
+            return evidence
         old_cache = dict(herdr._CODEX_PANE_CACHE)
         self.addCleanup(lambda: herdr._CODEX_PANE_CACHE.update(old_cache))
         herdr._CODEX_PANE_CACHE.update(key=None, until=0.0, identities={})
-        with mock.patch.object(herdr, "list_panes", return_value=panes) as pane_list, \
-             mock.patch.object(herdr, "pane_evidence", return_value=evidence), \
+        with mock.patch.object(herdr, "list_panes", return_value=(panes, None)) as pane_list, \
+             mock.patch.object(herdr, "pane_evidence", side_effect=observed), \
              mock.patch.object(procscan, "read_proc_start", return_value="start-1"):
             with mock.patch("pane_ownership.current_codex_thread", return_value=sid):
                 self.assertEqual(herdr.codex_pane_sessions([session]), {123: sid})
                 self.assertEqual(herdr.codex_pane_sessions([session]), {123: sid})
-        pane_list.assert_called_once_with(wait_timeout=0.0)
+        pane_list.assert_called_once_with(wait_timeout=0.0, with_observation=True)
 
 
 if __name__ == "__main__":
