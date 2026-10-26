@@ -49,7 +49,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "utilities") not in sys.path:
@@ -1084,27 +1084,29 @@ def run_suite_with_scratch(
     try:
         result = run_suite(suite, root, env, profile, timeout)
     except BaseException:
-        current = _root_identity(tmp_root)
-        if identity is not None and current == identity and current[2] == stat.S_IFDIR:
+        def consume_child_stderr(child_stderr: str) -> None:
+            print("suite-fixture-child-stderr-after-interruption:", file=sys.stderr)
+            sys.stderr.write(child_stderr)
+            if not child_stderr.endswith("\n"):
+                sys.stderr.write("\n")
+            sys.stderr.flush()
+
+        try:
+            finalize_suite_attempt(
+                None, env, tmp_root, identity,
+                child_stderr_consumer=consume_child_stderr,
+            )
+        except BaseException as cleanup_exc:
+            # A cleanup failure must not replace the exception that interrupted
+            # the suite. The common finalizer leaves uncertain roots in place.
             try:
-                reap_suite_tmp_processes(tmp_root)
-            except Exception as exc:
                 print(
-                    f"suite-fixture-scratch-preserved: reason=interrupted-reap-error "
-                    f"root={tmp_root} detail={exc}",
+                    f"suite-fixture-scratch-preserved: reason=interrupted-finalization-error "
+                    f"root={tmp_root} detail={cleanup_exc}",
                     file=sys.stderr,
                 )
-        else:
-            print(
-                f"suite-fixture-scratch-preserved: reason=interrupted-root-identity-changed "
-                f"root={tmp_root}",
-                file=sys.stderr,
-            )
-        print(
-            f"suite-fixture-scratch-preserved: reason=interrupted-attempt-output "
-            f"root={tmp_root}",
-            file=sys.stderr,
-        )
+            except BaseException:
+                pass
         raise
     if isinstance(result, SuiteResult):
         return finalize_suite_attempt(result, env, tmp_root, identity)
@@ -1353,9 +1355,10 @@ def cleanup_suite_tmp_root(
 
 
 def finalize_suite_attempt(
-    result: SuiteResult, env: dict[str, str], tmp_root: Path,
+    result: SuiteResult | None, env: dict[str, str], tmp_root: Path,
     identity: tuple[int, int, int] | None,
-) -> SuiteResult:
+    *, child_stderr_consumer: Callable[[str], None] | None = None,
+) -> SuiteResult | None:
     """Settle owned helpers, preserve their final stderr, then retire scratch."""
     current = _root_identity(tmp_root)
     if identity is None or current != identity or current[2] != stat.S_IFDIR:
@@ -1374,16 +1377,27 @@ def finalize_suite_attempt(
             file=sys.stderr,
         )
     output_error = None
+    output_error_reason = "child-stderr-unreadable"
     try:
         child_stderr = collect_child_stderr(env, remove=False, strict=True)
     except OSError as exc:
         child_stderr = ""
         output_error = exc
-    if not result.passed and child_stderr:
+    if result is not None and not result.passed and child_stderr:
         combined = (result.child_stderr or "") + child_stderr
         if len(combined) > _CHILD_STDERR_LIMIT:
             combined = "[earlier child stderr truncated]\n" + combined[-_CHILD_STDERR_LIMIT:]
         result.child_stderr = combined
+    elif result is None and child_stderr:
+        if child_stderr_consumer is None:
+            output_error = OSError("interrupted child stderr has no diagnostic consumer")
+            output_error_reason = "child-stderr-consumer-unavailable"
+        else:
+            try:
+                child_stderr_consumer(child_stderr)
+            except BaseException as exc:
+                output_error = exc
+                output_error_reason = "child-stderr-consumer-failed"
     if survivors is None:
         print(f"suite-fixture-scratch-preserved: process-state-unreadable root={tmp_root}", file=sys.stderr)
     elif survivors:
@@ -1394,7 +1408,7 @@ def finalize_suite_attempt(
         )
     elif output_error is not None:
         print(
-            f"suite-fixture-scratch-preserved: reason=child-stderr-unreadable "
+            f"suite-fixture-scratch-preserved: reason={output_error_reason} "
             f"root={tmp_root} detail={output_error}",
             file=sys.stderr,
         )

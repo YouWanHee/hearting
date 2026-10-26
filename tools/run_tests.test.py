@@ -897,6 +897,222 @@ class SuiteScratchLifetimeFixture(RunTestsFixtureBase):
             self.assertTrue(replaced.is_symlink())
 
 
+class SuiteScratchExceptionFinalizationFixture(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.mod = load_runner_module()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def make_attempt(self, name):
+        attempt_root = self.root / name
+        log_dir = attempt_root / "child-stderr"
+        log_dir.mkdir(parents=True)
+        identity = self.mod.register_fixture_root(attempt_root)
+        log = log_dir / "child.log"
+        log.write_text("early child stderr\n", encoding="utf-8")
+        env = {self.mod.CHILD_STDERR_ENV: str(log_dir)}
+        return attempt_root, identity, log, env
+
+    def recording_stderr(self, attempt_root):
+        class RecordingStderr(io.StringIO):
+            root_was_live_when_consumed = False
+
+            def write(inner_self, value):
+                if "final child stderr" in value:
+                    inner_self.root_was_live_when_consumed = attempt_root.is_dir()
+                return super(RecordingStderr, inner_self).write(value)
+
+        return RecordingStderr()
+
+    def test_runtime_error_and_keyboard_interrupt_finalize_then_reraise_original(self):
+        for error in (RuntimeError("synthetic runner failure"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                attempt_root, identity, log, env = self.make_attempt(type(error).__name__)
+                events = []
+                stderr = self.recording_stderr(attempt_root)
+
+                def settle(_tmp_root):
+                    events.append("settled")
+                    with log.open("a", encoding="utf-8") as stream:
+                        stream.write("final child stderr\n")
+                    return []
+
+                with mock.patch.object(self.mod, "run_suite", side_effect=error), \
+                        mock.patch.object(self.mod, "reap_suite_tmp_processes", side_effect=settle), \
+                        mock.patch.object(self.mod.sys, "stderr", stderr):
+                    with self.assertRaises(type(error)) as raised:
+                        self.mod.run_suite_with_scratch(
+                            self.root / "suite.test.py", self.root, env,
+                            "isolated", 1, attempt_root, identity,
+                        )
+
+                self.assertIs(raised.exception, error)
+                self.assertIn("early child stderr", stderr.getvalue())
+                self.assertIn("final child stderr", stderr.getvalue())
+                self.assertTrue(stderr.root_was_live_when_consumed)
+                self.assertEqual(events, ["settled"])
+                self.assertFalse(attempt_root.exists())
+
+    def test_popen_failure_uses_common_finalizer_and_reraises_original(self):
+        attempt_root, identity, log, env = self.make_attempt("popen-failure")
+        suite = write_suite(self.root, "spawn-failure.test.py", "print('not launched')")
+        error = FileNotFoundError("synthetic Popen failure")
+        stderr = self.recording_stderr(attempt_root)
+
+        def settle(_tmp_root):
+            with log.open("a", encoding="utf-8") as stream:
+                stream.write("final child stderr\n")
+            return []
+
+        with mock.patch.object(self.mod, "_suite_progress"), \
+                mock.patch.object(self.mod.subprocess, "Popen", side_effect=error), \
+                mock.patch.object(self.mod, "reap_suite_tmp_processes", side_effect=settle), \
+                mock.patch.object(self.mod.sys, "stderr", stderr):
+            with self.assertRaises(FileNotFoundError) as raised:
+                self.mod.run_suite_with_scratch(
+                    suite, self.root, env, "isolated", 1, attempt_root, identity,
+                )
+
+        self.assertIs(raised.exception, error)
+        self.assertIn("final child stderr", stderr.getvalue())
+        self.assertTrue(stderr.root_was_live_when_consumed)
+        self.assertFalse(attempt_root.exists())
+
+    def test_cleanup_baseexception_does_not_replace_runner_exception(self):
+        attempt_root, identity, log, env = self.make_attempt("cleanup-interrupted")
+        error = RuntimeError("original suite error")
+        stderr = self.recording_stderr(attempt_root)
+
+        with mock.patch.object(self.mod, "run_suite", side_effect=error), \
+                mock.patch.object(
+                    self.mod, "reap_suite_tmp_processes",
+                    side_effect=KeyboardInterrupt("cleanup interrupted"),
+                ), \
+                mock.patch.object(self.mod.sys, "stderr", stderr):
+            with self.assertRaises(RuntimeError) as raised:
+                self.mod.run_suite_with_scratch(
+                    self.root / "suite.test.py", self.root, env,
+                    "isolated", 1, attempt_root, identity,
+                )
+
+        self.assertIs(raised.exception, error)
+        self.assertTrue(attempt_root.is_dir())
+        self.assertTrue(log.is_file())
+        self.assertIn("interrupted-finalization-error", stderr.getvalue())
+
+    def test_live_unknown_and_unreadable_output_preserve_scratch_and_diagnostics(self):
+        cases = (
+            ("live", [88031], False, "owned-process-live-or-unreadable"),
+            ("unknown", None, False, "process-state-unreadable"),
+            ("unreadable-output", [], True, "child-stderr-unreadable"),
+        )
+        for name, settlement, unreadable, reason in cases:
+            with self.subTest(name=name):
+                attempt_root, identity, log, env = self.make_attempt(name)
+                error = RuntimeError(f"{name} runner error")
+                stderr = self.recording_stderr(attempt_root)
+
+                def settle(_tmp_root):
+                    if not unreadable:
+                        with log.open("a", encoding="utf-8") as stream:
+                            stream.write("final child stderr\n")
+                    return settlement
+
+                patches = [
+                    mock.patch.object(self.mod, "run_suite", side_effect=error),
+                    mock.patch.object(self.mod, "reap_suite_tmp_processes", side_effect=settle),
+                    mock.patch.object(self.mod.sys, "stderr", stderr),
+                ]
+                if unreadable:
+                    patches.append(mock.patch.object(
+                        self.mod, "collect_child_stderr",
+                        side_effect=PermissionError("fixture child log unreadable"),
+                    ))
+                with contextlib.ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    with self.assertRaises(RuntimeError) as raised:
+                        self.mod.run_suite_with_scratch(
+                            self.root / "suite.test.py", self.root, env,
+                            "isolated", 1, attempt_root, identity,
+                        )
+
+                self.assertIs(raised.exception, error)
+                self.assertTrue(attempt_root.is_dir())
+                self.assertIn(reason, stderr.getvalue())
+                if unreadable:
+                    self.assertNotIn("final child stderr", stderr.getvalue())
+                    self.assertTrue(log.is_file())
+                else:
+                    self.assertIn("final child stderr", stderr.getvalue())
+                    self.assertTrue(stderr.root_was_live_when_consumed)
+
+    def test_failed_diagnostic_consumer_preserves_scratch_and_original_exception(self):
+        attempt_root, identity, log, env = self.make_attempt("consumer-failure")
+        error = RuntimeError("original suite error")
+
+        class BrokenStderr(io.StringIO):
+            def write(inner_self, value):
+                if "final child stderr" in value:
+                    raise BrokenPipeError("diagnostic output closed")
+                return super(BrokenStderr, inner_self).write(value)
+
+        stderr = BrokenStderr()
+
+        def settle(_tmp_root):
+            with log.open("a", encoding="utf-8") as stream:
+                stream.write("final child stderr\n")
+            return []
+
+        with mock.patch.object(self.mod, "run_suite", side_effect=error), \
+                mock.patch.object(self.mod, "reap_suite_tmp_processes", side_effect=settle), \
+                mock.patch.object(self.mod.sys, "stderr", stderr):
+            with self.assertRaises(RuntimeError) as raised:
+                self.mod.run_suite_with_scratch(
+                    self.root / "suite.test.py", self.root, env,
+                    "isolated", 1, attempt_root, identity,
+                )
+
+        self.assertIs(raised.exception, error)
+        self.assertTrue(attempt_root.is_dir())
+        self.assertTrue(log.is_file())
+        self.assertIn("child-stderr-consumer-failed", stderr.getvalue())
+
+    def test_replaced_root_preserves_external_target_and_sibling_on_interruption(self):
+        attempt_root, identity, _log, env = self.make_attempt("replaced-root")
+        external = self.root / "external"
+        sibling = self.root / "sibling"
+        external.mkdir()
+        sibling.mkdir()
+        sentinel = external / "sentinel"
+        sentinel.write_text("keep", encoding="utf-8")
+        error = RuntimeError("suite failed after replacing its scratch root")
+        stderr = self.recording_stderr(attempt_root)
+
+        def replace_then_raise(*_args):
+            import shutil
+            shutil.rmtree(attempt_root)
+            attempt_root.symlink_to(external, target_is_directory=True)
+            raise error
+
+        with mock.patch.object(self.mod, "run_suite", side_effect=replace_then_raise), \
+                mock.patch.object(self.mod.sys, "stderr", stderr):
+            with self.assertRaises(RuntimeError) as raised:
+                self.mod.run_suite_with_scratch(
+                    self.root / "suite.test.py", self.root, env,
+                    "isolated", 1, attempt_root, identity,
+                )
+
+        self.assertIs(raised.exception, error)
+        self.assertTrue(attempt_root.is_symlink())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+        self.assertTrue(sibling.is_dir())
+        self.assertIn("root-identity-changed", stderr.getvalue())
+
+
 class InstalledLayoutLifetimeFixture(RunTestsFixtureBase):
     def test_shared_layout_lives_through_diagnostics_then_is_removed(self):
         mod = load_runner_module()
