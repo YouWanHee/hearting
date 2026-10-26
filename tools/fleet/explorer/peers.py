@@ -236,6 +236,7 @@ def _draw_links_compact(grid, vm, state, links, opened, x, y, use, right, bottom
     for link in links:
         if y + 1 >= bottom:
             grid.put(x + 2, bottom - 1, f"… {len(links)} links", "dim", limit=right)
+            _mark_page_incomplete(grid)
             return
         frm, to, kind, when, note = link[:5]
         start0, start1 = x + 2, x + 20
@@ -426,6 +427,11 @@ def draw_peers(grid, vm, state, x=34, y=3):
     if opened:
         links = tuple(link for link in links
                       if any(isinstance(end, (list, tuple)) and str(end[0]) == opened for end in link[:2]))
+    if links:
+        report_end = getattr(grid, "report_natural_page_end", None)
+        if report_end is not None:
+            last_row = y + (2 + 2 * len(links) - 1 if use < 75 else 2 + len(links) - 1)
+            report_end(last_row)
     if use < 75 and links:
         if y + 2 < bottom:
             _draw_links_compact(grid, vm, state, links, opened, x, y, use, right, bottom)
@@ -452,10 +458,15 @@ def _draw_links(grid, state, session_by_tag, links, opened, x, y, use, right):
         grid.put(x + off, y, label, "head", tint=234, limit=right)
     y += 1
     room = grid.rows - 6 - y
+    if getattr(grid, "complete_page", False):
+        # The natural-end repaint uses the row otherwise reserved between the
+        # renderer's internal limit and the shared bottom probe.
+        room += 1
     shown = links if len(links) <= room else links[:max(0, room - 1)]
     if len(shown) < len(links):
         more = len(links) - len(shown)
         grid.put(x + 3, y + len(shown), f"… {more} more link{'' if more == 1 else 's'}", "dim", limit=right)
+        _mark_page_incomplete(grid)
 
     def endpoint(px, py, value, limit):
         if isinstance(value, (tuple, list)) and value:
@@ -482,3 +493,9 @@ def _draw_links(grid, state, session_by_tag, links, opened, x, y, use, right):
         grid.put(x + 51, y, str(when), "dim", limit=right)
         grid.put(x + 64, y, _clip(str(note), max(0, use - 64)), "now_sub", limit=right)
         y += 1
+
+
+def _mark_page_incomplete(grid):
+    mark = getattr(grid, "mark_page_incomplete", None)
+    if mark is not None:
+        mark()

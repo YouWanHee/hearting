@@ -101,7 +101,7 @@ class _PageGrid(CellGrid):
     final painted body row without materializing the intervening canvas.
     """
 
-    def __init__(self, cols, rows, pane_x, keep_rows=()):
+    def __init__(self, cols, rows, pane_x, keep_rows=(), complete_page=False):
         self.cols, self.rows = max(0, int(cols)), max(0, int(rows))
         self.pane_x = int(pane_x)
         self.probe_y = max(0, self.rows - 5)
@@ -111,8 +111,20 @@ class _PageGrid(CellGrid):
         self.hits = []
         self.trace = CellGrid.default_trace
         self.pane_clip = None
+        self.complete_page = bool(complete_page)
+        self.page_incomplete = False
+        self.probe_overflow = False
+        self.natural_page_end = None
         self.last_content_row = 2
         self.last_hit_row = 2
+
+    def mark_page_incomplete(self):
+        """Record renderer-side clipping that is not visible at the bottom probe."""
+        self.page_incomplete = True
+
+    def report_natural_page_end(self, y):
+        y = int(y)
+        self.natural_page_end = max(y, self.natural_page_end or 2)
 
     def _keeps(self, y):
         return y == self.probe_y or self.keep_start <= y < self.keep_end
@@ -171,8 +183,8 @@ def _draw_page(grid, vm, state):
         resources.draw_system(grid, vm, state)
 
 
-def _page_canvas(vm, state, cols, logical_rows, pane_x, keep_rows=()):
-    grid = _PageGrid(cols, logical_rows, pane_x, keep_rows)
+def _page_canvas(vm, state, cols, logical_rows, pane_x, keep_rows=(), complete_page=False):
+    grid = _PageGrid(cols, logical_rows, pane_x, keep_rows, complete_page)
     spill_y = max(0, int(logical_rows) - 5)
     for x in range(pane_x, grid.cols):
         grid.put(x, spill_y, "━", "line")
@@ -181,8 +193,8 @@ def _page_canvas(vm, state, cols, logical_rows, pane_x, keep_rows=()):
         grid.pane_clip = (pane_x - 1, grid.cols - 1)
     _draw_page(grid, vm, state)
     grid.pane_clip = None
-    overflow = tuple(grid.cells[spill_y][pane_x:]) != baseline
-    return grid, overflow
+    grid.probe_overflow = tuple(grid.cells[spill_y][pane_x:]) != baseline
+    return grid, grid.probe_overflow
 
 
 def _page_end(grid, pane_x, logical_rows):
@@ -190,12 +202,15 @@ def _page_end(grid, pane_x, logical_rows):
     limit = max(3, int(logical_rows) - 5)
     content = grid.last_content_row if 3 <= grid.last_content_row < limit else 2
     hits = grid.last_hit_row if 3 <= grid.last_hit_row < limit else 2
-    return max(content, hits)
+    return max(content, hits, grid.natural_page_end or 2)
 
 
 def _page_max(grid, pane_x, logical_rows, viewport_rows, offset, overflow):
     if viewport_rows <= 0:
         return 0
+    if grid.natural_page_end is not None:
+        last = _page_end(grid, pane_x, logical_rows)
+        return max(0, last - (3 + int(viewport_rows) - 1))
     if overflow:
         return max(0, int(offset)) + int(viewport_rows)
     last = _page_end(grid, pane_x, logical_rows)
@@ -217,7 +232,9 @@ def measure_pane_max(view_model, nav_state, cols, rows):
     logical_rows = max(view_rows + viewport_rows, view_rows + 1)
     while True:
         grid, overflow = _page_canvas(vm, state, int(cols), logical_rows, pane_x)
-        if not overflow:
+        if grid.natural_page_end is not None:
+            return _page_max(grid, pane_x, logical_rows, viewport_rows, 0, overflow)
+        if not overflow and not grid.page_incomplete:
             return max(0, _page_end(grid, pane_x, logical_rows) -
                        (3 + viewport_rows - 1))
         logical_rows = max(logical_rows + viewport_rows, logical_rows * 2)
@@ -241,21 +258,30 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
     grid = CellGrid(cols, rows)
     tree_layout = chrome.draw_explorer(grid, vm, state)
 
-    def render_page(offset):
+    def render_page(offset, complete_page=False):
         logical_rows = max(1, view_rows + offset)
         shift = 1 + pushed_rows
         keep_start = max(0, content_top - shift + offset)
         keep_end = max(keep_start, body_end - shift + offset)
         page, overflow = _page_canvas(vm, state, int(cols), logical_rows, pane_x,
-                                      (keep_start, keep_end))
+                                      (keep_start, keep_end), complete_page)
+        overflow = overflow or page.page_incomplete
         maximum = _page_max(page, pane_x, logical_rows, viewport_rows, offset, overflow)
         return page, overflow, maximum, logical_rows
 
     page, overflow, pane_max, logical_rows = render_page(requested)
     effective = requested
-    if not overflow and effective > pane_max:
+    if page.natural_page_end is not None and effective > pane_max:
         effective = pane_max
         page, overflow, pane_max, logical_rows = render_page(effective)
+    elif not overflow and effective > pane_max:
+        effective = pane_max
+        page, overflow, pane_max, logical_rows = render_page(effective)
+
+    if (page.page_incomplete and page.natural_page_end is not None and
+            effective >= pane_max):
+        # At the natural end, use the row reserved for the renderer's continuation marker.
+        page, overflow, pane_max, logical_rows = render_page(effective, complete_page=True)
 
     # Page renderers draw from row 3. The shared header owns row 3, so the page
     # starts one row lower; usage uses its existing two-row push as well.
@@ -276,7 +302,7 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
             grid.hits.append(Hit(screen_y, hit.x0, hit.x1, hit.action))
     grid.hits = [hit for hit in grid.hits if hit.y < body_end or hit.y == -1]
     chrome.draw_chrome(grid, vm, state, beat)
-    if overflow and body_end < grid.rows:
+    if page.probe_overflow and body_end < grid.rows:
         grid.put(max(0, grid.cols - 18), body_end, " ↓ more below ", "dim", limit=grid.cols - 1)
     parent = "-"
     if state.scope.startswith("session:"):

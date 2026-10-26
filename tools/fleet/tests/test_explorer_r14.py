@@ -185,6 +185,65 @@ class R14Renderer(unittest.TestCase):
         self.assertIn("q1399", "\n".join(end.text_rows()))
         self.assertTrue(all(0 <= hit.y < 20 for hit in end.hits if hit.y >= 0))
 
+    def test_peers_end_and_stale_restore_reach_fixture_tail_in_wide_and_compact_layouts(self):
+        from unittest.mock import patch
+        import tools.fleet.explorer.frame as frame
+
+        links = tuple((self.vm.peer_edges or {}).get("links", ()))
+        self.assertGreater(len(links), 1)
+        tail = links[-1]
+        tail_to = tail[1]
+        tail_identity = str(tail_to[0]) if isinstance(tail_to, (list, tuple)) else str(tail_to)
+        tail_kind, tail_when = str(tail[2]), str(tail[3])
+
+        def assert_tail_text(frame):
+            rows = frame.text_rows()
+            identity_rows = [index for index, row in enumerate(rows) if tail_identity in row]
+            detail_rows = [index for index, row in enumerate(rows)
+                           if tail_kind in row and tail_when in row]
+            self.assertTrue(identity_rows, "final PEERS link endpoint is absent")
+            self.assertTrue(detail_rows, "final PEERS link kind/time text is absent")
+            self.assertTrue(any(detail in (identity, identity + 1)
+                                for identity in identity_rows for detail in detail_rows),
+                            "final endpoint and its link text are not painted together")
+
+        for cols in (120, 100):
+            with self.subTest(cols=cols):
+                with patch.object(frame, "measure_pane_max", wraps=measure_pane_max) as measured:
+                    first = draw(self.vm, NavState(view="PEERS"), cols=cols, rows=24)
+                    measured.assert_not_called()
+
+                maximum = measure_pane_max(self.vm, NavState(view="PEERS"), cols, 24)
+                end = draw(self.vm, NavState(view="PEERS", scroll=(("pane", maximum),)),
+                           cols=cols, rows=24)
+                end_text = "\n".join(end.text_rows())
+                self.assertEqual(end.pane_scroll[4], maximum)
+                self.assertEqual(end.pane_scroll[5], maximum)
+                self.assertFalse(end.pane_scroll[7])
+                self.assertIn(tail_identity, end_text)
+                self.assertIn(tail_kind, end_text)
+                self.assertIn(tail_when, end_text)
+                assert_tail_text(end)
+
+                restored = draw(self.vm, NavState(view="PEERS", scroll=(("pane", 1 << 20),)),
+                                cols=cols, rows=24)
+                restored_text = "\n".join(restored.text_rows())
+                self.assertEqual(restored.pane_scroll[4], maximum)
+                self.assertEqual(restored.pane_scroll[5], maximum)
+                self.assertFalse(restored.pane_scroll[7])
+                self.assertIn(tail_identity, restored_text)
+                self.assertIn(tail_kind, restored_text)
+                self.assertIn(tail_when, restored_text)
+                assert_tail_text(restored)
+
+        intermediate = draw(self.vm, NavState(view="PEERS", scroll=(("pane", 36),)),
+                             cols=120, rows=24)
+        intermediate_text = "\n".join(intermediate.text_rows())
+        self.assertIn("more link", intermediate_text)
+        self.assertNotIn(tail_identity, intermediate_text)
+        self.assertEqual(intermediate.pane_scroll[4:6], (36, 37))
+        self.assertTrue(intermediate.pane_scroll[7])
+
     def test_keyboard_session_selection_reveals_its_identity_in_scrolled_tree(self):
         frame = draw(self.vm, NavState(scroll=(("tree", 6),)), cols=120, rows=40)
         order = tuple("session:" + str(item.get("tag")) for item in self.vm.sessions)
