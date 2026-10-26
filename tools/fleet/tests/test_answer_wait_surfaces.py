@@ -1727,7 +1727,7 @@ class FleetWorkflowQuestionIntegrationTests(unittest.TestCase):
                              "hearting-human-gate" if source == "S2" else
                              "hearting-answer-marker")
             self.assertEqual(envelope["support"]["reason"],
-                             "workflow-release-missing-expected-raise-binding" if source == "S2" else
+                             "workflow-gate-artifact-unavailable" if source == "S2" else
                              "marker-has-no-bound-native-response-surface")
             question_body = envelope["detail"].get("question")
             display_detail = question_body or envelope["detail"].get("gate")

@@ -1554,7 +1554,7 @@ def _workflow_route_source(jobs, item):
         return None, None, "workflow-route-source-unavailable:" + type(exc).__name__
 
 
-def _workflow_gate_source(jobs, item):
+def _workflow_gate_source(jobs, item, *, allow_missing_artifact=False):
     """Bind a selected S2 row to the journal's current raise and sealed route."""
     route_path, route, error = _workflow_route_source(jobs, item)
     if route is None:
@@ -1583,6 +1583,11 @@ def _workflow_gate_source(jobs, item):
         artifact = resolution.get("artifact")
         artifact_root = route.get("artifact_root")
         if not isinstance(artifact, str) or not isinstance(artifact_root, str):
+            if allow_missing_artifact:
+                return {"route_path": str(route_path), "route": route,
+                        "resolution": resolution, "gate_epoch": epoch,
+                        "artifact_sha256": None,
+                        "response_error": "workflow-gate-artifact-unavailable"}, None
             return None, "workflow-gate-artifact-unavailable"
         artifact_path = Path(artifact).expanduser().resolve(strict=True)
         root_path = Path(artifact_root).expanduser().resolve(strict=True)
@@ -1634,6 +1639,12 @@ def _workflow_gate_detail(binding, item):
     """Build selected-only questions from the current gate or its sealed interview."""
     route = binding["route"]
     gate = item.get("gate_id")
+    if binding.get("response_error"):
+        # A current legacy raise can still keep its selected private draft.
+        # Missing release input never becomes permission to release the gate.
+        return {"detail": {"gate": gate, "question": item.get("question"),
+                           "choices": item.get("choices") or []},
+                "choices": [], "interview": None}, binding["response_error"]
     interview, error = _workflow_gate_interview(binding, item)
     if error:
         return None, error
@@ -1864,7 +1875,7 @@ def _selected_base(ref):
         jobs, current = match
         if not _workflow_item_matches(base, current):
             return None, "workflow-gate-binding-changed"
-        binding, error = _workflow_gate_source(jobs, current)
+        binding, error = _workflow_gate_source(jobs, current, allow_missing_artifact=True)
         if binding is None:
             return None, error
         base["gate_epoch"] = binding["gate_epoch"]
@@ -2073,7 +2084,7 @@ def _workflow_selected_transport(base):
     if not _workflow_item_matches(base, item):
         return {"state": "unknown", "reason": "workflow-selected-binding-changed"}
     if source == "S2":
-        binding, error = _workflow_gate_source(jobs, item)
+        binding, error = _workflow_gate_source(jobs, item, allow_missing_artifact=True)
         if binding is None:
             return {"state": "unknown", "reason": error}
         native_ref = {"transport": "hearting-human-gate", "jobs_path": str(jobs),
@@ -2091,7 +2102,7 @@ def _workflow_selected_transport(base):
                 "question_id": item.get("gate_id"), "gate_epoch": binding["gate_epoch"],
                 "detail": detail.get("detail") if detail else None,
                 "choices": detail.get("choices", []) if detail else [],
-                "support": bool(detail), "reason": detail_error,
+                "support": bool(detail) and not detail_error, "reason": detail_error,
                 "native_ref": native_ref}
 
     snapshot, error = _workflow_owner_snapshot(base, expected_native_ref=base.get("native_ref"))
