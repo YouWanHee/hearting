@@ -197,6 +197,72 @@ class AnswerWaitSurfaceTests(unittest.TestCase):
         self.assertIn("◑답변 필요", title)
         self.assertIn("기존 제목", title)
 
+    def test_explorer_projects_only_current_safe_waits_and_counts_unattributed(self):
+        from fleet.explorer.frame import draw
+        from fleet.explorer.live import build_view_model
+        from fleet.explorer.state import NavState
+
+        private = "PRIVATE-WAIT-BODY-SENTINEL"
+        snapshot = {
+            "sessions": [{"harness": "claude", "session_id": "sid-a", "session_tag": "a1",
+                          "cwd": "/synthetic/repo", "liveness": "idle", "herdr_pane": "pane-a",
+                          "summary": private,
+                          "interaction_state": {"kind": "decision"}},
+                         {"harness": "codex", "session_id": "sid-b", "session_tag": "b1",
+                          "cwd": "/synthetic/repo", "liveness": "blocked",
+                          "interaction_state": {"kind": "decision"}}],
+            "project_of": lambda _cwd: "repo",
+            "answer_waits": {
+                "items": [
+                    {"id": "S1:approval", "source": "S1-approval", "kind": "approval",
+                     "since": 100, "stale": "current", "harness": "claude", "session_id": "sid-a",
+                     "question": private, "choices": ["PRIVATE-CHOICE-SENTINEL"]},
+                    {"id": "S2:unattributed", "source": "S2", "kind": "human gate",
+                     "since": 101, "stale": "current", "harness": None, "session_id": None,
+                     "question": private},
+                    {"id": "S4:older", "source": "S4", "kind": "decision",
+                     "since": 90, "stale": "older", "harness": "claude", "session_id": "sid-a"},
+                ],
+                "by_session": {}, "unattributed": ["S2:unattributed"],
+                "total": 2, "older": 1, "complete": True, "health": [],
+            },
+            "resources": [], "jobs": [],
+        }
+        vm = build_view_model(snapshot, now=1000)
+        self.assertEqual(len(vm.questions), 2)
+        self.assertEqual(vm.system["answer_waits"], {"state": "complete", "total": 2, "older": 1})
+        by_tag = {row["tag"]: row for row in vm.sessions}
+        self.assertEqual(by_tag["a1"]["ask"], "answer needed")
+        self.assertEqual(by_tag["a1"]["answer_wait_marker"], "●")
+        self.assertIsNone(by_tag["b1"]["ask"])
+        records = [dict(item) for item in vm.questions]
+        self.assertEqual({item["tag"] for item in records}, {"S1:approval", "S2:unattributed"})
+        self.assertEqual(next(item for item in records if item["tag"] == "S2:unattributed")["marker"], "◑")
+        self.assertTrue(all(not ({"question", "choices", "title", "now"} & set(item))
+                            for item in records))
+        frame = draw(vm, NavState(view="QUESTIONS"), 140, 45)
+        text = "\n".join(frame.text_rows())
+        self.assertIn("2 questions", text)
+        self.assertIn("older waits 1", text)
+        self.assertNotIn(private, text)
+        self.assertNotIn("PRIVATE-CHOICE-SENTINEL", text)
+
+    def test_incomplete_explorer_wait_cache_never_presents_zero(self):
+        from fleet.explorer.frame import draw
+        from fleet.explorer.live import build_view_model
+        from fleet.explorer.state import NavState
+
+        vm = build_view_model({"sessions": [], "resources": [],
+                               "answer_waits": {"items": [], "total": 0, "older": 0,
+                                                "complete": False,
+                                                "health": [{"source": "cache", "state": "failed"}]}})
+        self.assertEqual(vm.system["answer_waits"]["state"], "failed")
+        self.assertIsNone(vm.system["answer_waits"]["total"])
+        text = "\n".join(draw(vm, NavState(view="QUESTIONS"), 140, 45).text_rows())
+        self.assertIn("? question", text)
+        self.assertNotIn("0 questions", text)
+        self.assertIn("? waiting", text)
+
 
 if __name__ == "__main__":
     unittest.main()

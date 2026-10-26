@@ -85,6 +85,10 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
             marker, marker_key = {"working": ("⠏", "spin"), "blocked": ("●", "blocked"),
                                   "dead": ("✕", "dead"), "done": ("✓", "done")}.get(
                                       status, ("●", "idle"))
+            if session.get("answer_wait_marker") == "●":
+                marker, marker_key = "●", "blocked"
+            elif session.get("answer_wait_marker") == "◑":
+                marker, marker_key = "◑", "lvl_y"
             grid.put(x + IND + 1, y, marker, marker_key)
             tag_x = x + IND + 3
             grid.put(tag_x, y, "[", "dim")
@@ -108,9 +112,7 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
                 model_name = _clip(model_name, max(1, room))
                 grid.put(x + c["h"], y, harness, "hb_" + harness)
                 grid.put(x + c["h"] + len(harness), y, " (", "dim")
-                model_style = ("g_idle" if harness == "codex" and session.get("state") != "working"
-                               else "hb_" + harness)
-                grid.put(x + c["h"] + len(harness) + 2, y, model_name, model_style)
+                grid.put(x + c["h"] + len(harness) + 2, y, model_name, model_key)
                 pos = x + c["h"] + len(harness) + 2 + len(model_name)
                 effort = str(session.get("effort") or "")
                 if effort:
@@ -348,6 +350,16 @@ def _session_unfold(grid, vm, x, use, y, session, c):
     for line in (_wrap_cells(now, x + use - x_val) if now else ["·"]):
         grid.put(x_val, y, line, "now_sub" if now else "dim")
         y += 1
+    system = vm.system if hasattr(vm.system, "get") else {}
+    task = system.get("task_summary") if hasattr(system, "get") else None
+    if (hasattr(task, "get") and task.get("session_tag") == tag
+            and task.get("state") not in (None, "unknown", "failed")):
+        for name, key in (("TODO", "lvl_y"), ("DOING", "g_spin_dim"), ("DONE", "done")):
+            values = tuple(task.get(name.casefold()) or ())
+            grid.put(x_lab, y, name, key)
+            grid.put(x_val, y, ", ".join(values[:3]) or "·", "soft" if values else "dim",
+                     limit=right)
+            y += 1
     grid.put(x_lab, y, "ROUTE", "label")
     rows = [route for route in vm.routes
             if route.get("session_tag") == tag and route.get("state") != "done"]
@@ -359,18 +371,21 @@ def _session_unfold(grid, vm, x, use, y, session, c):
         grid.put(x_val, y, "·", "dim")
         y += 1
     grid.put(x_lab, y, "ASK", "label")
-    question = next((item for item in (vm.questions or ()) if item.get("tag") == tag), None)
+    question = next((item for item in (vm.questions or ())
+                     if item.get("session_tag") == tag), None)
     if question:
-        lead = [(str(question.get("kind")), "blocked"),
+        marker = str(question.get("marker") or "●")
+        lead = [(marker, "lvl_y" if marker == "◑" else "blocked"),
+                (" " + str(question.get("source") or question.get("kind") or "wait"), "blocked"),
                 (" · waiting " + str(question.get("wait")) + " · ", "dim")]
-        room = x + use - x_val - sum(_seg_width(text) for text, _key in lead) - 10
-        title_room = max(0, room)
-        from .grid import put_fit
-        cursor = put_fit(grid, x_val, y, lead + [(_clip(question.get("title") or "", title_room)
-                                                  if title_room else "", "soft"),
-                                                 ("  ", "branch_s")], limit=right - 1 - 8)
-        grid.put(cursor, y, "(open ▸)", "hearting", limit=right)
-        grid.add_hit(y, cursor, cursor + 8, ("pane", tag, str(question.get("pane") or "")))
+        from .pages import _segs
+        cursor = _segs(grid, x_val, y, lead, right)
+        pane = question.get("pane")
+        if question.get("open_tag") and pane:
+            cursor = grid.put(cursor, y, "  ", "branch_s", limit=right)
+            open_x = grid.put(cursor, y, "(open ▸)", "hearting", limit=right)
+            if open_x <= right:
+                grid.add_hit(y, cursor, open_x, ("pane", tag, str(pane)))
     else:
         grid.put(x_val, y, "·", "dim")
     return y + 2
@@ -381,7 +396,13 @@ def _draw_overview_route(grid, x, use, y, route, steward=False):
 
 
 def _draw_route_line(grid, x0, x1, y, route, tag=True, repo=True, steward=False):
-    room = x1 - x0 - 2 - (4 + GAP if tag else 0) - 16 - GAP - 24 - GAP - AGE_W
+    age = _clip(str(route.get("age") or ""), AGE_W + 1)
+    tag_text = str(route.get("session_tag") or "··") if tag else ""
+    tag_width = min(_seg_width(tag_text), 8) if tag else 0
+    if tag:
+        tag_text = _clip(tag_text, tag_width)
+    tag_room = tag_width + 2 + GAP if tag else 0
+    room = x1 - x0 - 2 - tag_room - 16 - GAP - 24 - GAP - AGE_W
     own = room >= 8 + GAP + (12 + GAP if repo else 0)
     repo = repo and room >= 12 + GAP
     state = "working" if route.get("activity") == "running" else route.get("state")
@@ -391,11 +412,10 @@ def _draw_route_line(grid, x0, x1, y, route, tag=True, repo=True, steward=False)
     grid.put(x0, y, marker, marker_key)
     x = x0 + 2
     if tag:
-        tag_text = str(route.get("session_tag") or "··")
         grid.put(x, y, "[", "dim")
-        grid.put(x + 1, y, tag_text, "steward" if steward else "soft")
-        grid.put(x + 1 + len(tag_text), y, "]", "dim")
-        x += 4 + GAP
+        grid.put(x + 1, y, tag_text, "steward" if steward else "soft", limit=x + 1 + tag_width)
+        grid.put(x + 1 + tag_width, y, "]", "dim")
+        x += tag_width + 2 + GAP
     if own:
         owner = str(route.get("harness") or "·")
         grid.put(x, y, owner, "hb_" + owner)
@@ -403,7 +423,6 @@ def _draw_route_line(grid, x0, x1, y, route, tag=True, repo=True, steward=False)
     if repo:
         grid.put(x, y, repo_rule_label(route.get("repo"), 12), "title_dim")
         x += 12 + GAP
-    age = str(route.get("age") or "")
     title_width = max(16, min(48, (x1 - x) // 3))
     title_width = min(title_width, max(1, x1 - _seg_width(age) - 1 - x))     # the title ends before AGE starts
     grid.put(x, y, _clip(str(route.get("title") or "·"), title_width), "soft")
@@ -592,6 +611,7 @@ def draw_routes(grid, vm, state, x=34, y=3):
     right, bottom = x + use + 1, grid.rows - 5
     cols = _route_columns(use)
     slim = cols["slim"]
+    gap = cols["gap"]
     grid.fill(x, right, y, " ", tint=234)
     headers = [(cols["st"], "ID"), (cols["title"], "ROUTE"), (cols["kind"], "KIND"),
                (cols["own"], "HARNESS")]
@@ -614,7 +634,8 @@ def draw_routes(grid, vm, state, x=34, y=3):
             if str(getattr(state, "view", "")) not in _VIEW_NAMES:
                 grid.add_hit(y, x, right, ("scope", "repo:" + str(repo)))
             grid.put(x + 1, y, "┈ ", "line")
-            end = grid.put(x + 3, y, str(repo) + "/", "title_dim")
+            end = grid.put(x + 3, y, _clip(str(repo) + "/", min(24, max(1, use - 6))),
+                           "title_dim", limit=x + use - 1)
             for xx in range(end + 1, right):
                 grid.put(xx, y, "┈", "line")
             y += 1
@@ -642,11 +663,15 @@ def draw_routes(grid, vm, state, x=34, y=3):
             grid.put(x + cols["st"], y, marker, key)
             tag = str(route.get("session_tag") or route.get("past_from") or "")
             if tag:
+                tag_width = max(0, cols["title"] - cols["st"] - 4)
+                tag_text = _clip(tag, tag_width)
+                tag_x = x + cols["st"] + 3
                 grid.put(x + cols["st"] + 2, y, "[", "dim")
-                grid.put(x + cols["st"] + 3, y, tag, "soft" if route.get("session_tag") else "dim")
-                grid.put(x + cols["st"] + 3 + len(tag), y, "]", "dim")
+                grid.put(tag_x, y, tag_text, "soft" if route.get("session_tag") else "dim",
+                         limit=tag_x + _seg_width(tag_text))
+                grid.put(tag_x + _seg_width(tag_text), y, "]", "dim", limit=x + cols["title"])
             title = _clip(str(route.get("title") or "·"), cols["title_w"])
-            grid.put(x + cols["title"], y, title, "soft", limit=x + cols["kind"] - GAP)
+            grid.put(x + cols["title"], y, title, "soft", limit=x + cols["kind"] - gap)
             kind_parts = [(str(route.get("capability") or "·"), "soft")]
             short = {"standard": "std", "light": "lt", "quick": "q", "thorough": "thr",
                      "adversarial": "adv"}
@@ -655,11 +680,14 @@ def draw_routes(grid, vm, state, x=34, y=3):
             if suffix:
                 kind_parts.append(("(" + suffix + ")", "dim"))
             cursor = x + cols["kind"]
-            age_edge = x + use - len(str(route.get("age") or ""))           # content stops where AGE starts
+            age = _clip(str(route.get("age") or ""), cols["age_w"])
+            age_edge = x + use - _seg_width(age)                              # content stops where AGE starts
             for text, style in kind_parts:
-                cursor = grid.put(cursor, y, text, style, limit=min(x + cols["own"] - GAP, age_edge))
-            _draw_owner(grid, x + cols["own"], y, route, cols["narrow"], slim,
-                        min(x + (cols["ctx"] if not slim else cols["prog"]) - GAP, age_edge))
+                cursor = grid.put(cursor, y, text, style, limit=min(x + cols["own"] - gap, age_edge))
+            owner_edge = (x + cols["own"] + cols["own_w"] if cols["tiny"] else
+                          x + (cols["ctx"] if not slim else cols["prog"]) - gap)
+            owner_limit = min(owner_edge, age_edge)
+            _draw_owner(grid, x + cols["own"], y, route, cols["narrow"], slim, owner_limit)
             if not slim:
                 context = route.get("owner_context")
                 if context:
@@ -673,16 +701,15 @@ def draw_routes(grid, vm, state, x=34, y=3):
                     grid.put(x + cols["ctx"] + 9, y, f"{pct:3d}%", percent_key)
                 else:
                     grid.put(x + cols["ctx"] + 9, y, "   ·", "dim")
-            _draw_route_progress(grid, x + cols["prog"], x + use - AGE_W - GAP, y, route)
-            age = str(route.get("age") or "")
-            grid.put(x + use - len(age), y, age, "dim")
+            _draw_route_progress(grid, x + cols["prog"], age_edge - gap, y, route)
+            grid.put(age_edge, y, age, "dim")
             if is_open:
                 _tint_row(grid, y, x - 1, right, 236)
             y += 1
             worker = route.get("worker") or ()
             label = str(worker[0]) if worker else "worker"
             unit = route.get("worker_unit")
-            route_end = x + cols["kind"] - GAP
+            route_end = x + cols["kind"] - gap
             route_start = x + cols["title"]
             cursor = grid.put(route_start, y, "└ ", "dim", limit=route_end)
             cursor = grid.put(cursor, y, _clip(label, max(0, route_end - cursor)),
@@ -697,9 +724,9 @@ def draw_routes(grid, vm, state, x=34, y=3):
                          route.get("worker_stage_key")) or ((hue, 0, 0) if worker_running else (hue, 0, 1))
             if not worker_running and isinstance(stage_key, (tuple, list)) and len(stage_key) == 3:
                 stage_key = (stage_key[0], 0, 1)
-            stage_room = max(0, cols["own"] - GAP - cols["kind"])
+            stage_room = max(0, cols["own"] - gap - cols["kind"])
             grid.put(x + cols["kind"], y, _clip(worker_stage, stage_room), stage_key,
-                     limit=x + cols["own"] - GAP)
+                     limit=x + cols["own"] - gap)
             cursor = x + cols["own"]
             segments = tuple(worker[1] if len(worker) > 1 else ())
             if cols["narrow"] and label != "resource" and len(segments) > 1 and segments[1][0] == " (":
@@ -714,11 +741,9 @@ def draw_routes(grid, vm, state, x=34, y=3):
                 if isinstance(style, str) and style.startswith("hb_"):
                     style = {"hb_claude": "h_claude", "hb_codex": "h_codex",
                              "hb_opencode": "version_release"}.get(style, style)
-                elif style == "fam_gpt":
-                    style = "h_codex"
                 elif style == "eff_medium":
                     style = "branch_s"
-                grid.put(cursor, y, text, style, limit=x + cols["prog"] - GAP)
+                grid.put(cursor, y, text, style, limit=owner_limit)
                 from .grid import cell_width
                 cursor += sum(cell_width(char) for char in str(text))
             cursor = x + cols["prog"]
@@ -748,9 +773,21 @@ def draw_questions(grid, vm, state, x=34, y=3):
     use = max(0, grid.cols - x - 2)
     right, bottom = x + use + 1, grid.rows - 5
     questions = tuple(vm.questions or ())
+    system = vm.system if hasattr(vm.system, "get") else {}
+    waits = system.get("answer_waits") if hasattr(system, "get") else None
+    if not hasattr(waits, "get"):
+        waits = {"state": "complete", "total": len(questions), "older": 0}
+    known = waits.get("state") == "complete"
+    total = waits.get("total") if known else None
+    older = waits.get("older") if known else None
     grid.put(x, y, "── ", "line")
     cursor = grid.put(x + 3, y, "WAITING", "sect")
-    cursor = grid.put(cursor, y, f"  {len(questions)} question" + ("s" if len(questions) != 1 else ""), "dim")
+    cursor = grid.put(cursor, y, "  " + (str(total) if total is not None else "?") + " question" +
+                      ("s" if total != 1 else ""), "dim")
+    if isinstance(older, int) and older > 0:
+        cursor = grid.put(cursor, y, f" · older waits {older}", "dim")
+    elif not known:
+        cursor = grid.put(cursor, y, " · observation " + str(waits.get("state")), "dim")
     grid.put(cursor, y, " ", "branch_s")
     grid.put(cursor + 1, y, "─" * max(0, right - cursor - 1), "line", limit=right)
     y += 1
@@ -773,15 +810,18 @@ def draw_questions(grid, vm, state, x=34, y=3):
             grid.put(right - 18, bottom, "↓ more below", "dim", limit=right)
             return
         tag = str(question.get("tag") or "·")
+        tag_text = _clip(tag, 5)
+        tag_x = x + 4
         is_open = closed != tag
         grid.add_hit(y, x, right, ("fold", "qshut:" + state.view, tag))
         if is_open:
             grid.fill(x - 1, right, y, " ", tint=236)
             grid.put(x, y, "▶", "soft")
-        grid.put(x + 1, y, "●", "blocked")
+        marker = str(question.get("marker") or "●")
+        grid.put(x + 1, y, marker, "lvl_y" if marker == "◑" else "blocked")
         grid.put(x + 3, y, "[", "dim")
-        grid.put(x + 4, y, tag, "soft")
-        grid.put(x + 4 + len(tag), y, "]", "dim")
+        grid.put(tag_x, y, tag_text, "soft", limit=tag_x + _seg_width(tag_text))
+        grid.put(tag_x + _seg_width(tag_text), y, "]", "dim", limit=x + 10)
         harness = str(question.get("h") or "·")
         grid.put(x + 10, y, harness, "hb_" + harness)
         if narrow:
@@ -790,7 +830,7 @@ def draw_questions(grid, vm, state, x=34, y=3):
         else:
             model = question.get("m") or ("·", "dim")
             cursor = grid.put(x + 10 + len(harness), y, " (", "dim")
-            model_key = "g_idle" if harness == "codex" and len(model) > 1 and model[1] == "fam_gpt" else (model[1] if len(model) > 1 else "dim")
+            model_key = model[1] if len(model) > 1 else "dim"
             cursor = grid.put(cursor, y, str(model[0]), model_key)
             cursor = grid.put(cursor, y, "·", "dim")
             effort = str(question.get("e") or "")
@@ -800,15 +840,23 @@ def draw_questions(grid, vm, state, x=34, y=3):
         grid.put(x + wait_x, y, str(question.get("wait") or "·"), "soft")
         if project_x is not None:
             grid.put(x + project_x, y, str(question.get("project") or "·"), "soft")
-        grid.put(x + session_x, y, _clip(str(question.get("title") or "·"), use - session_x), "hb_" + harness)
+        row_label = question.get("session_tag") or question.get("title") or "·"
+        grid.put(x + session_x, y, _clip(str(row_label),
+                                         use - session_x), "hb_" + harness)
         if is_open:
             _tint_row(grid, y, x - 1, right, 236)
         y += 1
         if not is_open:
             continue
-        for label, value, style in (("title:", question.get("title"), "hb_" + harness),
-                                    *(([("project:", question.get("project"), "soft")] if narrow else [])),
-                                    ("now:", question.get("now"), "soft")):
+        if "session_tag" not in question and question.get("title") is not None:
+            detail_fields = (("title:", question.get("title"), "hb_" + harness),
+                             *(([("project:", question.get("project"), "soft")] if narrow else [])),
+                             ("now:", question.get("now"), "soft"))
+        else:
+            detail_fields = (("source:", question.get("source"), "soft"),
+                             ("kind:", question.get("kind"), "blocked"),
+                             *(([("project:", question.get("project"), "soft")] if narrow else [])))
+        for label, value, style in detail_fields:
             grid.put(x + 10, y, label, "label")
             for line in _wrap(str(value or "·"), max(1, use - 20)):
                 grid.put(x + 20, y, line, style, limit=right)
@@ -817,10 +865,22 @@ def draw_questions(grid, vm, state, x=34, y=3):
         grid.put(x + 10, y, "pane:", "label")
         pane_start = x + 20
         grid.put(pane_start, y, pane, "soft", limit=right)
-        pane_hit_start = x + 20 + len(pane) + 2
-        grid.add_hit(y, pane_hit_start, pane_hit_start + len("(open ▸)"), ("pane", tag, pane))
-        cursor = grid.put(pane_start + len(pane), y, "  ", "branch_s", limit=x + use)
-        grid.put(cursor, y, "(open ▸)", "hearting", limit=x + use)
+        open_tag = str(question.get("open_tag") or "")
+        legacy_fixture = "session_tag" not in question and question.get("title") is not None
+        if legacy_fixture:
+            pane_hit_start = pane_start + len(pane) + 2
+            grid.add_hit(y, pane_hit_start, pane_hit_start + len("(open ▸)"),
+                         ("pane", tag, pane))
+            cursor = grid.put(pane_start + len(pane), y, "  ", "branch_s", limit=x + use)
+            grid.put(cursor, y, "(open ▸)", "hearting", limit=x + use)
+        elif open_tag and pane != "·":
+            pane_hit_start = x + 20 + len(pane) + 2
+            grid.add_hit(y, pane_hit_start, pane_hit_start + len("(open ▸)"),
+                         ("pane", open_tag, pane))
+            cursor = grid.put(pane_start + len(pane), y, "  ", "branch_s", limit=x + use)
+            grid.put(cursor, y, "(open ▸)", "hearting", limit=x + use)
+        else:
+            grid.put(pane_start + len(pane), y, "  no current pane", "dim", limit=x + use)
         y += 1
         grid.put(x + 10, y, "answer:", "label")
         grid.put(x + 20, y, "⏎", "hearting")
@@ -884,18 +944,22 @@ def _wrap(text, width):
 
 
 def _route_columns(use):
+    if use < 60:
+        return {"narrow": True, "slim": True, "tiny": True, "gap": 1, "age_w": AGE_W + 1,
+                "st": 3, "title": 10, "title_w": 5, "kind": 16, "own": 25,
+                "own_w": 8, "ctx": 32, "prog": 33}
     narrow, slim = use < 150, use < 120
-    title, kind = 12, 15
-    own_w, ctx_w = (12 if slim else 13 if narrow else 26), (0 if slim else 13)
+    title, kind = (10, 12) if slim else (12, 15)
+    own_w, ctx_w = (10 if slim else 13 if narrow else 26), (0 if slim else 13)
     flex = use - title - kind - own_w - ctx_w - AGE_W - (4 if slim else 5) * GAP
-    title_w = min(48, max(12, int(flex * .5)))
+    title_w = min(48, max(8 if narrow else 24, int(flex * (.35 if narrow else .5))))
     kind_x = title + title_w + GAP
     own_x = kind_x + kind + GAP
     ctx_x = own_x + own_w + GAP
     prog_x = ctx_x + (ctx_w + GAP if ctx_w else 0)
     return {"narrow": narrow, "slim": slim, "st": 3, "title": title,
             "title_w": title_w, "kind": kind_x, "own": own_x, "own_w": own_w,
-            "ctx": ctx_x, "prog": prog_x}
+            "ctx": ctx_x, "prog": prog_x, "tiny": False, "gap": GAP, "age_w": AGE_W + 1}
 
 
 def _draw_owner(grid, x, y, route, narrow, slim, limit):
@@ -908,7 +972,7 @@ def _draw_owner(grid, x, y, route, narrow, slim, limit):
             parts.append(("·" + effort, "eff_" + effort if effort in ("medium", "xhigh") else "dim"))
     else:
         model_name, model_key = (tuple(model) + ("dim",))[:2] if model else ("·", "dim")
-        parts = [(harness, "hb_" + harness), (" (", "dim"), (str(model_name), "hb_" + harness),
+        parts = [(harness, "hb_" + harness), (" (", "dim"), (str(model_name), model_key),
                  ("·", "dim"), (effort, "eff_" + effort if effort in ("medium", "xhigh") else "dim"),
                  (")", "dim")]
     profile = route.get("profile")

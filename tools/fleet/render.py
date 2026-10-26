@@ -649,6 +649,8 @@ def _model_family(model):
     """Model-family token from a model/bucket name: 'Opus 4.8'→opus, 'gpt-5.5'→gpt, 'fable'→fable.
     Unknown (glm/deepseek/…) → 'other' (default fg — distinct from the colored families)."""
     m = (model or "").lower()
+    if re.fullmatch(r"\s*(?:sol|astra)\s*", m) or re.search(r"\bgpt(?:[-_ ]\d+(?:\.\d+)?)?[-_ /]*(?:sol|astra)\b", m):
+        return "gpt"
     for fam in _FAMILIES:
         if fam in m:
             return fam
@@ -6698,6 +6700,10 @@ _EXPLORER_NAV_ROWS = ()
 _EXPLORER_ALL_ROWS = ()      # every navigation row, folded or not: the s/x target map is built from these
 _EXPLORER_RESULT = None      # the accepted selected-scope result; never one read for another session
 _EXPLORER_MODEL = None       # the view model of the last frame: it names the session a route page belongs to
+_EXPLORER_COMPOSE_MODEL = None
+_EXPLORER_COMPOSE_SNAPSHOT = None
+_EXPLORER_COMPOSE_DETAIL = None
+_EXPLORER_COMPOSE_GENERATION = None
 _EXPLORER_ORDER = []         # main-session ids in first-seen order, so the navigation does not reshuffle
 _EXPLORER_SIZE = None
 _EXPLORER_EARLIER = False    # the output pane was scrolled past its first row: read further back once
@@ -7015,18 +7021,44 @@ def _explorer_state_for(state, cols):
     return NavState.from_value(state)
 
 
+def _explorer_selected_models(model, focus_result):
+    """Overlay the accepted MODELS selection result on the last complete base VM."""
+    if model is None or focus_result is None:
+        return None
+    config = getattr(focus_result, "config", None)
+    if config is None and isinstance(focus_result, Mapping):
+        config = focus_result.get("config")
+    if config is None or config == getattr(model, "models", None):
+        return None
+    from dataclasses import replace
+    return replace(model, models=config)
+
+
 def _explorer_compose(snapshot, cols, rows, state=None, focus_result=None, last_good=None, now=None,
                       providers=None):
     """Project collected facts through the immutable view model into the cell renderer."""
     from .explorer import frame as explorer_frame, live
     global _SELECTABLE, _EXPLORER_NAV_ROWS, _EXPLORER_STATE, _EXPLORER_ALL_ROWS
     global _EXPLORER_GENERATION, _EXPLORER_MODEL, _EXPLORER_READINESS, _EXPLORER_ORDER
+    global _EXPLORER_COMPOSE_MODEL, _EXPLORER_COMPOSE_SNAPSHOT
+    global _EXPLORER_COMPOSE_DETAIL, _EXPLORER_COMPOSE_GENERATION
     state = _explorer_state_for(state, cols)
-    view = _explorer_view(snapshot)
-    model = live.build_view_model(view, accepted_detail=focus_result, now=now)
+    same_inputs = (_EXPLORER_COMPOSE_MODEL is not None
+                   and _EXPLORER_COMPOSE_SNAPSHOT is snapshot
+                   and _EXPLORER_COMPOSE_DETAIL is focus_result
+                   and _EXPLORER_COMPOSE_GENERATION == _EXPLORER_GENERATION)
+    if same_inputs:
+        model = _EXPLORER_COMPOSE_MODEL
+    else:
+        view = _explorer_view(snapshot)
+        model = live.build_view_model(view, accepted_detail=focus_result, now=now)
     runtime = _explorer_runtime()
     model, readiness = runtime.prepare(
         snapshot, focus_result, vm=model, generation=_EXPLORER_GENERATION, now=now)
+    _EXPLORER_COMPOSE_SNAPSHOT = snapshot
+    _EXPLORER_COMPOSE_DETAIL = focus_result
+    _EXPLORER_COMPOSE_GENERATION = _EXPLORER_GENERATION
+    _EXPLORER_COMPOSE_MODEL = model
     _EXPLORER_READINESS = readiness
     _EXPLORER_MODEL = model
     drag = tuple(getattr(state, "drag", ()) or ())
@@ -7138,6 +7170,51 @@ def _explorer_click_current(size, snapshot):
     """A click is adopted only for the paint it was aimed at: same size, same snapshot."""
     return bool(_HIT_VALID and _HIT_SIZE == tuple(size)
                 and _HIT_SNAPSHOT_ID == (id(snapshot) if snapshot is not None else None))
+
+
+def _explorer_apply_effects(effects, vm):
+    """Run accepted live effects and publish MODELS action feedback immediately."""
+    from dataclasses import replace as _replace_state
+
+    effects = tuple(effects or ())
+    model_actions = tuple(effect for effect in effects
+                          if effect and effect[0] == "models.apply")
+    if _EXPLORER_REPLAY_ACTIVE:
+        effects = tuple(effect for effect in effects
+                        if not effect or effect[0] != "models.apply")
+        result = None
+        if effects:
+            result = _explorer_runtime().apply_effects(effects, vm)
+        if model_actions:
+            result = {"model_action": True, "status": "read-only",
+                      "message": "MODELS is read-only in replay", "models": None}
+    else:
+        result = _explorer_runtime().apply_effects(effects, vm)
+    if not isinstance(result, Mapping) or not result.get("model_action"):
+        return result
+
+    global _EXPLORER_STATE, _EXPLORER_MODEL, _EXPLORER_PUBLISHED_MODEL
+    global _EXPLORER_COMPOSE_MODEL, _EXPLORER_RESULT
+    state = _explorer_state_for(_EXPLORER_STATE, 0)
+    _EXPLORER_STATE = _replace_state(state, status=str(result.get("message") or "model set finished"))
+    refreshed = result.get("models")
+    if isinstance(refreshed, Mapping):
+        for name in ("_EXPLORER_MODEL", "_EXPLORER_PUBLISHED_MODEL", "_EXPLORER_COMPOSE_MODEL"):
+            current = globals()[name]
+            if current is not None:
+                try:
+                    globals()[name] = _replace_state(current, models=refreshed)
+                except (TypeError, ValueError):
+                    pass
+        if _EXPLORER_RESULT is not None:
+            if isinstance(_EXPLORER_RESULT, Mapping):
+                _EXPLORER_RESULT = dict(_EXPLORER_RESULT, config=refreshed)
+            elif hasattr(_EXPLORER_RESULT, "config"):
+                try:
+                    _EXPLORER_RESULT = _replace_state(_EXPLORER_RESULT, config=refreshed)
+                except (TypeError, ValueError):
+                    pass
+    return result
 
 
 def _explorer_reveal(state, rows):
@@ -9531,15 +9608,21 @@ def _plain(segs):
 
 
 def _collect_memory():
-    # F-19: best-effort — a collector import/read failure must never break the render.
+    return _collect_memory_observed()[0]
+
+
+def _collect_memory_observed(*, include_backlog=False):
+    # F-19: best-effort — source health is separate from a successful empty read.
     try:
         if os.environ.get("FLEET_DEMO"):
             from . import demo
-            return demo.memory_snapshot()
-        from .collectors import memory as memcol
-        return memcol.collect(include_summary=False)
+            value = demo.memory_snapshot()
+        else:
+            from .collectors import memory as memcol
+            value = memcol.collect(include_summary=False, include_backlog=include_backlog)
+        return value, "success" if value is not None else "absent"
     except Exception:
-        return None
+        return None, "failed"
 
 
 def _collect_governor():
@@ -10797,9 +10880,13 @@ def reset_scroll():
     _SHELL_TTY_MODE = None
     global _EXPLORER_STATE, _EXPLORER_RESULT, _EXPLORER_FRAME, _EXPLORER_SIZE
     global _EXPLORER_PUBLISHED_MODEL, _EXPLORER_REPLAY_ACTIVE, _EXPLORER_DETAIL_CONTINUATION
+    global _EXPLORER_COMPOSE_MODEL, _EXPLORER_COMPOSE_SNAPSHOT
+    global _EXPLORER_COMPOSE_DETAIL, _EXPLORER_COMPOSE_GENERATION
     global _EXPLORER_REMOTE_OBSERVATION
     _EXPLORER_STATE = _EXPLORER_RESULT = _EXPLORER_FRAME = _EXPLORER_SIZE = None
     _EXPLORER_PUBLISHED_MODEL = _EXPLORER_DETAIL_CONTINUATION = None
+    _EXPLORER_COMPOSE_MODEL = _EXPLORER_COMPOSE_SNAPSHOT = _EXPLORER_COMPOSE_DETAIL = None
+    _EXPLORER_COMPOSE_GENERATION = None
     _EXPLORER_REPLAY_ACTIVE = False
     _EXPLORER_REMOTE_OBSERVATION = None
 
@@ -10909,33 +10996,43 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
         elif loading:
             frame = runtime.loading_frame(w, h)
         else:
-            candidate_frame = _explorer_compose(current, w, h, state, _EXPLORER_RESULT)
-            candidate_model = _EXPLORER_MODEL
-            readiness = _EXPLORER_READINESS
-            complete = runtime.publication_ready(readiness)
-            # A partial basic/detail generation never replaces the last complete screen.
-            if complete:
-                _EXPLORER_REPLAY_ACTIVE = False
-                _EXPLORER_PUBLISHED_MODEL = candidate_model
-                _EXPLORER_MODEL = candidate_model
+            selected_model = (_explorer_selected_models(_EXPLORER_PUBLISHED_MODEL, _EXPLORER_RESULT)
+                              if state.view == "MODELS" else None)
+            if selected_model is not None:
+                # The selected local config read is independent of remote/basic
+                # readiness. It can repaint MODELS over the last complete base VM.
+                _EXPLORER_MODEL = selected_model
                 _EXPLORER_SHOWN = True
-                runtime.mark_published(readiness)
-                frame = candidate_frame
-                if runtime.all_new(readiness):
-                    runtime.persist_complete_async(candidate_model, readiness,
-                                                   _EXPLORER_DETAIL_CONTINUATION)
-            elif _EXPLORER_PUBLISHED_MODEL is not None:
-                _EXPLORER_MODEL = _EXPLORER_PUBLISHED_MODEL
-                if _EXPLORER_REPLAY_ACTIVE:
-                    frame = _explorer_frame_from_model(_EXPLORER_MODEL, state, w, h, beat=1)
-                else:
-                    from dataclasses import replace as _replace_model
-                    live_model = _replace_model(_EXPLORER_MODEL, clock=time.time())
-                    frame = _explorer_frame_from_model(live_model, state, w, h,
-                                                       beat=int(_BLINK_ON))
-                _EXPLORER_SHOWN = True
+                frame = _explorer_frame_from_model(selected_model, state, w, h,
+                                                   beat=int(_BLINK_ON))
             else:
-                frame = runtime.loading_frame(w, h)
+                candidate_frame = _explorer_compose(current, w, h, state, _EXPLORER_RESULT)
+                candidate_model = _EXPLORER_MODEL
+                readiness = _EXPLORER_READINESS
+                complete = runtime.publication_ready(readiness)
+                # A partial basic/detail generation never replaces the last complete screen.
+                if complete:
+                    _EXPLORER_REPLAY_ACTIVE = False
+                    _EXPLORER_PUBLISHED_MODEL = candidate_model
+                    _EXPLORER_MODEL = candidate_model
+                    _EXPLORER_SHOWN = True
+                    runtime.mark_published(readiness)
+                    frame = candidate_frame
+                    if runtime.all_new(readiness):
+                        runtime.persist_complete_async(candidate_model, readiness,
+                                                       _EXPLORER_DETAIL_CONTINUATION)
+                elif _EXPLORER_PUBLISHED_MODEL is not None:
+                    _EXPLORER_MODEL = _EXPLORER_PUBLISHED_MODEL
+                    if _EXPLORER_REPLAY_ACTIVE:
+                        frame = _explorer_frame_from_model(_EXPLORER_MODEL, state, w, h, beat=1)
+                    else:
+                        from dataclasses import replace as _replace_model
+                        live_model = _replace_model(_EXPLORER_MODEL, clock=time.time())
+                        frame = _explorer_frame_from_model(live_model, state, w, h,
+                                                           beat=int(_BLINK_ON))
+                    _EXPLORER_SHOWN = True
+                else:
+                    frame = runtime.loading_frame(w, h)
         _draw_explorer(stdscr, current, frame=frame)
         return
     stdscr.erase()
@@ -11170,27 +11267,39 @@ def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
         mx, my, bstate = mouse_event if mouse_event is not None else _getmouse_event()
         if mx is not None and size is not None and _explorer_click_current(size, snapshot):
             if bstate & getattr(curses, "BUTTON4_PRESSED", 0):
-                event = {"type": "wheel", "direction": 1, "x": mx, "y": my}
+                events = [{"type": "wheel", "direction": 1, "x": mx, "y": my}]
             elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
-                event = {"type": "wheel", "direction": -1, "x": mx, "y": my}
+                events = [{"type": "wheel", "direction": -1, "x": mx, "y": my}]
             elif bstate & _EXPLORER_MOUSE_MOTION:
-                event = {"type": "mouse", "phase": "press", "button": 0,
-                         "motion": True, "x": mx, "y": my}
+                events = [{"type": "mouse", "phase": "press", "button": 0,
+                           "motion": True, "x": mx, "y": my}]
             elif bstate & (getattr(curses, "BUTTON1_RELEASED", 0)):
-                event = {"type": "mouse", "phase": "release", "button": 0,
-                         "x": mx, "y": my}
+                events = [{"type": "mouse", "phase": "release", "button": 0,
+                           "x": mx, "y": my}]
             elif bstate & (getattr(curses, "BUTTON1_PRESSED", 0) |
                            getattr(curses, "BUTTON1_CLICKED", 0)):
-                event = {"type": "mouse", "phase": "press", "button": 0,
-                         "x": mx, "y": my}
+                click = getattr(curses, "BUTTON1_CLICKED", 0)
+                pressed = getattr(curses, "BUTTON1_PRESSED", 0)
+                events = [{"type": "mouse", "phase": "press", "button": 0,
+                           "x": mx, "y": my}]
+                # Some curses implementations report a complete click without
+                # separate press/release events. Tree rows start a drag on press,
+                # so close that same hit on release before another paint can age it.
+                if click and bstate & click and not (pressed and bstate & pressed):
+                    events.append({"type": "mouse", "phase": "release", "button": 0,
+                                   "x": mx, "y": my})
             else:
                 return
             from .explorer.runtime import tag_cycle
             order = tag_cycle(getattr(_EXPLORER_MODEL, "ordering", None))
             ordering = getattr(_EXPLORER_MODEL, "ordering", None) or {}
-            _EXPLORER_STATE, _effects = reduce(
-                state, {**event, "order": order, "ordering": ordering}, _EXPLORER_FRAME)
-            _explorer_runtime().apply_effects(_effects, _EXPLORER_MODEL)
+            _effects = []
+            for event in events:
+                state, effects = reduce(
+                    state, {**event, "order": order, "ordering": ordering}, _EXPLORER_FRAME)
+                _effects.extend(effects)
+            _EXPLORER_STATE = state
+            _explorer_apply_effects(_effects, _EXPLORER_MODEL)
         return
     key = _explorer_key_name(ch)
     if key:
@@ -11202,7 +11311,7 @@ def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
             event["max_scroll"] = measure_pane_max(
                 _EXPLORER_MODEL, state, int(size[1]), int(size[0]))
         _EXPLORER_STATE, _effects = reduce(state, event, _EXPLORER_FRAME)
-        _explorer_runtime().apply_effects(_effects, _EXPLORER_MODEL)
+        _explorer_apply_effects(_effects, _EXPLORER_MODEL)
 
 
 def _explorer_note_earlier(before, key):
@@ -11227,6 +11336,16 @@ def _explorer_detail_callback(collector, *, optional=False):
             return callback, True
     callback = getattr(collector, "detail_refresh", None)
     return (callback, False) if callable(callback) else (None, False)
+
+
+def _explorer_optional_detail_key(identity, state):
+    """One optional detail read per base generation, plus each selected PEERS/MEMORY scope."""
+    if identity is None:
+        return None
+    state = _explorer_state_for(state, 0)
+    view = state.view if state.view in ("PEERS", "MEMORY") else None
+    scope = state.scope if view is not None else "-"
+    return identity, view, scope
 
 
 def _explorer_resume_continuation(collector, source, payload, details):
@@ -11265,6 +11384,10 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     curses.curs_set(0)
     _init_colors()
     if _EXPLORER_ENABLED:
+        global _EXPLORER_COMPOSE_MODEL, _EXPLORER_COMPOSE_SNAPSHOT
+        global _EXPLORER_COMPOSE_DETAIL, _EXPLORER_COMPOSE_GENERATION
+        _EXPLORER_COMPOSE_MODEL = _EXPLORER_COMPOSE_SNAPSHOT = _EXPLORER_COMPOSE_DETAIL = None
+        _EXPLORER_COMPOSE_GENERATION = None
         _EXPLORER_REMOTE_OBSERVATION = None
         runtime = _explorer_runtime()
         runtime.configure_persistence(hfilter, strict_readiness=not bool(os.environ.get("FLEET_DEMO")))
@@ -11359,7 +11482,17 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         if not required_only_pass:
             governor = _collect_governor()
             gitinfo.enrich_entities(value.sessions + value.jobs, schedule_ahead=True)
-            value.memory, value.governor = _collect_memory(), governor
+            value.memory, memory_state = _collect_memory_observed(include_backlog=_EXPLORER_ENABLED)
+            value.governor = governor
+            observations = dict(getattr(value, "observations", None) or {})
+            observations["optional:memory"] = {"state": memory_state,
+                                                "observed_at": time.time()}
+            database = value.memory.get("database") if isinstance(value.memory, Mapping) else None
+            database_state = (database.get("state") if isinstance(database, Mapping)
+                              else "unobserved" if not _EXPLORER_ENABLED else memory_state)
+            observations["optional:memory-db"] = {"state": database_state,
+                                                   "observed_at": time.time()}
+            value.observations = observations
             try:
                 from .display_snapshot import extend
                 value.display_snapshot = extend(value.display_snapshot, memory=value.memory)
@@ -11460,8 +11593,9 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         if not runtime.publication_ready(readiness):
             return
         identity = readiness.get("generation_identity") if isinstance(readiness, Mapping) else None
+        request_key = _explorer_optional_detail_key(identity, _EXPLORER_STATE)
         source = latest_view[0]
-        if identity is None or identity == optional_detail_identity[0] or source is None:
+        if request_key is None or request_key == optional_detail_identity[0] or source is None:
             return
         observations = getattr(source, "observations", None)
         basic = observations.get("basic") if isinstance(observations, Mapping) else None
@@ -11470,7 +11604,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 or basic.get("generation_identity", basic.get("identity")) != identity
                 or detail.get("generation_identity", detail.get("identity")) != identity):
             return
-        optional_detail_identity[0] = identity
+        optional_detail_identity[0] = request_key
         optional_detail_source[0] = source
         detail_pump.request(force=True)
 
@@ -11515,10 +11649,13 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     detail_pump.request(force=True)
             detail_update = detail_pump.poll(detail_generation)
             if detail_update is not None:
-                detail_generation, latest_detail = detail_update
-                if (_EXPLORER_ENABLED and isinstance(latest_detail, tuple)
-                        and len(latest_detail) == 2):
-                    latest_detail, _EXPLORER_DETAIL_CONTINUATION = latest_detail
+                detail_generation, next_detail = detail_update
+                if (_EXPLORER_ENABLED and isinstance(next_detail, tuple)
+                        and len(next_detail) == 2):
+                    next_detail, _EXPLORER_DETAIL_CONTINUATION = next_detail
+                if (_EXPLORER_ENABLED and latest_detail is not None and next_detail is not None):
+                    next_detail = details.retain_optional_last_good(latest_detail, next_detail)
+                latest_detail = next_detail
             _EXPLORER_GENERATION = generation
             if update is not None or detail_update is not None:
                 snapshot = details.merge(basic_snapshot, latest_detail)
