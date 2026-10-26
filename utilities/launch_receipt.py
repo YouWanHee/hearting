@@ -19,11 +19,14 @@ from parent_next_directive import receipt_lines as parent_next_receipt_lines
 
 
 def _opencode_pre_carrier_notice(args) -> str | None:
-    """One line when an old OpenCode session launches an owner without the wake carrier.
+    """One line when an OpenCode parent launches an owner without the wake carrier.
 
-    Sessions on the plugin predating `opencode-turn` (`hearting-guards.js`)
-    print only the bounded-wait fallback, which reads as a hang. The line
-    names the cause and the one-step fix; it adds no gate or input.
+    The carrier env comes from the server plugin's `shell.env` hook, so its
+    absence means the OpenCode server has not loaded the current plugin (an
+    older plugin, or a V2 package it never loaded). Plugins load in the server,
+    not the TUI, so relaunching only the session does not attach the carrier.
+    The line names that state, the bounded wait this completion uses instead,
+    and the server-level fix; it adds no gate or input.
     """
     if getattr(args, "parent_harness", None) != "opencode":
         return None
@@ -34,8 +37,10 @@ def _opencode_pre_carrier_notice(args) -> str | None:
     carrier = os.environ.get(CARRIER_ENV) or ""
     if carrier.startswith("opencode-turn:"):
         return None
-    return ("opencode_carrier_notice=이 OpenCode 세션은 깨움 장치 이전 플러그인으로 돌고 있다 — "
-            "세션을 다시 띄우면 완료 때 자동으로 깨운다")
+    return ("opencode_carrier_notice=이 OpenCode 서버에 하팅 완료 깨움 플러그인이 로드되지 않았다 — "
+            "이번 완료는 위 bounded-wait 명령으로 확인한다. 자동 깨움은 TUI 세션이 아니라 "
+            "OpenCode 서버가 현재 플러그인을 다시 읽어야 붙는다"
+            "(서비스 모드는 opencode service restart, 같은 서버의 모든 세션에 영향)")
 
 
 def completion_lines(args) -> list[str]:
