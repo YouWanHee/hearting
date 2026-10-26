@@ -441,12 +441,21 @@ def session_seat(seat: Seat, harness: str, sid: str) -> Seat:
 @contextlib.contextmanager
 def session_state_lock(seat: Seat, *, wait: Optional[float] = None) -> Iterator[None]:
     """Lock logical session state and its physical seat in a stable order."""
-    keys = {key for key in (seat_state_key(seat), seat.key) if key}
-    harness, sid = session_identity(seat)
-    native_key = _native_session_key(harness, sid)
-    if (native_key and not (state_root() / "cards" / f"{native_key}.json").exists()
-            and _native_address_status(seat) != "conflict"):
-        keys.update(_legacy_native_source_keys(seat))
+    with _session_state_locks((seat,), wait=wait):
+        yield
+
+
+@contextlib.contextmanager
+def _session_state_locks(seats: Iterable[Seat], *, wait: Optional[float] = None) -> Iterator[None]:
+    """Lock related logical sessions and their shared physical seats in one order."""
+    keys = set()
+    for seat in seats:
+        keys.update(key for key in (seat_state_key(seat), seat.key) if key)
+        harness, sid = session_identity(seat)
+        native_key = _native_session_key(harness, sid)
+        if (native_key and not (state_root() / "cards" / f"{native_key}.json").exists()
+                and _native_address_status(seat) != "conflict"):
+            keys.update(_legacy_native_source_keys(seat))
     keys = sorted(keys)
     with contextlib.ExitStack() as stack:
         for key in keys:
@@ -2460,6 +2469,7 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                     prior_identity = {"harness": harness, "sid": str(booking["sid"])}
         if prior_identity is None:
             prior_identity = confirmed_predecessor_identity(seat, harness, sid)
+        prior_seat = None
         if prior_identity:
             prior_seat = dataclasses.replace(
                 session_seat(seat, prior_identity["harness"], prior_identity["sid"]),
@@ -2516,7 +2526,21 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                 answer_wait_lines.append("[답변 필요] " + str(question)[:160])
                 if len(answer_wait_lines) == 3:
                     break
-    with session_state_lock(seat):
+    state_seats = [seat]
+    if _native_session_key(harness, sid) and prior_seat:
+        state_seats.append(prior_seat)
+    elif _native_session_key(harness, sid) and event in ("start", "prompt"):
+        # OpenCode can confirm a snapshot's successor on its first message in
+        # this hook. Lock that named predecessor too; the snapshot is only a
+        # lock hint here, while the handover reader still decides authority.
+        with contextlib.suppress(BaseException):
+            import dispatch_seat_handover as handover
+            snapshot = handover.read_snapshot(seat.key)
+            origin = (snapshot or {}).get("from") or {}
+            old_sid = str(origin.get("sid") or "")
+            if origin.get("harness") == harness and old_sid and old_sid != sid:
+                state_seats.append(session_seat(seat, harness, old_sid))
+    with _session_state_locks(state_seats):
         if reread:
             saved = read_json(_reread_path(harness, sid))
             summary = session_summary(seat).get((harness, sid))
@@ -2734,6 +2758,34 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             atomic_write_json(_notices_path(seat), {"schema": SCHEMA, "items": rest,
                                                     "delivered": list(dict.fromkeys(delivered))[-200:],
                                                     "lineage_received": list(dict.fromkeys(received))[-200:]})
+            # The successor's receipt also settles the exact predecessor item, so the
+            # same result cannot reappear if that native session later prompts again.
+            for origin, group in notice_groups[1:]:
+                origin_ids = {item["id"] for item in group
+                              if isinstance(item.get("id"), str) and item["id"]}
+                if not origin_ids:
+                    continue
+                origin_data = read_json(_notices_path(origin))
+                if not isinstance(origin_data, dict):
+                    continue
+                origin_items = origin_data.get("items")
+                if not isinstance(origin_items, list):
+                    continue
+                origin_rest = [item for item in origin_items
+                               if not isinstance(item, dict) or item.get("id") not in origin_ids]
+                origin_delivered = origin_data.get("delivered")
+                if not isinstance(origin_delivered, list):
+                    origin_delivered = []
+                origin_delivered = [item for item in origin_delivered if isinstance(item, str)]
+                origin_delivered.extend(sorted(origin_ids))
+                origin_received = origin_data.get("lineage_received")
+                if not isinstance(origin_received, list):
+                    origin_received = []
+                atomic_write_json(_notices_path(origin), {
+                    "schema": SCHEMA, "items": origin_rest,
+                    "delivered": list(dict.fromkeys(origin_delivered))[-200:],
+                    "lineage_received": origin_received[-200:],
+                })
         # OpenCode re-emits this cache every turn: a later "참고할 기억" is added to what the session
         # already received instead of replacing it.
         earlier = read_json(_reread_path(harness, sid))

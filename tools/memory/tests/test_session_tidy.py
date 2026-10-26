@@ -80,6 +80,10 @@ class TidyCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
+    @staticmethod
+    def logical_seat(seat, harness, sid):
+        return st.session_seat(seat, harness, sid)
+
     def library(self, extra=None):
         env = {"HERDR_PANE_ID": PANE}
         env.update(extra or {})
@@ -795,6 +799,7 @@ class SeatTest(TidyCase):
 
     def test_without_a_pane_the_card_reaches_only_the_same_harness_and_project(self):
         self.card("sid-A", "표식-S", pane=None)
+        self.confirmed_handover("claude", "sid-A", "sid-B", pane=None)
         self.assertIn("표식-S", self.hook("claude", "start", "sid-B", pane=None))
         self.assertEqual(self.hook("codex", "start", "t-B", pane=None), "")
         elsewhere = self.iso.root / "elsewhere"
@@ -805,6 +810,7 @@ class SeatTest(TidyCase):
     def test_different_panes_do_not_share_cards(self):
         self.card("sid-A", "표식-pane-a", pane="test:pane-a")
         self.assertEqual(self.hook("claude", "start", "sid-B", pane="test:pane-b"), "")
+        self.confirmed_handover("claude", "sid-A", "sid-B2", pane="test:pane-a")
         self.assertIn("표식-pane-a", self.hook("claude", "start", "sid-B2", pane="test:pane-a"))
 
 
@@ -858,12 +864,12 @@ class DaemonCodexSeatTest(TidyCase):
     def pane_key(pane):
         return st._digest("pane", pane)
 
-    def know(self, pane, sid):
+    def know(self, pane, sid, event="prompt"):
         """The pane's seat ledger has seen ``sid`` (what a hook of that session leaves behind)."""
         with self.iso.patched_environ(self.env):
             seat = st.Seat("pane", self.pane_key(pane), pane, "codex", "")
             with st.seat_lock(seat.key):
-                st.record_event(seat, "codex", sid, "prompt", cwd=str(self.cwd))
+                st.record_event(seat, "codex", sid, event, cwd=str(self.cwd))
 
     def book(self, pane, sid, status="reserved", cwd=None):
         key = self.pane_key(pane)
@@ -928,7 +934,7 @@ class DaemonCodexSeatTest(TidyCase):
         self.prove("t-B", "w:p1")
         self.assertEqual(self.seat(sid="t-B").pane, "w:p1")
         self.assertEqual(self.seat(sid="t-C").kind, "project")
-        self.know("w:p2", "t-B")                                     # two panes claim it: no decision
+        self.know("w:p2", "t-B", event="start")                     # two pane ledgers claim it: no decision
         self.assertEqual(self.seat(sid="t-B").kind, "project")
         self.agents([self.agent("w:p1", "t-B"), self.agent("w:p2", "t-X")])
         self.assertEqual(self.seat(sid="t-B").pane, "w:p1")         # herdr's own value is decisive
@@ -1421,6 +1427,7 @@ class WorkerTest(TidyCase):
                 ledgers = "".join(p.read_text(encoding="utf-8") for p in (self.state / "sessions").glob("*.jsonl"))
                 self.assertNotIn("sid-worker", ledgers)
         self.assertFalse((self.state / "consumed").exists())
+        self.confirmed_handover("claude", "sid-A", "sid-B")
         self.assertIn("표식-W", self.hook("claude", "start", "sid-B"))               # the real next session still gets it
 
     def test_worker_writes_no_card_and_sees_no_notice(self):
@@ -1460,9 +1467,7 @@ class NoticeTest(TidyCase):
     def test_notice_goes_to_a_new_session_when_the_author_is_gone(self):
         self.hook("claude", "start", "sid-A")
         self.notice()
-        with self.library():
-            seat = st.resolve_seat("claude", str(self.cwd))
-            st.record_event(seat, "claude", "sid-B", "start", now=st.now_epoch() + 5)
+        self.confirmed_handover("claude", "sid-A", "sid-B")
         got = self.hook("claude", "start", "sid-B", "--source", "clear")
         self.assertIn("mem tidy-undo b7", got)
         self.assertEqual(self.hook("claude", "prompt", "sid-B"), "")
@@ -1480,6 +1485,7 @@ class NoticeTest(TidyCase):
         self.hook("claude", "start", "sid-A")
         self.card("sid-A", "표식-N")
         self.notice()
+        self.confirmed_handover("claude", "sid-A", "sid-B")
         got = self.hook("claude", "start", "sid-B")
         self.assertIn("[정리 결과]", got)
         self.assertIn("표식-N", got)
@@ -1535,11 +1541,12 @@ class LedgerTest(TidyCase):
 
     def test_status_prints_state_location_and_card(self):
         self.card("sid-A", "카드")
-        result = self.cli("status")
+        caller = {"CLAUDE_CODE_SESSION_ID": "sid-A"}
+        result = self.cli("status", extra=caller)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"state_root={self.state}", result.stdout)
         self.assertIn("card=gen1", result.stdout)
-        info = json.loads(self.cli("status", "--json").stdout)
+        info = json.loads(self.cli("status", "--json", extra=caller).stdout)
         self.assertEqual((info["card"]["generation"], info["worker"]), (1, False))
 
 
@@ -2002,15 +2009,16 @@ class CompactObservationTest(TidyCase):
 
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
             seat = st.resolve_seat("claude", str(self.cwd))
-            with st.seat_lock(seat.key):
-                st.write_card(seat, "claude", self.SID, "요약", cwd=str(self.cwd), origin="runtime-compact",
+            caller = self.logical_seat(seat, "claude", self.SID)
+            with st.session_state_lock(caller):
+                st.write_card(caller, "claude", self.SID, "요약", cwd=str(self.cwd), origin="runtime-compact",
                               compact_context={"identity": "compact-1", "transcript": str(path)})
-                card = st.read_latest_card(seat)
+                card = st.read_latest_card(caller)
                 self.assertTrue(st.update_compact_card_locked(
-                    seat, card["generation"], "compact-1", recent=observation["recent_post"],
+                    caller, card["generation"], "compact-1", recent=observation["recent_post"],
                     recent_preserved=observation["recent_preserved"], last_reply=observation["last_reply"],
                     source=observation["source"], recent_partial=observation["recent_partial"]))
-            card = st.read_latest_card(seat)
+            card = st.read_latest_card(caller)
             first_line = card["body"].splitlines()[0]
             self.assertEqual(first_line,
                              "압축 직전 마지막 답 (2026-10-21 13:46:13 UTC / 2026-10-21 22:46:13 KST): 압축 직전 마지막 답")
@@ -2022,18 +2030,19 @@ class CompactObservationTest(TidyCase):
                  "timestamp": "2026-10-21T13:46:13.510Z", "first_line": "완료 보고 " + "답" * 1000}
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
             seat = st.resolve_seat("claude", str(self.cwd))
+            caller = self.logical_seat(seat, "claude", self.SID)
             for recent in ("", "[assistant] 후속 답", "[assistant] " + "후" * 6000):
                 with self.subTest(recent_bytes=len(recent.encode("utf-8"))):
-                    with st.seat_lock(seat.key):
-                        st.write_card(seat, "claude", self.SID, "s" * st.COMPACT_SUMMARY_MAX_BYTES,
+                    with st.session_state_lock(caller):
+                        st.write_card(caller, "claude", self.SID, "s" * st.COMPACT_SUMMARY_MAX_BYTES,
                                       cwd=str(self.cwd), origin="runtime-compact",
                                       compact_context={"identity": "budget"})
-                        original = st.read_latest_card(seat)
+                        original = st.read_latest_card(caller)
                         self.assertTrue(st.update_compact_card_locked(
-                            seat, original["generation"], "budget", recent=recent,
+                            caller, original["generation"], "budget", recent=recent,
                             recent_preserved="[assistant] " + "보" * 6000,
                             last_reply=reply, source="p" * st.COMPACT_METADATA_MAX_BYTES))
-                    card = st.read_latest_card(seat)
+                    card = st.read_latest_card(caller)
                     compact = card["compact"]
                     self.assertEqual(compact["summary"], "s" * st.COMPACT_SUMMARY_MAX_BYTES)
                     self.assertEqual(card["generation"], original["generation"])
@@ -2528,7 +2537,10 @@ class CompactProgressRecoveryTest(TidyCase):
     def setUp(self):
         super().setUp()
         self.seat = st.Seat("pane", "b" * 32, pane=PANE, harness="claude", project_key="fixture")
-        self.resolve = mock.patch.object(st, "resolve_seat", return_value=self.seat)
+        self.resolve = mock.patch.object(
+            st, "resolve_seat",
+            side_effect=lambda harness, cwd=None, env=None, sid=None, source="", **_kwargs:
+                st.session_seat(self.seat, harness or "claude", sid or ""))
         self.resolve.start()
         self.addCleanup(self.resolve.stop)
         self.env = self.iso.env({"HERDR_PANE_ID": PANE})
@@ -2857,15 +2869,18 @@ class MemoryLayerTest(TidyCase):
                 for long_body in (False, True):
                     with self.subTest(harness=harness, bundled=bundled, long_body=long_body):
                         pane = f"{PANE}-{harness}-{bundled}-{long_body}"
+                        author = f"author-{harness}-{bundled}-{long_body}"
                         receiver = f"receiver-{harness}-{bundled}-{long_body}"
                         body = "진행 중: 카드 시험\n다음 할 일: 검증\n" + ("세부 내용 " * 900 if long_body else "")
-                        self.card("author-A", body, harness=harness, pane=pane)
+                        self.card(author, body, harness=harness, pane=pane)
                         with self.library({"HERDR_PANE_ID": pane}):
-                            seat = st.resolve_seat(harness, str(self.cwd))
+                            seat = self.logical_seat(st.resolve_seat(harness, str(self.cwd)), harness, author)
                             if bundled:
                                 st.update_memory_refs(seat, **self.refs(n=8))
                                 st.write_notice(seat, "정리 결과: 새 기록 3건. 되돌리기: mem tidy-undo b1",
-                                                author_harness=harness, author_sid="author-A")
+                                                author_harness=harness, author_sid=author)
+                        self.confirmed_handover(harness, author, receiver, pane=pane)
+                        with self.library({"HERDR_PANE_ID": pane}):
                             got = st.run_hook(harness, "start", receiver, cwd=str(self.cwd))
                             self.assertEqual(got.count(guidance), 1)
                             self.assertIn(guidance, got.splitlines())
@@ -2878,7 +2893,8 @@ class MemoryLayerTest(TidyCase):
                             self.assertEqual("이하 생략" in got, long_body)
                             self.assertEqual("[참고할 기억]" in got, bundled)
                             self.assertEqual(st.run_hook(harness, "prompt", receiver, cwd=str(self.cwd)), "")
-                            st.update_memory_refs(seat, **self.refs(batch="late-B"))
+                            late_refs = st.update_memory_refs(seat, **self.refs(batch="late-B"))
+                            self.assertIsNotNone(late_refs, f"late memory write missed {harness}/{receiver}")
                             late = st.run_hook(harness, "prompt", receiver, cwd=str(self.cwd))
                             self.assertIn("[참고할 기억]", late)
                             self.assertNotIn("[세션 카드]", late)
@@ -3021,7 +3037,7 @@ class MemoryLayerTest(TidyCase):
             after = {str(path.relative_to(self.state)): path.read_bytes()
                      for path in self.state.rglob("*") if path.is_file()}
         self.assertEqual(lineage[0]["relation"], "confirmed")
-        self.assertEqual(lineage[0]["card"]["generation"], 2)
+        self.assertEqual(lineage[0]["card"]["generation"], 1)
         self.assertEqual(lineage[1]["sid"], "sid-old")
         self.assertEqual(lineage[1]["card"]["generation"], 1)
         self.assertEqual(lineage[1]["transcript"], {"path": str(transcript), "status": "available"})
@@ -3122,9 +3138,9 @@ class MemoryLayerTest(TidyCase):
         rows = [{"id": f"mem-{i}", "kind": "새", "headline": f"기억 {i} 제목"} for i in range(n)]
         return dict(batch=batch, status=status, refs=rows, **more)
 
-    def update(self, sid="sid-A", **kw):
+    def update(self, sid="sid-A", harness="claude", **kw):
         with self.library():
-            seat = st.resolve_seat("claude", str(self.cwd), sid=sid)
+            seat = st.resolve_seat(harness, str(self.cwd), sid=sid)
             return st.update_memory_refs(seat, **kw)
 
     def read(self):
@@ -3199,7 +3215,7 @@ class MemoryLayerTest(TidyCase):
         self.card("ses_B", "OpenCode 카드", harness="opencode")
         with self.library({"HERDR_PANE_ID": PANE}):
             st.run_hook("opencode", "start", "ses_B", source="compact", cwd=str(self.cwd), emit=lambda t: None)
-        self.update(sid="ses_B", **self.refs())
+        self.update(sid="ses_B", harness="opencode", **self.refs())
         with self.library({"HERDR_PANE_ID": PANE}):
             st.run_hook("opencode", "prompt", "ses_B", cwd=str(self.cwd), emit=lambda t: None)
             replay = []
@@ -3304,9 +3320,10 @@ class LocateTest(TidyCase):
 class PromptSeqTest(TidyCase):
     """Real prompts are counted per seat, in a file the ledger throttle and fold never touch."""
 
-    def seq(self, pane=PANE):
+    def seq(self, pane=PANE, sid="sid-A"):
         with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
-            return st.read_prompt_seq(st.resolve_seat("claude", str(self.cwd)))
+            seat = st.resolve_seat("claude", str(self.cwd))
+            return st.read_prompt_seq(self.logical_seat(seat, "claude", sid))
 
     def test_only_real_prompts_count(self):
         self.hook("claude", "start", "sid-A")
@@ -3332,14 +3349,15 @@ class PromptSeqTest(TidyCase):
         self.hook("claude", "prompt", "sid-A")
         self.hook("claude", "prompt", "sid-A", "--reread")
         self.hook("claude", "prompt", "sid-Z", pane="test:pane-z")
-        self.assertEqual((self.seq(), self.seq("test:pane-z")), (1, 1))
+        self.assertEqual((self.seq(), self.seq("test:pane-z", "sid-Z")), (1, 1))
 
     def test_the_count_survives_a_ledger_fold(self):
         with self.library():
             seat = st.resolve_seat("claude", str(self.cwd))
+            caller = self.logical_seat(seat, "claude", "sid-A")
             for n in range(st.LEDGER_FOLD_LINES + 20):
                 st.run_hook("claude", "prompt", "sid-A", cwd=str(self.cwd), now=1000.0 + n * 100)
-            self.assertEqual(st.read_prompt_seq(seat), st.LEDGER_FOLD_LINES + 20)
+            self.assertEqual(st.read_prompt_seq(caller), st.LEDGER_FOLD_LINES + 20)
             self.assertLess(len(st._read_ledger_lines(seat)), st.LEDGER_FOLD_LINES + 20)
 
     def test_the_card_records_the_count_it_was_written_at(self):
@@ -3643,7 +3661,8 @@ class TidyOneCallTest(TidyCase):
         self.assertRegex(lines[1], r"^enqueue=\S+ seat=\S+ status=queued clear=scheduled$")
         self.assertEqual(lines[-1], "say=입력창이 비어 있으면 곧 이 창을 비우고, 새 세션이 카드를 받아 이어서 진행합니다. 그 전에 입력하시면 비우지 않습니다.")
         with self.iso.patched_environ():
-            self.assertEqual(st.read_latest_card(seat)["body"], "진행 중: 한 번에\n다음 할 일: 기다림")
+            caller = self.logical_seat(seat, "claude", "sid-A")
+            self.assertEqual(st.read_latest_card(caller)["body"], "진행 중: 한 번에\n다음 할 일: 기다림")
         self.assertEqual(len(self.queued()), 1)
         self.assertEqual(self.reservation(seat)["status"], "reserved")
         self.assertEqual(len(self.started), 1)
@@ -3778,6 +3797,7 @@ class CardContractTest(TidyCase):
         for harness in st.HARNESSES:
             pane = f"card-contract-{harness}"
             self.card("author", "원래 목표: 원천 조건 포함\n진행 중: 카드 계약", harness=harness, pane=pane)
+            self.confirmed_handover(harness, "author", "receiver", pane=pane)
             with self.library({"HERDR_PANE_ID": pane}):
                 output = st.run_hook(harness, "start", "receiver", cwd=str(self.cwd))
             self.assertEqual(output.count(st.CARD_FIRST_REPLY_GUIDANCE), 1)
@@ -3989,8 +4009,16 @@ class ClearHelperTest(TidyCase):
                                     sleep=lambda _s: None)
 
     def notices(self, seat):
-        data = st.read_json(self.state / "notices" / f"{seat.key}.json")
+        req = st.read_json(self.state / "clear" / f"{seat.key}.json")
+        self.assertIsInstance(req, dict, f"booking missing for {seat.key}")
+        caller = st.session_seat(seat, req["harness"], req["sid"])
+        with self.iso.patched_environ(self.extra):
+            data = st.read_json(st._notices_path(caller))
         return [i["text"] for i in (data or {}).get("items", [])]
+
+    def card_for_booking(self, seat, req):
+        caller = st.session_seat(seat, req["harness"], req["sid"])
+        return st.read_latest_card(caller)
 
     def status(self, seat):
         return st.read_json(self.state / "clear" / f"{seat.key}.json")["status"]
@@ -4055,7 +4083,7 @@ class ClearHelperTest(TidyCase):
             snap = handover.read_snapshot(seat.key)
         self.assertEqual([binding["attempt"] for binding in snap["bindings"]], ["att-before", "att-after"])
         with self.iso.patched_environ():
-            card = st.read_latest_card(seat)
+            card = self.card_for_booking(seat, req)
         self.assertEqual(card["generation"], req["card_generation"])
         self.assertIn("최종 결과: 끝", card["body"])
         self.assertEqual(card["compact"]["summary"], "full compact summary")
@@ -4133,7 +4161,7 @@ class ClearHelperTest(TidyCase):
                                        sleep=lambda _s: None)
         self.assertEqual((outcome, calls), ("continued", ["clear", "continue"]))
         with self.iso.patched_environ():
-            card = st.read_latest_card(seat)
+            card = self.card_for_booking(seat, req)
         self.assertEqual(card["generation"], req["card_generation"])
         self.assertEqual(card["compact"]["summary"], "full compact summary")
 
@@ -4260,14 +4288,24 @@ class ContinueHelperTest(TidyCase):
     def run_helper(self, seat, req, verdict=None, cont=None, after_clear=None, extra=None):
         def fake_steward(path, nonce, pane):
             self.calls.append("clear")
-            if after_clear:
-                after_clear()
             return dict(verdict or {"cleared": "true", "new_session": "sid-B"})
 
         def fake_continue(path, nonce, pane):
             self.calls.append(("continue", pane, nonce, Path(path).name))
             return dict(cont or {"continued": "true"})
-        with self.iso.patched_environ({**self.extra, **(extra or {})}):
+        real_finish = clear._finish
+        changed_after_clear = [False]
+
+        def finish_then_change(*args, **kwargs):
+            result = real_finish(*args, **kwargs)
+            held = clear.read_reservation(seat.key)
+            if after_clear and not changed_after_clear[0] and held and held.get("status") == "cleared":
+                changed_after_clear[0] = True
+                after_clear()
+            return result
+
+        with self.iso.patched_environ({**self.extra, **(extra or {})}), \
+                mock.patch.object(clear, "_finish", side_effect=finish_then_change):
             return clear.run_helper(seat.key, req["nonce"], wait=lambda *_a: "idle", steward=fake_steward,
                                     continuer=fake_continue, sleep=lambda _s: None)
 
@@ -4275,7 +4313,10 @@ class ContinueHelperTest(TidyCase):
         return st.read_json(self.state / "clear" / f"{seat.key}.json")
 
     def notices(self, seat):
-        data = st.read_json(self.state / "notices" / f"{seat.key}.json")
+        req = self.booking(seat)
+        caller = st.session_seat(seat, req["harness"], req["sid"])
+        with self.iso.patched_environ(self.extra):
+            data = st.read_json(st._notices_path(caller))
         return [i["text"] for i in (data or {}).get("items", [])]
 
     def test_a_confirmed_clear_is_continued_once_and_silently(self):
@@ -4344,12 +4385,16 @@ class ContinueHelperTest(TidyCase):
         def new_card():
             with self.iso.patched_environ(self.extra):
                 seat = st.resolve_seat("claude", str(self.cwd))
-                with st.seat_lock(seat.key):
-                    st.write_card(seat, "claude", "sid-B", "새 카드")
+                req = self.booking(seat)
+                caller = st.session_seat(seat, req["harness"], req["sid"])
+                with st.session_state_lock(caller):
+                    st.write_card(caller, req["harness"], req["sid"], "새 카드")
 
         def handed():
             with self.iso.patched_environ(self.extra):
-                st.mark_card_handed_off(st.resolve_seat("claude", str(self.cwd)))
+                seat = st.resolve_seat("claude", str(self.cwd))
+                req = self.booking(seat)
+                st.mark_card_handed_off(st.session_seat(seat, req["harness"], req["sid"]))
         for name, during, reason in (("prompt", prompt, "new-input"), ("card", new_card, "card-changed"),
                                      ("handoff", handed, "handed-off")):
             with self.subTest(name):
@@ -5219,17 +5264,18 @@ class SeatHandoverTest(TidyCase):
         pm = self.handover._peer_message()
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
             seat = self.seat()
+            caller = self.logical_seat(seat, "claude", "sid-A")
             self.assertTrue(pm.mark_steward("claude", "sid-A",
                 {"harness": "unknown", "name": "-"}, "explicit", "1", source="explicit"))
             with st.seat_lock(seat.key):
                 st.record_event(seat, "claude", "sid-A", "start", cwd=str(self.cwd))
-                st.write_card(seat, "claude", "sid-A", "compact summary", cwd=str(self.cwd),
+                st.write_card(caller, "claude", "sid-A", "compact summary", cwd=str(self.cwd),
                               origin="runtime-compact", compact_context={"identity": "fixture-compact"})
-            card = st.read_latest_card(seat)
+            card = st.read_latest_card(caller)
             request = {"schema": clear.SCHEMA, "seat": seat.as_dict(),
                        "harness": "claude", "sid": "sid-A",
                        "nonce": "fixture-nonce", "status": "reserved",
-                       "prompt_seq": st.read_prompt_seq(seat),
+                       "prompt_seq": st.read_prompt_seq(caller),
                        "card_generation": card["generation"], "created": st.now_epoch(),
                        "compact": {"identity": "fixture-compact"}}
             clear._write_reservation(request)
@@ -5251,7 +5297,7 @@ class SeatHandoverTest(TidyCase):
             self.assertEqual(refreshed["bindings"], [])
             self.assertEqual(refreshed["steward"]["roles"][0]["generation"],
                              prepared["steward"]["roles"][0]["generation"])
-            compact_card = st.read_latest_card(seat)
+            compact_card = st.read_latest_card(caller)
             self.assertEqual(compact_card["compact"]["last_reply"], observation["last_reply"])
             self.assertEqual(compact_card["compact"]["recent_preserved"], observation["recent_preserved"])
             self.assertEqual(compact_card["body"].splitlines()[0],
@@ -5262,13 +5308,13 @@ class SeatHandoverTest(TidyCase):
             clear._refresh_compact_card(request, {
                 "recent": "[assistant] 보존 원문", "recent_post": "",
                 "recent_preserved": "[assistant] 보존 원문", "source": "fixture"})
-            empty_post_card = st.read_latest_card(seat)
+            empty_post_card = st.read_latest_card(caller)
             self.assertEqual(empty_post_card["compact"]["recent_post"], "")
             self.assertEqual(empty_post_card["body"].count("[assistant] 보존 원문"), 1)
             self.assertNotIn("[압축 뒤 이어진 대화]", empty_post_card["body"])
             # Old callers without the new field still supply their recent tail.
             clear._refresh_compact_card(request, {"recent": "예전 후속 대화", "source": "fixture"})
-            self.assertEqual(st.read_latest_card(seat)["compact"]["recent_post"], "예전 후속 대화")
+            self.assertEqual(st.read_latest_card(caller)["compact"]["recent_post"], "예전 후속 대화")
 
     def test_watch_snapshot_keeps_exact_unresolved_watch_identity_across_handover(self):
         pm = self.handover._peer_message()
@@ -5398,7 +5444,9 @@ class SeatHandoverTest(TidyCase):
     def test_partial_transition_write_keeps_complete_ledger_and_retries_one_successor(self):
         pane = "test:partial-transition-write"
         _pm, seat, ledger = self._prepare_transition_failure(pane)
-        before = ledger.read_bytes()
+        successor = self.logical_seat(seat, "claude", "sid-B")
+        transition_ledger = st._ledger_path(successor)
+        before = st.read_bytes(transition_ledger) or b""
         real_write = os.write
         partial_calls = []
 
@@ -5407,7 +5455,7 @@ class SeatHandoverTest(TidyCase):
                 target = os.readlink(f"/proc/self/fd/{fd}")
             except OSError:
                 target = ""
-            if f".{seat.key}.jsonl." not in target or not target.endswith(".tmp"):
+            if f".{transition_ledger.stem}.jsonl." not in target or not target.endswith(".tmp"):
                 return real_write(fd, data)
             partial_calls.append(len(data))
             if len(partial_calls) == 1:
@@ -5419,12 +5467,14 @@ class SeatHandoverTest(TidyCase):
         self.assertGreaterEqual(len(partial_calls), 2)
         self.assertEqual(rows, [])
         self.assertEqual(self.handover.handover_rows(seat), [])
+        self.assertEqual(st.read_bytes(transition_ledger) or b"", before)
+        after_failed_write = st._read_ledger_lines(successor, include_physical_relations=False)
+        self.assertFalse(any(row.get("event") == "handover" for row in after_failed_write))
         with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
             holder = self.handover.resolved_steward_relations(
                 "claude", "sid-A", seat_key=seat.key)[0]["holder"]["sid"]
         self.assertEqual(holder, "sid-A")
-        self.assertEqual(ledger.read_bytes().splitlines()[0], before.splitlines()[0])
-        self.assertFalse(list(ledger.parent.glob(f".{seat.key}.jsonl.*.tmp")))
+        self.assertFalse(list(transition_ledger.parent.glob(f".{transition_ledger.stem}.jsonl.*.tmp")))
 
         _output, rows = self.start("sid-B", pane=pane)
         self.assertEqual([(row["from"], row["sid"]) for row in rows], [("sid-A", "sid-B")])
@@ -5438,7 +5488,9 @@ class SeatHandoverTest(TidyCase):
     def test_transition_fsync_failure_keeps_predecessor_until_retry(self):
         pane = "test:transition-fsync-failure"
         _pm, seat, ledger = self._prepare_transition_failure(pane)
-        before_lines = ledger.read_bytes().splitlines()
+        successor = self.logical_seat(seat, "claude", "sid-B")
+        transition_ledger = st._ledger_path(successor)
+        before = st.read_bytes(transition_ledger) or b""
         real_fsync = os.fsync
         synced = []
 
@@ -5447,7 +5499,7 @@ class SeatHandoverTest(TidyCase):
                 target = os.readlink(f"/proc/self/fd/{fd}")
             except OSError:
                 target = ""
-            if f".{seat.key}.jsonl." in target and target.endswith(".tmp"):
+            if f".{transition_ledger.stem}.jsonl." in target and target.endswith(".tmp"):
                 synced.append(Path(target).stat().st_size)
                 raise OSError("fixture fsync failure after complete transition write")
             return real_fsync(fd)
@@ -5457,7 +5509,9 @@ class SeatHandoverTest(TidyCase):
         self.assertEqual(len(synced), 1)
         self.assertGreater(synced[0], 0)
         self.assertEqual(rows, [])
-        self.assertEqual(ledger.read_bytes().splitlines()[:len(before_lines)], before_lines)
+        self.assertEqual(st.read_bytes(transition_ledger) or b"", before)
+        after_failed_write = st._read_ledger_lines(successor, include_physical_relations=False)
+        self.assertFalse(any(row.get("event") == "handover" for row in after_failed_write))
         with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
             self.assertEqual(self.handover.resolved_steward_relations(
                 "claude", "sid-A", seat_key=seat.key)[0]["holder"]["sid"], "sid-A")
