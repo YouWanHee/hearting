@@ -557,16 +557,24 @@ class ProjectCardSlotRunTest(RunnerCase):
 
     def test_project_queue_round_trip_uses_the_callers_card_slot(self):
         with self.iso.patched_environ({"HERDR_PANE_ID": ""}):
-            seat_b = st.resolve_seat("claude", str(self.cwd), sid="runner-B")
-            seat_a = st.resolve_seat("claude", str(self.cwd), sid="runner-A")
+            seat_b = st.session_seat(st.resolve_seat("claude", str(self.cwd), sid="runner-B"),
+                                     "claude", "runner-B")
+            seat_a = st.session_seat(st.resolve_seat("claude", str(self.cwd), sid="runner-A"),
+                                     "claude", "runner-A")
             with st.seat_lock(seat_b.key):
                 st.write_card(seat_b, "claude", "runner-B", "B card", cwd=str(self.cwd))
             with st.seat_lock(seat_a.key):
                 st.write_card(seat_a, "claude", "runner-A", "A card", cwd=str(self.cwd))
+            project_seat = st.seat_for_project("claude", seat_b.project_key)
             with mock.patch.object(runner, "start_detached", return_value=0):
-                item = runner.enqueue_item(st.seat_for_project("claude", seat_b.project_key),
-                                           "claude", "runner-B", str(self.cwd))
-            self.assertEqual((item["seat"]["sid"], item["card_generation"]), ("runner-B", 1))
+                item = runner.enqueue_item(project_seat, "claude", "runner-B", str(self.cwd))
+            queued_physical_seat = st.seat_from_dict(item["seat"])
+            queued_session_seat = st.session_seat(
+                queued_physical_seat, item["harness"], item["sid"])
+            self.assertEqual(st.session_identity(queued_session_seat), ("claude", "runner-B"))
+            self.assertEqual(queued_physical_seat, project_seat)
+            self.assertNotIn("sid", item["seat"])
+            self.assertEqual(item["card_generation"], 1)
             run_dir = st.state_root() / "runs" / "batch-project"
             run_dir.mkdir(parents=True)
             bundle = runner.assemble(item, "batch-project", run_dir)
@@ -1022,7 +1030,8 @@ class WorkerFolderTest(RunnerCase):
             dispatch.assert_not_called()
             advance.assert_not_called()
             self.assertIsNone(self.watermark("sid-A"))
-            self.assertEqual(st.read_latest_card(seat)["body"], "진행 중인 일: 시간 초과 시험")
+            self.assertEqual(st.read_latest_card(st.session_seat(seat, "claude", "sid-A"))["body"],
+                             "진행 중인 일: 시간 초과 시험")
             self.assertEqual(len(self.notices()), 1)
             self.assertIn("TimeoutExpired", self.notices()[0])
 
@@ -1148,6 +1157,20 @@ class MemoryRefsRunTest(RunnerCase):
     def start(self, sid, event="start"):
         return self.cli("hook", "--harness", "claude", "--event", event, "--session-id", sid).stdout
 
+    def confirm_successor(self, predecessor="sid-A", successor="sid-B"):
+        with self.iso.patched_environ(self.env()):
+            seat = st.resolve_seat("claude", str(self.cwd), os.environ, sid=successor)
+            seat = st.session_seat(seat, "claude", successor)
+            now = st.now_epoch()
+            with st.session_state_lock(seat):
+                st.record_event(seat, "claude", successor, "start", source="clear",
+                                cwd=str(self.cwd), now=now)
+                st._append_ledger_entry(seat, {
+                    "ts": now + 0.001, "harness": "claude", "sid": successor,
+                    "event": "handover", "from": {"harness": "claude", "sid": predecessor},
+                    "source": "clear",
+                })
+
     def test_the_actual_new_ids_and_the_related_existing_ones_become_the_list(self):
         self.scenario([{"mode": "ok", "related": [self.existing, "not-a-record", self.existing], "actions": [
             {"kind": "add", "type": "decision", "tier": "durable", "body": "Brand new decision about storage."}]}])
@@ -1164,7 +1187,10 @@ class MemoryRefsRunTest(RunnerCase):
         # the card itself did not move, and its text file carries the section
         card = self.card()
         self.assertEqual((card["generation"], card["body"]), (1, "진행 중: 시험"))
-        self.assertIn("[참고할 기억]", (self.state / "cards" / (card["seat"]["key"] + ".md")).read_text(encoding="utf-8"))
+        card_seat = st.session_seat(st.seat_from_dict(card["seat"]),
+                                    card["author"]["harness"], card["author"]["sid"])
+        card_text = self.state / "cards" / f"{st.card_key(card_seat)}.md"
+        self.assertIn("[참고할 기억]", card_text.read_text(encoding="utf-8"))
 
     def test_a_list_is_cut_to_eight_records_and_twelve_hundred_bytes(self):
         actions = [{"kind": "add", "type": "decision", "tier": "working",
@@ -1177,6 +1203,7 @@ class MemoryRefsRunTest(RunnerCase):
         self.assertLessEqual(len(refs["refs"]), 8)
         self.assertLessEqual(sum(len(f"- {r['id']} [{r['kind']}] {r['headline']}".encode("utf-8")) + 1 for r in refs["refs"]), 1200)
         self.assertGreater(refs["more"], 0)
+        self.confirm_successor()
         shown = self.start("sid-B")
         self.assertRegex(shown, rf"외 {refs['more'] + 10 - len(refs['refs'])}건|외 \d+건")
         self.assertIn(refs["result_path"], shown)
@@ -1186,6 +1213,7 @@ class MemoryRefsRunTest(RunnerCase):
             {"kind": "add", "type": "decision", "tier": "durable", "body": "A decision that lands late."}]}])
         qid = self.enqueue("sid-A")
         self.wait_status(qid, "waiting-worker")
+        self.confirm_successor()
         first = self.start("sid-B")                                                # cleared before the tidy ended
         self.assertIn("진행 중: 시험", first)
         self.assertNotIn("[참고할 기억]", first)
@@ -1203,6 +1231,7 @@ class MemoryRefsRunTest(RunnerCase):
             {"kind": "add", "type": "decision", "tier": "durable", "body": "Handed to the successor only."}]}])
         qid = self.enqueue("sid-A")
         self.wait_status(qid, "notified")
+        self.confirm_successor()
         shown = self.start("sid-A", "prompt")
         self.assertIn("[정리 결과]", shown)
         self.assertNotIn("[참고할 기억]", shown)
@@ -1215,6 +1244,7 @@ class MemoryRefsRunTest(RunnerCase):
         self.wait_status(qid, "failed")
         refs = self.card()["memory_refs"]
         self.assertEqual((refs["status"], refs["refs"]), ("failed", []))
+        self.confirm_successor()
         shown = self.start("sid-B")
         self.assertIn("정돈을 끝내지 못함", shown)
         self.assertIn("진행 중: 시험", shown)
