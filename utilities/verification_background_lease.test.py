@@ -537,7 +537,7 @@ raise SystemExit(lease.main(["--timeout","20","--",*{command!r}]))
             command = [sys.executable, "-c", "import time; time.sleep(0.2)"]
             observed = {}
 
-            def inspect_from_wait(process, timeout, _scope, budget, source, peak, on_peak):
+            def inspect_from_wait(process, timeout, _scope, budget, source, peak, on_peak, _observed):
                 self.assertEqual(budget, L.memory_budget_bytes())
                 self.assertEqual(source, "default")
                 self.assertIsInstance(peak, L.MemoryPeak)
