@@ -19,6 +19,40 @@ def expand_rows(rows):
              for cell in [[glyph, colour, tint]] * count] for row in rows]
 
 
+def normalize_new_tree_viewport_row(actual_cells, expected_cells, actual_hits, expected_hits,
+                                   tree_scroll):
+    """Apply only the new scroll help row and one newly visible r14 tree row."""
+    help_y = len(actual_cells) - 2
+    help_text = "".join(str(cell[0] or "") for cell in actual_cells[help_y]).rstrip()
+    expected_help = (" ↑↓ move · ←→ focus · PgUp/Dn·Home/End·wheel scroll · "
+                     "⏎ pane · Tab view · / filter · u usage · F feed · q quit")
+    if help_text != expected_help:
+        raise AssertionError(f"scroll help row changed outside the approved text: {help_text!r}")
+    normalized_cells = [list(row) for row in expected_cells]
+    normalized_cells[help_y] = actual_cells[help_y]
+    if len(tree_scroll) < 8 or int(tree_scroll[5]) <= 0:
+        return normalized_cells, expected_hits
+    _x0, _top, width, bottom, offset, _maximum, _total, _visible = tree_scroll[:8]
+    boundary = int(bottom) - 1
+    if int(offset) != 0 or not 0 <= boundary < len(actual_cells):
+        raise AssertionError("the frozen r14 row delta applies only to the initial tree viewport")
+    additions = [hit for hit in actual_hits if hit not in expected_hits]
+    if (len(additions) != 1 or additions[0][0] != boundary or
+            additions[0][3][:1] not in (["scope"], ["route"])):
+        raise AssertionError(f"expected exactly one newly visible tree-row hit: {additions!r}")
+    if any(hit[0] == boundary and hit[3][:1] in (["scope"], ["route"])
+           for hit in expected_hits):
+        raise AssertionError("the frozen r14 oracle already contains a hit on the expanded row")
+    normalized_cells[boundary][:int(width)] = actual_cells[boundary][:int(width)]
+    normalized_hits = list(expected_hits)
+    compute_index = next((index for index, hit in enumerate(normalized_hits)
+                          if hit[3][:2] == ["root", "COMPUTE"]), None)
+    if compute_index is None:
+        raise AssertionError("the frozen frame has no COMPUTE summary hit")
+    normalized_hits.insert(compute_index, additions[0])
+    return normalized_cells, normalized_hits
+
+
 def _fixture_header_identity(vm):
     source = vm.hearting if isinstance(vm.hearting, Mapping) else {}
     install = vm.system.get("install", {}) if isinstance(vm.system, Mapping) else {}
@@ -96,13 +130,15 @@ class CoreReference(unittest.TestCase):
                 hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits]
                 version, method = _fixture_header_identity(vm)
                 compared = normalize_f70_method_delta(cells, expected["cells"], version=version, method=method)
-                if compared != expected["cells"]:
-                    first = next((f"row={y} col={x} expected={expected['cells'][y][x]!r} actual={compared[y][x]!r}"
-                                  for y in range(min(len(compared), len(expected["cells"])))
-                                  for x in range(min(len(compared[y]), len(expected["cells"][y])))
-                                  if compared[y][x] != expected["cells"][y][x]), "dimensions differ")
+                expected_cells, expected_hits = normalize_new_tree_viewport_row(
+                    compared, expected["cells"], hits, expected["hits"], actual.tree_scroll)
+                if compared != expected_cells:
+                    first = next((f"row={y} col={x} expected={expected_cells[y][x]!r} actual={compared[y][x]!r}"
+                                  for y in range(min(len(compared), len(expected_cells)))
+                                  for x in range(min(len(compared[y]), len(expected_cells[y])))
+                                  if compared[y][x] != expected_cells[y][x]), "dimensions differ")
                     self.fail(f"first cell mismatch at {cols} columns: {first}")
-                self.assertEqual(hits, expected["hits"], f"ordered hit mismatch at {cols} columns")
+                self.assertEqual(hits, expected_hits, f"ordered hit mismatch at {cols} columns")
 
 
 class ListReference(unittest.TestCase):
@@ -119,8 +155,10 @@ class ListReference(unittest.TestCase):
                     expected_cells = expand_rows(expected["cells"])
                     version, method = _fixture_header_identity(vm)
                     cells = normalize_f70_method_delta(cells, expected_cells, version=version, method=method)
+                    expected_cells, expected_hits = normalize_new_tree_viewport_row(
+                        cells, expected_cells, hits, expected["hits"], actual.tree_scroll)
                     self.assertEqual(cells, expected_cells, f"{view} cells at {cols}")
-                    self.assertEqual(hits, expected["hits"], f"{view} ordered hits at {cols}")
+                    self.assertEqual(hits, expected_hits, f"{view} ordered hits at {cols}")
 
     def test_repo_session_route_pages_and_unfolded_route_match_reference(self):
         vm = load_fixture(FIXTURES / "view_model.json")
@@ -144,8 +182,10 @@ class ListReference(unittest.TestCase):
                     expected_cells = expand_rows(expected["cells"])
                     version, method = _fixture_header_identity(vm)
                     cells = normalize_f70_method_delta(cells, expected_cells, version=version, method=method)
+                    expected_cells, expected_hits = normalize_new_tree_viewport_row(
+                        cells, expected_cells, hits, expected["hits"], actual.tree_scroll)
                     self.assertEqual(cells, expected_cells, f"{case} cells at {cols}")
-                    self.assertEqual(hits, expected["hits"], f"{case} ordered hits at {cols}")
+                    self.assertEqual(hits, expected_hits, f"{case} ordered hits at {cols}")
 
     def test_peers_and_filtered_links_match_exact_reference(self):
         vm = load_fixture(FIXTURES / "view_model.json")
@@ -165,8 +205,10 @@ class ListReference(unittest.TestCase):
                     expected_cells = expand_rows(expected["cells"])
                     version, method = _fixture_header_identity(vm)
                     cells = normalize_f70_method_delta(cells, expected_cells, version=version, method=method)
+                    expected_cells, expected_hits = normalize_new_tree_viewport_row(
+                        cells, expected_cells, hits, expected["hits"], actual.tree_scroll)
                     self.assertEqual(cells, expected_cells, f"{name} cells at {cols}")
-                    self.assertEqual(hits, expected["hits"], f"{name} ordered hits at {cols}")
+                    self.assertEqual(hits, expected_hits, f"{name} ordered hits at {cols}")
 
 
 class QuietReference(unittest.TestCase):
@@ -183,8 +225,10 @@ class QuietReference(unittest.TestCase):
                     expected_cells = expand_rows(expected["cells"])
                     version, method = _fixture_header_identity(vm)
                     cells = normalize_f70_method_delta(cells, expected_cells, version=version, method=method)
+                    expected_cells, expected_hits = normalize_new_tree_viewport_row(
+                        cells, expected_cells, hits, expected["hits"], actual.tree_scroll)
                     self.assertEqual(cells, expected_cells, f"{view} cells at {cols}")
-                    self.assertEqual(hits, expected["hits"], f"{view} ordered hits at {cols}")
+                    self.assertEqual(hits, expected_hits, f"{view} ordered hits at {cols}")
 
     def test_folded_question_and_history_generation_timeline_match_reference(self):
         vm = load_fixture(FIXTURES / "view_model.json")
@@ -198,8 +242,11 @@ class QuietReference(unittest.TestCase):
             expected_cells = expand_rows(expected["cells"])
             version, method = _fixture_header_identity(vm)
             actual_cells = normalize_f70_method_delta(actual_cells, expected_cells, version=version, method=method)
+            actual_hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits]
+            expected_cells, expected_hits = normalize_new_tree_viewport_row(
+                actual_cells, expected_cells, actual_hits, expected["hits"], actual.tree_scroll)
             self.assertEqual(actual_cells, expected_cells)
-            self.assertEqual([[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits], expected["hits"])
+            self.assertEqual(actual_hits, expected_hits)
 
             history_state = NavState(view="HISTORY", title="HISTORY",
                                      folds=(("hopen:HISTORY", "0c"),))
@@ -226,9 +273,12 @@ class QuietReference(unittest.TestCase):
             expected_cells = expand_rows(expected["cells"])
             version, method = _fixture_header_identity(vm)
             actual_cells = normalize_f70_method_delta(actual_cells, expected_cells, version=version, method=method)
+            actual_hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits]
+            expected_cells, expected_hits = normalize_new_tree_viewport_row(
+                actual_cells, expected_cells, actual_hits, expected["hits"], actual.tree_scroll)
             self.assertEqual(actual_cells, expected_cells, f"HISTORY card/dialogue cells at {cols}")
-            self.assertEqual([[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits],
-                             expected["hits"], f"HISTORY card/dialogue ordered hits at {cols}")
+            self.assertEqual(actual_hits, expected_hits,
+                             f"HISTORY card/dialogue ordered hits at {cols}")
 
             picked_state = NavState(view="HISTORY", title="HISTORY",
                                     folds=(("hopen:HISTORY", "0c"),
@@ -239,6 +289,9 @@ class QuietReference(unittest.TestCase):
             expected_cells = expand_rows(expected["cells"])
             version, method = _fixture_header_identity(vm)
             actual_cells = normalize_f70_method_delta(actual_cells, expected_cells, version=version, method=method)
+            actual_hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits]
+            expected_cells, expected_hits = normalize_new_tree_viewport_row(
+                actual_cells, expected_cells, actual_hits, expected["hits"], actual.tree_scroll)
             self.assertEqual(actual_cells, expected_cells, f"HISTORY picked-generation cells at {cols}")
-            self.assertEqual([[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in actual.hits],
-                             expected["hits"], f"HISTORY picked-generation ordered hits at {cols}")
+            self.assertEqual(actual_hits, expected_hits,
+                             f"HISTORY picked-generation ordered hits at {cols}")

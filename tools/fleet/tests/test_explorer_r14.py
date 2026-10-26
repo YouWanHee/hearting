@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from tools.fleet.explorer.frame import draw
-from tools.fleet.explorer.state import NavState
+from tools.fleet.explorer.state import NavState, reduce
 from tools.fleet.explorer.view_model import load_fixture
 
 
@@ -86,6 +86,78 @@ class R14Renderer(unittest.TestCase):
         self.assertIn("project-x/", process_row)
         self.assertIn("run_eval.py", process_row)
         self.assertEqual("\n".join(rows).count("run_eval.py"), 1)
+
+    def test_compute_block_anchors_above_footer_and_tree_scroll_keeps_full_identity_map(self):
+        for cols in (80, 100, 140, 168):
+            for rows in (24, 40, 60):
+                for usage_open in (False, True):
+                    with self.subTest(cols=cols, rows=rows, usage_open=usage_open):
+                        frame = draw(self.vm, NavState(usage_open=usage_open), cols=cols, rows=rows)
+                        self.assertIn("PgUp/Dn", frame.text_rows()[-2])
+                        self.assertIn("Home/End", frame.text_rows()[-2])
+                        self.assertIn("wheel", frame.text_rows()[-2])
+                        footer = rows - 4
+                        compute_hit = next(hit for hit in frame.hits
+                                           if hit.action == ("root", "COMPUTE"))
+                        compute_rows = 2 + min(5, len(self.vm.compute))
+                        self.assertEqual(compute_hit.y, footer - compute_rows)
+                        compute_hits = [hit for hit in frame.hits
+                                        if hit.action == ("root", "COMPUTE")]
+                        self.assertEqual(max(hit.y for hit in compute_hits), footer - 1)
+                        self.assertTrue(all(hit.y < footer for hit in compute_hits))
+                        self.assertTrue(any(hit.action == ("tab", "COMPUTE") for hit in frame.hits))
+                        tree = frame.tree_scroll
+                        self.assertEqual(tree[3], compute_hit.y)
+                        tree_hits = [hit for hit in frame.hits
+                                     if hit.action[:1] in (("scope",), ("route",))]
+                        self.assertTrue(all(tree[1] <= hit.y < tree[3] for hit in tree_hits))
+                        self.assertTrue(all(0 <= hit.y < rows and 0 <= hit.x0 < hit.x1 <= cols
+                                            for hit in frame.hits if hit.y >= 0))
+
+                        if rows >= 40 and tree[5] > 0:
+                            state, _ = reduce(
+                                NavState(), {"type": "wheel", "direction": -1,
+                                             "x": 2, "y": tree[1]}, frame)
+                            self.assertEqual(dict(state.scroll)["tree"], 3)
+                            bottom = draw(self.vm, NavState(scroll=(("tree", tree[5]),)),
+                                          cols=cols, rows=rows)
+                            bottom_tree = bottom.tree_scroll
+                            bottom_hits = [hit for hit in bottom.hits
+                                           if hit.action[:1] in (("scope",), ("route",))]
+                            self.assertTrue(bottom_hits)
+                            self.assertEqual(max(hit.y for hit in bottom_hits), bottom_tree[3] - 1)
+
+    def test_page_keys_scroll_unclipped_body_rows_and_clamp_resize(self):
+        frame = draw(self.vm, NavState(), cols=120, rows=24)
+        self.assertTrue(frame.pane_scroll[5] > 0)
+        moved, _ = reduce(NavState(), {"type": "key", "key": "pagedown"}, frame)
+        self.assertGreater(dict(moved.scroll)["pane"], 0)
+        scrolled = draw(self.vm, moved, cols=120, rows=24)
+        self.assertGreater(scrolled.pane_scroll[4], 0)
+        self.assertTrue(all(hit.y < 20 for hit in scrolled.hits if hit.y >= 0))
+        top, _ = reduce(moved, {"type": "key", "key": "home"}, scrolled)
+        self.assertEqual(dict(top.scroll)["pane"], 0)
+        end_offset = frame.pane_scroll[5]
+        bottom, _ = reduce(NavState(), {"type": "key", "key": "end",
+                                        "max_scroll": end_offset}, frame)
+        self.assertEqual(dict(bottom.scroll)["pane"], end_offset)
+        resized = draw(self.vm, bottom, cols=168, rows=60)
+        self.assertLessEqual(resized.pane_scroll[4], resized.pane_scroll[5])
+
+    def test_keyboard_session_selection_reveals_its_identity_in_scrolled_tree(self):
+        frame = draw(self.vm, NavState(scroll=(("tree", 6),)), cols=120, rows=40)
+        order = tuple("session:" + str(item.get("tag")) for item in self.vm.sessions)
+        state, _ = reduce(NavState(scroll=(("tree", 6),)),
+                          {"type": "key", "key": "down", "order": order}, frame)
+        tree = frame.tree_scroll
+        indices = tree[8]
+        selected_index = indices[state.scope]
+        offset = dict(state.scroll).get("tree", tree[4])
+        self.assertLessEqual(offset, selected_index)
+        self.assertLess(selected_index, offset + tree[7])
+        repainted = draw(self.vm, state, cols=120, rows=40)
+        self.assertTrue(any(hit.action == ("scope", state.scope.partition(":")[2])
+                            for hit in repainted.hits))
 
 
 if __name__ == "__main__":
