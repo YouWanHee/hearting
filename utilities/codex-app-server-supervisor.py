@@ -837,9 +837,38 @@ def configure_permission_profiles(args: argparse.Namespace, command: list[str]) 
     )
 
 
+def host_payload_selection(row):
+    """The payload-only choice of a sealed host node; None leaves the owner's policy in force.
+
+    Never raises: the runner's own start check refuses a strict request or an invalid caller
+    sandbox, so a refusal settles the queued row instead of escaping the controller first."""
+    route_path, node = row.get("route"), row.get("node")
+    if not route_path or not node:
+        return None
+    try:
+        route = json.loads(Path(route_path).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(route, dict):
+        return None
+    import gpu_execution_sandbox as SANDBOX
+    try:
+        return SANDBOX.select_payload(route, node=node)
+    except ValueError:
+        return None
+
+
 def resource_sandbox_command(args, row):
     """Apply this owner's selected native policy; no tool namespace inheritance."""
     from codex_permission_profile import PROFILE_NAME
+    payload = host_payload_selection(row)
+    if payload is not None and payload["sandbox"] == "danger-full-access":
+        # Only this registered payload leaves the owner's profile; the owner keeps its own.
+        command = ["codex", "sandbox", "-P", ":danger-full-access", "--include-managed-config",
+                   "-C", args.worktree, "--", "/bin/sh", "-c", 'cd -- "$1" || exit; shift; exec "$@"',
+                   "resource-payload", row["cwd"], *row["command"]]
+        return command, {"mode": "danger-full-access", "enforcement": "none", "network_access": True,
+                         "source": payload["source"], "scope": "host-process-payload"}
     if getattr(args, "recordish_profile_active", False):
         options = [*config_arguments(args.native_permission_profile), "-P", RECORDISH_PROFILE_NAME]
         enforcement = "os-sandbox"

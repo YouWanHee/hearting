@@ -5195,6 +5195,52 @@
         "execution_needs": [
           "compute-hosts"
         ]
+      },
+      "autopilot-lab:host-run": {
+        "summary": "Run one registered GPU-free long-running host payload (measurement, benchmark, browser test, memory-capped command) without a GPU lease.",
+        "shareable": true,
+        "hosts": [
+          "autopilot-code",
+          "autopilot-lab"
+        ],
+        "optional": {
+          "modes": [
+            "setup",
+            "eval"
+          ],
+          "after": [],
+          "before": [],
+          "node": {
+            "id": "host-run",
+            "kind": "resource-runner",
+            "depends_on": [],
+            "role": "orchestrator",
+            "inputs": [
+              "task"
+            ],
+            "outputs": [
+              "run.json",
+              "logs/**"
+            ],
+            "write_scope": [
+              "run.json",
+              "logs/**",
+              "raw-results/**"
+            ],
+            "resource_class": "long-running",
+            "completion_gate": "resource-exit",
+            "resource_transport": "detached-process",
+            "unit": "_kernel/resource",
+            "continuation": {
+              "kind": "supervised"
+            },
+            "advance_class": "runtime-eligible",
+            "commit_expected": false
+          }
+        },
+        "execution_needs": [
+          "host-process"
+        ]
       }
     }
   }
