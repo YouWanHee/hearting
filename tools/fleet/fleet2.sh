@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# fleet2.sh — the Fleet explorer screen.
-#   `fleet` keeps the group/process screen until this one is ready to replace it.
-#   Same options as fleet.sh (including --window); this only adds --explorer.
+# fleet2.sh — compatibility alias for the Fleet Explorer.
+#   Keep this path for existing scripts; fleet.sh is the public command name.
 set -euo pipefail
 
 # Resolve the real script location when invoked through a symlink.
@@ -12,4 +11,4 @@ while [ -h "$SOURCE" ]; do
   [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 SCRIPT_DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
-exec "$SCRIPT_DIR/fleet.sh" --explorer "$@"
+exec "$SCRIPT_DIR/fleet.sh" "$@"

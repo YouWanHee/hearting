@@ -133,7 +133,10 @@ def build_parser():
 
     sub.add_parser("status", parents=[common], help="Summarize installation channels, versions, and drift")
 
-    p_uninstall = sub.add_parser("uninstall", parents=[common], help="Remove only manifest-owned files")
+    p_uninstall = sub.add_parser(
+        "uninstall", parents=[common],
+        help="Remove runtime-owned files; a full global uninstall also removes managed Fleet commands",
+    )
     p_uninstall.add_argument("target", nargs="?", choices=[*RUNTIMES, "all"], default=None)
 
     # Memory exchange policy: one portable file every adapter reads, plus the
@@ -1205,6 +1208,15 @@ def cmd_uninstall(args):
     if full and args.scope == "global":
         history_restore = herdr_integration.restore_history_key(dry_run=args.dry_run)
         lines.append("uninstall: herdr history key — " + history_restore["status"])
+        fleet_launchers = bootstrap.uninstall_fleet_launchers(dry_run=args.dry_run)
+        for fleet_launcher in fleet_launchers:
+            status = fleet_launcher["status"]
+            lines.append(f"uninstall: common {fleet_launcher['name']} launcher — {status}")
+            checks.append({
+                "id": f"bootstrap.launcher.{fleet_launcher['name']}",
+                "ok": True,
+                "detail": status,
+            })
         launcher_result = bootstrap.uninstall_compute_hosts(dry_run=args.dry_run)
         lines.append("uninstall: common compute-hosts launcher — " + launcher_result["status"])
         checks.append({
@@ -1214,6 +1226,7 @@ def cmd_uninstall(args):
         })
     else:
         lines.append("uninstall: herdr history key — retained for other runtimes")
+        lines.append("uninstall: common Fleet launchers — retained for other runtimes")
         lines.append("uninstall: common compute-hosts launcher — retained for other runtimes")
         checks.append({
             "id": "bootstrap.launcher.compute-hosts",

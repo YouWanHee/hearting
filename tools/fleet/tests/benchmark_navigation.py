@@ -85,7 +85,7 @@ def _production_order(replicates=3):
 def _production_argv(role, trees):
     tree = Path(trees[role]).resolve()
     launcher = tree / "tools" / "fleet" / (
-        "fleet.sh" if role == "legacy" else "fleet2.sh")
+        "fleet-monitor.sh" if role == "legacy" else "fleet2.sh")
     return [str(launcher)]
 
 
@@ -2378,7 +2378,7 @@ def main():
         for label, path in (("source", args.source_tree), ("base", args.base_tree),
                             ("legacy", args.legacy_tree)):
             if not (Path(path).expanduser() / "tools/fleet" /
-                    ("fleet.sh" if label == "legacy" else "fleet2.sh")).is_file():
+                    ("fleet-monitor.sh" if label == "legacy" else "fleet2.sh")).is_file():
                 parser.error("%s tree is missing its production launcher" % label)
         value = _production_campaign(args)
         print(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))

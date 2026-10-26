@@ -163,7 +163,7 @@ class BenchmarkProductionContractTest(unittest.TestCase):
             trees = {}
             for role, launcher in (("base", "fleet2.sh"),
                                    ("candidate", "fleet2.sh"),
-                                   ("legacy", "fleet.sh")):
+                                   ("legacy", "fleet-monitor.sh")):
                 tree = Path(tmp) / role
                 path = tree / "tools/fleet" / launcher
                 path.parent.mkdir(parents=True)
@@ -171,7 +171,7 @@ class BenchmarkProductionContractTest(unittest.TestCase):
                 trees[role] = tree
             for role, launcher in (("base", "fleet2.sh"),
                                    ("candidate", "fleet2.sh"),
-                                   ("legacy", "fleet.sh")):
+                                   ("legacy", "fleet-monitor.sh")):
                 self.assertEqual(benchmark._production_argv(role, trees), [
                     str(trees[role].resolve() / "tools/fleet" / launcher)
                 ])

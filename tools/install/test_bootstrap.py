@@ -135,7 +135,52 @@ class LauncherMigrationTest(unittest.TestCase):
         self.assertEqual(fleet.read_text(encoding="utf-8"), "user-owned\n")
         self.assertEqual(Path(os.readlink(hearting)), foreign)
         self.assertEqual(rows["harness"]["status"], "created")
+        self.assertEqual(rows["fleet-monitor"]["status"], "created")
+        self.assertEqual(rows["fleet2"]["status"], "created")
         self.assertEqual(rows["mem"]["status"], "created")
+
+    def test_fleet_names_map_to_the_public_monitor_and_compatibility_launchers(self):
+        expected = {
+            "fleet": "tools/fleet/fleet.sh",
+            "fleet-monitor": "tools/fleet/fleet-monitor.sh",
+            "fleet2": "tools/fleet/fleet2.sh",
+        }
+        self.assertEqual(
+            {name: rel for name, rel in bootstrap.LAUNCHERS if name in expected},
+            expected,
+        )
+        rows = {row["name"]: row for row in bootstrap.install_launchers(home=self.home)}
+        for name, rel_source in expected.items():
+            self.assertEqual(rows[name]["status"], "created")
+            self.assertEqual(self._target(name).resolve(), (self.source / rel_source).resolve())
+
+        removed = bootstrap.uninstall_fleet_launchers(home=self.home)
+        self.assertEqual({row["name"]: row["status"] for row in removed}, {
+            "fleet": "removed", "fleet-monitor": "removed", "fleet2": "removed",
+        })
+        self.assertTrue(all(not self._target(name).exists() and not self._target(name).is_symlink()
+                            for name in expected))
+
+    def test_full_fleet_uninstall_preserves_foreign_and_user_owned_names(self):
+        target_dir = self.home / ".local/bin"
+        target_dir.mkdir(parents=True)
+        foreign = self.root / "foreign/fleet-monitor"
+        foreign.parent.mkdir()
+        foreign.write_text("user-owned\n", encoding="utf-8")
+        self._target("fleet-monitor").symlink_to(foreign)
+        self._target("fleet2").write_text("user command\n", encoding="utf-8")
+
+        installed = {row["name"]: row for row in bootstrap.install_launchers(home=self.home)}
+        self.assertEqual(installed["fleet"]["status"], "created")
+        self.assertEqual(installed["fleet-monitor"]["status"], "skipped-collision")
+        self.assertEqual(installed["fleet2"]["status"], "skipped-collision")
+
+        removed = {row["name"]: row for row in bootstrap.uninstall_fleet_launchers(home=self.home)}
+        self.assertEqual(removed["fleet"]["status"], "removed")
+        self.assertEqual(removed["fleet-monitor"]["status"], "preserved-foreign")
+        self.assertEqual(removed["fleet2"]["status"], "preserved-foreign")
+        self.assertEqual(self._target("fleet-monitor").resolve(), foreign.resolve())
+        self.assertEqual(self._target("fleet2").read_text(encoding="utf-8"), "user command\n")
 
 
 class InstallerCollisionExitTest(unittest.TestCase):
