@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -29,6 +30,23 @@ import dispatch_contract as DC
 import route_authority as RA
 
 
+V3532_READ_ARMED_SOURCE = '''def read_armed(ledger):
+    rows = {}
+    directory = armed_dir(ledger)
+    if not directory.is_dir():
+        return rows
+    for path in sorted(directory.glob("*.json")):
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(row, dict) and row.get("node"):
+            rows[row["node"]] = row
+    return rows
+'''
+V3532_READ_ARMED_SHA256 = "3887ab00b30ef79bcbdc4a09fa9a624efbce9bd606eead194cf540a62ea4b883"
+
+
 class ResourceSequenceTest(FIX.WorkflowFixture):
     EMPTY_LAUNCH_REQUEST = {"smoke_attestation": None, "smoke_attestation_sha256": None,
                             "config_manifest": None, "config_manifest_sha256": None}
@@ -52,6 +70,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
     def live_owner(self, route, jobs, registry, *, harness='codex'):
         import dispatch_owner_input as INPUT
         identity = SUP.RR.proc_identity(os.getpid())
+        resource_snapshot = json.loads(registry.read_text())
+        resource_route_file = resource_snapshot['runs']['fixture-run']['route']
         attempt = 'att-owner'
         lease = DC.supervisor_lease_path(jobs, attempt)
         nonce = 'd' * 64
@@ -65,6 +85,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             'supervisor_lease': DC.SUPERVISOR_LEASE_KIND,
             'supervisor_lease_file': str(lease), 'supervisor_lease_nonce': nonce,
             'attempt_id': attempt, 'pid': str(identity['pid']), 'pid_start': identity['starttime'],
+            'owner_route_file': str(Path(resource_route_file).resolve()),
             'owner_route_id': route['route_id'], 'owner_route_hash': route['route_hash'],
             'route_id': route['route_id'], 'route_hash': route['route_hash'],
             'parent_sid': 'fixture-parent-session',
@@ -78,7 +99,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         lease_context = DC.hold_supervisor_lease(jobs, attempt, lease)
         lease_context.__enter__()
         self.addCleanup(lease_context.__exit__, None, None, None)
-        owner_input = INPUT.OwnerInput(jobs, attempt, 'same-native', 'codex-active-turn', lambda _: None)
+        transport = 'codex-active-turn' if harness == 'codex' else f'{harness}-session-resume'
+        owner_input = INPUT.OwnerInput(jobs, attempt, 'same-native', transport, lambda _: None)
         self.addCleanup(owner_input.close)
         resource_data = json.loads(registry.read_text())
         armed_path = SUP.ledger_for(route, jobs).root / 'armed/full-run.json'
@@ -466,6 +488,50 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                 'status': 'launching', 'workflow_state': 'READY', 'resource_policy': 'supervised-owner',
                 'launch_request': dict(self.EMPTY_LAUNCH_REQUEST)}
 
+    def authorized_body(self, route, path, jobs, registry, owner_attempt, owner_input,
+                        name, output, *, scope="independent approved resource operation",
+                        payload_code="import time; time.sleep(20)", payload_args=()):
+        import dispatch_owner_input as INPUT
+        body = self.next_body(registry, name, output)
+        body.update(parent_attempt_id=owner_attempt)
+        request_path = self.base / f'{name}-request.json'
+        admission_dir = self.base / f'{name}-admission'
+        admission_dir.mkdir(parents=True, exist_ok=True)
+        command = [sys.executable, '-c', payload_code, *map(str, payload_args), str(request_path)]
+        request = {
+            'user_direction_id': f'input-{name}', 'parent_attempt_id': owner_attempt,
+            'run_id': name, 'requested_scope': scope,
+            'compute_argv': ['compute-hosts', 'run', '--cwd', body['cwd'], '--name', name],
+            'config_manifest': None, 'smoke_attestation': None,
+            'Dev_admission_evidence': str(admission_dir / 'admission-evidence.json'),
+            'provenance': {},
+        }
+        request_bytes = json.dumps(request, sort_keys=True).encode()
+        request_path.write_bytes(request_bytes)
+        body['command'] = command
+        argv = ['python3', str(HERE / 'resource-runner.py'),
+            '--registry', str(Path(registry).resolve()), 'start',
+            '--run-id', name, '--cwd', str(Path(body['cwd']).resolve()),
+            '--log', str(Path(body['log']).resolve()), '--route', str(Path(path).resolve()),
+            '--node', body['node'], '--parent-attempt-id', owner_attempt,
+            '--jobs', str(Path(jobs).resolve()), '--', *command]
+        (admission_dir / f'{name}-resource-start-command.json').write_text(json.dumps({
+            'argv': argv, 'request_path': str(request_path),
+            'request_sha256': hashlib.sha256(request_bytes).hexdigest()}, sort_keys=True))
+        with mock.patch.object(RA, 'correction_source_session', return_value='fixture-user-session'):
+            INPUT.submit(jobs, owner_attempt, scope, request_id=f'input-{name}')
+            owner_input.prepare('continue the approved work')
+            turn = f'turn-{name}'
+            owner_input.started(turn)
+            owner_input.completed(turn)
+        operation = SUP.runner().resource_operation_binding(
+            route, path, body['node'], name, command, body['cwd'],
+            dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
+            registry_path=registry, log_path=body['log'])
+        self.assertIsNotNone(operation)
+        body['resource_operation'] = operation
+        return body
+
     def arm(self, path, registry, *, node='full-run', run_id='fixture-run', extra=()):
         argv = ['arm', '--route', str(path), '--node', node, '--predecessor-kind', 'resource',
                 '--predecessor-id', run_id, '--resource-registry', str(registry),
@@ -477,7 +543,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         with contextlib.redirect_stdout(io.StringIO()):
             return SUP.main(argv)
 
-    def launch(self, route, path, jobs, registry, output, body, *, controller=None, close_at=None, exit_code=0):
+    def launch(self, route, path, jobs, registry, output, body, *, controller=None,
+               close_at=None, exit_code=0, wait_for_exit=True):
         import artifact_producer
         runner = SUP.runner()
         args = SimpleNamespace(jobs=str(jobs), run_id=body['run_id'], node=body['node'])
@@ -512,8 +579,9 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                 mock.patch.object(runner.subprocess, 'Popen', side_effect=popen), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             runner.start_verified(registry, args, route, path, dict(body), controller=controller)
-        for proc in payloads:
-            self.assertEqual(proc.wait(timeout=5), exit_code)
+        if wait_for_exit:
+            for proc in payloads:
+                self.assertEqual(proc.wait(timeout=5), exit_code)
         return payloads, json.loads(out.getvalue().splitlines()[-1])
 
     def test_verified_sequential_launch_release_accepts_multidigit_fd(self):
@@ -1530,6 +1598,277 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'STAGE_SUCCEEDED')
         self.assertEqual(registry.read_bytes(), registry_bytes)
         self.assertEqual(ledger.claims(), {})
+
+    def test_v3532_flat_reader_keeps_fix_bytes_and_var_receipt_is_independent(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        identity = SUP.RR.proc_identity(os.getpid())
+        data = json.loads(registry.read_text())
+        data['runs']['fixture-run'].update(identity, process_group=os.getpgrp(),
+            pid_namespace=os.readlink('/proc/self/ns/pid'), status='running', exit_code=None)
+        registry.write_text(json.dumps(data))
+        primary_path = ledger.root / 'armed' / 'full-run.json'
+        primary_bytes = primary_path.read_bytes()
+        old_fix = json.loads(registry.read_text())['runs']['fixture-run']
+        body = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+                                    'var-run', output, scope='var run; preserve running fix',
+                                    payload_code='pass')
+        processes, _receipt = self.launch(route, path, jobs, registry, output, body)
+        self.assertEqual(len(processes), 1)
+        self.assertEqual(primary_path.read_bytes(), primary_bytes)
+        self.assertEqual(json.loads(registry.read_text())['runs']['fixture-run'], old_fix)
+
+        self.assertEqual(hashlib.sha256(V3532_READ_ARMED_SOURCE.encode()).hexdigest(),
+                         V3532_READ_ARMED_SHA256)
+        namespace = {'json': json, 'Path': Path,
+                     'armed_dir': lambda current: current.root / 'armed'}
+        exec(compile(V3532_READ_ARMED_SOURCE, 'v3.53.2-workflow-supervisor.py', 'exec'), namespace)
+        old_view = namespace['read_armed'](ledger)
+        self.assertEqual(old_view['full-run'], json.loads(primary_bytes))
+        current = SUP.read_resource_watches(ledger, 'full-run')
+        self.assertEqual({row['predecessor_id'] for row in current}, {'fixture-run', 'var-run'})
+
+        phase = self.base / 'owner-state.json'
+        WAIT.JOIN.write_supervisor_state(phase, owner_attempt, set(), phase='running-turn')
+        control = SimpleNamespace(thread_id='same-native', pending=lambda: False)
+        args = SimpleNamespace(parent_attempt_id=owner_attempt, route_file=str(path),
+            route_id=route['route_id'], route_hash=route['route_hash'], jobs=str(jobs))
+        pairs = [(armed, json.loads(Path(armed['resource_registry']).read_text())['runs'][armed['predecessor_id']])
+                 for armed in current]
+        with mock.patch.object(WAIT, 'context', return_value=(SUP, route, ledger, pairs)):
+            prompt = WAIT.wait(args, phase, control, set(), lambda _event: None,
+                              sleep=lambda _seconds: self.fail('ready var receipt must not wait for fix'))
+        receipt = WAIT.JOIN.read_supervisor_phase_state(phase, owner_attempt).resource['outbox']['receipt']
+        self.assertIn('var-run', prompt)
+        self.assertEqual((receipt['run_id'], receipt['state']), ('var-run', 'succeeded'))
+        self.assertFalse(receipt['verification_pass'])
+        with self.assertRaisesRegex(SUP.SupervisorError, 'resource-owner-operation-unsettled'):
+            SUP.admit_owner_successor_start(route, 'run-verify', jobs, owner_attempt, 'same-native')
+        self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'RUNNING')
+        self.assertEqual(ledger.claims(), {})
+
+    def test_two_approved_cpu_operations_run_together_then_admit_once(self):
+        for harness in ('claude', 'codex', 'opencode'):
+            with self.subTest(owner_harness=harness), self.subfixture():
+                self._exercise_two_approved_operations(harness)
+
+    def _exercise_two_approved_operations(self, harness):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry, harness=harness)
+        release_a, release_b = self.base / 'a.release', self.base / 'b.release'
+        barrier = ('import sys,time\nfrom pathlib import Path\np=Path(sys.argv[1])\n'
+                   'while not p.exists(): time.sleep(.01)\n')
+        body_a = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+            'operation-a', output, scope='authorized operation A',
+            payload_code=barrier, payload_args=[str(release_a)])
+        body_b = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+            'operation-b', output, scope='authorized operation B',
+            payload_code=barrier, payload_args=[str(release_b)])
+        data = json.loads(registry.read_text())
+        data['runs'].pop('fixture-run')
+        registry.write_text(json.dumps(data))
+        (ledger.root / 'armed' / 'full-run.json').unlink()
+        processes = []
+        try:
+            first, receipt_a = self.launch(route, path, jobs, registry, output, body_a, wait_for_exit=False)
+            processes.extend(first)
+            second, receipt_b = self.launch(route, path, jobs, registry, output, body_b, wait_for_exit=False)
+            processes.extend(second)
+            self.assertTrue(all(proc.poll() is None for proc in processes))
+            watches = SUP.read_resource_watches(ledger, 'full-run')
+            self.assertEqual({row['predecessor_id'] for row in watches}, {'operation-a', 'operation-b'})
+            self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'wait-resource-operation')
+            self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'RUNNING')
+            self.assertEqual(ledger.claims(), {})
+
+            release_a.write_text('go')
+            release_b.write_text('go')
+            for proc in processes:
+                self.assertEqual(proc.wait(timeout=5), 0)
+            SUP.poll_once(route, ledger)
+            runtime_runs = json.loads((output / 'run.json').read_text())['hearting_resource_runs']['runs']
+            self.assertEqual(set(runtime_runs), {'operation-a', 'operation-b'})
+            self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'RUNNING')
+            self.assertEqual(ledger.claims(), {})
+
+            self.assertTrue(SUP.admit_owner_successor_start(
+                route, 'run-verify', jobs, owner_attempt, 'same-native'))
+            stage = ledger.state()['nodes']['full-run']
+            self.assertEqual(stage['state'], 'STAGE_SUCCEEDED')
+            self.assertEqual({row['run_id'] for row in stage['evidence']['resource_operations']},
+                             {'operation-a', 'operation-b'})
+            self.assertEqual(len(ledger.claims()), 1)
+            self.assertEqual(len(ledger.claim_history()), 1)
+        finally:
+            for release in (release_a, release_b):
+                release.write_text('cleanup')
+            for proc in processes:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5)
+
+    def test_sibling_pass_does_not_erase_an_unresolved_operation_failure(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        release_a, release_b = self.base / 'fail.release', self.base / 'pass.release'
+        barrier_fail = ('import sys,time\nfrom pathlib import Path\np=Path(sys.argv[1])\n'
+                        'while not p.exists(): time.sleep(.01)\nsys.exit(7)\n')
+        barrier_pass = ('import sys,time\nfrom pathlib import Path\np=Path(sys.argv[1])\n'
+                        'while not p.exists(): time.sleep(.01)\n')
+        failed = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+            'operation-fail', output, scope='authorized failing operation',
+            payload_code=barrier_fail, payload_args=[str(release_a)])
+        passed = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+            'operation-pass', output, scope='authorized successful operation',
+            payload_code=barrier_pass, payload_args=[str(release_b)])
+        data = json.loads(registry.read_text())
+        data['runs'].pop('fixture-run')
+        registry.write_text(json.dumps(data))
+        (ledger.root / 'armed' / 'full-run.json').unlink()
+        processes = []
+        try:
+            first, _ = self.launch(route, path, jobs, registry, output, failed, wait_for_exit=False)
+            second, _ = self.launch(route, path, jobs, registry, output, passed, wait_for_exit=False)
+            processes.extend(first + second)
+            release_a.write_text('go')
+            release_b.write_text('go')
+            self.assertEqual(first[0].wait(timeout=5), 7)
+            self.assertEqual(second[0].wait(timeout=5), 0)
+            observations = SUP.poll_once(route, ledger)
+            self.assertEqual(len(observations), 2)
+            self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'RUNNING')
+            current = json.loads(registry.read_text())['runs']
+            self.assertEqual(current['operation-fail']['exit_code'], 7)
+            self.assertEqual(current['operation-pass']['exit_code'], 0)
+            with self.assertRaisesRegex(SUP.SupervisorError, 'resource-owner-operation-unsettled'):
+                SUP.admit_owner_successor_start(route, 'run-verify', jobs, owner_attempt, 'same-native')
+            self.assertEqual(ledger.claims(), {})
+            self.assertFalse((jobs.parent / 'completion' / route['route_id'] / 'full-run.json').exists())
+        finally:
+            for release in (release_a, release_b):
+                release.write_text('cleanup')
+            for proc in processes:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5)
+
+    def test_public_start_with_live_leased_owner_runs_cpu_then_uses_existing_successor_gate(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, _owner_input = self.live_owner(route, jobs, registry, harness='claude')
+        import dispatch_contract as CONTRACT
+        state_path = CONTRACT.dispatch_state_root(jobs) / 'supervisor-state' / f'{owner_attempt}.json'
+        WAIT.JOIN.write_supervisor_state(state_path, owner_attempt, set(), phase='running-turn')
+        smoke = self.base / 'public-smoke.json'
+        smoke.write_text('{"fixture":true}\n')
+        command = [sys.executable, '-c', 'print("public current cpu launch")']
+        import artifact_producer
+        runner = SUP.runner()
+        payloads = []
+        real_popen = subprocess.Popen
+        def capture_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            command_line = args[0] if args else kwargs.get('args')
+            if isinstance(command_line, list) and command_line[:2] == ['/bin/bash', '-p']:
+                payloads.append(proc)
+            return proc
+        env = {
+            'CUDA_VISIBLE_DEVICES': '',
+            'AGENT_DISPATCH_COMPLETION_MODE': 'supervised',
+            'AGENT_DISPATCH_ATTEMPT_ID': owner_attempt,
+            'AGENT_OWNER_ROUTE_FILE': str(path),
+            'AGENT_DISPATCH_JOBS': str(jobs),
+            'AGENT_DISPATCH_COMPLETION_STATE_FILE': str(state_path),
+        }
+        log = self.base / 'public-current.log'
+        argv = ['--registry', str(registry), 'start', '--run-id', 'public-current-run',
+            '--cwd', str(self.base), '--log', str(log), '--route', str(path),
+            '--node', 'full-run', '--smoke-attestation', str(smoke),
+            '--parent-attempt-id', owner_attempt, '--jobs', str(jobs), '--', *command]
+        try:
+            with mock.patch.dict(os.environ, env, clear=False), \
+                 mock.patch.object(runner, 'verify_launch_input'), \
+                 mock.patch.object(artifact_producer, 'prepare_route_artifact_env',
+                    return_value={'AGENT_ARTIFACT_OUTPUT_DIR': str(output)}), \
+                 mock.patch.object(runner, 'register_registry'), \
+                 mock.patch.object(runner, 'start_watch',
+                    return_value=(mock.Mock(poll=lambda: None), SUP.RR.proc_identity(os.getpid()))), \
+                 mock.patch.object(runner.subprocess, 'Popen', side_effect=capture_popen), \
+                 contextlib.redirect_stdout(io.StringIO()) as stdout:
+                runner.main(argv)
+            self.assertEqual(len(payloads), 1)
+            receipt = json.loads(stdout.getvalue().splitlines()[-1])
+            self.assertEqual(receipt['status'], 'running')
+            self.assertEqual(receipt['pid'], payloads[0].pid)
+            self.assertEqual(receipt['parent_attempt_id'], owner_attempt)
+            self.assertEqual(payloads[0].wait(timeout=5), 0)
+            result = SUP.poll_once(route, ledger)
+            self.assertEqual(result[0]['action'], 'wait-next-resource')
+            self.assertTrue(SUP.admit_owner_successor_start(
+                route, 'run-verify', jobs, owner_attempt, 'same-native'))
+            self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'STAGE_SUCCEEDED')
+            self.assertEqual(len(ledger.claims()), 1)
+        finally:
+            for proc in payloads:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5)
+
+    def test_same_operation_body_with_a_new_request_id_cannot_overlap(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        release = self.base / 'same.release'
+        barrier = ('import sys,time\nfrom pathlib import Path\np=Path(sys.argv[1])\n'
+                   'while not p.exists(): time.sleep(.01)\n')
+        first = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+            'first-id', output, payload_code=barrier, payload_args=[str(release)])
+        second = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+            'second-id', output, payload_code=barrier, payload_args=[str(release)])
+        processes, _ = self.launch(route, path, jobs, registry, output, first, wait_for_exit=False)
+        before_registry = registry.read_bytes()
+        before_watches = SUP.read_resource_watches(ledger, 'full-run')
+        try:
+            self.assertEqual(first['resource_operation']['operation_id'],
+                             second['resource_operation']['operation_id'])
+            with self.assertRaisesRegex(ValueError, 'resource-operation-duplicate'):
+                self.launch(route, path, jobs, registry, output, second, wait_for_exit=False)
+            self.assertEqual(registry.read_bytes(), before_registry)
+            self.assertEqual(SUP.read_resource_watches(ledger, 'full-run'), before_watches)
+        finally:
+            release.write_text('cleanup')
+            for proc in processes:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5)
+
+    def test_user_direction_id_without_exact_command_receipt_does_not_authorize_overlap(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        body = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+                                    'unreceipted-var', output, payload_code='pass')
+        request_path = Path(body['command'][-1])
+        request = json.loads(request_path.read_text())
+        command_receipt = Path(request['Dev_admission_evidence']).parent / \
+            'unreceipted-var-resource-start-command.json'
+        receipt = json.loads(command_receipt.read_text())
+        receipt['argv'][1] = '/installed/releases/v3.53.2/utilities/resource-runner.py'
+        command_receipt.write_text(json.dumps(receipt))
+        self.assertIsNone(SUP.runner().resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
+            registry_path=registry, log_path=body['log']))
+        command_receipt.unlink()
+        self.assertIsNone(SUP.runner().resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
+            registry_path=registry, log_path=body['log']))
+        body.pop('resource_operation')
+        identity = SUP.RR.proc_identity(os.getpid())
+        data = json.loads(registry.read_text())
+        data['runs']['fixture-run'].update(identity, process_group=os.getpgrp(),
+            pid_namespace=os.readlink('/proc/self/ns/pid'), status='running', exit_code=None)
+        registry.write_text(json.dumps(data))
+        before_registry = registry.read_bytes()
+        before_armed = SUP.read_armed(ledger)
+        with self.assertRaisesRegex(ValueError, 'resource-route-body-conflict'):
+            self.launch(route, path, jobs, registry, output, body)
+        self.assertEqual(registry.read_bytes(), before_registry)
+        self.assertEqual(SUP.read_armed(ledger), before_armed)
 
 
 if __name__ == '__main__':

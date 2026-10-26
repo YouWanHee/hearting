@@ -1564,6 +1564,19 @@ an unacknowledged success or failure remains recoverable from its original bindi
 next registration, with no lifetime receipt-count ceiling.
 The resource that supplies the declared stage outputs can complete the stage. Continuation retains that admitted resource identity and quiescence; it requires no model attempt sidecar for the resource prefix.
 
+Distinct owner-authorized operations for one route/node may have separate live
+resource rows. Admission binds each operation to the existing owner input and
+request lineage plus its exact route, owner, command, cwd, environment,
+configuration, attestation, and input digests. A retry of one
+operation still requires that operation's prior execution to be terminal and
+quiescent; unrelated operations retain independent registry rows, watches,
+results, receipts, and output-settlement duties. Aggregate stage admission waits
+for every current authorized operation and claims the existing successor once.
+The legacy `<node>.json` watch remains the original flat-file view; additive
+execution watches are stored outside `armed/*.json`, and only current readers
+aggregate them. Existing cached consumers are supported only when their current
+launch/admission path is independently available and proven.
+
 **Registry selection is workflow-ledger authority.** When a supervisor command
 or any adapter launch fence receives an explicit `--jobs`, the ledger is always
 `<jobs-parent>/workflow/<route-id>` even if the raising and releasing actors

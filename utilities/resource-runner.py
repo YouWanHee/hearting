@@ -160,6 +160,260 @@ def launch_request(args):
     return request
 
 
+def supervisor_resource_watches(supervisor, ledger, node=None):
+    reader = getattr(supervisor, "read_resource_watches", None)
+    if callable(reader):
+        return reader(ledger, node)
+    return [row for row in supervisor.read_armed(ledger).values()
+            if row.get("predecessor_kind") == "resource"
+            and (node is None or row.get("node") == node)]
+
+
+def supervisor_resource_watch_for_run(supervisor, ledger, node, registry, run_id):
+    primary = supervisor.read_armed(ledger).get(node)
+    if (primary and primary.get("predecessor_id") == run_id
+            and str(Path(primary.get("resource_registry") or "").resolve(strict=False))
+                == str(Path(registry).resolve(strict=False))):
+        return primary
+    finder = getattr(supervisor, "resource_watch_for_run", None)
+    if callable(finder):
+        return finder(ledger, node, registry, run_id)
+    expected = (node, str(Path(registry).resolve(strict=False)), run_id)
+    rows = getattr(supervisor, "read_armed")(ledger).values()
+    return next((row for row in rows
+        if (row.get("node"), str(Path(row.get("resource_registry") or "").resolve(strict=False)),
+            row.get("predecessor_id")) == expected), None)
+
+
+def resource_operation_binding(route, route_file, node, run_id, command, cwd,
+                               launch_request_value, owner_wait, *, registry_path=None,
+                               log_path=None):
+    """Bind an existing operation request to this exact supervised launch.
+
+    Ordinary one-at-a-time runs need no new request format. A second live run
+    can use only an existing request JSON named in its payload argv, tied to an
+    exact input already recorded for this live owner. The run id or
+    ``user_direction_id`` by itself is never sufficient.
+    """
+    if not isinstance(owner_wait, dict):
+        return None
+    work_request = route.get("work_request")
+    if isinstance(work_request, dict) and isinstance(work_request.get("text"), str) \
+            and work_request["text"].strip():
+        work_request_sha256 = hashlib.sha256(json.dumps(
+            work_request, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False).encode("utf-8")).hexdigest()
+    else:
+        route_hash = route.get("route_hash")
+        if not isinstance(route_hash, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", route_hash):
+            return None
+        # Older sealed routes may predate work_request capture. Their exact
+        # route hash still binds the accepted owner input target; no route plan
+        # or checklist is required to retain ordinary resource compatibility.
+        work_request_sha256 = route_hash.split(":", 1)[1]
+    artifact_root = Path(route.get("artifact_root", "")).resolve(strict=True)
+    candidates = []
+    for token in command:
+        if not isinstance(token, str) or not token.lower().endswith(".json"):
+            continue
+        path = Path(token)
+        if not path.is_absolute() or path.is_symlink():
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+            if not resolved.is_relative_to(artifact_root):
+                continue
+            before = resolved.stat()
+            raw = resolved.read_bytes()
+            after = resolved.stat()
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                    after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                raise ValueError("resource-operation-request-changed")
+            value = json.loads(raw)
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(value, dict) and "user_direction_id" in value:
+            candidates.append((resolved, raw, value))
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        return None
+    request_path, request_bytes, request = candidates[0]
+    parent_attempt = owner_wait.get("parent_attempt_id")
+    if (not isinstance(parent_attempt, str) or request.get("parent_attempt_id") != parent_attempt
+            or request.get("run_id") != run_id
+            or not isinstance(request.get("requested_scope"), str)
+            or not request["requested_scope"].strip()
+            or not isinstance(request.get("user_direction_id"), str)
+            or not request["user_direction_id"]
+            or not isinstance(request.get("compute_argv"), list)
+            or not request["compute_argv"]):
+        return None
+    for name in ("smoke_attestation", "config_manifest"):
+        if request.get(name) != launch_request_value.get(name):
+            return None
+    provenance = request.get("provenance")
+    if provenance is not None:
+        if not isinstance(provenance, dict):
+            return None
+        for field, name in (("smoke_attestation_sha256", "smoke_attestation"),):
+            if (provenance.get(field) is not None
+                    and provenance[field] != launch_request_value.get(name + "_sha256")):
+                return None
+    compute_argv = request["compute_argv"]
+    if any(not isinstance(part, str) for part in compute_argv):
+        return None
+    for option, expected in (("--cwd", str(Path(cwd).resolve(strict=True))),):
+        if option in compute_argv:
+            index = compute_argv.index(option)
+            if index + 1 >= len(compute_argv) or str(Path(compute_argv[index + 1]).resolve(strict=False)) != expected:
+                return None
+
+    command_record = None
+    command_record_path = None
+    command_record_bytes = None
+    evidence_path = request.get("Dev_admission_evidence")
+    if isinstance(evidence_path, str) and Path(evidence_path).is_absolute():
+        directory = Path(evidence_path).resolve(strict=False).parent
+        command_records = []
+        for candidate_path in sorted(directory.glob("*resource-start-command.json")):
+            if candidate_path.is_symlink():
+                continue
+            try:
+                raw_record = candidate_path.read_bytes()
+                record_value = json.loads(raw_record)
+            except (OSError, ValueError, TypeError):
+                continue
+            if (isinstance(record_value, dict)
+                    and record_value.get("request_path") == str(request_path)
+                    and record_value.get("request_sha256") == hashlib.sha256(request_bytes).hexdigest()
+                    and isinstance(record_value.get("argv"), list)):
+                command_records.append((candidate_path.resolve(strict=True), raw_record, record_value))
+        if len(command_records) == 1:
+            command_record_path, command_record_bytes, command_record = command_records[0]
+    if command_record is None:
+        return None
+    argv = command_record["argv"]
+    if not all(isinstance(part, str) for part in argv) or "--" not in argv:
+        return None
+    # The launcher already cached by a live owner is part of the consumer
+    # boundary. A receipt pointing at another release cannot claim this
+    # implementation's launch/admission behavior.
+    if len(argv) < 2 or not Path(argv[1]).is_absolute() \
+            or Path(argv[1]).resolve(strict=False) != Path(__file__).resolve():
+        return None
+    def option_value(flag):
+        indexes = [index for index, value in enumerate(argv) if value == flag]
+        return argv[indexes[0] + 1] if len(indexes) == 1 and indexes[0] + 1 < len(argv) else None
+    expected_values = {
+        "--registry": str(Path(registry_path).resolve(strict=False)) if registry_path else None,
+        "--run-id": run_id,
+        "--cwd": str(Path(cwd).resolve(strict=True)),
+        "--log": str(Path(log_path).resolve(strict=False)) if log_path else None,
+        "--route": str(Path(route_file).resolve(strict=True)),
+        "--node": node,
+        "--parent-attempt-id": parent_attempt,
+        "--jobs": str(Path(owner_wait.get("jobs", "")).resolve(strict=True)),
+        "--smoke-attestation": launch_request_value.get("smoke_attestation"),
+        "--config-manifest": launch_request_value.get("config_manifest"),
+    }
+    separator = argv.index("--")
+    if (argv[separator + 1:] != list(command)
+            or any(option_value(flag) != expected for flag, expected in expected_values.items())):
+        return None
+
+    import dispatch_owner_input as INPUT
+    jobs = Path(owner_wait.get("jobs", "")).resolve(strict=True)
+    with INPUT._locked(jobs, parent_attempt) as (_, value):
+        parent, target = INPUT._target(jobs, parent_attempt)
+        if (value is None or value.get("target") != target
+                or value.get("thread_id") != owner_wait.get("session_id")
+                or owner_wait.get("route_id") != route.get("route_id")
+                or owner_wait.get("route_hash") != route.get("route_hash")
+                or owner_wait.get("jobs") != str(jobs)
+                or parent.status not in {"open", "running"}
+                or str(owner_wait.get("owner_pid")) != parent.metadata.get("pid")
+                or owner_wait.get("owner_start") != parent.metadata.get("pid_start")
+                or (owner_wait.get("harness") is not None
+                    and owner_wait.get("harness") != parent.metadata.get("harness"))
+                or not INPUT.supervisor_lease_is_held(jobs, parent.metadata)):
+            return None
+        item = next((row for row in value.get("requests", [])
+                     if row.get("id") == request["user_direction_id"]), None)
+        if not isinstance(item, dict):
+            return None
+        events = item.get("events")
+        if not isinstance(events, list):
+            return None
+        accepted = {event.get("turn_id") for event in events
+                    if isinstance(event, dict) and event.get("state") == "accepted"}
+        completed = {event.get("turn_id") for event in events
+                     if isinstance(event, dict) and event.get("state") == "turn-completed"}
+        if (not isinstance(item.get("text"), str) or not item["text"].strip()
+                or INPUT._digest(item["text"]) != item.get("digest")
+                or item.get("state") != "turn-completed"
+                or not item.get("source_session")
+                or not (accepted & completed)):
+            return None
+
+    try:
+        import route_plan as ROUTE_PLAN
+        sealed_plan = route.get("route_plan")
+        if sealed_plan is None:
+            plan_digest = None
+        else:
+            ROUTE_PLAN.validate_sealed(sealed_plan)
+            binding = ROUTE_PLAN.read_route_plan(
+                f"{artifact_root / sealed_plan['decision']}#{sealed_plan['index']}", artifact_root)
+            if binding.get("digest") != sealed_plan.get("digest"):
+                raise ValueError("resource-operation-route-plan-changed")
+            plan_digest = binding["digest"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return None
+
+    request_sha256 = hashlib.sha256(request_bytes).hexdigest()
+    input_binding = {"id": item["id"], "digest": item["digest"],
+                     "source_session": item["source_session"], "target": target,
+                     "turn_ids": sorted(accepted & completed)}
+    stable_request = dict(request)
+    for identity_field in ("user_direction_id", "run_id", "row_id", "compute_name",
+                           "requested_scope", "parent_attempt_id", "Dev_admission_evidence",
+                           "attention_file", "first_step_path", "first_step_report",
+                           "first_step_report_delivery", "first_step_report_hook",
+                           "first_step_report_hook_sha256", "sample_report_path",
+                           "supervision_timeout_basis", "supervision_timeout_s", "timing",
+                           "protected_processes"):
+        stable_request.pop(identity_field, None)
+    stable_argv = list(stable_request.get("compute_argv") or [])
+    if "--name" in stable_argv:
+        name_index = stable_argv.index("--name")
+        if name_index + 1 < len(stable_argv):
+            stable_argv[name_index + 1] = "<operation-name>"
+    stable_request["compute_argv"] = stable_argv
+    stable_command = ["<resource-operation-request>" if token == str(request_path) else token
+                      for token in command]
+    stable_launch_request = {name + "_sha256": launch_request_value.get(name + "_sha256")
+                             for name in ("smoke_attestation", "config_manifest")}
+    operation_body = {"route_id": route["route_id"], "route_hash": route["route_hash"],
+        "node": node, "command": stable_command,
+        "cwd": str(Path(cwd).resolve(strict=True)),
+        "launch_input_hashes": stable_launch_request, "request": stable_request}
+    operation_id = hashlib.sha256(json.dumps(
+        operation_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+    return {"schema_version": 1, "operation_id": operation_id,
+            "request_path": str(request_path), "request_sha256": request_sha256,
+            "command_record_path": str(command_record_path),
+            "command_record_sha256": hashlib.sha256(command_record_bytes).hexdigest(),
+            "requested_scope": request["requested_scope"],
+            "input": {**input_binding, "state": "turn-completed"},
+            "route_plan_digest": plan_digest,
+            "work_request_sha256": work_request_sha256,
+            "body_sha256": hashlib.sha256(json.dumps(
+                {"command": list(command), "cwd": operation_body["cwd"],
+                 "launch_request": launch_request_value},
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()}
+
+
 def controller_argv(registry, row):
     request = row["launch_request"]
     argv = ["--registry", str(registry), "start", "--run-id", row["run_id"],
@@ -226,7 +480,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         placeholder["launch_request"] = request
     keys = ("run_id", "cwd", "log", "command", "route", "node", "parent_attempt_id", "jobs",
             "config_ref", "config_sha256", "source_commit", "source_dirty", "source_git_state", "config_layout",
-            "resource_policy", "owner_wait", "launch_request", "share")
+            "resource_policy", "owner_wait", "launch_request", "resource_operation", "share")
     import dispatch_resource_wait as OWNER_RESOURCE
     import resource_run_registry as RR
     sup = OWNER_RESOURCE.supervisor()
@@ -284,6 +538,13 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         data["runs"][args.run_id] = placeholder
         return True, placeholder
     with ledger.lock() if ledger else contextlib.nullcontext():
+        if placeholder.get("resource_operation") is not None:
+            current_operation = resource_operation_binding(
+                route, route_file, args.node, args.run_id, placeholder["command"],
+                placeholder["cwd"], placeholder.get("launch_request") or {}, owner_wait,
+                registry_path=registry, log_path=placeholder.get("log"))
+            if current_operation != placeholder["resource_operation"]:
+                raise ValueError("resource-operation-authorization-changed")
         if ledger and sup.resource_continuation_cancelled(route, ledger):
             raise ValueError("resource-parent-close-requested")
         history_pairs = sup.resource_predecessors(ledger, args.node) if ledger else []
@@ -298,8 +559,8 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         with controller.guard() if controller else contextlib.nullcontext():
             created, row = locked_update(registry, reserve)
     if not created:
-        armed = sup.read_armed(ledger).get(args.node)
-        if armed and armed.get("predecessor_id") == args.run_id:
+        armed = supervisor_resource_watch_for_run(sup, ledger, args.node, registry, args.run_id)
+        if armed:
             sup.reattach_resource_watch(route, ledger, armed)
             row = json.loads(Path(registry).read_text())["runs"][args.run_id]
         print(json.dumps({**row, "replayed": True, "payload_spawned": False,
@@ -397,6 +658,13 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         with ledger.lock():
             if sup.resource_continuation_cancelled(route, ledger):
                 raise ValueError("resource-parent-close-requested")
+            if row.get("resource_operation") is not None:
+                current_operation = resource_operation_binding(
+                    route, route_file, args.node, args.run_id, row["command"],
+                    row["cwd"], row.get("launch_request") or {}, owner_wait,
+                    registry_path=registry, log_path=row.get("log"))
+                if current_operation != row["resource_operation"]:
+                    raise ValueError("resource-operation-authorization-changed")
             with controller.guard() if controller else contextlib.nullcontext():
                 publish_verified_run(registry, args.run_id, placeholder, row)
                 os.write(release, b"start\n")
@@ -444,7 +712,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                 # Settle only this exact armed run through the normal failure
                 # consumer, without polling or starting unrelated successors.
                 with ledger.lock():
-                    armed = sup.read_armed(ledger).get(args.node)
+                    armed = supervisor_resource_watch_for_run(sup, ledger, args.node, registry, args.run_id)
                     if (armed and armed.get("predecessor_id") == args.run_id
                             and not sup.resource_continuation_cancelled(route, ledger)):
                         sup._evaluate(route, ledger, armed, [])
@@ -674,11 +942,12 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
                          retryable=False)
 
     ledger = sup.ledger_for(route, str(jobs))
-    armed_rows = sup.read_armed(ledger)
+    armed_rows = supervisor_resource_watches(sup, ledger)
     eligible = []
     differences = []
     refusal_reason = "resource-compute-contract-unavailable"
-    for node_id, armed in armed_rows.items():
+    for armed in armed_rows:
+        node_id = armed["node"]
         if (armed.get("predecessor_kind") != "resource"
                 or armed.get("resource_registry") != str(registry)
                 or armed.get("route_id") != route.get("route_id")
@@ -816,7 +1085,6 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
         # can converge before treating that successful row as a new baseline.
         replay_node_id = node_id
         replay_node = WS.route_node(route, replay_node_id) if isinstance(replay_node_id, str) else None
-        replay_armed = armed_rows.get(replay_node_id) if isinstance(replay_node_id, str) else None
         replay_rows = [row for row in (json.loads(registry.read_text(encoding="utf-8")).get("runs") or {}).values()
                        if isinstance(row, dict)
                        and identity is not None
@@ -826,12 +1094,16 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
                        and row.get("node") == replay_node_id and row.get("jobs") == str(jobs)
                        and row.get("compute_run_id") == compute_run_id
                        and (row.get("execution") or {}).get("run_root") == execution.get("run_root")
-                       and replay_armed is not None
-                       and replay_armed.get("predecessor_id") in {
-                           row.get("run_id"), (provenance.get("contract") or {}).get("run_id")}
                        and row.get("status") == "succeeded"]
-        if len(replay_rows) == 1 and isinstance(replay_node, dict):
-            eligible.append((replay_node_id, replay_armed, replay_node, replay_rows[0]))
+        replay_bound = []
+        if isinstance(replay_node, dict):
+            for replay_row in replay_rows:
+                replay_armed = supervisor_resource_watch_for_run(
+                    sup, ledger, replay_node_id, registry, replay_row.get("run_id"))
+                if replay_armed is not None:
+                    replay_bound.append((replay_node_id, replay_armed, replay_node, replay_row))
+        if len(replay_bound) == 1:
+            eligible.append(replay_bound[0])
     if len(eligible) != 1:
         if eligible:
             fail_compute("resource-compute-baseline-ambiguous")
@@ -901,7 +1173,8 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
             {"field": "compute_execution_identity.matches", "expected": 1, "actual": len(existing)}],
             next_action="resolve duplicate adopted rows through the existing resource owner")
     def arm_adopted(adopted_row):
-        current_armed = sup.read_armed(ledger).get(node_id)
+        current_armed = supervisor_resource_watch_for_run(
+            sup, ledger, node_id, registry, adopted_row.get("run_id"))
         if current_armed and current_armed.get("predecessor_id") == adopted_row.get("run_id"):
             return
         artifacts = __import__("artifact_producer").prepare_route_artifact_env(
@@ -971,7 +1244,8 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
             fail_compute("resource-compute-route-closed", differences=[
                 {"field": "route.state", "expected": "open", "actual": "closed or cancelled"}],
                 next_action="continue only after the route owner opens a new authorized route")
-        current_armed = sup.read_armed(ledger).get(node_id)
+        current_armed = supervisor_resource_watch_for_run(
+            sup, ledger, node_id, registry, armed.get("predecessor_id"))
         if current_armed != armed:
             fail_compute("resource-compute-binding-conflict", differences=[
                 {"field": "armed_row", "expected": hashlib.sha256(json.dumps(
@@ -1125,7 +1399,8 @@ def settle_queued_validation_failure(controller, error):
         current = json.loads(Path(controller.registry).read_text())["runs"].get(expected["run_id"])
         if current != expected:
             return
-        armed = sup.read_armed(ledger).get(expected["node"])
+        armed = supervisor_resource_watch_for_run(
+            sup, ledger, expected["node"], controller.registry, expected["run_id"])
         if (not armed or armed.get("predecessor_id") != expected["run_id"]
                 or armed.get("resource_registry") != str(Path(controller.registry).resolve())
                 or armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(expected)
@@ -1200,10 +1475,12 @@ def start_observer(registry, args, route, route_file, command):
                 if any(previous.get(key) != value for key, value in observer.items()):
                     raise ValueError("resource-route-body-conflict")
                 return False, previous
-            armed = sup.read_armed(ledger).get(args.node)
+            armed_rows = [armed for armed in supervisor_resource_watches(sup, ledger, args.node)
+                          if armed.get("resource_registry") == str(registry)]
+            armed_ids = {armed.get("predecessor_id") for armed in armed_rows}
             primaries = [row for row in rows.values() if row.get("route") == str(route_file)
                          and row.get("node") == args.node and row.get("resource_policy") != "observer"
-                         and (not armed or row.get("run_id") == armed.get("predecessor_id"))
+                         and (not armed_ids or row.get("run_id") in armed_ids)
                          and classify_identity(row)[0] == "working"]
             if len(primaries) != 1:
                 raise ValueError("resource-observer-requires-live-resource")
@@ -1457,6 +1734,15 @@ def _main(argv=None, *, controller=None):
                 if owner_wait.get("launch_scope") == "codex-owner-controller":
                     if controller is not None and placeholder["launch_request"] != controller.expected.get("launch_request"):
                         fail("resource-launch-request-changed")
+                try:
+                    operation = resource_operation_binding(
+                        route, route_file, args.node, args.run_id, command, cwd,
+                        placeholder["launch_request"], owner_wait,
+                        registry_path=registry, log_path=log)
+                except (OSError, ValueError, KeyError, TypeError):
+                    operation = None
+                if operation is not None:
+                    placeholder["resource_operation"] = operation
         if controller is not None and (not owner_wait or owner_wait.get("launch_scope") != "codex-owner-controller"):
             fail("resource-controller-scope-invalid")
         if resume or owner_wait:

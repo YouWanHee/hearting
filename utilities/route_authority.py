@@ -1901,23 +1901,120 @@ def resource_predecessor_finished(row, *, observation=None):
                  or resource_process_group_quiescent(row)))
 
 
+def _resource_operation(row):
+    operation = row.get("resource_operation") if isinstance(row, dict) else None
+    if not isinstance(operation, dict) or operation.get("schema_version") != 1:
+        return None
+    identity = operation.get("operation_id")
+    request_sha = operation.get("request_sha256")
+    command_sha = operation.get("command_record_sha256")
+    body_sha = operation.get("body_sha256")
+    source = operation.get("input")
+    if (not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{64}", identity)
+            or not isinstance(request_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", request_sha)
+            or not isinstance(command_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", command_sha)
+            or not isinstance(operation.get("command_record_path"), str)
+            or not isinstance(body_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", body_sha)
+            or not isinstance(operation.get("work_request_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", operation["work_request_sha256"])
+            or not isinstance(source, dict)
+            or not isinstance(source.get("id"), str) or not source["id"]
+            or not isinstance(source.get("digest"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", source["digest"])
+            or not isinstance(source.get("target"), str)
+            or not isinstance(source.get("source_session"), str) or not source["source_session"]
+            or source.get("state") != "turn-completed"
+            or not isinstance(source.get("turn_ids"), list) or not source["turn_ids"]
+            or any(not isinstance(turn, str) or not turn for turn in source["turn_ids"])):
+        return None
+    return operation
+
+
+def _same_resource_owner(left, right):
+    left_wait, right_wait = left.get("owner_wait") or {}, right.get("owner_wait") or {}
+    return (left.get("resource_policy") == right.get("resource_policy") == "supervised-owner"
+            and left.get("route") == right.get("route")
+            and left.get("route_id") == right.get("route_id")
+            and left.get("node") == right.get("node")
+            and left.get("jobs") == right.get("jobs")
+            and left.get("parent_attempt_id") == right.get("parent_attempt_id")
+            and left_wait.get("parent_attempt_id") == right_wait.get("parent_attempt_id")
+            and left_wait.get("session_id") == right_wait.get("session_id")
+            and left_wait.get("route_id") == right_wait.get("route_id")
+            and left_wait.get("route_hash") == right_wait.get("route_hash")
+            and left_wait.get("jobs") == right_wait.get("jobs"))
+
+
+def _independent_resource_operations(left, right):
+    """Only exact, separate owner inputs authorize overlapping operation bodies."""
+    first, second = _resource_operation(left), _resource_operation(right)
+    if not first or not second or not _same_resource_owner(left, right):
+        return False
+    a, b = first["input"], second["input"]
+    return (first["operation_id"] != second["operation_id"]
+            and first["body_sha256"] != second["body_sha256"]
+            and first["request_sha256"] != second["request_sha256"]
+            and a["target"] == b["target"]
+            and first["work_request_sha256"] == second["work_request_sha256"]
+            and first.get("route_plan_digest") == second.get("route_plan_digest"))
+
+
 def require_resource_predecessors(rows, candidate, *, observations=None):
     """Recheck execution and evidence-address protection within the existing reservation lock."""
     from dispatch_resource_wait import resource_evidence_paths_conflict
     observations = observations or {}
+    unique_rows, seen = [], set()
     for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = json.dumps(row, sort_keys=True, separators=(",", ":"))
+        if key not in seen:
+            seen.add(key)
+            unique_rows.append(row)
+    def finished(row):
+        execution = row.get("execution") if isinstance(row, dict) else None
+        captured = observations.get(row.get("run_id"))
+        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+            return bool(captured and captured.get("row") == row
+                        and resource_predecessor_finished(row, observation=captured))
+        return resource_predecessor_finished(row)
+
+    active_legacy = [row for row in unique_rows
+                     if row.get("resource_policy") == "supervised-owner"
+                     and _resource_operation(row) is None
+                     and not finished(row)]
+    for row in unique_rows:
         if row.get("resource_policy") == "observer":
             if resource_evidence_paths_conflict(row, candidate):
                 raise ValueError("resource-route-body-conflict")
             continue
         execution = row.get("execution") if isinstance(row, dict) else None
-        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
-            captured = observations.get(row.get("run_id"))
-            if (not captured or captured.get("row") != row
-                    or not resource_predecessor_finished(row, observation=captured)):
-                raise ValueError("resource-route-body-conflict")
-        elif not resource_predecessor_finished(row):
-            raise ValueError("resource-route-body-conflict")
+        is_finished = finished(row)
+        if not is_finished:
+            # A legacy live primary may be preserved beside one newly proven
+            # operation. It remains the old flat-view row; no legacy row is
+            # inferred to authorize another launch.
+            legacy_pair = (len(active_legacy) == 1 and row is active_legacy[0]
+                           and row.get("resource_policy") == "supervised-owner"
+                           and _resource_operation(candidate) is not None
+                           and _same_resource_owner(row, candidate))
+            if not legacy_pair:
+                previous_operation = _resource_operation(row)
+                candidate_operation = _resource_operation(candidate)
+                if candidate_operation is None or previous_operation is None:
+                    raise ValueError("resource-route-body-conflict")
+                if previous_operation["operation_id"] == candidate_operation["operation_id"]:
+                    raise ValueError("resource-operation-duplicate")
+                if not _independent_resource_operations(row, candidate):
+                    raise ValueError("resource-operation-authorization-conflict")
+        elif (_resource_operation(row) is not None
+              and _resource_operation(candidate) is not None
+              and _resource_operation(row)["operation_id"] == _resource_operation(candidate)["operation_id"]
+              and row.get("run_id") != candidate.get("run_id")
+              and row.get("status") == "succeeded"):
+            # A new registry id cannot turn a completed exact operation into a
+            # second success or an unbounded repetition.
+            raise ValueError("resource-operation-duplicate")
         if resource_evidence_paths_conflict(row, candidate):
             raise ValueError("resource-route-body-conflict")
 
