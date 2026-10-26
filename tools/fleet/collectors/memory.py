@@ -189,12 +189,107 @@ def _durable_over(soft_ceiling=DOCTOR_DURABLE_SOFT_CEILING):
         return []
 
 
-def collect(now=None, *, include_summary=True):
+_BACKLOG_RECORD_LIMIT = 512
+_BACKLOG_TYPES = frozenset(("backlog", "task", "todo", "obligation"))
+
+
+def _json_strings(value, limit=80):
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        try:
+            items = json.loads(value) if isinstance(value, str) else ()
+        except (TypeError, ValueError):
+            items = ()
+    if not isinstance(items, (list, tuple)):
+        return ()
+    return tuple(text.strip()[:limit] for text in items
+                 if isinstance(text, str) and text.strip())[:32]
+
+
+def _repo_label(origin):
+    if not isinstance(origin, str) or not origin:
+        return "·"
+    if origin.startswith("git:"):
+        return origin.rsplit("/", 1)[-1] or "·"
+    if origin.startswith("-"):
+        return "·"                         # encoded cwd values are not display labels
+    return origin.rstrip("/").rsplit("/", 1)[-1] or "·"
+
+
+def _read_backlog_records(limit=_BACKLOG_RECORD_LIMIT):
+    """Read explicit backlog metadata from memory.db without opening record bodies."""
+    path = _db_path()
+    if not path.is_file():
+        return {"state": "unavailable", "by_repo": {}, "record_count": None}
+    try:
+        con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0)
+        try:
+            con.execute("PRAGMA query_only=1")
+            tables = {row[0] for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "records" not in tables:
+                return {"state": "unavailable", "by_repo": {}, "record_count": None}
+            columns = {row[1] for row in con.execute("PRAGMA table_info(records)").fetchall()}
+            metadata_contract = {"id", "tier", "scope", "cwd_origin", "type", "source", "tags",
+                                 "links", "artifact_refs", "status", "canonical_id"}
+            if not metadata_contract.issubset(columns):
+                return {"state": "incomplete", "by_repo": {}, "record_count": None}
+            fields = ("id", "tier", "scope", "type", "cwd_origin", "source", "tags", "links",
+                      "artifact_refs", "status", "canonical_id", "superseded_by", "updated",
+                      "headline", "delivery_state", "injection_flag")
+            select = ", ".join(name if name in columns else f"NULL AS {name}" for name in fields)
+            where = ["scope='project'"]
+            if "status" in columns:
+                where.append("status='active'")
+            if "injection_flag" in columns:
+                where.append("(injection_flag IS NULL OR injection_flag=0)")
+            order = " ORDER BY updated DESC, id" if "updated" in columns else " ORDER BY id"
+            rows = con.execute(
+                f"SELECT {select} FROM records WHERE {' AND '.join(where)}{order} LIMIT ?",
+                (max(1, min(int(limit), _BACKLOG_RECORD_LIMIT)),),
+            ).fetchall()
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError, ValueError, TypeError):
+        return {"state": "failed", "by_repo": {}, "record_count": None}
+
+    by_repo, seen = {}, set()
+    for values in rows:
+        (rid, tier, scope, rtype, origin, source, tags_raw, links_raw, refs_raw, status,
+         canonical, superseded_by, updated, headline, delivery, _injection) = values
+        tags = _json_strings(tags_raw)
+        if not any(tag.casefold() == "backlog" for tag in tags) and str(rtype or "").casefold() not in _BACKLOG_TYPES:
+            continue
+        canonical = canonical or rid
+        if not rid or canonical in seen:
+            continue
+        seen.add(canonical)
+        repo = _repo_label(origin)
+        record = {
+            "id": str(rid)[:256], "canonical_id": str(canonical)[:256],
+            "repo": repo, "cwd_origin": str(origin or "")[:512],
+            "tier": str(tier or "")[:32], "type": str(rtype or "")[:80],
+            "source": str(source or "")[:240], "tags": tags,
+            "links": _json_strings(links_raw, 256),
+            "artifact_refs": _json_strings(refs_raw, 512),
+            "headline": str(headline or "")[:240], "updated": str(updated or "")[:40],
+            "status": str(status or "unknown")[:32],
+            "superseded_by": str(superseded_by or "")[:256],
+            "delivery_state": str(delivery or "unknown")[:32],
+        }
+        by_repo.setdefault(repo, []).append(record)
+    count = sum(len(records) for records in by_repo.values())
+    return {"state": "success", "by_repo": by_repo, "record_count": count,
+            "limited": len(rows) >= max(1, min(int(limit), _BACKLOG_RECORD_LIMIT))}
+
+
+def collect(now=None, *, include_summary=True, include_backlog=False):
     """Return an additive `memory` dict (fleet.py --json / render.py consume it), or None
     when neither the journal nor the graveyard exists (F-19 not wired up yet — panel omitted).
 
-    ``include_summary=False`` reads only the write journal and returns recent/project
-    events, or None without a journal. The default preserves the aggregate API.
+    ``include_summary=False`` reads the write journal. ``include_backlog=True`` adds bounded,
+    read-only DB metadata for the Explorer; the default collector surface stays journal-only.
     """
     now = now or datetime.datetime.now()
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -215,8 +310,12 @@ def collect(now=None, *, include_summary=True):
     # Renderers only consume journal/project events. Keep the default aggregate API
     # for structured consumers without touching its DB, graveyard or curator in this mode.
     if not include_summary:
+        if not include_backlog:
+            return {"journal_available": journal_ok, "recent": recent,
+                    "by_repo": by_repo} if journal_ok else None
+        database = _read_backlog_records()
         return {"journal_available": journal_ok, "recent": recent,
-                "by_repo": by_repo} if journal_ok else None
+                "by_repo": by_repo, "database": database}
     graveyard, graveyard_ok = _read_jsonl_tail(_graveyard_path())
     periodic_curate = _periodic_curate(now)
     if not journal_ok and not graveyard_ok and periodic_curate is None:

@@ -57,9 +57,16 @@ function ownLifecycle() {
 
 function selectedSid(api) {
   try {
-    const current = api && api.route && api.route.current
-    if (!current || current.name !== "session") return null
-    return cleanSid(current.params && current.params.sessionID)
+    let current = api && api.route && api.route.current
+    if (typeof current === "function") current = current()
+    if (!current && api && api.ui && api.ui.router
+        && typeof api.ui.router.current === "function") {
+      current = api.ui.router.current()
+    }
+    if (!current) return null
+    if (current.name === "session") return cleanSid(current.params && current.params.sessionID)
+    if (current.type === "session") return cleanSid(current.sessionID)
+    return null
   } catch { return null }
 }
 
@@ -152,6 +159,8 @@ function clearRecord() {
 }
 
 async function tui(api) {
+  // V2 invokes setup() with ui.router.current(); keep one producer per API surface.
+  if (api && api.ui && api.ui.router && typeof api.ui.router.current === "function") return
   const mem = { last: "", sequence: 0, source: "" }
   const refresh = () => { syncRecord(api, mem) }
   refresh()
@@ -232,4 +241,38 @@ async function tui(api) {
   }
 }
 
-export default { id: PLUGIN_ID, tui }
+function setup(api) {
+  if (!api || !api.ui || !api.ui.router || typeof api.ui.router.current !== "function") return
+  const mem = { last: "", sequence: 0, source: "" }
+  const refresh = () => { syncRecord(api, mem) }
+  refresh()
+  const unsubs = []
+  try {
+    for (const type of REFRESH_EVENTS) {
+      unsubs.push(api.event.on(type, (event) => {
+        const sid = selectedSid(api)
+        if (type === "session.deleted" && deletedSid(event) === sid) clearRecord()
+        syncRecord(api, mem, lifecycleSource(type, event, sid))
+      }))
+    }
+  } catch {
+    // A partial event bus is repaired by the route poll below.
+  }
+  const poll = setInterval(refresh, 100)
+  poll.unref?.()
+  const done = () => {
+    clearInterval(poll)
+    for (const off of unsubs) {
+      try { off() } catch { /* teardown is best-effort */ }
+    }
+    clearRecord()
+  }
+  try {
+    api.lifecycle.onDispose(done)
+  } catch {
+    // A missing disposer leaves only this process's bounded identity record.
+  }
+  return done
+}
+
+export default { id: PLUGIN_ID, setup, tui }
