@@ -28,6 +28,8 @@ S = importlib.util.spec_from_file_location("topology", P); T = importlib.util.mo
 # the declared design parallel-group digest is unchanged.
 # 2026-10-25 route-local spec authoring: only the code execute node's spec/**
 # scope and artifact-order-prechecked declaration change its node census.
+# 2026-10-26 audit report authoring: only the audit report node's default unit
+# (`editorial/polish` -> `editorial/report`) re-freezes the audit node census.
 PRESERVED_FULL_FIELD_DIGESTS = {
     # Added with the compiler-internal framed recipe (v3.0 part 3): two `top` frame legs and the
     # model-less runtime terminal. No other entry moves.
@@ -44,7 +46,7 @@ PRESERVED_FULL_FIELD_DIGESTS = {
         "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     ),
     ('audit', ('default',)): (
-        "bfa07502c8e197aa8b592f0615434dd8f15631e1beede87da14fe89987a34f25",
+        "c74333f3c0ee7b5a6ca929a15027d71f16bc54d1aa84eb0a47840925990fc365",
         "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     ),
     ("autopilot-apply", ('default',)): (

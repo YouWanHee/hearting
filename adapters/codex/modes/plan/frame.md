@@ -150,10 +150,18 @@ created: {YYYY-MM-DD}
            - {text: "latency report written", check: "test -f reports/latency.md"}
          verify: "one line: what verification looks at"   # optional
          hands_over: [reports/latency.md]                   # optional: what the next leg reads
-         parallel: [...]                                    # optional: work the owner may split into slices
+         parallel: [...]                                    # optional: slices the owner may use to assign workers or permitted sub-sessions; not compiled as nodes
          extra_stages: [{id, unit, after, verify}]          # optional: compiled as node plan-<id> after `after`, shaped on a catalogue check/measurement stage of that unit (never one that edits source)
      execution_scope: complete   # optional: complete (default) | report
    ```
+
+   `parallel` is an optional list of non-empty strings, each at most 200
+   characters after trimming. Valid entries are kept in order with no separate
+   item-count cap within the existing proposal and record limits; malformed
+   entries receive individual notes. The owner may use these slices to assign
+   workers or permitted sub-sessions. They do not compile into route nodes or
+   parallel groups, and a slice without a result is unfinished. The number of
+   entries does not require the same number of workers.
 
    The runtime reads section 8 under any title (the whole brief when it has no
    section 8 heading), takes the first readable block when there are several,

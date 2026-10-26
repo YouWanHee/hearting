@@ -14,6 +14,7 @@ from unittest import mock
 import frame_interview as FI
 import workflow_state as WS
 import worker_bootstrap as WB
+import route_plan as RP
 
 ROOT = Path(__file__).resolve().parents[1]
 def _clean_test_env():
@@ -269,6 +270,90 @@ class WorkerDispatchPromptTest(unittest.TestCase):
                             if endpoint == "report":
                                 self.assertIn("Execution scope: report.", prompt)
                                 self.assertIn("bounded stage completes only its assigned portion", prompt)
+
+    def test_standard_owner_adapters_render_only_the_sealed_bound_plan(self):
+        parallel = [f"approved slice {index:02d}" for index in range(16)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_root = root / "reports"
+            artifact_root.mkdir()
+            record_path = artifact_root / "route-decision.json"
+            selected = {"summary": "approved", "legs": [{
+                "capability": "autopilot-code", "mode": "dev", "shape": "staged",
+                "graph": ["plan", "execute", "test", "report"],
+                "done_when": [{"id": "d1", "text": "first approved result"},
+                              {"id": "d2", "text": "second approved result"}],
+                "verify": "run the selected suites", "parallel": parallel,
+            }]}
+            unselected = {"summary": "unselected", "legs": [{
+                "capability": "unused", "shape": "direct", "parallel": ["UNSELECTED SOURCE SENTINEL"]
+            }]}
+            decision = RP.build_decision(
+                frame_route={"route_id": "rt-bound-plan", "route_hash": "sha256:" + "a" * 64,
+                             "cycle_id": "cyc_" + "b" * 32},
+                selected="approved option", reason="", briefs=[], intent={}, proposal=selected,
+                proposals=[{"proposal": selected, "brief_path": "shards/frame/direction-brief.md"},
+                           {"proposal": unselected, "brief_path": "shards/frame-alternative/direction-brief.md",
+                            "source": "UNSELECTED RAW SOURCE SENTINEL"}],
+                approvals={}, first_leg_compose={},
+            )
+            record_path.write_bytes(RP.render(RP.build_record(decision)))
+            sealed = RP.read_route_plan(f"{record_path}#0", artifact_root)
+            route = {"route_id": "rt-bound-plan", "route_hash": "sha256:" + "c" * 64,
+                     "artifact_root": str(artifact_root), "route_plan": RP.sealed_form(sealed), "nodes": []}
+            route_path = root / "bound-route.json"
+            route_path.write_text(json.dumps(route), encoding="utf-8")
+            task = "Assign the approved route work."
+
+            for harness, (wrapper, model, _suffix) in ADAPTERS.items():
+                with self.subTest(harness=harness):
+                    spec = importlib.util.spec_from_file_location("owner_plan_" + harness, wrapper)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    axes = ["--worktree", str(root), "--slug", "owner-plan", "--capability", "autopilot-code",
+                            "--capability-mode", "dev", "--intensity", "standard", "--dispatch-depth", "1",
+                            "--worker-type", "owner", "--unit", "_kernel/owner", "--prompt-text", task,
+                            "--jobs", str(root / "missing-jobs.log"), *model]
+                    args = module.parser().parse_args(axes)
+                    args.route_file = None
+                    args.route_node = None
+                    args.artifact_root = str(artifact_root)
+                    args.agent_home = module.resolve_agent_home()
+                    args.owner_route_binding = SimpleNamespace(
+                        route_file=str(route_path), route_id=route["route_id"], route_hash=route["route_hash"])
+                    render = module.prompt if harness == "opencode" else module.dispatch_prompt
+                    prompt, _ = render(args)
+                    self.assertEqual(prompt.count("Plan for this leg (approved in the frame interview; base the verdict on it):"), 1)
+                    self.assertIn("- d1: first approved result", prompt)
+                    self.assertIn("- d2: second approved result", prompt)
+                    self.assertIn("Verify: run the selected suites", prompt)
+                    self.assertIn("Approved slices: use these when assigning workers or permitted sub-sessions", prompt)
+                    positions = [prompt.index(item) for item in parallel]
+                    self.assertEqual(positions, sorted(positions))
+                    self.assertIn(parallel[-1], prompt)
+                    self.assertNotIn("UNSELECTED SOURCE SENTINEL", prompt)
+                    self.assertNotIn("UNSELECTED RAW SOURCE SENTINEL", prompt)
+                    self.assertNotIn("items.json", prompt)
+
+            no_plan_route = {"route_id": "rt-no-plan", "route_hash": "sha256:" + "d" * 64,
+                             "artifact_root": str(artifact_root), "nodes": []}
+            no_plan_path = root / "no-plan-route.json"
+            no_plan_path.write_text(json.dumps(no_plan_route), encoding="utf-8")
+            binding = SimpleNamespace(route_file=str(no_plan_path), route_id=no_plan_route["route_id"],
+                                      route_hash=no_plan_route["route_hash"])
+            bound_owner = SimpleNamespace(worker_type="owner", route_file=None, route_node=None,
+                                          owner_route_binding=binding)
+            no_binding_owner = SimpleNamespace(worker_type="owner", route_file=None, route_node=None,
+                                               owner_route_binding=None)
+            expected = ("Assignment:\nTASK\n\n" + WB.completion_scope_prompt() + WB.owner_gate_prompt(bound_owner)
+                        + WB.owner_inline_marker_prompt(bound_owner) + WB.owner_close_prompt(bound_owner))
+            self.assertEqual(WB.assignment_prompt(bound_owner, "TASK", {}), expected)
+            self.assertEqual(WB.assignment_prompt(no_binding_owner, "TASK", {}),
+                             "Assignment:\nTASK\n\n" + WB.completion_scope_prompt())
+            stage_with_binding = SimpleNamespace(worker_type="stage", route_file=None, route_node=None,
+                                                 owner_route_binding=SimpleNamespace(route_file=str(route_path)))
+            self.assertEqual(WB.assignment_prompt(stage_with_binding, "TASK", {}),
+                             "Assignment:\nTASK\n\n" + WB.completion_scope_prompt())
 
 
 class FrameAssignmentPromptTest(unittest.TestCase):

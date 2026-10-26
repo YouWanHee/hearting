@@ -18,15 +18,26 @@ from terminal_surface import HerdrSurface, Near, open_pane
 
 
 def _identity(args):
+    resolved = session_tidy.resolve_caller(
+        args.harness, args.session_id, os.getcwd(), project=False)
+    if resolved:
+        seat, harness, sid = resolved
+        if harness in session_tidy.HARNESSES and sid and not sid.startswith("unknown-"):
+            seat = session_tidy.session_seat(seat, harness, sid)
+            if seat.kind == "pane":
+                return seat, seat.pane, seat.socket_path
+            return seat, "", ""
+    if args.session_id:
+        return None, "", ""
+
+    # A keybinding without any native identity keeps its read-only active-pane
+    # behavior. It cannot override a native caller selected above.
     pane = (os.environ.get("HERDR_ACTIVE_PANE_ID") or os.environ.get("HERDR_PANE_ID") or "").strip()
     socket = os.environ.get("HERDR_SOCKET_PATH", "")
     if pane and socket:
         endpoint = session_tidy._endpoint_scope({"HERDR_SOCKET_PATH": socket})
         seat = session_tidy._pane_seat_of(pane, endpoint=endpoint, socket_path=socket)
         return seat, pane, socket
-    resolved = session_tidy.resolve_caller(args.harness, args.session_id, os.getcwd())
-    if resolved:
-        return resolved[0], "", ""
     return None, "", ""
 
 
@@ -55,8 +66,14 @@ def _show(text):
 
 
 def _view(args):
-    seat = session_tidy.Seat("pane", args.seat_key, args.pane, "codex", "",
-                             endpoint=args.endpoint, socket_path=args.socket_path)
+    if args.harness and args.session_id:
+        seat = session_tidy.session_seat(
+            session_tidy.resolve_seat(args.harness, os.getcwd(), sid=args.session_id,
+                                      project=False),
+            args.harness, args.session_id)
+    else:
+        seat = session_tidy.Seat("pane", args.seat_key, args.pane, "codex", "",
+                                 endpoint=args.endpoint, socket_path=args.socket_path)
     rows = session_tidy.seat_lineage(seat)
     return _display(rows, args.generation, args.stdout, clear_before_prompt=True)
 
@@ -167,6 +184,8 @@ def main(argv=None):
         argv = ["exec", sys.executable, str(Path(__file__).resolve()), "--in-pane", "--seat-key", seat.key,
                 "--pane", pane, "--endpoint", endpoint, "--socket-path", socket,
                 "--generation", str(args.generation)]
+        if seat.harness and seat.sid:
+            argv += ["--harness", seat.harness, "--session-id", seat.sid]
         active_cwd = os.environ.get("HERDR_ACTIVE_PANE_CWD") or os.getcwd()
         def runner(command):
             env = os.environ.copy()

@@ -39,7 +39,9 @@ Invoke `code-execute` with the fix-plan path. If status is `failed`, report and 
 
 ### Step 5: Verify and Reproduce
 
-Invoke `code-test`, then reproduce the original scenario:
+Invoke `code-test`. Reuse a successful reproduction already captured on the fixed source
+when its target, inputs, dependencies, and execution conditions still match. Reproduce the
+original scenario only if the current evidence does not yet observe that behavior on the fix:
 
 - rerun the user's failing command when provided;
 - for training, run one or two short epochs;
@@ -89,11 +91,11 @@ git worktree add <repo>-wt/audit-<key> -b <branch> main
 
 Do not use a workflow helper that may branch from a stale base. The 2026-06-15 incident created a worktree 32 commits behind main and produced a merge reverting more than 5,000 lines. Review isolation is harmless; correction bases must be explicit and current.
 
-Link required local dependencies such as `node_modules`, `.cache`, `<artifact-root>`, and `.env.local`, then dispatch one headless correction per cluster. Each fixer stays within its cluster, respects token contracts, and verifies with `tsc --noEmit`, a full `next build` when applicable, and `design/verifier` unit evidence for UI changes at light, dark, and mobile-390 views. Commit but do not merge.
+Link required local dependencies such as `node_modules`, `.cache`, `<artifact-root>`, and `.env.local`, then dispatch one headless correction per cluster. Each fixer stays within its cluster, respects token contracts, and runs focused checks relevant to its change, such as `tsc --noEmit` when applicable. Run a full `next build` only when a specific broad impact requires it and no valid result already covers that source and scope. Preserve `design/verifier` unit evidence for UI changes at light, dark, and mobile-390 views. Commit but do not merge.
 
 ### Step 4: Harvest and Report
 
-The main orchestrator reviews real diffs, merges verified nonoverlapping branches sequentially, reruns the full build, and reports flagged items for user judgment or a later dev/debug cycle. Record finding, autofix, flagged, and dropped counts in `pipeline_summary.md`.
+The main orchestrator reviews real diffs and merges verified nonoverlapping branches sequentially. Reuse applicable fixer results; run a relevant integration check only when the combined diff adds an interaction or uncovered impact. Run a full build only when that integrated impact is broad and existing results do not cover it. Report flagged items for user judgment or a later dev/debug cycle. Record finding, autofix, flagged, and dropped counts in `pipeline_summary.md`.
 
 ### Audit Discipline
 

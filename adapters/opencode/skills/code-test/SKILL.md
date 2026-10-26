@@ -37,7 +37,7 @@ capability contract. It is adapter-owned output, not a legacy compatibility Skil
 
 ## Portable Contract
 
-- Invocation semantics: Run graduated verification after `code-execute` or on demand to verify code correctness. Intensity-derived rigor scales final verification and test-adequacy review; it does not force a separate parallel QA loop by itself. The capability resolves a plan path, changed-file list, or test scope, runs the applicable test levels, stops on the first failing level, and records durable evidence before reporting a verdict. When the verification target includes a report spectrogram, the graduated levels include the fail-closed figure semantic verifier against its manifest and report. Missing exact 48 kHz full-band metadata, range-compatible claims, shared-scale evidence, or a hash-current visual review is a failed level. For a planned QA leg with sealed `done_when` items, its `<primary-report>.items.json` is a derived output of that exact primary report. The existing report scope, sub-session fence, state ledger, and continuation carry the sidecar with the primary; no separate path input is needed. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable. Put pytest basetemp and tool scratch data under the supplied `runtime_dir` or system temporary storage. Keep test reports and compact evidence in the declared artifact outputs.
+- Invocation semantics: Assess graduated verification after `code-execute` or on demand to verify code correctness. Intensity-derived rigor scales final verification and test-adequacy review; it does not force a separate parallel QA loop by itself. The capability resolves a plan path, changed-file list, or test scope, assesses the applicable test levels, runs only checks whose evidence is missing or invalidated by the change, stops on the first failing new check, and records durable evidence before reporting a verdict. When the verification target includes a report spectrogram, assess the fail-closed figure semantic verifier against its manifest and report. Reuse its result only while the manifest, report, PNG hash, and visual-review evidence still match. Missing exact 48 kHz full-band metadata, range-compatible claims, shared-scale evidence, or a hash-current visual review is a failed level. For a planned QA leg with sealed `done_when` items, its `<primary-report>.items.json` is a derived output of that exact primary report. The existing report scope, sub-session fence, state ledger, and continuation carry the sidecar with the primary; no separate path input is needed. Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable. Put pytest basetemp and tool scratch data under the supplied `runtime_dir` or system temporary storage. Keep test reports and compact evidence in the declared artifact outputs.
 
 
 
@@ -111,12 +111,21 @@ Additional test-entry gates:
    - if changed files are provided, use them directly;
    - otherwise infer recent changed files from git state and report the
      inference.
-2. Select the applicable graduated levels from `roles/units/qa/test.md`:
-   syntax, import, smoke, functional, integration, and behavioral runtime
-   observation for user-facing surfaces.
-   If changed outputs include a spectrogram report, also run the fail-closed
-   figure semantic verifier against its manifest and report.
-3. Run each applicable level in order and stop on the first failure.
+2. Assess the applicable levels from `roles/units/qa/test.md`: syntax, import,
+   smoke, functional, integration, and behavioral runtime observation for
+   user-facing surfaces. These levels classify evidence; they do not require a
+   restart at syntax when valid evidence already covers a level. Use existing
+   execution, review, test, and CI artifacts when their source, scope, inputs,
+   dependencies, and run conditions still apply. Identify the changed delta,
+   any known failure, and any required unverified dimension.
+   If changed outputs include a spectrogram report, assess the fail-closed
+   figure semantic verifier against its manifest and report, reusing its result
+   only when the evidence remains current.
+3. Run only selected checks whose evidence is missing or invalidated, in level
+   order, and stop at the first failure. Preserve known unresolved failures;
+   after a fix, rerun the check affected by that fix. A handoff or a historical
+   PASS marker alone neither invalidates command evidence nor satisfies the
+   current test gate.
 4. Record commands, outputs or excerpts, skips, blockers, and the first
    actionable failure in `test_logs/`.
 5. Emit the final verdict as a handoff to `code-report`; in a `standard+` stage

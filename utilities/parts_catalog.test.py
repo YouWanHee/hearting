@@ -726,7 +726,8 @@ class StagesTest(unittest.TestCase):
             "autopilot-lab:host-run", "autopilot-lab:resume-run"])
         self.assertFalse(parts["autopilot-code:execute"]["shareable"])
         self.assertEqual(parts["autopilot-lab:metrics"]["unit_choices"], ["material/data-script", "qa/ml-debug"])
-        self.assertEqual(parts["audit:report"]["unit_choices"], ["editorial/polish", "research/research-survey"])
+        self.assertEqual(parts["audit:report"]["unit_choices"],
+                         ["editorial/report", "editorial/polish", "research/research-survey"])
         self.assertEqual(parts["autopilot-lab:diagnose"]["optional_inputs"], ["field-samples", "repro-conditions"])
         self.assertEqual(parts["autopilot-lab:eval-run"]["external_inputs"],
                          ["checkpoint", "eval-spec", "smoke-attestation"])

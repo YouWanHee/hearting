@@ -697,8 +697,12 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
         original_deadlines = {watch_id: arm["deadline"]
                               for watch_id, arm, _paths in self.arms}
         store = peer_steward.peer_obligations.ObligationStore(self.state_root)
+        self.endpoint.pause_after.value = 0
+        self.addCleanup(self.endpoint.resume.set)
         self._hold_runner_lock()
         self._launch_watchers()
+        gate_started_at = time.monotonic()
+        gate_deadline = gate_started_at + 13.0
         self._start_runner()
 
         def pending_projection_exists():
@@ -713,14 +717,6 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
                 if not result or result.get("state") != "pending":
                     return False
             return True
-
-        self._wait_until(pending_projection_exists,
-                         "real runner did not publish pending projections for recovered native results")
-        self.assertFalse(any(paths.receipt.exists() for _watch, _arm, paths in self.arms))
-        self.endpoint.pause_after.value = self.endpoint.observe_count.value + 1
-        self.endpoint.set_idle()
-        self.assertTrue(self.endpoint.pause_entered.wait(10),
-                        "real runner did not pause after publishing ready projections")
 
         recovered = {}
         watch_id, arm, paths = self.arms[0]
@@ -739,21 +735,49 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
             recovered.update(observation=current, request=request)
             return True
 
-        self._wait_until(
-            fresh_request_survived_outer_pending_write,
-            "fresh current-consumer request did not survive the stale cmd_watch_run pending write",
-            timeout=10)
-        self.assertTrue(shared_readiness.consumer_is_current(
-            {"consumer": recovered["request"]["consumer"]}))
-        self.assertEqual(recovered["observation"]["native_wait"],
-                         peer_steward._read_json(paths.observation)["native_wait"])
-        runner_marker = peer_steward._read_json(
-            store.root / "readiness-v1" / "runner.json") or {}
-        self.assertEqual(
-            str(process_start_ticks(runner_marker.get("pid", -1)) or ""),
-            runner_marker.get("pid_start"),
-            "the existing normal runner must own the recovery pass")
-        self.endpoint.resume.set()
+        try:
+            event_wait = min(4.0, max(0.0, gate_deadline - time.monotonic()))
+            self.assertTrue(self.endpoint.pause_entered.wait(event_wait),
+                            "real runner did not pause before its first readiness snapshot")
+            self.assertEqual(self.endpoint.observe_count.value, 1,
+                             "the readiness gate must stop the runner's first observation")
+            snapshots_before_release = (
+                self.snapshot_count_path.read_text(encoding="utf-8").splitlines()
+                if self.snapshot_count_path.exists() else [])
+            self.assertEqual(snapshots_before_release, [],
+                             "the runner must be paused before publishing its first snapshot")
+            self.assertFalse(any(paths.receipt.exists()
+                                 for _watch, _arm, paths in self.arms),
+                             "no watch may settle before the first observation gate")
+
+            predicate_wait = min(10.0, gate_deadline - time.monotonic())
+            self.assertGreater(predicate_wait, 0.0,
+                               "first-observation gate exhausted its shared time budget")
+            self._wait_until(
+                fresh_request_survived_outer_pending_write,
+                "fresh current-consumer request did not survive the stale cmd_watch_run pending write",
+                timeout=predicate_wait)
+            self.assertTrue(shared_readiness.consumer_is_current(
+                {"consumer": recovered["request"]["consumer"]}))
+            self.assertEqual(recovered["observation"]["native_wait"],
+                             peer_steward._read_json(paths.observation)["native_wait"])
+            runner_marker = peer_steward._read_json(
+                store.root / "readiness-v1" / "runner.json") or {}
+            self.assertEqual(
+                str(process_start_ticks(runner_marker.get("pid", -1)) or ""),
+                runner_marker.get("pid_start"),
+                "the existing normal runner must own the recovery pass")
+        finally:
+            self.endpoint.resume.set()
+            gate_released_at = time.monotonic()
+        gate_pause_seconds = gate_released_at - gate_started_at
+        self.assertLessEqual(gate_pause_seconds, 15.0,
+                             "first-observation gate exceeded its 15-second pause budget")
+
+        self._wait_until(pending_projection_exists,
+                         "real runner did not publish pending projections for recovered native results")
+        self.assertFalse(any(paths.receipt.exists() for _watch, _arm, paths in self.arms))
+        self.endpoint.set_idle()
 
         self._wait_until(
             lambda: all(paths.receipt.exists() for _watch, _arm, paths in self.arms),
@@ -834,6 +858,7 @@ class LifecycleRunnerProcessTest(unittest.TestCase):
             "jobs_sha256_before_after": [self.jobs_before,
                                          hashlib.sha256(self.jobs.read_bytes()).hexdigest()],
             "runner_session_snapshot_calls": runner_snapshots,
+            "first_observation_gate_seconds": round(gate_pause_seconds, 3),
             "runner_process_count": int(self.runner_pid is not None),
             "observation_groups": observation_groups,
             "acknowledged_watch": first_id,

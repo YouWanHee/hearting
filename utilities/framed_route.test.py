@@ -461,7 +461,20 @@ class RegistryRegistrationTest(unittest.TestCase):
             if isinstance(value, dict):
                 return {key: restore(item) for key, item in value.items()}
             return value
-        return restore(registry)
+        layout = restore(registry)
+        self._assert_audit_report_delta_and_restore(layout)
+        return layout
+
+    def _assert_audit_report_delta_and_restore(self, registry):
+        # Audit report authoring intentionally moves the default report unit to
+        # editorial/report and lists it first among the catalog choices.
+        audit = next(r for r in registry["recipes"] if r["capability"] == "audit")
+        report = next(n for n in audit["standard_plus"]["nodes"] if n["id"] == "report")
+        self.assertEqual(report["unit"], "editorial/report")
+        report["unit"] = "editorial/polish"
+        choices = registry["part_catalog"]["parts"]["audit:report"]["unit_choices"]
+        self.assertEqual(choices, ["editorial/report", "editorial/polish", "research/research-survey"])
+        choices.remove("editorial/report")
 
     def recipe(self, registry):
         return next(r for r in registry["recipes"] if r["capability"] == "route-frame")

@@ -144,9 +144,10 @@ class SharedCacheFallbackTests(unittest.TestCase):
         self.assertEqual(source, "unknown:timeout")
 
     def test_capacity_report_names_manual_and_unknown_sources(self):
-        with mock.patch.dict(os.environ, {"HARNESS_CAPACITY_SCORES": "codex:12"}), \
+        with mock.patch.dict(os.environ, {"HARNESS_CAPACITY_SCORES": "codex:12",
+                                         "AGENT_DISPATCH_JOBS": ""}), \
                 mock.patch.object(C, "_opencode_api_score", return_value=None), \
-                mock.patch.object(C, "_claude_score", return_value=None):
+                mock.patch.object(C, "_claude_capacity_reading", return_value=(None, None)):
             report = C.capacity_report(now=0.0)
             self.assertEqual(C.capacity_scores(now=0.0)["codex"], 12.0)
         self.assertEqual(report["sources"]["codex"], "manual")
@@ -159,7 +160,7 @@ class SharedCacheFallbackTests(unittest.TestCase):
         with mock.patch.object(C, "_codex_api_score", return_value=None), \
                 mock.patch.object(C, "_codex_score", return_value=None), \
                 mock.patch.object(C, "_opencode_api_score", return_value=None), \
-                mock.patch.object(C, "_claude_score", return_value=None):
+                mock.patch.object(C, "_claude_capacity_reading", return_value=(None, None)):
             report = C.refresh_gauges(now=200.0)
         self.assertEqual(report["scores"]["codex"], 70.0)      # cache reused
         snapshot = cache.read("codex", now=200.0)
@@ -622,11 +623,21 @@ class ClaudeAccountAggregationTests(unittest.TestCase):
     which file's mtime happened to sort first.
     """
 
-    def _write(self, statusline_dir, name, rate_limits, mtime):
+    def _write(self, statusline_dir, name, rate_limits, mtime, **payload_fields):
         path = statusline_dir / name
-        path.write_text(json.dumps({"rate_limits": rate_limits}), encoding="utf-8")
+        payload = {"rate_limits": rate_limits, **payload_fields}
+        path.write_text(json.dumps(payload), encoding="utf-8")
         os.utime(path, (mtime, mtime))
         return path
+
+    def _report(self, home, now, scopes=None):
+        # Manual non-Claude scores keep all networked provider probes disabled.
+        with mock.patch.dict(os.environ, {
+                "CLAUDE_CONFIG_DIR": str(home),
+                "HARNESS_CAPACITY_SCORES": "codex:12,opencode:34",
+                "AGENT_DISPATCH_JOBS": "",
+        }), mock.patch("dispatch_capacity_evidence._scope_candidates", return_value=scopes or {}):
+            return C.capacity_report(now=now)
 
     def test_merges_windows_across_fresh_sessions_instead_of_picking_one_file(self):
         with tempfile.TemporaryDirectory() as home:
@@ -684,9 +695,51 @@ class ClaudeAccountAggregationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             statusline=Path(home)/'.statusline';statusline.mkdir();now=1_000_000.
             self._write(statusline,'high.json',{'seven_day':{'used_percentage':99,'resets_at':now+3600}},now-20)
+            self._write(statusline,'identical.json',{'seven_day':{'used_percentage':99,'resets_at':now+3600}},now-2)
             self._write(statusline,'rewrite.json',{'seven_day':{'used_percentage':69,'resets_at':now+3600}},now-1)
             with mock.patch.dict(os.environ,{'CLAUDE_CONFIG_DIR':home}):
                 self.assertEqual(C._claude_score(now,3600),1.)
+            report = self._report(home, now)
+        self.assertEqual(report["scores"]["claude"], 1.0)
+        self.assertEqual(report["sources"]["claude"], "taps")
+        self.assertEqual(report["freshness"]["claude"]["observation_time"], "unknown")
+        self.assertEqual(report["freshness"]["claude"]["age_seconds"], 20.0)
+
+    def test_fresh_tap_reports_file_age_threshold_and_unknown_observation_time(self):
+        with tempfile.TemporaryDirectory() as home:
+            statusline = Path(home) / ".statusline"
+            statusline.mkdir()
+            now = 1_000_000.0
+            self._write(statusline, "fresh.json", {
+                "five_hour": {"used_percentage": 65, "resets_at": now + 3600},
+            }, now - 42.3)
+            report = self._report(home, now)
+        self.assertEqual(report["scores"]["claude"], 35.0)
+        self.assertEqual(report["sources"]["claude"], "taps")
+        self.assertEqual(report["freshness"]["claude"], {
+            "basis": "file-mtime",
+            "age_seconds": 42.3,
+            "stale_after_seconds": 3600,
+            "observation_time": "unknown",
+        })
+
+    def test_stale_future_and_scope_mismatched_taps_do_not_report_freshness(self):
+        now = 1_000_000.0
+        for name, mtime, fields in (
+                ("stale", now - 3601, {}),
+                ("future", now + 1, {}),
+                ("mismatched", now - 5, {"quota_scope": "foreign", "quota_scope_kind": "account"}),
+        ):
+            with self.subTest(kind=name), tempfile.TemporaryDirectory() as home:
+                statusline = Path(home) / ".statusline"
+                statusline.mkdir()
+                self._write(statusline, f"{name}.json", {
+                    "week": {"used_percentage": 80, "resets_at": now + 3600},
+                }, mtime, **fields)
+                report = self._report(home, now, scopes={"account": "current"})
+                self.assertIsNone(report["scores"]["claude"])
+                self.assertEqual(report["sources"]["claude"], "unknown:no-fresh-taps")
+                self.assertNotIn("claude", report["freshness"])
 
     def test_expired_window_does_not_block_real_reset_or_merge_other_window(self):
         with tempfile.TemporaryDirectory() as home:
