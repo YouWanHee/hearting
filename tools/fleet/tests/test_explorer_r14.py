@@ -2,9 +2,9 @@
 import unittest
 from pathlib import Path
 
-from tools.fleet.explorer.frame import draw
+from tools.fleet.explorer.frame import draw, measure_pane_max
 from tools.fleet.explorer.state import NavState, reduce
-from tools.fleet.explorer.view_model import load_fixture
+from tools.fleet.explorer.view_model import ExplorerViewModel, load_fixture
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "explorer" / "view_model.json"
@@ -143,6 +143,47 @@ class R14Renderer(unittest.TestCase):
         self.assertEqual(dict(bottom.scroll)["pane"], end_offset)
         resized = draw(self.vm, bottom, cols=168, rows=60)
         self.assertLessEqual(resized.pane_scroll[4], resized.pane_scroll[5])
+
+    def test_huge_stale_offset_clamps_without_offset_sized_canvas(self):
+        from unittest.mock import patch
+        import tools.fleet.explorer.frame as frame
+
+        real_grid = frame.CellGrid
+        allocated = []
+
+        class ScreenGridGuard(real_grid):
+            def __init__(self, cols, rows, *args, **kwargs):
+                allocated.append((cols, rows))
+                if rows > 24:
+                    raise AssertionError(f"dense canvas allocation scales with stale offset: {rows}")
+                super().__init__(cols, rows, *args, **kwargs)
+
+        stale = NavState(view="QUESTIONS", scroll=(("pane", 1 << 20),))
+        with patch.object(frame, "CellGrid", ScreenGridGuard), patch.object(frame, "_draw_page"):
+            rendered = frame.draw(self.vm, stale, cols=120, rows=24)
+
+        self.assertEqual(allocated, [(120, 24)])
+        self.assertEqual(rendered.pane_scroll[4], 0)
+        self.assertEqual(rendered.pane_scroll[5], 0)
+        self.assertFalse(rendered.pane_scroll[7])
+
+    def test_end_measures_finite_questions_past_8192_rows(self):
+        questions = tuple({"tag": f"q{index:04d}", "h": "claude", "kind": "wait",
+                           "wait": "1m", "project": "p", "title": "q", "now": "n",
+                           "pane": "p"} for index in range(1400))
+        vm = ExplorerViewModel.from_mapping({"questions": questions})
+        state = NavState(view="QUESTIONS")
+
+        maximum = measure_pane_max(vm, state, cols=60, rows=24)
+        self.assertGreater(maximum, 8192)
+
+        end = draw(vm, NavState(view="QUESTIONS", scroll=(("pane", maximum),)),
+                   cols=60, rows=24)
+        self.assertEqual(end.pane_scroll[4], maximum)
+        self.assertEqual(end.pane_scroll[5], maximum)
+        self.assertFalse(end.pane_scroll[7])
+        self.assertIn("q1399", "\n".join(end.text_rows()))
+        self.assertTrue(all(0 <= hit.y < 20 for hit in end.hits if hit.y >= 0))
 
     def test_keyboard_session_selection_reveals_its_identity_in_scrolled_tree(self):
         frame = draw(self.vm, NavState(scroll=(("tree", 6),)), cols=120, rows=40)

@@ -45,6 +45,109 @@ class CellFrame:
         return tuple("".join(cell[0] for cell in row) for row in self.cells)
 
 
+class _PageRow:
+    """List-like row view backed only when it falls inside the current page window."""
+
+    def __init__(self, grid, y):
+        self.grid, self.y = grid, int(y)
+
+    def __getitem__(self, column):
+        if isinstance(column, slice):
+            return [self.grid._cell(self.y, x)
+                    for x in range(*column.indices(self.grid.cols))]
+        column = int(column)
+        if column < 0:
+            column += self.grid.cols
+        return self.grid._cell(self.y, column)
+
+    def __setitem__(self, column, value):
+        if isinstance(column, slice):
+            indexes = range(*column.indices(self.grid.cols))
+            values = list(value)
+            if len(indexes) != len(values):
+                raise ValueError("page row slice assignment cannot change width")
+            for x, cell in zip(indexes, values):
+                self.grid._set_cell(self.y, x, cell)
+            return
+        column = int(column)
+        if column < 0:
+            column += self.grid.cols
+        self.grid._set_cell(self.y, column, value)
+
+
+class _PageRows:
+    def __init__(self, grid):
+        self.grid = grid
+        self._last_y = None
+        self._last_row = None
+
+    def __getitem__(self, y):
+        y = int(y)
+        if y < 0:
+            y += self.grid.rows
+        if y < 0 or y >= self.grid.rows:
+            raise IndexError(y)
+        if y != self._last_y:
+            self._last_y = y
+            self._last_row = _PageRow(self.grid, y)
+        return self._last_row
+
+
+class _PageGrid(CellGrid):
+    """Virtual-height page grid with bounded cell/hit storage.
+
+    Renderers retain their existing logical row coordinates and bounds, while only the
+    displayed slice and bottom overflow probe keep cells. End measurement tracks the
+    final painted body row without materializing the intervening canvas.
+    """
+
+    def __init__(self, cols, rows, pane_x, keep_rows=()):
+        self.cols, self.rows = max(0, int(cols)), max(0, int(rows))
+        self.pane_x = int(pane_x)
+        self.probe_y = max(0, self.rows - 5)
+        self.keep_start, self.keep_end = tuple(keep_rows) if keep_rows else (0, 0)
+        self._cells = {}
+        self.cells = _PageRows(self)
+        self.hits = []
+        self.trace = CellGrid.default_trace
+        self.pane_clip = None
+        self.last_content_row = 2
+        self.last_hit_row = 2
+
+    def _keeps(self, y):
+        return y == self.probe_y or self.keep_start <= y < self.keep_end
+
+    def _cell(self, y, x):
+        if x < 0 or x >= self.cols:
+            raise IndexError(x)
+        row = self._cells.get(y)
+        return row[x] if row is not None else (" ", None, None)
+
+    def _set_cell(self, y, x, value):
+        if y < 0 or y >= self.rows or x < 0 or x >= self.cols:
+            return
+        if (3 <= y < self.probe_y and x >= self.pane_x and
+                (value[0] != " " or value[1] is not None or value[2] is not None)):
+            self.last_content_row = max(self.last_content_row, y)
+        if not self._keeps(y):
+            return
+        row = self._cells.get(y)
+        if row is None:
+            row = [(" ", None, None) for _ in range(self.cols)]
+            self._cells[y] = row
+        row[x] = value
+
+    def add_hit(self, y, x0, x1, action):
+        y, x0, x1 = int(y), int(x0), int(x1)
+        if 0 <= y < self.rows and x0 < x1:
+            left, right = max(0, x0), min(self.cols, x1)
+            if left < right:
+                if right > self.pane_x and 3 <= y < self.probe_y:
+                    self.last_hit_row = max(self.last_hit_row, y)
+                if self.keep_start <= y < self.keep_end:
+                    self.hits.append(Hit(y, left, right, tuple(action)))
+
+
 def _draw_page(grid, vm, state):
     if state.scope != "-":
         pages.draw_scope(grid, vm, state)
@@ -68,8 +171,8 @@ def _draw_page(grid, vm, state):
         resources.draw_system(grid, vm, state)
 
 
-def _page_canvas(vm, state, cols, logical_rows, pane_x):
-    grid = CellGrid(cols, logical_rows)
+def _page_canvas(vm, state, cols, logical_rows, pane_x, keep_rows=()):
+    grid = _PageGrid(cols, logical_rows, pane_x, keep_rows)
     spill_y = max(0, int(logical_rows) - 5)
     for x in range(pane_x, grid.cols):
         grid.put(x, spill_y, "━", "line")
@@ -85,12 +188,9 @@ def _page_canvas(vm, state, cols, logical_rows, pane_x):
 def _page_end(grid, pane_x, logical_rows):
     """Last painted or actionable body row, excluding the bottom overflow probe."""
     limit = max(3, int(logical_rows) - 5)
-    hit_rows = [hit.y for hit in grid.hits if 3 <= hit.y < limit and hit.x1 > pane_x]
-    for y in range(limit - 1, 2, -1):
-        if any(cell[0] != " " or cell[1] is not None or cell[2] is not None
-               for cell in grid.cells[y][pane_x:]):
-            return max(y, max(hit_rows, default=2))
-    return max(hit_rows, default=2)
+    content = grid.last_content_row if 3 <= grid.last_content_row < limit else 2
+    hits = grid.last_hit_row if 3 <= grid.last_hit_row < limit else 2
+    return max(content, hits)
 
 
 def _page_max(grid, pane_x, logical_rows, viewport_rows, offset, overflow):
@@ -120,9 +220,7 @@ def measure_pane_max(view_model, nav_state, cols, rows):
         if not overflow:
             return max(0, _page_end(grid, pane_x, logical_rows) -
                        (3 + viewport_rows - 1))
-        if logical_rows >= 8192:
-            return max(0, logical_rows - view_rows)
-        logical_rows = min(8192, max(logical_rows + viewport_rows, logical_rows * 2))
+        logical_rows = max(logical_rows + viewport_rows, logical_rows * 2)
 
 
 def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
@@ -139,15 +237,17 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
     pane_x = NAV_WIDTH + 2
     offsets = dict(state.scroll)
     requested = max(0, int(offsets.get("pane", 0)))
-    if requested >= (1 << 30):
-        requested = measure_pane_max(vm, state, cols, rows)
 
     grid = CellGrid(cols, rows)
     tree_layout = chrome.draw_explorer(grid, vm, state)
 
     def render_page(offset):
         logical_rows = max(1, view_rows + offset)
-        page, overflow = _page_canvas(vm, state, int(cols), logical_rows, pane_x)
+        shift = 1 + pushed_rows
+        keep_start = max(0, content_top - shift + offset)
+        keep_end = max(keep_start, body_end - shift + offset)
+        page, overflow = _page_canvas(vm, state, int(cols), logical_rows, pane_x,
+                                      (keep_start, keep_end))
         maximum = _page_max(page, pane_x, logical_rows, viewport_rows, offset, overflow)
         return page, overflow, maximum, logical_rows
 
