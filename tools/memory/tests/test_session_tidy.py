@@ -101,6 +101,132 @@ class TidyCase(unittest.TestCase):
 
 class LegacyNativeMigrationAccessTest(TidyCase):
 
+    def test_later_exact_source_migrates_after_empty_ready_observations(self):
+        sid = "late-known-source-same-sid"
+        pane = "fixture:late-known-source"
+        project_key = st.project_key_for(str(self.cwd))
+
+        with self.iso.patched_environ({}):
+            self.assertEqual(st.run_hook("claude", "prompt", sid, cwd=str(self.cwd),
+                                         env=os.environ, now=5000,
+                                         emit=lambda _text: None), "")
+            logical = st.session_seat(st.seat_for_project("claude", project_key),
+                                      "claude", sid)
+            self.assertEqual(st._native_address_status(logical), "ready")
+            rows = [row for row in st._read_ledger_lines(logical)
+                    if row.get("event") == "native-address"
+                    and (row.get("harness"), row.get("sid")) == ("claude", sid)]
+            self.assertEqual(len(rows), 1)
+            self.assertNotIn("legacy_source", rows[0])
+
+            # A second empty observation stays idempotent and records no recovery
+            # or readiness row of its own.
+            self.assertEqual(st.run_hook("claude", "prompt", sid, cwd=str(self.cwd),
+                                         env=os.environ, now=5001,
+                                         emit=lambda _text: None), "")
+            rows = [row for row in st._read_ledger_lines(logical)
+                    if row.get("event") == "native-address"
+                    and (row.get("harness"), row.get("sid")) == ("claude", sid)]
+            self.assertEqual(len(rows), 1)
+
+        source = st.Seat("pane", st._digest("pane", pane), pane=pane, harness="claude")
+        card = {"schema": st.SCHEMA, "seat": source.as_dict(),
+                "author": {"harness": "claude", "sid": sid, "epoch": 0},
+                "authored_at": st.iso_utc(4000), "authored_at_epoch": 4000,
+                "generation": 9, "memory_refs": {"revision": 3, "batch": "late"},
+                "cwd": str(self.cwd), "body": "legacy generation nine"}
+        receipt = st._receipt("claude", sid, 0)
+        with self.library({"HERDR_PANE_ID": pane}):
+            with st.seat_lock(source.key):
+                st._write_card_pair(source, card)
+                st._write_consumed(source, generation=8, receipts=[receipt])
+            history = self.state / "card-history" / source.key / "00000008.json"
+            history.parent.mkdir(parents=True, exist_ok=True)
+            st.atomic_write_json(history, {**card, "generation": 8,
+                                           "body": "legacy history eight"})
+            source_card = st.read_bytes(st.card_json_path(source))
+            source_receipt = st.read_bytes(st._consumed_path(source))
+            source_history = st.read_bytes(history)
+
+            emitted = []
+            self.assertEqual(st.run_hook("claude", "prompt", sid, cwd=str(self.cwd),
+                                         env=os.environ, now=5002, emit=emitted.append), "")
+            caller = st.session_seat(
+                st.resolve_seat("claude", str(self.cwd), os.environ, sid), "claude", sid)
+            native = st.read_latest_card(caller)
+            self.assertEqual((native["generation"], native["body"],
+                              native["memory_refs"]["revision"]),
+                             (9, "legacy generation nine", 3))
+            self.assertEqual(st.read_bytes(st.card_json_path(caller)), source_card)
+            self.assertEqual(st.read_bytes(st._consumed_path(caller)), source_receipt)
+            self.assertEqual(st.read_bytes(self.state / "card-history" /
+                                           st.card_key(caller) / "00000008.json"), source_history)
+            self.assertEqual(emitted, [], "same-session migration must not replay its own card or result")
+            self.assertEqual(st.read_bytes(st.card_json_path(source)), source_card)
+            self.assertEqual(st.read_bytes(st._consumed_path(source)), source_receipt)
+            self.assertEqual(st.read_bytes(history), source_history)
+
+            rows = [row for row in st._read_ledger_lines(caller)
+                    if row.get("event") == "native-address"
+                    and (row.get("harness"), row.get("sid")) == ("claude", sid)]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[-1].get("legacy_source"), source.key)
+
+        # Successful native migration remains available to the ordinary
+        # pane-less prompt consumer and does not create another address row.
+        with self.iso.patched_environ({}):
+            self.assertEqual(st.run_hook("claude", "prompt", sid, cwd=str(self.cwd),
+                                         env=os.environ, now=5003,
+                                         emit=lambda _text: None), "")
+            logical = st.session_seat(st.seat_for_project("claude", project_key),
+                                      "claude", sid)
+            self.assertEqual(st.read_latest_card(logical)["generation"], 9)
+            rows = [row for row in st._read_ledger_lines(logical)
+                    if row.get("event") == "native-address"
+                    and (row.get("harness"), row.get("sid")) == ("claude", sid)]
+            self.assertEqual(len(rows), 2)
+
+    def test_newer_canonical_card_beats_later_higher_generation_legacy_card(self):
+        sid = "late-source-canonical-priority"
+        pane = "fixture:canonical-priority"
+
+        with self.iso.patched_environ({}):
+            self.assertEqual(st.run_hook("claude", "prompt", sid, cwd=str(self.cwd),
+                                         env=os.environ, now=5000,
+                                         emit=lambda _text: None), "")
+
+        # Use the real card command after the empty observation. Its canonical
+        # generation is intentionally lower than the later legacy generation.
+        self.card(sid, "newer canonical card", pane=None)
+        source = st.Seat("pane", st._digest("pane", pane), pane=pane, harness="claude")
+        legacy = {"schema": st.SCHEMA, "seat": source.as_dict(),
+                  "author": {"harness": "claude", "sid": sid, "epoch": 0},
+                  "authored_at": st.iso_utc(4000), "authored_at_epoch": 4000,
+                  "generation": 99, "cwd": str(self.cwd), "body": "old high generation"}
+        with self.iso.patched_environ({}):
+            logical = st.session_seat(st.seat_for_project(
+                "claude", st.project_key_for(str(self.cwd))), "claude", sid)
+            canonical_raw = st.read_bytes(st.card_json_path(logical))
+            canonical = st.read_latest_card(logical)
+            self.assertEqual((canonical["generation"], canonical["body"]),
+                             (1, "newer canonical card"))
+        with self.library({"HERDR_PANE_ID": pane}):
+            with st.seat_lock(source.key):
+                st._write_card_pair(source, legacy)
+            source_raw = st.read_bytes(st.card_json_path(source))
+
+            emitted = []
+            st.run_hook("claude", "prompt", sid, cwd=str(self.cwd), env=os.environ,
+                        now=5001, emit=emitted.append)
+            caller = st.session_seat(
+                st.resolve_seat("claude", str(self.cwd), os.environ, sid), "claude", sid)
+            saved = st.read_latest_card(caller)
+            self.assertEqual((saved["generation"], saved["body"]),
+                             (1, "newer canonical card"))
+            self.assertEqual(st.read_bytes(st.card_json_path(caller)), canonical_raw)
+            self.assertEqual(st.read_bytes(st.card_json_path(source)), source_raw)
+            self.assertNotIn("old high generation", "".join(emitted))
+
     def test_prompt_hook_probes_only_the_exact_known_card_source_once(self):
         sid = "known-source-author"
         with self.library():

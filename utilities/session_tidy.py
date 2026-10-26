@@ -445,7 +445,7 @@ def session_state_lock(seat: Seat, *, wait: Optional[float] = None) -> Iterator[
     harness, sid = session_identity(seat)
     native_key = _native_session_key(harness, sid)
     if (native_key and not (state_root() / "cards" / f"{native_key}.json").exists()
-            and not _native_address_status(seat)):
+            and _native_address_status(seat) != "conflict"):
         keys.update(_legacy_native_source_keys(seat))
     keys = sorted(keys)
     with contextlib.ExitStack() as stack:
@@ -1750,15 +1750,16 @@ def prepare_native_session_state(seat: Seat) -> bool:
             _remember_native_address_status(seat, "conflict")
         return valid
     status = _native_address_status(seat)
-    if status:
-        return status == "ready"
+    if status and status != "ready":
+        return False
 
     source_keys = _legacy_native_source_keys(seat)
     candidates = _legacy_native_cards(seat, source_keys)
     if not candidates:
-        _append_ledger_entry(seat, {"ts": now_epoch(), "harness": harness, "sid": sid,
-                                    "event": "native-address", "legacy_status": "ready"})
-        _remember_native_address_status(seat, "ready")
+        if not status:
+            _append_ledger_entry(seat, {"ts": now_epoch(), "harness": harness, "sid": sid,
+                                        "event": "native-address", "legacy_status": "ready"})
+            _remember_native_address_status(seat, "ready")
         return True
     first_path, first_raw, first_card = candidates[0]
     source_key = str(((first_card.get("seat") or {}).get("key") or ""))
