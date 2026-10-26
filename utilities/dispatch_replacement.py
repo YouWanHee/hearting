@@ -2695,7 +2695,7 @@ def effective_attempts(jobs, attempts):
     return effective, mapping
 
 
-def advance_batch(jobs, attempts, *, authority_check=None, run=subprocess.run):
+def advance_batch(jobs, attempts, *, authority_check=None, run=subprocess.run, resume_capacity=False):
     """Runtime-only checkpoint; no model turn or new polling service."""
     jobs_path = Path(jobs)
     if not attempts:
@@ -2723,7 +2723,7 @@ def advance_batch(jobs, attempts, *, authority_check=None, run=subprocess.run):
                     # its fresh process/recipient checks for this checkpoint.
                     continue
                 needs_projection = True
-        step=advance(jobs,aid,authority_check=authority_check,run=run)
+        step=advance(jobs,aid,authority_check=authority_check,run=run,resume_capacity=resume_capacity)
         if step.get('state')=='needs-attention':
             attention.append(step)
         else:

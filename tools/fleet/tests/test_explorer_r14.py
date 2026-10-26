@@ -29,6 +29,40 @@ class R14Renderer(unittest.TestCase):
         self.assertEqual(rows[2].strip(), "")
         self.assertIn("┴", rows[-4])
 
+    def test_resources_label_keeps_the_internal_compute_navigation_key(self):
+        frame = draw(self.vm, NavState(view="COMPUTE"), cols=140, rows=45)
+        text = "\n".join(frame.text_rows())
+        self.assertIn("RESOURCES", text)
+        self.assertNotIn("COMPUTE", text)
+        self.assertTrue(any(hit.action == ("tab", "COMPUTE") for hit in frame.hits))
+        self.assertTrue(any(hit.action == ("root", "COMPUTE") for hit in frame.hits))
+
+    def test_sol_and_astra_share_model_family_color_across_viewers(self):
+        from tools.fleet import render
+        from tools.fleet.explorer import live, models
+        from tools.fleet.explorer.grid import CellGrid
+
+        for model in ("gpt-6.1-sol", "gpt-6.1-astra", "Sol", "Astra"):
+            self.assertEqual(render._model_key(model), "fam_gpt")
+            self.assertEqual(live._model_pair(model)[1], "fam_gpt")
+            self.assertEqual(live._stage_model(model)[1], "fam_gpt")
+            grid = CellGrid(48, 3)
+            models._model_cell(grid, 1, 1, "codex", (model, "high"), {}, {}, 40)
+            self.assertEqual(grid.cells[1][1][1], "g_idle")
+
+    def test_route_columns_leave_progress_room_at_100_140_and_168(self):
+        from tools.fleet.explorer.tables import _route_columns
+
+        for width in (100, 140, 168):
+            use = width - 36
+            cols = _route_columns(use)
+            age_start = use - 6 - 3
+            with self.subTest(width=width):
+                self.assertLessEqual(cols["title_w"], 48)
+                self.assertLess(cols["kind"], cols["own"])
+                self.assertLess(cols["own"], cols["prog"])
+                self.assertGreater(age_start - cols["prog"], 0)
+
     def test_peers_and_all_renderer_views_stay_inside_four_viewports(self):
         views = ("OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "COMPUTE",
                  "MEMORY", "MODELS", "SYSTEM")

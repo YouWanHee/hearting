@@ -56,6 +56,8 @@ class HarnessModelCellTest(unittest.TestCase):
         self.assertIn("hb_claude", keys)                    # harness text keeps its badge color
         self.assertIn(render._model_key("Fable 5"), keys)   # model reuses _model_cell's family color
         self.assertIn(render._eff_key("xhigh", False), keys)  # effort reuses the heat-ramp color
+        for model in ("gpt-6.1-sol", "gpt-6.1-astra", "Sol", "Astra"):
+            self.assertEqual(render._model_key(model), "fam_gpt")
 
 
 class NoColumnHeaderTest(unittest.TestCase):

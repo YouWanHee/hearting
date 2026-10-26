@@ -5,15 +5,16 @@ A missing or unreadable ledger returns an empty result — every Session field t
 feeds stays at its snapshot default so the rendered board is byte-identical to a
 pre-SD-122 board.
 """
-import glob
 import importlib.util
 from itertools import islice
 import json
 import os
 import re
+import stat
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 _TAIL_BYTES = 64 * 1024
 _WINDOW_SECONDS = 24 * 3600
@@ -36,7 +37,16 @@ def _clean_from_name(name):
     return _REF_TRAILER_RE.sub("", name)
 
 
-def _load_peer_message():
+def _note_diagnostic(diagnostics, operation, error):
+    if diagnostics is None:
+        return
+    name = error if isinstance(error, str) else type(error).__name__
+    item = {"operation": operation, "error": name}
+    if item not in diagnostics:
+        diagnostics.append(item)
+
+
+def _load_peer_message(diagnostics=None):
     """Lazy-load `utilities/peer-message.py` (hyphenated — not `import`able by
     name) once, so `_state_roots()` can ask it for the peer ledger's canonical
     root (C-8). Fail-soft and cached: a read-only collector must never raise,
@@ -47,25 +57,35 @@ def _load_peer_message():
     here = Path(__file__).resolve()
     for candidate in here.parents:
         pm_path = candidate / "utilities" / "peer-message.py"
-        if pm_path.is_file():
-            try:
-                spec = importlib.util.spec_from_file_location("peer_message", str(pm_path))
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-            except Exception:
-                return None
-            _peer_message_module = module
-            return module
+        try:
+            if not stat.S_ISREG(pm_path.stat().st_mode):
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _note_diagnostic(diagnostics, "resolve_peer_module", exc)
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("peer_message", str(pm_path))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as exc:
+            _note_diagnostic(diagnostics, "resolve_peer_module", exc)
+            return None
+        _peer_message_module = module
+        return module
+    _note_diagnostic(diagnostics, "resolve_peer_module", "ResolverUnavailable")
     return None
 
 
-def _peer_ledger_root():
-    module = _load_peer_message()
+def _peer_ledger_root(diagnostics=None):
+    module = _load_peer_message(diagnostics)
     if module is None:
         return None
     try:
         return str(module.peer_state_root())
-    except Exception:
+    except Exception as exc:
+        _note_diagnostic(diagnostics, "resolve_peer_root", exc)
         return None
 
 
@@ -74,7 +94,7 @@ def _agent_home():
     return dispatch._registry_home()
 
 
-def _runtime_ledger_roots():
+def _runtime_ledger_roots(diagnostics=None):
     """F-100c — each installed runtime resolves ITS OWN dispatch state root
     (`~/.codex/.harness/dispatch`, `~/.config/opencode/.harness/dispatch`, …; measured
     2026-09-03), so a Codex/OpenCode receiver's `notice` lands in that runtime's ledger,
@@ -86,12 +106,24 @@ def _runtime_ledger_roots():
         if not home:
             continue
         root = os.path.join(home, ".harness", "dispatch")
-        if os.path.isdir(os.path.join(root, "peer-messages")) or os.path.isdir(os.path.join(root, "peer-steward")):
+        active = False
+        for child in ("peer-messages", "peer-steward"):
+            try:
+                is_dir = stat.S_ISDIR(os.stat(os.path.join(root, child)).st_mode)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                _note_diagnostic(diagnostics, "resolve_runtime_roots", exc)
+                continue
+            if is_dir:
+                active = True
+                break
+        if active:
             out.append(root)
     return out
 
 
-def _state_roots():
+def _state_roots(diagnostics=None):
     """F-98d — read through the SAME resolver chain the writer (`peer-message.py`) uses,
     not `dispatch._row_state_roots()`'s no-row default (which pins to the release tree's
     `.dispatch` and ignores an inherited `AGENT_DISPATCH_JOBS`). Modelled on
@@ -106,40 +138,60 @@ def _state_roots():
     "fleet-reader" branch, and its "chain index 0 = the writer's root" contract
     depends on this ordering. A resolver failure here is swallowed — the rest
     of the roots still apply."""
+    if diagnostics is None:
+        diagnostics = []
     roots = []
     try:
         home = _agent_home()
-    except Exception:
+    except Exception as exc:
+        _note_diagnostic(diagnostics, "resolve_dispatch_home", exc)
         home = None
     if home is not None:
         here = Path(__file__).resolve()
+        found_contract = False
         for candidate in here.parents:
             utilities_dir = candidate / "utilities"
-            if (utilities_dir / "dispatch_contract.py").is_file():
-                if str(utilities_dir) not in sys.path:
-                    sys.path.insert(0, str(utilities_dir))
-                try:
-                    from dispatch_contract import dispatch_state_roots
-                    roots = [str(root) for root in dispatch_state_roots(
-                        Path(home), jobs=os.environ.get("AGENT_DISPATCH_JOBS"))]
-                except Exception:
-                    roots = []
-                break
+            contract_path = utilities_dir / "dispatch_contract.py"
+            try:
+                if not stat.S_ISREG(contract_path.stat().st_mode):
+                    continue
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                _note_diagnostic(diagnostics, "resolve_dispatch_roots", exc)
+                continue
+            found_contract = True
+            if str(utilities_dir) not in sys.path:
+                sys.path.insert(0, str(utilities_dir))
+            try:
+                from dispatch_contract import dispatch_state_roots
+                roots = [str(root) for root in dispatch_state_roots(
+                    Path(home), jobs=os.environ.get("AGENT_DISPATCH_JOBS"))]
+            except Exception as exc:
+                _note_diagnostic(diagnostics, "resolve_dispatch_roots", exc)
+                roots = []
+            break
+        if not found_contract:
+            _note_diagnostic(diagnostics, "resolve_dispatch_roots", "ResolverUnavailable")
     try:
-        for extra in _runtime_ledger_roots():
+        for extra in _runtime_ledger_roots(diagnostics):
             if extra not in roots:
                 roots.append(extra)
-    except Exception:
-        pass
-    peer_root = _peer_ledger_root()
+    except Exception as exc:
+        _note_diagnostic(diagnostics, "resolve_runtime_roots", exc)
+    peer_root = _peer_ledger_root(diagnostics)
     if peer_root is not None:
         peer_norm = os.path.normpath(peer_root)
         roots = [r for r in roots if os.path.normpath(r) != peer_norm]
         roots.insert(0, peer_root)
+    _state_roots.last_diagnostics = list(diagnostics)
     return tuple(roots)
 
 
-def _tail_lines(path):
+_state_roots.last_diagnostics = []
+
+
+def _tail_lines(path, diagnostics=None):
     try:
         size = os.path.getsize(path)
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -147,7 +199,8 @@ def _tail_lines(path):
                 fh.seek(size - _TAIL_BYTES)
                 fh.readline()  # discard the first, possibly-incomplete line
             return fh.read().splitlines()
-    except OSError:
+    except OSError as exc:
+        _note_diagnostic(diagnostics, "read_peer_ledger", exc)
         return []
 
 
@@ -162,7 +215,7 @@ def _parse_ts(ts):
         return None
 
 
-def _bounded_duty_paths(root, limit):
+def _bounded_duty_paths(root, limit, diagnostics=None):
     """Bound directory enumeration as well as file reads; this is a preview."""
     if limit <= 0:
         return []
@@ -172,18 +225,83 @@ def _bounded_duty_paths(root, limit):
             paths = [Path(entry.path) for entry in islice(entries, limit * 4)
                      if entry.name.endswith(".json")]
         return sorted(paths)[:limit]
-    except OSError:
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        _note_diagnostic(diagnostics, "scan_peer_duties", exc)
         return []
 
 
-def _pending_obligations(roots, now):
+def _ledger_paths(roots, diagnostics, scan_status):
+    """Enumerate the existing two-level ledger layout while preserving scan errors."""
+    paths = []
+    for root in roots:
+        root_failed = False
+        ledger_root = os.path.join(str(root), "peer-messages")
+        try:
+            month_dirs = os.scandir(ledger_root)
+        except FileNotFoundError:
+            scan_status["checked_roots"] += 1  # a missing ledger is a complete empty scan
+            continue
+        except OSError as exc:
+            _note_diagnostic(diagnostics, "scan_peer_ledger", exc)
+            scan_status["failed_roots"] += 1
+            continue
+
+        try:
+            with month_dirs:
+                for month in month_dirs:
+                    if month.name.startswith("."):
+                        continue
+                    try:
+                        if not month.is_dir(follow_symlinks=True):
+                            continue
+                    except OSError as exc:
+                        root_failed = True
+                        _note_diagnostic(diagnostics, "scan_peer_ledger", exc)
+                        continue
+                    try:
+                        with os.scandir(month.path) as entries:
+                            for entry in entries:
+                                if entry.name.startswith(".") or not entry.name.endswith(".jsonl"):
+                                    continue
+                                try:
+                                    if entry.is_file(follow_symlinks=True):
+                                        paths.append(entry.path)
+                                except OSError as exc:
+                                    root_failed = True
+                                    _note_diagnostic(diagnostics, "scan_peer_ledger", exc)
+                    except OSError as exc:
+                        root_failed = True
+                        _note_diagnostic(diagnostics, "scan_peer_ledger", exc)
+        except OSError as exc:
+            root_failed = True
+            _note_diagnostic(diagnostics, "scan_peer_ledger", exc)
+        if root_failed:
+            scan_status["failed_roots"] += 1
+        else:
+            scan_status["checked_roots"] += 1
+    return paths
+
+
+def _regular_file_exists(path, diagnostics, operation):
+    try:
+        return stat.S_ISREG(path.stat().st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        _note_diagnostic(diagnostics, operation, exc)
+        return None
+
+
+def _pending_obligations(roots, now, diagnostics=None):
     """Read a bounded, body-free view of accepted peer follow-through."""
     by_session = {}
     seen = set()
     examined = 0
 
     def add(key, kind, state, created, ref=None):
-        if not key or not key[1]:
+        if not key or not isinstance(key[1], str) or not key[1]:
             return
         row = by_session.setdefault(key, [])
         entry = {"kind": kind, "state": state,
@@ -196,28 +314,50 @@ def _pending_obligations(roots, now):
         if examined >= _MAX_PENDING_DUTIES:
             break
         obligation_root = Path(state_root) / "peer-steward" / "obligations"
-        paths = _bounded_duty_paths(obligation_root, _MAX_PENDING_DUTIES - examined)
+        paths = _bounded_duty_paths(obligation_root, _MAX_PENDING_DUTIES - examined,
+                                    diagnostics)
         for path in paths:
             examined += 1
             try:
                 if path.is_symlink() or path.stat().st_size > 128 * 1024:
                     continue
                 duty = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, UnicodeError):
+            except OSError as exc:
+                _note_diagnostic(diagnostics, "read_peer_duty", exc)
                 continue
-            if not isinstance(duty, dict) or duty.get("state") not in _PENDING_DUTY_STATES:
+            except (ValueError, UnicodeError) as exc:
+                _note_diagnostic(diagnostics, "parse_peer_duty", exc)
+                continue
+            if not isinstance(duty, dict):
+                _note_diagnostic(diagnostics, "parse_peer_duty", "MalformedRecord")
+                continue
+            if (not isinstance(duty.get("state"), str)
+                    or duty.get("state") not in _PENDING_DUTY_STATES):
                 continue
             duty_id = duty.get("id")
             if not isinstance(duty_id, str) or duty_id in seen:
                 continue
             seen.add(duty_id)
             intent = duty.get("intent") or {}
+            if not isinstance(intent, dict):
+                _note_diagnostic(diagnostics, "parse_peer_duty", "MalformedRecord")
+                continue
             identity = intent.get("identity") or duty.get("identity") or {}
-            kind = (intent.get("kind") or duty.get("kind") or "").lower()
+            if not isinstance(identity, dict):
+                _note_diagnostic(diagnostics, "parse_peer_duty", "MalformedRecord")
+                continue
+            kind = intent.get("kind") or duty.get("kind") or ""
+            kind = kind.lower() if isinstance(kind, str) else ""
             if kind == "message":
                 target = intent.get("to") or identity
+                if not isinstance(target, dict):
+                    _note_diagnostic(diagnostics, "parse_peer_duty", "MalformedRecord")
+                    continue
                 label = "delay" if duty_id.startswith("delay-") or intent.get("delay_notice_for") else "message"
-                ref = intent.get("ref") or (duty.get("observation") or {}).get("transfer_ref")
+                observation = duty.get("observation") or {}
+                if not isinstance(observation, dict):
+                    observation = {}
+                ref = intent.get("ref") or observation.get("transfer_ref")
             elif kind == "retire":
                 target, label, ref = identity, "retire", None
             else:
@@ -231,7 +371,8 @@ def _pending_obligations(roots, now):
             add(key, label, duty.get("state"), created, ref)
 
         watch_root = Path(state_root) / "peer-watches"
-        arms = _bounded_duty_paths(watch_root, _MAX_PENDING_DUTIES - examined)
+        arms = _bounded_duty_paths(watch_root, _MAX_PENDING_DUTIES - examined,
+                                    diagnostics)
         for path in arms:
             if examined >= _MAX_PENDING_DUTIES:
                 break
@@ -242,57 +383,110 @@ def _pending_obligations(roots, now):
                 if path.is_symlink() or path.stat().st_size > 128 * 1024:
                     continue
                 arm = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(arm, dict):
-                    continue
-                watch_id = arm.get("watch_id")
-                if not isinstance(watch_id, str) or watch_id in seen:
-                    continue
-                seen.add(watch_id)
-                receipt = watch_root / f"{watch_id}.receipt.json"
-                ack = watch_root / f"{watch_id}.ack.json"
-                if receipt.is_file() and ack.is_file():
-                    continue
-                agent = arm.get("agent") or {}
-                key = (str(agent.get("harness") or "").lower(), agent.get("session_id"))
-                created = _parse_ts(str(arm.get("armed_ts") or ""))
-                add(key, "watch", "receipt-pending" if receipt.is_file() else "watching",
-                    created if created is not None else now, None)
-            except (OSError, ValueError, UnicodeError):
+            except OSError as exc:
+                _note_diagnostic(diagnostics, "read_peer_watch", exc)
                 continue
+            except (ValueError, UnicodeError) as exc:
+                _note_diagnostic(diagnostics, "parse_peer_watch", exc)
+                continue
+
+            if not isinstance(arm, dict):
+                _note_diagnostic(diagnostics, "parse_peer_watch", "MalformedRecord")
+                continue
+            watch_id = arm.get("watch_id")
+            if not isinstance(watch_id, str) or watch_id in seen:
+                continue
+            seen.add(watch_id)
+            receipt = watch_root / f"{watch_id}.receipt.json"
+            ack = watch_root / f"{watch_id}.ack.json"
+            receipt_exists = _regular_file_exists(receipt, diagnostics, "read_peer_watch")
+            ack_exists = _regular_file_exists(ack, diagnostics, "read_peer_watch")
+            if receipt_exists is None or ack_exists is None or (receipt_exists and ack_exists):
+                continue
+            agent = arm.get("agent") or {}
+            if not isinstance(agent, dict):
+                _note_diagnostic(diagnostics, "parse_peer_watch", "MalformedRecord")
+                continue
+            key = (str(agent.get("harness") or "").lower(), agent.get("session_id"))
+            created = _parse_ts(str(arm.get("armed_ts") or ""))
+            add(key, "watch", "receipt-pending" if receipt_exists else "watching",
+                created if created is not None else now, None)
     return by_session
 
 
-def collect(state_roots=None):
+def collect(state_roots=None, *, include_health=False):
     records = []
     malformed = 0
     now = time.time()
-    roots = state_roots if state_roots is not None else _state_roots()
+    diagnostics = []
+    if state_roots is None:
+        try:
+            roots = tuple(_state_roots(diagnostics))
+        except Exception as exc:
+            roots = ()
+            _note_diagnostic(diagnostics, "resolve_state_roots", exc)
+    else:
+        try:
+            roots = tuple(state_roots)
+        except Exception as exc:
+            roots = ()
+            _note_diagnostic(diagnostics, "resolve_state_roots", exc)
+
     seen_files = set()
-    try:
-        for root in roots:
-            pattern = os.path.join(str(root), "peer-messages", "*", "*.jsonl")
-            for path in glob.glob(pattern):
-                real = os.path.realpath(path)
-                if real in seen_files:
-                    continue
-                seen_files.add(real)
-                for line in _tail_lines(path):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except Exception:
-                        malformed += 1
-                        continue
-                    ts = _parse_ts(rec.get("ts", ""))
-                    if ts is None or (now - ts) > _WINDOW_SECONDS:
-                        continue
-                    records.append((ts, rec))
-    except Exception:
-        collect.last_diagnostics = []
-        collect.last_malformed = malformed
-        return {"records": [], "by_session": {}}
+    scan_status = {"checked_roots": 0, "failed_roots": 0}
+    paths = _ledger_paths(roots, diagnostics, scan_status)
+    for path in paths:
+        try:
+            real = os.path.realpath(path)
+            if real in seen_files:
+                continue
+            seen_files.add(real)
+        except OSError as exc:
+            _note_diagnostic(diagnostics, "resolve_peer_path", exc)
+            continue
+        for line in _tail_lines(path, diagnostics):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                malformed += 1
+                _note_diagnostic(diagnostics, "parse_peer_record", "MalformedRecord")
+                continue
+            if not isinstance(rec, dict):
+                malformed += 1
+                _note_diagnostic(diagnostics, "parse_peer_record", "MalformedRecord")
+                continue
+            ts = _parse_ts(rec.get("ts", ""))
+            if ts is None:
+                _note_diagnostic(diagnostics, "parse_peer_record", "InvalidTimestamp")
+                continue
+            if (now - ts) > _WINDOW_SECONDS:
+                continue
+            malformed_record = False
+            for field in ("from", "to", "delivery"):
+                value = rec.get(field)
+                if value is not None and not isinstance(value, dict):
+                    malformed_record = True
+                    break
+            if not malformed_record:
+                for field in ("from", "to"):
+                    endpoint = rec.get(field) or {}
+                    sid = endpoint.get("session_id")
+                    if sid is not None and not isinstance(sid, str):
+                        malformed_record = True
+                        break
+            if not isinstance(rec.get("kind"), str):
+                malformed_record = True
+            delivery = rec.get("delivery") or {}
+            status = delivery.get("status") or ""
+            if not isinstance(status, str):
+                malformed_record = True
+            if malformed_record:
+                _note_diagnostic(diagnostics, "parse_peer_record", "MalformedRecord")
+                continue
+            records.append((ts, rec))
 
     records.sort(key=lambda pair: pair[0], reverse=True)
     records = records[:_MAX_RECORDS]
@@ -402,14 +596,23 @@ def collect(state_roots=None):
             elif to_key and deliverable:
                 _record_recv(to_key, "notice", frm, to, from_key, age_min)
 
-    for key, duties in _pending_obligations(roots, now).items():
+    for key, duties in _pending_obligations(roots, now, diagnostics).items():
         _row(key)["pending_obligations"] = sorted(
             duties, key=lambda item: (item.get("kind", ""), item.get("age_min", 0))
         )[:8]
 
-    collect.last_diagnostics = []
+    if not diagnostics:
+        state = "success"
+    elif scan_status["checked_roots"] or records or by_session:
+        state = "unknown"
+    else:
+        state = "failed"
+    collect.last_diagnostics = list(diagnostics)
     collect.last_malformed = malformed
-    return {"records": [rec for _ts, rec in records], "by_session": by_session}
+    result = {"records": [rec for _ts, rec in records], "by_session": by_session}
+    if include_health:
+        return result, SimpleNamespace(state=state, diagnostics=tuple(diagnostics))
+    return result
 
 
 collect.last_diagnostics = []

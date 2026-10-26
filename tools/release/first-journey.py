@@ -952,6 +952,7 @@ def journey_profile(profile: str, args: argparse.Namespace, repo: Path) -> dict:
                     commands = [hook.get("command", "") for entries in cfg.get("hooks", {}).values()
                                 for entry in entries for hook in entry.get("hooks", []) if isinstance(hook, dict)]
                     # Same rule as post-publish-smoke.sh: every $HOME/<file> a hook names must exist.
+                    commands = [re.sub(r"\$\{\w+:-(\$HOME/[^}\s\"']*)\}", r"\1", command) for command in commands]
                     paths = [p for command in commands for p in re.findall(r"\$HOME/([^\s\"']+)", command)]
                     missing = sorted({p for p in paths if Path(p).suffix and not (home / p).exists()})
                     record["steps"].append({"name": "hook-files", "exit": 1 if missing else 0, "seconds": 0,
