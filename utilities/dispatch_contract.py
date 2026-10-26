@@ -10404,7 +10404,7 @@ def _marker_bound_prepare_marker_proof(
             recovery = verify_marker(route, nodes[0], marker, marker_path)
             record = marker["retained_review"]
             dependency_paths.extend(Path(e["path"]) for e in recovery["dependencies"])
-            dependency_paths.extend((Path(record["review"]["path"]), Path(record["jobs"])))
+            dependency_paths.append(Path(record["jobs"]))
         except (IndexError, KeyError, OSError, TypeError, ValueError):
             return None
     if "reviewer_disposition" in marker:

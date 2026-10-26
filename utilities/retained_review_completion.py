@@ -358,6 +358,12 @@ def _record_shape(record):
             or not isinstance(record.get("actor"), dict) or not isinstance(record.get("review"), dict)
             or set(record["review"]) != {"path", "sha256"}):
         _fail("record-invalid")
+    digest = record["review"].get("sha256")
+    if (not isinstance(digest, str) or len(digest) != 64
+            or any(c not in "0123456789abcdef" for c in digest)
+            or not isinstance(record["review"].get("path"), str)
+            or not Path(record["review"]["path"]).is_absolute()):
+        _fail("record-review-invalid")
     actor = record["actor"]
     if (set(actor) not in ({"owner_attempt_id", "attempt_id"}, {"owner_attempt_id", "session_id"})
             or not all(isinstance(v, str) and v for v in actor.values())
@@ -437,13 +443,13 @@ def verify_marker(route, node, marker, marker_path, *, allow_pending=False, hist
     if (expected != marker or record.get("proof") != value["proof"]
             or route["route_hash"] != value["route"]["route_hash"] or node != value["node"]):
         _fail("record-binding-invalid")
-    review, raw = _json_record_bytes(record["review"])
+    review_sha256 = record["review"]["sha256"]
     owner = value["rows"].get(record["actor"].get("owner_attempt_id"))
     if not owner or owner[1].get("owner_route_id") != route["route_id"]:
         _fail("record-actor-invalid")
     row = value["rows"][record["rejected_attempt_id"]][1]
     conflicts = D.terminal_conflicts(row)
-    if not allow_pending and any(e.get("resolution") != KIND or e.get("resolution_review_sha256") != _sha(raw)
+    if not allow_pending and any(e.get("resolution") != KIND or e.get("resolution_review_sha256") != review_sha256
             or e.get("resolved_failure_class") != "blocked" for e in conflicts.values()):
         _fail("record-not-committed")
     history = Path(marker_path).parent / f"{node['id']}.{marker['sequence']}.json"
@@ -452,16 +458,6 @@ def verify_marker(route, node, marker, marker_path, *, allow_pending=False, hist
     if history.is_file() and json.loads(history.read_bytes()) != marker:
         _fail("recovery-history-changed")
     return value
-
-
-def _json_record_bytes(record):
-    path = Path(record["path"])
-    if not path.is_absolute() or path.is_symlink() or not path.is_file():
-        _fail("review-unreadable")
-    raw = path.read_bytes()
-    if not raw.strip() or _sha(raw) != record["sha256"]:
-        _fail("review-changed")
-    return path, raw
 
 
 def apply(jobs, attempt_id, *, expected_row_sha256, review):

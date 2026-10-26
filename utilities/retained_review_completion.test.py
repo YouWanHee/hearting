@@ -314,6 +314,18 @@ class RetainedReviewTest(unittest.TestCase):
         self.manifest.write_text("changed by a later producer revision")
         retained.verify_marker(self.route,self.node,recorded,self.directory/f"{self.node['id']}.3.json",historical=True)
 
+    def test_later_review_memo_edit_does_not_invalidate_a_committed_judgment(self):
+        self.seed();self.apply()
+        self.review.write_text("Later operator note; original reviewed hash remains recorded.\n")
+        marker_path=self.directory/f"{self.node['id']}.json"
+        currency=D.gate_currency(self.route,self.node,marker_path,jobs=self.f.jobs)
+        self.assertEqual(currency.state,"current",currency)
+        import dispatch_completion_join as join
+        current=join.current_delivery_state(self.f.jobs,"att-retained-prior",parent_attempt_id="att-retained-owner",advance=False)
+        self.assertEqual(join.delivery_classification(current),"success")
+        self.review.unlink()
+        self.assertEqual(D.gate_currency(self.route,self.node,marker_path,jobs=self.f.jobs).state,"current")
+
     def test_forged_recovery_marker_and_history_do_not_pass_readers(self):
         self.seed();self.apply()
         canonical=self.directory/f"{self.node['id']}.json"
