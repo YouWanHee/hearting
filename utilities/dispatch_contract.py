@@ -392,6 +392,8 @@ ATTEMPT_TERMINAL_EVIDENCE_KEYS = {
     "detected_by",
     "failure_class",
     "process_exit",
+    "quota_model_scope",
+    "quota_window",
     "reconcile_reason",
     "reset",
     "terminal_event",
@@ -10926,6 +10928,42 @@ def recover_unstarted_attempt(jobs: Path, attempt_id: str) -> bool:
         return True
 
 
+def _retry_parent_matches(source, candidate, jobs, lines) -> bool:
+    """An existing owner replacement may continue its predecessor's child.
+
+    Called under the registry lock. These existing lineage and route readers
+    take no locks and preserve the original owner/child rows.
+    """
+    previous, current = source.get("parent_attempt_id"), candidate.get("parent_attempt_id")
+    if previous == current:
+        return True
+    if not jobs or not previous or not current:
+        return False
+    if any(row.get("dispatch_depth") != "2" for row in (source, candidate)):
+        return False
+    route = (source.get("route_id"), source.get("route_hash"))
+    if (not all(route) or not source.get("route_node")
+            or route != (candidate.get("route_id"), candidate.get("route_hash"))):
+        return False
+    from dispatch_replacement import _rows, effective_attempts
+    from owner_route_binding import OwnerRouteBindingError, resolve_owner_route_lifecycle
+    rows = _rows(lines)
+    try:
+        for parent in (previous, current):
+            owner = rows.get(parent, (None, {}))[1]
+            if (owner.get("worker_type") != "owner" or owner.get("dispatch_depth") != "1"
+                    or owner.get("registered_worker") != "1"):
+                return False
+            binding, _ = resolve_owner_route_lifecycle(
+                jobs, owner_attempt_id=parent, registry_rows=list(rows.values()))
+            if binding is None or (binding.route_id, binding.route_hash) != route:
+                return False
+        effective, lineage = effective_attempts(jobs, {previous})
+    except (OSError, OwnerRouteBindingError):
+        return False
+    return effective == {current} and bool(lineage)
+
+
 def _automatic_retry_admission(lines: list[str], metadata: dict[str, str], *, jobs: Path | None = None) -> None:
     """The jobs lock arbitrates retries against the committed predecessor.
 
@@ -10980,7 +11018,8 @@ def _automatic_retry_admission(lines: list[str], metadata: dict[str, str], *, jo
                 or metadata.get("replacement_family_id") != family):
             raise DispatchContractError("automatic-replacement-exhausted", prior)
         return
-    if any(source.get(k) != metadata.get(k) for k in ("route_id", "route_node", "parent_attempt_id")):
+    if (any(source.get(k) != metadata.get(k) for k in ("route_id", "route_node"))
+            or not _retry_parent_matches(source, metadata, jobs, lines)):
         raise DispatchContractError("retry-predecessor-binding-mismatch", prior)
     proof = attempt_process_quiescence(source, terminal_receipt=status in {"done", "killed", "cancelled"})
     decision = decide_attempt(status, source, process_state=proof.state, process_reason=proof.reason)

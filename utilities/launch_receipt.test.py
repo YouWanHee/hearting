@@ -63,7 +63,12 @@ class SharedReceiptTest(unittest.TestCase):
             os.environ.pop("AGENT_PARENT_COMPLETION_CARRIER", None)
             lines = L.attempt_lines(old, jobs="/s/jobs.log", registry_source="inherited",
                                     action="start", launch_state="claimed")
-        self.assertTrue(any(line.startswith("opencode_carrier_notice=") for line in lines))
+        notice = next(line for line in lines if line.startswith("opencode_carrier_notice="))
+        # The server, not the TUI session, loads the plugin; the line names the wait in use.
+        self.assertIn("bounded-wait", notice)
+        self.assertIn("OpenCode 서버", notice)
+        self.assertNotIn("세션을 다시 띄우면", notice)
+        self.assertLess(lines.index("parent_next=bounded-wait"), lines.index(notice))
 
     def test_carrier_opencode_parent_gets_no_notice(self):
         new = args(parent_harness="opencode", parent_completion_delivery="opencode-turn",

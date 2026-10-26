@@ -596,6 +596,105 @@ class MetricSourcesTest(unittest.TestCase):
                    ["binding_state"])
         self.assertNotIn("decisions", binding)
 
+    def test_evicted_listing_cursor_resumes_exact_binding_without_restarting(self):
+        root = self.root / "installed-cursor-without-bundle-cache"
+        bundle = root / "r2-launch-a8"
+        bundle.mkdir(parents=True)
+        registry = root / "resource-runs.json"
+        run_id = "ami-leg2__leg2-run-config__8ec838ee14c4__a8"
+        registry.write_text(json.dumps({"runs": {run_id: {
+            "run_id": run_id, "row_key": "run", "started_at": 1,
+            "log": str(self.root / "eval-run-r2-a8.log")}}}) + "\n")
+        (self.root / "eval-run-r2-a8.log").write_text("fixture log identity\n")
+
+        admitted = {"admitted": True, "shared_admission": {
+            "authorized_run_id": "smoke__config-bundle__8a9d8619aed3"},
+            "snapshot": {"t": 100}}
+        denied = {"admitted": False, "shared_admission": {
+            "authorized_run_id": "smoke__config-bundle__8a9d8619aed3"},
+            "preceding_evaluation_leases": [{"run_id": "preceding-run",
+                "task": "evaluation"}], "snapshot": {"t": 101},
+            "reasons": ["other evaluation has priority"]}
+        (bundle / "admission-0000-00.json").write_text(json.dumps(admitted))
+        (bundle / "admission-0000-01.json").write_text(json.dumps(denied))
+        expected = {"admitted": 1, "denied": 1}
+        for index in range(8):
+            value = {"admitted": index % 2 == 0,
+                "shared_admission": {"authorized_run_id":
+                    "smoke__config-bundle__8a9d8619aed3"},
+                "snapshot": {"t": 200 + index}, "padding": "x" * 1200}
+            (bundle / f"admission-005{index + 1}-00.json").write_text(
+                json.dumps(value))
+            expected["admitted" if value["admitted"] else "denied"] += 1
+        (bundle / "command-01.json").write_text(json.dumps({"argv": [
+            "runner", "--run-id", run_id, "--raw-results", str(root)]}))
+        (bundle / "entry.json").write_text(json.dumps({"run_id": run_id,
+            "selection_sha256": "a" * 64,
+            "selection_replay_sha256": "b" * 64}))
+
+        root_info, bundle_info = root.lstat(), bundle.lstat()
+        root_key = str(root)
+        bundle_identity = f"{bundle_info.st_dev}:{bundle_info.st_ino}"
+        binding = {"bundle": bundle.name, "identity": bundle_identity,
+            "target_seen": False, "foreign_seen": False, "generation_fields": [],
+            "source_files": {}, "binding_sources": {}, "phase": "binding",
+            "page_decisions": [], "latest": None, "recovery_latest": None,
+            "decisions_seen": True, "binding_complete": False,
+            "partial": False, "overflow": False}
+        cursor = {"schema_version": 5,
+            "root_generations": {root_key: f"{root_info.st_dev}:{root_info.st_ino}"},
+            "scan": {root_key: {"last_bundle": "effective-bundle",
+                "last_file": "condition-registry.json", "last_root_entry": "vstar.json",
+                "bundle_cursors": {bundle.name: {
+                    "last_file": "admission-0050-01.json",
+                    "identity": bundle_identity, "binding_state": binding}}}},
+            "sample_ids": [], "uncertainty_reason": "source-invalid"}
+
+        samples = {}
+        trace = []
+        first_page = None
+        cache_limit_seen = False
+        result = None
+        with mock.patch.object(metrics, "MAX_ADMISSION_CACHED_ENTRIES", 2), \
+                mock.patch.object(metrics, "MAX_ADMISSION_BYTES_PER_PASS", 5000):
+            for turn in range(32):
+                result = metrics.read_admission_sources([root], run_id=run_id,
+                    row_key="run", registry_path=registry, started_at=1,
+                    now=1000 + turn, cursor=cursor)
+                cursor = result["cursor"]
+                saved = cursor["scan"][root_key]["bundle_cursors"][bundle.name]
+                saved_binding = saved["binding_state"]
+                trace.append((turn, result["coverage"], saved.get("last_file"),
+                    saved_binding.get("phase"), saved_binding.get("binding_complete"),
+                    saved_binding.get("target_seen"), len(result["samples"])))
+                if turn == 0:
+                    first_page = (saved.get("last_file"), saved.get("scan_prefix"))
+                cache_limit_seen = (cache_limit_seen or
+                    "admission-listing-cache-limit" in result["warnings"])
+                samples.update({sample["sample_id"]: sample
+                                for sample in result["samples"]})
+                if result["coverage"] == "observed":
+                    break
+
+        self.assertIsNotNone(result)
+        self.assertTrue(first_page[0].startswith("admission-"))
+        self.assertNotEqual(first_page[0], "admission-0050-01.json")
+        self.assertTrue(first_page[1])
+        self.assertTrue(cache_limit_seen)
+        self.assertEqual(result["coverage"], "observed",
+            f"coverage={result['coverage']} warnings={result['warnings']} "
+            f"trace={trace!r} "
+            f"binding={cursor['scan'][root_key]['bundle_cursors'][bundle.name]['binding_state']!r}")
+        self.assertEqual(len(samples), sum(expected.values()))
+        self.assertEqual({sample["state"] for sample in samples.values()},
+                         {"admitted", "denied"})
+        final_binding = cursor["scan"][root_key]["bundle_cursors"][bundle.name][
+            "binding_state"]
+        self.assertTrue(final_binding["target_seen"])
+        self.assertFalse(final_binding["foreign_seen"])
+        self.assertTrue(final_binding["binding_complete"])
+        self.assertNotIn("admission-run-binding-ambiguous", result["warnings"])
+
     def test_admission_reader_observes_320_separate_decisions_across_bounded_pages(self):
         root = self.root / "320-separate-admission-files"
         bundle = root / "one-bundle"

@@ -403,6 +403,75 @@ def _frame_pair_rotation_verified(jobs, meta):
         return False
 
 
+def _same_role_successful_frame_peer_harness(jobs, meta, *, lines=None):
+    """Return an exact successful peer's harness when the same sealed persona permits reuse."""
+    if (meta.get('worker_type') != 'frame' or meta.get('dispatch_depth') != '1'
+            or meta.get('route_node') not in {'frame', 'frame-alternative'}
+            or not meta.get('attempt_id') or not meta.get('route_file')
+            or not meta.get('route_id') or not meta.get('route_hash')
+            or not meta.get('model_role') or not meta.get('model_profile')
+            or not meta.get('harness')):
+        return None
+    try:
+        route = _read(Path(meta['route_file']))
+        if (not route or route.get('route_id') != meta.get('route_id')
+                or route.get('route_hash') != meta.get('route_hash')):
+            return None
+        nodes = {node.get('id'): node for node in route.get('nodes', [])
+                 if isinstance(node, dict) and node.get('id') in {'frame', 'frame-alternative'}}
+        source_node = nodes.get(meta['route_node'])
+        peer_id = 'frame-alternative' if meta['route_node'] == 'frame' else 'frame'
+        peer_node = nodes.get(peer_id)
+        if (not source_node or not peer_node or source_node.get('worker_type') != 'frame'
+                or peer_node.get('worker_type') != 'frame'
+                or source_node.get('role') != meta.get('model_role')
+                or source_node.get('model_profile') != meta.get('model_profile')
+                or peer_node.get('role') != meta.get('model_role')
+                or peer_node.get('model_profile') != meta.get('model_profile')):
+            return None
+        in_force = route_authority.route_in_force(route)
+        pins = route_authority.selection_pin_rows(in_force)
+        pin = pins.get('frame') or pins.get('owner') or {}
+        # A concrete model/effort is an exact user choice. A harness-only pin
+        # may use the peer only when it names that peer's harness.
+        if pin.get('model') or pin.get('effort'):
+            return None
+        candidates = (route.get('registered_headless_candidates') or []
+                      if route.get('effective_intensity') == 'quick'
+                      else (route.get('dispatch_evidence') or {}).get('tuples') or [])
+        candidate_key = 'harness' if route.get('effective_intensity') == 'quick' else 'child_harness'
+        supported = {row.get(candidate_key) for row in candidates
+                     if isinstance(row, dict) and row.get('status') == 'supported'}
+        current_lines = Path(jobs).read_text().splitlines() if lines is None else lines
+        rows = _rows(current_lines)
+        source_row = rows.get(meta['attempt_id'])
+        peer_rows = [(fields, row) for fields, row in rows.values()
+                     if row.get('route_id') == meta.get('route_id')
+                     and row.get('route_hash') == meta.get('route_hash')
+                     and row.get('route_node') == peer_id
+                     and row.get('worker_type') == 'frame']
+        if (source_row is None or source_row[1] != dict(meta)
+                or source_row[0][1] != 'done' or len(peer_rows) != 1):
+            return None
+        peer_fields, peer = peer_rows[0]
+        peer_harness = peer.get('harness')
+        policy = peer_node.get('harness_policy')
+        if (peer_fields[1] != 'done' or peer.get('note') != 'completed-marker'
+                or not DC.verdict_pass(peer)
+                or not peer_harness or peer_harness not in supported
+                or (pin.get('harness') and pin.get('harness') != peer_harness)
+                or isinstance(policy, dict) and peer_harness not in {
+                    harness for band in ('primary', 'relief', 'last_resort')
+                    for harness in (policy.get(band) or [])}
+                or peer_harness == meta.get('harness')
+                or peer.get('model_role') != meta.get('model_role')
+                or peer.get('model_profile') != meta.get('model_profile')):
+            return None
+        return peer_harness
+    except (DC.DispatchContractError, OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+
+
 def death_kind(fields, meta, *, jobs=None, lines=None):
     return route_authority._replacement_kind(fields[1], meta, jobs=jobs, lines=lines)
 
@@ -1956,7 +2025,7 @@ def admission(jobs, lines, metadata):
         # Legacy pre-registered candidates converge at their first launch claim;
         # the shared admission under this same jobs lock rejects a committed
         # sibling without letting unclaimed candidates deadlock one another.
-        DC._automatic_retry_admission(peers, metadata)
+        DC._automatic_retry_admission(peers, metadata, jobs=jobs)
         if source.get('replacement_original_attempt_id'):
             # A completed content result or frame's already-applied profile
             # descent cannot become transport failure merely by retry labeling.
@@ -2125,6 +2194,25 @@ def _command(jobs, record, source, replay):
     raw = task.encode()
     if prompt.is_symlink() or (not _write_once(prompt.parent,prompt,raw) and prompt.read_bytes()!=raw):
         raise DC.DispatchContractError('replacement-task-conflict')
+    if (source.get('worker_type') == 'frame'
+            and (record.get('proof') or {}).get('death_kind') == 'capacity'):
+        # A frame capacity successor with no top-to-deep claim follows the
+        # route's normal selector. The node supplies the exact profile and
+        # role; the original peer remains a completed row and is never started.
+        command = [sys.executable, str(root/'utilities/dispatch-owner.py'), '--start',
+                   '--route-evidence', record['route_file'], '--route-node', source['route_node'],
+                   '--jobs', str(Path(jobs).resolve()), '--worktree', replay['worktree'],
+                   '--slug', _argv_value(replay.get('argv', []), '--slug')
+                       or record['replacement_attempt_id'],
+                   '--attempt-id', record['replacement_attempt_id'],
+                   '--automatic-retry-of', record['original_attempt_id'], '--prompt-file', str(prompt)]
+        for flag in ('--execution-access-file', '--parent-session-id', '--parent-harness'):
+            value = ((record.get('execution_access') or {}).get('request_path')
+                     if flag == '--execution-access-file' else
+                     _argv_value(replay.get('argv', []), flag))
+            if value:
+                command += [flag, value]
+        return command
     options = {'--start': None, '--attempt-id': record['replacement_attempt_id'],
                '--automatic-retry-of': record['original_attempt_id'], '--prompt-file': prompt,
                '--jobs': Path(jobs).resolve(), '--worktree': replay['worktree']}
@@ -2198,7 +2286,7 @@ def _capacity_reader():
     return capacity
 
 
-def _capacity_hold(jobs, source, model=None):
+def _capacity_hold(jobs, source, model=None, *, allow_frame_peer=False):
     from dispatch_capacity_evidence import harness_hold, usage_states
     _, route = _route(jobs, source.get('attempt_id'), source)
     from model_profile import sealed_pin_harness
@@ -2213,6 +2301,45 @@ def _capacity_hold(jobs, source, model=None):
         return None
     hold = harness_hold(jobs, harness, model=model or source.get('model'), recheck=True)
     if hold:
+        if allow_frame_peer and source.get('worker_type') == 'frame':
+            peer_harness = _same_role_successful_frame_peer_harness(jobs, source)
+            node = next((row for row in route.get('nodes', [])
+                         if isinstance(row, dict) and row.get('id') == source.get('route_node')), None)
+            policy = node.get('harness_policy') if isinstance(node, dict) else None
+            allocation = route.get('dispatch_allocation') or {}
+            profile = source.get('model_profile')
+            if (peer_harness and isinstance(policy, dict) and profile
+                    and allocation.get('strategy') in {'balanced', 'capacity-aware'}):
+                try:
+                    from model_config import resolve_config
+                    from model_profile import resolve_profile_values
+                    models = {}
+                    for candidate in {h for band in ('primary', 'relief', 'last_resort')
+                                      for h in (policy.get(band) or [])}:
+                        config, _ = resolve_config(candidate, source_root=ROOT)
+                        models[candidate] = resolve_profile_values(candidate, config, profile)['model']
+                    states = usage_states(jobs, models=models, recheck=True)
+                    states[harness] = f"limited({hold.get('label') or 'native-capacity'})"
+                    capacity = _capacity_reader()
+                    report = capacity.capacity_report()
+                    scores = report['scores']
+                    from dispatch_allocation import attempt_counts
+                    counts = attempt_counts(jobs, window=allocation.get('window', 30))
+                    selected, _, _, _ = capacity.select(
+                        policy, states, counts, allocation.get('harness_order', []), scores,
+                        strategy=allocation['strategy'],
+                        usage_gate_used_percent=allocation.get('usage_gate_used_percent', 90),
+                        preferred=capacity.preferred_for_depth(allocation, int(source.get('dispatch_depth', '1'))),
+                        affinity_weight=allocation.get('depth_affinity_weight', .5),
+                        headroom_exponent=allocation.get('usage_headroom_exponent', 1),
+                        harness_weights=allocation.get('harness_weights'),
+                    )
+                    if selected == peer_harness:
+                        # The following normal dispatch-owner start consumes the
+                        # same selector and rechecks admission before row/spawn.
+                        return None
+                except (DC.DispatchContractError, OSError, ValueError, KeyError, TypeError, RuntimeError):
+                    pass
         return hold
     if pin == harness:
         # A sealed pin moves only for a real usage limit (harness_hold above), as at its
@@ -2334,7 +2461,9 @@ def _advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capa
             moved = (route_authority.moved_owner_harness(current_route, launch_input(jobs, aid, source).get('harness'))
                      if source.get('worker_type') == 'owner' else None)
             hold_source = {**source, 'harness': moved, 'model': None} if moved else source
-            hold = _capacity_hold(jobs, hold_source, None if moved else _retry_model(source, kind))
+            hold = _capacity_hold(jobs, hold_source, None if moved else _retry_model(source, kind),
+                                  allow_frame_peer=(kind == 'capacity'
+                                      and source.get('worker_type') == 'frame'))
             if hold:
                 return _capacity_wait(jobs, aid, hold_source, hold)
             _settle_terminal_cleanup(jobs, rows, aid, source)

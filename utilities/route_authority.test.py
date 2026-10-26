@@ -43,6 +43,67 @@ class RotatedFrameCapacityAuthorityTest(unittest.TestCase):
             self.assertEqual(RA._replacement_kind("done", meta, jobs=jobs, lines=[]), "capacity")
 
 
+class NativeClaudeCapacityTerminalAuthorityTest(unittest.TestCase):
+    def terminal(self, path, *, status=429):
+        import codex_dispatch_terminal as CT
+        rows = [{"type": "rate_limit_event", "session_id": "sid-capacity", "rate_limit_info": {
+            "status": "rejected", "rateLimitType": "five_hour",
+            "resetsAt": int(time.time()) + 3600,
+            "unifiedWindows": {"five_hour": {"utilization": 1}}, "isUsingOverage": False}},
+            {"type": "result", "session_id": "sid-capacity", "is_error": True,
+             "subtype": "success", "terminal_reason": "api_error", "api_error_status": status}]
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        return CT.inspect_terminal_attempt(path, worktree=str(path.parent),
+                                           artifact_root_metadata=None,
+                                           artifact_binding={"harness": "claude"})
+
+    def test_only_the_native_quota_classifier_result_becomes_typed_capacity(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "frame.att-native-capacity.claude.jsonl"
+            metadata = {"attempt_id": "att-native-capacity", "log_file": str(path),
+                        "harness": "claude", "worker_type": "frame"}
+            terminal = self.terminal(path)
+            decision = RA.decide_continuation(action="terminal-evidence",
+                metadata=metadata,
+                facts={"terminal": terminal})
+            self.assertEqual((terminal["reason"], terminal["failure_class"], terminal["failure_note"]),
+                             ("claude-result-capacity", "capacity", "dead-capacity"))
+            self.assertEqual((decision.state, decision.detail, decision.census["quota_window"]),
+                             ("typed", "dead-capacity", "five_hour"))
+
+            auth = self.terminal(path, status=401)
+            refused = RA.decide_continuation(action="terminal-evidence",
+                metadata=metadata, facts={"terminal": auth})
+            self.assertNotEqual(refused.detail, "dead-capacity")
+            self.assertEqual(auth["failure_class"], "auth")
+
+            overload = self.terminal(path, status=503)
+            refused = RA.decide_continuation(action="terminal-evidence",
+                metadata=metadata, facts={"terminal": overload})
+            self.assertNotEqual(refused.detail, "dead-capacity")
+            self.assertNotEqual(overload["failure_class"], "capacity")
+
+    def test_valid_fail_blocked_and_missing_or_malformed_results_keep_their_existing_meaning(self):
+        for verdict, note in (("FAIL", "dead-worker-fail"), ("BLOCKED", "dead-worker-blocked")):
+            with self.subTest(verdict=verdict):
+                decision = RA.decide_continuation(action="terminal-evidence",
+                    metadata={"harness": "claude", "worker_type": "frame"},
+                    facts={"terminal": {"state": "valid", "verdict": verdict}})
+                self.assertEqual(decision.detail, note)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "frame.att-malformed.claude.jsonl"
+            path.write_text("{malformed\n", encoding="utf-8")
+            import codex_dispatch_terminal as CT
+            terminal = CT.inspect_terminal_attempt(path, worktree=td,
+                artifact_root_metadata=None, artifact_binding={"harness": "claude"})
+            decision = RA.decide_continuation(action="terminal-evidence",
+                metadata={"attempt_id": "att-malformed", "log_file": str(path),
+                          "harness": "claude", "worker_type": "frame"},
+                facts={"terminal": terminal})
+            self.assertNotEqual(decision.detail, "dead-capacity")
+            self.assertIn(decision.state, {"absent", "error", "invalid"})
+
+
 
 def _load(name, relative):
     spec = importlib.util.spec_from_file_location(name, ROOT / relative)

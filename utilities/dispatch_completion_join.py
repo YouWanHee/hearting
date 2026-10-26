@@ -4808,6 +4808,25 @@ def close_finished_child(
             note, evidence, reason = missing.note, missing.evidence(), "terminal-envelope-absent"
         elif choice.state in {"invalid", "evidence"}:
             evidence = {key: str(terminal.get(key) or "") for key in ARTIFACT_HINT_KEYS}
+        if choice.state == "typed" and note == "dead-capacity":
+            # The shared native reader already classified this exact raw
+            # Claude result. Preserve its typed reason and any quota reset
+            # fields so a later normal start can consume the existing pause.
+            capacity_evidence = {"failure_class": "capacity"}
+            if metadata.get("log_file"):
+                capacity_evidence["capacity_log"] = str(metadata["log_file"])
+            if terminal.get("quota_reset_epoch") is not None:
+                capacity_evidence["reset"] = str(terminal["quota_reset_epoch"])
+            for key in ("quota_window", "quota_model_scope"):
+                if terminal.get(key) is not None:
+                    capacity_evidence[key] = str(terminal[key])
+            reason = f"terminal-invalid:{terminal.get('reason') or 'claude-result-capacity'}"
+            if _close_invalid_envelope_child(
+                    row, jobs=jobs, reason=reason, note="dead-capacity",
+                    classifier_source="completion-join-native-capacity-v1",
+                    terminal_envelope=True, extra_evidence=capacity_evidence):
+                return ""
+            return choice.reason
         if _close_invalid_envelope_child(row, jobs=jobs, reason=reason, note=note,
             classifier_source="completion-join-terminal-verdict-v1" if choice.state == "typed"
                               else "completion-join-missing-result-v1" if choice.state == "absent"

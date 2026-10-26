@@ -34,6 +34,61 @@ def _contract_error(reason, detail=""):
     return DispatchContractError(reason, detail)
 
 
+def _native_claude_capacity(terminal, metadata):
+    """The existing native reader's exact Claude quota result, not a generic invalid envelope."""
+    attempt = metadata.get("attempt_id")
+    log_file = metadata.get("log_file")
+    if (not attempt or not isinstance(log_file, str)
+            or not Path(log_file).name.endswith(f".{attempt}.claude.jsonl")):
+        return False
+    try:
+        log_path = Path(log_file)
+        if log_path.is_symlink() or not log_path.is_file():
+            return False
+    except OSError:
+        return False
+    return (
+        isinstance(terminal, Mapping)
+        and metadata.get("harness") == "claude"
+        and terminal.get("state") == "invalid"
+        and terminal.get("source") == "exact-claude-result"
+        and terminal.get("reason") == "claude-result-capacity"
+        and terminal.get("failure_class") == "capacity"
+        and terminal.get("failure_note") == "dead-capacity"
+    )
+
+
+def _closed_native_capacity(status, metadata, *, jobs=None, lines=None):
+    """Recover the exact legacy invalid-envelope row only from its bound raw attempt log."""
+    if (status != "done" or jobs is None
+            or metadata.get("note") != "dead-invalid-envelope"
+            or metadata.get("failure_class") != "invalid-envelope"
+            or metadata.get("classifier_source") != "completion-join-invalid-envelope-v1"
+            or metadata.get("reconcile_reason") != "terminal-invalid:claude-result-capacity"):
+        return False
+    attempt = metadata.get("attempt_id")
+    log_file = metadata.get("log_file")
+    if (not attempt or not isinstance(log_file, str)
+            or not Path(log_file).name.endswith(f".{attempt}.claude.jsonl")):
+        return False
+    try:
+        import dispatch_replacement as DR
+        rows = DR._rows(Path(jobs).read_text().splitlines() if lines is None else lines)
+        if attempt not in rows:
+            return False
+        fields, current = rows[attempt]
+        if (fields[1] != status or current != dict(metadata)
+                or current.get("route_id") != metadata.get("route_id")
+                or current.get("route_hash") != metadata.get("route_hash")
+                or current.get("route_node") != metadata.get("route_node")):
+            return False
+        return _native_claude_capacity(DR.terminal_observation(fields, current), current)
+    except Exception:
+        # Registry or classifier uncertainty is a refusal; this read-only
+        # eligibility branch never turns it into replacement authority.
+        return False
+
+
 class ContinuationDecision(NamedTuple):
     allowed: bool
     state: str
@@ -87,21 +142,25 @@ def _replacement_kind(status, meta, *, jobs=None, lines=None):
         return None
     if meta.get('note') in DR.DEATH_NOTES and status not in {'cancelled', 'killed'}:
         return 'silent'
-    if (meta.get('worker_type') == 'owner' and status == 'done'
-            and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')):
+    native_closed_capacity = _closed_native_capacity(status, meta, jobs=jobs, lines=lines)
+    capacity_row = (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity'
+                    or native_closed_capacity)
+    if (meta.get('worker_type') == 'owner' and status == 'done' and capacity_row):
         return 'capacity'
     if meta.get('worker_type') == 'owner' and status == 'done' and meta.get('note') in DR.RUNTIME_DEATH_NOTES:
         return 'runtime'  # the owner's runtime died under it; only an explicit `start` replaces it
-    if (jobs is not None and meta.get('worker_type') == 'frame' and status == 'done'
-            and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')
-            and DR._frame_rule_top(jobs, meta)):
-        return DR.FRAME_CAPACITY
-    if (jobs is not None and meta.get('worker_type') == 'frame' and status == 'done'
-            and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')
-            and DR._frame_pair_rotation_verified(jobs, meta)):
-        # A verified rotated alternative uses ordinary capacity recovery; it
-        # does not claim the frame rule's top-to-deep transition.
-        return 'capacity'
+    if jobs is not None and meta.get('worker_type') == 'frame' and status == 'done' and capacity_row:
+        if DR._same_role_successful_frame_peer_harness(jobs, meta, lines=lines):
+            # The ordinary route selector may replay this missing leg at the
+            # peer's already-admitted persona. This is harness placement only;
+            # the frame's sealed profile/role remain unchanged.
+            return 'capacity'
+        if DR._frame_rule_top(jobs, meta):
+            return DR.FRAME_CAPACITY
+        if DR._frame_pair_rotation_verified(jobs, meta):
+            # A verified rotated alternative uses ordinary capacity recovery; it
+            # does not claim the frame rule's top-to-deep transition.
+            return 'capacity'
     return None
 
 
@@ -342,6 +401,11 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         terminal = facts["terminal"]
         state, verdict = str(terminal.get("state") or "absent"), str(terminal.get("verdict") or "")
         if state != "valid":
+            if _native_claude_capacity(terminal, metadata or {}):
+                return ContinuationDecision(False, "typed", "typed-capacity", "typed-close",
+                    detail="dead-capacity", census={key: terminal[key] for key in (
+                        "reason", "failure_note", "failure_class", "quota_window",
+                        "quota_reset_epoch", "quota_model_scope") if terminal.get(key) is not None})
             reason = "terminal-" + state
             if terminal.get("reason"):
                 reason += ":" + str(terminal["reason"])
@@ -1210,6 +1274,31 @@ def recovery_task(record, source, history):
     return history["task"]
 
 
+def _frame_peer_recovery_harness(candidate, history, route):
+    """A cross-harness frame recovery may reuse only its exact successful same-persona peer."""
+    if (not isinstance(route, dict)
+            or (candidate.get("resolved") or {}).get("worker_type") != "frame"
+            or candidate.get("harness") == history.get("harness")
+            or candidate.get("route_id") != route.get("route_id")
+            or candidate.get("route_node") != history.get("route_node")
+            or candidate.get("route_node") not in {"frame", "frame-alternative"}):
+        return False
+    try:
+        import dispatch_replacement as DR
+        rows = DR._rows(Path(history["jobs"]).read_text().splitlines())
+        source = rows.get(history.get("attempt_id"))
+        if source is None:
+            return False
+        fields, metadata = source
+        return (fields[1] == "done"
+                and metadata.get("route_id") == route.get("route_id")
+                and metadata.get("route_hash") == route.get("route_hash")
+                and DR._same_role_successful_frame_peer_harness(
+                    history["jobs"], metadata) == candidate.get("harness"))
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return False
+
+
 def permission_mismatch_detail(previous, current):
     """Describe a historical permission difference with its exact evidence source."""
     old, new = _granted_permission_pair(previous, current)
@@ -1382,7 +1471,9 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
     """
     owner = worker_type == "owner"
     pinned = sealed_pin_harness(route, worker_type=worker_type) if route else None
-    keys = ("jobs", "worktree") if owner or pinned else REPLACEMENT_FIXED_KEYS
+    frame_peer = bool(route and worker_type == "frame"
+                      and _frame_peer_recovery_harness(candidate, history, route))
+    keys = ("jobs", "worktree") if owner or pinned or frame_peer else REPLACEMENT_FIXED_KEYS
     for key in keys:
         if candidate.get(key) != history.get(key):
             raise _contract_error("replacement-input-tuple-mismatch", key)
@@ -1390,10 +1481,19 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
         raise _contract_error("pin-ignored-for-replacement", pinned)
     drift = candidate.get("launch_home") != history.get("launch_home")
     old, new = history.get("resolved") or {}, candidate.get("resolved") or {}
+    if frame_peer:
+        node = next((row for row in route.get("nodes", [])
+                     if isinstance(row, dict) and row.get("id") == candidate.get("route_node")), None)
+        expected_profile = transition["to"] if transition else (node or {}).get("model_profile")
+        if (not node or new.get("model_profile") != expected_profile
+                or new.get("model_role") != node.get("role")):
+            raise _contract_error("replacement-input-tuple-mismatch", "frame-model-role-profile")
     if transition and new.get("model_profile") != transition["to"]:
         raise _contract_error("replacement-input-tuple-mismatch", "resolved")
     ignored = RECOVERY_SELECTION_VALUES if route else frozenset()
-    if owner and route and candidate.get("harness") != history.get("harness"):
+    cross_runtime = (bool(route) and candidate.get("harness") != history.get("harness")
+                     and (owner or frame_peer))
+    if cross_runtime:
         ignored = ignored | {"sandbox", "permission_mode", "parent_sandbox", "parent_transport"}
     for key in sorted(set(old) | set(new)):
         expected = (parent_values or {}).get(key, old.get(key))
@@ -1426,8 +1526,7 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
                 and flag in options and options[flag] != [str(expected)]):
             raise _contract_error("replacement-argv-mismatch", flag)
     sealed, granted = _granted_permission_pair(history, candidate)
-    cross_owner = owner and candidate.get("harness") != history.get("harness")
-    if cross_owner:
+    if cross_runtime:
         require_recovery_grant_addresses(candidate, history, route=route, access=access)
     elif (candidate.get("harness") == "opencode"
           and "opencode_selected_agent_permission" not in
@@ -1443,10 +1542,10 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
         if (granted.get("execution_access") or {}).get("request_sha256") != access["request_sha256"]:
             raise _contract_error("replacement-input-tuple-mismatch", "execution_access")
         granted, sealed = _without_recovery_access(granted), _without_recovery_access(sealed)
-    # A cross-harness owner goes through the ordinary access-grant launcher.
+    # Cross-harness owner/frame recovery goes through the ordinary access-grant launcher.
     # Its runtime permission spelling differs, while the exact approved request
     # and addresses above remain bound. Same-harness grants stay comparable.
-    if not cross_owner and granted != sealed:
+    if not cross_runtime and granted != sealed:
         detail = permission_mismatch_detail(history, candidate)
         raise _contract_error("replacement-input-tuple-mismatch", detail or "applied_permissions")
     if (not owner and _work_options(candidate.get("argv", []), harness=candidate.get("harness"))
