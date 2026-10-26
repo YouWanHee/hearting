@@ -146,7 +146,7 @@ class CompactHookTest(unittest.TestCase):
             st.write_card(project, "codex", "sid-other", "another session's card", cwd=str(self.cwd), now=900)
             st.run_hook("codex", "compact", "sid-project", phase="after", compact_summary="project summary",
                         cwd=str(self.cwd), env=self.env, now=1000)
-        kept = st.read_latest_card(project)
+        kept = st.read_latest_card(st.session_seat(project, "codex", "sid-other"))
         self.assertEqual((kept["body"], kept["generation"]), ("another session's card", 1))
         self.assertNotIn("origin", kept)
         self.assertEqual(st.session_summary(project)[("codex", "sid-project")]["epoch"], 1)
@@ -272,9 +272,10 @@ class CompactHookTest(unittest.TestCase):
         import session_tidy_clear as clear
         previous = st.write_card(self.seat, "claude", "sid-main", "old card", cwd=str(self.cwd), now=900)
         original_atomic_write = st.atomic_write
+        logical_text_path = st.card_text_path(self.session_seat("sid-main"))
 
         def fail_text(path, data):
-            if Path(path) == st.card_text_path(self.seat):
+            if Path(path) == logical_text_path:
                 raise OSError("fixture text write failed")
             return original_atomic_write(path, data)
 

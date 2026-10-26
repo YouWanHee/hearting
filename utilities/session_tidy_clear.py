@@ -308,7 +308,14 @@ def observe_idle_event(harness: str, sid: str, cwd: str, *, event_id: str, provi
                 rearm_after = int(existing.get("prompt_seq", 0) or 0)
                 if existing.get("origin") == "idle" and existing.get("status") == "cleared" \
                         and existing.get("followup_kind") == "status-only":
-                    rearm_after = max(rearm_after, int(prior.get("status_prompt_seq", 0) or 0))
+                    status_sid = str(prior.get("status_prompt_sid") or existing.get("new_session") or "")
+                    status_harness = str(prior.get("status_prompt_harness") or existing.get("harness") or "")
+                    if (status_harness, status_sid) == (harness, sid):
+                        rearm_after = max(rearm_after, int(prior.get("status_prompt_seq", 0) or 0))
+                    else:
+                        # Prompt sequence numbers belong to one exact native session.
+                        # A new session starts its own sequence and needs one real prompt.
+                        rearm_after = 0
                 if (not frontier or int(frontier.get("sequence", 0) or 0) <= rearm_after
                         or int(frontier.get("sequence", 0) or 0) != sequence):
                     return "booking=skipped reason=not-rearmed"
@@ -319,7 +326,8 @@ def observe_idle_event(harness: str, sid: str, cwd: str, *, event_id: str, provi
             booking = {
                 "schema": SCHEMA, "nonce": nonce, "status": "reserved", "created": now,
                 "deadline": due_at + IDLE_CARD_WINDOW_SEC,
-                "seat": seat.as_dict(), "harness": harness, "sid": sid, "cwd": cwd,
+                "seat": _booking_seat_fields(seat, harness, sid),
+                "harness": harness, "sid": sid, "cwd": cwd,
                 "card_generation": card_generation, "prompt_seq": sequence,
                 "continue_off": False, "origin": "idle", "followup_kind": "status-only",
                 "snapshot_state": "deferred", "idle": {
@@ -511,7 +519,11 @@ def observe_prompt_locked(seat: "st.Seat", harness: str, sid: str, prompt: str, 
                 if continued.get("kind") == "status-only":
                     idle = req.get("idle") if isinstance(req.get("idle"), dict) else {}
                     idle["status_prompt_seq"] = sequence
+                    idle["status_prompt_harness"] = harness
+                    idle["status_prompt_sid"] = sid
                     req["idle"] = idle
+                continued["status_prompt_harness"] = harness
+                continued["status_prompt_sid"] = sid
                 _write_reservation(req)
         return True
 
@@ -679,7 +691,12 @@ def idle_clear_armed(seat: "st.Seat", harness: str, sid: str) -> bool:
     frontier = st.real_prompt_frontier(seat, harness, sid)
     base = int(req.get("prompt_seq", 0) or 0)
     if req.get("status") == "cleared" and req.get("followup_kind") == "status-only":
-        base = max(base, int(idle.get("status_prompt_seq", 0) or 0))
+        status_sid = str(idle.get("status_prompt_sid") or req.get("new_session") or "")
+        status_harness = str(idle.get("status_prompt_harness") or req.get("harness") or "")
+        if (status_harness, status_sid) == (harness, sid):
+            base = max(base, int(idle.get("status_prompt_seq", 0) or 0))
+        else:
+            base = 0
     return bool(frontier and int(frontier.get("sequence", 0) or 0) > base)
 
 
@@ -872,7 +889,8 @@ def schedule_compact_card_request(seat: "st.Seat", harness: str, sid: str, cwd: 
                 metadata["turn_end_observed"] = False
                 booking = {
                     "schema": SCHEMA, "nonce": nonce, "status": "reserved", "created": now,
-                    "deadline": now + COMPACT_CLEAR_DEADLINE_SEC, "seat": seat.as_dict(),
+                    "deadline": now + COMPACT_CLEAR_DEADLINE_SEC,
+                    "seat": _booking_seat_fields(seat, harness, sid),
                     "harness": harness, "sid": sid, "cwd": cwd, "card_generation": generation,
                     "prompt_seq": sequence, "continue_off": False, "origin": "compact",
                     "compact": metadata, "event_identity": identity, "operation_id": operation_id,
@@ -1003,13 +1021,13 @@ def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, o
             booking = {
                 "schema": SCHEMA, "nonce": nonce, "status": "reserved", "created": now,
                 "deadline": now + duration,
-                "seat": seat.as_dict(),
+                "seat": _booking_seat_fields(seat, harness, sid),
                 "harness": harness, "sid": sid, "cwd": cwd,
                 "card_generation": int(card["generation"]) if card else 0, "prompt_seq": seq,
                 "continue_off": bool(no_continue or inherit_stop),
                 "snapshot_state": ("deferred" if compact else "pending")
                 if seat.kind in ("pane", "native") else "not-applicable"}
-            if seat.kind == "pane" and seat.harness == "codex":
+            if seat.kind == "pane" and harness == "codex":
                 booking["herdr_transport"] = {"socket_path": str(seat.socket_path or "")}
             if compact:
                 identity = operation_id or compact.get("identity")
@@ -1069,7 +1087,8 @@ def _refresh_compact_card(req: dict, observation: dict) -> None:
     """Collect current owners outside the lock, then publish against the booked card/input."""
     import session_tidy as st
     import dispatch_seat_handover as handover
-    seat = st.seat_from_dict(req["seat"])
+    seat = st.session_seat(st.seat_from_dict(req["seat"]),
+                           str(req.get("harness") or ""), str(req.get("sid") or ""))
     identity = str((req.get("compact") or {}).get("identity") or "")
     try:
         bindings = handover.collect_snapshot_bindings(req["harness"], req["sid"])
@@ -1100,7 +1119,8 @@ def _refresh_compact_card(req: dict, observation: dict) -> None:
 
 def _prepare_handover_snapshot(req: dict) -> bool:
     """Take the dispatch snapshot after durable queueing, outside the short hook's lock."""
-    seat = st.seat_from_dict(req["seat"])
+    seat = st.session_seat(st.seat_from_dict(req["seat"]),
+                           str(req.get("harness") or ""), str(req.get("sid") or ""))
     if seat.kind not in ("pane", "native"):
         return True
     import dispatch_seat_handover as handover
@@ -1168,7 +1188,7 @@ def note_start_locked(seat: "st.Seat", harness: str, sid: str, now: float) -> No
         # can show up after the helper stopped waiting: the clear did happen, drop the doubt.
         req.update(status="cleared", new_session=sid, reason="")
         _set_successor_prompt_frontier(req, sid)
-        _drop_unverified_notice(seat, req)
+        _drop_unverified_notice(_booked_seat(req, seat.key), req)
     _write_reservation(req)
 
 
@@ -1204,6 +1224,7 @@ def _booking_at(path: Path):
     if req.get("status") == "cleared" and req.get("new_session"):
         seat_fields = {**seat_fields, "continuation_sid": str(req["new_session"])}
     seat = st.seat_from_dict(seat_fields)
+    seat = st.session_seat(seat, str(req.get("harness") or ""), str(req.get("sid") or ""))
     return req, seat, ""
 
 
@@ -1590,23 +1611,30 @@ def _continue_notice_text(outcome: str, reason: str, prompt_text: str = CONTINUE
     return f"[정리] 창은 비웠지만 {said}를 {verb}({why}). 이어서 하려면 {said}라고 입력하세요."
 
 
+def _booking_seat_fields(seat: "st.Seat", harness: str, sid: str) -> dict:
+    """Serialize the physical binding and exact logical card author as separate fields."""
+    return {**seat.as_dict(), "session": {"harness": harness, "sid": sid}}
+
+
 def _booked_seat(req: dict, seat_key: str) -> "st.Seat":
     fields = req.get("seat") or {}
     successor = str(req.get("new_session") or fields.get("continuation_sid") or "")
-    return st.seat_from_dict({**fields, "key": seat_key, "continuation_sid": successor})
+    seat = st.seat_from_dict({**fields, "key": seat_key, "continuation_sid": successor})
+    return st.session_seat(seat, str(req.get("harness") or ""), str(req.get("sid") or ""))
 
 
 def _set_successor_prompt_frontier(req: dict, sid: str) -> None:
     """Keep the predecessor card seat and the exact successor prompt frontier separate."""
     fields = req.get("seat") if isinstance(req.get("seat"), dict) else {}
-    physical = st.seat_from_dict({**fields, "continuation_sid": ""})
+    physical = st.physical_seat(st.seat_from_dict({**fields, "continuation_sid": ""}))
     harness = str(req.get("harness") or "")
     target = st.session_seat(physical, harness, sid)
     req.setdefault("source_prompt_seq", int(req.get("prompt_seq", 0) or 0))
     req["successor_prompt_seq"] = st.read_prompt_seq(target)
     req["prompt_seq"] = req["successor_prompt_seq"]
     req["new_session"] = sid
-    req["seat"] = {**fields, "continuation_sid": sid}
+    req["seat"] = {**physical.as_dict(), "continuation_sid": sid,
+                    "session": {"harness": harness, "sid": str(req.get("sid") or "")}}
 
 
 def _finish(seat_key: str, nonce: str, outcome: str, reason: str = "", *, observed: str = "") -> bool:

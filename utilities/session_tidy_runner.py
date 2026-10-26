@@ -221,7 +221,7 @@ def _log(run_dir: Path, text: str) -> None:
 
 def _card_seat(item: dict) -> "st.Seat":
     """Restore the exact logical author beside the queue's unchanged physical seat."""
-    seat = st.Seat(**item["seat"])
+    seat = st.seat_from_dict(item["seat"])
     return st.session_seat(seat, item.get("harness") or seat.harness,
                            item.get("sid") or seat.sid)
 
@@ -504,7 +504,7 @@ def _target_sessions(item: dict, seat) -> list:
         caller["transcript"] = str(located) if located else ""
     targets = [caller]
     try:
-        recent = tt.select_recent_sessions(seat, cwd=item["cwd"])
+        recent = tt.select_recent_sessions(st.physical_seat(seat), cwd=item["cwd"])
     except BaseException:  # noqa: BLE001
         recent = []
     for row in recent:
@@ -523,7 +523,7 @@ def _unread_entry(target: dict, chunk) -> dict:
 
 
 def assemble(item: dict, batch: str, run_dir: Path) -> Bundle:
-    seat = st.Seat(**item["seat"])
+    seat = st.physical_seat(st.seat_from_dict(item["seat"]))
     card_seat = _card_seat(item)
     project_key = st.project_key_for(item["cwd"])
     sessions, cursors, choices, skipped, unread = [], [], [], [], []

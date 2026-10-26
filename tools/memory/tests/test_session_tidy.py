@@ -315,6 +315,17 @@ class CardConsumeTest(TidyCase):
 
 class ProjectFallbackTest(TidyCase):
 
+    def write_legacy_project_card(self, seat, harness, sid, body):
+        now = st.now_epoch()
+        card = {
+            "schema": st.SCHEMA, "seat": seat.as_dict(),
+            "author": {"harness": harness, "sid": sid, "epoch": 0},
+            "authored_at": st.iso_utc(now), "authored_at_epoch": now,
+            "generation": 1, "cwd": str(self.cwd), "body": body,
+        }
+        st._write_card_pair(seat, card)
+        return card
+
     def test_project_seat_sid_round_trips_without_changing_legacy_constructors(self):
         with self.library({"HERDR_PANE_ID": ""}):
             project = st.resolve_seat("claude", str(self.cwd), sid="sid-roundtrip")
@@ -322,6 +333,8 @@ class ProjectFallbackTest(TidyCase):
             pane6 = st.Seat("pane", "pane-key", "pane-id", "claude", "", None)
             self.assertEqual(st.seat_from_dict(project.as_dict()), project)
             self.assertEqual(st.Seat(**project.as_dict()), project)
+            self.assertEqual(project.sid, "")
+            self.assertEqual(st.session_identity(project), ("claude", "sid-roundtrip"))
             self.assertEqual((pane5.sid, pane6.sid), ("", ""))
 
     def test_legacy_project_card_stays_with_its_author_and_new_author_gets_a_new_slot(self):
@@ -330,7 +343,7 @@ class ProjectFallbackTest(TidyCase):
             author_a = st.dataclasses.replace(shared, sid="legacy-A")
             author_b = st.dataclasses.replace(shared, sid="new-B")
             with st.seat_lock(shared.key):
-                st.write_card(shared, "claude", "legacy-A", "legacy body", cwd=str(self.cwd))
+                self.write_legacy_project_card(shared, "claude", "legacy-A", "legacy body")
             with st.session_state_lock(author_a):
                 self.assertTrue(st.prepare_native_session_state(author_a))
                 self.assertEqual(st.card_key(author_a), st._digest("native-session", "claude", "legacy-A"))
@@ -352,7 +365,8 @@ class ProjectFallbackTest(TidyCase):
                 st.atomic_write_json(st._project_latest_path(shared), {"harness": "claude", "sid": "pointer-A"})
             with mock.patch.object(Path, "glob", side_effect=AssertionError("card enumeration")):
                 card, chosen = st.read_latest_project_card(shared)
-            self.assertEqual((card["body"], chosen.sid), ("pointed body", "pointer-A"))
+            self.assertEqual((card["body"], st.session_identity(chosen)),
+                             ("pointed body", ("claude", "pointer-A")))
 
     def test_live_project_authors_keep_separate_cards_and_do_not_receive_each_others(self):
         self.hook("claude", "start", "sid-A", pane=None)
@@ -427,7 +441,7 @@ class ProjectFallbackTest(TidyCase):
         with self.library({"HERDR_PANE_ID": ""}):
             seat = st.seat_for_project("claude", st.project_key_for(str(self.cwd)))
             with st.seat_lock(seat.key):
-                st.write_card(seat, "claude", "legacy-author", "legacy handoff", cwd=str(self.cwd))
+                self.write_legacy_project_card(seat, "claude", "legacy-author", "legacy handoff")
             old_path = st.card_json_path(seat)
         received = self.hook("claude", "start", "legacy-author", "--source", "compact", pane=None)
         self.assertIn("legacy handoff", received)
@@ -457,7 +471,8 @@ class ProjectFallbackTest(TidyCase):
             seat, harness, sid = st.resolve_caller(None, None, str(self.cwd))
         self.assertEqual((seat.kind, harness), ("project", "claude"))
         self.assertTrue(sid.startswith("unknown-"))
-        self.assertEqual(seat.sid, sid)
+        self.assertEqual(seat.sid, "")
+        self.assertEqual(st.session_identity(seat), ("claude", sid))
         self.assertNotEqual(sid, "ledger-author")
 
 
@@ -588,7 +603,8 @@ class DaemonCodexSeatTest(TidyCase):
         with self.iso.patched_environ(self.env):
             own = st.resolve_seat("codex", str(self.cwd), {"HERDR_PANE_ID": "w:p5"}, "t-A")
             claude = st.resolve_seat("claude", str(self.cwd), {"HERDR_PANE_ID": "w:p5"}, "sid-A")
-        self.assertEqual((own.kind, own.pane, own.sid), ("project", "", "t-A"))
+        self.assertEqual((own.kind, own.pane, own.sid), ("project", "", ""))
+        self.assertEqual(st.session_identity(own), ("codex", "t-A"))
         self.assertEqual(claude.pane, "w:p5")
         self.assertFalse(self.calls.exists(), self.calls.read_text() if self.calls.exists() else "")
 
@@ -598,7 +614,8 @@ class DaemonCodexSeatTest(TidyCase):
         env = {**self.env, "AGENT_HERDR_SESSION": "secondary"}
         with self.iso.patched_environ(env):
             seat = st.resolve_seat("codex", str(self.cwd), None, "t-A")
-        self.assertEqual((seat.kind, seat.pane, seat.sid), ("project", "", "t-A"))
+        self.assertEqual((seat.kind, seat.pane, seat.sid), ("project", "", ""))
+        self.assertEqual(st.session_identity(seat), ("codex", "t-A"))
         self.assertFalse(self.calls.exists())
 
     def test_a_pane_whose_ledger_knows_the_thread_keeps_it_while_herdr_shows_the_old_session(self):
