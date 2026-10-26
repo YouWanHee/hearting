@@ -850,7 +850,8 @@ def ack_delivered(root: Path, session_id: str, records: list[dict], *, acked_by:
             from codex_queue_dispatch import resolve_queue_socket
             endpoint = resolve_queue_socket()
             deadline = time.monotonic() + 1.5
-            with codex_queue_delivery.DeliverySession(endpoint, timeout=1.0) as session:
+            with codex_queue_delivery.DeliverySession(
+                    endpoint, timeout=1.0, deadline=deadline) as session:
                 by_storage: dict[str, list[dict]] = {}
                 for seed in acknowledged:
                     storage = seed.get(STORAGE_KEY) or session_id

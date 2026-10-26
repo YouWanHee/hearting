@@ -995,9 +995,14 @@ def _retire_acked_native_copy(root, path, receiver, storage, records,
                               client_message_id, bodies, session) -> None:
     """Advisory cleanup after durable ACK; never changes courier acceptance."""
     try:
+        deadline = time.monotonic() + 1.5
+        if session is not None:
+            session.deadline = deadline
+            if session.client is not None:
+                session.client.deadline = deadline
         codex_queue_delivery.retire_acked_completion(
             root, path, receiver, records, storage, timeout=1.0,
-            deadline=time.monotonic() + 1.5, session=session,
+            deadline=deadline, session=session,
             expected_body=bodies, expected_client_id=client_message_id,
         )
     except Exception:  # noqa: BLE001 - ACK and accepted response remain authoritative.

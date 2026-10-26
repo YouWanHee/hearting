@@ -28,8 +28,9 @@ class PromptReceiptTest(unittest.TestCase):
         from dispatch_completion_join import completion_followup_text
 
         class FakeSession:
-            def __init__(self, _path, *, timeout):
+            def __init__(self, _path, *, timeout, deadline=None):
                 self.timeout = timeout
+                self.deadline = deadline
                 self.methods = []
             def __enter__(self):
                 return self
@@ -37,7 +38,7 @@ class PromptReceiptTest(unittest.TestCase):
                 return None
             def close(self):
                 return None
-            def request(self, _path, method, params, *, timeout=None):
+            def request(self, _path, method, params, *, timeout=None, deadline=None):
                 self.methods.append((method, params, timeout))
                 if method == "thread/queue/list":
                     return {"data": queue_items}

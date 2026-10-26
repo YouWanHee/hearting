@@ -79,7 +79,8 @@ def resolve_endpoint(path: Path) -> Path:
 class _WebSocket:
     """Small synchronous WebSocket client for Codex's local UDS control API."""
 
-    def __init__(self, path: Path, *, timeout: float):
+    def __init__(self, path: Path, *, timeout: float,
+                 deadline: float | None = None):
         path = resolve_endpoint(path)
         try:
             info = path.lstat()
@@ -89,15 +90,18 @@ class _WebSocket:
             raise QueueDeliveryError("queue-endpoint-permissions-unsafe")
         self.path = path
         self.timeout = timeout
+        self.deadline = deadline
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.socket.settimeout(timeout)
         try:
+            self.socket.settimeout(_rpc_timeout(timeout, deadline))
             self.socket.connect(str(path))
-            self._upgrade()
+            self._upgrade(deadline=deadline)
         except (OSError, QueueDeliveryError) as exc:
             self.socket.close()
             if isinstance(exc, QueueDeliveryError):
                 raise
+            if deadline is not None and time.monotonic() >= deadline:
+                raise QueueDeliveryError("queue-operation-deadline-exceeded") from exc
             raise QueueDeliveryError("queue-endpoint-unavailable") from exc
         self.next_id = 1
         self.request_sent = False
@@ -105,8 +109,11 @@ class _WebSocket:
     def close(self) -> None:
         self.socket.close()
 
-    def _read_until(self, marker: bytes, limit: int) -> bytes:
+    def _read_until(self, marker: bytes, limit: int, *,
+                    deadline: float | None = None) -> bytes:
         while marker not in self.buffer:
+            if deadline is not None:
+                self.socket.settimeout(_rpc_timeout(self.timeout, deadline))
             if len(self.buffer) > limit:
                 raise QueueDeliveryError("queue-websocket-header-oversized")
             chunk = self.socket.recv(4096)
@@ -118,7 +125,7 @@ class _WebSocket:
         del self.buffer[:end]
         return value
 
-    def _upgrade(self) -> None:
+    def _upgrade(self, *, deadline: float | None = None) -> None:
         key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
         request = (
             "GET /rpc HTTP/1.1\r\n"
@@ -128,11 +135,14 @@ class _WebSocket:
             f"Sec-WebSocket-Key: {key}\r\n"
             "Sec-WebSocket-Version: 13\r\n\r\n"
         )
+        if deadline is not None:
+            self.socket.settimeout(_rpc_timeout(self.timeout, deadline))
         self.socket.sendall(request.encode("ascii"))
         # The buffer is initialized lazily because the handshake precedes the
         # rest of the instance state.
         self.buffer = bytearray()
-        response = self._read_until(b"\r\n\r\n", 16 * 1024).decode("latin-1")
+        response = self._read_until(b"\r\n\r\n", 16 * 1024,
+                                    deadline=deadline).decode("latin-1")
         lines = response.split("\r\n")
         if not lines or " 101 " not in f" {lines[0]} ":
             raise QueueDeliveryError("queue-websocket-upgrade-refused")
@@ -217,29 +227,61 @@ class _WebSocket:
             if final:
                 return initial_opcode or opcode, bytes(parts)
 
-    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    def request(self, method: str, params: dict[str, Any], *,
+                deadline: float | None = None) -> dict[str, Any]:
         self.request_sent = False
-        deadline = time.monotonic() + self.timeout
+        absolute_deadline = getattr(self, "deadline", None)
+        if deadline is not None:
+            absolute_deadline = (deadline if absolute_deadline is None
+                                 else min(absolute_deadline, deadline))
+        if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
+            raise QueueDeliveryError("queue-operation-deadline-exceeded")
+        request_deadline = time.monotonic() + self.timeout
+        if absolute_deadline is not None:
+            request_deadline = min(request_deadline, absolute_deadline)
+        operation_deadline_wins = (absolute_deadline is not None
+                                   and absolute_deadline <= time.monotonic() + self.timeout)
+        self.socket.settimeout(max(0.0, request_deadline - time.monotonic()))
         request_id = self.next_id
         self.next_id += 1
         self.request_sent = True  # A partial send also has an ambiguous outcome.
-        self._send_frame(0x1, json.dumps({
-            "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
-        }, separators=(",", ":")).encode("utf-8"))
+        try:
+            self._send_frame(0x1, json.dumps({
+                "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
+            }, separators=(",", ":")).encode("utf-8"))
+        except (OSError, TimeoutError) as exc:
+            if (operation_deadline_wins and absolute_deadline is not None
+                    and time.monotonic() >= absolute_deadline):
+                raise QueueDeliveryError("queue-operation-deadline-exceeded",
+                                         ambiguous=self.request_sent) from exc
+            raise QueueDeliveryError("queue-websocket-timeout",
+                                     ambiguous=self.request_sent) from exc
         self.request_sent = True
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = request_deadline - time.monotonic()
             if remaining <= 0:
+                if operation_deadline_wins:
+                    raise QueueDeliveryError("queue-operation-deadline-exceeded",
+                                             ambiguous=self.request_sent)
                 raise QueueDeliveryError("queue-websocket-timeout", ambiguous=self.request_sent)
             try:
-                opcode, raw = self._recv_message(deadline=deadline)
+                opcode, raw = self._recv_message(deadline=request_deadline)
             except QueueDeliveryError as exc:
+                if (operation_deadline_wins and exc.reason == "queue-websocket-timeout"
+                        and absolute_deadline is not None
+                        and time.monotonic() >= absolute_deadline):
+                    raise QueueDeliveryError("queue-operation-deadline-exceeded",
+                                             ambiguous=self.request_sent) from exc
                 if (not exc.ambiguous and method in {"thread/queue/add", "thread/queue/start"}
                         and exc.reason in {"queue-websocket-message-oversized",
                                            "queue-websocket-frame-invalid"}):
                     raise QueueDeliveryError(exc.reason, ambiguous=True) from exc
                 raise
             except (OSError, TimeoutError) as exc:
+                if (operation_deadline_wins and absolute_deadline is not None
+                        and time.monotonic() >= absolute_deadline):
+                    raise QueueDeliveryError("queue-operation-deadline-exceeded",
+                                             ambiguous=self.request_sent) from exc
                 raise QueueDeliveryError("queue-websocket-timeout", ambiguous=self.request_sent) from exc
             if opcode != 0x1:
                 continue
@@ -268,19 +310,28 @@ class _WebSocket:
             return result
 
     def initialize(self) -> None:
+        if self.deadline is not None:
+            self.socket.settimeout(_rpc_timeout(self.timeout, self.deadline))
         result = self.request("initialize", {
             "clientInfo": {"name": "hearting-native-queue", "title": "Hearting Queue", "version": "1"},
             "capabilities": {"experimentalApi": True},
-        })
+        }, deadline=self.deadline)
         if not isinstance(result, dict):
             raise QueueDeliveryError("queue-initialize-result-invalid")
+        if self.deadline is not None:
+            self.socket.settimeout(_rpc_timeout(self.timeout, self.deadline))
         self._send_frame(0x1, json.dumps({"jsonrpc": "2.0", "method": "initialized"},
                                          separators=(",", ":")).encode("utf-8"))
 
 
-def _connect(path: Path, timeout: float) -> _WebSocket:
-    client = _WebSocket(path, timeout=timeout)
+def _connect(path: Path, timeout: float, *,
+             deadline: float | None = None) -> _WebSocket:
+    if deadline is not None:
+        _rpc_timeout(timeout, deadline)
+    client = _WebSocket(path, timeout=timeout, deadline=deadline)
     try:
+        if deadline is not None:
+            _rpc_timeout(timeout, deadline)
         client.initialize()
         return client
     except Exception:
@@ -291,9 +342,11 @@ def _connect(path: Path, timeout: float) -> _WebSocket:
 class DeliverySession:
     """Reuse one queue-only WebSocket for a bounded completion observation pass."""
 
-    def __init__(self, path: Path, *, timeout: float = 5.0):
+    def __init__(self, path: Path, *, timeout: float = 5.0,
+                 deadline: float | None = None):
         self.path: Path | None = None
         self.timeout = timeout
+        self.deadline = deadline
         self.client: _WebSocket | None = None
 
     def __enter__(self) -> "DeliverySession":
@@ -312,8 +365,14 @@ class DeliverySession:
                 pass
 
     def request(self, path: Path, method: str, params: dict[str, Any], *,
-                timeout: float | None = None) -> dict[str, Any]:
+                timeout: float | None = None,
+                deadline: float | None = None) -> dict[str, Any]:
         timeout = self.timeout if timeout is None else timeout
+        if self.deadline is not None:
+            deadline = (self.deadline if deadline is None
+                        else min(self.deadline, deadline))
+        if deadline is not None:
+            _rpc_timeout(timeout, deadline)
         try:
             endpoint = resolve_endpoint(path)
         except QueueDeliveryError:
@@ -328,12 +387,13 @@ class DeliverySession:
             self.path = endpoint
             raise QueueDeliveryError("queue-session-endpoint-changed")
         if self.client is None:
-            self.client = _connect(endpoint, timeout)
+            self.client = _connect(endpoint, timeout, deadline=deadline)
         client = self.client
         client.timeout = timeout
-        client.socket.settimeout(timeout)
+        client.deadline = deadline
+        client.socket.settimeout(_rpc_timeout(timeout, deadline))
         try:
-            return client.request(method, params)
+            return client.request(method, params, deadline=deadline)
         except QueueDeliveryError as exc:
             if not exc.reason.startswith("queue-rpc-refused:"):
                 self.close()
@@ -350,12 +410,14 @@ def _session_kwargs(session):
 
 
 def _rpc(path: Path, method: str, params: dict[str, Any], *, timeout: float,
-         session: DeliverySession | None = None) -> dict[str, Any]:
+         session: DeliverySession | None = None,
+         deadline: float | None = None) -> dict[str, Any]:
     if session is not None:
-        return session.request(path, method, params, timeout=timeout)
-    client = _connect(path, timeout)
+        return session.request(path, method, params, timeout=timeout,
+                               deadline=deadline)
+    client = _connect(path, timeout, deadline=deadline)
     try:
-        return client.request(method, params)
+        return client.request(method, params, deadline=deadline)
     except QueueDeliveryError as exc:
         if exc.ambiguous:
             raise
@@ -389,7 +451,7 @@ def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0,
             params["cursor"] = cursor
         response = _rpc(path, "thread/queue/list", params,
                         timeout=_rpc_timeout(timeout, deadline),
-                        **_session_kwargs(session))
+                        **_session_kwargs(session), deadline=deadline)
         page = response.get("data")
         if not isinstance(page, list):
             raise QueueDeliveryError("queue-list-response-invalid")
@@ -402,14 +464,16 @@ def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0,
 
 def delete_queue_item(path: Path, thread_id: str, submission_id: str, *,
                       timeout: float = 5.0,
-                      session: DeliverySession | None = None) -> bool:
+                      session: DeliverySession | None = None,
+                      deadline: float | None = None) -> bool:
     """Delete one exact native queued submission; unknown results are failures."""
     if (not isinstance(thread_id, str) or not thread_id
             or not isinstance(submission_id, str) or not submission_id):
         raise QueueDeliveryError("queue-delete-identity-invalid")
     result = _rpc(path, "thread/queue/delete", {
         "threadId": thread_id, "queuedSubmissionId": submission_id,
-    }, timeout=timeout, **_session_kwargs(session))
+    }, timeout=_rpc_timeout(timeout, deadline),
+                  **_session_kwargs(session), deadline=deadline)
     deleted = result.get("deleted")
     if not isinstance(deleted, bool):
         raise QueueDeliveryError("queue-delete-response-invalid")
@@ -586,7 +650,8 @@ def retire_acked_completion(root: Path, path: Path, thread_id: str, seed: dict |
             if not exact:
                 continue
             if delete_queue_item(path, thread_id, matches[0]["id"],
-                                 timeout=_rpc_timeout(timeout, end), session=session):
+                                 timeout=_rpc_timeout(timeout, end), session=session,
+                                 deadline=end):
                 deleted += 1
         return deleted > 0
     except Exception:  # noqa: BLE001 - retirement is advisory; preserve the ACK result.
