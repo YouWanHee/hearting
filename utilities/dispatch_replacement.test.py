@@ -4207,16 +4207,53 @@ class ClosedNativeFrameCapacityRecoveryTest(unittest.TestCase):
         history, candidate, metadata = self._candidate_input(record)
         import route_authority as RA
         self.assertEqual(R.admission(self.jobs, self.jobs.read_text().splitlines(), metadata), record)
-        canonical_route = copy.deepcopy(self.route)
-        for node in canonical_route["nodes"]:
-            node.pop("worker_type", None)
-        with mock.patch.object(RA, "_frame_peer_recovery_harness", return_value=True):
-            self.assertIsNone(RA.require_recovery_work(
-                candidate, history, route=canonical_route, worker_type="frame"))
-            for field, value in (("model_profile", "deep"), ("model_role", "fast reviewer")):
-                changed = {**candidate, "resolved": {**candidate["resolved"], field: value}}
-                with self.subTest(field=field), self.assertRaises(D.DispatchContractError):
-                    RA.require_recovery_work(changed, history, route=canonical_route, worker_type="frame")
+        self.assertTrue(self.path.is_relative_to(self.root))
+        self.assertTrue(self.jobs.is_relative_to(self.root))
+        self.assertTrue(self.log_path.is_relative_to(self.root))
+        self.assertEqual(
+            [(node["kind"], node["unit"], node["worker_type"], node["dispatch_depth"],
+              node["role"], node["model_profile"])
+             for node in self.route["nodes"]],
+            [("map-worker", "plan/frame", "frame", 1, "deep maker", "top")] * 2)
+        self.assertIs(RA._frame_peer_recovery_harness(candidate, history, self.route), True)
+        self.assertIsNone(RA.require_recovery_work(
+            candidate, history, route=self.route, worker_type="frame"))
+        for field, value in (("model_profile", "deep"), ("model_role", "fast reviewer")):
+            changed = {**candidate, "resolved": {**candidate["resolved"], field: value}}
+            with self.subTest(field=field), self.assertRaises(D.DispatchContractError):
+                RA.require_recovery_work(changed, history, route=self.route, worker_type="frame")
+
+        self.assertIs(RA._frame_peer_recovery_harness(
+            {**candidate, "route_id": "rt-unrelated"}, history, self.route), False)
+
+        pin_path = RA.pin_changes_path(self.route)
+        self.assertTrue(pin_path.is_relative_to(self.root))
+        pin_path.parent.mkdir(parents=True, exist_ok=True)
+        pin_path.write_text(json.dumps({
+            "schema": 1, "route_id": self.route["route_id"],
+            "route_hash": self.route["route_hash"], "target": "frame",
+            "pin": {"harness": "claude"}, "tuples": [],
+        }) + "\n", encoding="utf-8")
+        self.assertIs(RA._frame_peer_recovery_harness(candidate, history, self.route), False)
+        pin_path.unlink()
+
+        def helper_with_peer_variant(name, **changes):
+            variant_jobs = self.root / f"jobs-{name}.log"
+            variant_lines = []
+            for attempt_id in ("att-source", "att-peer"):
+                fields, row = self.rows()[attempt_id]
+                fields = list(fields)
+                row = dict(row)
+                if attempt_id == "att-peer":
+                    row.update(changes)
+                fields[5] = ",".join(f"{key}={value}" for key, value in row.items())
+                variant_lines.append("\t".join(fields))
+            variant_jobs.write_text("\n".join(variant_lines) + "\n", encoding="utf-8")
+            return RA._frame_peer_recovery_harness(
+                candidate, {**history, "jobs": str(variant_jobs)}, self.route)
+
+        self.assertIs(helper_with_peer_variant("unsupported-peer", harness="unsupported"), False)
+        self.assertIs(helper_with_peer_variant("unsuccessful-peer", failure_class="fail"), False)
 
         current = self.rows()
         source_fields_after, source_meta_after = current["att-source"]
