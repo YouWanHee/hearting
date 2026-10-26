@@ -846,6 +846,144 @@ class MetricSourcesTest(unittest.TestCase):
         self.assertEqual(len(emitted_ids), len(set(emitted_ids)),
             f"continued prefix sample was emitted more than once: {trace!r}")
 
+    def test_root_listing_prefix_invalidates_cached_latest_and_recovery(self):
+        root = self.root / "flat-root-cached-prefix-mutation"
+        root.mkdir()
+        registry = root / "resource-runs.json"
+        run_id = "ami-leg2__leg2-run-config__8ec838ee14c4__a8"
+        registry.write_text(json.dumps({"runs": {run_id: {
+            "run_id": run_id, "row_key": "run", "started_at": 1}}}) + "\n")
+        (root / "entry.json").write_text(json.dumps({
+            "run_id": run_id, "selection_sha256": "a" * 64,
+            "selection_replay_sha256": "b" * 64}))
+        (root / "command-01.json").write_text(json.dumps({"argv": [
+            "runner", "--run-id", run_id, "--raw-results", str(root)]}))
+        for index, stamp in enumerate((110, 80, 70, 60, 50)):
+            (root / f"admission-{index:04d}.json").write_text(json.dumps({
+                "admitted": index == 0,
+                "snapshot": {"t": stamp},
+                "shared_admission": {"authorized_run_id": "other-smoke-run"},
+            }))
+
+        seed = metrics.read_admission_sources([root], run_id=run_id,
+            row_key="run", registry_path=registry, started_at=1, now=200)
+        self.assertEqual(seed["coverage"], "observed")
+        self.assertEqual(seed["latest"]["at"], 110)
+        self.assertEqual(seed["latest"]["source_file"], "admission-0000.json")
+        _previous_summary, previous = progress._admission_summary({}, seed,
+            200, run_id, "run", 1)
+        cursor = progress._restore_special_numbers(json.loads(json.dumps(
+            progress._json_safe(previous["admission_cursor"]))))
+        root_state = cursor["scan"][str(root)]
+        root_cursor = root_state["bundle_cursors"]["@root"]
+        binding = root_cursor["binding_state"]
+        self.assertTrue(binding["target_seen"])
+        self.assertFalse(binding["foreign_seen"])
+
+        # Retain a plausible old latest and a generation-recovery candidate
+        # for the exact same flat-root source, as a normal continued cursor can.
+        stale = copy.deepcopy(seed["latest"])
+        binding["latest"] = copy.deepcopy(stale)
+        binding["recovery_latest"] = copy.deepcopy(stale)
+        cursor["generation_revalidation_required"] = True
+        cursor["generation_baseline_at"] = 100
+        cursor["generation_baseline_ids"] = ["f" * 16]
+        cursor["generation_baseline_overflow"] = False
+        cursor["generation_baseline_ready"] = True
+        cursor["historical_latest_at"] = 100
+        cursor["historical_latest_ids"] = ["f" * 16]
+        cursor["historical_latest_overflow"] = False
+        cursor["latest_at"] = 100
+        cursor["source_latest"] = {}
+        # Re-adopt the exact JSON-safe normalizer representation before the
+        # saved listing marker is produced by a bounded ordinary reader poll.
+        cursor = progress._restore_special_numbers(json.loads(json.dumps(
+            progress._json_safe(cursor))))
+
+        clock = [0.0]
+        original_lstat = Path.lstat
+        trace = []
+        results = []
+        directory_token = metrics._admission_stat_token(root.lstat())
+
+        def slow_root_cached_lstat(path):
+            result = original_lstat(path)
+            if (sys._getframe(1).f_code.co_name == "revalidate_listing_entries"
+                    and path.parent == root):
+                clock[0] += 0.1
+            return result
+
+        with mock.patch.object(Path, "lstat", slow_root_cached_lstat):
+            for turn in range(8):
+                clock[0] = 0.0
+                result = metrics.read_admission_sources([root], run_id=run_id,
+                    row_key="run", registry_path=registry, started_at=1,
+                    now=201 + turn, cursor=cursor, monotonic=lambda: clock[0],
+                    time_budget=0.25)
+                summary, state = progress._admission_summary(previous, result,
+                    201 + turn, run_id, "run", 1)
+                previous = {**previous, **state}
+                results.append(result)
+                cursor = progress._restore_special_numbers(json.loads(json.dumps(
+                    progress._json_safe(state["admission_cursor"]))))
+                saved_root = cursor["scan"][str(root)]
+                saved_listing = saved_root["root_listing"]
+                saved_binding = saved_root["bundle_cursors"]["@root"][
+                    "binding_state"]
+                trace.append({"turn": turn, "coverage": result["coverage"],
+                    "latest": result.get("latest"), "current": summary["state"],
+                    "freshness_seconds": summary["freshness_seconds"],
+                    "revalidation_after": saved_listing.get("revalidation_after"),
+                    "latest_cache": saved_binding.get("latest"),
+                    "recovery_latest": saved_binding.get("recovery_latest")})
+                if turn == 0:
+                    self.assertEqual(result["coverage"], "partial")
+                    marker = saved_listing.get("revalidation_after")
+                    self.assertEqual(marker, "admission-0002.json")
+                    self.assertLessEqual("admission-0000.json", marker)
+                    source = root / "admission-0000.json"
+                    replacement = json.loads(source.read_text())
+                    replacement["snapshot"]["t"] = 90
+                    source.write_text(json.dumps(replacement))
+                    self.assertEqual(metrics._admission_stat_token(root.lstat()),
+                                     directory_token)
+                if result["coverage"] == "observed":
+                    break
+
+        self.assertEqual(metrics._admission_stat_token(root.lstat()), directory_token)
+        self.assertEqual(results[-1]["coverage"], "observed",
+            f"flat-root bounded continuation did not finish: {trace!r}")
+        final = results[-1]
+        summary, _state = progress._admission_summary({}, final,
+            201 + len(results) - 1, run_id, "run", 1)
+        self.assertEqual(summary["state"], "unknown",
+            f"flat-root source regression did not stay unknown: {trace!r}")
+        self.assertEqual(final["latest"]["state"], "unknown")
+        self.assertEqual(final["latest"]["at"], 90)
+        self.assertEqual(summary["freshness_seconds"],
+            201 + len(results) - 1 - 90,
+            f"flat-root stale evidence supplied freshness: {trace!r}")
+        self.assertFalse(final.get("latest", {}).get("at") == 110
+            and final["latest"].get("state") in {"admitted", "denied"},
+            f"stale flat-root latest authorized current state: {trace!r}")
+        self.assertFalse(summary["state"] in {"admitted", "denied"}
+            and summary["freshness_seconds"] == 201 + len(results) - 1 - 110,
+            f"stale flat-root latest authorized freshness: {trace!r}")
+        final_binding = cursor["scan"][str(root)]["bundle_cursors"]["@root"][
+            "binding_state"]
+        self.assertTrue(final_binding["target_seen"])
+        self.assertFalse(final_binding["foreign_seen"])
+        recovery_latest = final_binding.get("recovery_latest")
+        self.assertFalse(isinstance(recovery_latest, dict)
+                         and recovery_latest.get("at") == 110,
+            f"stale flat-root recovery evidence survived: {trace!r}")
+        self.assertTrue(cursor["generation_revalidation_required"],
+            f"stale recovery evidence completed generation validation: {trace!r}")
+        emitted_ids = [sample["sample_id"] for item in results
+                       for sample in item["samples"]]
+        self.assertEqual(len(emitted_ids), len(set(emitted_ids)),
+            f"flat-root continuation duplicated samples: {trace!r}")
+
     def test_evicted_listing_cursor_resumes_exact_binding_without_restarting(self):
         root = self.root / "installed-cursor-without-bundle-cache"
         bundle = root / "r2-launch-a8"

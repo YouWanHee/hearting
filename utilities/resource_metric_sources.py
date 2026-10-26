@@ -1198,6 +1198,34 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
         listing.pop("revalidation_after", None)
         return "ok", changed, invalidated_prefix
 
+    def rewind_invalidated_listing_prefix(binding_state, progress, listing, key,
+                                           resume_after, invalidated_prefix):
+        """Drop cached evidence from a skipped prefix and resume its file cursor."""
+        invalidated = {name for name in invalidated_prefix
+                       if isinstance(name, str)}
+        if isinstance(resume_after, str):
+            rows = listing.get(key, []) if isinstance(listing, dict) else []
+            skipped_prefix = {item.get("name") for item in rows
+                if isinstance(item, dict) and isinstance(item.get("name"), str)
+                and item["name"] <= resume_after}
+            if isinstance(binding_state, dict):
+                for field in ("latest", "recovery_latest"):
+                    evidence = binding_state.get(field)
+                    source_name = (evidence.get("source_file")
+                        if isinstance(evidence, dict) else None)
+                    if source_name in skipped_prefix:
+                        binding_state[field] = None
+                        invalidated.add(source_name)
+                        if field == "latest":
+                            binding_state.pop("latest_source_token", None)
+                binding_state["page_decisions"] = []
+        if invalidated and isinstance(progress, dict):
+            # Re-read invalidated sources with the existing bounded no-follow
+            # file cursor. The listing validation frontier remains independent.
+            progress["last_file"] = ""
+            progress.pop("scan_prefix", None)
+        return invalidated
+
     def listing_entry_token(listing, key, name):
         rows = listing.get(key, []) if isinstance(listing, dict) else []
         if isinstance(rows, list):
@@ -1508,9 +1536,13 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     if isinstance(root_binding, dict) else {}
                 root_latest_name = root_latest.get("source_file") \
                     if isinstance(root_latest, dict) else None
-                root_revalidation, changed_root_entries, _invalidated_root_prefix = \
+                root_resume_marker = root_listing.get("revalidation_after")
+                root_revalidation, changed_root_entries, invalidated_root_prefix = \
                     revalidate_listing_entries(root_listing, "entries", root,
                                                root_entries=True)
+                rewind_invalidated_listing_prefix(root_binding, root_cursor,
+                    root_listing, "entries", root_resume_marker,
+                    invalidated_root_prefix)
                 if (root_latest_name in changed_root_entries
                         and valid_latest_evidence(root_latest)):
                     note_generation_change("admission-bundle-generation-changed")
@@ -1948,31 +1980,11 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     listing_revalidation, changed_file_names, invalidated_prefix = \
                         revalidate_listing_entries(bundle_listing, "files", bundle)
                     if isinstance(resume_marker, str):
-                        skipped_prefix = {item.get("name")
-                            for item in bundle_listing.get("files", [])
-                            if isinstance(item, dict)
-                            and isinstance(item.get("name"), str)
-                            and item["name"] <= resume_marker}
-                        latest = binding_state.get("latest")
-                        if (isinstance(latest, dict)
-                                and latest.get("source_file") in skipped_prefix):
-                            binding_state["latest"] = None
-                            binding_state.pop("latest_source_token", None)
-                            invalidated_prefix.append(latest.get("source_file"))
-                        recovery_latest = binding_state.get("recovery_latest")
-                        if (isinstance(recovery_latest, dict)
-                                and recovery_latest.get("source_file") in skipped_prefix):
-                            binding_state["recovery_latest"] = None
-                            invalidated_prefix.append(recovery_latest.get("source_file"))
-                        binding_state["page_decisions"] = []
-                        # Re-read the invalidated prefix with the existing
-                        # bounded file cursor before it can authorize a current
-                        # decision. The listing validation frontier itself
-                        # continues from its saved marker.
+                        invalidated_prefix = rewind_invalidated_listing_prefix(
+                            binding_state, bundle_progress, bundle_listing, "files",
+                            resume_marker, invalidated_prefix)
                         if invalidated_prefix:
                             file_cursor = ""
-                            bundle_progress["last_file"] = ""
-                            bundle_progress.pop("scan_prefix", None)
                     if (latest_source_name in changed_file_names
                             and valid_latest_evidence(latest_row_prior)):
                         note_generation_change("admission-bundle-generation-changed")
