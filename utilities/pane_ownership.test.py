@@ -270,6 +270,18 @@ class PaneOwnershipTest(unittest.TestCase):
             self.assertEqual(st.read_latest_card(seat)["body"], "home-os 카드")
             consumed = st._consumed_path(pane_seat)
             before = consumed.read_bytes() if consumed.exists() else None
+            self.assertEqual(st.run_hook("claude", "start", "home-os-successor",
+                                         cwd=str(self.root), env=env), "")
+            successor = st.session_seat(seat, "claude", "home-os-successor")
+            now = st.now_epoch()
+            with st.session_state_lock(successor):
+                st.record_event(successor, "claude", "home-os-successor", "start",
+                                source="clear", cwd=str(self.root), now=now)
+                st._append_ledger_entry(successor, {
+                    "ts": now + 0.001, "harness": "claude", "sid": "home-os-successor",
+                    "event": "handover", "from": {"harness": "claude", "sid": "home-os-sid"},
+                    "source": "clear",
+                })
             injected = st.run_hook("claude", "start", "home-os-successor",
                                    cwd=str(self.root), env=env)
             self.assertIn("home-os 카드", injected)

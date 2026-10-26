@@ -1750,6 +1750,23 @@ class ForegroundLaunchTest(unittest.TestCase):
                 else:
                     self.assertNotIn(L.FOREGROUND_NOTICE, lines)
                     self.assertEqual(launched[-1][0], "run")
+class ProducerRevisionGenerationValidationTest(unittest.TestCase):
+    def test_producer_revision_node_revalidates_batch_generation_at_launch_fence(self):
+        route = {"route_id": "rt-node-producer", "nodes": [
+            {"id": "plan", "unit": "plan/plan-author", "parallel_group": "plan"},
+            {"id": "plan-alternative", "unit": "plan/plan-author", "parallel_group": "plan"},
+        ]}
+        jobs = Path("/tmp/producer-generation-jobs.log")
+        admission = {"managed": True, "generation": "rev-" + "d" * 64}
+        with mock.patch.object(N.ROUTE, "producer_revision_admission", return_value=admission) as read:
+            result = N.validate_producer_generation(route, route["nodes"][0], jobs,
+                                                    admission["generation"])
+        self.assertEqual(result, admission)
+        read.assert_called_once_with(route, route["nodes"], jobs)
+        with mock.patch.object(N.ROUTE, "producer_revision_admission", return_value=admission):
+            with self.assertRaises(N.DispatchNodeError) as caught:
+                N.validate_producer_generation(route, route["nodes"][0], jobs, "rev-" + "e" * 64)
+        self.assertEqual(caught.exception.reason, "producer-revision-generation-drift")
 
 
 if __name__ == "__main__":

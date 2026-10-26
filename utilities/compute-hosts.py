@@ -3134,6 +3134,10 @@ def _observe_compute_experiment(meta, run_dir, now, *, final=False):
         started = datetime.datetime.fromisoformat(str(meta.get("started_at"))).timestamp()
     except (TypeError, ValueError, OverflowError):
         started = None
+    observation_meta = {}
+    for candidate in (meta.get("observation"), resource.get("observation")):
+        if isinstance(candidate, dict):
+            observation_meta.update(candidate)
     record = {
         "run_id": meta.get("run_id") or Path(run_dir).name,
         "row_id": resource.get("row_id") or meta.get("row_id"),
@@ -3149,6 +3153,7 @@ def _observe_compute_experiment(meta, run_dir, now, *, final=False):
         "session": provenance.get("session"), "notify": provenance.get("notify"),
         "started_at": started, "ended_at": now if final else None,
         "planned_seconds": resource.get("planned_seconds"),
+        "observation": observation_meta or None,
         "status": "finished" if final else "running",
     }
     if not artifact_root:

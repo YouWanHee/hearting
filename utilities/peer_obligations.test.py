@@ -216,14 +216,50 @@ class ObligationStoreTest(unittest.TestCase):
         pending = self.store.create("old-active", "message", {}, {})
         unknown = self.store.create("old-unknown", "registered-batch", {}, {})
         self.store.update(unknown["id"], state="unknown", observer_error="unavailable")
-        result = self.store.prune_terminal_obligations(now=now)
+        with mock.patch.object(obligations.time, "monotonic", return_value=0.0):
+            result = self.store.prune_terminal_obligations(now=now)
         self.assertLessEqual(result["examined"], 64)
         self.assertEqual(result["removed"], 16)
         self.assertEqual(sum(self.store.get(duty_id) is None for duty_id in old_ids), 16)
         self.assertEqual(self.store.prune_terminal_obligations(now=now)["status"], "not-due")
 
-        next_pass = self.store.prune_terminal_obligations(now=now + 300)
+        with mock.patch.object(obligations.time, "monotonic", return_value=0.0):
+            next_pass = self.store.prune_terminal_obligations(now=now + 300)
         self.assertEqual(next_pass["removed"], 4)
+        self.assertIsNotNone(self.store.get(pending["id"]))
+        self.assertEqual(self.store.get(unknown["id"])["state"], "unknown")
+
+        deadline_ids = []
+        for index in range(2):
+            duty_id = f"deadline-readiness-{index:02d}"
+            duty = self.store.create(duty_id, "readiness-observation",
+                                     {"consumer": {"pid": 2_000_000_100 + index,
+                                                    "pid_start": "1"}}, {})
+            self.store.update(duty["id"], state="complete", result="consumer-exited")
+            record_path = self.store._record_path(duty["id"])
+            persisted = json.loads(record_path.read_text(encoding="utf-8"))
+            persisted["terminal_at"] = now - 2 * 86400
+            record_path.write_text(json.dumps(persisted), encoding="utf-8")
+            deadline_ids.append(duty_id)
+
+        with mock.patch.object(obligations.time, "monotonic",
+                               side_effect=(0.0, 0.0, 0.05)) as clock:
+            deadline_pass = self.store.prune_terminal_obligations(
+                now=now + 3600, time_budget=0.05)
+        self.assertEqual(clock.call_count, 3)
+        self.assertEqual(deadline_pass["examined"], 1)
+        self.assertEqual(deadline_pass["removed"], 1)
+        self.assertEqual(deadline_pass["cursor"], deadline_ids[0] + ".json")
+        self.assertIsNone(self.store.get(deadline_ids[0]))
+        self.assertIsNotNone(self.store.get(deadline_ids[1]))
+
+        not_due = self.store.prune_terminal_obligations(now=now + 3601)
+        self.assertEqual(not_due["status"], "not-due")
+        self.assertEqual(not_due["cursor"], deadline_pass["cursor"])
+        with mock.patch.object(obligations.time, "monotonic", return_value=0.0):
+            resumed = self.store.prune_terminal_obligations(now=now + 3900)
+        self.assertEqual(resumed["removed"], 1)
+        self.assertIsNone(self.store.get(deadline_ids[1]))
         self.assertIsNotNone(self.store.get(pending["id"]))
         self.assertEqual(self.store.get(unknown["id"])["state"], "unknown")
 

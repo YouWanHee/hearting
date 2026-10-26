@@ -14,15 +14,15 @@ Run the `qa/test` unit. Select one prompt form:
 
   ```text
   Run graduated tests for plan: {$ARG}
-  Read the plan verification sections and checklist.md in the task root to identify targets.
-  Execute Level 1 → 2 → 3 → 4 → 5 in order, stopping on the first failure.
+  Read the plan verification sections, checklist.md, and available execution, review, test, and CI evidence to identify targets and applicable gaps.
+  Treat Levels 1–5 as evidence categories; run only missing or invalidated checks in order, stopping on the first failure.
   ```
 
 - File or directory path:
 
   ```text
   Run graduated tests on: {$ARG}
-  Execute Level 1 → 2 → 3 → 4 → 5 in order, stopping on the first failure.
+  Read available execution, review, test, and CI evidence for this target. Run only missing or invalidated applicable checks in level order, stopping on the first failure.
   Skip levels that do not apply, such as Level 4 when no plan exists.
   ```
 
@@ -31,9 +31,18 @@ Run the `qa/test` unit. Select one prompt form:
   ```text
   Run graduated tests on recently changed files.
   Use git diff --name-only HEAD~1 to find targets.
-  Execute Level 1 → 2 → 3 → 4 → 5 in order, stopping on the first failure.
+  Read available execution, review, test, and CI evidence for these targets. Run only missing or invalidated applicable checks in level order, stopping on the first failure.
   Skip levels that do not apply, such as Level 4 when no plan exists.
   ```
+
+For all prompt forms, reuse evidence only when it covers the current source,
+target and scope, relevant inputs and dependencies, and execution conditions.
+Stage, person, worktree, or interruption changes alone do not invalidate a
+result. Preserve known FAIL and BLOCKED states; rerun a failed check only after
+a relevant fix, and do not turn an unresolved failure or required unknown into
+SKIP or PASS. Record reused evidence in the existing report body with its
+artifact path, command, scope, and verdict; do not add a report schema. The
+current test stage still makes its own scoped assessment and verdict.
 
 ## Test Log Contract
 
@@ -47,8 +56,8 @@ The report structure is owned by the `qa/test` unit persona (`roles/units/qa/tes
 
 Run test commands through the active adapter's bounded verification runner when its contract requires one. Preserve the actual exit status in the log.
 
-When changed outputs include a report spectrogram, add the report-figure
-semantic level from `roles/units/qa/test.md`: run
+When changed outputs include a report spectrogram, assess the report-figure
+semantic evidence from `roles/units/qa/test.md`. If missing or invalidated, run
 `tools/figure-semantic-verify.py` or the adapter-native `figure-gen
 --verify-report` wrapper against the manifest and report. Exit 2 is a test
 failure; unavailable or unreadable required inputs are blockers. Record the
@@ -61,13 +70,18 @@ This is the concrete final verify stage. Derive rigor from plan frontmatter or c
 
 | Rigor | Concrete verification | Optional adequacy review |
 |---|---|---|
-| `quick` | Run the narrowest applicable command or check and record skip reasons | None by default |
-| `light` | Run focused syntax, import, smoke, or caller-specified checks | One fast review only when risk selects it |
-| `standard` | Run applicable graduated levels and capture command evidence | One focused adequacy review for a nontrivial change surface |
+| `quick` | Reuse applicable evidence; run the narrowest missing check and record skip reasons | None by default |
+| `light` | Reuse applicable results; run missing focused syntax, import, smoke, or caller-specified checks | One fast review only when an uncovered risk selects it |
+| `standard` | Assess applicable graduated evidence and run only missing or invalidated checks | One focused adequacy review only for a nontrivial adequacy question not answered by existing review |
 | `thorough` | Broaden target coverage and add behavioral runtime observation for changed user-facing surfaces | Parallel or dispatch-depth-2 review only when selected by `intensity=thorough` |
 | `adversarial` | Thorough verification plus applicable security, failure-mode, and external-adversary evidence | Prove every claimed adversary or security pass ran |
 
-After the `qa/test` unit returns, read the supplied report path. Run a separate adequacy review only when the selected assurance budget requires it, and append its findings to the report. Otherwise return the concrete verification verdict directly.
+After the `qa/test` unit returns, read the supplied report path. Reuse an existing
+independent review that answers test adequacy for this scope. Run a separate
+adequacy review only when selected and an unresolved adequacy question remains;
+the assurance budget is a ceiling, not an instruction to fill another slot.
+Append any new findings to the report and return the current scoped verdict
+based on executed and applicable reused evidence.
 
 Do not modify source or invoke a hotfix worker from this stage. Any repair belongs to the caller's bounded retry/fix path.
 

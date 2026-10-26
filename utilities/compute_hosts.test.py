@@ -2972,6 +2972,7 @@ class CompletionWatchTest(unittest.TestCase):
 
     def test_rootless_compute_observation_uses_exact_admission_and_shared_summary(self):
         module = load_module()
+        import hashlib
         import resource_progress
         bundle = self.run_dir / "unfamiliar-bundle"
         bundle.mkdir()
@@ -2996,6 +2997,33 @@ class CompletionWatchTest(unittest.TestCase):
         self.assertIn("admission waiting", summary)
         self.assertIn("sample ratio 1.0", summary)
         self.assertNotIn("wait duration", summary.lower())
+
+        source = self.root / "writer" / "observation.json"
+        source.parent.mkdir()
+        source.write_text(json.dumps({"observed_at": 950, "finished_cells": 21}))
+        proof = self.root / "writer-proof.json"
+        proof.write_text(json.dumps({"target": "here-1", "writer": "writer-1"}))
+        binding = {"target_run_id": "here-1", "row_key": "compute-row",
+            "path": str(source), "writer_run_id": "writer-1",
+            "timestamp_pointer": "/observed_at", "scope": "shared-results",
+            "counters": [{"name": "finished_cells", "pointer": "/finished_cells",
+                          "comparison_eligible": False}],
+            "proofs": [{"path": str(proof),
+                "sha256": hashlib.sha256(proof.read_bytes()).hexdigest(),
+                "assertions": [{"pointer": "/target", "equals": "here-1"},
+                               {"pointer": "/writer", "equals": "writer-1"}]}]}
+        self.meta["provenance"]["resource"] = {"row_id": "compute-row",
+            "observation": {"source_bindings": [binding]}}
+        with mock.patch.object(resource_progress, "_observation_state_path", return_value=state), \
+                mock.patch("session_notice.notify", return_value={"state": "pending"}):
+            attached = module._observe_compute_experiment(self.meta, self.run_dir, 1000)
+            self.meta["provenance"]["resource"].pop("observation")
+            reattached = module._observe_compute_experiment(self.meta, self.run_dir, 1061)
+        self.assertEqual(attached["observation"]["source_observations"][0]["value"], 21)
+        self.assertEqual(reattached["observation"]["source_observations"][0]["writer_run_id"],
+                         "writer-1")
+        record = resource_progress.read_public_run_record(self.root / "artifacts", "here-1")
+        self.assertEqual(record["progress"]["observed_counters"][0]["value"], 21)
 
     def test_watch_outlives_old_deadline_and_waits_for_a_valid_exit_code(self):
         module = load_module()
