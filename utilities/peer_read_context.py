@@ -98,7 +98,12 @@ class PeerReadContext:
         return self._lineage_ledgers
 
     def lineage_graph(self, signature, loader):
-        """Reuse one immutable graph per sessions-directory generation in this pass."""
+        """Reuse this read-only pass's graph; normal observations replace it.
+
+        The signature detects writer changes inside the pass. Current authority
+        at an effect boundary comes from a fresh readable lineage observation,
+        even when that boundary was preceded by this same context's discovery.
+        """
         key = tuple(signature)
         if key not in self._lineage_graphs:
             self._lineage_graphs = {key: loader()}

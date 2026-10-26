@@ -616,8 +616,24 @@ class _LedgerLines(list):
     usable = True
 
 
-def _read_ledger_lines(seat: Seat) -> list[dict]:
-    raw = read_bytes(_ledger_path(seat))
+def _handover_origin(row) -> Optional[tuple[str, str]]:
+    """Normalize the existing string/structured origin without inventing an edge."""
+    harness = row.get("harness")
+    if not isinstance(harness, str) or harness not in HARNESSES:
+        return None
+    origin = row.get("from")
+    if isinstance(origin, dict):
+        harness, origin = origin.get("harness"), origin.get("sid")
+    if (not isinstance(harness, str) or harness not in HARNESSES
+            or not isinstance(origin, str) or not origin):
+        return None
+    return harness, origin
+
+
+def _read_ledger_lines(seat: Seat, *, raw: Optional[bytes] = None) -> list[dict]:
+    """Parse already observed bytes, or read the ledger for a standalone caller."""
+    if raw is None:
+        raw = read_bytes(_ledger_path(seat))
     entries = _LedgerLines()
     entries.usable = raw is not None
     if raw is not None:
@@ -642,12 +658,10 @@ def _read_ledger_lines(seat: Seat) -> list[dict]:
         # these rows no unbound succession edge.
         if event == "handover" and "source" not in item:
             bindings = item.get("bindings")
-            origin = item.get("from")
-            if isinstance(origin, dict):
-                origin = origin.get("sid") if origin.get("harness") in HARNESSES else None
+            origin = _handover_origin(item)
             if (type(item.get("schema", 1)) is not int or item.get("schema", 1) != 1
                     or not all(isinstance(value, str) and value
-                               for value in (item.get("harness"), item.get("sid"), origin))
+                               for value in (item.get("harness"), item.get("sid"))) or origin is None
                     or item.get("harness") not in HARNESSES
                     or not isinstance(bindings, list) or not bindings
                     or not all(isinstance(binding, dict)
@@ -664,12 +678,10 @@ def _read_ledger_lines(seat: Seat) -> list[dict]:
                     or event == "handover" and (source is None or isinstance(source, str)
                         and source in {"clear", "reservation", "first-message", "retire"}))
         if relation:
-            origin = item.get("from")
-            if isinstance(origin, dict):
-                origin = origin.get("sid") if (source == "retire"
-                    or origin.get("harness") == item.get("harness")) else None
+            origin = _handover_origin(item)
             if (not source or not all(isinstance(value, str) and value
-                                      for value in (item.get("harness"), item.get("sid"), origin))
+                                      for value in (item.get("harness"), item.get("sid")))
+                    or origin is None or source != "retire" and origin[0] != item.get("harness")
                     or not isinstance(item.get("bindings", []), list)):
                 entries.usable = False
         if isinstance(item, dict) and item.get("sid"):
@@ -923,11 +935,10 @@ def tidy_lineage_edge(row: dict) -> Optional[tuple[str, str, str]]:
     else:
         return None
     harness, target = row.get("harness"), row.get("sid")
-    origin = row.get("from")
-    if isinstance(origin, dict):
-        if origin.get("harness") != harness:
-            return None
-        origin = origin.get("sid")
+    source = _handover_origin(row)
+    if source is None or source[0] != harness:
+        return None
+    origin = source[1]
     if not all(isinstance(value, str) and value for value in (harness, origin, target)):
         return None
     return harness, origin, target

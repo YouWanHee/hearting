@@ -111,13 +111,13 @@ def _lineage_signature(directory: Path):
 
 
 def _readable_lineage_signature(directory: Path):
-    """Only parsing survives a pass; current readable bytes remain an input.
+    """Observe current readable bytes once and retain them for the parser.
 
     Stat alone cannot expose transient read failures. Use the normal no-follow
     reader even on cache hits, binding its bytes to the observed generation.
     """
     location, files, generation = _lineage_signature(directory)
-    observed = []
+    observed, contents = [], {}
     for filename, *file_generation in files:
         path = directory / filename
         raw = _st().read_bytes(path)
@@ -125,30 +125,38 @@ def _readable_lineage_signature(directory: Path):
                 or _lineage_generation(path.lstat()) != tuple(file_generation)):
             raise OSError("lineage-ledger-unavailable")
         observed.append((filename, *file_generation, hashlib.sha256(raw).hexdigest()))
+        contents[filename] = raw
     if generation is not None and _lineage_generation(directory.stat()) != generation:
         raise OSError("lineage-directory-changed")
-    return location, tuple(observed), generation
+    return (location, tuple(observed), generation), contents
 
 
 def _build_lineage_graph(read_context=None) -> LineageGraph:
     directory = _st().state_root() / "sessions"
     try:
-        signature = _readable_lineage_signature(directory)
+        signature, contents = _readable_lineage_signature(directory)
+        metadata = (signature[0], tuple(item[:-1] for item in signature[1]), signature[2])
         cached = _LINEAGE_GRAPH_CACHE.get(signature)
 
         def load():
             if cached is not None:
                 return cached
-            graph = _build_lineage_graph_uncached(signature)
+            graph = _build_lineage_graph_uncached(signature, contents)
             # A replacement while the parser was reading must not publish a
             # graph under the earlier observation's identity.
-            if _readable_lineage_signature(directory) != signature:
+            if _lineage_signature(directory) != metadata:
                 raise OSError("lineage-observation-changed")
             _LINEAGE_GRAPH_CACHE.clear()
             _LINEAGE_GRAPH_CACHE[signature] = graph
             return graph
 
-        return read_context.lineage_graph(signature, load) if read_context is not None else load()
+        graph = load()
+        if read_context is not None:
+            # A normal observation replaces the pass, even if only readable
+            # bytes changed. Metadata never substitutes for this observation.
+            read_context.invalidate_lineage_graph()
+            read_context.lineage_graph(metadata, lambda: graph)
+        return graph
     except (OSError, ValueError, TypeError):
         _LINEAGE_GRAPH_CACHE.clear()
         if read_context is not None:
@@ -156,13 +164,30 @@ def _build_lineage_graph(read_context=None) -> LineageGraph:
         raise
 
 
-def _build_lineage_graph_uncached(signature) -> LineageGraph:
+def _pass_lineage_graph(read_context=None) -> LineageGraph:
+    """Resolve read-only records from this pass; effects observe without it.
+
+    Detect writer changes during a pass, but do not reopen every ledger for
+    every record. Normal lineage_graph observations always read current bytes.
+    """
+    if read_context is None:
+        return lineage_graph()
+    try:
+        signature = _lineage_signature(_st().state_root() / "sessions")
+        return read_context.lineage_graph(signature, lambda: lineage_graph(read_context=read_context))
+    except (OSError, ValueError, TypeError):
+        _LINEAGE_GRAPH_CACHE.clear()
+        read_context.invalidate_lineage_graph()
+        raise
+
+
+def _build_lineage_graph_uncached(signature, contents) -> LineageGraph:
     st = _st()
     edges, keys_by_vertex, rows_by_key, latest_bindings = set(), {}, {}, {}
     for filename, *_generation in signature[1]:
         ledger_key = Path(filename).stem
         seat = st.Seat("pane", ledger_key)
-        rows = st._read_ledger_lines(seat)
+        rows = st._read_ledger_lines(seat, raw=contents[filename])
         if not getattr(rows, "usable", True):
             raise OSError("lineage-ledger-unavailable")
         rows_by_key[ledger_key] = rows
@@ -230,14 +255,14 @@ def _build_lineage_graph_uncached(signature) -> LineageGraph:
 
 
 def lineage_graph(*, read_context=None) -> LineageGraph:
-    """Return the cached immutable graph built from every session ledger."""
+    """Observe current readable lineage and seed this read-only pass's graph."""
     return _build_lineage_graph(read_context)
 
 
 def chain_end(harness: str, sid: str, *, read_context=None) -> tuple[str, str]:
     """Return the unique end, or unresolved for ambiguity or unavailable observation."""
     try:
-        return _chain_end(lineage_graph(read_context=read_context), harness, sid)
+        return _chain_end(_pass_lineage_graph(read_context), harness, sid)
     except (OSError, ValueError, TypeError):
         return sid, "unresolved"
 
@@ -1092,7 +1117,7 @@ def _binds(bindings: Iterable[dict], jobs, meta: dict) -> bool:
 
 def _lineage_seats(extra=(), *, read_context=None) -> dict:
     """Compatibility projection over the single normalized graph snapshot."""
-    graph = lineage_graph(read_context=read_context)
+    graph = _pass_lineage_graph(read_context)
     return {key: [dict(row) for row in rows if row.get("event") in {"handover", "succession"}]
             for key, rows in graph.ledger_rows.items()}
 
@@ -1103,8 +1128,7 @@ def _lineage_successor(rows_by_seat: dict, sid: str, harness: str) -> str:
     return sid if state == "unresolved" else end
 
 
-def _lineage_holder(rows_by_seat: dict, key: tuple, registered: str, harness: str,
-                    *, read_context=None) -> tuple[str, str, str]:
+def _lineage_holder(graph: LineageGraph, key: tuple, registered: str, harness: str) -> tuple[str, str, str]:
     """Who answers for one logical job (jobs, route, hash, node) now.
 
     The latest row that binds the job names its holder (a later hand-off wins).  From there the
@@ -1113,7 +1137,6 @@ def _lineage_holder(rows_by_seat: dict, key: tuple, registered: str, harness: st
     queried session therefore answers only while it is the end of that chain.
     Keep the selected holder's disposition: an unresolved explicit handoff
     cannot restore the registered parent or authorize the ambiguous holder."""
-    graph = lineage_graph(read_context=read_context)
     latest = graph.binding_rows.get(key)
     holder = registered
     if latest is not None:
@@ -1141,7 +1164,7 @@ def _effective(meta: dict, jobs=None, *, read_context=None, extra_seats=()) -> t
     try:
         key = (_jobs_key(jobs), *route_identity(meta))
         holder, holder_harness, state = _lineage_holder(
-            {}, key, registered, harness, read_context=read_context)
+            _pass_lineage_graph(read_context), key, registered, harness)
         return ("" if state == "unresolved" else holder), holder_harness
     except Exception:  # noqa: BLE001 - incomplete observation grants no current authority
         return "", harness
@@ -1333,6 +1356,10 @@ def record_recipient_binding(record: dict, storage_key: str, *, harness: str,
         return None
     latest = latest_rows(jobs)
     targets = set()
+    try:
+        graph = _pass_lineage_graph(read_context)
+    except (OSError, ValueError, TypeError):
+        return None
     for attempt in ids:
         current = latest.get(attempt)
         if not current:
@@ -1341,7 +1368,7 @@ def record_recipient_binding(record: dict, storage_key: str, *, harness: str,
         if str(meta.get("parent_sid") or "") != storage_key:
             return None
         if not eligible_row(meta):
-            if chain_end(harness, storage_key, read_context=read_context)[1] == "unresolved":
+            if _chain_end(graph, harness, storage_key)[1] == "unresolved":
                 return None
             targets.add((storage_key, _registered_parent_harness(meta) or harness))
             continue
@@ -1350,8 +1377,7 @@ def record_recipient_binding(record: dict, storage_key: str, *, harness: str,
         try:
             key = (_jobs_key(jobs), *route_identity(meta))
             target, target_harness, state = _lineage_holder(
-                {}, key, registered, row_harness,
-                read_context=read_context)
+                graph, key, registered, row_harness)
         except Exception:  # noqa: BLE001 - unreadable/ambiguous lineage remains pending
             return None
         if state == "unresolved":
@@ -1400,7 +1426,7 @@ def owns(meta: dict, session: str, jobs=None, *, read_context=None) -> bool:
     return _effective(meta, jobs, read_context=read_context, extra_seats=(own,))[0] == session
 
 
-def storage_recipients(session: str, env=None, harness: Optional[str] = None) -> list:
+def storage_recipients(session: str, env=None, harness: Optional[str] = None, *, read_context=None) -> list:
     """``[(storage key, attempt ids | None)]``: where records addressed to ``session`` live.
 
     The session's own key first (all its records); then one entry per registered parent it
@@ -1412,15 +1438,14 @@ def storage_recipients(session: str, env=None, harness: Optional[str] = None) ->
         seat = pane_seat(env, harness, session)
         if seat is None:
             return out
-        rows_by_seat = _lineage_seats((seat,))
-        graph = lineage_graph()
+        graph = _pass_lineage_graph(read_context)
         lineage_harnesses = {edge_harness for edge_harness, origin, target in graph.edges
                              if session in {origin, target}}
         current_harness = (harness or (next(iter(lineage_harnesses)) if len(lineage_harnesses) == 1 else "")
                            or _st().session_from_env(None, env or os.environ)[0])
         lineage_storage = set()
         if current_harness:
-            end, state = chain_end(current_harness, session)
+            end, state = _chain_end(graph, current_harness, session)
             if state != "unresolved" and end == session:
                 reverse = {}
                 for edge_harness, origin, target in graph.edges:
@@ -1438,7 +1463,6 @@ def storage_recipients(session: str, env=None, harness: Optional[str] = None) ->
         owed: dict = {}
         # Explicit registry bindings remain valid across the existing cross-seat retire
         # path; same-harness clear inheritance comes only from the normalized graph.
-        graph = lineage_graph()
         for rows in graph.ledger_rows.values():
             for row in rows:
                 bindings = [b for b in row.get("bindings") or ()
@@ -1447,11 +1471,12 @@ def storage_recipients(session: str, env=None, harness: Optional[str] = None) ->
                     key = (binding.get("jobs"), binding.get("route"), binding.get("hash"), binding.get("node"))
                     if not all(isinstance(part, str) for part in key):
                         continue
-                    parent = str(binding.get("parent") or row.get("from") or "")
+                    origin = _st()._handover_origin(row)
+                    parent = str(binding.get("parent") or (origin[1] if origin else ""))
                     if not parent:
                         continue
                     holder, holder_harness, state = _lineage_holder(
-                        rows_by_seat, key, parent,
+                        graph, key, parent,
                         str(row.get("harness") or current_harness or ""))
                     if (state == "unresolved" or holder != session
                             or current_harness and holder_harness != current_harness):
@@ -1467,13 +1492,13 @@ def storage_recipients(session: str, env=None, harness: Optional[str] = None) ->
     return out
 
 
-def _chain_to(rows: list, session: str) -> list:
+def _chain_to(rows: list, session: str, *, graph=None) -> list:
     """Authority handovers plus tidy edges on the unique ancestry to ``session``.
 
     Binding-carrying handover rows are explicit authority regardless of source.
     Tidy succession/handover edges remain available where a row has no binding.
     """
-    graph = lineage_graph()
+    graph = graph if graph is not None else lineage_graph()
     candidates = []
     for ledger_key, ledger_rows in graph.ledger_rows.items():
         for index, row in enumerate(ledger_rows):
@@ -1484,8 +1509,9 @@ def _chain_to(rows: list, session: str) -> list:
                                for binding in row.get("bindings") or ())
             if edge is None and not has_bindings:
                 continue
+            source = _st()._handover_origin(row)
             harness, origin, target = edge or (
-                row.get("harness"), row.get("from"), row.get("sid"))
+                row.get("harness"), source[1] if source else None, row.get("sid"))
             if all(isinstance(value, str) and value for value in (harness, origin, target)):
                 candidates.append((harness, origin, target, ledger_key, index, row))
     # Succession is a tidy edge with no handover row counterpart.
@@ -1697,24 +1723,39 @@ def _handover_binding_keys_for_session(jobs, sid: str, *, read_context=None) -> 
     """Current exact jobs/route/node bindings handed along to this session."""
     jobs_key = _jobs_key(jobs)
     keys = set()
+    if read_context is None:
+        from peer_read_context import PeerReadContext
+        read_context = PeerReadContext()
+    try:
+        graph = _pass_lineage_graph(read_context)
+    except (OSError, ValueError, TypeError):
+        return ()
+    rows, observed_seat = [], False
     for snapshot in _all_snapshots(read_context):
         seat_data = snapshot.get("seat")
         if not isinstance(seat_data, dict):
             continue
         try:
             seat = _seat_of(str(seat_data.get("key") or ""), snapshot)
-            chain = _chain_to(handover_rows(seat, read_context=read_context), sid)
+            observed_seat = True
+            rows.extend(graph.ledger_rows.get(seat.key, ()))
         except Exception:  # noqa: BLE001 - discovery failure leaves no inherited candidates
             continue
-        for row in chain:
-            for binding in row.get("bindings") or ():
-                if not isinstance(binding, dict) or binding.get("jobs") != jobs_key:
-                    continue
-                route = str(binding.get("route") or "")
-                digest = str(binding.get("hash") or "")
-                node = str(binding.get("node") or "")
-                if route and digest:         # a node-less owner binds as (route, hash, "")
-                    keys.add((route, digest, node))
+    if not observed_seat:
+        return ()
+    try:
+        chain = _chain_to(rows, sid, graph=graph)
+    except (OSError, ValueError, TypeError):
+        return ()
+    for row in chain:
+        for binding in row.get("bindings") or ():
+            if not isinstance(binding, dict) or binding.get("jobs") != jobs_key:
+                continue
+            route = str(binding.get("route") or "")
+            digest = str(binding.get("hash") or "")
+            node = str(binding.get("node") or "")
+            if route and digest:         # a node-less owner binds as (route, hash, "")
+                keys.add((route, digest, node))
     return tuple(keys)
 
 

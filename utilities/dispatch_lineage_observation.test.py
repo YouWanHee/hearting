@@ -298,6 +298,13 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
                     context = PeerReadContext()
 
                     def resolve():
+                        # This matrix observes current authority, including a
+                        # same-context pass warmed before an effect. Read-only
+                        # record loops reuse the observation instead.
+                        try:
+                            handover.lineage_graph(read_context=context)
+                        except OSError:
+                            return None
                         return handover.record_recipient_binding(record, tag + "-A",
                             harness=harness, jobs=self.jobs_path, read_context=context)
 
@@ -387,6 +394,12 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
         context = PeerReadContext()
         self.assertEqual(handover.record_recipient(notice, "race-A", harness="claude",
                                                    read_context=context), "race-B")
+        def observe():
+            try:
+                handover.lineage_graph(read_context=context)
+            except OSError:
+                return None
+            return handover.record_recipient(notice, "race-A", harness="claude", read_context=context)
         real_read = tidy.read_bytes
         changed = False
 
@@ -399,24 +412,22 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
             return raw
 
         with mock.patch.object(tidy, "read_bytes", side_effect=read):
-            self.assertIsNone(handover.record_recipient(notice, "race-A", harness="claude",
-                                                       read_context=context))
+            self.assertIsNone(observe())
         self.assertEqual(handover._LINEAGE_GRAPH_CACHE, {})
         self.assertEqual(context._lineage_graphs, {})
         real_parse = tidy._read_ledger_lines
         changed = False
 
-        def parse(seat):
+        def parse(seat, **kwargs):
             nonlocal changed
-            rows = real_parse(seat)
+            rows = real_parse(seat, **kwargs)
             if tidy._ledger_path(seat) == path and not changed:
                 changed = True
                 self.replace_ledger(path, "race-C", "race-D")
             return rows
 
         with mock.patch.object(tidy, "_read_ledger_lines", side_effect=parse):
-            self.assertIsNone(handover.record_recipient(notice, "race-A", harness="claude",
-                                                       read_context=context))
+            self.assertIsNone(observe())
         self.assertEqual(handover._LINEAGE_GRAPH_CACHE, {})
         self.assertEqual(context._lineage_graphs, {})
         self.assertEqual(handover.record_recipient(notice, "race-A", harness="claude",
@@ -448,6 +459,38 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
         self.assertEqual(history()[0]["relation"], "confirmed")
         self.assertEqual(self.counts({("claude", "view-B")})["no_recipient"], 0)
         self.assertEqual([self.snapshot(p) for p in paths], before)
+
+    def test_fleet_record_loop_and_history_reuse_each_observation(self):
+        for index in range(3):
+            self.notice(sid=f"fleet-{index}-A", key=f"fleet-{index}")
+            tidy._append_ledger_entry(tidy.Seat("pane", f"fleet-seat-{index}"), dict(event="succession",
+                source="tidy-clear", harness="claude", **{"from": f"fleet-{index}-A"}, sid=f"fleet-{index}-B"))
+        real_read = tidy.read_bytes
+        raw = []
+        def read(path):
+            data = real_read(path)
+            if Path(path).suffix == ".jsonl":
+                raw.append((str(path), len(data or b"")))
+            return data
+        with mock.patch.object(tidy, "read_bytes", side_effect=read):
+            self.assertEqual(self.counts()["no_recipient"], 3)
+            self.assertEqual(len(raw), 3)
+            observed = list(raw)
+            seat = tidy.Seat("pane", Path(raw[0][0]).stem)
+            with mock.patch.object(tidy, "_lineage_transcript", return_value={"path": None, "status": "missing"}):
+                tidy.seat_lineage(seat, harness="claude")
+            self.assertEqual(raw, observed + observed)
+
+    def test_effect_lock_reobserves_authority_after_the_same_context_was_warmed(self):
+        meta, record, seat = self.handoff("warm-admission", "claude", "codex")
+        context = PeerReadContext()
+        self.assertEqual(handover.record_recipient_binding(record, "warm-admission-A", harness="claude",
+            jobs=self.jobs_path, read_context=context), ("codex", "warm-admission-Z"))
+        with self.unreadable(tidy._ledger_path(seat)):
+            with handover.lineage_effect_lock(meta, self.jobs_path, "warm-admission-Z") as current:
+                self.assertFalse(current)
+        with handover.lineage_effect_lock(meta, self.jobs_path, "warm-admission-Z") as current:
+            self.assertTrue(current)
 
     def test_opencode_projection_uses_the_current_readable_graph_generation(self):
         seat = self.edge("opencode", "projection-A", "projection-B")
@@ -988,7 +1031,7 @@ class BindingScopeDiscoveryTest(peer._TmpRootMixin, unittest.TestCase):
         os.environ["AGENT_HOME"] = str(ROOT)
         handover._LINEAGE_GRAPH_CACHE.clear()
 
-    def seed(self, tag, *, reverse=False, jobs=None, legacy=False):
+    def seed(self, tag, *, reverse=False, jobs=None, legacy=False, structured=False):
         jobs = jobs or self.jobs_path
         origin, holder = tag + "-A", tag + "-B"
         metas = [dict(attempt_schema_version="2", dispatch_depth="1", worker_type="owner",
@@ -1008,7 +1051,8 @@ class BindingScopeDiscoveryTest(peer._TmpRootMixin, unittest.TestCase):
             with tidy.seat_lock(seat.key):
                 handover.publish_snapshot_locked(seat, "claude", origin, scope, jobs=jobs)
                 row = dict(event="handover", harness="codex", sid=holder,
-                    **{"from": origin}, ts=100 - i if reverse else i + 1, bindings=scope)
+                    **{"from": {"harness": "claude", "sid": origin} if structured else origin},
+                    ts=100 - i if reverse else i + 1, bindings=scope)
                 if not legacy:
                     row["source"] = "retire"
                 tidy._append_ledger_entry(seat, row)
@@ -1016,6 +1060,111 @@ class BindingScopeDiscoveryTest(peer._TmpRootMixin, unittest.TestCase):
 
     def candidates(self, jobs, holder, harness="codex", context=None):
         return handover._handover_candidates(harness, holder, jobs, read_context=context)
+
+    def test_read_only_discovery_and_bindings_share_observed_bytes_and_parsing(self):
+        jobs, origin, holder, metas, bindings, seats = self.seed("one-observation", structured=True)
+        context = PeerReadContext()
+        real_read = tidy.read_bytes
+        raw = []
+        def read(path):
+            data = real_read(path)
+            if Path(path).suffix == ".jsonl":
+                raw.append((str(path), len(data or b"")))
+            return data
+        with mock.patch.object(tidy, "read_bytes", side_effect=read), \
+                mock.patch.object(tidy, "_read_ledger_lines", wraps=tidy._read_ledger_lines) as parses, \
+                mock.patch.object(handover, "pane_seat", return_value=seats[0]):
+            graph = handover.lineage_graph(read_context=context)
+            self.assertEqual(len(raw), len(seats))
+            self.assertEqual(parses.call_count, len(seats))
+            observed = list(raw)
+            self.assertEqual(len(self.candidates(jobs, holder, context=context)), 13)
+            self.assertEqual(len(handover.current_bindings("codex", holder, jobs, read_context=context)), 12)
+            self.assertEqual(len(handover._handover_binding_keys_for_session(jobs, holder,
+                                                                            read_context=context)), 13)
+            self.assertEqual(dict(handover.storage_recipients(holder, harness="codex",
+                read_context=context))[origin], frozenset(meta["attempt_id"] for meta in metas))
+            for meta in metas:
+                record = {"attempt_ids": [meta["attempt_id"]]}
+                self.assertEqual(handover.record_recipient_binding(record, origin, harness="claude",
+                    jobs=jobs, read_context=context), ("codex", holder))
+                self.assertEqual(handover.effective_parent(meta, jobs, read_context=context), holder)
+            self.assertEqual(raw, observed)
+            self.assertEqual(parses.call_count, len(seats))
+            # The next existing observation reads current bytes, even when it
+            # reuses both the context and the global parsed graph.
+            self.assertIs(handover.lineage_graph(read_context=context), graph)
+            self.assertEqual(raw, observed + observed)
+            self.assertEqual(parses.call_count, len(seats))
+
+    def test_string_and_structured_explicit_scopes_follow_only_qualified_holder_hops(self):
+        for legacy in (False, True):
+            for structured in (False, True):
+                for reverse in (False, True):
+                    tag = f"origins-{legacy}-{structured}-{reverse}"
+                    jobs = self.tmp_root / (tag + ".registry")
+                    jobs, origin, holder, metas, bindings, seats = self.seed(tag, jobs=jobs,
+                        legacy=legacy, structured=structured, reverse=reverse)
+                    context = PeerReadContext()
+                    for current in (holder, holder + "-C", holder + "-D"):
+                        if current != holder:
+                            previous = holder if current.endswith("-C") else holder + "-C"
+                            tidy._append_ledger_entry(tidy.Seat("pane", current), dict(event="succession",
+                                source="tidy-clear", harness="codex", **{"from": previous}, sid=current, ts=200))
+                        with self.subTest(legacy=legacy, structured=structured, reverse=reverse, current=current):
+                            self.assertTrue(handover._chain_to(handover.handover_rows(seats[0]), current))
+                            self.assertEqual(len(handover._handover_binding_keys_for_session(jobs, current)), 13)
+                            self.assertEqual(len(self.candidates(jobs, current, context=context)), 13)
+                            self.assertEqual(len(handover.current_bindings("codex", current, jobs)), 12)
+                            for meta in metas:
+                                record = {"attempt_ids": [meta["attempt_id"]]}
+                                self.assertEqual(handover.record_recipient_binding(record, origin, harness="claude",
+                                    jobs=jobs, read_context=context), ("codex", current))
+                                self.assertFalse(handover.record_for_session(record, None, session=current,
+                                    harness="claude", storage_key=origin, jobs=jobs, read_context=context))
+                            with mock.patch.object(handover, "pane_seat", return_value=seats[0]):
+                                self.assertEqual(len(dict(handover.storage_recipients(current,
+                                    harness="codex"))[origin]), 13)
+                            unbound = dict(metas[0], route_id="unbound")
+                            self.assertEqual(handover.effective_parent(unbound, jobs), origin)
+                            self.assertEqual(handover.chain_end("claude", origin), (origin, "self"))
+                    tidy._append_ledger_entry(tidy.Seat("pane", tag + "-away"), dict(event="handover",
+                        source="retire", harness="opencode", sid=tag + "-elsewhere", ts=300,
+                        **{"from": {"harness": "codex", "sid": current}}, bindings=[bindings[0]]))
+                    self.assertEqual(len(self.candidates(jobs, current, context=context)), 12)
+                    self.assertEqual(handover.effective_parent(metas[0], jobs), tag + "-elsewhere")
+                    self.assertEqual(handover.effective_parent_harness(metas[0], jobs), "opencode")
+
+    def test_invalid_structured_origins_leave_all_authority_unavailable_and_recover(self):
+        for legacy in (False, True):
+            jobs, origin, holder, metas, _bindings, seats = self.seed("invalid-" + str(legacy), legacy=legacy)
+            originals = {tidy._ledger_path(seat): tidy._ledger_path(seat).read_bytes() for seat in seats}
+            for bad in ({"harness": "unsupported", "sid": origin}, {"sid": origin},
+                        {"harness": None, "sid": origin}, {"harness": [], "sid": origin},
+                        {"harness": "claude", "sid": None}, {"harness": "claude", "sid": []}):
+                with self.subTest(legacy=legacy, origin=bad):
+                    for path, raw in originals.items():
+                        rows = [json.loads(line) for line in raw.splitlines()]
+                        for row in rows:
+                            if row.get("event") == "handover":
+                                row["from"] = bad
+                        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                    self.assertEqual(self.candidates(jobs, holder), [])
+                    self.assertEqual(handover.effective_parent(metas[0], jobs), "")
+                    self.assertEqual(handover.current_bindings("codex", holder, jobs), [])
+            for path, raw in originals.items():
+                path.write_bytes(raw)
+            self.assertEqual(len(self.candidates(jobs, holder)), 13)
+
+    def test_structured_explicit_scopes_keep_global_refusal_and_current_admission(self):
+        seed = self.seed
+        for legacy in (False, True):
+            def structured_seed(tag, **kwargs):
+                return seed(f"structured-{legacy}-" + tag, structured=True, legacy=legacy, **kwargs)
+            with self.subTest(legacy=legacy), mock.patch.object(self, "seed", side_effect=structured_seed):
+                self.test_global_fork_merge_cycle_and_different_origins_never_use_local_scope_fallback()
+                self.test_manual_clear_is_not_an_implicit_edge_and_global_incomplete_is_not_local_authority()
+                self.test_candidate_admission_rechecks_explicit_authority_after_discovery()
 
     def test_disjoint_overlapping_duplicate_scopes_and_owner_keys_ignore_publication_order(self):
         for reverse in (False, True):

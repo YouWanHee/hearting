@@ -3930,6 +3930,8 @@ def _pending_delivery_counts(paths, *, session_observation=None):
     no_recipient = None
     live_sessions = None
     graph = None
+    from peer_read_context import PeerReadContext
+    read_context = PeerReadContext()
     if (isinstance(session_observation, dict)
             and session_observation.get("complete") is True
             and session_observation.get("herdr_complete") is True
@@ -3951,7 +3953,7 @@ def _pending_delivery_counts(paths, *, session_observation=None):
                 no_recipient = 0
                 try:
                     from dispatch_seat_handover import lineage_graph
-                    graph = lineage_graph()
+                    graph = lineage_graph(read_context=read_context)
                 except Exception:
                     graph = None
                     no_recipient = None
@@ -4120,7 +4122,7 @@ def _pending_delivery_counts(paths, *, session_observation=None):
                                 if not is_notice:
                                     no_recipient_unknown = True
                         recipient = record_recipient_binding(
-                            record, storage_sid, harness=harness, jobs=jobs)
+                            record, storage_sid, harness=harness, jobs=jobs, read_context=read_context)
                     except Exception:
                         recipient = None
                     if recipient is None:
@@ -4172,7 +4174,7 @@ def _pending_delivery_counts(paths, *, session_observation=None):
                     or not eligible_row(meta) or not _registered_parent_harness(meta)):
                 no_recipient_unknown = True
                 continue
-            sid, harness = _effective(meta, path)
+            sid, harness = _effective(meta, path, read_context=read_context)
             if not sid or harness not in {"claude", "codex", "opencode"}:
                 no_recipient_unknown = True
                 continue

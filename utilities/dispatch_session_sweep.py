@@ -185,12 +185,14 @@ def _recipient_harness(recipient_kind: str) -> str | None:
     return None
 
 
-def addressed_records(root: Path, recipient_kind: str, session_id: str) -> tuple[list[dict], int]:
+def addressed_records(root: Path, recipient_kind: str, session_id: str, *, read_context=None) -> tuple[list[dict], int]:
     """Read the current session's open notices without claiming or consuming them."""
     from dispatch_seat_handover import record_for_session, storage_recipients
+    from peer_read_context import PeerReadContext
+    read_context = read_context or PeerReadContext()
     records, count = [], 0
     harness = _recipient_harness(recipient_kind)
-    for storage_key, allowed in storage_recipients(session_id, harness=harness):
+    for storage_key, allowed in storage_recipients(session_id, harness=harness, read_context=read_context):
         try:
             directory = pending_delivery.record_directory(root, storage_key)
             entries = sorted(directory.glob("delivery-*.json"))
@@ -206,7 +208,8 @@ def addressed_records(root: Path, recipient_kind: str, session_id: str) -> tuple
                     and record.get("state") in pending_delivery.OPEN_STATES
                     and record_for_session(record, allowed, session=session_id,
                                            harness=harness,
-                                           storage_key=storage_key, jobs=record_jobs(root, record))):
+                                           storage_key=storage_key, jobs=record_jobs(root, record),
+                                           read_context=read_context)):
                 records.append({**record, STORAGE_KEY: storage_key})
     return records, count
 
@@ -379,10 +382,13 @@ def sweep_deliver(
 
     def currently_addressed(record, storage_key):
         from dispatch_seat_handover import record_for_session, storage_recipients
-        scopes = dict(storage_recipients(session_id, harness=harness))
+        from peer_read_context import PeerReadContext
+        # A new effect check must not consume the discovery pass's authority.
+        context = PeerReadContext()
+        scopes = dict(storage_recipients(session_id, harness=harness, read_context=context))
         return storage_key in scopes and record_for_session(
             record, scopes[storage_key], session=session_id, harness=harness,
-            storage_key=storage_key, jobs=record_jobs(root, record))
+            storage_key=storage_key, jobs=record_jobs(root, record), read_context=context)
 
     def settle_observed(record):
         evidence = native_evidence
@@ -906,6 +912,8 @@ def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
     """
     from dispatch_recipient_receipt import OPENCODE_MARKER_LINE_RE, identity_binding
     from dispatch_seat_handover import record_for_session, storage_recipients
+    from peer_read_context import PeerReadContext
+    read_context = PeerReadContext()
 
     by_id: dict[str, list[tuple[Path, dict]]] = {}
     candidate_ids = set()
@@ -918,7 +926,7 @@ def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
         candidate_ids.update(delivery_id for delivery_id, _digest in markers)
 
     for root in roots:
-        records, _count = addressed_records(root, recipient_kind, session_id)
+        records, _count = addressed_records(root, recipient_kind, session_id, read_context=read_context)
         for record in records:
             delivery_id = record.get("delivery_id")
             if delivery_id in candidate_ids:
@@ -927,7 +935,7 @@ def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
     # Open records are already enumerated above. Look up only marker-selected
     # terminal records so an ACKed member can validate the old complete batch.
     harness = _recipient_harness(recipient_kind)
-    recipients = storage_recipients(session_id, harness=harness)
+    recipients = storage_recipients(session_id, harness=harness, read_context=read_context)
     for delivery_id in candidate_ids - by_id.keys():
         for root in roots:
             for storage, allowed in recipients:
@@ -937,7 +945,7 @@ def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
                             or record.get("recipient_kind") != recipient_kind
                             or not record_for_session(record, allowed, session=session_id,
                                                       harness=harness,
-                                                      storage_key=storage)):
+                                                      storage_key=storage, read_context=read_context)):
                         continue
                     by_id.setdefault(delivery_id, []).append(
                         (root, {**record, STORAGE_KEY: storage}))
@@ -1115,13 +1123,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.recipient_kind != "opencode-turn":
             parser.error("recipients is an internal OpenCode carrier action")
         from dispatch_seat_handover import lineage_graph, storage_recipients
+        from peer_read_context import PeerReadContext
+        read_context = PeerReadContext()
         # Project the generation that was actually readable by the shared
         # graph, so a warm observation failure cannot preserve old digests.
-        graph = lineage_graph()
+        graph = lineage_graph(read_context=read_context)
         generation = hashlib.sha256(json.dumps(graph.generation, separators=(",", ":")).encode()).hexdigest()
         digests = sorted({hashlib.sha256(storage.encode()).hexdigest()
                           for storage, _allowed in storage_recipients(
-                              args.session, harness="opencode")})
+                              args.session, harness="opencode", read_context=read_context)})
         if lineage_graph() is not graph:
             raise OSError("lineage-observation-changed")
         print(json.dumps({"generation": generation, "digests": digests}))
