@@ -3145,15 +3145,16 @@ def _guess_seat_from_ledgers(cwd: str) -> tuple[Optional[Seat], Optional[dict]]:
     return best
 
 
-def resolve_caller(harness, sid, cwd: str) -> Optional[tuple[Seat, str, str]]:
+def resolve_caller(harness, sid, cwd: str, *, project: bool = True) -> Optional[tuple[Seat, str, str]]:
     """(seat, harness, session id) of the calling session; ids come from the arguments,
     harness variables and, for pane/native seats, the seat ledger. Project ledger inference
-    selects only the shared seat and harness; an absent caller id gets a fresh ``unknown-`` id."""
+    selects only the shared seat and harness when project resolution is enabled; an absent
+    caller id gets a fresh ``unknown-`` id."""
     explicit_sid = bool(sid)
     if not sid:
         harness, sid = session_from_env(harness)
     detected = harness or session_from_env(None)[0]
-    seat = resolve_seat(detected, cwd, sid=sid)
+    seat = resolve_seat(detected, cwd, sid=sid, project=project)
     if seat.native:
         # The inherited Claude session variable can still name the previous
         # conversation after /clear. This exact process declares the current id.
@@ -3166,7 +3167,7 @@ def resolve_caller(harness, sid, cwd: str) -> Optional[tuple[Seat, str, str]]:
     if seat.kind == "project":
         # Ledger inference still chooses the project seat and harness when neither
         # was supplied, but a neighboring session is never evidence of this caller's id.
-        if not detected:
+        if project and not detected:
             guessed_seat, ledger_row = _guess_seat_from_ledgers(cwd)
             if guessed_seat is not None and ledger_row:
                 seat = guessed_seat

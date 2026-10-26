@@ -18,7 +18,8 @@ from terminal_surface import HerdrSurface, Near, open_pane
 
 
 def _identity(args):
-    resolved = session_tidy.resolve_caller(args.harness, args.session_id, os.getcwd())
+    resolved = session_tidy.resolve_caller(
+        args.harness, args.session_id, os.getcwd(), project=False)
     if resolved:
         seat, harness, sid = resolved
         if harness in session_tidy.HARNESSES and sid and not sid.startswith("unknown-"):
@@ -67,7 +68,8 @@ def _show(text):
 def _view(args):
     if args.harness and args.session_id:
         seat = session_tidy.session_seat(
-            session_tidy.resolve_seat(args.harness, os.getcwd(), sid=args.session_id),
+            session_tidy.resolve_seat(args.harness, os.getcwd(), sid=args.session_id,
+                                      project=False),
             args.harness, args.session_id)
     else:
         seat = session_tidy.Seat("pane", args.seat_key, args.pane, "codex", "",
