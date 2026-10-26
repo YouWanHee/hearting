@@ -562,6 +562,38 @@ class QueuedManual:
         self.params = params
 
 
+class PendingServerRequest:
+    """One exact server-initiated request on the current App Server socket."""
+
+    def __init__(
+        self,
+        *,
+        request_id: Any,
+        method: str,
+        params: dict[str, Any],
+        thread_id: str,
+        turn_id: str | None,
+        item_id: str | None,
+        kind: str,
+        epoch: int,
+        binding_generation: int,
+        received_at: float,
+    ) -> None:
+        self.request_id = request_id
+        self.method = method
+        self.params = params
+        self.thread_id = thread_id
+        self.turn_id = turn_id
+        self.item_id = item_id
+        self.kind = kind
+        self.epoch = epoch
+        self.binding_generation = binding_generation
+        self.received_at = received_at
+        self.state = "open"
+        self.ambiguous = False
+        self.action_id = ""
+
+
 class ThreadState:
     def __init__(
         self,
@@ -642,8 +674,15 @@ class ManagedGateway:
             if (value := os.environ.get(key, ""))
         }
         self._appserver_requests: dict[
-            tuple[str, tuple[str, Any]], float
+            tuple[str, tuple[str, Any]], PendingServerRequest
         ] = {}
+        # Body-free terminal records prevent a late TUI reply or a repeated
+        # Fleet action from answering a request twice. They are scoped to the
+        # current App Server connection epoch and are never written to disk.
+        self._retired_appserver_requests: dict[
+            tuple[str, tuple[str, Any]], dict[str, Any]
+        ] = {}
+        self._interaction_actions: dict[str, tuple[str, dict[str, Any]]] = {}
         self._internal: dict[tuple[str, Any], PendingInternal] = {}
         self._delivery_pending: dict[str, PendingInternal] = {}
         self._next_internal_id = 1
@@ -767,6 +806,7 @@ class ManagedGateway:
                 self._threads.clear()
                 self._tui_requests.clear()
                 self._pending_transitions.clear()
+                self._retired_appserver_requests.clear()
                 for thread_id in {
                     identity[0] for identity in self._appserver_requests
                 }:
@@ -878,12 +918,19 @@ class ManagedGateway:
             response_key = (
                 request_key(message.get("id")) if "id" in message else None
             )
+            native_server_response: tuple[str, tuple[str, Any]] | None = None
             if (
                 response_key is not None
                 and "method" not in message
                 and ("result" in message or "error" in message)
+                and response_key not in self._tui_requests
             ):
-                self._resolve_unique_appserver_response_locked(response_key)
+                action, identity = self._prepare_tui_server_response_locked(
+                    response_key
+                )
+                if action == "suppress":
+                    return
+                native_server_response = identity
             if method == "turn/start" and "id" in message:
                 params = message.get("params")
                 if not isinstance(params, dict):
@@ -909,7 +956,18 @@ class ManagedGateway:
                         "prior_thread_id": self._binding_thread_id,
                         "prior_generation": self._binding_generation,
                     }
-            self._upstream.write_json(message)
+            try:
+                self._upstream.write_json(message)
+            except OSError:
+                if native_server_response is not None:
+                    self._set_retired_request_state_locked(
+                        native_server_response, "unknown"
+                    )
+                raise
+            if native_server_response is not None:
+                self._set_retired_request_state_locked(
+                    native_server_response, "submitted"
+                )
             self.trace("tui-forward", method=str(method or ""))
 
     def _handle_manual_start_locked(
@@ -1000,28 +1058,58 @@ class ManagedGateway:
     def _handle_upstream_locked(self, message: dict[str, Any]) -> None:
         method = message.get("method")
         key = request_key(message.get("id")) if "id" in message else None
-        if method == "item/tool/requestUserInput":
-            thread_id = thread_id_from_message(message)
-            if (
-                thread_id
-                and FLEET_SESSION_PATTERN.fullmatch(thread_id)
-                and key is not None
-            ):
-                identity = (thread_id, key)
-                self._appserver_requests.setdefault(identity, time.time())
-                self._publish_wait_locked(thread_id)
-                # Human availability is not a deadline. Codex 0.153.4's TUI
-                # ignores autoResolutionMs and expires non-blocking questions
-                # after 60s grace + 60s countdown. Project only the native UI
-                # wait policy; the TUI still owns answers and explicit cancel.
-                params = message["params"]
-                projected = dict(params)
-                if isinstance(params.get("isBlocking"), bool):
-                    projected["isBlocking"] = True
-                if "autoResolutionMs" in params:
-                    projected["autoResolutionMs"] = None
-                if projected != params:
-                    message = {**message, "params": projected}
+        if method in {"item/started", "item/completed"}:
+            params = message.get("params")
+            item = params.get("item") if isinstance(params, dict) else None
+            state = self._threads.get(thread_id_from_message(message))
+            if (isinstance(item, dict) and item.get("type") == "fileChange"
+                    and isinstance(item.get("id"), str) and state is not None
+                    and state.active_turn_id == turn_id_from_message(message)):
+                # Retain the actual native item in the existing current-turn
+                # object. It is erased with that turn and never enters status.
+                affected = [pending for pending in self._appserver_requests.values()
+                            if pending.thread_id == thread_id_from_message(message)
+                            and pending.turn_id == state.active_turn_id
+                            and pending.item_id == item["id"]
+                            and pending.method == "item/fileChange/requestApproval"]
+                previous_targets = [self._file_change_targets_locked(pending)
+                                    for pending in affected]
+                turn = dict(state.active_turn or self._minimal_turn(state.active_turn_id))
+                previous_items = turn.get("items")
+                previous_items = previous_items if isinstance(previous_items, list) else []
+                items = [old for old in previous_items
+                         if not isinstance(old, dict) or old.get("id") != item["id"]]
+                turn["items"] = items + [copy.deepcopy(item)]
+                state.active_turn = turn
+                for pending, previous in zip(affected, previous_targets):
+                    if previous != self._file_change_targets_locked(pending):
+                        pending.binding_generation += 1
+        if isinstance(method, str) and self._interaction_kind(method) is not None:
+            pending = self._pending_server_interaction_locked(message, key)
+            if pending is not None:
+                request_key_value = request_key(pending.request_id)
+                assert request_key_value is not None
+                identity = (pending.thread_id, request_key_value)
+                existing = self._appserver_requests.get(identity)
+                if existing is None and identity not in self._retired_appserver_requests:
+                    self._appserver_requests[identity] = pending
+                    self._publish_wait_locked(pending.thread_id)
+                elif existing is not None and (
+                    existing.method != pending.method
+                    or existing.params != pending.params
+                ):
+                    existing.ambiguous = True
+                if method == "item/tool/requestUserInput":
+                    # Preserve the native question while preventing the
+                    # gateway-owned TUI from expiring it on a local timer.
+                    params = message["params"]
+                    projected = dict(params)
+                    if isinstance(params.get("isBlocking"), bool):
+                        projected["isBlocking"] = True
+                    if "autoResolutionMs" in params:
+                        projected["autoResolutionMs"] = None
+                    if projected != params:
+                        message = {**message, "params": projected}
         elif method == "serverRequest/resolved":
             params = message.get("params")
             if isinstance(params, dict):
@@ -1033,7 +1121,7 @@ class ManagedGateway:
                     and resolved is not None
                 ):
                     self._resolve_appserver_request_locked(
-                        thread_id, resolved
+                        thread_id, resolved, state="resolved"
                     )
         if key is not None and key in self._internal:
             self._handle_internal_response_locked(
@@ -1053,6 +1141,7 @@ class ManagedGateway:
             thread_id = thread_id_from_message(message)
             turn_id = turn_id_from_message(message)
             if thread_id and turn_id:
+                self._cancel_replaced_requests_locked(thread_id, turn_id)
                 state = self._threads.setdefault(thread_id, ThreadState())
                 state.active_turn_id = turn_id
                 state.active_turn = turn_from_message(message)
@@ -1083,7 +1172,9 @@ class ManagedGateway:
             thread_id = thread_id_from_message(message)
             turn_id = turn_id_from_message(message)
             if thread_id:
-                self._clear_thread_requests_locked(thread_id)
+                self._clear_thread_requests_locked(
+                    thread_id, state="cancelled"
+                )
             state = self._threads.get(thread_id)
             if state is not None and (
                 not turn_id or state.active_turn_id == turn_id
@@ -1100,6 +1191,36 @@ class ManagedGateway:
                 self._merge_pending_registry_fields_locked(
                     {"status": "idle", "statusUpdatedAt": now_ms, "updatedAt": now_ms}
                 )
+        elif method == "turn/aborted":
+            thread_id = thread_id_from_message(message)
+            if thread_id:
+                self._clear_thread_requests_locked(
+                    thread_id, state="cancelled"
+                )
+        elif method == "item/completed":
+            params = message.get("params")
+            item = params.get("item") if isinstance(params, dict) else None
+            thread_id = thread_id_from_message(message)
+            turn_id = turn_id_from_message(message)
+            item_id = item.get("id") if isinstance(item, dict) else None
+            item_status = item.get("status") if isinstance(item, dict) else None
+            if (
+                isinstance(thread_id, str)
+                and isinstance(turn_id, str)
+                and isinstance(item_id, str)
+                and item_status in {"completed", "failed", "declined"}
+            ):
+                for identity, retired in list(self._retired_appserver_requests.items()):
+                    ref = retired.get("ref", {})
+                    if (
+                        ref.get("session_id") == thread_id
+                        and ref.get("turn_id") == turn_id
+                        and ref.get("item_id") == item_id
+                        and retired.get("state") in {"submitted", "received"}
+                    ):
+                        self._set_retired_request_state_locked(
+                            identity, "applied"
+                        )
         self._send_tui_locked(message)
 
     def _publish_wait_locked(self, thread_id: str) -> None:
@@ -1109,8 +1230,8 @@ class ManagedGateway:
                 for (current, _), waiting in self._appserver_requests.items()
                 if current == thread_id
             ]
+            existing = fleet_interaction.read_wait(thread_id, "codex")
             if pending:
-                existing = fleet_interaction.read_wait(thread_id, "codex")
                 if (
                     existing is None
                     or existing.get("source") == "codex-appserver"
@@ -1120,63 +1241,210 @@ class ManagedGateway:
                         "codex",
                         "decision",
                         "codex-appserver",
-                        now=min(pending),
+                        now=min(item.received_at for item in pending),
+                        request_id=(pending[0].request_id if len(pending) == 1 else None),
+                        turn_id=(pending[0].turn_id if len(pending) == 1 else None),
+                        item_id=(pending[0].item_id if len(pending) == 1 else None),
                     )
+            elif existing and existing.get("source") == "codex-appserver":
+                fleet_interaction.clear_wait(thread_id, "codex")
         except Exception:
             pass
 
-    def _clear_thread_requests_locked(self, thread_id: str) -> None:
+    def _clear_thread_requests_locked(
+        self, thread_id: str, *, state: str = "unknown"
+    ) -> None:
         keys = [
             identity
             for identity in self._appserver_requests
             if identity[0] == thread_id
         ]
         for key in keys:
-            self._appserver_requests.pop(key, None)
-        try:
-            existing = fleet_interaction.read_wait(thread_id, "codex")
-            if existing and existing.get("source") == "codex-appserver":
-                fleet_interaction.clear_wait(thread_id, "codex")
-        except Exception:
-            pass
+            pending = self._appserver_requests.pop(key, None)
+            if pending is not None:
+                self._retire_server_request_locked(pending, state)
+        self._publish_wait_locked(thread_id)
 
-    def _resolve_unique_appserver_response_locked(
+    def _prepare_tui_server_response_locked(
         self, key: tuple[str, Any]
-    ) -> None:
+    ) -> tuple[str, tuple[str, tuple[str, Any]] | None]:
         matches = [
             identity
             for identity in self._appserver_requests
             if identity[1] == key
         ]
-        if len(matches) == 1:
-            self._resolve_appserver_request_locked(*matches[0])
+        retired = [
+            identity
+            for identity in self._retired_appserver_requests
+            if identity[1] == key
+        ]
+        if len(matches) == 1 and not retired:
+            pending = self._appserver_requests.pop(matches[0])
+            self._retire_server_request_locked(pending, "submitted")
+            self._publish_wait_locked(pending.thread_id)
+            return "forward", matches[0]
+        if matches:
+            # A native TUI response already carries the original JSON-RPC
+            # id. When that id collides across threads or a retired request,
+            # only the App Server can disambiguate it; preserve the native
+            # relay and do not attribute the response to either wait marker.
+            return "forward", None
+        if retired:
+            return "suppress", None
+        return "forward", None
 
     def _resolve_appserver_request_locked(
-        self, thread_id: str, key: tuple[str, Any]
+        self,
+        thread_id: str,
+        key: tuple[str, Any],
+        *,
+        state: str = "resolved",
     ) -> None:
         identity = (thread_id, key)
-        if self._appserver_requests.pop(identity, None) is None:
+        pending = self._appserver_requests.pop(identity, None)
+        if pending is not None:
+            terminal_state = (
+                "received" if pending.state == "submitted" else "unknown"
+            ) if state == "resolved" else state
+            self._retire_server_request_locked(pending, terminal_state)
+        else:
+            retired = self._retired_appserver_requests.get(identity)
+            if retired is not None and retired.get("state") == "submitted":
+                self._set_retired_request_state_locked(identity, "received")
+            else:
+                return
+        self._publish_wait_locked(thread_id)
+
+    @staticmethod
+    def _interaction_kind(method: str) -> str | None:
+        return {
+            "item/tool/requestUserInput": "question",
+            "item/commandExecution/requestApproval": "approval",
+            "item/fileChange/requestApproval": "approval",
+            "item/permissions/requestApproval": "approval",
+            "mcpServer/elicitation/request": "elicitation",
+        }.get(method)
+
+    def _pending_server_interaction_locked(
+        self, message: dict[str, Any], key: tuple[str, Any] | None
+    ) -> PendingServerRequest | None:
+        method = message.get("method")
+        params = message.get("params")
+        kind = self._interaction_kind(method) if isinstance(method, str) else None
+        if kind is None or key is None or not isinstance(params, dict):
+            return None
+        thread_id = params.get("threadId")
+        turn_id = params.get("turnId")
+        item_id = params.get("itemId")
+        if (
+            not isinstance(thread_id, str)
+            or not FLEET_SESSION_PATTERN.fullmatch(thread_id)
+            or (turn_id is not None and not isinstance(turn_id, str))
+            or (item_id is not None and not isinstance(item_id, str))
+        ):
+            return None
+        if method != "mcpServer/elicitation/request":
+            if not turn_id or not item_id:
+                return None
+        elif not isinstance(params.get("serverName"), str):
+            return None
+        if method == "item/tool/requestUserInput":
+            questions = params.get("questions")
+            if not isinstance(questions, list) or not questions:
+                return None
+            question_ids: set[str] = set()
+            for question in questions:
+                if (
+                    not isinstance(question, dict)
+                    or not isinstance(question.get("id"), str)
+                    or not question.get("id")
+                    or question["id"] in question_ids
+                    or not isinstance(question.get("question"), str)
+                    or not question["question"]
+                ):
+                    return None
+                question_ids.add(question["id"])
+        if method == "mcpServer/elicitation/request" and params.get("mode") not in {
+            "form", "openai/form", "openaiForm", "openai/userVerification", "url"
+        }:
+            return None
+        return PendingServerRequest(
+            request_id=message.get("id"),
+            method=method,
+            params=copy.deepcopy(params),
+            thread_id=thread_id,
+            turn_id=turn_id,
+            item_id=item_id,
+            kind=kind,
+            epoch=self._epoch,
+            binding_generation=self._binding_generation,
+            received_at=time.time(),
+        )
+
+    @staticmethod
+    def _server_request_ref(pending: PendingServerRequest) -> dict[str, Any]:
+        return {
+            "harness": "codex",
+            "session_id": pending.thread_id,
+            "request_id": pending.request_id,
+            "turn_id": pending.turn_id,
+            "item_id": pending.item_id,
+            "method": pending.method,
+            "kind": pending.kind,
+            "epoch": pending.epoch,
+            "binding_generation": pending.binding_generation,
+        }
+
+    def _retire_server_request_locked(
+        self, pending: PendingServerRequest, state: str
+    ) -> None:
+        key = request_key(pending.request_id)
+        if key is None:
             return
-        remaining = [
-            waiting
-            for (current, _), waiting in self._appserver_requests.items()
-            if current == thread_id
+        identity = (pending.thread_id, key)
+        pending.state = state
+        pending.params = {}
+        self._retired_appserver_requests[identity] = {
+            "ref": self._server_request_ref(pending),
+            "state": state,
+            "action_id": pending.action_id,
+        }
+        if pending.action_id:
+            self._set_retired_request_state_locked(identity, state)
+
+    def _set_retired_request_state_locked(
+        self, identity: tuple[str, tuple[str, Any]], state: str
+    ) -> None:
+        retired = self._retired_appserver_requests.get(identity)
+        if retired is None:
+            return
+        retired["state"] = state
+        action_id = retired.get("action_id")
+        previous = (
+            self._interaction_actions.get(action_id)
+            if isinstance(action_id, str) and action_id
+            else None
+        )
+        if previous is not None:
+            receipt = dict(previous[1])
+            receipt["status"] = state
+            self._interaction_actions[action_id] = (previous[0], receipt)
+
+    def _cancel_replaced_requests_locked(
+        self, thread_id: str, turn_id: str
+    ) -> None:
+        replaced = [
+            (identity, pending)
+            for identity, pending in self._appserver_requests.items()
+            if pending.thread_id == thread_id
+            and pending.turn_id
+            and pending.turn_id != turn_id
         ]
-        try:
-            existing = fleet_interaction.read_wait(thread_id, "codex")
-            if existing and existing.get("source") == "codex-appserver":
-                if remaining:
-                    fleet_interaction.set_wait(
-                        thread_id,
-                        "codex",
-                        "decision",
-                        "codex-appserver",
-                        now=min(remaining),
-                    )
-                else:
-                    fleet_interaction.clear_wait(thread_id, "codex")
-        except Exception:
-            pass
+        for identity, pending in replaced:
+            self._appserver_requests.pop(identity, None)
+            self._retire_server_request_locked(pending, "cancelled")
+        if replaced:
+            self._publish_wait_locked(thread_id)
 
     def _track_tui_response_locked(
         self,
@@ -1600,6 +1868,12 @@ class ManagedGateway:
                 raise GatewayError("control-request-schema-invalid")
             if value.get("op") == "status":
                 response = self.status()
+            elif value.get("op") == "interaction-list":
+                response = self._interaction_list(value)
+            elif value.get("op") == "interaction-detail":
+                response = self._interaction_detail(value)
+            elif value.get("op") == "interaction-reply":
+                response = self._interaction_reply(value)
             elif value.get("op") == "deliver":
                 response = self.deliver(value)
             elif value.get("op") in {"deliver-human-gate", "deliver-notice"}:
@@ -1626,6 +1900,332 @@ class ManagedGateway:
             pass
         finally:
             connection.close()
+
+    def _interaction_list(self, request: dict[str, Any]) -> dict[str, Any]:
+        if set(request) != {"schema_version", "op", "session_id"}:
+            raise GatewayError("interaction-list-shape-invalid")
+        session_id = request.get("session_id")
+        if not isinstance(session_id, str) or not FLEET_SESSION_PATTERN.fullmatch(session_id):
+            raise GatewayError("interaction-session-id-invalid")
+        with self._lock:
+            if self._tui is None or self._upstream is None:
+                return {
+                    "schema_version": 1,
+                    "status": "unavailable",
+                    "capability": {"supported": False, "reason": "upstream-disconnected"},
+                    "requests": [],
+                }
+            pending = sorted(
+                (
+                    item for item in self._appserver_requests.values()
+                    if item.thread_id == session_id and item.epoch == self._epoch
+                ),
+                key=lambda item: item.received_at,
+            )
+            return {
+                "schema_version": 1,
+                "status": "ready",
+                "capability": {
+                    "supported": True,
+                    "harness": "codex",
+                    "surface": "owning-app-server-connection",
+                },
+                "requests": [self._server_request_ref(item) for item in pending],
+            }
+
+    @staticmethod
+    def _unknown_interaction_envelope(
+        ref: dict[str, Any], state: str, *, reason: str = ""
+    ) -> dict[str, Any]:
+        envelope = {
+            "v": 1,
+            "harness": "codex",
+            "session_id": ref["session_id"],
+            "request_id": ref["request_id"],
+            "turn_id": ref["turn_id"],
+            "kind": ref["kind"],
+            "state": state,
+            "support": {"supported": False},
+            "actions": [],
+        }
+        if reason:
+            envelope["support"]["reason"] = reason
+        return envelope
+
+    def _file_change_targets_locked(self, pending: PendingServerRequest) -> list[dict[str, Any]]:
+        state = self._threads.get(pending.thread_id)
+        turn = state.active_turn if state is not None else None
+        if (state is None or state.active_turn_id != pending.turn_id or not isinstance(turn, dict)):
+            return []
+        items = turn.get("items")
+        if not isinstance(items, list):
+            return []
+        for item in items:
+            if (not isinstance(item, dict) or item.get("type") != "fileChange"
+                    or item.get("id") != pending.item_id):
+                continue
+            changes = item.get("changes")
+            if (not isinstance(changes, list) or not changes
+                    or any(not isinstance(change, dict) or not isinstance(change.get("path"), str)
+                           or not change["path"] for change in changes)):
+                return []
+            return [{"path": change["path"], "kind": copy.deepcopy(change.get("kind"))}
+                    for change in changes]
+        return []
+
+    def _interaction_detail(self, request: dict[str, Any]) -> dict[str, Any]:
+        if set(request) != {"schema_version", "op", "ref"}:
+            raise GatewayError("interaction-detail-shape-invalid")
+        ref = request.get("ref")
+        ref_keys = {
+            "harness", "session_id", "request_id", "turn_id", "item_id",
+            "method", "kind", "epoch", "binding_generation",
+        }
+        if not isinstance(ref, dict) or set(ref) != ref_keys:
+            raise GatewayError("interaction-ref-shape-invalid")
+        if (
+            ref.get("harness") != "codex"
+            or not isinstance(ref.get("session_id"), str)
+            or not FLEET_SESSION_PATTERN.fullmatch(ref["session_id"])
+            or type(ref.get("epoch")) is not int
+            or type(ref.get("binding_generation")) is not int
+            or request_key(ref.get("request_id")) is None
+        ):
+            raise GatewayError("interaction-ref-invalid")
+        with self._lock:
+            identity = (ref["session_id"], request_key(ref["request_id"]))
+            if ref["epoch"] != self._epoch:
+                envelope = self._unknown_interaction_envelope(ref, "expired")
+                return {"schema_version": 1, "status": "expired", "request": envelope}
+            pending = self._appserver_requests.get(identity)
+            if pending is not None and self._server_request_ref(pending) == ref:
+                if pending.ambiguous or self._upstream is None or self._tui is None:
+                    envelope = self._unknown_interaction_envelope(
+                        ref, "unknown", reason="request-identity-or-connection-ambiguous"
+                    )
+                    return {"schema_version": 1, "status": "unknown", "request": envelope}
+                detail = copy.deepcopy(pending.params)
+                if pending.method == "mcpServer/elicitation/request":
+                    detail.pop("_meta", None)
+                actions: list[str]
+                support: dict[str, Any] = {"supported": True}
+                if pending.kind == "question":
+                    actions = ["answer"]
+                elif pending.kind == "approval":
+                    actions = ["approve", "reject", "defer"]
+                    if pending.method == "item/fileChange/requestApproval":
+                        detail["operation"] = "Apply file changes"
+                        detail["changes"] = self._file_change_targets_locked(pending)
+                        if pending.params.get("grantRoot") is not None or not detail["changes"]:
+                            actions = ["reject", "defer"]
+                            support.update(approve_supported=False,
+                                           reason="file-change-targets-or-one-request-scope-unavailable")
+                elif pending.params.get("mode") == "url":
+                    actions = ["approve", "reject", "cancel", "defer"]
+                else:
+                    actions = ["reject", "cancel", "defer"]
+                    support = {
+                        "supported": True,
+                        "approve_supported": False,
+                        "reason": "elicitation-accept-requires-explicit-content",
+                    }
+                envelope = {
+                    "v": 1,
+                    "harness": "codex",
+                    "session_id": pending.thread_id,
+                    "request_id": pending.request_id,
+                    "turn_id": pending.turn_id,
+                    "kind": pending.kind,
+                    "detail": detail,
+                    "state": "open",
+                    "support": support,
+                    "actions": actions,
+                }
+                return {"schema_version": 1, "status": "ready", "request": envelope}
+            retired = self._retired_appserver_requests.get(identity)
+            if retired is not None and retired.get("ref") == ref:
+                state = retired.get("state", "unknown")
+                envelope = self._unknown_interaction_envelope(ref, state)
+                return {"schema_version": 1, "status": state, "request": envelope}
+            envelope = self._unknown_interaction_envelope(ref, "unknown")
+            return {"schema_version": 1, "status": "unknown", "request": envelope}
+
+    @staticmethod
+    def _validate_question_answers(
+        pending: PendingServerRequest, response: dict[str, Any]
+    ) -> dict[str, Any]:
+        if set(response) != {"answers"} or not isinstance(response.get("answers"), dict):
+            raise GatewayError("interaction-answer-shape-invalid")
+        questions = pending.params.get("questions")
+        if not isinstance(questions, list):
+            raise GatewayError("interaction-question-schema-invalid")
+        answers = response["answers"]
+        expected = {question.get("id") for question in questions if isinstance(question, dict)}
+        if not expected or set(answers) != expected:
+            raise GatewayError("interaction-answer-question-id-mismatch")
+        native_answers: dict[str, Any] = {}
+        by_id = {question["id"]: question for question in questions}
+        for question_id, values in answers.items():
+            if (
+                not isinstance(values, list)
+                or not values
+                or any(not isinstance(value, str) or not value.strip() for value in values)
+            ):
+                raise GatewayError("interaction-answer-empty-or-invalid")
+            question = by_id[question_id]
+            options = question.get("options")
+            if isinstance(options, list) and not question.get("isOther", False):
+                allowed = {
+                    option.get("label") for option in options
+                    if isinstance(option, dict) and isinstance(option.get("label"), str)
+                }
+                if not set(values).issubset(allowed):
+                    raise GatewayError("interaction-answer-choice-invalid")
+            native_answers[question_id] = {"answers": list(values)}
+        return {"answers": native_answers}
+
+    @staticmethod
+    def _native_interaction_response(
+        pending: PendingServerRequest, response: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if pending.kind == "question":
+            return ManagedGateway._validate_question_answers(pending, response)
+        if not isinstance(response, dict) or set(response) != {"decision"}:
+            raise GatewayError("interaction-decision-shape-invalid")
+        decision = response.get("decision")
+        if decision == "defer":
+            return None
+        if pending.kind == "elicitation":
+            if decision == "approve" and pending.params.get("mode") == "url":
+                return {"action": "accept", "content": None, "_meta": None}
+            if decision == "reject":
+                return {"action": "decline", "content": None, "_meta": None}
+            if decision == "cancel":
+                return {"action": "cancel", "content": None, "_meta": None}
+            if decision == "approve":
+                raise GatewayError("elicitation-accept-requires-explicit-content")
+            raise GatewayError("interaction-decision-unsupported")
+        if decision not in {"approve", "reject"}:
+            raise GatewayError("interaction-decision-unsupported")
+        native_decision = "accept" if decision == "approve" else "decline"
+        if pending.method == "item/commandExecution/requestApproval":
+            available = pending.params.get("availableDecisions")
+            if isinstance(available, list) and native_decision not in available:
+                raise GatewayError("interaction-decision-not-available")
+            return {"decision": native_decision}
+        if pending.method == "item/fileChange/requestApproval":
+            return {"decision": native_decision}
+        if pending.method == "item/permissions/requestApproval":
+            if decision == "reject":
+                return {"permissions": {}, "scope": "turn"}
+            requested = pending.params.get("permissions")
+            if not isinstance(requested, dict) or set(requested) != {"network", "fileSystem"}:
+                raise GatewayError("interaction-permissions-schema-invalid")
+            granted = {
+                key: copy.deepcopy(value)
+                for key, value in requested.items()
+                if value is not None
+            }
+            if not granted:
+                raise GatewayError("interaction-permissions-empty")
+            return {"permissions": granted, "scope": "turn"}
+        raise GatewayError("interaction-method-unsupported")
+
+    def _interaction_reply(self, request: dict[str, Any]) -> dict[str, Any]:
+        if set(request) != {"schema_version", "op", "ref", "response", "action_id"}:
+            raise GatewayError("interaction-reply-shape-invalid")
+        ref = request.get("ref")
+        response = request.get("response")
+        action_id = request.get("action_id")
+        if not isinstance(action_id, str) or not ID_PATTERN.fullmatch(action_id):
+            raise GatewayError("interaction-action-id-invalid")
+        if not isinstance(response, dict):
+            raise GatewayError("interaction-response-invalid")
+        fingerprint = hashlib.sha256(
+            canonical({"ref": ref, "response": response}).encode("utf-8")
+        ).hexdigest()
+        with self._lock:
+            prior = self._interaction_actions.get(action_id)
+            if prior is not None:
+                if prior[0] != fingerprint:
+                    raise GatewayError("interaction-action-id-reused")
+                return copy.deepcopy(prior[1])
+            ref_keys = {
+                "harness", "session_id", "request_id", "turn_id", "item_id",
+                "method", "kind", "epoch", "binding_generation",
+            }
+            if not isinstance(ref, dict) or set(ref) != ref_keys:
+                raise GatewayError("interaction-ref-shape-invalid")
+            request_id_key = request_key(ref.get("request_id"))
+            if (
+                ref.get("harness") != "codex"
+                or not isinstance(ref.get("session_id"), str)
+                or not FLEET_SESSION_PATTERN.fullmatch(ref["session_id"])
+                or request_id_key is None
+                or type(ref.get("epoch")) is not int
+                or type(ref.get("binding_generation")) is not int
+            ):
+                raise GatewayError("interaction-ref-invalid")
+            if ref["epoch"] != self._epoch:
+                raise GatewayError("interaction-request-expired")
+            identity = (ref["session_id"], request_id_key)
+            pending = self._appserver_requests.get(identity)
+            if pending is None or self._server_request_ref(pending) != ref:
+                raise GatewayError("interaction-request-not-pending")
+            if pending.ambiguous:
+                raise GatewayError("interaction-request-identity-ambiguous")
+            if self._tui is None or self._upstream is None or pending.epoch != self._epoch:
+                raise GatewayError("interaction-upstream-disconnected")
+            if (
+                isinstance(response.get("decision"), str)
+                and response.get("decision") == "defer"
+            ):
+                if set(response) != {"decision"}:
+                    raise GatewayError("interaction-decision-shape-invalid")
+                if pending.kind == "question":
+                    raise GatewayError("interaction-defer-unsupported")
+                result = {
+                    "schema_version": 1,
+                    "status": "deferred",
+                    "request": ref,
+                    "action_id": action_id,
+                }
+                self._interaction_actions[action_id] = (fingerprint, result)
+                return copy.deepcopy(result)
+            native_response = self._native_interaction_response(pending, response)
+            if (pending.method == "item/fileChange/requestApproval"
+                    and response.get("decision") == "approve"
+                    and (pending.params.get("grantRoot") is not None
+                         or not self._file_change_targets_locked(pending))):
+                raise GatewayError("file-change-targets-or-one-request-scope-unavailable")
+            if native_response is None:
+                raise GatewayError("interaction-decision-shape-invalid")
+            result = {
+                "schema_version": 1,
+                "status": "submitted",
+                "request": ref,
+                "action_id": action_id,
+            }
+            pending.action_id = action_id
+            try:
+                self._upstream.write_json({
+                    "jsonrpc": "2.0",
+                    "id": pending.request_id,
+                    "result": native_response,
+                })
+            except OSError:
+                result["status"] = "unknown"
+                result["reason"] = "transport-write-ambiguous"
+                self._interaction_actions[action_id] = (fingerprint, result)
+                self._appserver_requests.pop(identity, None)
+                self._retire_server_request_locked(pending, "unknown")
+                self._publish_wait_locked(pending.thread_id)
+                return copy.deepcopy(result)
+            self._interaction_actions[action_id] = (fingerprint, result)
+            self._appserver_requests.pop(identity, None)
+            self._retire_server_request_locked(pending, "submitted")
+            self._publish_wait_locked(pending.thread_id)
+            return copy.deepcopy(result)
 
     def status(self) -> dict[str, Any]:
         with self._lock:

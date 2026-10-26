@@ -340,7 +340,9 @@ class ResetSignalTest(SeenTestCase):
                     for hook in group["hooks"]
                     if "mem.py" in hook["command"] and "inject --hook" in hook["command"]]
         self.assertEqual(len(commands), 1)
-        command = commands[0].replace('"$HOME/.claude/tools/memory/mem.py"', f'"{MEM}"')
+        command = commands[0].replace(
+            '"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/tools/memory/mem.py"',
+            f'"{MEM}"')
         self.assertIn(str(MEM), command)
         session = self.sid("real-command")
         self.candidates(session)

@@ -392,6 +392,8 @@ ATTEMPT_TERMINAL_EVIDENCE_KEYS = {
     "detected_by",
     "failure_class",
     "process_exit",
+    "quota_model_scope",
+    "quota_window",
     "reconcile_reason",
     "reset",
     "terminal_event",

@@ -15,6 +15,7 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import fixture_env  # noqa: E402
 import runtime_activation  # noqa: E402
 
 HOOKS = {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}]}
@@ -209,6 +210,102 @@ class ClaudeManagedSettingsTests(unittest.TestCase):
             self.assertEqual(conflicts, [])
 
 
+class ClaudeHookRootHealthTests(unittest.TestCase):
+    def _source(self, root: Path) -> tuple[Path, dict]:
+        active_root = root / "source"
+        (active_root / "adapters/claude").mkdir(parents=True)
+        config_root = "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+        hooks = {
+            "SessionStart": [{"matcher": "*", "hooks": [
+                {"type": "command", "command": f'sh "{config_root}/hooks/run-hook.sh" exec probe.py'},
+                {"type": "command", "command": f'sh -c \'exec python3 "{config_root}/tools/memory/mem.py" inject --hook\''},
+            ]}],
+            "Stop": [{"matcher": "*", "hooks": [
+                {"type": "command", "command": f'bash "{config_root}/hooks/herdr-agent-state.sh" session'},
+            ]}],
+        }
+        source = {
+            "hooks": hooks,
+            "statusLine": STATUS_LINE,
+            "autoMemoryEnabled": False,
+            "env": {key: "" for key in runtime_activation.CLAUDE_MANAGED_ENV_KEYS},
+        }
+        (active_root / "adapters/claude/settings.json").write_text(
+            json.dumps(source), encoding="utf-8"
+        )
+        return active_root, source
+
+    @staticmethod
+    def _files(home: Path) -> list[Path]:
+        paths = [
+            home / "hooks/run-hook.sh",
+            home / "tools/memory/mem.py",
+            home / "hooks/herdr-agent-state.sh",
+            home / "statusline.sh",
+        ]
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n", encoding="utf-8")
+            if path.name == "statusline.sh":
+                path.chmod(0o755)
+        return paths
+
+    def test_health_checks_custom_config_root_with_spaces_and_missing_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active_root, source = self._source(root)
+            custom_home = root / "custom config home"
+            settings_path = custom_home / "settings.json"
+            settings_path.parent.mkdir(parents=True)
+            (custom_home / "hooks").mkdir()
+            (custom_home / "tools/memory").mkdir(parents=True)
+            files = self._files(custom_home)
+            settings_path.write_text(json.dumps({
+                **source,
+                "hooks": source["hooks"],
+            }), encoding="utf-8")
+            default_home = root / "default home"
+            with fixture_env.patched_environment(root, HERE.parents[1]), \
+                    mock.patch.dict(os.environ, {
+                        "HOME": str(default_home),
+                        "ZDOTDIR": str(default_home),
+                        "CLAUDE_CONFIG_DIR": str(custom_home),
+                    }), \
+                    mock.patch.object(runtime_activation, "_config_path", return_value=settings_path):
+                self.assertEqual(runtime_activation._claude_settings_health(active_root), (False, []))
+                for path in files:
+                    before = path.read_bytes()
+                    # destructive-ok: reason=simulate one missing managed hook target for health detection; boundary=one item returned by _files under custom_home in this TemporaryDirectory
+                    path.unlink()
+                    self.assertTrue(runtime_activation._claude_settings_health(active_root)[0], path)
+                    path.write_bytes(before)
+
+    def test_default_home_fallback_health_accepts_old_command_spelling(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active_root, source = self._source(root)
+            home = root / "default home"
+            claude_home = home / ".claude"
+            self._files(claude_home)
+            old_hooks = json.loads(json.dumps(source["hooks"]))
+            for groups in old_hooks.values():
+                for group in groups:
+                    for hook in group["hooks"]:
+                        hook["command"] = hook["command"].replace(
+                            "${CLAUDE_CONFIG_DIR:-$HOME/.claude}", "$HOME/.claude"
+                        )
+            settings_path = claude_home / "settings.json"
+            settings_path.write_text(json.dumps({**source, "hooks": old_hooks}), encoding="utf-8")
+            with fixture_env.patched_environment(root, HERE.parents[1]), \
+                    mock.patch.dict(os.environ, {
+                        "HOME": str(home),
+                        "ZDOTDIR": str(home),
+                        "CLAUDE_CONFIG_DIR": "",
+                    }), \
+                    mock.patch.object(runtime_activation, "_config_path", return_value=settings_path):
+                self.assertEqual(runtime_activation._claude_settings_health(active_root), (False, []))
+
+
 class RetiredHookMigrationTests(unittest.TestCase):
     def setUp(self):
         # These cases isolate retirement and the statusLine/autoMemoryEnabled merge; the
@@ -264,6 +361,21 @@ class RetiredHookMigrationTests(unittest.TestCase):
                 runtime_activation._merge_claude_settings(source, None)
             self.assertEqual(helper._read_user_settings(home)["hooks"]["PreToolUse"][0]["hooks"], [user_hook])
 
+    def test_retired_commands_cover_both_config_root_spellings_and_preserve_foreign(self):
+        import claude_settings_config as settings
+        old_root = "$HOME/.claude/hooks/"
+        new_root = "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/"
+        user_hook = {"type": "command", "command": "/home/user/hooks/core-first-guard.sh"}
+        live_hook = {"type": "command", "command": f'sh "{new_root}spec-read-marker.sh"'}
+        data = {"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+            {"type": "command", "command": f'sh "{old_root}core-first-guard.sh"'},
+            {"type": "command", "command": f'sh "{new_root}core-first-guard.sh"'},
+            user_hook,
+            live_hook,
+        ]}]}}
+        self.assertTrue(settings.remove_retired_hooks(data))
+        self.assertEqual(data["hooks"]["PreToolUse"][0]["hooks"], [user_hook, live_hook])
+
     def test_retired_guard_called_through_the_harness_root_is_pruned(self):
         # Settings that reached a guard through the runtime-home `hearting`
         # projection, the managed `current` pointer, or a release directory
@@ -292,8 +404,8 @@ OLD_MEM_SYNC = (
     "|| [ \"${FLEET_TITLE_REFRESH:-}\" = 1 ] || [ \"${MEM_DISTILL:-}\" = 1 ]; then exit 0; fi; "
     "exec python3 \"$HOME/.claude/tools/memory/mem.py\" sync --json >/dev/null'"
 )
-FLEET_END = 'sh "$HOME/.claude/hooks/run-hook.sh" python3 fleet-interaction-state.py clear'
-HERDR_END = 'sh "$HOME/.claude/hooks/run-hook.sh" bash herdr-agent-state.sh release'
+FLEET_END = 'sh "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/run-hook.sh" python3 fleet-interaction-state.py clear'
+HERDR_END = 'sh "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/run-hook.sh" bash herdr-agent-state.sh release'
 
 
 class SessionEndMemorySyncRetirementTests(unittest.TestCase):

@@ -286,7 +286,11 @@ def main(argv=None):
             else:
                 from .projection import attach_projections
             ds, dj = attach_projections(ds, dj, **report_option)
-            return replace(observed, sessions=rs + ds, jobs=rj + dj)
+            answer_waits = demo.merge_answer_waits(
+                observed.answer_waits,
+                demo.answer_wait_snapshot(harness_filter=harness_filter))
+            return replace(observed, sessions=rs + ds, jobs=rj + dj,
+                           answer_waits=answer_waits)
 
     def projected_collector(harness_filter=None, usage="cache-only", fast_first=False,
                             include_report_verification=True):

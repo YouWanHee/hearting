@@ -936,16 +936,16 @@ class PtyRun:
             tree_hits = [hit for hit in explorer["hits"] if hit[3][:1] in (["scope"], ["route"])]
             tabs = [hit for hit in explorer["hits"] if hit[3] == ["tab", "COMPUTE"]]
             block_rows = 2 + explorer["compute_host_rows"]
-            self.check("whole COMPUTE block is painted and bottom anchored",
+            self.check("whole RESOURCES block is painted and bottom anchored",
                        explorer["frame_size"] == [rows, cols]
                        and len(compute_hits) == block_rows and compute_hits[0][0] == footer - block_rows
                        and compute_hits[-1][0] == footer - 1
                        and len(explorer["compute_lines"]) == block_rows
-                       and "COMPUTE" in explorer["compute_lines"][0]
+                       and "RESOURCES" in explorer["compute_lines"][0]
                        and all(hit[0] < footer for hit in compute_hits),
                        {"size": [rows, cols], "compute_hits": compute_hits,
                         "compute_lines": explorer["compute_lines"], "footer": footer})
-            self.check("COMPUTE menu remains a separate visible tab",
+            self.check("RESOURCES menu remains a separate visible tab",
                        len(tabs) == 1 and tabs[0][0] < tree[1], tabs)
             self.check("painted tree hits stay inside the tree viewport",
                        all(tree[1] <= hit[0] < tree[3] for hit in tree_hits),

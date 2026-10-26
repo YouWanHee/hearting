@@ -23,7 +23,8 @@ class ExplorerRuntimeReuseTests(unittest.TestCase):
         self.identity_patches = (
             patch.object(live, "_resolver", return_value={}),
             patch.object(live, "_session_records",
-                         return_value=([], {"tag": {"session": self.source, "sid": "sid"}})),
+                         return_value=([], {"tag": {"session": self.source, "sid": "sid",
+                                                     "ids": ("sid",)}})),
             patch.object(order, "order_path", return_value=self.path),
         )
         for item in self.identity_patches:
@@ -67,6 +68,64 @@ class ExplorerRuntimeReuseTests(unittest.TestCase):
         self.runtime.apply_effects((("reorder", "repo", "repo", "repo", "repo"),), model)
         self.prepare()
         self.assertEqual(self.load_order.call_count, 2)
+
+    def test_compose_reuses_immutable_vm_until_snapshot_detail_or_generation_changes(self):
+        from tools.fleet import render
+        from tools.fleet.explorer import live, order
+        from tools.fleet.explorer.state import NavState
+
+        runtime = ExplorerRuntime()
+        snapshot = {"sessions": [], "resources": [], "jobs": []}
+        detail = object()
+        compose_globals = ("_EXPLORER_COMPOSE_MODEL", "_EXPLORER_COMPOSE_SNAPSHOT",
+                           "_EXPLORER_COMPOSE_DETAIL", "_EXPLORER_COMPOSE_GENERATION")
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(order, "order_path", return_value=Path(temp) / "order.json"), \
+                patch.object(render, "_explorer_runtime", return_value=runtime), \
+                patch.object(render, "_EXPLORER_GENERATION", 10), \
+                patch.object(render, "_EXPLORER_STATE", NavState()), \
+                patch.object(render, "_EXPLORER_ORDER", []), \
+                patch.object(render, "_BLINK_ON", 1), \
+                patch.object(render, "_EXPLORER_COMPOSE_MODEL", None), \
+                patch.object(render, "_EXPLORER_COMPOSE_SNAPSHOT", None), \
+                patch.object(render, "_EXPLORER_COMPOSE_DETAIL", None), \
+                patch.object(render, "_EXPLORER_COMPOSE_GENERATION", None), \
+                patch.object(live, "build_view_model", wraps=live.build_view_model) as build:
+            render._explorer_compose(snapshot, 140, 45, NavState(), detail, now=1000)
+            first = render._EXPLORER_MODEL
+            render._explorer_compose(snapshot, 140, 45, NavState(), detail, now=1000)
+            self.assertIs(render._EXPLORER_MODEL, first)
+            self.assertEqual(build.call_count, 1)
+
+            render._explorer_compose(snapshot, 140, 45, NavState(), object(), now=1000)
+            self.assertEqual(build.call_count, 2)
+            render._EXPLORER_GENERATION = 11
+            render._explorer_compose(snapshot, 140, 45, NavState(), render._EXPLORER_RESULT, now=1000)
+            self.assertEqual(build.call_count, 3)
+
+    def test_persistence_deduplicates_before_serializing_and_retries_failed_write(self):
+        from tools.fleet.explorer.view_model import ExplorerViewModel
+
+        readiness = {"ready": True, "fully_fresh": True, "all_new": True,
+                     "observed_at": 1000.0, "generation": 1, "generation_identity": "g1"}
+        vm = ExplorerViewModel.from_mapping({"repos": [], "sessions": []})
+        with patch.object(self.runtime, "_write_cache", return_value=True) as write, \
+                patch.object(self.runtime, "_cache_envelope", wraps=self.runtime._cache_envelope) as envelope:
+            first = self.runtime.persist_complete_async(vm, readiness)
+            first.join(2)
+            self.assertIsNone(self.runtime.persist_complete_async(vm, readiness))
+            self.assertEqual(envelope.call_count, 1)
+            self.assertEqual(write.call_count, 1)
+
+        retry_runtime = ExplorerRuntime(self.path.parent)
+        retry_runtime.configure_persistence({"codex"})
+        with patch.object(retry_runtime, "_write_cache", side_effect=(False, True)) as write:
+            failed = retry_runtime.persist_complete_async(vm, readiness)
+            failed.join(2)
+            recovered = retry_runtime.persist_complete_async(vm, readiness)
+            self.assertIsNotNone(recovered)
+            recovered.join(2)
+            self.assertEqual(write.call_count, 2)
 
 
 if __name__ == "__main__":

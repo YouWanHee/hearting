@@ -33,7 +33,7 @@ class InteractionStateTest(unittest.TestCase):
             )
         )
         record = interaction.read_wait("sid-a", "claude")
-        self.assertEqual(set(record), interaction._ALLOWED_KEYS)
+        self.assertEqual(set(record), interaction._BASE_KEYS)
         self.assertEqual(record["kind"], "decision")
         path = interaction.sidecar_path("sid-a", "claude")
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
@@ -50,6 +50,23 @@ class InteractionStateTest(unittest.TestCase):
         self.assertEqual((record["harness"], record["session_id"], record["source"]),
                          ("opencode", "oc-sid", "opencode-question"))
         self.assertTrue(interaction.clear_wait("oc-sid", "opencode"))
+
+    def test_optional_native_refs_are_allowlisted_and_backward_compatible(self):
+        self.assertTrue(interaction.set_wait(
+            "sid-native", "codex", "decision", "codex-appserver", now=201.0,
+            request_id="42", turn_id="turn_7", item_id="item_9"))
+        record = interaction.read_wait("sid-native", "codex")
+        self.assertEqual((record["request_id"], record["turn_id"], record["item_id"]),
+                         ("42", "turn_7", "item_9"))
+        self.assertNotIn("question", record)
+        self.assertNotIn("choices", record)
+        self.assertTrue(interaction.set_wait(
+            "sid-native", "codex", "decision", "codex-appserver", now=202.0))
+        self.assertEqual(set(interaction.read_wait("sid-native", "codex")),
+                         interaction._BASE_KEYS)
+        self.assertFalse(interaction.set_wait(
+            "sid-native", "codex", "decision", "codex-appserver", now=203.0,
+            request_id="../foreign"))
 
     def test_schema_has_no_content_channel(self):
         signature = inspect.signature(interaction.set_wait)
@@ -133,7 +150,33 @@ class InteractionStateTest(unittest.TestCase):
         path = interaction.sidecar_path("sid", "claude")
         os.utime(path, (10, 10))
         self.assertIsNotNone(interaction.pending_wait("sid", "claude", now=1000))
-        self.assertEqual(interaction.sweep(now=1000, max_age=100), 1)
+        directory = os.path.dirname(path)
+        malformed = os.path.join(directory, "malformed.json")
+        with open(malformed, "w", encoding="utf-8") as handle:
+            handle.write("{broken")
+        os.utime(malformed, (10, 10))
+        temporary = os.path.join(directory, "abandoned.tmp")
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write("partial")
+        os.utime(temporary, (10, 10))
+        with tempfile.TemporaryDirectory() as external:
+            target = os.path.join(external, "keep.json")
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            os.utime(target, (10, 10))
+            linked = os.path.join(directory, "linked.json")
+            os.symlink(target, linked)
+
+            self.assertEqual(interaction.sweep(now=1000, max_age=100), 2)
+            self.assertIsNotNone(interaction.read_wait("sid", "claude"))
+            self.assertFalse(os.path.exists(malformed))
+            self.assertFalse(os.path.exists(temporary))
+            self.assertTrue(os.path.islink(linked))
+            self.assertTrue(os.path.exists(target))
+
+        self.assertIsNone(interaction.pending_wait(
+            "sid", "claude", activity_since=11, now=1000))
+        self.assertTrue(interaction.clear_wait("sid", "claude"))
         self.assertIsNone(interaction.read_wait("sid", "claude"))
 
     def test_sweep_does_not_follow_harness_directory_symlinks(self):

@@ -379,9 +379,12 @@ a next leg that could not be prepared is named in `plan_advance` beside it. The
 main session may still change the plan or stop; §0.4 says when a card comes first.
 A replayed `start` of the closed frame route answers for the furthest leg already
 started from its decision, so after the last leg it reports that leg's completion
-and no `next_leg`. A leg's optional `done_when` (sealed as `d1`, `d2`…), `verify`
-and `hands_over`, and the brief whose route the person chose, reach the owner and
-every stage worker of that leg from the sealed decision; a `qa/*` stage records
+and no `next_leg`. A leg's optional `done_when` (sealed as `d1`, `d2`…), `verify`,
+`hands_over` and approved `parallel` slices, and the brief whose route the person
+chose, reach the owner and every stage worker of that leg from the sealed decision.
+The owner may use `parallel` to assign workers or permitted sub-sessions; these
+notes are owner guidance, not route nodes or parallel groups, and a slice without
+a result is unfinished. A `qa/*` stage records
 each item beside its artifact as `<artifact>.items.json` (`leg_items_v1`, read by
 `route_plan.read_leg_items`). A leg may name its existing worktree with optional
 `cwd`; validation, first launch, later legs and the printed compose command use
@@ -652,7 +655,9 @@ registered part catalog row in `capabilities/topologies.json`. Native and
 borrowed route nodes resolve the same row from their sealed stage identity;
 the need is not copied into sealed nodes or inferred from the outer
 capability, node name, or task text. Routes without a declared compute stage
-retain their ordinary execution access.
+retain their ordinary execution access. The `host-process` need is a separate
+vocabulary entry for a GPU-free resource payload: it grants no compute-host
+storage or GPU scope and only selects that node's payload launch.
 
 Before approval, choose from compact manifest routing metadata and §0.2; do not
 load the full entry Skill body or its references merely to propose a route. At
@@ -832,7 +837,15 @@ owner-closure procedure — and `검증` should say so by that name (SD-153 rule
 SD-134 A75-9).
 
 For dispatched work, the parent follows the runtime's next-action receipt and
-checks the completed artifact before reporting. Normal success needs no harvest.
+reads the completed artifact to accept the results, limits, and remaining duties.
+Reuse valid verification and independent-review results; a stage, person, folder,
+or interruption change alone does not require another audit or suite. Check only
+uncovered integration changes, unresolved failures, or required unknowns. A broad
+rerun needs a concrete broad impact not covered by existing results. Current
+stage judgments still apply to their current subject; an old PASS marker does
+not become current through evidence reuse. When the requested outcome has
+sufficient evidence, advance to the authorized handoff, integration, or closure.
+Normal success needs no harvest.
 A process exit or intermediate stage verdict alone is not task completion.
 Read-only orientation and status replies use concise prose instead.
 
@@ -1068,7 +1081,16 @@ blocks verification.
 A supervised route owner starts its ordinary detached resource through the same
 runner. A sandboxed Codex owner tool records only the exact launch intent;
 its outer controller owns the observable watch and exit wrapper, and runs the
-payload with the owner's selected native sandbox. Intent admission is not a
+payload with the owner's selected native sandbox. A GPU-free long-running host
+measurement, benchmark, browser test or memory-capped command borrows
+`autopilot-lab:host-run` (`execution_needs: host-process`, a detached supervised
+resource-runner with no GPU lease, start approval or smoke attestation): the
+Codex owner and its model children stay at their ordinary `workspace-write`, and
+only that registered node's controller-built payload command runs as a host
+process, so a payload-level `systemd-run --user --scope -p MemoryMax=… -p
+MemorySwapMax=0` can reach the user manager. A caller or forced sandbox keeps
+precedence, and an already delivered strict `os-sandbox` request is refused at
+start instead of being weakened; no new gate, approval or input is added. Intent admission is not a
 payload start. An exact controller-owned wrapper awaiting its parent's reap is
 nonterminal; an independent watch cannot settle it from empty cmdline or sentinel
 alone. Other runner paths retain their existing launch boundary. The
