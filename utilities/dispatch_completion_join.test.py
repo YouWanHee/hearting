@@ -3090,7 +3090,21 @@ class FinishedChildClosure(unittest.TestCase):
                          "terminal-invalid:claude-result-capacity")
         self.assertEqual(settled.metadata["capacity_log"], str(log))
         self.assertEqual(int(settled.metadata["reset"]), reset)
+        self.assertEqual(settled.metadata["quota_window"], "five_hour")
+        self.assertEqual(settled.metadata["quota_model_scope"], "all")
         self.assertEqual(log.read_bytes(), raw_before)
+
+        settled_row_bytes = self.jobs.read_bytes()
+        self.assertFalse(D.close_attempt_row(
+            self.jobs, child.attempt_id, "dead-capacity",
+            evidence={"quota_window": "five_hour", "quota_model_scope": "all"},
+        ))
+        for key, value in (("quota_window", "one_minute"),
+                           ("quota_model_scope", "another-model")):
+            with self.subTest(immutable_key=key), self.assertRaises(D.DispatchContractError) as caught:
+                D.annotate_attempt_row(self.jobs, child.attempt_id, {key: value})
+            self.assertEqual(caught.exception.reason, "attempt-immutable-metadata-mutation")
+        self.assertEqual(self.jobs.read_bytes(), settled_row_bytes)
 
     def test_a_receipt_settles_only_an_open_stage_child_that_finished_with_a_readable_pass(self):
         """A1 F17: the runtime, not the parent, closes a finished PASS still open at delivery."""

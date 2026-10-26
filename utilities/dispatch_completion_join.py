@@ -4817,6 +4817,9 @@ def close_finished_child(
                 capacity_evidence["capacity_log"] = str(metadata["log_file"])
             if terminal.get("quota_reset_epoch") is not None:
                 capacity_evidence["reset"] = str(terminal["quota_reset_epoch"])
+            for key in ("quota_window", "quota_model_scope"):
+                if terminal.get(key) is not None:
+                    capacity_evidence[key] = str(terminal[key])
             reason = f"terminal-invalid:{terminal.get('reason') or 'claude-result-capacity'}"
             if _close_invalid_envelope_child(
                     row, jobs=jobs, reason=reason, note="dead-capacity",
