@@ -824,6 +824,7 @@ def ack_delivered(root: Path, session_id: str, records: list[dict], *, acked_by:
     A record a handover bound to this session is acked under the registered parent it is stored under."""
 
     acked = 0
+    acknowledged: list[dict] = []
     for record in records:
         try:
             storage = record.get(STORAGE_KEY) or session_id
@@ -834,10 +835,33 @@ def ack_delivered(root: Path, session_id: str, records: list[dict], *, acked_by:
                     source="prompt-context-rendered", event_id=event_id)
             except (pending_delivery.PendingDeliveryError, OSError):
                 pass  # Timestamp observation is advisory; it never withholds an exact ACK.
-            pending_delivery.ack(root, storage, delivery_id, acked_by=acked_by)
+            updated = pending_delivery.ack(root, storage, delivery_id, acked_by=acked_by)
             acked += 1
+            if (isinstance(updated, dict)
+                    and updated.get("recipient_kind") == "codex-native-queue"):
+                acknowledged.append({**updated, STORAGE_KEY: storage})
         except (pending_delivery.PendingDeliveryError, KeyError, OSError):
             continue
+    # ACK locks are all released before any queue RPC. The caller's exact
+    # session_id is the thread whose prompt rendered this batch.
+    if acknowledged and len(acknowledged) == len(records):
+        try:
+            import codex_queue_delivery
+            from codex_queue_dispatch import resolve_queue_socket
+            endpoint = resolve_queue_socket()
+            deadline = time.monotonic() + 1.5
+            with codex_queue_delivery.DeliverySession(endpoint, timeout=1.0) as session:
+                by_storage: dict[str, list[dict]] = {}
+                for seed in acknowledged:
+                    storage = seed.get(STORAGE_KEY) or session_id
+                    by_storage.setdefault(storage, []).append(seed)
+                for storage, seeds in by_storage.items():
+                    codex_queue_delivery.retire_acked_completion(
+                        root, endpoint, session_id, seeds, storage,
+                        timeout=1.0, deadline=deadline, session=session,
+                    )
+        except Exception:  # noqa: BLE001 - queue retirement never changes ACK outcome.
+            pass
     return acked
 
 

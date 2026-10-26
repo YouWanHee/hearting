@@ -5,7 +5,8 @@ The app-server queue API is used directly so Hearting can supply a stable
 ``clientUserMessageId`` and inspect only its own pending item. One completion
 observation pass may reuse a bounded queue-only connection. The interactive
 TUI remains the only subscriber and approval owner; no events are subscribed
-to and no user-owned queue item is edited, deleted, or reordered.
+to and no user-owned queue item is edited or reordered. An ACKed exact
+Hearting item may be best-effort deleted after full identity and body checks.
 """
 
 from __future__ import annotations
@@ -27,6 +28,23 @@ from typing import Any
 MAX_FRAME_BYTES = 4 * 1024 * 1024
 MAX_QUEUE_PAGES = 16
 MAX_PAGE_SIZE = 100
+MAX_QUEUE_RETIREMENTS = 4
+NATIVE_QUEUE_CLIENT_ID = "codex-native-queue-v1"
+NATIVE_QUEUE_BATCH_CLIENT_ID = "codex-native-queue-batch-v1"
+_PRIOR_SUCCESS_FOLLOWUP = (
+    "The requested work is complete, including its declared stages and runtime workflow/route/cycle settlement. "
+    "Continue and complete the original user task itself, preserving every explicit content and output-format "
+    "requirement from that request; this receipt supplements the task and does not replace it with a receipt-only response. "
+    "Read the exact result and perform the already approved parent review/follow-through in this turn, "
+    "or run its existing registered continuation. On the first user-facing close, explain what changed and why, "
+    "the observed before/after, checks actually run (including reused, skipped, and unrun checks), applicable "
+    "commit/PR/deployment/serving state, and limits or remaining work. Do not invent deployment or operating "
+    "results. Receipt, queue consumption and ACK are not execution. No harvest, route restart, or manual "
+    "finalization is required. An automatic repeat of this exact result or a cleanup-only notice after the "
+    "follow-through is handled does not call for the same action or a new user ACK; preserve a new failure, "
+    "conflict, unfinished work, or direct user question."
+)
+_CURRENT_SUCCESS_FOLLOWUP_START = "Original request/format apply."
 
 
 class QueueDeliveryError(RuntimeError):
@@ -348,8 +366,18 @@ def _rpc(path: Path, method: str, params: dict[str, Any], *, timeout: float,
         client.close()
 
 
+def _rpc_timeout(timeout: float, deadline: float | None) -> float:
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise QueueDeliveryError("queue-operation-deadline-exceeded")
+    return min(timeout, remaining)
+
+
 def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0,
-               session: DeliverySession | None = None) -> list[dict[str, Any]]:
+               session: DeliverySession | None = None,
+               deadline: float | None = None) -> list[dict[str, Any]]:
     if not thread_id:
         raise QueueDeliveryError("queue-thread-id-missing")
     cursor = None
@@ -358,7 +386,8 @@ def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0,
         params: dict[str, Any] = {"threadId": thread_id, "limit": MAX_PAGE_SIZE}
         if cursor:
             params["cursor"] = cursor
-        response = _rpc(path, "thread/queue/list", params, timeout=timeout,
+        response = _rpc(path, "thread/queue/list", params,
+                        timeout=_rpc_timeout(timeout, deadline),
                         **_session_kwargs(session))
         page = response.get("data")
         if not isinstance(page, list):
@@ -368,6 +397,139 @@ def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0,
         if not cursor:
             return values
     raise QueueDeliveryError("queue-list-page-limit-exceeded")
+
+
+def delete_queue_item(path: Path, thread_id: str, submission_id: str, *,
+                      timeout: float = 5.0,
+                      session: DeliverySession | None = None) -> bool:
+    """Delete one exact native queued submission; unknown results are failures."""
+    if (not isinstance(thread_id, str) or not thread_id
+            or not isinstance(submission_id, str) or not submission_id):
+        raise QueueDeliveryError("queue-delete-identity-invalid")
+    result = _rpc(path, "thread/queue/delete", {
+        "threadId": thread_id, "queuedSubmissionId": submission_id,
+    }, timeout=timeout, **_session_kwargs(session))
+    deleted = result.get("deleted")
+    if not isinstance(deleted, bool):
+        raise QueueDeliveryError("queue-delete-response-invalid")
+    return deleted
+
+
+def native_client_message_id(storage_key: str, delivery_ids, *, batch: bool = False) -> str:
+    """Stable queue ID shared by the producer and exact-item retirement."""
+    namespace = NATIVE_QUEUE_BATCH_CLIENT_ID if batch else NATIVE_QUEUE_CLIENT_ID
+    material = "\0".join((namespace, storage_key, *sorted(delivery_ids)))
+    return "delivery-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def native_completion_body(storage_key: str, records: list[dict], receipt: dict,
+                           followup: str) -> str:
+    """Build producer bytes from the canonical receipt and immutable markers."""
+    from dispatch_recipient_receipt import receipt_marker
+
+    envelope = "AGENT_HARNESS_COMPLETION_V1\n" + json.dumps(
+        receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+    markers = "\n" + "\n".join(receipt_marker(record, storage_key) for record in records)
+    return envelope + followup + markers
+
+
+def prior_followup_text(current: str) -> str | None:
+    """The one exact historical completion wording retained for recovery."""
+    head, newline, rest = current.partition("\n")
+    if not head.startswith(_CURRENT_SUCCESS_FOLLOWUP_START):
+        return None
+    return _PRIOR_SUCCESS_FOLLOWUP + newline + rest
+
+
+def retire_acked_completion(root: Path, path: Path, thread_id: str, seed: dict | list[dict],
+                            storage_key: str, *, timeout: float = 1.0,
+                            deadline: float | None = None,
+                            session: DeliverySession | None = None,
+                            expected_body: str | list[str] | None = None,
+                            expected_client_id: str | None = None) -> bool:
+    """Best-effort remove exact, fully ACKed Hearting completion items.
+
+    The caller supplies the exact receiver thread. Any incomplete, changed, or
+    ambiguous evidence preserves the queue item. The total caller deadline also
+    bounds connection initialization and every paginated list RPC.
+    """
+    import dispatch_pending_delivery as pending
+    from dispatch_completion_join import completion_followup_text
+    from dispatch_recipient_receipt import IDENTITY_KEY
+
+    seeds = seed if isinstance(seed, list) else [seed]
+    if (not seeds or any(not isinstance(row, dict)
+                         or row.get("recipient_kind") != "codex-native-queue"
+                         or row.get("state") != "acked" for row in seeds)):
+        return False
+    try:
+        fresh_records = []
+        for row in seeds:
+            delivery_id = row.get("delivery_id")
+            if not isinstance(delivery_id, str) or not delivery_id.startswith("delivery-"):
+                return False
+            fresh = pending.read(root, storage_key, delivery_id)
+            if not isinstance(fresh, dict) or fresh.get("state") != "acked":
+                return False
+            expected_identity = row.get(IDENTITY_KEY)
+            if not isinstance(expected_identity, dict):
+                expected_identity = pending.received_ack_identity(row, storage_key, delivery_id)
+            if pending.received_ack_identity(fresh, storage_key, delivery_id) != expected_identity:
+                return False
+            fresh_records.append(fresh)
+        candidates = []
+        if expected_body is not None:
+            bodies = expected_body if isinstance(expected_body, list) else [expected_body]
+            candidates.append((fresh_records, expected_client_id or native_client_message_id(
+                storage_key, [row["delivery_id"] for row in fresh_records]), bodies))
+        else:
+            for fresh in fresh_records:
+                receipt = fresh.get("receipt")
+                jobs = receipt.get("job_registry") if isinstance(receipt, dict) else None
+                if not isinstance(jobs, str) or not jobs:
+                    continue
+                followup = completion_followup_text(
+                    receipt, jobs=jobs,
+                    surface=str(Path(__file__).resolve().parents[1] / "adapters" / "codex" / "bin" / "preflight.sh"),
+                )
+                bodies = [native_completion_body(storage_key, [fresh], receipt, followup)]
+                prior_followup = prior_followup_text(followup)
+                if prior_followup is not None:
+                    bodies.append(native_completion_body(storage_key, [fresh], receipt, prior_followup))
+                candidates.append((
+                    [fresh], native_client_message_id(storage_key, [fresh["delivery_id"]]), bodies))
+        if not candidates:
+            return False
+        end = deadline if deadline is not None else time.monotonic() + 1.5
+        queue = list_queue(path, thread_id, timeout=_rpc_timeout(timeout, end),
+                           session=session, deadline=end)
+        deleted = 0
+        for member_records, client_id, candidate_bodies in candidates:
+            if deleted >= MAX_QUEUE_RETIREMENTS:
+                break
+            matches = [item for item in queue if item.get("clientUserMessageId") == client_id]
+            if (len(matches) != 1 or not isinstance(matches[0].get("id"), str)
+                    or not matches[0]["id"]
+                    or sum(item.get("id") == matches[0]["id"] for item in queue) != 1
+                    or not any(_peer_text_input(matches[0].get("input"), body)
+                               for body in candidate_bodies)):
+                continue
+            exact = True
+            for fresh in member_records:
+                latest = pending.read(root, storage_key, fresh["delivery_id"])
+                if (not isinstance(latest, dict) or latest.get("state") != "acked"
+                        or pending.received_ack_identity(latest, storage_key, fresh["delivery_id"])
+                        != pending.received_ack_identity(fresh, storage_key, fresh["delivery_id"])):
+                    exact = False
+                    break
+            if not exact:
+                continue
+            if delete_queue_item(path, thread_id, matches[0]["id"],
+                                 timeout=_rpc_timeout(timeout, end), session=session):
+                deleted += 1
+        return deleted > 0
+    except Exception:  # noqa: BLE001 - retirement is advisory; preserve the ACK result.
+        return False
 
 
 def _latest_turn(path: Path, thread_id: str, *, timeout: float,

@@ -1886,7 +1886,11 @@ class NativeQueueDeliveryTest(unittest.TestCase):
             "state": "acked" if index == 0 else "sent-ambiguous",
             "acked_by": f"codex-native-queue:{client_id}" if index == 0 else None,
         } for index, delivery_id in enumerate(ids)]
-        read_records = [*records, *records]
+        def read_record(_root, _thread, delivery_id):
+            return dict(records[ids.index(delivery_id)])
+        def ack_record(_root, _thread, delivery_id, **_kwargs):
+            records[ids.index(delivery_id)].update(state="acked",
+                                                   acked_by=f"codex-native-queue:{client_id}")
         args = SimpleNamespace(
             queue_socket=Path("/tmp/app-server.sock"), thread_id=SESSION,
             sealed_batch_id="batch-exact", jobs=Path("/tmp/jobs.log"),
@@ -1895,8 +1899,8 @@ class NativeQueueDeliveryTest(unittest.TestCase):
         with mock.patch.object(module.codex_queue_delivery, "_rpc", return_value={
                  "thread": {"id": SESSION, "cwd": "/tmp/repo"}}), \
              mock.patch.object(module, "current_session_children", return_value=rows), \
-             mock.patch.object(module.pending_delivery, "read", side_effect=read_records), \
-             mock.patch.object(module.pending_delivery, "ack") as ack, \
+             mock.patch.object(module.pending_delivery, "read", side_effect=read_record), \
+             mock.patch.object(module.pending_delivery, "ack", side_effect=ack_record) as ack, \
              mock.patch.object(module.codex_queue_delivery, "send_at_least_once") as send:
             result = module.deliver_to_native_queue(args, receipt, {"att-0", "att-1"})
         self.assertEqual(result["status"], "accepted")
@@ -2284,6 +2288,9 @@ class NativeQueueSiblingBatchTest(unittest.TestCase):
         results = self._run(members)
         self.assertEqual(len(self.sent), 1)
         message = self.sent[0]["message"]
+        self.assertEqual(self.module._batch_client_id(SESSION, [d for _a, d, _r in members]),
+                         self.module.codex_queue_delivery.native_client_message_id(
+                             SESSION, [d for _a, d, _r in members], batch=True))
         self.assertTrue(self.sent[0]["client_message_id"].startswith("delivery-"))
         self.assertEqual(sum(1 for line in message.splitlines()
                              if line.startswith("HEARTING_RECEIPT_V1")), 24)
@@ -2312,6 +2319,12 @@ class NativeQueueSiblingBatchTest(unittest.TestCase):
         results = self._run([failure])
         self.assertEqual(len(self.sent), 1)
         self.assertTrue(self.sent[0]["message"].startswith("AGENT_HARNESS_COMPLETION_V1\n"))
+        record = self.pending.read(self.root, SESSION, failure[1])
+        followup = self.module.completion_followup_text(
+            failure[2], jobs=str(self.jobs),
+            surface=str(ROOT / "adapters" / "codex" / "bin" / "preflight.sh"))
+        self.assertEqual(self.sent[0]["message"], self.module.codex_queue_delivery.native_completion_body(
+            SESSION, [record], failure[2], followup))
         self.assertEqual(results[0]["status"], "accepted")
         states = self._states()
         self.assertEqual(states[failure[1]], "acked")

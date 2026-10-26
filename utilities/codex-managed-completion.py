@@ -956,23 +956,8 @@ def _queue_target_from_rows(jobs: Path, rows, registered: str, *, read_context=N
     return registered
 
 
-# Read-only copy of the success follow-up text sent before the trimmed wording
-# (commit aec3a362f). A body already queued or consumed with it is recognized by an
-# exact full-body match only; every new send uses the current text.
-_PRIOR_SUCCESS_FOLLOWUP = (
-    "The requested work is complete, including its declared stages and runtime workflow/route/cycle settlement. "
-    "Continue and complete the original user task itself, preserving every explicit content and output-format "
-    "requirement from that request; this receipt supplements the task and does not replace it with a receipt-only response. "
-    "Read the exact result and perform the already approved parent review/follow-through in this turn, "
-    "or run its existing registered continuation. On the first user-facing close, explain what changed and why, "
-    "the observed before/after, checks actually run (including reused, skipped, and unrun checks), applicable "
-    "commit/PR/deployment/serving state, and limits or remaining work. Do not invent deployment or operating "
-    "results. Receipt, queue consumption and ACK are not execution. No harvest, route restart, or manual "
-    "finalization is required. An automatic repeat of this exact result or a cleanup-only notice after the "
-    "follow-through is handled does not call for the same action or a new user ACK; preserve a new failure, "
-    "conflict, unfinished work, or direct user question."
-)
-_CURRENT_SUCCESS_FOLLOWUP_START = "Original request/format apply."
+_PRIOR_SUCCESS_FOLLOWUP = codex_queue_delivery._PRIOR_SUCCESS_FOLLOWUP
+_CURRENT_SUCCESS_FOLLOWUP_START = codex_queue_delivery._CURRENT_SUCCESS_FOLLOWUP_START
 _LEGACY_HISTORY_MISMATCH = {"queue-peer-history-mismatch", "queue-peer-history-conflict",
                             "queue-peer-pending-mismatch"}
 _IMMEDIATE_RECEIPT_KINDS = {"human-gate", "supervision", "notice"}
@@ -980,11 +965,7 @@ QUEUE_BODY_LIMIT = 15 * 1024  # codex_queue_delivery refuses a message over 16 K
 
 
 def _prior_followup_text(current: str) -> str | None:
-    """The previous wording of a current success follow-up, or None when it never differed."""
-    head, newline, rest = current.partition("\n")
-    if not head.startswith(_CURRENT_SUCCESS_FOLLOWUP_START):
-        return None
-    return _PRIOR_SUCCESS_FOLLOWUP + newline + rest
+    return codex_queue_delivery.prior_followup_text(current)
 
 
 def _is_completion_record(record: dict) -> bool:
@@ -994,8 +975,7 @@ def _is_completion_record(record: dict) -> bool:
 
 
 def _batch_client_id(thread_id: str, delivery_ids) -> str:
-    material = "\0".join(("codex-native-queue-batch-v1", thread_id, *sorted(delivery_ids)))
-    return "delivery-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+    return codex_queue_delivery.native_client_message_id(thread_id, delivery_ids, batch=True)
 
 
 def _batch_units(root: Path, thread_id: str, members: list[dict]) -> list[tuple[list[dict], str]]:
@@ -1011,6 +991,19 @@ def _batch_units(root: Path, thread_id: str, members: list[dict]) -> list[tuple[
     middle = len(members) // 2
     return (_batch_units(root, thread_id, members[:middle])
             + _batch_units(root, thread_id, members[middle:]))
+
+
+def _retire_acked_native_copy(root, path, receiver, storage, records,
+                              client_message_id, bodies, session) -> None:
+    """Advisory cleanup after durable ACK; never changes courier acceptance."""
+    try:
+        codex_queue_delivery.retire_acked_completion(
+            root, path, receiver, records, storage, timeout=1.0,
+            deadline=time.monotonic() + 1.5, session=session,
+            expected_body=bodies, expected_client_id=client_message_id,
+        )
+    except Exception:  # noqa: BLE001 - ACK and accepted response remain authoritative.
+        pass
 
 
 def _native_queue_delivery_once(
@@ -1045,22 +1038,14 @@ def _native_queue_delivery_once(
         raise CompletionError("native-queue-thread-identity-invalid")
     if thread.get("cwd") and not isinstance(thread.get("cwd"), str):
         raise CompletionError("native-queue-thread-cwd-invalid")
-    envelope = "AGENT_HARNESS_COMPLETION_V1\n" + canonical(receipt) + "\n"
     followup = completion_followup_text(
         receipt,
         jobs=str(args.jobs),
         surface=str(ROOT / "adapters" / "codex" / "bin" / "preflight.sh"),
     )
-    context = envelope + followup
     prior_followup = _prior_followup_text(followup)
-    prior_context = envelope + prior_followup if prior_followup else None
-    delivery_material = "\0".join((
-        "codex-native-queue-v1", args.thread_id,
-        *sorted(row.metadata.get("delivery_id", "") for row in rows),
-    ))
-    client_message_id = "delivery-" + hashlib.sha256(
-        delivery_material.encode("utf-8")
-    ).hexdigest()[:32]
+    client_message_id = codex_queue_delivery.native_client_message_id(
+        args.thread_id, [row.metadata.get("delivery_id", "") for row in rows])
     # The first batch read selected the queue. Re-read immediately before the
     # claim/send boundary and reject a changed recipient or delivery identity.
     fresh_rows = current_session_children(
@@ -1095,6 +1080,16 @@ def _native_queue_delivery_once(
                for delivery_id in ledger_ids]
     if any(record is None for record in records):
         raise CompletionError("native-queue-ledger-state-invalid")
+    from dispatch_recipient_receipt import (
+        codex_consumed_evidence, codex_queue_evidence, settle_native_receipt,
+    )
+    try:
+        context = codex_queue_delivery.native_completion_body(
+            args.thread_id, records, receipt, followup)
+        prior_context = (codex_queue_delivery.native_completion_body(
+            args.thread_id, records, receipt, prior_followup) if prior_followup else None)
+    except Exception:  # noqa: BLE001 - malformed marker input cannot alter ACK dedupe.
+        context = prior_context = None
     acked_by = f"codex-native-queue:{client_message_id}"
     if all(record.get("state") in {"acked", "rejected", "expired"} for record in records) and any(
             record.get("state") != "acked" for record in records):
@@ -1121,25 +1116,27 @@ def _native_queue_delivery_once(
                 root, args.thread_id, record["delivery_id"], acked_by=acked_by,
                 expected_states=("pending", "claimed", "sent-ambiguous"),
             )
+        fresh_records = [pending_delivery.read(root, args.thread_id, record["delivery_id"])
+                         for record in records]
+        if fresh_records and all(record and record.get("state") == "acked"
+                                 for record in fresh_records):
+            if context is not None:
+                _retire_acked_native_copy(root, path, target, args.thread_id, fresh_records,
+                                          client_message_id,
+                                          [context] + ([prior_context] if prior_context else []), session)
         return {
             "schema_version": 1, "status": "accepted", "thread_id": args.thread_id,
             "client_user_message_id": client_message_id,
             "deduplicated_by": "pending-delivery-ledger",
         }
-    from dispatch_recipient_receipt import (
-        codex_consumed_evidence, codex_queue_evidence, receipt_marker,
-        settle_native_receipt,
-    )
-    markers = "\n" + "\n".join(receipt_marker(record, args.thread_id) for record in records)
-    context += markers
-    if prior_context is not None:
-        prior_context += markers
     # Recover an exact native receipt before taking another queue claim. A
     # successful queue RPC is insufficient; the strict history translator
     # requires the stable client id and this exact marker-bearing body.
     # The registered recipient owns the record; after an approved handover,
     # only the exact current successor may settle it. A predecessor's native
     # history is never promoted into the successor's receipt.
+    if context is None:
+        raise CompletionError("native-queue-marker-identity-invalid")
     native_threads = (target,) if target != args.thread_id else (args.thread_id,)
     previous_send_observed = any(
         record.get("state") in {"claimed", "sent-ambiguous"}
@@ -1277,8 +1274,8 @@ def _native_queue_delivery_once(
                 result = {"status": "consumed", "turn_id": consumed.get("id"),
                           "turn_status": consumed.get("status")}
             else:
-                # An item still waiting in the old thread's queue cannot be moved (the local queue API
-                # has no move/remove): it is never restarted there; the successor gets the same record.
+                # An ACKed item can be retired only by the exact-item helper;
+                # an unconsumed item is never moved or restarted in the old thread.
                 result = codex_queue_delivery.poll_owned_item(
                     path, thread_id=target, client_message_id=unit_client_id, timeout=5.0,
                     **transport)

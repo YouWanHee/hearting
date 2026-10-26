@@ -22,6 +22,81 @@ sys.modules[spec.name] = hook
 spec.loader.exec_module(hook)
 
 class PromptReceiptTest(unittest.TestCase):
+    def test_real_ack_deletes_only_the_exact_shared_builder_singleton(self):
+        import codex_queue_delivery as queue
+        import codex_queue_dispatch
+        from dispatch_completion_join import completion_followup_text
+
+        class FakeSession:
+            def __init__(self, _path, *, timeout):
+                self.timeout = timeout
+                self.methods = []
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return None
+            def close(self):
+                return None
+            def request(self, _path, method, params, *, timeout=None):
+                self.methods.append((method, params, timeout))
+                if method == "thread/queue/list":
+                    return {"data": queue_items}
+                if method == "thread/queue/delete":
+                    queue_items[:] = [queued for queued in queue_items
+                                      if queued.get("id") != params["queuedSubmissionId"]]
+                    return {"deleted": True}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs.log"
+            jobs.touch()
+            session_id = "native-parent"
+            did = "delivery-real-incident"
+            receipt = {
+                "schema_version": 2, "state": "ready", "job_registry": str(jobs),
+                "parent_attempt_id": "parent-session-native", "delivery_classification": "success",
+                "children": [{"attempt_id": "att-exact", "status": "done", "readiness": "ready",
+                              "reason": "registry-closed", "required_action": "advance-completed",
+                              "harness": "codex", "delivery_classification": "success"}],
+            }
+            pending.create(root, recipient_kind="codex-native-queue", recipient_key=session_id,
+                delivery_id=did, session_generation="", session_generation_supported="0",
+                attempt_ids=["att-exact"], parent_attempt_id="parent-session-native",
+                route_id="rt-test", route_node="execute", receipt=receipt,
+                receipt_digest=pending._canonical_receipt_digest(receipt), row_revisions={"att-exact": "rev"})
+            pending.claim(root, session_id, did, claim_owner="fixture", lease_seconds=60)
+            seed = pending.read(root, session_id, did)
+            followup = completion_followup_text(
+                receipt, jobs=str(jobs),
+                surface=str(ROOT / "adapters" / "codex" / "bin" / "preflight.sh"))
+            body = queue.native_completion_body(session_id, [seed], receipt, followup)
+            client_id = queue.native_client_message_id(session_id, [did])
+            item = {"id": "queued-exact", "clientUserMessageId": client_id,
+                    "input": [{"type": "text", "text": body}]}
+            queue_items = [item,
+                           {"id": "user-item", "clientUserMessageId": "user-created",
+                            "input": [{"type": "text", "text": "keep this"}]},
+                           {"id": "other-hearting", "clientUserMessageId": "other-delivery",
+                            "input": [{"type": "text", "text": "other thread's item"}]}]
+            fake_session = FakeSession(Path("/tmp/fake-queue.sock"), timeout=1.0)
+            with mock.patch.object(codex_queue_dispatch, "resolve_queue_socket",
+                                   return_value=Path("/tmp/fake-queue.sock")), \
+                 mock.patch.object(queue, "DeliverySession", return_value=fake_session):
+                self.assertEqual(sweep.ack_delivered(root, session_id, [{**seed, sweep.STORAGE_KEY: session_id}],
+                                                     acked_by="codex-native-prompt:native-parent"), 1)
+            self.assertEqual([row[0] for row in fake_session.methods], [
+                "thread/queue/list", "thread/queue/delete",
+            ])
+            self.assertEqual(fake_session.methods[-1][1], {
+                "threadId": session_id, "queuedSubmissionId": "queued-exact",
+            })
+            self.assertEqual(pending.read(root, session_id, did)["state"], "acked")
+            # The delayed drain sees only unrelated/user queue entries; cleanup
+            # is tied to the exact ACKed body and submission ID.
+            self.assertEqual([queued["id"] for queued in queue_items],
+                             ["user-item", "other-hearting"])
+
     def test_runtime_completion_trailer_is_received_as_runtime_by_the_codex_hook(self):
         peer_spec = importlib.util.spec_from_file_location(
             "codex_runtime_prompt_peer", ROOT / "utilities/peer-message.py")

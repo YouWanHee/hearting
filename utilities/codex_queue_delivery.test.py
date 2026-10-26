@@ -100,6 +100,49 @@ def native_fixture(root, *, entries=(), turn_ids=(), thread_id=THREAD,
 
 
 class QueueDeliveryTest(unittest.TestCase):
+    def test_queue_delete_uses_exact_thread_submission_and_requires_boolean_result(self):
+        with mock.patch.object(QUEUE, "_rpc", return_value={"deleted": True}) as rpc:
+            self.assertTrue(QUEUE.delete_queue_item(SOCKET, THREAD, ITEM_ID, timeout=0.4))
+        self.assertEqual(rpc.call_args.args[1], "thread/queue/delete")
+        self.assertEqual(rpc.call_args.args[2], {
+            "threadId": THREAD, "queuedSubmissionId": ITEM_ID,
+        })
+        with mock.patch.object(QUEUE, "_rpc", return_value={"deleted": 1}):
+            with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "queue-delete-response-invalid"):
+                QUEUE.delete_queue_item(SOCKET, THREAD, ITEM_ID)
+
+    def test_native_completion_builder_keeps_v1_singleton_identity_and_exact_bytes(self):
+        import dispatch_pending_delivery as pending
+        import dispatch_recipient_receipt as recipient
+
+        record = {
+            "delivery_id": "delivery-builder-test", "recipient_kind": "codex-native-queue",
+            "recipient_digest": pending.recipient_digest(THREAD), "attempt_ids": ["att-one"],
+            "receipt": {"kind": "completion", "children": []}, "receipt_digest": "0" * 64,
+            "row_revisions": {}, "session_generation": "", "session_generation_supported": "0",
+        }
+        record["receipt_digest"] = pending._canonical_receipt_digest(record["receipt"])
+        client_id = QUEUE.native_client_message_id(THREAD, [record["delivery_id"]])
+        body = QUEUE.native_completion_body(THREAD, [record], record["receipt"], "follow up")
+        self.assertEqual(client_id, "delivery-" + __import__("hashlib").sha256(
+            ("codex-native-queue-v1\0" + THREAD + "\0" + record["delivery_id"]).encode()
+        ).hexdigest()[:32])
+        self.assertEqual(body, "AGENT_HARNESS_COMPLETION_V1\n" +
+                         __import__("json").dumps(record["receipt"], sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=False) + "\nfollow up\n" +
+                         recipient.receipt_marker(record, THREAD))
+
+    def test_deadline_bounds_paginated_queue_listing_without_reading_later_pages(self):
+        clock = iter((100.0, 100.6))
+        with mock.patch.object(QUEUE.time, "monotonic", side_effect=lambda: next(clock)), \
+             mock.patch.object(QUEUE, "_rpc", return_value={
+                 "data": [], "nextCursor": "page-2"}) as rpc:
+            with self.assertRaisesRegex(QUEUE.QueueDeliveryError,
+                                        "queue-operation-deadline-exceeded"):
+                QUEUE.list_queue(SOCKET, THREAD, timeout=1.0, deadline=100.5)
+        rpc.assert_called_once()
+        self.assertEqual(rpc.call_args.kwargs["timeout"], 0.5)
+
     def test_read_exact_turn_confirms_native_turn_id_from_thread_history(self):
         items = [{"id": "item-user-exact", "type": "userMessage",
                   "content": [{"type": "text", "text": "original requested task"}]}]

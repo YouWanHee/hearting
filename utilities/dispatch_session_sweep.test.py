@@ -615,6 +615,16 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         state = PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)["state"]
         self.assertEqual(state, "acked")
 
+    def test_non_codex_ack_never_resolves_a_queue_endpoint(self):
+        self._seed()
+        claimed, _ = SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-owner")
+        with mock.patch("codex_queue_dispatch.resolve_queue_socket") as resolve:
+            self.assertEqual(SWEEP.ack_delivered(
+                self.root, "sess-owner", claimed, acked_by="claude-hook"), 1)
+        resolve.assert_not_called()
+        self.assertEqual(PD.read(
+            self.root, "sess-owner", claimed[0]["delivery_id"])["state"], "acked")
+
     def test_two_carriers_recheck_after_exact_receipt_at_final_output_barrier(self):
         import dispatch_recipient_receipt as recipient_receipt
         self._seed()
