@@ -884,12 +884,17 @@ def _observe_source_bindings(bindings, run_id, row_key, now, path_namespace=None
                     or not math.isfinite(float(observed_at))):
                 raise ValueError("source-timestamp-invalid")
             proof_hashes = []
+            asserted_identity_values = set()
             for proof in proofs:
                 if not isinstance(proof, dict) or not isinstance(proof.get("sha256"), str):
                     raise ValueError("source-proof-invalid")
                 expected_hash = proof["sha256"].lower()
                 if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
                     raise ValueError("source-proof-hash-invalid")
+                assertions = proof.get("assertions", [])
+                if (not isinstance(assertions, list)
+                        or len(assertions) > MAX_SOURCE_BINDING_ASSERTIONS):
+                    raise ValueError("source-proof-assertions-invalid")
                 _proof_path, proof_raw, _proof_info = _bounded_source_file(
                     proof.get("path"), MAX_SOURCE_BINDING_BYTES - total_bytes,
                     path_namespace)
@@ -899,18 +904,23 @@ def _observe_source_bindings(bindings, run_id, row_key, now, path_namespace=None
                 actual_hash = hashlib.sha256(proof_raw).hexdigest()
                 if actual_hash != expected_hash:
                     raise ValueError("source-proof-changed")
-                proof_doc = __import__("resource_metric_sources")._admission_json_object(proof_raw)
-                assertions = proof.get("assertions", [])
-                if not isinstance(assertions, list) or len(assertions) > MAX_SOURCE_BINDING_ASSERTIONS:
-                    raise ValueError("source-proof-assertions-invalid")
-                for assertion in assertions:
-                    if not isinstance(assertion, dict) or "equals" not in assertion:
-                        raise ValueError("source-proof-assertion-invalid")
-                    proved = _json_pointer(proof_doc, assertion.get("pointer"))
-                    expected = assertion["equals"]
-                    if type(proved) is not type(expected) or proved != expected:
-                        raise ValueError("source-proof-assertion-mismatch")
+                if assertions:
+                    proof_doc = __import__("resource_metric_sources")._admission_json_object(proof_raw)
+                    for assertion in assertions:
+                        if not isinstance(assertion, dict) or "equals" not in assertion:
+                            raise ValueError("source-proof-assertion-invalid")
+                        proved = _json_pointer(proof_doc, assertion.get("pointer"))
+                        expected = assertion["equals"]
+                        if type(proved) is not type(expected) or proved != expected:
+                            raise ValueError("source-proof-assertion-mismatch")
+                        if (isinstance(expected, str)
+                                and expected in {binding["target_run_id"],
+                                                 binding["writer_run_id"]}):
+                            asserted_identity_values.add(expected)
                 proof_hashes.append(actual_hash)
+            required_identity_values = {binding["target_run_id"], binding["writer_run_id"]}
+            if not required_identity_values.issubset(asserted_identity_values):
+                raise ValueError("source-proof-identity-incomplete")
             generation_material = {"run_id": run_id, "row_key": str(row_key),
                 "writer_run_id": binding["writer_run_id"], "path": binding.get("path"),
                 "timestamp_pointer": binding["timestamp_pointer"],

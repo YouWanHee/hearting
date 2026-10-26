@@ -778,8 +778,11 @@ class ExperimentObservationTest(unittest.TestCase):
             proof.parent.mkdir()
             proof.write_text(json.dumps({"target": "target-run", "writer": "writer-run",
                 "argv": ["writer", "--target", "target-run"]}))
+            script_proof = base / "proof" / "writer.py"
+            script_proof.write_bytes(b"def write_observation():\n    return True\n")
             proof_hash = hashlib.sha256(proof.read_bytes()).hexdigest()
-            binding = {"target_run_id": "target-run", "row_key": "row-a",
+            script_hash = hashlib.sha256(script_proof.read_bytes()).hexdigest()
+            binding = {"target_run_id": "target-run", "row_key": "run",
                 "path": "/nas/writer/observation.json", "writer_run_id": "writer-run",
                 "timestamp_pointer": "/observed_at", "scope": "shared-results",
                 "counters": [{"name": "finished_cells", "pointer": "/finished_cells",
@@ -788,18 +791,24 @@ class ExperimentObservationTest(unittest.TestCase):
                     "sha256": proof_hash,
                     "assertions": [{"pointer": "/target", "equals": "target-run"},
                                    {"pointer": "/writer", "equals": "writer-run"},
-                                   {"pointer": "/argv/2", "equals": "target-run"}]}]}
+                                   {"pointer": "/argv/2", "equals": "target-run"}]},
+                    {"path": "/nas/proof/writer.py", "sha256": script_hash,
+                     "assertions": []}]}
             state = base / "runtime" / "state.json"
             state.parent.mkdir()
-            run = {"run_id": "target-run", "started_at": 100,
-                "artifact_root": str(artifact), "route_id": "route-a",
+            registry_row = {"run_id": "target-run", "started_at": 100,
+                "status": "running", "artifact_root": str(artifact), "route_id": "route-a"}
+            registry.write_text(json.dumps({"schema_version": 1,
+                "runs": {"target-run": registry_row}}, sort_keys=True))
+            registry_before = registry.read_bytes()
+            run = {**registry_row,
                 "path_namespace": {"/nas": str(base)},
                 "observation": {"source_bindings": [binding]},
                 "owner_wait": {"harness": "codex", "session_id": "owner-session"}}
             with mock.patch.object(progress, "_observation_state_path", return_value=state), \
                     mock.patch("session_notice.notify", return_value={"state": "pending"}):
                 first = progress.observe_experiment(run, registry, 1000,
-                    row_key="row-a", started_at=100, row_scoped=True)
+                    row_key="run", started_at=100)
                 first_state = progress._read_observation_state(state)
                 self.assertEqual(first["observation"]["source_observations"][0]["value"], 21)
                 self.assertEqual(first["observation"]["source_observations"][0]["writer_run_id"],
@@ -807,10 +816,25 @@ class ExperimentObservationTest(unittest.TestCase):
                 self.assertEqual(first["observation"]["source_observations"][0]["target_run_id"],
                                  "target-run")
                 self.assertIsNone(first["observation"]["reached"])
+                self.assertIsNone(first["observation"]["total"])
+                self.assertIsNone(first["observation"]["unit"])
+                self.assertIsNone(first["observation"]["rate_per_second"])
                 self.assertIsNone(first["observation"]["eta_seconds"])
+                self.assertIsNone(first["observation"]["predicted_total_seconds"])
+                self.assertEqual(first["observation"]["stagnation"], {"state": "unknown"})
+                self.assertFalse(first["observation"]["final"])
                 self.assertEqual(first_state["source_bindings"], [binding])
                 persisted = progress.read_public_run_record(artifact, "target-run")
                 self.assertEqual(persisted["progress"]["observed_counters"][0]["value"], 21)
+                self.assertEqual(persisted["progress"]["reached"], None)
+                self.assertEqual(persisted["progress"]["total"], None)
+                self.assertEqual(persisted["progress"]["unit"], None)
+                self.assertIsNone(persisted["progress"].get("rate_per_second"))
+                self.assertIsNone(persisted["progress"].get("eta_seconds"))
+                self.assertNotIn("completed", persisted["progress"])
+                self.assertEqual(persisted["status"], "running")
+                self.assertIsNone(persisted["eta"])
+                self.assertEqual(persisted["stagnation"]["state"], "unknown")
                 self.assertEqual(persisted["rows"][0]["observed_counters"][0]["name"],
                                  "finished_cells")
                 self.assertEqual(persisted["sources"][0]["format"], "independent-counter")
@@ -822,21 +846,103 @@ class ExperimentObservationTest(unittest.TestCase):
                 self.assertIn("writer=writer-run target=target-run",
                               first_state["outbox"][0]["text"])
                 self.assertIn("ETA 총 미상", first_state["outbox"][0]["text"])
-                resumed = progress.observe_experiment({"run_id": "target-run",
-                    "started_at": 100, "artifact_root": str(artifact),
+                resumed = progress.observe_experiment({**registry_row,
                     "path_namespace": {"/nas": str(base)}}, registry, 1061,
-                    row_key="row-a", started_at=100, row_scoped=True)
+                    row_key="run", started_at=100)
                 self.assertEqual(resumed["observation"]["source_observations"][0]["value"], 21)
-                proof.write_text(json.dumps({"target": "other-run", "writer": "writer-run",
-                    "argv": ["writer", "--target", "target-run"]}))
-                withdrawn = progress.observe_experiment({"run_id": "target-run",
-                    "started_at": 100, "artifact_root": str(artifact),
+                self.assertEqual(registry.read_bytes(), registry_before)
+                script_proof.write_bytes(script_proof.read_bytes() + b"# changed\n")
+                withdrawn = progress.observe_experiment({**registry_row,
                     "path_namespace": {"/nas": str(base)}}, registry, 1122,
-                    row_key="row-a", started_at=100, row_scoped=True)
+                    row_key="run", started_at=100)
                 self.assertEqual(withdrawn["observation"]["source_observations"][0]["state"],
                                  "unknown")
                 self.assertIsNone(withdrawn["observation"]["reached"])
                 self.assertIsNone(withdrawn["observation"]["eta_seconds"])
+                self.assertEqual(registry.read_bytes(), registry_before)
+
+    def test_raw_counter_requires_both_verified_identity_assertions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            artifact = base / "artifact"
+            artifact.mkdir()
+            registry = base / "registry.json"
+            registry.write_text("{}\n")
+            runtime = base / "runtime"
+            runtime.mkdir()
+            source = base / "source" / "observation.json"
+            source.parent.mkdir()
+            source.write_text(json.dumps({"observed_at": 950, "progress_token": 19}))
+            proof_dir = base / "proofs"
+            proof_dir.mkdir()
+
+            for index, case in enumerate(("empty", "omitted", "non-identity",
+                    "target-only", "writer-only", "opaque-with-assertions")):
+                with self.subTest(case=case):
+                    target, writer = f"target-{index}", f"writer-{index}"
+                    identity_doc = json.dumps({"target": target, "writer": writer,
+                        "note": "ordinary"}).encode()
+                    identity_assertions = [
+                        {"pointer": "/target", "equals": target},
+                        {"pointer": "/writer", "equals": writer}]
+                    if case == "empty":
+                        proof_specs = [(identity_doc, [])]
+                    elif case == "omitted":
+                        proof_specs = [(identity_doc, None)]
+                    elif case == "non-identity":
+                        proof_specs = [(identity_doc,
+                            [{"pointer": "/note", "equals": "ordinary"}])]
+                    elif case == "target-only":
+                        proof_specs = [(identity_doc, [identity_assertions[0]])]
+                    elif case == "writer-only":
+                        proof_specs = [(identity_doc, [identity_assertions[1]])]
+                    else:
+                        proof_specs = [(identity_doc, identity_assertions),
+                            (b"def write_observation():\n    return True\n",
+                             [{"pointer": "/target", "equals": target}])]
+
+                    proofs = []
+                    for proof_index, (raw, assertions) in enumerate(proof_specs):
+                        proof_path = proof_dir / f"{index}-{proof_index}.proof"
+                        proof_path.write_bytes(raw)
+                        proof = {"path": str(proof_path),
+                            "sha256": hashlib.sha256(raw).hexdigest()}
+                        if assertions is not None:
+                            proof["assertions"] = assertions
+                        proofs.append(proof)
+                    binding = {"target_run_id": target, "row_key": "run",
+                        "path": str(source), "writer_run_id": writer,
+                        "timestamp_pointer": "/observed_at", "scope": "shared-results",
+                        "counters": [{"name": "sample_count", "pointer": "/progress_token",
+                                      "comparison_eligible": False}],
+                        "proofs": proofs}
+                    run = {"run_id": target, "started_at": 100, "status": "running",
+                        "artifact_root": str(artifact),
+                        "observation": {"source_bindings": [binding]},
+                        "owner_wait": {"harness": "codex", "session_id": "fixture"}}
+                    state_path = runtime / f"{target}.json"
+
+                    with mock.patch.object(progress, "_observation_state_path",
+                            return_value=state_path), \
+                            mock.patch("session_notice.notify", return_value={"state": "pending"}):
+                        result = progress.observe_experiment(run, registry, 1000,
+                            row_key="run", started_at=100)
+                        state = progress._read_observation_state(state_path)
+                        public = progress.read_public_run_record(artifact, target)
+
+                    observed = result["observation"]["source_observations"][0]
+                    self.assertEqual(observed["state"], "unknown")
+                    self.assertIsNone(observed["value"])
+                    counters = public["progress"]["observed_counters"]
+                    self.assertTrue(counters)
+                    self.assertTrue(all(item["state"] != "observed"
+                                        and item.get("value") is None for item in counters))
+                    row_counters = public["rows"][0]["observed_counters"]
+                    self.assertTrue(all(item["state"] != "observed"
+                                        and item.get("value") is None for item in row_counters))
+                    notice_text = "\n".join(item["text"] for item in state["outbox"])
+                    self.assertIn("raw counter=sample_count:unknown", notice_text)
+                    self.assertNotIn("raw counter=sample_count:19", notice_text)
 
     def test_admission_recovery_starts_a_new_stagnation_grace(self):
         with tempfile.TemporaryDirectory() as tmp:

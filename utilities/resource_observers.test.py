@@ -253,40 +253,50 @@ class AdoptionTest(unittest.TestCase):
         source = self.base / "writer" / "observation.json"
         source.parent.mkdir()
         source.write_text(json.dumps({"observed_at": time.time() - 30,
-                                     "finished_cells": 21}))
+                                     "sample_units": 21}))
         proof = self.base / "writer-proof.json"
-        proof.write_text(json.dumps({"target": "installed-run", "writer": "writer-run"}))
-        binding = {"target_run_id": "installed-run", "row_key": "run",
-            "path": str(source), "writer_run_id": "writer-run",
+        target_id, writer_id = "fixture-target-x4", "fixture-writer-p2"
+        proof.write_text(json.dumps({"target": target_id, "writer": writer_id,
+            "command": ["fixture", "--target", target_id]}))
+        script_proof = self.base / "writer-proof.py"
+        script_proof.write_bytes(b"def emit_sample():\n    return {'sample_units': 21}\n")
+        binding = {"target_run_id": target_id, "row_key": "run",
+            "path": str(source), "writer_run_id": writer_id,
             "timestamp_pointer": "/observed_at", "scope": "shared-results",
-            "counters": [{"name": "finished_cells", "pointer": "/finished_cells",
+            "counters": [{"name": "sample_units", "pointer": "/sample_units",
                           "comparison_eligible": False}],
             "proofs": [{"path": str(proof),
                 "sha256": hashlib.sha256(proof.read_bytes()).hexdigest(),
-                "assertions": [{"pointer": "/target", "equals": "installed-run"},
-                               {"pointer": "/writer", "equals": "writer-run"}]}]}
+                "assertions": [{"pointer": "/target", "equals": target_id},
+                               {"pointer": "/writer", "equals": writer_id},
+                               {"pointer": "/command/2", "equals": target_id}]},
+                {"path": str(script_proof),
+                 "sha256": hashlib.sha256(script_proof.read_bytes()).hexdigest(),
+                 "assertions": []}]}
         sentinel = self.base / "absent-sentinel"
         row = {"status": "failed", "workflow_state": "FAILED_RETRYABLE",
             "failure_class": "resource-launch-incomplete", "resource_policy": "supervised-owner",
             "exit_code": None, "sentinel": str(sentinel), "started_at": time.time() - 30,
             "artifact_root": str(artifact), "observation": {"source_bindings": [binding]}}
         registry_bytes = json.dumps({"schema_version": 1,
-            "runs": {"installed-run": row}}, sort_keys=True).encode() + b"\n"
+            "runs": {target_id: row}}, sort_keys=True).encode() + b"\n"
         registry.write_bytes(registry_bytes)
         source_before, proof_before = source.read_bytes(), proof.read_bytes()
+        script_before = script_proof.read_bytes()
         env = fixture_env.build_environment(self.base / "fixture-env", current)
         env.pop("PYTHONPATH", None)
         command = [sys.executable, str(current / "utilities" / "resource-observers.py"),
-                   "watch", str(registry), "installed-run"]
+                   "watch", str(registry), target_id]
         completed = subprocess.run(command, cwd=self.base, env=env,
             capture_output=True, text=True, timeout=20)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(registry.read_bytes(), registry_bytes)
-        self.assertEqual((source.read_bytes(), proof.read_bytes()), (source_before, proof_before))
-        record = resource_progress.read_public_run_record(artifact, "installed-run")
+        self.assertEqual((source.read_bytes(), proof.read_bytes(), script_proof.read_bytes()),
+                         (source_before, proof_before, script_before))
+        record = resource_progress.read_public_run_record(artifact, target_id)
         self.assertEqual(record["progress"]["observed_counters"][0]["value"], 21)
         self.assertEqual(record["progress"]["observed_counters"][0]["writer_run_id"],
-                         "writer-run")
+                         writer_id)
         self.assertIsNone(record["progress"]["reached"])
         self.assertIsNone(record["eta"])
 
