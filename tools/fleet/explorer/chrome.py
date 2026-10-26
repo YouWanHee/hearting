@@ -8,6 +8,73 @@ from .tables import repo_label
 NAV_WIDTH = 32
 
 
+class _TreeRow:
+    def __init__(self, grid, y):
+        self.grid, self.y = grid, y
+
+    def __getitem__(self, column):
+        row = self.grid._row(self.y)
+        if row is None:
+            if isinstance(column, slice):
+                return [(" ", None, None)] * len(range(*column.indices(self.grid.cols)))
+            return (" ", None, None)
+        return row[column]
+
+    def __setitem__(self, column, value):
+        row = self.grid._row(self.y)
+        if row is not None:
+            row[column] = value
+
+
+class _TreeRows:
+    def __init__(self, grid):
+        self.grid = grid
+
+    def __getitem__(self, y):
+        return _TreeRow(self.grid, y)
+
+    def __setitem__(self, y, value):
+        row = self.grid._row(y)
+        if row is not None:
+            row[:] = value
+
+
+class _TreeViewport:
+    """Map logical tree rows into the visible session viewport without dropping identities."""
+
+    def __init__(self, grid, top, bottom, offset, total):
+        self.base = grid
+        self.top, self.bottom = int(top), int(bottom)
+        self.offset, self.total = int(offset), int(total)
+        self.rows, self.cols = grid.rows, grid.cols
+        self.cells = _TreeRows(self)
+
+    def _screen_y(self, y):
+        y = int(y)
+        if y < self.top or y >= self.top + self.total:
+            return None
+        screen_y = y - self.offset
+        return screen_y if self.top <= screen_y < self.bottom else None
+
+    def _row(self, y):
+        screen_y = self._screen_y(y)
+        return self.base.cells[screen_y] if screen_y is not None else None
+
+    def put(self, x, y, *args, **kwargs):
+        screen_y = self._screen_y(y)
+        return x if screen_y is None else self.base.put(x, screen_y, *args, **kwargs)
+
+    def fill(self, x0, x1, y, *args, **kwargs):
+        screen_y = self._screen_y(y)
+        if screen_y is not None:
+            self.base.fill(x0, x1, screen_y, *args, **kwargs)
+
+    def add_hit(self, y, x0, x1, action):
+        screen_y = self._screen_y(y)
+        if screen_y is not None:
+            self.base.add_hit(screen_y, x0, x1, action)
+
+
 def count_word(count, word, plural=None):
     """``1 question`` / ``2 questions``: the reference's ``nof`` for every count word on the screen."""
     return f"{count} {word if count == 1 else (plural or word + 's')}"
@@ -482,13 +549,14 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
     if height >= 2:
         grid.fill(0, width, height - 2, " ")
     x = 1
-    legend = [("↑↓", "move"), ("←→", "focus"), ("⏎", "go to pane"), ("Tab", "next view"),
-              ("/", "filter"), ("u", "usage"), ("F", "feed"), ("q", "quit")]
+    legend = [("↑↓", "move"), ("←→", "focus"), ("PgUp/Dn·Home/End·wheel", "scroll"),
+              ("⏎", "pane"), ("Tab", "view"), ("/", "filter"),
+              ("u", "usage"), ("F", "feed"), ("q", "quit")]
     for key, label in legend:
         if x > 1:
-            x = grid.put(x, height - 2, " · ", "line")
-        x = grid.put(x, height - 2, key, "hearting")
-        x = grid.put(x + 1, height - 2, label, "dim")
+            x = grid.put(x, height - 2, " · ", "line", limit=width - 1)
+        x = grid.put(x, height - 2, key, "hearting", limit=width - 1)
+        x = grid.put(x + 1, height - 2, label, "dim", limit=width - 1)
     return grid
 
 
@@ -560,29 +628,39 @@ def draw_explorer(grid: CellGrid, vm, state):
     # r14 separates the utility tabs from the SESSIONS band with a blank row.
     y += 1
     sessions = tuple(vm.sessions or ())
+    hosts = tuple(vm.compute or ())
+    shown_hosts = hosts[:5]
+    footer_start = max(0, grid.rows - 4)
+    compute_rows = 2 + len(shown_hosts)
+    compute_y = max(0, footer_start - compute_rows)
     working = sum(1 for item in sessions if item.get("state") == "working")
     idle = sum(1 for item in sessions if item.get("state") == "idle")
     blocked = sum(1 for item in sessions if item.get("state") == "blocked")
-    grid.fill(0, width, y, " ", "dim", tint=234)
-    grid.put(1, y, "SESSIONS ", "title_dim", tint=234)
-    count_x = max(1, width - 12)
-    grid.put(count_x, y, " ", "branch_s", tint=234)
-    grid.put(count_x + 1, y, "  ", None, tint=234)
-    grid.put(count_x + 3, y, f"⠏{working}", "g_spin", tint=234)
-    grid.put(count_x + 5, y, " ", "g_work_off", tint=234)
-    grid.put(count_x + 6, y, f"●{idle}", "g_work_off", tint=234)
-    grid.put(count_x + 8, y, " ", "g_blocked", tint=234)
-    grid.put(count_x + 9, y, f"●{blocked}", "g_blocked", tint=234)
-    grid.put(width - 1, y, " ", None, tint=234)
-    y += 1
-    tree_bottom = min(height - 1, 34)
+    if y < compute_y:
+        grid.fill(0, width, y, " ", "dim", tint=234)
+        grid.put(1, y, "SESSIONS ", "title_dim", tint=234)
+        count_x = max(1, width - 12)
+        grid.put(count_x, y, " ", "branch_s", tint=234)
+        grid.put(count_x + 1, y, "  ", None, tint=234)
+        grid.put(count_x + 3, y, f"⠏{working}", "g_spin", tint=234)
+        grid.put(count_x + 5, y, " ", "g_work_off", tint=234)
+        grid.put(count_x + 6, y, f"●{idle}", "g_work_off", tint=234)
+        grid.put(count_x + 8, y, " ", "g_blocked", tint=234)
+        grid.put(count_x + 9, y, f"●{blocked}", "g_blocked", tint=234)
+        grid.put(width - 1, y, " ", None, tint=234)
+        y += 1
+        tree_top = y
+    else:
+        # At the shortest usage-open geometry the complete COMPUTE block owns
+        # the remaining rows, so the sessions caption and tree yield space.
+        tree_top = compute_y
+    tree_bottom = compute_y
     tree_total = _tree_row_count(vm, sessions)
-    cut, tree_top = tree_bottom, y
-    if y + tree_total > tree_bottom:
-        # A tree taller than its pane stops above COMPUTE and says so on its last row; the rows
-        # it hides are neither drawn nor clickable.
-        cut = tree_bottom - 1
-        hidden_rows = y + tree_total - cut
+    tree_visible = max(0, tree_bottom - tree_top)
+    tree_max = max(0, tree_total - tree_visible)
+    offsets = dict(getattr(state, "scroll", ()) or ())
+    tree_offset = max(0, min(tree_max, int(offsets.get("tree", 0))))
+    cut = tree_top + tree_total
     route_scope = (next((item for item in vm.routes if str(item.get("id")) == scope_id), None)
                    if scope_kind == "route" else None)
     listed = {str(route.get("id")) for session in sessions for route in vm.routes
@@ -593,6 +671,9 @@ def draw_explorer(grid: CellGrid, vm, state):
     tree_repos = [repo for repo in vm.repos
                   if any(session.get("repo_id", session.get("repo")) == repo.get("id", repo.get("name", "·"))
                          for session in sessions)]
+    base_grid = grid
+    grid = _TreeViewport(base_grid, tree_top, tree_bottom, tree_offset, tree_total)
+    tree_indices = {}
     for repo_index, repo in enumerate(tree_repos):
         name = repo_label(repo.get("name", "·"))
         repo_id = repo.get("id", repo.get("name", "·"))
@@ -605,6 +686,7 @@ def draw_explorer(grid: CellGrid, vm, state):
         flat = not name
         shift = 3 if flat else 0
         if not flat:
+            tree_indices["repo:" + str(repo_id)] = y - tree_top
             grid.add_hit(y, 0, width, ("scope", "repo:" + str(repo_id)))
             repo_lit = ((scope_kind == "repo" and str(repo_id) == scope_id) or
                         (hidden and not lit_tag and str(repo_id) == str((route_scope or {}).get("repo"))))
@@ -629,6 +711,8 @@ def draw_explorer(grid: CellGrid, vm, state):
             if y >= cut:
                 break
             tag = str(session.get("tag") or "·")
+            tree_indices[tag] = y - tree_top
+            tree_indices["session:" + tag] = y - tree_top
             last_session = session_index == len(children) - 1
             stem = "   " if last_repo else "┃  "
             grid.add_hit(y, 0, width, ("scope", tag))
@@ -672,6 +756,7 @@ def draw_explorer(grid: CellGrid, vm, state):
             for route_index, route in enumerate(session_routes):
                 if y >= cut:
                     break
+                tree_indices.setdefault("route:" + str(route.get("id")), y - tree_top)
                 grid.add_hit(y, 0, width, ("route", route.get("id"), tag))
                 if scope_kind == "route" and str(route.get("id")) == scope_id:
                     grid.fill(0, width, y, " ", tint=236)
@@ -726,16 +811,13 @@ def draw_explorer(grid: CellGrid, vm, state):
     drag = tuple(getattr(state, "drag", ()) or ())
     if y < cut and len(drag) >= 9 and drag[0] == "tree" and drag[8] and drag[7] and drag[6] == "end":
         grid.put(1, y, "↳", "accent", limit=width - 1)
-    if cut < tree_bottom and cut >= tree_top:
-        grid.put(4, cut, f"… {hidden_rows} more rows", "dim", limit=width - 1)
+    grid = base_grid
 
-    # COMPUTE is a fixed explorer section. Percentages are source facts; draw the
-    # compact host summary from the immutable fixture without probing resources.
-    compute_y = 34
-    if compute_y < height:
-        hosts = tuple(vm.compute or ())
+    # The whole COMPUTE summary is anchored above the shared footer. The menu tab
+    # remains in the VIEWS list; this compact block is a separate destination.
+    if compute_y < footer_start:
         grid.add_hit(compute_y, 0, width, ("root", "COMPUTE"))
-        for hit_y in range(compute_y + 1, grid.rows - 4):
+        for hit_y in range(compute_y + 1, footer_start):
             grid.add_hit(hit_y, 0, width, ("root", "COMPUTE"))
         grid.fill(0, width, compute_y, " ", "dim", tint=234)
         grid.put(1, compute_y, "COMPUTE ",
@@ -750,9 +832,9 @@ def draw_explorer(grid: CellGrid, vm, state):
         grid.put(20, compute_y + 1, "gpu0", "dim")
         grid.put(27, compute_y + 1, "gpu1", "dim")
         host_labels = tuple(vm.hosts or ())
-        for offset, host in enumerate(hosts[:5]):
+        for offset, host in enumerate(shown_hosts):
             row_y = compute_y + 2 + offset
-            if row_y >= grid.rows - 4:
+            if row_y >= footer_start:
                 break
             _name, base, cpu, _memory, _disk, gpus = (tuple(host) + (None,) * 6)[:6]
             gpus = tuple(gpus or ())
@@ -779,3 +861,5 @@ def draw_explorer(grid: CellGrid, vm, state):
                     grid.put(gx, row_y, f" {pct:2d}%", key)
                 if gpu_index == 0:
                     grid.put(gx + 5, row_y, "●", "spin" if gpu_state == "working" else "idle")
+    return (0, tree_top, width, tree_bottom, tree_offset, tree_max,
+            tree_total, tree_visible, tree_indices)

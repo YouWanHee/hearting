@@ -7045,6 +7045,17 @@ def _explorer_compose(snapshot, cols, rows, state=None, focus_result=None, last_
         _EXPLORER_ORDER = list(cycle)
     _EXPLORER_STATE = state
     frame = explorer_frame.draw(model, state, cols, rows, beat=int(_BLINK_ON))
+    from dataclasses import replace
+    scrolls = dict(state.scroll)
+    for slot, layout in (("pane", frame.pane_scroll), ("tree", frame.tree_scroll)):
+        if len(layout) >= 5 and int(layout[4]):
+            scrolls[slot] = int(layout[4])
+        else:
+            scrolls.pop(slot, None)
+    normalized_scrolls = tuple(sorted(scrolls.items()))
+    if normalized_scrolls != state.scroll:
+        state = replace(state, scroll=normalized_scrolls)
+        _EXPLORER_STATE = state
     _EXPLORER_NAV_ROWS = _EXPLORER_ALL_ROWS = ()
     _SELECTABLE = []
     return frame
@@ -11185,8 +11196,12 @@ def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
     if key:
         from .explorer.runtime import tag_cycle
         order = tag_cycle(getattr(_EXPLORER_MODEL, "ordering", None))
-        _EXPLORER_STATE, _effects = reduce(state, {"type": "key", "key": key,
-                                                    "order": order}, _EXPLORER_FRAME)
+        event = {"type": "key", "key": key, "order": order}
+        if key == "end" and _EXPLORER_MODEL is not None and size is not None:
+            from .explorer.frame import measure_pane_max
+            event["max_scroll"] = measure_pane_max(
+                _EXPLORER_MODEL, state, int(size[1]), int(size[0]))
+        _EXPLORER_STATE, _effects = reduce(state, event, _EXPLORER_FRAME)
         _explorer_runtime().apply_effects(_effects, _EXPLORER_MODEL)
 
 

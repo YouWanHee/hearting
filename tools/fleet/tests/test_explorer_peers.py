@@ -31,12 +31,20 @@ class PeerPaneReference(unittest.TestCase):
             for name, folds in (("PEERS", ()), ("PEERS-pick-f5", (("pfocus:PEERS", "f5"),))):
                 with self.subTest(cols=cols, state=name):
                     state = NavState(view="PEERS", title="PEERS", folds=folds)
-                    actual_cells, actual_hits = _pane(draw(vm, state, cols, 45, beat=1))
+                    frame = draw(vm, state, cols, 45, beat=1)
+                    actual_cells, actual_hits = _pane(frame)
                     expected = capture["list_states"][name]
                     expected_cells = _expand(expected["cells"])
+                    # The pane slice includes the shared key guide. Apply the
+                    # same exact, approved scroll-help delta as the full oracle.
+                    from tools.fleet.tests.test_explorer_oracle import normalize_new_tree_viewport_row
+                    expected_cells, expected_full_hits = normalize_new_tree_viewport_row(
+                        [[list(cell) for cell in row] for row in frame.cells], expected_cells,
+                        [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in frame.hits],
+                        expected["hits"], frame.tree_scroll)
                     expected_cells = [row[SEPARATOR:] for row in expected_cells[5:]]
                     expected_hits = [[hit[0] - 5, hit[1] - SEPARATOR, hit[2] - SEPARATOR, hit[3]]
-                                     for hit in expected["hits"]
+                                     for hit in expected_full_hits
                                      if hit[0] >= 5 and hit[1] >= SEPARATOR]
                     if actual_cells != expected_cells:
                         mismatch = next(((row, col, expected_cells[row][col], actual_cells[row][col])

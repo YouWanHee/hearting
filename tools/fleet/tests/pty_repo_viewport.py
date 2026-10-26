@@ -193,8 +193,19 @@ def _child_main(evidence_dir, explorer=False):
             explorer_state = render._EXPLORER_STATE
             state["explorer"] = {
                 "title": getattr(frame, "title", ""),
+                "frame_size": ([int(frame.rows), int(frame.cols)] if frame is not None else []),
                 "regions": ({"screen": [0, 0, int(w), int(h)]} if frame is not None else {}),
                 "hit_count": len(getattr(frame, "hits", ()) or ()),
+                "pane_scroll": (list(frame.pane_scroll) if frame is not None else []),
+                "tree_scroll": (list(frame.tree_scroll[:8]) if frame is not None else []),
+                "pane_lines": ([line for line in frame.text_rows()[frame.pane_scroll[1]:frame.pane_scroll[3]]]
+                               if frame is not None and len(frame.pane_scroll) >= 4 else []),
+                "compute_host_rows": min(5, len(getattr(render._EXPLORER_MODEL, "compute", ()) or ())),
+                "compute_lines": (["".join(cell[0] for cell in row[1:32])
+                                   for row in frame.cells[
+                                       frame.tree_scroll[3]:frame.tree_scroll[3] + 2 +
+                                       min(5, len(getattr(render._EXPLORER_MODEL, "compute", ()) or ()))]]
+                                  if frame is not None and len(frame.tree_scroll) >= 4 else []),
                 "state": ({"view": explorer_state.view,
                            "scope": explorer_state.scope,
                            "opened": explorer_state.opened,
@@ -460,6 +471,11 @@ class PtyRun:
         child_env = dict(os.environ)
         child_env["TERM"] = os.environ.get("TERM") or "xterm-256color"
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        child_env["XDG_CONFIG_HOME"] = str(self.evidence_dir / "xdg-config")
+        # An explicit fixture state root is shared across process restarts.
+        # A standalone invocation still gets its own isolated default.
+        if not child_env.get("XDG_STATE_HOME"):
+            child_env["XDG_STATE_HOME"] = str(self.evidence_dir / "xdg-state")
         if self.live_capture:
             command = [sys.executable, str(TOOLS_DIR / "fleet" / "fleet.py"), "--explorer"]
             child_env["FLEET_PTY_LIVE_CAPTURE"] = "1"
@@ -908,6 +924,133 @@ class PtyRun:
                    parent_scope != "-" and root["explorer"]["state"]["scope"] == "-",
                    {"session": before_escape, "parent": parent_scope,
                     "list": root["explorer"]["state"]})
+
+        def scroll_value(sample, slot):
+            return dict(sample["explorer"]["state"].get("scroll", ())).get(slot, 0)
+
+        def check_layout(sample, rows, cols):
+            explorer = sample["explorer"]
+            footer = rows - 4
+            tree = explorer["tree_scroll"]
+            compute_hits = [hit for hit in explorer["hits"] if hit[3] == ["root", "COMPUTE"]]
+            tree_hits = [hit for hit in explorer["hits"] if hit[3][:1] in (["scope"], ["route"])]
+            tabs = [hit for hit in explorer["hits"] if hit[3] == ["tab", "COMPUTE"]]
+            block_rows = 2 + explorer["compute_host_rows"]
+            self.check("whole COMPUTE block is painted and bottom anchored",
+                       explorer["frame_size"] == [rows, cols]
+                       and len(compute_hits) == block_rows and compute_hits[0][0] == footer - block_rows
+                       and compute_hits[-1][0] == footer - 1
+                       and len(explorer["compute_lines"]) == block_rows
+                       and "COMPUTE" in explorer["compute_lines"][0]
+                       and all(hit[0] < footer for hit in compute_hits),
+                       {"size": [rows, cols], "compute_hits": compute_hits,
+                        "compute_lines": explorer["compute_lines"], "footer": footer})
+            self.check("COMPUTE menu remains a separate visible tab",
+                       len(tabs) == 1 and tabs[0][0] < tree[1], tabs)
+            self.check("painted tree hits stay inside the tree viewport",
+                       all(tree[1] <= hit[0] < tree[3] for hit in tree_hits),
+                       {"tree": tree, "hits": tree_hits})
+            self.check("painted hits stay inside the resized screen",
+                       all((hit[0] == -1 and hit[3][:1] == ["parent"]
+                            and hit[1] == hit[2] == 0) or
+                           (0 <= hit[0] < rows and 0 <= hit[1] < hit[2] <= cols)
+                           for hit in explorer["hits"]), explorer["hits"])
+            return tree
+
+        self.resize(24, 120)
+        short = self.wait_for("short explorer viewport paints",
+                              lambda s: s.get("size") == [24, 120]
+                              and s.get("explorer", {}).get("frame_size") == [24, 120])
+        check_layout(short, 24, 120)
+        pane = short["explorer"]["pane_scroll"]
+        self.check("short pane exposes unclipped body scroll rows",
+                   len(pane) >= 8 and pane[5] > 0 and pane[7], pane)
+        self.send(b"\x1b[6~", "explorer-body-page-down")
+        page_down = self.wait_for("PageDown scrolls the pane body",
+                                  lambda s: scroll_value(s, "pane") > 0)
+        self.check("PageDown offset stays in the painted scroll range",
+                   scroll_value(page_down, "pane") <= page_down["explorer"]["pane_scroll"][5],
+                   page_down["explorer"]["pane_scroll"])
+        self.check("PageDown paints the next body rows",
+                   page_down["explorer"]["pane_lines"] != short["explorer"]["pane_lines"],
+                   {"before": short["explorer"]["pane_lines"],
+                    "after": page_down["explorer"]["pane_lines"]})
+        self.send(b"\x1b[H", "explorer-body-home")
+        home = self.wait_for("Home restores the first body row",
+                             lambda s: scroll_value(s, "pane") == 0)
+        self.send(b"\x1b[F", "explorer-body-end")
+        end = self.wait_for("End reaches the last body row",
+                            lambda s: scroll_value(s, "pane") ==
+                            s.get("explorer", {}).get("pane_scroll", [0, 0, 0, 0, 0, -1])[5])
+        self.check("End remains at the measured body clamp",
+                   scroll_value(end, "pane") == end["explorer"]["pane_scroll"][5],
+                   end["explorer"]["pane_scroll"])
+        self.send(b"\x1b[H", "explorer-body-home-before-wheel")
+        self.wait_for("body scroll returns to top before wheel",
+                      lambda s: scroll_value(s, "pane") == 0)
+        pane = self.state()["explorer"]["pane_scroll"]
+        self.send(b"\x1b[<65;%d;%dM" % (pane[0] + 2, pane[1] + 2),
+                  "explorer-body-wheel-down")
+        wheel_body = self.wait_for("body wheel scrolls the pane",
+                                   lambda s: scroll_value(s, "pane") > 0)
+        self.check("body wheel uses a visible frame coordinate",
+                   pane[0] <= pane[0] + 1 < pane[2]
+                   and pane[1] <= pane[1] + 1 < pane[3]
+                   and scroll_value(wheel_body, "pane") <= wheel_body["explorer"]["pane_scroll"][5],
+                   {"pane": pane, "scroll": wheel_body["explorer"]["pane_scroll"]})
+
+        self.resize(40, 120)
+        medium = self.wait_for("medium explorer viewport paints",
+                               lambda s: s.get("size") == [40, 120]
+                               and s.get("explorer", {}).get("frame_size") == [40, 120])
+        tree = check_layout(medium, 40, 120)
+        self.check("resize clamps body offset to the current viewport",
+                   scroll_value(medium, "pane") <= medium["explorer"]["pane_scroll"][5]
+                   and scroll_value(medium, "pane") <= scroll_value(wheel_body, "pane"),
+                   {"before": wheel_body["explorer"]["pane_scroll"],
+                    "after": medium["explorer"]["pane_scroll"]})
+        self.check("medium viewport exposes scrollable tree rows", tree[5] > 0 and tree[7] > 0, tree)
+        tree_before = scroll_value(medium, "tree")
+        tree_direction = 1 if tree_before >= tree[5] else -1
+        tree_after = max(0, min(tree[5], tree_before - 3 * tree_direction))
+        tree_button = 64 if tree_direction > 0 else 65
+        self.send(b"\x1b[<%d;%d;%dM" % (tree_button, 3, tree[1] + 2),
+                  "explorer-tree-wheel-up" if tree_direction > 0 else "explorer-tree-wheel-down")
+        tree_down = self.wait_for("sidebar wheel scrolls the full session tree",
+                                  lambda s: scroll_value(s, "tree") == tree_after)
+        before_tree_rows = [hit[3] for hit in medium["explorer"]["hits"]
+                            if hit[3][:1] in (["scope"], ["route"])]
+        after_tree_rows = [hit[3] for hit in tree_down["explorer"]["hits"]
+                           if hit[3][:1] in (["scope"], ["route"])]
+        tree_cells_before = medium["explorer"]["order"]["tree_cells"][tree[1]:tree[3]]
+        tree_cells_after = tree_down["explorer"]["order"]["tree_cells"][tree[1]:tree[3]]
+        self.check("tree wheel retains visible row hit coordinates",
+                   all(tree_down["explorer"]["tree_scroll"][1] <= hit[0] <
+                       tree_down["explorer"]["tree_scroll"][3]
+                       for hit in tree_down["explorer"]["hits"]
+                       if hit[3][:1] in (["scope"], ["route"]))
+                   and tree_before != tree_after and tree_cells_before != tree_cells_after
+                   and medium["explorer"]["order"]["repos"] ==
+                       tree_down["explorer"]["order"]["repos"]
+                   and medium["explorer"]["order"]["sessions"] ==
+                       tree_down["explorer"]["order"]["sessions"],
+                   {"offsets": [tree_before, tree_after],
+                    "before": before_tree_rows, "after": after_tree_rows,
+                    "viewport": tree_down["explorer"]["tree_scroll"]})
+
+        self.resize(60, 140)
+        tall = self.wait_for("tall explorer viewport paints",
+                             lambda s: s.get("size") == [60, 140]
+                             and s.get("explorer", {}).get("frame_size") == [60, 140])
+        tall_tree = check_layout(tall, 60, 140)
+        self.check("tall viewport reveals the complete tree and clamps its old offset",
+                   tall_tree[5] == 0 and tall_tree[7] >= tall_tree[6]
+                   and scroll_value(tall, "tree") == 0, tall_tree)
+        self.resize(40, 120)
+        root = self.wait_for("restored medium viewport paints at the top of the tree",
+                             lambda s: s.get("size") == [40, 120]
+                             and s.get("explorer", {}).get("frame_size") == [40, 120]
+                             and s.get("explorer", {}).get("tree_scroll", [0, 0, 0, 0, 1])[4] == 0)
 
         if os.environ.get("FLEET_PTY_DRAG") == "1":
             def tree_hits(state, kind):
