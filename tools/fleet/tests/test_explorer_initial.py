@@ -105,6 +105,23 @@ class DetailCallbackSelection(unittest.TestCase):
         optional("complete")
         self.assertEqual(calls, [("required", "basic"), ("full", "complete")])
 
+    def test_selected_peers_and_memory_scopes_request_optional_refresh_without_reselecting_base(self):
+        from tools.fleet import render
+        from tools.fleet.explorer.state import NavState
+
+        overview = render._explorer_optional_detail_key("generation-1", NavState())
+        peers = render._explorer_optional_detail_key(
+            "generation-1", NavState(view="PEERS", scope="repo:repo-a"))
+        memory = render._explorer_optional_detail_key(
+            "generation-1", NavState(view="MEMORY", scope="repo:repo-a"))
+        other_repo = render._explorer_optional_detail_key(
+            "generation-1", NavState(view="MEMORY", scope="repo:repo-b"))
+        self.assertNotEqual(overview, peers)
+        self.assertNotEqual(peers, memory)
+        self.assertNotEqual(memory, other_repo)
+        self.assertEqual(peers, render._explorer_optional_detail_key(
+            "generation-1", NavState(view="PEERS", scope="repo:repo-a")))
+
 
 class _Screen:
     def __init__(self, rows=45, cols=140):
@@ -194,6 +211,40 @@ class LoadingGate(unittest.TestCase):
                 self.render._draw_explorer_frame(screen, frame, self.snapshot)
             glyphs.update(ch for ch in screen.text() if "⠀" <= ch <= "⣿")
         self.assertEqual(len(glyphs), 10)
+
+    def test_selected_models_publish_over_complete_base_while_next_base_is_pending(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from tools.fleet import render
+        from tools.fleet.explorer.state import NavState
+        from tools.fleet.explorer.view_model import ExplorerViewModel
+
+        base = ExplorerViewModel.from_mapping({"models": {"profiles": ("old",)}})
+        selected = SimpleNamespace(config={"profiles": ("new",)})
+        published = []
+        screen = _Screen()
+        patches = (
+            mock.patch.object(render, "_EXPLORER_ENABLED", True),
+            mock.patch.object(render, "_EXPLORER_STATE", NavState(view="MODELS")),
+            mock.patch.object(render, "_EXPLORER_PUBLISHED_MODEL", base),
+            mock.patch.object(render, "_EXPLORER_MODEL", base),
+            mock.patch.object(render, "_EXPLORER_RESULT", selected),
+            mock.patch.object(render, "_EXPLORER_READINESS", {"ready": False, "pending": ("basic",)}),
+            mock.patch.object(render, "_explorer_runtime", return_value=SimpleNamespace()),
+            mock.patch.object(render, "_explorer_compose",
+                              side_effect=AssertionError("selection overlay must not wait for base")),
+            mock.patch.object(render, "_explorer_frame_from_model",
+                              side_effect=lambda model, *_args, **_kwargs: model),
+            mock.patch.object(render, "_draw_explorer",
+                              side_effect=lambda _screen, _snapshot, frame=None: published.append(frame)),
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+                patches[6], patches[7], patches[8], patches[9]:
+            render._draw(screen, [], [], "all", 0, loading=False,
+                         snapshot={"observations": {"basic": {"state": "pending"}}})
+
+        self.assertEqual(published[0].models["profiles"], ("new",))
+        self.assertEqual(base.models["profiles"], ("old",))
 
 
 class RemoteHostObservation(unittest.TestCase):
