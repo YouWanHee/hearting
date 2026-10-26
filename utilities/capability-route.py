@@ -9705,6 +9705,153 @@ def _node_revision_records(route, node_id, jobs=None):
             revisions.append(marker.get("revision") or {})
     return revisions
 
+
+def producer_revision_admission(route, nodes, jobs):
+    """Resolve the approved generation for one atomic plan-author group.
+
+    A generation changes only when the existing producer revision writer has
+    recorded a new, basis-verified revision. The returned token is derived
+    from immutable marker history; it is not a new approval or history store.
+    """
+    nodes = list(nodes or ())
+    if (not nodes or any(node.get("unit") != "plan/plan-author" for node in nodes)
+            or len({str(node.get("id")) for node in nodes}) != len(nodes)):
+        return {"managed": False, "generation": None, "pending": False,
+                "current_attempt_ids": {}}
+    group_ids = {node.get("parallel_group") or node.get("replica_group") for node in nodes}
+    if len(group_ids) != 1 or None in group_ids:
+        raise ValueError("producer-revision-group-invalid")
+    if jobs is None:
+        raise ValueError("producer-revision-jobs-required")
+    jobs = Path(jobs).resolve()
+    directory = completion_dir(route["route_id"], jobs=jobs)
+    if not jobs.is_file():
+        if directory.exists() or directory.is_symlink():
+            raise ValueError("producer-revision-registry-unreadable")
+        return {"managed": True, "generation": "1", "pending": False,
+                "current_attempt_ids": {},
+                "basis": [{"node_id": str(node["id"]), "sequence": 0} for node in nodes]}
+    generation_basis = []
+    current_attempt_ids = {}
+    pending = False
+    any_revision = False
+    for node in nodes:
+        node_id = str(node["id"])
+        prefix = f"{node_id}."
+        revision_markers = []
+        numeric_paths = []
+        if directory.is_dir():
+            for path in directory.glob(f"{node_id}.*.json"):
+                middle = path.name[len(prefix):-5]
+                if middle.isdigit():
+                    numeric_paths.append((int(middle), path))
+        numeric_paths.sort()
+        for sequence, path in numeric_paths:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("producer-revision-history-invalid")
+            try:
+                raw = path.read_bytes()
+                marker = json.loads(raw.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("producer-revision-history-invalid") from exc
+            if (not isinstance(marker, dict) or marker.get("sequence") != sequence
+                    or marker.get("route_id") != route.get("route_id")
+                    or marker.get("route_hash") != route.get("route_hash")
+                    or marker.get("node_id") != node_id):
+                raise ValueError("producer-revision-history-invalid")
+            if marker.get("stage_authority") != "revision":
+                continue
+            revision = marker.get("revision")
+            evidence = marker.get("evidence")
+            if not isinstance(revision, dict) or not isinstance(evidence, dict):
+                raise ValueError("producer-revision-history-invalid")
+            prior_sequence = revision.get("of_sequence")
+            if not isinstance(prior_sequence, int) or prior_sequence < 1 or prior_sequence >= sequence:
+                raise ValueError("producer-revision-history-invalid")
+            prior_path = directory / f"{node_id}.{prior_sequence}.json"
+            try:
+                prior_bytes = prior_path.read_bytes()
+                prior_marker = json.loads(prior_bytes.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("producer-revision-history-invalid") from exc
+            prior_sha = hashlib.sha256(prior_bytes).hexdigest()
+            if (revision.get("of_marker_sha256") != prior_sha
+                    or revision.get("of_evidence_sha256") != (prior_marker.get("evidence") or {}).get("sha256")
+                    or revision.get("evidence_sha256") != evidence.get("sha256")):
+                raise ValueError("producer-revision-history-invalid")
+            try:
+                revision_basis_verdict(
+                    route, node, revision.get("basis"), revision.get("answers") or (),
+                    jobs=jobs, direction=revision.get("direction"), reason=revision.get("reason"),
+                )
+            except ValueError as exc:
+                raise ValueError(f"producer-revision-basis-unverified:{node_id}:{exc}") from exc
+            revision_markers.append((sequence, raw, marker))
+
+        canonical_path = directory / f"{node_id}.json"
+        if canonical_path.is_symlink():
+            raise ValueError("producer-revision-canonical-invalid")
+        if canonical_path.is_file():
+            try:
+                canonical_raw = canonical_path.read_bytes()
+                canonical = json.loads(canonical_raw.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("producer-revision-canonical-invalid") from exc
+            if not isinstance(canonical, dict):
+                raise ValueError("producer-revision-canonical-invalid")
+            sequence = canonical.get("sequence")
+            if not isinstance(sequence, int) or sequence < 1:
+                raise ValueError("producer-revision-canonical-invalid")
+            history_path = directory / f"{node_id}.{sequence}.json"
+            if (canonical.get("route_id") != route.get("route_id")
+                    or canonical.get("route_hash") != route.get("route_hash")
+                    or canonical.get("node_id") != node_id
+                    or history_path.is_symlink() or not history_path.is_file()
+                    or history_path.read_bytes() != canonical_raw):
+                raise ValueError("producer-revision-canonical-history-conflict")
+            currency = gate_currency(route, node, canonical_path, canonical,
+                                     observe=True, jobs=jobs)
+            if currency.state != "current":
+                raise ValueError(f"producer-revision-marker-{currency.state}:{node_id}:{currency.reason}")
+            latest_revision = revision_markers[-1] if revision_markers else None
+            if (latest_revision and canonical.get("stage_authority") == "revision"
+                    and canonical.get("sequence") == latest_revision[0]):
+                pending = True
+            elif (canonical.get("stage_authority") != "revision"
+                    and not canonical.get("state") and canonical.get("attempt_id")):
+                current_attempt_ids[node_id] = str(canonical["attempt_id"])
+        elif numeric_paths:
+            raise ValueError("producer-revision-canonical-missing")
+
+        if revision_markers:
+            any_revision = True
+            sequence, raw, marker = revision_markers[-1]
+            revision = marker["revision"]
+            generation_basis.append({
+                "node_id": node_id,
+                "sequence": sequence,
+                "marker_sha256": hashlib.sha256(raw).hexdigest(),
+                "basis": revision.get("basis"),
+                "answers": revision.get("answers") or [],
+                "direction": revision.get("direction"),
+                "reason": revision.get("reason"),
+                "author_attempt_id": revision.get("author_attempt_id"),
+                "evidence_sha256": (marker.get("evidence") or {}).get("sha256"),
+            })
+        else:
+            generation_basis.append({"node_id": node_id, "sequence": 0})
+
+    generation = "1"
+    if any_revision:
+        encoded = json.dumps(generation_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        generation = "rev-" + hashlib.sha256(encoded).hexdigest()
+    if pending:
+        # A revision marker is the approval for a new generation. The prior
+        # completed producer attempts remain history, not peers in this batch.
+        current_attempt_ids = {}
+    return {"managed": True, "generation": generation, "pending": pending,
+            "current_attempt_ids": current_attempt_ids, "basis": generation_basis}
+
 def _supersession_records(route, node_id, jobs=None):
     """The node's canonical marker when an upstream revision tombstoned it,
     as a `supersedes` entry: its verdict no longer covers the revised input,
