@@ -1843,7 +1843,7 @@ tags the command's environment. After the command finishes, the lease ends any
 remaining owned processes, confirms that known owned identities are no longer
 live, and removes only the directory it created. If an owned child remains live
 or its identity cannot be read, the lease keeps that directory and reports its
-path and cause; unreadable unrelated processes do not prevent its removal. The
+path and cause; unrelated process read failures have no effect on its removal. The
 inherited parent, sibling roots, external symlink targets, and shared runtime
 caches are not lease scratch. The caller retains command output independently
 of scratch removal. The scope's memory, measured as its proportional set size
