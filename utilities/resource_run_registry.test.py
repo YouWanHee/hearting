@@ -458,6 +458,159 @@ class ResourceRegistryTest(unittest.TestCase):
             self.assertEqual(resumed["experiment_observation"]["observation"]
                 ["source_observations"][0]["value"], 21)
 
+    def test_rootless_stale_observer_resumes_exact_persisted_generic_binding(self):
+        import hashlib
+        import resource_progress
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            artifact = base / "artifacts"
+            artifact.mkdir()
+            route = artifact / "route.json"
+            route.write_text(json.dumps({"route_id": "route-fixture",
+                                         "artifact_root": str(artifact)}))
+            registry_dir = base / "registry"
+            bundle = registry_dir / "admission-bundle"
+            bundle.mkdir(parents=True)
+            registry_path = registry_dir / "resource-runs.json"
+            jobs_path = base / "dispatch" / "jobs.log"
+            jobs_path.parent.mkdir()
+            jobs_path.touch()
+            run_id, writer_id = "rootless-stale-run", "independent-writer"
+            (bundle / "execution-record.json").write_text(json.dumps({"run_id": run_id}))
+            admission_path = bundle / "arbitrary-admission.json"
+            admission_path.write_text(json.dumps({"admitted": False,
+                "snapshot": {"t": 900}, "first_snapshot": {"t": 800},
+                "reasons": ["capacity"],
+                "preceding_evaluation_leases": [{"task": "evaluation", "host": "h1"}]}))
+            source = base / "writer" / "observation.json"
+            source.parent.mkdir()
+            source.write_text(json.dumps({"observed_at": 950, "finished_cells": 11}))
+            proof = base / "writer-proof.json"
+            proof.write_text(json.dumps({"target": run_id, "writer": writer_id,
+                "command": ["writer", "--target", run_id]}))
+            binding = {"target_run_id": run_id, "row_key": "run",
+                "path": str(source), "writer_run_id": writer_id,
+                "timestamp_pointer": "/observed_at", "scope": "shared-results",
+                "counters": [{"name": "finished_cells", "pointer": "/finished_cells",
+                              "comparison_eligible": False}],
+                "proofs": [{"path": str(proof),
+                    "sha256": hashlib.sha256(proof.read_bytes()).hexdigest(),
+                    "assertions": [{"pointer": "/target", "equals": run_id},
+                                   {"pointer": "/writer", "equals": writer_id},
+                                   {"pointer": "/command/2", "equals": run_id}]}]}
+            identity = {"pid": 77, "starttime": "9", "command_hash": "a" * 64,
+                        "process_group": 77}
+            raw_row = {**identity, "run_id": run_id, "status": "running",
+                "pid_namespace": "pid:[foreign-fixture]", "route": str(route),
+                "route_id": "route-fixture", "jobs": str(jobs_path),
+                "execution": {"kind": "local-resource", "run_id": "execution-a"},
+                "owner_wait": {"harness": "codex", "session_id": "fixture-owner"}}
+            registry_bytes = json.dumps({"schema_version": 1,
+                "runs": {run_id: raw_row}}, sort_keys=True).encode() + b"\n"
+            registry_path.write_bytes(registry_bytes)
+            initial = {**raw_row, "observation": {"source_bindings": [binding]}}
+            notices = []
+
+            def capture_notice(*args, **kwargs):
+                notices.append(kwargs)
+                return {"state": "pending"}
+
+            with mock.patch.object(registry, "proc_identity", return_value=identity), \
+                    mock.patch("session_notice.notify", side_effect=capture_notice):
+                first = registry.observe_run_if_due(run_id, initial, registry_path, now=1000)
+                first_state_path = resource_progress._observation_state_path(
+                    {**raw_row, "run_id": run_id}, registry_path, "run", create=False)
+                first_state = resource_progress._read_observation_state(first_state_path)
+                raw_view = registry.normalize_run(run_id, raw_row, registry_path,
+                    identity_reader=lambda _pid: identity, now=1001)
+                unchanged_poll = registry.observe_run_if_due(
+                    run_id, raw_row, registry_path, now=1061)
+
+                # The registry row remains byte-for-byte unchanged and carries no
+                # metadata on this later normal call; only the exact state retains it.
+                source.write_text(json.dumps({"observed_at": 1120, "finished_cells": 21}))
+                admission_path.write_text(json.dumps({"admitted": True,
+                    "snapshot": {"t": 1100}, "first_snapshot": {"t": 800}}))
+                resumed = registry.observe_run_if_due(run_id, raw_row, registry_path, now=1122)
+                normalized = registry.normalize_run(run_id, raw_row, registry_path,
+                    identity_reader=lambda _pid: identity, now=1123)
+                final_state = resource_progress._read_observation_state(first_state_path)
+                public = resource_progress.read_public_run_record(artifact, run_id)
+
+            self.assertEqual(registry_path.read_bytes(), registry_bytes)
+            self.assertNotIn("started_at", raw_row)
+            self.assertNotIn("output_dir", raw_row)
+            self.assertNotIn("progress_file", raw_row)
+            for view in (first, raw_view, resumed, normalized):
+                self.assertEqual(view["liveness"], "stale")
+                self.assertEqual(view["state_evidence"]["reason"],
+                                 "process-namespace-mismatch")
+            self.assertEqual(first["experiment_observation"]["observation"]
+                ["source_observations"][0]["value"], 11)
+            self.assertEqual(raw_view["experiment_observation"]["observation"]
+                ["source_observations"][0]["value"], 11)
+            self.assertEqual(resumed["experiment_observation"]["observation"]
+                ["source_observations"][0]["value"], 21)
+            self.assertEqual(unchanged_poll["experiment_observation"]["observation"]
+                ["source_observations"][0]["value"], 11)
+            normalized_observation = normalized["experiment_observation"]["observation"]
+            self.assertEqual(normalized_observation["source_observations"][0]["value"], 21)
+            # The admission file reports the latest decision, while current
+            # admission status remains unknown because this registry row has
+            # no trustworthy birth clock.
+            self.assertEqual(normalized_observation["admission"]["state"], "unknown")
+            self.assertEqual(normalized_observation["admission"]["admitted_samples"], 1)
+            self.assertEqual(normalized_observation["admission"]["denied_samples"], 1)
+            self.assertIsNone(normalized_observation["reached"])
+            self.assertIsNone(normalized_observation["total"])
+            self.assertIsNone(normalized_observation["unit"])
+            self.assertIsNone(normalized_observation["rate_per_second"])
+            self.assertIsNone(normalized_observation["eta_seconds"])
+            self.assertIsNone(normalized_observation["elapsed_seconds"])
+            self.assertIsNone(final_state["row_started_at"])
+            self.assertEqual(final_state["clock_scope"], "unknown")
+            self.assertEqual(final_state["source_bindings"], [binding])
+            self.assertEqual(final_state["source_observations"][0]["value"], 21)
+            self.assertNotIn("final:run", final_state["event_keys"])
+            self.assertFalse(any(event.get("kind") == "final"
+                                 for event in final_state["outbox"]))
+            self.assertEqual(final_state["admission_counts"],
+                             {"admitted": 1, "denied": 1, "unknown": 0})
+            self.assertEqual(final_state["admission_latest"]["state"], "admitted")
+            self.assertEqual(public["status"], "stale")
+            self.assertIsNone(public["ended_at"])
+            self.assertEqual(public["progress"]["observed_counters"][0]["value"], 21)
+            self.assertEqual(public["admission"]["state"], "unknown")
+            self.assertIsNone(public["progress"]["reached"])
+            self.assertIsNone(public["progress"]["total"])
+            self.assertIsNone(public["progress"].get("eta_seconds"))
+            self.assertIsNone(public["eta"])
+            self.assertIsNone(public["rows"][0]["started_at"])
+            self.assertEqual(public["rows"][0]["clock_scope"], "unknown")
+
+            first_notice = next(event for event in first_state["outbox"]
+                if "raw counter=finished_cells:11" in event["text"])
+            resumed_notice = next(event for event in final_state["outbox"]
+                if "raw counter=finished_cells:21" in event["text"])
+            self.assertNotEqual(first_notice["key"], resumed_notice["key"])
+            self.assertEqual(first_notice["recipients"], resumed_notice["recipients"])
+            self.assertIn("admission=unknown", resumed_notice["text"])
+            self.assertIn("samples denied/valid=1/2", resumed_notice["text"])
+            self.assertIn("raw counter=finished_cells:21", notices[-1]["text"])
+            self.assertIn("samples denied/valid=1/2", notices[-1]["text"])
+            self.assertEqual(notices[-1]["lineage"], resumed_notice["recipients"][0]["lineage"])
+
+            mismatched_execution = {**raw_row, "execution": {"kind": "local-resource",
+                "run_id": "execution-b"}}
+            unrelated_identity = {**raw_row, "starttime": "10"}
+            mismatched = registry.normalize_run(run_id, mismatched_execution, registry_path,
+                identity_reader=lambda _pid: identity, now=1063)
+            unrelated = registry.normalize_run("other-stale-run", unrelated_identity,
+                registry_path, identity_reader=lambda _pid: identity, now=1063)
+            self.assertIsNone(mismatched["experiment_observation"])
+            self.assertIsNone(unrelated["experiment_observation"])
+
     def test_explicit_observer_requires_exact_terminal_evidence_and_reuses_one_notice(self):
         import resource_progress
         import dispatch_pending_delivery

@@ -300,6 +300,103 @@ class AdoptionTest(unittest.TestCase):
         self.assertIsNone(record["progress"]["reached"])
         self.assertIsNone(record["eta"])
 
+    def test_installed_current_subprocess_continues_persisted_stale_source(self):
+        import resource_progress
+
+        source_bundle = self.base / "stale-bundle-source"
+        (source_bundle / "utilities").mkdir(parents=True)
+        shutil.copytree(HERE, source_bundle / "utilities", dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.test.py", "*.test.sh"))
+        install_root = self.base / "fixture-home-stale" / ".local" / "share" / "hearting"
+        release = install_root / "releases" / "fixture-stale-release"
+        install_root.mkdir(parents=True)
+        shutil.copytree(source_bundle, release)
+        current = install_root / "current"
+        current.symlink_to(release, target_is_directory=True)
+
+        registry = self.base / "stale-registry" / "resource-runs.json"
+        registry.parent.mkdir()
+        dispatch_jobs = self.base / "stale-dispatch" / "jobs.log"
+        dispatch_jobs.parent.mkdir()
+        dispatch_jobs.touch()
+        artifact = self.base / "stale-artifacts"
+        artifact.mkdir()
+        route = artifact / "route.json"
+        route.write_text(json.dumps({"route_id": "stale-route",
+                                     "artifact_root": str(artifact)}))
+        run_id, writer_id = "installed-stale-target", "installed-independent-writer"
+        source = self.base / "stale-writer" / "observation.json"
+        source.parent.mkdir()
+        proof = self.base / "stale-writer-proof.json"
+        proof.write_text(json.dumps({"target": run_id, "writer": writer_id,
+            "command": ["writer", "--target", run_id]}))
+        binding = {"target_run_id": run_id, "row_key": "run",
+            "path": str(source), "writer_run_id": writer_id,
+            "timestamp_pointer": "/observed_at", "scope": "shared-results",
+            "counters": [{"name": "sample_units", "pointer": "/sample_units",
+                          "comparison_eligible": False}],
+            "proofs": [{"path": str(proof),
+                "sha256": hashlib.sha256(proof.read_bytes()).hexdigest(),
+                "assertions": [{"pointer": "/target", "equals": run_id},
+                               {"pointer": "/writer", "equals": writer_id},
+                               {"pointer": "/command/2", "equals": run_id}]}]}
+        raw_row = {"run_id": run_id, "status": "running", "pid": 777,
+            "starttime": "9", "command_hash": "d" * 64,
+            "pid_namespace": "pid:[foreign-fixture]", "route": str(route),
+            "route_id": "stale-route", "jobs": str(dispatch_jobs),
+            "execution": {"kind": "local-resource", "run_id": "installed-execution"}}
+        registry_bytes = json.dumps({"schema_version": 1,
+            "runs": {run_id: raw_row}}, sort_keys=True).encode() + b"\n"
+        registry.write_bytes(registry_bytes)
+        seed_now = time.time() - 120
+        source.write_text(json.dumps({"observed_at": seed_now - 10, "sample_units": 11}))
+        accepted = {**raw_row, "artifact_root": str(artifact),
+                    "observation": {"source_bindings": [binding]}}
+        seeded = resource_progress.observe_experiment(accepted, registry, seed_now,
+            row_key="run", started_at=None, status="stale", notify_events=False)
+        self.assertEqual(seeded["observation"]["source_observations"][0]["value"], 11)
+
+        source.write_text(json.dumps({"observed_at": time.time(), "sample_units": 22}))
+        source_before, proof_before = source.read_bytes(), proof.read_bytes()
+        env = fixture_env.build_environment(self.base / "fixture-env-stale", current)
+        env.pop("PYTHONPATH", None)
+        driver = self.base / "run-installed-observer-once.py"
+        driver.write_text(
+            "import importlib.util, sys\n"
+            "from pathlib import Path\n"
+            "utilities = Path(sys.argv[1])\n"
+            "sys.path.insert(0, str(utilities))\n"
+            "spec = importlib.util.spec_from_file_location('installed_observer', "
+            "utilities / 'resource-observers.py')\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "class StopAfterPoll(Exception): pass\n"
+            "def stop(_seconds): raise StopAfterPoll()\n"
+            "try: module.watch_resource(sys.argv[2], sys.argv[3], sleep=stop)\n"
+            "except StopAfterPoll: pass\n")
+        command = [sys.executable, "-B", str(driver), str(current / "utilities"),
+                   str(registry), run_id]
+        completed = subprocess.run(command, cwd=self.base, env=env,
+            capture_output=True, text=True, timeout=20)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(registry.read_bytes(), registry_bytes)
+        self.assertEqual((source.read_bytes(), proof.read_bytes()), (source_before, proof_before))
+
+        state_path = resource_progress._observation_state_path(raw_row, registry, "run",
+                                                                create=False)
+        state = resource_progress._read_observation_state(state_path)
+        record = resource_progress.read_public_run_record(artifact, run_id)
+        self.assertEqual(state["source_bindings"], [binding])
+        self.assertEqual(state["source_observations"][0]["value"], 22)
+        self.assertEqual(record["status"], "stale")
+        self.assertEqual(record["progress"]["observed_counters"][0]["value"], 22)
+        self.assertIsNone(record["progress"]["reached"])
+        self.assertIsNone(record["progress"]["total"])
+        self.assertIsNone(record["progress"].get("eta_seconds"))
+        self.assertIsNone(record["eta"])
+        self.assertTrue(any("raw counter=sample_units:22" in event["text"]
+                            for event in state["outbox"]))
+
     def test_hash_bound_request_discovery_and_invalid_digest(self):
         import resource_progress as progress
         with tempfile.TemporaryDirectory() as directory:
