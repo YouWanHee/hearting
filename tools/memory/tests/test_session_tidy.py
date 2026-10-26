@@ -933,6 +933,62 @@ class NativeSessionConsumerTest(TidyCase):
     TARGET = "33333333-3333-4333-8333-333333333333"
     REF = "abcdefabcdefabcdefabcdefabcdefab"
 
+    def test_unsent_continue_releases_successor_claim_and_retry_once(self):
+        predecessor_sid = "native-predecessor-fixture"
+        other_sid = "native-other-fixture"
+        source = st.Seat("pane", st._digest("pane", "fixture:unsent-continue"),
+                         pane="fixture:unsent-continue", harness="codex", sid=predecessor_sid)
+        nonce = "unsent-continue-fixture-nonce"
+        with self.library():
+            now = st.now_epoch()
+            with st.session_state_lock(source):
+                card = st.write_card(source, "codex", predecessor_sid, "continuation claim fixture",
+                                     cwd=str(self.cwd), prompt_seq=st.read_prompt_seq(source), now=now)
+            clear._write_reservation({
+                "schema": clear.SCHEMA, "nonce": nonce, "status": "reserved",
+                "created": now, "deadline": now + clear.CLEAR_DEADLINE_SEC,
+                "seat": source.as_dict(), "harness": "codex", "sid": predecessor_sid,
+                "cwd": str(self.cwd), "card_generation": card["generation"],
+                "prompt_seq": st.read_prompt_seq(source), "continue_off": False,
+            })
+            self.assertTrue(clear._finish(source.key, nonce, "cleared", observed=self.TARGET))
+            path = clear.reservation_path(source.key)
+
+            first, reason = clear.claim_continue(path, nonce)
+            self.assertEqual(reason, "")
+            old_claim_id = first["continued"]["claim_id"]
+            self.assertEqual(first["continued"]["state"], "sending")
+            booked = clear.read_reservation(source.key)
+            successor = st.session_seat(clear._booked_seat(booked, source.key), "codex", self.TARGET)
+            prompt = clear.followup_text(first)
+            sequence = int(first["continued"].get("sent_seq", 0) or 0) + 1
+            self.assertEqual(st.matching_tidy_claim(successor, "codex", self.TARGET, prompt, sequence)
+                             ["claim_id"], old_claim_id)
+
+            self.assertTrue(clear.release_unsent_continue(first))
+            released_booking = clear.read_reservation(source.key)
+            self.assertEqual(released_booking["continued"]["state"], "pending")
+            released = st.tidy_claim_by_id(successor, old_claim_id)
+            self.assertEqual(released["state"], "released")
+            self.assertIsNone(st.matching_tidy_claim(successor, "codex", self.TARGET, prompt, sequence))
+
+            predecessor = st.session_seat(source, "codex", predecessor_sid)
+            other = st.session_seat(source, "codex", other_sid)
+            self.assertIsNone(st.tidy_claim_by_id(predecessor, old_claim_id))
+            self.assertIsNone(st.matching_tidy_claim(predecessor, "codex", predecessor_sid, prompt, sequence))
+            self.assertIsNone(st.matching_tidy_claim(other, "codex", other_sid, prompt, sequence))
+
+            retry, reason = clear.claim_continue(path, nonce)
+            self.assertEqual(reason, "")
+            self.assertEqual(retry["continued"]["state"], "sending")
+            new_claim_id = retry["continued"]["claim_id"]
+            self.assertNotEqual(new_claim_id, old_claim_id)
+            self.assertEqual(st.tidy_claim_by_id(successor, new_claim_id)["state"], "sending")
+            self.assertEqual(st.matching_tidy_claim(successor, "codex", self.TARGET, prompt, sequence)
+                             ["claim_id"], new_claim_id)
+            self.assertIsNone(st.tidy_claim_by_id(predecessor, new_claim_id))
+            self.assertIsNone(st.tidy_claim_by_id(other, new_claim_id))
+
     def _receipt_booking(self, pane, sid, ref):
         seat = st.Seat("pane", st._digest("pane", pane), pane=pane, harness="codex", sid="old-session")
         req = {"schema": 1, "nonce": "nonce-" + pane, "status": "cleared",

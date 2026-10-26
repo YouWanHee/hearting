@@ -1473,22 +1473,28 @@ def observe_continue_receipt(harness: str, sid: str, transfer_ref: str = "") -> 
 def release_unsent_continue(claim):
     """Return only this unsent claim to the same booking's pending state."""
     key = claim["seat"]["key"]
-    with st.seat_lock(key):
+    harness = str(claim.get("harness") or "")
+    target_sid = str(claim.get("new_session") or "")
+    booked = _booked_seat(claim, key)
+    target_seat = st.session_seat(booked, harness, target_sid)
+    with st.session_state_lock(target_seat):
         req = read_reservation(key)
         if (not req or req.get("nonce") != claim.get("nonce")
                 or req.get("continued") != claim.get("continued")
-                or (req.get("continued") or {}).get("state") != "sending"):
+                or (req.get("continued") or {}).get("state") != "sending"
+                or str(req.get("harness") or "") != harness
+                or str(req.get("new_session") or "") != target_sid):
             return False
         held = req["continued"]
-        st.record_tidy_claim(st.seat_from_dict(req.get("seat") or {}),
-                             harness=str(req.get("harness") or ""),
-                             sid=str(req.get("new_session") or "-"), claim_id=str(held.get("claim_id") or ""),
+        recipient = st.session_seat(_booked_seat(req, key), harness, target_sid)
+        st.record_tidy_claim(recipient, harness=harness,
+                             sid=target_sid or "-", claim_id=str(held.get("claim_id") or ""),
                              nonce=str(req.get("nonce") or ""), token=str(held.get("token") or ""),
                              digest=hashlib.sha256(followup_text(req).encode("utf-8")).hexdigest(),
                              origin=str(held.get("kind") or "continue"),
                              operation_id=str(req.get("operation_id") or ""),
                              sent_seq=int(held.get("sent_seq", 0) or 0), state="released",
-                             target_sid=str(req.get("new_session") or ""))
+                             target_sid=target_sid)
         req["continued"] = {**req["continued"], "state": "pending"}
         _write_reservation(req)
         return True
