@@ -1558,6 +1558,40 @@ def _stage_zone_segs(bc):
     return ([("  ", None)] if own_prefix else [(" : ", "dim")]) + bc
 
 
+def _stall_attention_stage_segs(job, max_width=None):
+    """Show a retained attempt advisory in the existing dispatch stage slot."""
+    observation = getattr(job, "stall_observation", None)
+    if not isinstance(observation, dict):
+        return None
+    if getattr(job, "liveness", None) == "stale":
+        from . import route
+        if route._is_reconciling_attempt(job):
+            return None
+    label = "! stalled" if observation.get("state") == "stalled" else "! check"
+    try:
+        age = max(0, int((float(observation["observed_at"])
+                          - float(observation["last_progress_at"])) / 60))
+        age_label = " " + fmt_min(age)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        age_label = ""
+    if max_width is not None:
+        # `_stage_zone_segs` adds the existing ` : ` prefix outside this budget.
+        content_width = max(0, int(max_width) - 3)
+        if len(label + age_label) <= content_width:
+            label += age_label
+        elif len(label) <= content_width:
+            pass
+        elif len("! check") <= content_width:
+            label = "! check"
+        elif content_width >= 1:
+            label = "!"
+        else:
+            return []
+    else:
+        label += age_label
+    return _stage_zone_segs([(label, "lvl_y")])
+
+
 def _session_name(s):
     """Keep explicit user names and successful Fleet subjects; leave gaps blank.
 
@@ -3142,6 +3176,9 @@ def _dispatch_row(j, orphan=False, parent_model=None, parent_harness=None, is_la
         def _stage_part(budget):
             if _route_rides_the_rail(j, route_seq, in_card):
                 return []
+            stall = _stall_attention_stage_segs(j, budget)
+            if stall is not None:
+                return stall
             residue = getattr(j, "residue_pids", None)
             if residue:
                 return _stage_zone_segs([("⚠ worker left pid %s running" % ",".join(map(str, residue)), "gate_u")])
@@ -3421,7 +3458,8 @@ def _dispatch_row_2line(j, orphan=False, parent_model=None, parent_effort=None, 
         if optw < _OPTW:
             l2.append((" " * (_OPTW - optw), None))
         if not _route_rides_the_rail(j, route_seq, in_card):
-            l2 += _stage_zone_segs(
+            stall = _stall_attention_stage_segs(j)
+            l2 += (stall if stall is not None else _stage_zone_segs(
                 _dispatch_stage_segs(j, key, stage, slug_name,
                                      # F-67 parity (77d0c2): the current
                                      # breadcrumb token pulses on UNIT activity
@@ -3431,7 +3469,7 @@ def _dispatch_row_2line(j, orphan=False, parent_model=None, parent_effort=None, 
                                      working=(unit_working
                                               if unit_working is not None
                                               else j.liveness == "working"),
-                                     route_seq=route_seq, compact_route=in_card))
+                                     route_seq=route_seq, compact_route=in_card)))
     if _split:
         return l1, l2, br_segs
     return l1, l2
@@ -7193,6 +7231,16 @@ def _route_node_text(n):
         tail = fmt_min(elapsed) if elapsed is not None else ""
         return "%s ✓%s%s" % (nid, tail, deps), "dim", mark
     if st == "attention":
+        stall = n.get("stall_observation")
+        if isinstance(stall, dict):
+            label = "! stalled" if stall.get("state") == "stalled" else "! check"
+            try:
+                age = max(0, int((float(stall["observed_at"])
+                                  - float(stall["last_progress_at"])) / 60))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                age = None
+            tail = (" " + fmt_min(age)) if age is not None else ""
+            return "%s %s%s%s" % (nid, label, tail, deps), "lvl_y", mark
         return "%s ! check%s" % (nid, deps), "lvl_y", mark
     if st == "active":
         tail = (" " + fmt_min(elapsed)) if elapsed is not None else ""
