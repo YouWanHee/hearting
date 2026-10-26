@@ -550,7 +550,7 @@ class WorkStartTest(unittest.TestCase):
             return {"state": "timeout", "children": []}
         replaced = [True]
 
-        def batch(jobs, attempts, run=None):
+        def batch(jobs, attempts, run=None, resume_capacity=False):
             if replaced:
                 replaced.pop()
                 return set(attempts) | {"att-replacement"}, [{"replacement_attempt_id": "att-replacement"}], []
@@ -996,7 +996,7 @@ class WorkStartTest(unittest.TestCase):
             seen.update(kwargs);return set(attempts),[],[self._wait_attention(frame)]
         with mock.patch('dispatch_replacement.advance_batch',side_effect=held):
             result=self.start()
-        self.assertNotIn('resume_capacity',seen)          # a supervisor-shaped call never resumes
+        self.assertTrue(seen['resume_capacity'])         # explicit start still respects a live hold
         self.assertEqual((result['state'],result['reason']),('waiting-capacity','owner-capacity-wait'))
         self.assertEqual(result['retry_at'],'2099-01-01T00:00:00Z')
 
