@@ -378,6 +378,7 @@ def _session_unfold(grid, vm, x, use, y, session, c):
         lead = [(marker, "lvl_y" if marker == "◑" else "blocked"),
                 (" " + str(question.get("source") or question.get("kind") or "wait"), "blocked"),
                 (" · waiting " + str(question.get("wait")) + " · ", "dim")]
+        from .pages import _segs
         cursor = _segs(grid, x_val, y, lead, right)
         pane = question.get("pane")
         if question.get("open_tag") and pane:
@@ -395,7 +396,13 @@ def _draw_overview_route(grid, x, use, y, route, steward=False):
 
 
 def _draw_route_line(grid, x0, x1, y, route, tag=True, repo=True, steward=False):
-    room = x1 - x0 - 2 - (4 + GAP if tag else 0) - 16 - GAP - 24 - GAP - AGE_W
+    age = _clip(str(route.get("age") or ""), AGE_W + 1)
+    tag_text = str(route.get("session_tag") or "··") if tag else ""
+    tag_width = min(_seg_width(tag_text), 8) if tag else 0
+    if tag:
+        tag_text = _clip(tag_text, tag_width)
+    tag_room = tag_width + 2 + GAP if tag else 0
+    room = x1 - x0 - 2 - tag_room - 16 - GAP - 24 - GAP - AGE_W
     own = room >= 8 + GAP + (12 + GAP if repo else 0)
     repo = repo and room >= 12 + GAP
     state = "working" if route.get("activity") == "running" else route.get("state")
@@ -405,11 +412,10 @@ def _draw_route_line(grid, x0, x1, y, route, tag=True, repo=True, steward=False)
     grid.put(x0, y, marker, marker_key)
     x = x0 + 2
     if tag:
-        tag_text = str(route.get("session_tag") or "··")
         grid.put(x, y, "[", "dim")
-        grid.put(x + 1, y, tag_text, "steward" if steward else "soft")
-        grid.put(x + 1 + len(tag_text), y, "]", "dim")
-        x += 4 + GAP
+        grid.put(x + 1, y, tag_text, "steward" if steward else "soft", limit=x + 1 + tag_width)
+        grid.put(x + 1 + tag_width, y, "]", "dim")
+        x += tag_width + 2 + GAP
     if own:
         owner = str(route.get("harness") or "·")
         grid.put(x, y, owner, "hb_" + owner)
@@ -417,7 +423,6 @@ def _draw_route_line(grid, x0, x1, y, route, tag=True, repo=True, steward=False)
     if repo:
         grid.put(x, y, repo_rule_label(route.get("repo"), 12), "title_dim")
         x += 12 + GAP
-    age = str(route.get("age") or "")
     title_width = max(16, min(48, (x1 - x) // 3))
     title_width = min(title_width, max(1, x1 - _seg_width(age) - 1 - x))     # the title ends before AGE starts
     grid.put(x, y, _clip(str(route.get("title") or "·"), title_width), "soft")
@@ -606,6 +611,7 @@ def draw_routes(grid, vm, state, x=34, y=3):
     right, bottom = x + use + 1, grid.rows - 5
     cols = _route_columns(use)
     slim = cols["slim"]
+    gap = cols["gap"]
     grid.fill(x, right, y, " ", tint=234)
     headers = [(cols["st"], "ID"), (cols["title"], "ROUTE"), (cols["kind"], "KIND"),
                (cols["own"], "HARNESS")]
@@ -657,11 +663,15 @@ def draw_routes(grid, vm, state, x=34, y=3):
             grid.put(x + cols["st"], y, marker, key)
             tag = str(route.get("session_tag") or route.get("past_from") or "")
             if tag:
+                tag_width = max(0, cols["title"] - cols["st"] - 4)
+                tag_text = _clip(tag, tag_width)
+                tag_x = x + cols["st"] + 3
                 grid.put(x + cols["st"] + 2, y, "[", "dim")
-                grid.put(x + cols["st"] + 3, y, tag, "soft" if route.get("session_tag") else "dim")
-                grid.put(x + cols["st"] + 3 + len(tag), y, "]", "dim")
+                grid.put(tag_x, y, tag_text, "soft" if route.get("session_tag") else "dim",
+                         limit=tag_x + _seg_width(tag_text))
+                grid.put(tag_x + _seg_width(tag_text), y, "]", "dim", limit=x + cols["title"])
             title = _clip(str(route.get("title") or "·"), cols["title_w"])
-            grid.put(x + cols["title"], y, title, "soft", limit=x + cols["kind"] - GAP)
+            grid.put(x + cols["title"], y, title, "soft", limit=x + cols["kind"] - gap)
             kind_parts = [(str(route.get("capability") or "·"), "soft")]
             short = {"standard": "std", "light": "lt", "quick": "q", "thorough": "thr",
                      "adversarial": "adv"}
@@ -670,11 +680,14 @@ def draw_routes(grid, vm, state, x=34, y=3):
             if suffix:
                 kind_parts.append(("(" + suffix + ")", "dim"))
             cursor = x + cols["kind"]
-            age_edge = x + use - len(str(route.get("age") or ""))           # content stops where AGE starts
+            age = _clip(str(route.get("age") or ""), cols["age_w"])
+            age_edge = x + use - _seg_width(age)                              # content stops where AGE starts
             for text, style in kind_parts:
-                cursor = grid.put(cursor, y, text, style, limit=min(x + cols["own"] - GAP, age_edge))
-            _draw_owner(grid, x + cols["own"], y, route, cols["narrow"], slim,
-                        min(x + (cols["ctx"] if not slim else cols["prog"]) - GAP, age_edge))
+                cursor = grid.put(cursor, y, text, style, limit=min(x + cols["own"] - gap, age_edge))
+            owner_edge = (x + cols["own"] + cols["own_w"] if cols["tiny"] else
+                          x + (cols["ctx"] if not slim else cols["prog"]) - gap)
+            owner_limit = min(owner_edge, age_edge)
+            _draw_owner(grid, x + cols["own"], y, route, cols["narrow"], slim, owner_limit)
             if not slim:
                 context = route.get("owner_context")
                 if context:
@@ -688,16 +701,15 @@ def draw_routes(grid, vm, state, x=34, y=3):
                     grid.put(x + cols["ctx"] + 9, y, f"{pct:3d}%", percent_key)
                 else:
                     grid.put(x + cols["ctx"] + 9, y, "   ·", "dim")
-            _draw_route_progress(grid, x + cols["prog"], x + use - AGE_W - GAP, y, route)
-            age = str(route.get("age") or "")
-            grid.put(x + use - len(age), y, age, "dim")
+            _draw_route_progress(grid, x + cols["prog"], age_edge - gap, y, route)
+            grid.put(age_edge, y, age, "dim")
             if is_open:
                 _tint_row(grid, y, x - 1, right, 236)
             y += 1
             worker = route.get("worker") or ()
             label = str(worker[0]) if worker else "worker"
             unit = route.get("worker_unit")
-            route_end = x + cols["kind"] - GAP
+            route_end = x + cols["kind"] - gap
             route_start = x + cols["title"]
             cursor = grid.put(route_start, y, "└ ", "dim", limit=route_end)
             cursor = grid.put(cursor, y, _clip(label, max(0, route_end - cursor)),
@@ -712,9 +724,9 @@ def draw_routes(grid, vm, state, x=34, y=3):
                          route.get("worker_stage_key")) or ((hue, 0, 0) if worker_running else (hue, 0, 1))
             if not worker_running and isinstance(stage_key, (tuple, list)) and len(stage_key) == 3:
                 stage_key = (stage_key[0], 0, 1)
-            stage_room = max(0, cols["own"] - GAP - cols["kind"])
+            stage_room = max(0, cols["own"] - gap - cols["kind"])
             grid.put(x + cols["kind"], y, _clip(worker_stage, stage_room), stage_key,
-                     limit=x + cols["own"] - GAP)
+                     limit=x + cols["own"] - gap)
             cursor = x + cols["own"]
             segments = tuple(worker[1] if len(worker) > 1 else ())
             if cols["narrow"] and label != "resource" and len(segments) > 1 and segments[1][0] == " (":
@@ -731,7 +743,7 @@ def draw_routes(grid, vm, state, x=34, y=3):
                              "hb_opencode": "version_release"}.get(style, style)
                 elif style == "eff_medium":
                     style = "branch_s"
-                grid.put(cursor, y, text, style, limit=x + cols["prog"] - GAP)
+                grid.put(cursor, y, text, style, limit=owner_limit)
                 from .grid import cell_width
                 cursor += sum(cell_width(char) for char in str(text))
             cursor = x + cols["prog"]
@@ -798,6 +810,8 @@ def draw_questions(grid, vm, state, x=34, y=3):
             grid.put(right - 18, bottom, "↓ more below", "dim", limit=right)
             return
         tag = str(question.get("tag") or "·")
+        tag_text = _clip(tag, 5)
+        tag_x = x + 4
         is_open = closed != tag
         grid.add_hit(y, x, right, ("fold", "qshut:" + state.view, tag))
         if is_open:
@@ -806,8 +820,8 @@ def draw_questions(grid, vm, state, x=34, y=3):
         marker = str(question.get("marker") or "●")
         grid.put(x + 1, y, marker, "lvl_y" if marker == "◑" else "blocked")
         grid.put(x + 3, y, "[", "dim")
-        grid.put(x + 4, y, tag, "soft")
-        grid.put(x + 4 + len(tag), y, "]", "dim")
+        grid.put(tag_x, y, tag_text, "soft", limit=tag_x + _seg_width(tag_text))
+        grid.put(tag_x + _seg_width(tag_text), y, "]", "dim", limit=x + 10)
         harness = str(question.get("h") or "·")
         grid.put(x + 10, y, harness, "hb_" + harness)
         if narrow:
@@ -930,6 +944,10 @@ def _wrap(text, width):
 
 
 def _route_columns(use):
+    if use < 60:
+        return {"narrow": True, "slim": True, "tiny": True, "gap": 1, "age_w": AGE_W + 1,
+                "st": 3, "title": 10, "title_w": 5, "kind": 16, "own": 25,
+                "own_w": 8, "ctx": 32, "prog": 33}
     narrow, slim = use < 150, use < 120
     title, kind = (10, 12) if slim else (12, 15)
     own_w, ctx_w = (10 if slim else 13 if narrow else 26), (0 if slim else 13)
@@ -941,7 +959,7 @@ def _route_columns(use):
     prog_x = ctx_x + (ctx_w + GAP if ctx_w else 0)
     return {"narrow": narrow, "slim": slim, "st": 3, "title": title,
             "title_w": title_w, "kind": kind_x, "own": own_x, "own_w": own_w,
-            "ctx": ctx_x, "prog": prog_x}
+            "ctx": ctx_x, "prog": prog_x, "tiny": False, "gap": GAP, "age_w": AGE_W + 1}
 
 
 def _draw_owner(grid, x, y, route, narrow, slim, limit):

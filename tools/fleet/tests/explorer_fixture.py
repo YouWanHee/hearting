@@ -97,6 +97,8 @@ def demo_snapshot(now=None):
          "memory_used_mib": 8192, "memory_total_mib": 64000, "gpus": []},
         {"host": "gone", "self": False, "reachable": False, "gpus": []}]}
     memory = demo.memory_snapshot()
+    # This fixture supplies synthetic journal rows, so its journal is available.
+    memory["journal_available"] = True
     memory["today"] = {"added": 2, "expired": 1}
     memory["by_repo"] = {"demo-app": [
         {"ts": "2026-10-23T12:00:00+00:00", "action": "add", "type": "decision", "snippet": "keep the row"},
@@ -104,7 +106,8 @@ def demo_snapshot(now=None):
     memory["recent"] = [memory["by_repo"]["demo-app"][0]]
     return LiveSnapshot(sessions=sessions, jobs=jobs, memory=memory,
                         usage_snapshots={}, hearting={"version": "v3.42.0-2-gdc406c55a-dirty",
-                                                      "install_method": "unmanaged"}), hosts
+                                                      "install_method": "unmanaged"},
+                        answer_waits=demo.answer_wait_snapshot(now=now)), hosts
 
 
 def demo_seat_entries(now, sid, harness="claude", full=True):
