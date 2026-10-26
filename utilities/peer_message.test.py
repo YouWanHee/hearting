@@ -2841,7 +2841,10 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
         }
         args = self.steward.build_parser().parse_args(["prompt", "w1:p2", "owner report body"])
         outputs = []
-        with mock.patch.object(self.steward, "_prompt_current_candidate",
+        # This case exercises native identity rejection after the executable
+        # prerequisite; it must not depend on Herdr being installed on CI.
+        with mock.patch.object(self.steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(self.steward, "_prompt_current_candidate",
                                return_value=(None, "target-identity-unverified")), \
              mock.patch.object(self.steward, "_herdr_prompt") as send, \
              mock.patch("builtins.print", side_effect=lambda *a, **_k: outputs.append(" ".join(map(str, a)))):
@@ -2852,6 +2855,21 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
             'prompted=false reason=target-identity-unverified target="w1:p2" candidate_panes=["w1:p2"]',
             'prompted=false reason=target-identity-unverified target="w1:p2" candidate_panes=["w1:p2"]',
         ])
+        send.assert_not_called()
+
+    def test_owner_peer_and_completion_without_herdr_remain_unavailable(self):
+        args = self.steward.build_parser().parse_args(["prompt", "w1:p2", "owner report body"])
+        outputs = []
+        with mock.patch.object(self.steward, "_herdr_missing", return_value=True), \
+             mock.patch.object(self.steward, "_prompt_current_candidate") as identity, \
+             mock.patch.object(self.steward, "_herdr_prompt") as send, \
+             mock.patch("builtins.print", side_effect=lambda *a, **_k: outputs.append(" ".join(map(str, a)))):
+            self.assertEqual(self.steward.cmd_prompt(args), 4)
+            self.assertEqual(self.steward.cmd_prompt(args, producer_binding={}), 4)
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(all(line.startswith("herdr-unavailable reason=herdr-not-found ")
+                            for line in outputs))
+        identity.assert_not_called()
         send.assert_not_called()
 
     def test_crash_after_reply_and_after_reservation_reuses_both(self):
