@@ -840,9 +840,9 @@ rerun needs a concrete broad impact not covered by existing results. Current
 stage judgments still apply to their current subject; an old PASS marker does
 not become current through evidence reuse. When the requested outcome has
 sufficient evidence, advance to the authorized handoff, integration, or closure.
-Normal success needs no harvest. A process exit or intermediate stage verdict
-alone is not task completion. Read-only orientation and status replies use
-concise prose instead.
+Normal success needs no harvest.
+A process exit or intermediate stage verdict alone is not task completion.
+Read-only orientation and status replies use concise prose instead.
 
 New registered owners carry `workflow_completion=runtime-v1`. Their completion
 controller owns the exact workflow/route/cycle closing transaction after PASS
