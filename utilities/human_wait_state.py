@@ -16,6 +16,7 @@ import fcntl
 import math
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 import ipaddress
 import socket
 import urllib.error
@@ -501,6 +502,19 @@ def _selected_identity(envelope):
             if safe is None:
                 return None
             identity[key] = safe
+    if (envelope.get("source") == "S2" or "gate_epoch" in envelope
+            or isinstance(native, dict)
+            and native.get("transport") == "hearting-human-gate"):
+        gate_epoch = envelope.get("gate_epoch")
+        if type(gate_epoch) is not int or gate_epoch < 1:
+            return None
+        identity["gate_epoch"] = gate_epoch
+        artifact_sha256 = (native.get("artifact_sha256") if isinstance(native, dict)
+                           else envelope.get("artifact_sha256"))
+        if artifact_sha256 is not None:
+            if not isinstance(artifact_sha256, str) or not _SAFE_ROUTE_HASH.fullmatch(artifact_sha256):
+                return None
+            identity["artifact_sha256"] = artifact_sha256
     return identity
 
 
@@ -1472,7 +1486,8 @@ def _stored_workflow_action(ref):
     if not isinstance(ref, dict):
         return None
     native_ref = ref.get("native_ref")
-    if not isinstance(native_ref, dict) or native_ref.get("transport") != "hearting-owner-input":
+    if (not isinstance(native_ref, dict)
+            or native_ref.get("transport") not in {"hearting-owner-input", "hearting-human-gate"}):
         return None
     entry = _selected_entry(ref)
     if not entry or not entry.get("action_id"):
@@ -1480,19 +1495,24 @@ def _stored_workflow_action(ref):
     identity = _selected_identity(ref)
     if identity is None:
         return None
+    source = "S2" if native_ref.get("transport") == "hearting-human-gate" else "S3"
     return {**identity, "id": ref.get("selected_id") or ref.get("id"),
             "selected_id": ref.get("selected_id") or ref.get("id"),
-            "item_id": identity.get("item_id"), "source": "S3",
+            "item_id": identity.get("item_id"), "source": source,
             "attempt_id": native_ref.get("attempt_id"), "since": ref.get("since"),
             "detail": ref.get("detail"),
             "native_ref": native_ref}
 
 
 def _selected_hints_match(values, base):
-    for key in ("request_id", "turn_id", "item_id", "question_id"):
+    for key in ("request_id", "turn_id", "item_id", "question_id", "gate_epoch"):
         supplied = values.get(key)
         actual = base.get(key)
         if supplied is None:
+            continue
+        if key == "gate_epoch":
+            if type(supplied) is not int or supplied != actual:
+                return False
             continue
         safe = _safe_request_id(supplied) if key == "request_id" else _safe_native_ref(supplied)
         if safe is None or (not _same_request_id(safe, actual) if key == "request_id"
@@ -1502,6 +1522,245 @@ def _selected_hints_match(values, base):
         if values.get(key) is not None and values.get(key) != base.get(key):
             return False
     return True
+
+
+def _workflow_route_source(jobs, item):
+    """Resolve the unique sealed route named by this current registry source."""
+    try:
+        from dispatch_registry_cache import registry_snapshot
+        from tools.fleet import route as route_module
+
+        snapshot = registry_snapshot(jobs)
+        if not snapshot.complete:
+            return None, None, "workflow-route-registry-incomplete"
+        matches = set()
+        for row in snapshot.view.route_alias_candidates():
+            meta = row.completion_metadata()
+            route_id = meta.get("owner_route_id") or meta.get("route_id")
+            route_hash = meta.get("owner_route_hash") or meta.get("route_hash")
+            route_file = meta.get("owner_route_file") or meta.get("route_file")
+            if route_id == item.get("route_id") and route_hash == item.get("route_hash") and route_file:
+                matches.add(str(route_file))
+        if len(matches) != 1:
+            return None, None, ("workflow-route-source-ambiguous" if matches else
+                                "workflow-route-source-unavailable")
+        path = Path(next(iter(matches))).expanduser().resolve(strict=True)
+        route = route_module.load(str(path), item.get("route_hash"), item.get("route_id"))
+        if (not isinstance(route, dict) or route.get("route_id") != item.get("route_id")
+                or route.get("route_hash") != item.get("route_hash")):
+            return None, None, "workflow-route-binding-changed"
+        return path, route, None
+    except Exception as exc:
+        return None, None, "workflow-route-source-unavailable:" + type(exc).__name__
+
+
+def _workflow_gate_source(jobs, item):
+    """Bind a selected S2 row to the journal's current raise and sealed route."""
+    route_path, route, error = _workflow_route_source(jobs, item)
+    if route is None:
+        return None, error
+    try:
+        import workflow_state as WS
+
+        ledger_root, _ = WS.ledger_root_for(jobs)
+        ledger = WS.WorkflowLedger(item["route_id"], item["route_hash"], root=ledger_root)
+        journal = [row for row in ledger.journal()
+                   if row.get("route_id") == item["route_id"]
+                   and row.get("route_hash") == item["route_hash"]]
+        resolution = WS.human_gate_resolution(journal, item.get("gate_id"))
+        epoch = resolution.get("epoch")
+        if (resolution.get("status") != "blocked" or type(epoch) is not int or epoch < 1
+                or not resolution.get("raised_at")):
+            return None, "workflow-gate-no-longer-current"
+        try:
+            raised_at = float(datetime.fromisoformat(
+                str(resolution["raised_at"]).replace("Z", "+00:00")).timestamp())
+            item_since = float(item.get("since"))
+        except (TypeError, ValueError, OverflowError):
+            return None, "workflow-gate-raise-time-invalid"
+        if not math.isfinite(raised_at) or abs(raised_at - item_since) >= 0.001:
+            return None, "workflow-gate-raise-changed"
+        artifact = resolution.get("artifact")
+        artifact_root = route.get("artifact_root")
+        if not isinstance(artifact, str) or not isinstance(artifact_root, str):
+            return None, "workflow-gate-artifact-unavailable"
+        artifact_path = Path(artifact).expanduser().resolve(strict=True)
+        root_path = Path(artifact_root).expanduser().resolve(strict=True)
+        if (not artifact_path.is_file()
+                or root_path not in artifact_path.parents):
+            return None, "workflow-gate-artifact-outside-root"
+        artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        recorded_digest = resolution.get("artifact_sha256")
+        if recorded_digest is not None and recorded_digest != artifact_sha256:
+            return None, "workflow-gate-artifact-changed"
+        binding = {"route_path": str(route_path), "route": route,
+                   "resolution": resolution, "gate_epoch": epoch,
+                   "artifact_sha256": "sha256:" + artifact_sha256}
+        return binding, None
+    except Exception as exc:
+        return None, "workflow-gate-journal-unavailable:" + type(exc).__name__
+
+
+def _workflow_gate_interview(binding, item):
+    """Load only the exact interview sealed on this gate raise, using its validator."""
+    resolution = binding["resolution"]
+    artifact = resolution.get("artifact")
+    digest = binding.get("artifact_sha256")
+    route = binding["route"]
+    if not artifact or not digest or not isinstance(route.get("artifact_root"), str):
+        return None, None
+    try:
+        import frame_interview as FI
+        import human_gate_observation as HGO
+
+        path = Path(artifact).expanduser().resolve(strict=True)
+        if path.suffix.lower() != ".json":
+            return None, None
+        if not HGO._inside(path, route["artifact_root"]):
+            return None, "workflow-interview-outside-artifact-root"
+        if "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            return None, "workflow-interview-artifact-changed"
+        interview = FI.load_json_file(path, kind="interview")
+        if not FI.is_interview(interview):
+            return None, None
+        if (interview.get("route_id") != item.get("route_id") or FI.validate(interview)):
+            return None, "workflow-interview-invalid"
+        return interview, None
+    except Exception as exc:
+        return None, "workflow-interview-unavailable:" + type(exc).__name__
+
+
+def _workflow_gate_detail(binding, item):
+    """Build selected-only questions from the current gate or its sealed interview."""
+    route = binding["route"]
+    gate = item.get("gate_id")
+    interview, error = _workflow_gate_interview(binding, item)
+    if error:
+        return None, error
+    bindings = [row for row in route.get("human_gate_bindings", ())
+                if isinstance(row, dict) and row.get("gate") == gate]
+    if len(bindings) != 1:
+        return None, "workflow-gate-route-binding-ambiguous"
+    target_node = bindings[0].get("node")
+    node = next((row for row in route.get("nodes", ())
+                 if isinstance(row, dict) and row.get("id") == target_node), None)
+    target = {"route_id": route.get("route_id"), "gate": gate, "node": target_node}
+    if node:
+        for key in ("title", "task", "description"):
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                target[key] = value.strip()[:240]
+                break
+    if interview is None:
+        if binding["resolution"].get("interview"):
+            return None, "workflow-interview-unavailable"
+        detail = {"gate": gate, "target": target, "response_mode": "gate-decision",
+                  "decision": "explicit", "questions": [{
+                      "id": "gate-decision", "question": "Choose what to do with this human gate.",
+                      "choices": [{"value": decision, "label": decision}
+                                  for decision in ("proceed", "revise", "stop")],
+                      "is_other": False,
+                  }]}
+        return {"detail": detail, "choices": ["proceed", "revise", "stop"],
+                "interview": None}, None
+    import frame_interview as FI
+    questions = [{"id": FI.UNDERSTANDING_SLOT,
+                  "question": interview["understanding"],
+                  "choices": [{"value": "I understand the restatement",
+                               "label": "I understand the restatement"}],
+                  "is_other": True}]
+    for question in interview.get("questions", ()):
+        if not isinstance(question, dict):
+            continue
+        options = question.get("options") if isinstance(question.get("options"), list) else []
+        questions.append({"id": question["id"], "question": question["question"],
+                          "choices": [{"value": option["label"], "label": option["label"],
+                                       **({"means": option["means"]} if isinstance(option.get("means"), str)
+                                          else {})}
+                                      for option in options if isinstance(option, dict)
+                                      and isinstance(option.get("label"), str)],
+                          # The existing frame answer validator accepts off-menu notes.
+                          "is_other": True})
+    detail = {"gate": gate, "target": target, "response_mode": "frame-interview",
+              "decision": "proceed", "questions": questions}
+    return {"detail": detail, "choices": [], "interview": interview}, None
+
+
+def _workflow_gate_receipt(base, entry):
+    """Confirm one selected gate action from the release receipt and journal transition."""
+    native = base.get("native_ref") if isinstance(base, dict) else None
+    if (not isinstance(native, dict) or native.get("transport") != "hearting-human-gate"
+            or not isinstance(entry, dict) or not entry.get("action_id")):
+        return {"state": "unknown", "reason": "workflow-release-receipt-binding-missing"}
+    jobs = native.get("jobs_path")
+    route_path = native.get("route_path")
+    route_id, route_hash, gate = native.get("route_id"), native.get("route_hash"), native.get("gate_id")
+    epoch, request_id = native.get("gate_epoch"), entry.get("action_id")
+    if (not isinstance(jobs, str) or not isinstance(route_path, str)
+            or type(epoch) is not int or epoch < 1 or not isinstance(request_id, str)):
+        return {"state": "unknown", "reason": "workflow-release-receipt-binding-invalid"}
+    public_receipt = entry.get("result")
+    if (not isinstance(public_receipt, dict) or public_receipt.get("route_id") != route_id
+            or public_receipt.get("route_hash") != route_hash
+            or public_receipt.get("gate") != gate or public_receipt.get("gate_epoch") != epoch
+            or public_receipt.get("request_id") != request_id
+            or public_receipt.get("decision") not in {"proceed", "revise", "stop"}
+            or public_receipt.get("actor_kind") != "user"):
+        return {"state": "unknown", "reason": "workflow-release-receipt-unconfirmed"}
+    try:
+        import workflow_state as WS
+
+        ledger_root, _ = WS.ledger_root_for(jobs)
+        ledger = WS.WorkflowLedger(route_id, route_hash, root=ledger_root)
+        journal = [row for row in ledger.journal()
+                   if row.get("route_id") == route_id and row.get("route_hash") == route_hash]
+        releases = [(row, row.get("evidence")) for row in journal
+                    if isinstance(row.get("evidence"), dict)
+                    and row["evidence"].get("selected_request_id") == request_id]
+        if any(evidence.get("released_gate") != gate
+               or evidence.get("gate_epoch") != epoch
+               or evidence.get("route_hash") != route_hash
+               or evidence.get("decision") != public_receipt["decision"]
+               for _row, evidence in releases):
+            return {"state": "unknown", "reason": "workflow-release-request-binding-changed"}
+        release = next((row for row, evidence in reversed(releases)
+                        if evidence.get("released_gate") == gate
+                        and evidence.get("gate_epoch") == epoch), None)
+        person_release = any(evidence.get("actor_kind") == "user"
+                             and evidence.get("released_gate") == gate
+                             and evidence.get("decision") == public_receipt["decision"]
+                             for _row, evidence in releases)
+        sidecar = Path(route_path).with_name(Path(route_path).stem + ".gate-release.json")
+        try:
+            value = json.loads(sidecar.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            value = None
+        rows = value.get("gate_releases") if isinstance(value, dict) else None
+        sidecar_row = (next((row for row in reversed(rows or ())
+                            if isinstance(row, dict) and row.get("request_id") == request_id
+                            and row.get("gate") == gate and row.get("route_hash") == route_hash
+                            and row.get("gate_epoch") == epoch), None)
+                       if isinstance(value, dict) and value.get("route_id") == route_id else None)
+        if (release is None
+                or release.get("workflow_state") not in {
+                    "RUNNING", "NEXT_REGISTERED", "FAILED_RETRYABLE", "CANCELLED"}
+                or not person_release):
+            return {"state": "unknown", "reason": "workflow-release-receipt-unconfirmed"}
+        if sidecar_row is not None:
+            recorded = sidecar_row.get("receipt")
+            if (not isinstance(recorded, dict)
+                    or any(recorded.get(key) != public_receipt.get(key) for key in
+                           ("route_id", "route_hash", "gate", "gate_epoch", "request_id",
+                            "decision", "actor_kind"))):
+                return {"state": "unknown", "reason": "workflow-release-sidecar-mismatch"}
+        return {"state": "applied", "result": {
+            "action_id": request_id, "route_id": route_id, "route_hash": route_hash,
+            "gate": gate, "gate_epoch": epoch, "decision": public_receipt["decision"],
+            "workflow_state": public_receipt.get("workflow_state") or release.get("workflow_state"),
+            "actor_kind": "user"}}
+    except Exception as exc:
+        return {"state": "unknown", "reason": "workflow-release-receipt-unavailable:" +
+                type(exc).__name__}
 
 
 def _selected_base(ref):
@@ -1598,14 +1857,26 @@ def _selected_base(ref):
                      if _safe_native_ref(item.get("attempt_id")) else None})
         match, error = _workflow_current_item(item_id, source)
         if match is None:
+            stored = _stored_workflow_action(ref)
+            if stored is not None:
+                return stored, None
             return None, error
         jobs, current = match
         if not _workflow_item_matches(base, current):
             return None, "workflow-gate-binding-changed"
+        binding, error = _workflow_gate_source(jobs, current)
+        if binding is None:
+            return None, error
+        base["gate_epoch"] = binding["gate_epoch"]
+        base["route_path"] = binding["route_path"]
         native_ref = {"transport": "hearting-human-gate", "jobs_path": str(jobs),
                       "source_id": item_id, "route_id": current.get("route_id"),
                       "route_hash": current.get("route_hash"), "gate_id": current.get("gate_id"),
-                      "attempt_id": current.get("attempt_id"), "raised_at": current.get("since")}
+                      "attempt_id": current.get("attempt_id"),
+                      "route_path": binding["route_path"],
+                      "artifact_sha256": binding["artifact_sha256"],
+                      "gate_epoch": binding["gate_epoch"],
+                      "raised_at": float(current.get("since"))}
     else:
         attempt_id = item.get("attempt_id")
         if not _safe_native_ref(attempt_id):
@@ -1702,6 +1973,10 @@ def _selected_envelope(base, resolved):
                 "state": resolved.get("state") if resolved.get("state") in _SELECTED_STATES else "unknown"}
     if route_id is not None:
         envelope["route_id"] = route_id
+    if base.get("source") in {"S2", "S3", "S4"}:
+        envelope["source"] = base["source"]
+    if type(base.get("gate_epoch")) is int and base["gate_epoch"] > 0:
+        envelope["gate_epoch"] = base["gate_epoch"]
     question_id = _safe_native_ref(resolved.get("question_id")) or base.get("question_id")
     if question_id is not None:
         envelope["question_id"] = question_id
@@ -1782,6 +2057,15 @@ def _workflow_selected_transport(base):
                 "choices": [], "support": True, "reason": receipt.get("reason"),
                 "result": receipt.get("result"), "native_ref": base.get("native_ref")}
 
+    if source == "S2" and entry and entry.get("action_id"):
+        receipt = _workflow_gate_receipt(base, entry)
+        return {"state": receipt["state"], "kind": "question",
+                "request_id": base.get("request_id"), "turn_id": None,
+                "route_id": base.get("route_id"), "question_id": base.get("question_id"),
+                "gate_epoch": base.get("gate_epoch"), "detail": base.get("detail"),
+                "choices": [], "support": True, "reason": receipt.get("reason"),
+                "result": receipt.get("result"), "native_ref": base.get("native_ref")}
+
     match, error = _workflow_current_item(base.get("id"), source)
     if match is None:
         return {"state": "unknown", "reason": error}
@@ -1789,19 +2073,25 @@ def _workflow_selected_transport(base):
     if not _workflow_item_matches(base, item):
         return {"state": "unknown", "reason": "workflow-selected-binding-changed"}
     if source == "S2":
+        binding, error = _workflow_gate_source(jobs, item)
+        if binding is None:
+            return {"state": "unknown", "reason": error}
         native_ref = {"transport": "hearting-human-gate", "jobs_path": str(jobs),
                       "source_id": item["id"], "route_id": item.get("route_id"),
                       "route_hash": item.get("route_hash"), "gate_id": item.get("gate_id"),
-                      "attempt_id": item.get("attempt_id"), "raised_at": item.get("since")}
+                      "attempt_id": item.get("attempt_id"), "route_path": binding["route_path"],
+                      "artifact_sha256": binding["artifact_sha256"],
+                      "gate_epoch": binding["gate_epoch"],
+                      "raised_at": float(item.get("since"))}
         if base.get("native_ref") != native_ref:
             return {"state": "unknown", "reason": "workflow-gate-binding-changed"}
+        detail, detail_error = _workflow_gate_detail(binding, item)
         return {"state": "open", "kind": "question", "request_id": base["request_id"],
-                "turn_id": base.get("turn_id"), "route_id": item.get("route_id"),
-                "question_id": item.get("gate_id"), "detail": {
-                    "gate": item.get("gate_id"), "question": item.get("question"),
-                    "choices": item.get("choices") or []},
-                "choices": item.get("choices") or [], "support": False,
-                "reason": "workflow-release-missing-expected-raise-binding",
+                "turn_id": None, "route_id": item.get("route_id"),
+                "question_id": item.get("gate_id"), "gate_epoch": binding["gate_epoch"],
+                "detail": detail.get("detail") if detail else None,
+                "choices": detail.get("choices", []) if detail else [],
+                "support": bool(detail), "reason": detail_error,
                 "native_ref": native_ref}
 
     snapshot, error = _workflow_owner_snapshot(base, expected_native_ref=base.get("native_ref"))
@@ -1942,8 +2232,30 @@ def _native_response_error(envelope, portable):
     detail = envelope.get("detail")
     if isinstance(native_ref, dict) and native_ref.get("transport") == "hearting-owner-input":
         return None
-    if isinstance(native_ref, dict) and native_ref.get("transport") in {
-            "hearting-human-gate", "hearting-answer-marker"}:
+    if isinstance(native_ref, dict) and native_ref.get("transport") == "hearting-human-gate":
+        if (envelope.get("source") != "S2" or type(envelope.get("gate_epoch")) is not int
+                or envelope.get("gate_epoch") != native_ref.get("gate_epoch")
+                or not isinstance(detail, dict)):
+            return "workflow-gate-binding-invalid"
+        questions = detail.get("questions")
+        if not isinstance(questions, list) or not questions:
+            return "workflow-gate-questions-unavailable"
+        answers = portable.get("answers") if isinstance(portable, dict) else None
+        if not isinstance(answers, dict) or set(answers) != {row.get("id") for row in questions}:
+            return "workflow-gate-answer-set-incomplete"
+        for question in questions:
+            if not isinstance(question, dict):
+                return "workflow-gate-question-invalid"
+            values = answers.get(question.get("id"))
+            if not isinstance(values, list) or len(values) != 1:
+                return "workflow-gate-answer-count-invalid"
+            choices = question.get("choices")
+            allowed = {choice.get("value", choice.get("label")) for choice in choices
+                       if isinstance(choice, dict)} if isinstance(choices, list) else set()
+            if values[0] not in allowed and question.get("is_other") is not True:
+                return "workflow-gate-answer-not-current-option"
+        return None
+    if isinstance(native_ref, dict) and native_ref.get("transport") == "hearting-answer-marker":
         return "workflow-response-surface-unavailable"
     if envelope.get("kind") == "approval":
         decision = portable.get("decision")
@@ -2007,6 +2319,119 @@ def _native_response_error(envelope, portable):
                     } for value in values)):
                 return "codex-answer-not-in-current-options"
     return None
+
+
+def _workflow_gate_submit(envelope, portable, action_id):
+    """Submit a current person's explicit S2 decision through the normal release CLI."""
+    base, error = _selected_base(envelope)
+    if base is None:
+        return "unknown", {"reason": error}
+    match, error = _workflow_current_item(base.get("id"), "S2")
+    if match is None:
+        return "unknown", {"reason": error}
+    jobs, item = match
+    if not _workflow_item_matches(base, item):
+        return "unknown", {"reason": "workflow-gate-binding-changed"}
+    binding, error = _workflow_gate_source(jobs, item)
+    if binding is None:
+        return "unknown", {"reason": error}
+    current, error = _workflow_gate_detail(binding, item)
+    native = envelope.get("native_ref")
+    expected_native = {"transport": "hearting-human-gate", "jobs_path": str(jobs),
+                       "source_id": item["id"], "route_id": item.get("route_id"),
+                       "route_hash": item.get("route_hash"), "gate_id": item.get("gate_id"),
+                       "attempt_id": item.get("attempt_id"), "route_path": binding["route_path"],
+                       "artifact_sha256": binding["artifact_sha256"],
+                       "gate_epoch": binding["gate_epoch"],
+                       "raised_at": float(item.get("since"))}
+    if (current is None or error or native != expected_native
+            or envelope.get("gate_epoch") != binding["gate_epoch"]
+            or current.get("detail") != envelope.get("detail")):
+        return "unknown", {"reason": error or "workflow-gate-detail-changed"}
+    answers = portable.get("answers") if isinstance(portable, dict) else None
+    mode = current["detail"].get("response_mode")
+    answer_file = None
+    temp_dir = None
+    if mode == "gate-decision":
+        decision = answers.get("gate-decision", [None])[0]
+        if decision not in {"proceed", "revise", "stop"}:
+            return "unknown", {"reason": "workflow-gate-decision-invalid"}
+    elif mode == "frame-interview":
+        import frame_interview as FI
+
+        asked = []
+        for question in current["detail"].get("questions", ()):
+            values = answers.get(question.get("id"))
+            if not isinstance(values, list) or len(values) != 1:
+                return "unknown", {"reason": "workflow-interview-answer-incomplete"}
+            options = [choice.get("label", choice.get("value"))
+                       for choice in question.get("choices", ()) if isinstance(choice, dict)]
+            asked.append({"question": question.get("question"), "options": options,
+                          "answer": values[0]})
+        answers_file_value = FI.answers_from_native(current["interview"], asked)
+        if (not isinstance(answers_file_value, dict)
+                or FI.validate_answers(current["interview"], answers_file_value)):
+            return "unknown", {"reason": "workflow-interview-answer-invalid"}
+        decision = "proceed"
+        try:
+            temp_dir = tempfile.TemporaryDirectory(prefix="hearting-s2-", dir="/tmp")
+            answer_file = Path(temp_dir.name) / "answers.json"
+            fd = os.open(answer_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(answers_file_value, handle, ensure_ascii=False,
+                              separators=(",", ":"))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+        except Exception as exc:
+            if temp_dir is not None:
+                temp_dir.cleanup()
+            return "unknown", {"reason": "workflow-answer-file-unavailable:" + type(exc).__name__}
+    else:
+        return "unknown", {"reason": "workflow-gate-response-mode-unsupported"}
+
+    command = [sys.executable, str(Path(__file__).resolve().parent / "workflow-supervisor.py"),
+               "release", "--route", binding["route_path"], "--gate", str(item["gate_id"]),
+               "--decision", decision, "--jobs", str(jobs),
+               "--expected-route-hash", str(item["route_hash"]),
+               "--expected-gate-epoch", str(binding["gate_epoch"]),
+               "--request-id", action_id]
+    if answer_file is not None:
+        command.extend(("--answers", str(answer_file)))
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True,
+                                   timeout=120, check=False)
+        if completed.returncode != 0:
+            return "unknown", {"reason": "workflow-release-command-refused",
+                                "returncode": completed.returncode}
+        try:
+            receipt = json.loads(completed.stdout)
+        except (TypeError, ValueError):
+            return "unknown", {"reason": "workflow-release-receipt-invalid"}
+        required = {"route_id": item["route_id"], "route_hash": item["route_hash"],
+                    "gate": item["gate_id"], "gate_epoch": binding["gate_epoch"],
+                    "request_id": action_id, "decision": decision, "actor_kind": "user"}
+        if not isinstance(receipt, dict) or any(receipt.get(key) != value
+                                                for key, value in required.items()):
+            return "unknown", {"reason": "workflow-release-receipt-mismatch"}
+        verified = _workflow_gate_receipt(
+            {**base, "native_ref": expected_native},
+            {"action_id": action_id, "result": receipt})
+        if verified["state"] != "applied":
+            return "unknown", {"reason": verified.get("reason") or
+                                "workflow-release-source-transition-unconfirmed"}
+        return "applied", receipt
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "unknown", {"reason": "workflow-release-command-ambiguous:" + type(exc).__name__}
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
 
 
 def _workflow_owner_submit(envelope, portable, action_id):
@@ -2190,7 +2615,13 @@ def submit_selected_response(ref, response, *, action_id=None):
         and identity.get("turn_id") is None
         and identity.get("item_id") == native_ref.get("attempt_id")
         and identity.get("route_id") == native_ref.get("route_id"))
-    if identity.get("turn_id") is None and not workflow_owner_request:
+    workflow_gate_request = (
+        isinstance(native_ref, dict)
+        and native_ref.get("transport") == "hearting-human-gate"
+        and identity.get("turn_id") is None
+        and identity.get("gate_epoch") == native_ref.get("gate_epoch")
+        and identity.get("route_id") == native_ref.get("route_id"))
+    if identity.get("turn_id") is None and not workflow_owner_request and not workflow_gate_request:
         return _selected_fallback(base, "exact-request-turn-binding-required")
     portable, response_error = _portable_response(current, response)
     if portable is None:
@@ -2225,6 +2656,9 @@ def submit_selected_response(ref, response, *, action_id=None):
     if (isinstance(native_ref, dict)
             and native_ref.get("transport") == "hearting-owner-input"):
         state, result = _workflow_owner_submit(current, portable, action_id)
+    elif (isinstance(native_ref, dict)
+          and native_ref.get("transport") == "hearting-human-gate"):
+        state, result = _workflow_gate_submit(current, portable, action_id)
     elif current["harness"] == "opencode":
         state, result = _opencode_submit(current, portable)
     elif current["harness"] == "codex":
