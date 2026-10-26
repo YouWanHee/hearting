@@ -300,8 +300,8 @@ def is_worker(env=None) -> bool:
 def session_from_env(harness: Optional[str] = None, env=None) -> tuple[Optional[str], Optional[str]]:
     """(harness, session id) from the harness-provided variables, or (harness, None).
 
-    Read by `session_identity`; with several harnesses' ids inherited and none
-    named, the first in its claude, codex, opencode order answers.
+    Read by `session_identity`; several inherited harness ids without a named
+    caller are ambiguous and do not supply a session identity.
     """
     live_process = env is None
     env = os.environ if env is None else env
@@ -321,8 +321,6 @@ def session_from_env(harness: Optional[str] = None, env=None) -> tuple[Optional[
     found = identity(env)
     if found.known and found.session_id:
         return found.harness, found.session_id.strip()
-    for name, (session_id, _variable) in sessions.items():
-        return name, session_id.strip()
     return None, None
 
 
@@ -384,6 +382,7 @@ class Seat:
     sid: str = ""
     endpoint: str = ""
     socket_path: str = ""   # raw transport is private; endpoint remains the key hash
+    continuation_sid: str = ""  # exact successor prompt frontier for a completed physical booking
 
     def as_dict(self) -> dict:
         result = {"kind": self.kind, "key": self.key, "pane": self.pane,
@@ -394,14 +393,60 @@ class Seat:
             result["sid"] = self.sid
         if self.endpoint:
             result["endpoint"] = self.endpoint
+        if self.continuation_sid:
+            result["continuation_sid"] = self.continuation_sid
         return result
+
+
+def _native_session_key(harness: str, sid: str) -> str:
+    if harness not in HARNESSES or not isinstance(sid, str) or not sid or sid == "-" \
+            or sid.startswith("unknown-"):
+        return ""
+    return _digest("native-session", harness, sid)
+
+
+def seat_state_key(seat: Seat) -> str:
+    """The logical state key for an exact native identity, else its physical seat key."""
+    return _native_session_key(seat.harness, seat.sid) or seat.key
+
+
+def session_seat(seat: Seat, harness: str, sid: str) -> Seat:
+    """Carry exact native identity beside the unchanged physical seat binding."""
+    if not _native_session_key(harness, sid):
+        return seat
+    return dataclasses.replace(seat, harness=harness, sid=sid)
+
+
+@contextlib.contextmanager
+def session_state_lock(seat: Seat, *, wait: Optional[float] = None) -> Iterator[None]:
+    """Lock logical session state and its physical seat in a stable order."""
+    keys = {key for key in (seat_state_key(seat), seat.key) if key}
+    native_key = _native_session_key(seat.harness, seat.sid)
+    if (native_key and not (state_root() / "cards" / f"{native_key}.json").exists()
+            and not _native_address_status(seat)):
+        for _path, _raw, card in _legacy_native_cards(seat):
+            source_key = str(((card.get("seat") or {}).get("key") or ""))
+            if re.fullmatch(r"[0-9a-f]{20,64}", source_key):
+                keys.add(source_key)
+    keys = sorted(keys)
+    with contextlib.ExitStack() as stack:
+        for key in keys:
+            stack.enter_context(seat_lock(key, wait=wait))
+        with seat_ledger_read_scope():
+            active = _NATIVE_ADDRESS_READ_SCOPE.get()
+            token = _NATIVE_ADDRESS_READ_SCOPE.set(active if active is not None else {})
+            try:
+                yield
+            finally:
+                _NATIVE_ADDRESS_READ_SCOPE.reset(token)
 
 
 def seat_from_dict(data: dict) -> Seat:
     return Seat(str(data.get("kind") or ""), str(data.get("key") or ""),
                 str(data.get("pane") or ""), str(data.get("harness") or ""),
                 str(data.get("project_key") or ""), data.get("native"),
-                str(data.get("sid") or ""), str(data.get("endpoint") or ""))
+                str(data.get("sid") or ""), str(data.get("endpoint") or ""), "",
+                str(data.get("continuation_sid") or ""))
 
 
 def seat_for_project(harness: str, project_key: str) -> Seat:
@@ -575,7 +620,7 @@ def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] 
         if caller is not None and service:
             binding = codex_caller_binding(sid, environ=env)
             if binding:
-                return pane_seat_from_binding(binding)
+                return session_seat(pane_seat_from_binding(binding), harness or "codex", sid)
             # A shared daemon's inherited pane values belong to no caller.
             pane = ""
             server = None
@@ -592,16 +637,17 @@ def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] 
     if pane:
         endpoint = _endpoint_scope(env if live_caller else {})
         key = _digest("pane", endpoint, pane) if endpoint else _digest("pane", pane)
-        return Seat("pane", key, pane, harness or "", "", endpoint=endpoint)
+        return session_seat(Seat("pane", key, pane, harness or "", "", endpoint=endpoint),
+                            harness or "", sid or "")
     from session_tidy_native import caller_target
     native = caller_target(harness, env)
     if native:
-        return Seat("native", _digest("native", harness, native["home"], native["job"], native["start"]),
-                    harness=harness or "", native=native)
+        return session_seat(Seat("native", _digest("native", harness, native["home"], native["job"], native["start"]),
+                                 harness=harness or "", native=native), harness or "", sid or "")
     if not project:
         return Seat("project", "", harness=harness or "", sid=sid or "")
     found = seat_for_project(harness or "unknown", project_key_for(cwd))
-    return dataclasses.replace(found, sid=sid or "")
+    return session_seat(found, harness or "", sid or "")
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +656,7 @@ def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] 
 
 _LEDGER_READ_SCOPE = contextvars.ContextVar("session_tidy_ledger_read_scope", default=None)
 _LEDGER_READ_ONLY = contextvars.ContextVar("session_tidy_ledger_read_only", default=False)
+_NATIVE_ADDRESS_READ_SCOPE = contextvars.ContextVar("session_tidy_native_address_scope", default=None)
 
 
 @contextlib.contextmanager
@@ -637,8 +684,13 @@ def _invalidate_ledger_read(seat: Seat) -> None:
     scope = _LEDGER_READ_SCOPE.get()
     if scope is not None:
         scope.pop(os.fspath(_ledger_path(seat)), None)
+        scope.pop(os.fspath(_physical_ledger_path(seat)), None)
 
 def _ledger_path(seat: Seat) -> Path:
+    return state_root() / "sessions" / f"{seat_state_key(seat)}.jsonl"
+
+
+def _physical_ledger_path(seat: Seat) -> Path:
     return state_root() / "sessions" / f"{seat.key}.jsonl"
 
 
@@ -667,19 +719,24 @@ def _read_ledger_lines(seat: Seat) -> list[dict]:
 
 
 def _append_ledger_entry(seat: Seat, entry: dict) -> None:
-    """Append a caller-locked ledger row and fold without dropping tidy provenance."""
-    path = _ledger_path(seat)
-    ensure_dir(path.parent)
-    _reject_symlink(path)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
-    try:
+    """Append logical state and retain the same event in its physical seat ledger."""
+    paths = [_ledger_path(seat)]
+    physical = _physical_ledger_path(seat)
+    if physical != paths[0]:
+        paths.append(physical)
+    encoded = (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    for path in paths:
+        ensure_dir(path.parent)
+        _reject_symlink(path)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         try:
-            os.write(fd, (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+            os.write(fd, encoded)
         finally:
             os.close(fd)
-    finally:
-        _invalidate_ledger_read(seat)
+    _invalidate_ledger_read(seat)
     _fold_ledger(seat)
+    if physical != _ledger_path(seat):
+        _fold_ledger(dataclasses.replace(seat, harness="", sid=""))
 
 
 def record_tidy_claim(seat: Seat, *, harness: str, sid: str, claim_id: str, nonce: str,
@@ -796,7 +853,8 @@ def session_summary(seat: Seat) -> dict[tuple[str, str], dict]:
     """Fold the ledger: ``(harness, sid) -> first_seen, last_seen, epoch, transcript, cwd, ...``."""
     out: dict[tuple[str, str], dict] = {}
     for item in _read_ledger_lines(seat):
-        if item.get("event") in {"handover", "succession", "steward-release", "tidy-claim", "real-prompt"}:
+        if item.get("event") in {"handover", "succession", "steward-release", "tidy-claim",
+                                  "real-prompt", "native-address"}:
             # Relations, revocation and prompt provenance are not session activity.
             continue
         key = (str(item.get("harness") or ""), str(item["sid"]))
@@ -832,7 +890,7 @@ def _project_seat_lineage(rows: list[dict], cards: dict, locations: dict,
     edges = {}
     for row in rows:
         name, session = str(row.get("harness") or ""), str(row.get("sid") or "")
-        if not name or not session:
+        if not name or not session or row.get("event") == "native-address":
             continue
         key = (name, session)
         if row.get("event") in {"handover", "succession"}:
@@ -996,6 +1054,25 @@ def _confirmed_predecessor(lineage: list[dict], harness: str, sid: str) -> Optio
                   if row.get("harness") == name and row.get("sid") == session), None)
     return found or {"harness": name, "sid": session,
                      "transcript": _lineage_transcript(name, session, "")}
+
+
+def confirmed_predecessor_identity(seat: Seat, harness: str, sid: str) -> Optional[dict]:
+    """Resolve only the exact predecessor edge in this native session's existing ledger."""
+    if not _native_session_key(harness, sid):
+        return None
+    predecessors = set()
+    for row in _read_ledger_lines(seat):
+        if (row.get("event") not in {"handover", "succession"}
+                or (row.get("harness"), row.get("sid")) != (harness, sid)):
+            continue
+        old = row.get("from")
+        if isinstance(old, dict):
+            if old.get("harness") != harness:
+                continue
+            old = old.get("sid")
+        if isinstance(old, str) and old and old != sid:
+            predecessors.add(old)
+    return {"harness": harness, "sid": next(iter(predecessors))} if len(predecessors) == 1 else None
 
 
 def _lineage_row_matches_seat(row: dict, seat: Seat) -> bool:
@@ -1405,8 +1482,9 @@ def _fold_ledger(seat: Seat) -> None:
                  and row.get("event") in {"handover", "succession", "steward-release"}]
     claims: dict[str, dict] = {}
     real_frontiers: dict[tuple[str, str], dict] = {}
+    native_addresses: dict[tuple[str, str], dict] = {}
     activity = [l for l in lines if l.get("event") not in {
-        "handover", "succession", "steward-release", "tidy-claim", "real-prompt"}]
+        "handover", "succession", "steward-release", "tidy-claim", "real-prompt", "native-address"}]
     for item in lines:
         if item.get("event") == "tidy-claim" and item.get("claim_id"):
             claims[str(item["claim_id"])] = item
@@ -1415,6 +1493,8 @@ def _fold_ledger(seat: Seat) -> None:
             prior = real_frontiers.get(key)
             if prior is None or int(item.get("sequence", 0) or 0) >= int(prior.get("sequence", 0) or 0):
                 real_frontiers[key] = item
+        elif item.get("event") == "native-address":
+            native_addresses[(str(item.get("harness") or ""), str(item.get("sid") or ""))] = item
     claim_rows = sorted(claims.values(), key=lambda row: float(row.get("ts", 0) or 0))[-TIDY_CLAIM_KEEP_ROWS:]
     provenance = claim_rows + list(real_frontiers.values())
     recent = activity[-LEDGER_KEEP_RAW:]
@@ -1451,7 +1531,8 @@ def _fold_ledger(seat: Seat) -> None:
             if item.get(field):
                 row[field] = item[field]
     body = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n"
-                    for r in list(folded.values()) + relations + provenance + recent)
+                    for r in list(folded.values()) + relations + provenance
+                    + list(native_addresses.values()) + recent)
     try:
         atomic_write(_ledger_path(seat), body.encode("utf-8"))
     finally:
@@ -1463,7 +1544,10 @@ def _fold_ledger(seat: Seat) -> None:
 # ---------------------------------------------------------------------------
 
 def card_key(seat: Seat) -> str:
-    """Return the storage key for this author; sid-less project calls retain the shared legacy key."""
+    """Return the exact native card key, or the existing physical/project key without one."""
+    native_key = _native_session_key(seat.harness, seat.sid)
+    if native_key:
+        return native_key
     if seat.kind != "project" or not seat.sid:
         return seat.key
     keyed = _digest("project-card", seat.key, seat.sid)
@@ -1485,6 +1569,182 @@ def card_json_path(seat: Seat) -> Path:
 
 def card_text_path(seat: Seat) -> Path:
     return state_root() / "cards" / f"{card_key(seat)}.md"
+
+
+def _native_address_status(seat: Seat) -> str:
+    key = _native_session_key(seat.harness, seat.sid)
+    if not key:
+        return ""
+    cache = _NATIVE_ADDRESS_READ_SCOPE.get()
+    cache_key = (os.fspath(state_root()), key, seat.harness, seat.sid)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+    rows = _read_ledger_lines(seat)
+    marker = next((row for row in reversed(rows)
+                   if row.get("event") == "native-address"
+                   and (row.get("harness"), row.get("sid")) == (seat.harness, seat.sid)), None)
+    status = str((marker or {}).get("legacy_status") or "")
+    if cache is not None:
+        cache[cache_key] = status
+    return status
+
+
+def _remember_native_address_status(seat: Seat, status: str) -> None:
+    cache = _NATIVE_ADDRESS_READ_SCOPE.get()
+    if cache is not None:
+        cache[(os.fspath(state_root()), card_key(seat), seat.harness, seat.sid)] = status
+
+
+def _legacy_native_cards(seat: Seat) -> list[tuple[Path, bytes, dict]]:
+    root = state_root() / "cards"
+    try:
+        paths = sorted(root.glob("*.json"))
+    except OSError:
+        return []
+    logical = card_key(seat)
+    out = []
+    for path in paths:
+        if path.stem == logical:
+            continue
+        try:
+            if not stat.S_ISREG(path.lstat().st_mode):
+                continue
+        except OSError:
+            continue
+        raw = read_bytes(path)
+        if raw is None or len(raw) > 512 * 1024:
+            continue
+        try:
+            card = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            continue
+        author = card.get("author") if isinstance(card, dict) else None
+        if (isinstance(card, dict) and card.get("schema") == SCHEMA
+                and isinstance(card.get("body"), str) and isinstance(author, dict)
+                and (author.get("harness"), author.get("sid")) == (seat.harness, seat.sid)):
+            out.append((path, raw, card))
+    return out
+
+
+def prepare_native_session_state(seat: Seat) -> bool:
+    """Link one unambiguous author-bound legacy card into its deterministic native slot."""
+    logical = _native_session_key(seat.harness, seat.sid)
+    if not logical:
+        return True
+    target = state_root() / "cards" / f"{logical}.json"
+    current = read_json(target)
+    if current is not None:
+        author = current.get("author") if isinstance(current, dict) else None
+        valid = bool(isinstance(author, dict)
+                     and (author.get("harness"), author.get("sid")) == (seat.harness, seat.sid))
+        if valid:
+            _remember_native_address_status(seat, "ready")
+        else:
+            _append_ledger_entry(seat, {"ts": now_epoch(), "harness": seat.harness, "sid": seat.sid,
+                                        "event": "native-address", "legacy_status": "conflict"})
+            _remember_native_address_status(seat, "conflict")
+        return valid
+    status = _native_address_status(seat)
+    if status:
+        return status == "ready"
+
+    candidates = _legacy_native_cards(seat)
+    if not candidates:
+        _append_ledger_entry(seat, {"ts": now_epoch(), "harness": seat.harness, "sid": seat.sid,
+                                    "event": "native-address", "legacy_status": "ready"})
+        _remember_native_address_status(seat, "ready")
+        return True
+    first_path, first_raw, first_card = candidates[0]
+    source_key = str(((first_card.get("seat") or {}).get("key") or ""))
+    consumed_path = state_root() / "consumed" / f"{first_path.stem}.json"
+    consumed_raw = read_bytes(consumed_path)
+    conflict = not re.fullmatch(r"[0-9a-f]{20,64}", source_key)
+    for path, raw, card in candidates[1:]:
+        other_consumed = read_bytes(state_root() / "consumed" / f"{path.stem}.json")
+        if (raw != first_raw or other_consumed != consumed_raw
+                or str(((card.get("seat") or {}).get("key") or "")) != source_key):
+            conflict = True
+            break
+    if conflict:
+        _append_ledger_entry(seat, {"ts": now_epoch(), "harness": seat.harness, "sid": seat.sid,
+                                    "event": "native-address", "legacy_status": "conflict"})
+        _remember_native_address_status(seat, "conflict")
+        return False
+
+    try:
+        text_raw = read_bytes(first_path.with_suffix(".md"))
+        atomic_write(target, first_raw)
+        atomic_write(state_root() / "cards" / f"{logical}.md",
+                     text_raw if text_raw is not None else render_card_text(first_card).encode("utf-8"))
+
+        history_src = state_root() / "card-history" / first_path.stem
+        history_dst = state_root() / "card-history" / logical
+        if history_src.exists() or history_src.is_symlink():
+            if history_src.is_symlink() or not history_src.is_dir():
+                raise StateError("legacy card history is not a private directory")
+            ensure_dir(history_dst)
+            for path in sorted(history_src.glob("*.json")):
+                raw = read_bytes(path)
+                if raw is None:
+                    raise StateError("legacy card history is unreadable")
+                try:
+                    old = json.loads(raw.decode("utf-8"))
+                except (ValueError, UnicodeError) as exc:
+                    raise StateError("legacy card history is unreadable") from exc
+                author = old.get("author") if isinstance(old, dict) else None
+                if (isinstance(author, dict)
+                        and (author.get("harness"), author.get("sid")) == (seat.harness, seat.sid)):
+                    atomic_write(history_dst / path.name, raw)
+
+        if consumed_raw is not None:
+            atomic_write(state_root() / "consumed" / f"{logical}.json", consumed_raw)
+
+        # Import only this author's old session rows; the physical ledger remains
+        # intact and continues to serve pane-bound readers.
+        source_ledger = state_root() / "sessions" / f"{source_key}.jsonl"
+        raw_ledger = read_bytes(source_ledger) or b""
+        rows = []
+        for line in raw_ledger.decode("utf-8", "replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            exact = (row.get("harness"), row.get("sid")) == (seat.harness, seat.sid)
+            targeted = (row.get("harness") == seat.harness
+                        and row.get("event") == "tidy-claim"
+                        and row.get("target_sid") == seat.sid)
+            if exact or targeted:
+                rows.append(row)
+        if rows:
+            ledger_target = _ledger_path(seat)
+            atomic_write(ledger_target, b"".join(
+                (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+                for row in rows))
+
+        # Notices and prompt frontiers are seat-wide in the old layout. Carry
+        # only this author's results and its own most recent prompt boundary.
+        old_notices = read_json(state_root() / "notices" / f"{source_key}.json")
+        own_notices = [item for item in (old_notices or {}).get("items", [])
+                       if ((item.get("author") or {}).get("harness"),
+                           (item.get("author") or {}).get("sid")) == (seat.harness, seat.sid)] \
+            if isinstance(old_notices, dict) else []
+        if own_notices:
+            atomic_write_json(_notices_path(seat), {"schema": SCHEMA, "items": own_notices[-20:]})
+        old_prompt = read_json(state_root() / "prompt-seq" / f"{source_key}.json")
+        if isinstance(old_prompt, dict) and old_prompt.get("sid") == seat.sid:
+            atomic_write_json(_prompt_seq_path(seat), old_prompt)
+        _append_ledger_entry(seat, {"ts": now_epoch(), "harness": seat.harness, "sid": seat.sid,
+                                    "event": "native-address", "legacy_status": "ready",
+                                    "legacy_source": source_key})
+        _remember_native_address_status(seat, "ready")
+        return True
+    except BaseException:
+        _append_ledger_entry(seat, {"ts": now_epoch(), "harness": seat.harness, "sid": seat.sid,
+                                    "event": "native-address", "legacy_status": "conflict"})
+        _remember_native_address_status(seat, "conflict")
+        return False
 
 
 def _project_latest_path(seat: Seat) -> Path:
@@ -1534,8 +1794,15 @@ def _cut_bytes(text: str, limit: int) -> tuple[str, bool]:
 
 
 def read_latest_card(seat: Seat) -> Optional[dict]:
+    if _native_address_status(seat) == "conflict":
+        return None
     card = read_json(card_json_path(seat))
-    if isinstance(card, dict) and card.get("schema") == SCHEMA and isinstance(card.get("body"), str):
+    author = card.get("author") if isinstance(card, dict) else None
+    exact = _native_session_key(seat.harness, seat.sid)
+    if (isinstance(card, dict) and card.get("schema") == SCHEMA
+            and isinstance(card.get("body"), str)
+            and (not exact or isinstance(author, dict)
+                 and (author.get("harness"), author.get("sid")) == (seat.harness, seat.sid))):
         return card
     return None
 
@@ -1564,6 +1831,12 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
                now: Optional[float] = None, prompt_seq: Optional[int] = None,
                origin: Optional[str] = None, compact_context: Optional[dict] = None) -> dict:
     """Write this author's newest card (caller holds the shared seat lock)."""
+    if seat.kind in ("pane", "native"):
+        seat = session_seat(seat, harness, sid)
+    if _native_session_key(harness, sid) and seat.sid == sid:
+        prepare_native_session_state(seat)
+        if _native_address_status(session_seat(seat, harness, sid)) == "conflict":
+            raise ValueError("ambiguous legacy card for native session")
     now = now_epoch() if now is None else now
     compact = None
     if origin == "runtime-compact":
@@ -1620,7 +1893,7 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
         except (OSError, StateError):
             if compact is None:
                 raise
-    if seat.kind == "project" and seat.sid:
+    if seat.kind == "project" and not _native_session_key(harness, sid) and seat.sid:
         atomic_write_json(_project_latest_path(seat), {"harness": seat.harness or harness, "sid": seat.sid})
     return card
 
@@ -1692,7 +1965,7 @@ def update_compact_card_locked(seat: Seat, generation: int, identity: str, *, re
 def mark_card_handed_off(seat: Seat) -> None:
     """The latest card went to a peer session: this seat's window is not continued from it
     (takes the seat lock; a newer card starts unmarked)."""
-    with seat_lock(seat.key):
+    with seat_lock(seat_state_key(seat)):
         card = read_latest_card(seat)
         if card and not card.get("handed_off"):
             card["handed_off"] = True
@@ -1755,7 +2028,7 @@ def update_memory_refs(seat: Seat, *, batch: str, status: str, refs: list, more:
     it was queued under).  No card, no layer: ``None``.
     """
     now = now_epoch() if now is None else now
-    with seat_lock(seat.key):
+    with seat_lock(seat_state_key(seat)):
         card = read_latest_card(seat)
         if not card:
             return None
@@ -1800,11 +2073,13 @@ def _reread_path(harness: str, sid: str) -> Path:
 
 
 def _notices_path(seat: Seat) -> Path:
-    return state_root() / "notices" / f"{seat.key}.json"
+    return state_root() / "notices" / f"{seat_state_key(seat)}.json"
 
 
 def _prompt_seq_path(seat: Seat) -> Path:
-    return state_root() / "prompt-seq" / f"{seat.key}.json"
+    target_key = _native_session_key(seat.harness, seat.continuation_sid) \
+        if seat.continuation_sid else ""
+    return state_root() / "prompt-seq" / f"{target_key or seat_state_key(seat)}.json"
 
 
 def read_prompt_seq(seat: Seat) -> int:
@@ -1868,18 +2143,31 @@ def record_prompt_origin(seat: Seat, harness: str, sid: str, sequence: int, orig
 
 
 def write_notice(seat: Seat, text: str, *, author_harness: str = "", author_sid: str = "",
-                 now: Optional[float] = None) -> dict:
+                 now: Optional[float] = None, notice_id: str = "") -> dict:
     """Leave one result line for the seat's next start/prompt (takes the seat lock)."""
     now = now_epoch() if now is None else now
     line = " ".join((text or "").split())
     line = _cut_bytes("".join(ch for ch in line if ch.isprintable()), NOTICE_MAX_BYTES)[0]
-    item = {"id": secrets.token_hex(6), "text": line, "created": now,
+    item = {"id": (notice_id[:96] if notice_id else secrets.token_hex(6)), "text": line, "created": now,
             "author": {"harness": author_harness, "sid": author_sid}}
-    with seat_lock(seat.key):
+    with seat_lock(seat_state_key(seat)):
         data = read_json(_notices_path(seat))
         items = data.get("items", []) if isinstance(data, dict) else []
+        delivered = data.get("delivered", []) if isinstance(data, dict) else []
+        lineage_received = data.get("lineage_received", []) if isinstance(data, dict) else []
+        if item["id"] in delivered:
+            return item
+        for index, existing in enumerate(items):
+            if existing.get("id") == item["id"]:
+                items[index] = {**existing, "text": line}
+                atomic_write_json(_notices_path(seat), {"schema": SCHEMA, "items": items[-20:],
+                                                        "delivered": delivered[-200:],
+                                                        "lineage_received": lineage_received[-200:]})
+                return items[index]
         items.append(item)
-        atomic_write_json(_notices_path(seat), {"schema": SCHEMA, "items": items[-20:]})
+        atomic_write_json(_notices_path(seat), {"schema": SCHEMA, "items": items[-20:],
+                                                "delivered": delivered[-200:],
+                                                "lineage_received": lineage_received[-200:]})
     return item
 
 
@@ -2039,7 +2327,7 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                                     compact_context=compact_context or {}, env=env, now=now)
         return booked
     now = now_epoch() if now is None else now
-    seat = resolve_seat(harness, cwd or None, env, sid, source)
+    seat = session_seat(resolve_seat(harness, cwd or None, env, sid, source), harness, sid)
     if human_only:
         if event == "start" and emit_human:
             with contextlib.suppress(BaseException):
@@ -2047,6 +2335,26 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                 if notice:
                     emit_human(notice)
         return ""
+    if _native_session_key(harness, sid):
+        prior_identity = None
+        if event == "start" and source == "clear":
+            with contextlib.suppress(BaseException):
+                import session_tidy_clear as clear
+                booking = clear.read_reservation(seat.key)
+                if (booking and booking.get("harness") == harness
+                        and booking.get("new_session") == sid and booking.get("sid")
+                        and booking.get("sid") != sid):
+                    prior_identity = {"harness": harness, "sid": str(booking["sid"])}
+        if prior_identity is None:
+            prior_identity = confirmed_predecessor_identity(seat, harness, sid)
+        if prior_identity:
+            prior_seat = dataclasses.replace(
+                session_seat(seat, prior_identity["harness"], prior_identity["sid"]),
+                continuation_sid="")
+            with session_state_lock(prior_seat):
+                prepare_native_session_state(prior_seat)
+        with session_state_lock(seat):
+            prepare_native_session_state(seat)
     if event == "start":
         with contextlib.suppress(BaseException):
             import session_tidy_clear
@@ -2095,7 +2403,7 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                 answer_wait_lines.append("[답변 필요] " + str(question)[:160])
                 if len(answer_wait_lines) == 3:
                     break
-    with seat_lock(seat.key):
+    with session_state_lock(seat):
         if reread:
             saved = read_json(_reread_path(harness, sid))
             summary = session_summary(seat).get((harness, sid))
@@ -2162,14 +2470,37 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                 handed = handover.record_locked(seat, harness, sid, event, source, now)
         epoch = int(row.get("epoch", 0) or 0)
         parts: list[str] = []
-        notices = pending_notices(seat, harness, sid, now=now, summary=sessions)
+        lineage = []
+        predecessor = None
+        predecessor_seat = None
+        if _native_session_key(harness, sid):
+            predecessor = confirmed_predecessor_identity(seat, harness, sid)
+            if predecessor:
+                predecessor_seat = session_seat(seat, predecessor["harness"], predecessor["sid"])
+        notice_groups = [(seat, pending_notices(seat, harness, sid, now=now, summary=sessions))]
+        if predecessor_seat:
+            current_notice_state = read_json(_notices_path(seat))
+            received_ids = set((current_notice_state or {}).get("lineage_received", [])) \
+                if isinstance(current_notice_state, dict) else set()
+            prior_notices = [item for item in pending_notices(
+                predecessor_seat, harness, sid, now=now, summary=sessions)
+                if item.get("id") not in received_ids]
+            notice_groups.append((predecessor_seat, prior_notices))
+        notices = []
+        notice_ids = set()
+        for _source_seat, group in notice_groups:
+            for item in group:
+                if item.get("id") not in notice_ids:
+                    notices.append(item)
+                    notice_ids.add(item.get("id"))
         notice_block = ""
         if notices:
             notice_block = "\n".join(f"[정리 결과] {n['text']}" for n in notices)
             notice_block = _cut_bytes(notice_block, NOTICE_MAX_BYTES)[0]
             parts.append(notice_block)
         card_seat = seat
-        own_card = read_latest_card(seat) if seat.kind == "project" else None
+        project_fallback = seat.kind == "project" and not _native_session_key(harness, sid)
+        own_card = read_latest_card(seat) if project_fallback else None
         own_author = (own_card or {}).get("author") or {}
         own_card_due = bool(own_card
                             and (own_author.get("harness"), own_author.get("sid")) == (harness, sid)
@@ -2177,10 +2508,17 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                             and epoch > int(own_author.get("epoch", 0) or 0))
         if own_card_due:
             card = own_card
-        elif seat.kind == "project":
+        elif project_fallback:
             card, card_seat = read_latest_project_card(seat)
         else:
             card = read_latest_card(seat)
+        predecessor_card = False
+        if not card and predecessor_seat:
+            inherited = read_latest_card(predecessor_seat)
+            author = (inherited or {}).get("author") or {}
+            if inherited and (author.get("harness"), author.get("sid")) == (
+                    predecessor["harness"], predecessor["sid"]):
+                card, card_seat, predecessor_card = inherited, predecessor_seat, True
         card_due = False
         memory_due = False
         memory = None
@@ -2188,14 +2526,18 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         if card:
             author = card.get("author") or {}
             same_session = (author.get("harness"), author.get("sid")) == (harness, sid)
-            if seat.kind == "project" and own_card_due:
+            if project_fallback and own_card_due:
                 eligible = True
-            elif seat.kind == "project" and not same_session:
+            elif project_fallback and not same_session:
                 eligible = _appeared_after(sessions, harness, sid,
                                            (author.get("harness") or "", author.get("sid") or ""))
-            elif seat.kind == "project":
+            elif project_fallback:
                 eligible = (card.get("origin") != "runtime-compact"
                             and epoch > int(author.get("epoch", 0) or 0))
+            elif (predecessor_card and predecessor
+                  and (author.get("harness"), author.get("sid"))
+                  == (predecessor.get("harness"), predecessor.get("sid"))):
+                eligible = True
             else:
                 eligible = (not same_session) or (
                     card.get("origin") != "runtime-compact" and epoch > int(author.get("epoch", 0) or 0))
@@ -2226,9 +2568,10 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                 parts.append(resume_text)
             if card_due:
                 previous = None
-                if seat.kind in ("pane", "native") and card_seat.kind in ("pane", "native"):
-                    previous = _confirmed_predecessor(
-                        seat_lineage(seat, harness=harness, sid=sid), harness, sid)
+                if predecessor:
+                    with contextlib.suppress(BaseException):
+                        lineage = seat_lineage(seat, harness=harness, sid=sid)
+                        previous = _confirmed_predecessor(lineage, harness, sid)
                 parts.append(build_card_injection(
                     card, card_text_path(card_seat), now, room, previous_transcript=previous))
             if memory_text:
@@ -2260,10 +2603,19 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             receipts.append(_receipt(harness, sid, epoch))
             _write_consumed(card_seat, memory_revision=memory["revision"], memory_receipts=receipts[-200:])
         if notices:
-            shown = {n["id"] for n in notices}
+            own_ids = {item.get("id") for item in notice_groups[0][1]}
+            inherited_ids = {item.get("id") for _origin, group in notice_groups[1:]
+                             for item in group}
             data = read_json(_notices_path(seat))
-            rest = [i for i in (data.get("items", []) if isinstance(data, dict) else []) if i.get("id") not in shown]
-            atomic_write_json(_notices_path(seat), {"schema": SCHEMA, "items": rest})
+            items = data.get("items", []) if isinstance(data, dict) else []
+            rest = [item for item in items if item.get("id") not in own_ids]
+            delivered = list(data.get("delivered", [])) if isinstance(data, dict) else []
+            delivered.extend(sorted(value for value in own_ids if value))
+            received = list(data.get("lineage_received", [])) if isinstance(data, dict) else []
+            received.extend(sorted(value for value in inherited_ids if value))
+            atomic_write_json(_notices_path(seat), {"schema": SCHEMA, "items": rest,
+                                                    "delivered": list(dict.fromkeys(delivered))[-200:],
+                                                    "lineage_received": list(dict.fromkeys(received))[-200:]})
         # OpenCode re-emits this cache every turn: a later "참고할 기억" is added to what the session
         # already received instead of replacing it.
         earlier = read_json(_reread_path(harness, sid))
@@ -2298,7 +2650,7 @@ def _run_compact_after(harness: str, sid: str, summary: str, *, cwd: str, transc
     """Record one compact event and preserve its card → queue → clear progress."""
     now = now_epoch() if now is None else now
     started = time.monotonic()
-    seat = resolve_seat(harness, cwd or None, env, sid, "compact")
+    seat = session_seat(resolve_seat(harness, cwd or None, env, sid, "compact"), harness, sid)
     prior_hint = (session_summary(seat).get((harness, sid)) or {}).get("transcript", "")
     transcript = transcript or prior_hint
     context = dict(compact_context or {})
@@ -2351,7 +2703,8 @@ def _run_compact_after(harness: str, sid: str, summary: str, *, cwd: str, transc
     expected_booking_nonce: Optional[str] = None
     inherit_continue_off = False
     try:
-        with seat_lock(seat.key, wait=COMPACT_LOCK_WAIT_SEC):
+        with session_state_lock(seat, wait=COMPACT_LOCK_WAIT_SEC):
+            prepare_native_session_state(seat)
             prior = session_summary(seat).get((harness, sid))
             previous = read_latest_card(seat)
             matching_events = [row for row in _read_ledger_lines(seat)
@@ -2663,7 +3016,8 @@ def _write_caller_card(args, cwd: str) -> tuple[Optional[tuple[Seat, str, str]],
     if caller is None:
         return None, "card=none reason=no-seat"
     seat, harness, sid = caller
-    with seat_lock(seat.key):
+    with session_state_lock(seat):
+        prepare_native_session_state(seat)
         previous = read_latest_card(seat)
         generation = int(previous.get("generation", 0) or 0) + 1 if previous else 1
         record_event(seat, harness, sid, "card", cwd=cwd, card_generation=generation)
@@ -2832,7 +3186,8 @@ def accept_reply_card(harness: str, sid: str, cwd: str, reply: str) -> str:
     request = (clear.read_reservation(seat.key) or {}).get("idle_request")
     if isinstance(request, dict) and request.get("state") == "accepted":
         return "reply-card=skipped reason=already-accepted"       # the session ran ``tidy`` itself
-    with seat_lock(seat.key):
+    with session_state_lock(seat):
+        prepare_native_session_state(seat)
         previous = read_latest_card(seat)
         generation = int(previous.get("generation", 0) or 0) + 1 if previous else 1
         record_event(seat, harness, sid, "card", cwd=cwd, card_generation=generation)

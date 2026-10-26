@@ -85,6 +85,19 @@ class TidyCase(unittest.TestCase):
         env.update(extra or {})
         return self.iso.patched_environ(env)
 
+    def confirmed_handover(self, harness, predecessor, successor, *, pane=PANE):
+        extra = {"HERDR_PANE_ID": pane or ""}
+        with self.library(extra):
+            seat = st.resolve_seat(harness, str(self.cwd), sid=successor)
+            now = st.now_epoch()
+            with st.session_state_lock(seat):
+                st.record_event(seat, harness, successor, "start", source="clear",
+                                cwd=str(self.cwd), now=now)
+                st._append_ledger_entry(seat, {
+                    "ts": now + 0.001, "harness": harness, "sid": successor,
+                    "event": "handover", "from": {"harness": harness, "sid": predecessor},
+                    "source": "clear"})
+
 
 class AnswerWaitHookTest(TidyCase):
 
@@ -178,6 +191,7 @@ class CardConsumeTest(TidyCase):
     def test_new_session_receives_the_card_once_at_start_and_not_again(self):
         self.hook("claude", "start", "sid-A")
         self.card("sid-A", "진행 중인 일: 표식-7Q")
+        self.confirmed_handover("claude", "sid-A", "sid-B")
         got = self.hook("claude", "start", "sid-B", "--source", "clear")
         self.assertIn("표식-7Q", got)
         self.assertIn("[세션 카드]", got)
@@ -186,7 +200,8 @@ class CardConsumeTest(TidyCase):
         self.assertEqual(self.hook("claude", "prompt", "sid-B"), "")
 
     def test_new_session_that_only_sends_a_prompt_receives_it_once(self):
-        self.card("sid-A", "표식-P1")
+        self.card("sid-A", "표식-P1", harness="codex")
+        self.confirmed_handover("codex", "sid-A", "sid-C")
         self.assertIn("표식-P1", self.hook("codex", "prompt", "sid-C"))
         self.assertEqual(self.hook("codex", "prompt", "sid-C"), "")
 
@@ -206,17 +221,19 @@ class CardConsumeTest(TidyCase):
         # the compact delivery was the one hand-over of this generation for the whole seat
         self.assertEqual(self.hook("claude", "start", "sid-B"), "")
 
-    def test_one_generation_is_handed_over_once_for_the_whole_seat(self):
+    def test_one_generation_is_handed_over_once_to_each_confirmed_successor(self):
         self.hook("claude", "start", "sid-A")
         self.card("sid-A", "표식-S")
+        self.confirmed_handover("claude", "sid-A", "sid-B")
         self.assertIn("표식-S", self.hook("claude", "start", "sid-B"))
         self.assertEqual(self.hook("claude", "start", "sid-C"), "")
         self.assertEqual(self.hook("claude", "prompt", "sid-C"), "")
         self.assertEqual(self.hook("claude", "start", "sid-B", "--source", "compact"), "")
         self.assertEqual(self.hook("claude", "start", "sid-A", "--source", "compact"), "")
         self.card("sid-A", "표식-S2")                                      # a new card: once more
-        self.assertIn("표식-S2", self.hook("claude", "start", "sid-C", "--source", "resume"))
-        self.assertEqual(self.hook("claude", "start", "sid-D"), "")
+        self.confirmed_handover("claude", "sid-A", "sid-D")
+        self.assertEqual(self.hook("claude", "start", "sid-C", "--source", "resume"), "")
+        self.assertIn("표식-S2", self.hook("claude", "start", "sid-D", "--source", "resume"))
 
     def test_compact_event_only_marks_the_round_and_the_next_prompt_delivers(self):
         self.hook("opencode", "start", "ses_A")
@@ -234,6 +251,7 @@ class CardConsumeTest(TidyCase):
 
     def test_a_newer_card_generation_is_delivered_again(self):
         self.card("sid-A", "표식-1")
+        self.confirmed_handover("claude", "sid-A", "sid-B")
         self.assertIn("표식-1", self.hook("claude", "start", "sid-B"))
         self.card("sid-A", "표식-2")
         got = self.hook("claude", "start", "sid-B", "--source", "resume")
@@ -250,14 +268,12 @@ class CardConsumeTest(TidyCase):
         self.assertEqual(self.hook("codex", "start", "t-new"), "")
 
     def test_reread_repeats_the_consumed_text_for_that_session_only(self):
-        self.card("sid-A", "표식-R")
-        first = self.hook("opencode", "prompt", "ses_B")
+        self.card("ses_B", "표식-R", harness="opencode")
+        first = self.hook("opencode", "start", "ses_B", "--source", "compact")
         self.assertIn("표식-R", first)
         again = self.hook("opencode", "prompt", "ses_B", "--reread")
         self.assertEqual(again.strip(), first.strip())
         self.assertEqual(self.hook("opencode", "prompt", "ses_C", "--reread"), "")
-        self.hook("opencode", "compact", "ses_B")
-        self.assertEqual(self.hook("opencode", "prompt", "ses_B", "--reread").strip().count("표식-R"), 0)
 
     def test_receipt_is_written_only_after_the_output_went_out(self):
         self.card("sid-A", "표식-E")
@@ -267,16 +283,17 @@ class CardConsumeTest(TidyCase):
 
         with self.library():
             with self.assertRaises(BrokenPipeError):
-                st.run_hook("claude", "start", "sid-B", cwd=str(self.cwd), emit=broken)
+                st.run_hook("claude", "start", "sid-A", source="compact", cwd=str(self.cwd), emit=broken)
             sent = []
-            text = st.run_hook("claude", "start", "sid-B", cwd=str(self.cwd), emit=sent.append)
+            text = st.run_hook("claude", "start", "sid-A", source="compact", cwd=str(self.cwd), emit=sent.append)
         self.assertIn("표식-E", text)
         self.assertEqual(sent, [text])
 
     def test_output_never_exceeds_2400_bytes_and_always_names_the_file(self):
         self.card("sid-A", "가나다라 " * 900)
+        self.confirmed_handover("claude", "sid-A", "sid-B")
         with self.library():
-            seat = st.resolve_seat("claude", str(self.cwd))
+            seat = st.resolve_seat("claude", str(self.cwd), sid="sid-A")
             st.write_notice(seat, "정리 결과: 새 기록 3건. 되돌리기: mem tidy-undo b1", author_harness="claude", author_sid="sid-A")
         got = self.hook("claude", "start", "sid-B")
         self.assertLessEqual(len(got.encode("utf-8")), st.INJECTION_MAX_BYTES)
@@ -286,6 +303,7 @@ class CardConsumeTest(TidyCase):
 
     def test_header_carries_the_write_time_and_elapsed_days(self):
         self.card("sid-A", "오래된 카드")
+        self.confirmed_handover("claude", "sid-A", "sid-B")
         json_path = next((self.state / "cards").glob("*.json"))
         data = json.loads(json_path.read_text(encoding="utf-8"))
         data["authored_at_epoch"] -= 4 * DAY
@@ -313,22 +331,27 @@ class ProjectFallbackTest(TidyCase):
             author_b = st.dataclasses.replace(shared, sid="new-B")
             with st.seat_lock(shared.key):
                 st.write_card(shared, "claude", "legacy-A", "legacy body", cwd=str(self.cwd))
-                self.assertEqual(st.card_key(author_a), shared.key)
+            with st.session_state_lock(author_a):
+                self.assertTrue(st.prepare_native_session_state(author_a))
+                self.assertEqual(st.card_key(author_a), st._digest("native-session", "claude", "legacy-A"))
                 continued = st.write_card(author_a, "claude", "legacy-A", "continued body", cwd=str(self.cwd))
+            with st.session_state_lock(author_b):
                 separate = st.write_card(author_b, "claude", "new-B", "new body", cwd=str(self.cwd))
             self.assertEqual(continued["generation"], 2)
             self.assertEqual(separate["generation"], 1)
-            self.assertEqual(st.card_key(author_b), st._digest("project-card", shared.key, "new-B"))
-            self.assertTrue((self.state / "card-history" / shared.key / "00000001.json").is_file())
-            self.assertEqual(st.read_latest_project_card(shared)[0]["body"], "new body")
+            self.assertEqual(st.card_key(author_b), st._digest("native-session", "claude", "new-B"))
+            self.assertTrue((self.state / "card-history" / st.card_key(author_a) / "00000001.json").is_file())
+            self.assertEqual(st.read_latest_project_card(shared)[0]["body"], "legacy body")
 
     def test_latest_project_lookup_uses_a_fixed_pointer_without_card_enumeration(self):
         with self.library({"HERDR_PANE_ID": ""}):
-            seat = st.resolve_seat("claude", str(self.cwd), sid="pointer-A")
-            with st.seat_lock(seat.key):
+            shared = st.seat_for_project("claude", st.project_key_for(str(self.cwd)))
+            seat = st.dataclasses.replace(shared, sid="pointer-A")
+            with st.session_state_lock(seat):
                 st.write_card(seat, "claude", "pointer-A", "pointed body", cwd=str(self.cwd))
+                st.atomic_write_json(st._project_latest_path(shared), {"harness": "claude", "sid": "pointer-A"})
             with mock.patch.object(Path, "glob", side_effect=AssertionError("card enumeration")):
-                card, chosen = st.read_latest_project_card(seat)
+                card, chosen = st.read_latest_project_card(shared)
             self.assertEqual((card["body"], chosen.sid), ("pointed body", "pointer-A"))
 
     def test_live_project_authors_keep_separate_cards_and_do_not_receive_each_others(self):
@@ -371,6 +394,7 @@ class ProjectFallbackTest(TidyCase):
                 ("claude", "claude-author", "claude-next", "claude-last"),
                 ("codex", "codex-author", "codex-next", "codex-last")):
             self.card(author, f"{harness}-card", harness=harness, pane=None)
+            self.confirmed_handover(harness, author, successor, pane=None)
             first = self.hook(harness, "start", successor, "--source", "clear", pane=None)
             self.assertIn(f"{harness}-card", first)
             self.assertEqual(self.hook(harness, "prompt", successor, pane=None), "")
@@ -379,6 +403,7 @@ class ProjectFallbackTest(TidyCase):
     def test_late_project_memory_revision_is_retried_after_failed_emit_once(self):
         self.hook("claude", "start", "author-A", pane=None)
         self.card("author-A", "layer A", pane=None)
+        self.confirmed_handover("claude", "author-A", "successor-C", pane=None)
         self.assertIn("layer A", self.hook("claude", "start", "successor-C", pane=None))
         with self.library({"HERDR_PANE_ID": ""}):
             author = st.resolve_seat("claude", str(self.cwd), sid="author-A")
@@ -399,19 +424,18 @@ class ProjectFallbackTest(TidyCase):
         self.assertEqual((receipt["generation"], receipt["memory_revision"]), (1, 1))
 
     def test_legacy_shared_project_card_is_delivered_once_without_moving_its_files(self):
-        self.hook("claude", "start", "legacy-author", pane=None)
         with self.library({"HERDR_PANE_ID": ""}):
             seat = st.seat_for_project("claude", st.project_key_for(str(self.cwd)))
             with st.seat_lock(seat.key):
                 st.write_card(seat, "claude", "legacy-author", "legacy handoff", cwd=str(self.cwd))
             old_path = st.card_json_path(seat)
-        received = self.hook("claude", "start", "legacy-next", pane=None)
+        received = self.hook("claude", "start", "legacy-author", "--source", "compact", pane=None)
         self.assertIn("legacy handoff", received)
         self.assertEqual(self.hook("claude", "start", "legacy-following", pane=None), "")
         self.assertTrue(old_path.is_file())
         self.assertFalse((self.state / "project-latest" / f"{seat.key}.json").exists())
 
-    def test_project_delivery_requires_strict_replacement_but_unknown_author_is_eligible(self):
+    def test_project_seat_never_promotes_unconfirmed_or_unknown_author_cards(self):
         with self.library({"HERDR_PANE_ID": ""}):
             seat = st.resolve_seat("claude", str(self.cwd), sid="same-time-author")
             st.record_event(seat, "claude", "same-time-author", "start", now=100)
@@ -420,12 +444,12 @@ class ProjectFallbackTest(TidyCase):
             # Equal first_seen/last_seen is not a replacement.
             output = st.run_hook("claude", "start", "equal-successor", cwd=str(self.cwd), now=200)
             self.assertEqual(output, "")
-            # A valid card whose author is absent from the ledger retains notice-compatible delivery.
+            # A missing author row is not a confirmed handover to another native identity.
             unknown = st.dataclasses.replace(seat, sid="missing-ledger-author")
             st.write_card(unknown, "claude", "missing-ledger-author", "unknown author card",
                           cwd=str(self.cwd), now=300)
-            self.assertIn("unknown author card",
-                          st.run_hook("claude", "start", "unknown-author-successor", cwd=str(self.cwd), now=301))
+            self.assertEqual(st.run_hook("claude", "start", "unknown-author-successor",
+                                         cwd=str(self.cwd), now=301), "")
 
     def test_project_resolve_caller_keeps_ledger_seat_but_never_borrows_its_sid(self):
         self.hook("claude", "start", "ledger-author", pane=None)
@@ -712,6 +736,254 @@ class DaemonCodexSeatTest(TidyCase):
 def clear_booking_seen(case, pane):
     with case.iso.patched_environ():
         yield clear.read_reservation(st._digest("pane", pane))
+
+
+class NativeSessionContinuityTest(unittest.TestCase):
+    """Exercise the real caller-binding/seat seam with only process observations fixed."""
+
+    A = "11111111-1111-4111-8111-111111111111"
+    B = "22222222-2222-4222-8222-222222222222"
+    PANE_A = "fixture:pane-a"
+    PANE_B = "fixture:pane-b"
+
+    def setUp(self):
+        self.iso = isolated_env()
+        self.addCleanup(self.iso.cleanup)
+        self.cwd = self.iso.root / "project"
+        self.cwd.mkdir()
+        self.state = self.iso.xdg_state / "hearting" / "session-tidy"
+        self.herdr = self.iso.root / "herdr"
+        self.herdr.write_text('#!/bin/sh\nprintf \'%s\\n\' \'{"result":{"agents":[]}}\'\n',
+                              encoding="utf-8")
+        self.herdr.chmod(0o755)
+
+    def environment(self, sid=None):
+        extra = {"HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+                 "HEARTING_TIDY_HERDR": str(self.herdr)}
+        if sid:
+            extra["CODEX_THREAD_ID"] = sid
+        return extra
+
+    def _binding_inputs(self):
+        bindings = {
+            self.A: {"pid": 42101, "pid_start": "start-a", "session_id": self.A,
+                     "pane": self.PANE_A, "socket_path": ""},
+            self.B: {"pid": 42102, "pid_start": "start-b", "session_id": self.B,
+                     "pane": self.PANE_B, "socket_path": ""},
+        }
+        process = lambda pid: (int(pid), 1, int(pid), 1, int(pid),
+                               "start-a" if int(pid) == 42101 else "start-b")
+        return (
+            mock.patch.object(pane_ownership, "_registered_worker", return_value=False),
+            mock.patch.object(pane_ownership, "_caller_runtime",
+                              return_value=((os.getpid(), 1, 1, 1, 1, "caller"), True)),
+            mock.patch.object(pane_ownership, "codex_tui_process_bindings",
+                              side_effect=lambda sid, **_kw: [bindings[sid]] if sid in bindings else []),
+            mock.patch.object(pane_ownership, "_process", side_effect=process),
+        )
+
+    def _legacy_seat(self, pane):
+        return st.Seat("pane", st._digest("pane", pane), pane=pane, harness="codex")
+
+    def _write_legacy_card(self, seat, sid, body, generation, now):
+        card = {"schema": st.SCHEMA, "seat": seat.as_dict(),
+                "author": {"harness": "codex", "sid": sid, "epoch": 0},
+                "authored_at": st.iso_utc(now), "authored_at_epoch": now,
+                "generation": generation, "cwd": str(self.cwd), "body": body}
+        with st.seat_lock(seat.key):
+            st._write_card_pair(seat, card)
+        return card
+
+    def test_payload_sid_keeps_legacy_card_generation_and_next_input_across_env_drift(self):
+        imports = self._binding_inputs()
+        for patcher in imports:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        # Seed the two incident shapes in distinct exact pane seats. Neither
+        # resolver nor codex_caller_binding is mocked; only their OS observations
+        # and TUI binding inventory are fixed above.
+        with self.iso.patched_environ(self.environment(self.A)):
+            seat_a = st.resolve_seat("codex", str(self.cwd), sid=self.A)
+            self.assertEqual((seat_a.kind, seat_a.pane), ("pane", self.PANE_A))
+            legacy_a = st.Seat("pane", seat_a.key, pane=seat_a.pane, harness="codex",
+                               endpoint=seat_a.endpoint, socket_path=seat_a.socket_path)
+            card_a = self._write_legacy_card(legacy_a, self.A, "card-a-generation-1", 1, 1001)
+        with self.iso.patched_environ(self.environment(self.B)):
+            seat_b = st.resolve_seat("codex", str(self.cwd), sid=self.B)
+            self.assertEqual((seat_b.kind, seat_b.pane), ("pane", self.PANE_B))
+            legacy_b = st.Seat("pane", seat_b.key, pane=seat_b.pane, harness="codex",
+                               endpoint=seat_b.endpoint, socket_path=seat_b.socket_path)
+            card_b = self._write_legacy_card(legacy_b, self.B, "card-b-generation-28", 28, 1028)
+        self.assertEqual((card_a["generation"], card_b["generation"]), (1, 28))
+        self.assertNotEqual(st.card_key(legacy_a), st.card_key(seat_a))
+
+        transcript = self.iso.root / "rollout.jsonl"
+        transcript.write_text("fixture transcript", encoding="utf-8")
+        with mock.patch.object(runner, "start_detached", return_value=42199):
+            for sid, inherited in ((self.A, None), (self.B, self.A)):
+                with self.iso.patched_environ(self.environment(inherited)):
+                    result = st.run_hook(
+                        "codex", "compact", sid, phase="after", compact_summary="",
+                        compact_context={"trigger": "auto", "turn_id": f"turn-{sid}",
+                                         "event_id": f"event-{sid}"},
+                        transcript=str(transcript), cwd=str(self.cwd), env=os.environ, now=5000)
+                self.assertTrue(result.startswith("booking=queue-only"), result)
+            with self.iso.patched_environ(self.environment(None)):
+                items = runner.list_items()
+        by_sid = {item["sid"]: item for item in items}
+        self.assertEqual({sid: int(item.get("card_generation", 0) or 0)
+                          for sid, item in by_sid.items()}, {self.A: 1, self.B: 28})
+        clear_files = list((self.state / "clear").glob("*.json")) if (self.state / "clear").exists() else []
+        self.assertEqual(clear_files, [])  # no exact physical binding: no clear/card-request booking
+
+        # A's next supported prompt carries A's card with a missing/mismatched
+        # inherited environment id. It cannot consume B's card or mutate B's receipt.
+        with self.iso.patched_environ(self.environment(self.B)):
+            got_a = st.run_hook("codex", "prompt", self.A, cwd=str(self.cwd),
+                                env=os.environ, now=5001, emit=lambda _text: None)
+        self.assertIn("card-a-generation-1", got_a)
+        self.assertNotIn("card-b-generation-28", got_a)
+        with self.iso.patched_environ(self.environment(None)):
+            self.assertEqual(st.run_hook("codex", "prompt", self.A, cwd=str(self.cwd),
+                                         env=os.environ, now=5002), "")
+            run_dir = self.iso.root / "runs" / "batch-a"
+            run_dir.mkdir(parents=True)
+            refs = ([{"id": "memory-a", "kind": "새", "headline": "result-a"}], 0)
+            with mock.patch.object(runner, "memory_refs", return_value=refs), \
+                    mock.patch.object(runner, "coverage_note", return_value="covered-a"):
+                runner.publish_memory(by_sid[self.A], "batch-a", run_dir, None, "applied")
+                runner.publish_memory(by_sid[self.A], "batch-a", run_dir, None, "applied")
+            runner.notify(by_sid[self.A], "tidy-result-a")
+            runner.notify(by_sid[self.A], "tidy-result-a")
+            logical_a = st.session_seat(seat_a, "codex", self.A)
+            saved = st.read_latest_card(logical_a)
+            self.assertEqual((saved["generation"], saved["memory_refs"]["revision"],
+                              saved["memory_refs"]["source_generation"]), (1, 1, 1))
+            result_a = st.run_hook("codex", "prompt", self.A, cwd=str(self.cwd),
+                                   env=os.environ, now=5003)
+            runner.notify(by_sid[self.A], "tidy-result-a")  # a consumed operation stays consumed
+            got_b = st.run_hook("codex", "prompt", self.B, cwd=str(self.cwd),
+                                env=os.environ, now=5004)
+            replay_a = st.run_hook("codex", "prompt", self.A, cwd=str(self.cwd),
+                                   env=os.environ, now=5005)
+        self.assertIn("memory-a", result_a)
+        self.assertIn("tidy-result-a", result_a)
+        self.assertEqual(replay_a, "")
+        self.assertIn("card-b-generation-28", got_b)
+        with self.iso.patched_environ(self.environment(None)):
+            self.assertEqual(st.read_latest_card(st.resolve_seat(
+                "codex", str(self.cwd), env=os.environ, sid=self.B))["generation"], 28)
+
+    def test_conflicting_legacy_author_cards_are_not_merged_or_selected(self):
+        legacy_a, legacy_b = self._legacy_seat(self.PANE_A), self._legacy_seat(self.PANE_B)
+        with self.iso.patched_environ(self.environment(None)):
+            self._write_legacy_card(legacy_a, self.A, "legacy-source-a", 1, 1001)
+            self._write_legacy_card(legacy_b, self.A, "legacy-source-b", 1, 1002)
+            old_a = st.read_bytes(st.card_json_path(legacy_a))
+            old_b = st.read_bytes(st.card_json_path(legacy_b))
+            logical = st.resolve_seat("codex", str(self.cwd), sid=self.A)
+            with st.session_state_lock(logical):
+                self.assertFalse(st.prepare_native_session_state(logical))
+                self.assertIsNone(st.read_latest_card(logical))
+                with self.assertRaisesRegex(ValueError, "ambiguous legacy card"):
+                    st.write_card(logical, "codex", self.A, "must-not-merge", cwd=str(self.cwd))
+            self.assertEqual(st.read_bytes(st.card_json_path(legacy_a)), old_a)
+            self.assertEqual(st.read_bytes(st.card_json_path(legacy_b)), old_b)
+
+    def test_legacy_consumed_receipt_survives_compact_without_replay(self):
+        legacy = self._legacy_seat(self.PANE_A)
+        with self.iso.patched_environ(self.environment(None)):
+            self._write_legacy_card(legacy, self.A, "already-consumed", 1, 1001)
+            with st.seat_lock(legacy.key):
+                st._write_consumed(legacy, generation=1, receipts=[st._receipt("codex", self.A, 0)])
+            legacy_receipt = st.read_bytes(st._consumed_path(legacy))
+            logical = st.resolve_seat("codex", str(self.cwd), sid=self.A)
+            with st.session_state_lock(logical):
+                self.assertTrue(st.prepare_native_session_state(logical))
+            self.assertEqual(st.read_bytes(st._consumed_path(logical)), legacy_receipt)
+            transcript = self.iso.root / "rollout.jsonl"
+            transcript.write_text("fixture", encoding="utf-8")
+            with mock.patch.object(runner, "start_detached", return_value=42199):
+                outcome = st.run_hook(
+                    "codex", "compact", self.A, phase="after", compact_summary="",
+                    compact_context={"trigger": "auto", "turn_id": "turn-consumed",
+                                     "event_id": "event-consumed"},
+                    transcript=str(transcript), cwd=str(self.cwd), env=os.environ, now=5000)
+                self.assertTrue(outcome.startswith("booking=queue-only"), outcome)
+                self.assertEqual(st.run_hook("codex", "prompt", self.A, cwd=str(self.cwd),
+                                             env=os.environ, now=5001), "")
+            self.assertEqual(st.read_bytes(st._consumed_path(logical)), legacy_receipt)
+
+
+class NativeSessionConsumerTest(TidyCase):
+    TARGET = "33333333-3333-4333-8333-333333333333"
+    REF = "abcdefabcdefabcdefabcdefabcdefab"
+
+    def _receipt_booking(self, pane, sid, ref):
+        seat = st.Seat("pane", st._digest("pane", pane), pane=pane, harness="codex", sid="old-session")
+        req = {"schema": 1, "nonce": "nonce-" + pane, "status": "cleared",
+               "seat": seat.as_dict(), "harness": "codex", "sid": "old-session",
+               "new_session": sid, "prompt_seq": 0,
+               "continued": {"state": "pending", "transfer_ref": ref}}
+        clear._write_reservation(req)
+        return seat
+
+    def test_exact_native_history_receipt_settles_without_rediscovering_its_pane(self):
+        import importlib.util
+
+        path = ROOT / "utilities" / "peer-message.py"
+        spec = importlib.util.spec_from_file_location("native_consumer_peer_message", path)
+        peer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(peer)
+        sender = {"harness": "codex", "session_id": "44444444-4444-4444-8444-444444444444"}
+        recipient = {"harness": "codex", "session_id": self.TARGET}
+        with self.library():
+            _text, ref = peer.prepare_peer_message("continuation fixture", sender, recipient,
+                                                   defer=True, with_trailer=False)
+            pending = peer._read_pending(ref)
+            peer._save_pending({**pending, "state": "received", "text": None,
+                                "receipt": "exact-native-history"})
+
+            physical = self._receipt_booking("fixture:pane-old", self.TARGET, ref)
+            target = st.session_seat(physical, "codex", self.TARGET)
+            with st.seat_lock(st.seat_state_key(target)):
+                st.bump_prompt_seq(target, "codex", self.TARGET, 5000)
+            self.assertFalse(clear.observe_continue_receipt("codex", "55555555-5555-4555-8555-555555555555", ref))
+            self.assertTrue(clear.observe_continue_receipt("codex", self.TARGET, ref))
+            settled = clear.read_reservation(physical.key)
+            self.assertEqual(settled["continued"]["state"], "sent")
+            self.assertEqual(settled["continued"]["reason"], "exact-native-history")
+            self.assertEqual(peer._read_pending(ref)["state"], "received")
+
+    def test_conflicting_exact_bookings_remain_pending_without_a_send(self):
+        with self.library():
+            first = self._receipt_booking("fixture:pane-one", self.TARGET, self.REF)
+            second = self._receipt_booking("fixture:pane-two", self.TARGET, self.REF)
+            self.assertFalse(clear.observe_continue_receipt("codex", self.TARGET, self.REF))
+            self.assertEqual(clear.read_reservation(first.key)["continued"]["state"], "pending")
+            self.assertEqual(clear.read_reservation(second.key)["continued"]["state"], "pending")
+
+    def test_confirmed_clear_keeps_source_and_successor_prompt_frontiers_separate(self):
+        with self.library():
+            source = st.Seat("pane", st._digest("pane", "fixture:source"),
+                             pane="fixture:source", harness="codex", sid="source-session")
+            with st.session_state_lock(source):
+                st.write_card(source, "codex", source.sid, "source card", cwd=str(self.cwd), now=100)
+                for sequence in range(1, 6):
+                    st.bump_prompt_seq(source, "codex", source.sid, float(100 + sequence))
+            now = st.now_epoch()
+            booking = {"schema": 1, "nonce": "frontier-nonce", "status": "reserved",
+                       "created": now, "deadline": now + 600, "seat": source.as_dict(),
+                       "harness": "codex", "sid": source.sid, "cwd": str(self.cwd),
+                       "card_generation": 1, "prompt_seq": 5, "continue_off": False}
+            clear._write_reservation(booking)
+            self.assertTrue(clear._finish(source.key, "frontier-nonce", "cleared", observed=self.TARGET))
+            settled = clear.read_reservation(source.key)
+            self.assertEqual((settled["source_prompt_seq"], settled["prompt_seq"],
+                              settled["seat"]["continuation_sid"]), (5, 0, self.TARGET))
+            req, reason = clear.validate_continue(clear.reservation_path(source.key), "frontier-nonce")
+            self.assertIsNotNone(req, reason)
 
 
 class WorkerTest(TidyCase):
@@ -1499,7 +1771,9 @@ class CodexCompactBridgeTest(TidyCase):
 
     def setUp(self):
         super().setUp()
-        self.seat = st.Seat("pane", "a" * 32, pane=PANE, harness="codex", project_key="fixture")
+        self.seat = st.session_seat(
+            st.Seat("pane", "a" * 32, pane=PANE, harness="codex", project_key="fixture"),
+            "codex", self.SID)
         self.resolve = mock.patch.object(st, "resolve_seat", return_value=self.seat)
         self.resolve.start()
         self.addCleanup(self.resolve.stop)
@@ -2429,9 +2703,9 @@ class MemoryLayerTest(TidyCase):
         rows = [{"id": f"mem-{i}", "kind": "새", "headline": f"기억 {i} 제목"} for i in range(n)]
         return dict(batch=batch, status=status, refs=rows, **more)
 
-    def update(self, **kw):
+    def update(self, sid="sid-A", **kw):
         with self.library():
-            seat = st.resolve_seat("claude", str(self.cwd))
+            seat = st.resolve_seat("claude", str(self.cwd), sid=sid)
             return st.update_memory_refs(seat, **kw)
 
     def read(self):
@@ -2460,18 +2734,18 @@ class MemoryLayerTest(TidyCase):
         late = self.update(**self.refs(batch="old-runner"), source_generation=1)
         self.assertEqual((late["source_generation"], self.read()["generation"], self.read()["body"]), (1, 2, "둘째 카드"))
 
-    def test_a_new_session_gets_the_card_and_the_list_in_one_injection_within_the_cap(self):
+    def test_the_exact_session_gets_its_card_and_list_in_one_injection_within_the_cap(self):
         self.card("sid-A", "가나다라 " * 900)
         self.update(**self.refs(n=8, more=4, coverage="일부만 읽음(byte 1–2 / 전체 3) — 앞부분은 다음 정리에서 계속",
                                 result_path=str(self.state / "runs" / "b1" / "result.json")))
         with self.library():
-            seat = st.resolve_seat("claude", str(self.cwd))
+            seat = st.resolve_seat("claude", str(self.cwd), sid="sid-A")
             st.write_notice(seat, "정리 결과: 새 기록 3건. 되돌리기: mem tidy-undo b1", author_harness="claude", author_sid="sid-A")
-        got = self.hook("claude", "start", "sid-B")
+        got = self.hook("claude", "start", "sid-A", "--source", "compact")
         self.assertLessEqual(len(got.encode("utf-8")), st.INJECTION_MAX_BYTES)
         for needle in ("[정리 결과]", "[세션 카드]", "[참고할 기억]", "mem-0", "일부만 읽음", "b1/result.json", "카드 전문:"):
             self.assertIn(needle, got)
-        self.assertEqual(self.hook("claude", "prompt", "sid-B"), "")
+        self.assertEqual(self.hook("claude", "prompt", "sid-A"), "")
 
     def test_a_listed_record_is_never_a_body_and_the_list_alone_stays_within_its_bytes(self):
         self.card("sid-A", "본문")
@@ -2484,7 +2758,7 @@ class MemoryLayerTest(TidyCase):
 
     def test_a_session_that_took_layer_a_still_gets_a_newer_list_once_and_a_failed_emit_keeps_it(self):
         self.card("sid-A", "카드")
-        self.assertIn("카드", self.hook("claude", "start", "sid-B"))            # A taken before any list exists
+        self.assertIn("카드", self.hook("claude", "start", "sid-A", "--source", "compact"))
         self.update(**self.refs())
 
         def broken(_text):
@@ -2492,21 +2766,21 @@ class MemoryLayerTest(TidyCase):
 
         with self.library():
             with self.assertRaises(BrokenPipeError):
-                st.run_hook("claude", "prompt", "sid-B", cwd=str(self.cwd), emit=broken)
-        got = self.hook("claude", "prompt", "sid-B")                            # the failed emit used nothing up
+                st.run_hook("claude", "prompt", "sid-A", cwd=str(self.cwd), emit=broken)
+        got = self.hook("claude", "prompt", "sid-A")                            # the failed emit used nothing up
         self.assertIn("[참고할 기억]", got)
         self.assertNotIn("[세션 카드]", got)
-        self.assertEqual(self.hook("claude", "prompt", "sid-B"), "")
+        self.assertEqual(self.hook("claude", "prompt", "sid-A"), "")
         consumed = json.loads(next((self.state / "consumed").glob("*.json")).read_text(encoding="utf-8"))
         self.assertEqual((consumed["generation"], consumed["memory_revision"]), (1, 1))     # two receipts, kept apart
         self.update(**self.refs(batch="b2"))
-        self.assertIn("[참고할 기억]", self.hook("claude", "prompt", "sid-B"))   # a newer revision is handed out again
+        self.assertIn("[참고할 기억]", self.hook("claude", "prompt", "sid-A"))   # a newer revision is handed out again
 
     def test_reread_keeps_what_the_session_already_got_and_adds_the_later_list(self):
-        self.card("sid-A", "OpenCode 카드")
+        self.card("ses_B", "OpenCode 카드", harness="opencode")
         with self.library({"HERDR_PANE_ID": PANE}):
-            st.run_hook("opencode", "start", "ses_B", cwd=str(self.cwd), emit=lambda t: None)
-        self.update(**self.refs())
+            st.run_hook("opencode", "start", "ses_B", source="compact", cwd=str(self.cwd), emit=lambda t: None)
+        self.update(sid="ses_B", **self.refs())
         with self.library({"HERDR_PANE_ID": PANE}):
             st.run_hook("opencode", "prompt", "ses_B", cwd=str(self.cwd), emit=lambda t: None)
             replay = []

@@ -624,6 +624,7 @@ def note_real_prompt_locked(seat: "st.Seat", harness: str, sid: str, sequence: i
 
 
 def idle_context_for_enqueue(seat: "st.Seat", harness: str, sid: str) -> Optional[dict]:
+    seat = st.session_seat(seat, harness, sid)
     req = read_reservation(seat.key)
     prompt = st.prompt_state(seat)
 
@@ -810,6 +811,7 @@ def schedule_compact_card_request(seat: "st.Seat", harness: str, sid: str, cwd: 
                                  compact_context: dict, *, now: Optional[float] = None,
                                  lock_wait: Optional[float] = None) -> str:
     """Durably book Codex's automatic post-compaction main-card request."""
+    seat = st.session_seat(seat, harness, sid)
     now = st.now_epoch() if now is None else now
     identity = str(compact_context.get("identity") or "")
     transcript = str(compact_context.get("transcript") or "")
@@ -904,6 +906,7 @@ def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, o
     ``clear=skipped reason`` a prompt was submitted after the card: nothing is booked;
     ``clear=manual hint=C``  outside herdr (no pane, no herdr): the user types ``C``.
     """
+    seat = st.session_seat(seat, harness, sid)
     now = st.now_epoch() if now is None else now
     hint = CLEAR_COMMAND.get(harness, "/clear")
     if idle_context is not None:
@@ -1164,6 +1167,7 @@ def note_start_locked(seat: "st.Seat", harness: str, sid: str, now: float) -> No
         # Codex starts the new thread's SessionStart only with its first message, so the successor
         # can show up after the helper stopped waiting: the clear did happen, drop the doubt.
         req.update(status="cleared", new_session=sid, reason="")
+        _set_successor_prompt_frontier(req, sid)
         _drop_unverified_notice(seat, req)
     _write_reservation(req)
 
@@ -1179,7 +1183,9 @@ def _drop_unverified_notice(seat: "st.Seat", req: dict) -> None:
     kept = [i for i in items if not (isinstance(i, dict) and i.get("text") == text
                                      and (i.get("author") or {}).get("sid") == req.get("sid"))]
     if len(kept) != len(items):
-        st.atomic_write_json(path, {"schema": st.SCHEMA, "items": kept})
+        st.atomic_write_json(path, {"schema": st.SCHEMA, "items": kept,
+                                    "delivered": data.get("delivered", []),
+                                    "lineage_received": data.get("lineage_received", [])})
 
 
 def _booking_at(path: Path):
@@ -1195,6 +1201,8 @@ def _booking_at(path: Path):
         in_place = False
     if not re.fullmatch(r"[0-9a-f]{8,64}", key) or path.name != f"{key}.json" or not in_place:
         return None, None, "request-unreadable"
+    if req.get("status") == "cleared" and req.get("new_session"):
+        seat_fields = {**seat_fields, "continuation_sid": str(req["new_session"])}
     seat = st.seat_from_dict(seat_fields)
     return req, seat, ""
 
@@ -1348,18 +1356,22 @@ def claim_continue(path, nonce: Optional[str] = None):
     req, seat, reason = _booking_at(Path(path))
     if req is None:
         return None, reason
-    with st.seat_lock(seat.key):
+    target_sid = str(req.get("new_session") or seat.continuation_sid or "")
+    target_seat = st.session_seat(seat, str(req.get("harness") or ""), target_sid)
+    with st.session_state_lock(target_seat):
         req, reason = validate_continue(path, nonce)
         if req is None:
             return None, reason
         token = secrets.token_hex(12)
-        sent_seq = st.read_prompt_seq(seat)
+        target_sid = str(req.get("new_session") or target_sid)
+        target_seat = st.session_seat(seat, str(req.get("harness") or ""), target_sid)
+        sent_seq = st.read_prompt_seq(target_seat)
         continued = {**req["continued"], "state": "sending", "at": st.now_epoch(),
                      "claim_id": token, "token": token, "sent_seq": sent_seq}
         req["continued"] = continued
         text = followup_text(req)
-        st.record_tidy_claim(seat, harness=str(req.get("harness") or ""),
-                             sid=str(req.get("new_session") or "-"), claim_id=token,
+        st.record_tidy_claim(target_seat, harness=str(req.get("harness") or ""),
+                             sid=target_sid or "-", claim_id=token,
                              nonce=str(req.get("nonce") or ""), token=token,
                              digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
                              origin=str(continued.get("kind") or "continue"),
@@ -1393,11 +1405,32 @@ def bind_continue_transfer(claim, transfer_ref: str) -> bool:
 
 def observe_continue_receipt(harness: str, sid: str, transfer_ref: str = "") -> bool:
     """Settle a booked continue only after exact native history says it was received."""
-    seat = st.resolve_seat(harness, sid=sid)
+    matches = []
+    try:
+        paths = sorted(clear_dir().glob("*.json"))
+    except OSError:
+        return False
+    for path in paths:
+        try:
+            if not path.is_file() or path.is_symlink():
+                continue
+        except OSError:
+            continue
+        candidate = read_reservation(path.stem)
+        held = (candidate or {}).get("continued") if isinstance((candidate or {}).get("continued"), dict) else {}
+        ref = transfer_ref or held.get("transfer_ref")
+        if (candidate and candidate.get("status") == "cleared"
+                and candidate.get("harness") == harness and candidate.get("new_session") == sid
+                and held.get("state") in ("pending", "sending") and ref
+                and held.get("transfer_ref") == ref):
+            matches.append((candidate, path.stem, str(ref)))
+    if len(matches) != 1:
+        return False
+    candidate, seat_key, ref = matches[0]
+    seat = st.session_seat(_booked_seat(candidate, seat_key), harness, sid)
     with st.seat_lock(seat.key):
         req = read_reservation(seat.key)
         held = (req or {}).get("continued") if isinstance((req or {}).get("continued"), dict) else {}
-        ref = transfer_ref or held.get("transfer_ref")
         if (not req or req.get("status") != "cleared" or req.get("harness") != harness
                 or req.get("new_session") != sid or held.get("state") not in ("pending", "sending")
                 or not ref or held.get("transfer_ref") != ref):
@@ -1427,7 +1460,9 @@ def observe_continue_receipt(harness: str, sid: str, transfer_ref: str = "") -> 
                 or held.get("state") not in ("pending", "sending")
                 or held.get("transfer_ref") != ref):
             return False
-        if st.read_prompt_seq(seat) <= int(req.get("prompt_seq", -1)):
+        prompt = st.prompt_state(seat)
+        if (not isinstance(prompt, dict) or prompt.get("sid") != sid
+                or int(prompt.get("seq", 0) or 0) <= 0):
             return False
         req["continued"] = {**held, "state": "sent", "reason": "exact-native-history",
                             "finished": st.now_epoch()}
@@ -1551,7 +1586,21 @@ def _continue_notice_text(outcome: str, reason: str, prompt_text: str = CONTINUE
 
 def _booked_seat(req: dict, seat_key: str) -> "st.Seat":
     fields = req.get("seat") or {}
-    return st.seat_from_dict({**fields, "key": seat_key})
+    successor = str(req.get("new_session") or fields.get("continuation_sid") or "")
+    return st.seat_from_dict({**fields, "key": seat_key, "continuation_sid": successor})
+
+
+def _set_successor_prompt_frontier(req: dict, sid: str) -> None:
+    """Keep the predecessor card seat and the exact successor prompt frontier separate."""
+    fields = req.get("seat") if isinstance(req.get("seat"), dict) else {}
+    physical = st.seat_from_dict({**fields, "continuation_sid": ""})
+    harness = str(req.get("harness") or "")
+    target = st.session_seat(physical, harness, sid)
+    req.setdefault("source_prompt_seq", int(req.get("prompt_seq", 0) or 0))
+    req["successor_prompt_seq"] = st.read_prompt_seq(target)
+    req["prompt_seq"] = req["successor_prompt_seq"]
+    req["new_session"] = sid
+    req["seat"] = {**fields, "continuation_sid": sid}
 
 
 def _finish(seat_key: str, nonce: str, outcome: str, reason: str = "", *, observed: str = "") -> bool:
@@ -1569,7 +1618,9 @@ def _finish(seat_key: str, nonce: str, outcome: str, reason: str = "", *, observ
             req["clear_claim"] = {**claim, "state": "sent" if outcome in ("cleared", "unverified") else "finished",
                                   "outcome": outcome, "finished": now}
         if observed:
-            req["new_session"] = observed
+            _set_successor_prompt_frontier(req, observed)
+        elif outcome == "cleared" and req.get("new_session"):
+            _set_successor_prompt_frontier(req, str(req["new_session"]))
         if outcome == "cleared" and not req.get("continue_off"):
             # Written before anything is typed: the new Codex thread's first hook finds its window by it.
             kind = req.get("followup_kind") or "continue"
@@ -1590,10 +1641,17 @@ def _finish(seat_key: str, nonce: str, outcome: str, reason: str = "", *, observ
 def _finish_continue(seat_key: str, nonce: str, outcome: str, reason: str = "", *,
                      claim_id: str = "", transfer_ref: str = "") -> bool:
     """Settle only this continue claim; queued delivery keeps its exact native ref."""
-    with st.seat_lock(seat_key):
+    initial = read_reservation(seat_key)
+    if not initial:
+        return False
+    initial_booked = _booked_seat(initial, seat_key)
+    target_sid = str(initial.get("new_session") or "")
+    target = st.session_seat(initial_booked, str(initial.get("harness") or ""), target_sid)
+    with st.session_state_lock(target):
         req = read_reservation(seat_key)
         held = (req or {}).get("continued") if isinstance((req or {}).get("continued"), dict) else {}
         if not req or req.get("nonce") != nonce or req.get("status") != "cleared" \
+                or str(req.get("new_session") or "") != target_sid \
                 or held.get("state") not in ("pending", "sending"):
             return False
         if claim_id and held.get("claim_id") != claim_id:
@@ -1612,7 +1670,9 @@ def _finish_continue(seat_key: str, nonce: str, outcome: str, reason: str = "", 
             req["continued"]["transfer_ref"] = transfer_ref
         held_claim = str(held.get("claim_id") or "")
         if held_claim:
-            st.record_tidy_claim(_booked_seat(req, seat_key), harness=str(req.get("harness") or ""),
+            booked = _booked_seat(req, seat_key)
+            recipient = st.session_seat(booked, str(req.get("harness") or ""), target_sid)
+            st.record_tidy_claim(recipient, harness=str(req.get("harness") or ""),
                                  sid=str(req.get("new_session") or "-"), claim_id=held_claim,
                                  nonce=str(req.get("nonce") or ""), token=str(held.get("token") or held_claim),
                                  digest=hashlib.sha256(followup_text(req).encode("utf-8")).hexdigest(),

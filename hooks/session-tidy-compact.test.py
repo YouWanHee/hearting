@@ -64,12 +64,29 @@ class CompactHookTest(unittest.TestCase):
         for key in WORKER_MARKERS:
             os.environ.pop(key, None)
         self.seat = st.Seat("pane", "fixture-seat", pane="w1:p1", harness="claude", project_key="fixture")
-        self.resolve = mock.patch.object(st, "resolve_seat", return_value=self.seat)
+        self.resolve = mock.patch.object(
+            st, "resolve_seat",
+            side_effect=lambda harness, _cwd=None, _env=None, sid=None, _source="", **_kwargs:
+                st.session_seat(self.seat, harness, sid or ""))
         self.resolve.start()
         self.addCleanup(self.resolve.stop)
         self.enqueue = mock.patch.object(runner, "enqueue_item", return_value={"id": "fixture"})
         self.enqueue_mock = self.enqueue.start()
         self.addCleanup(self.enqueue.stop)
+
+    def session_seat(self, sid, harness="claude"):
+        return st.session_seat(self.seat, harness, sid)
+
+    def confirmed_handover(self, predecessor, successor, harness="claude"):
+        seat = self.session_seat(successor, harness)
+        now = st.now_epoch()
+        with st.session_state_lock(seat):
+            st.record_event(seat, harness, successor, "start", source="clear",
+                            cwd=str(self.cwd), now=now)
+            st._append_ledger_entry(seat, {"ts": now + 0.001, "harness": harness,
+                                           "sid": successor, "event": "handover",
+                                           "from": {"harness": harness, "sid": predecessor},
+                                           "source": "clear"})
 
     def test_before_is_shared_and_does_not_touch_state(self):
         self.assertEqual(st.run_hook("claude", "compact", "sid-main", phase="before", env=self.env),
@@ -89,7 +106,7 @@ class CompactHookTest(unittest.TestCase):
         ledger = list((self.state / "hearting/session-tidy/sessions").glob("*.jsonl"))
         row = json.loads(ledger[0].read_text(encoding="utf-8").splitlines()[-1])
         self.assertEqual((row["event"], row["source"], row["epoch"]), ("compact", "compact", 1))
-        card = st.read_latest_card(self.seat)
+        card = st.read_latest_card(self.session_seat("sid-main"))
         self.assertEqual(card["origin"], "runtime-compact")
         self.assertEqual(card["compact"]["summary"], "summary\n\tkept")
         self.assertIn("요약이 보지 못한 최근 대화", card["body"])
@@ -100,17 +117,18 @@ class CompactHookTest(unittest.TestCase):
         self.assertEqual(st.run_hook("claude", "start", "sid-main", source="compact",
                                      env=self.env, now=1002), "")
         self.assertEqual(st.run_hook("claude", "prompt", "sid-main", env=self.env, now=1003), "")
+        self.confirmed_handover("sid-main", "sid-next")
         self.assertIn("summary", st.run_hook("claude", "start", "sid-next", env=self.env, now=1004))
         self.assertEqual(st.run_hook("claude", "prompt", "sid-next", env=self.env, now=1005), "")
 
     def test_empty_after_still_queues_once_without_replacing_card(self):
         st.run_hook("claude", "compact", "sid-main", phase="after", compact_summary="saved",
                     cwd=str(self.cwd), env=self.env, now=1000)
-        card_before = st.read_latest_card(self.seat)
+        card_before = st.read_latest_card(self.session_seat("sid-main"))
         st.run_hook("claude", "compact", "sid-main", phase="after", compact_summary=" \x00\n ",
                     cwd=str(self.cwd), env=self.env, now=1010)
         self.assertEqual(self.enqueue_mock.call_count, 2)
-        self.assertEqual(st.read_latest_card(self.seat), card_before)
+        self.assertEqual(st.read_latest_card(self.session_seat("sid-main")), card_before)
         self.assertEqual(st.session_summary(self.seat)[("claude", "sid-main")]["epoch"], 1)
 
     def test_card_is_saved_only_at_a_session_seat_and_project_seat_queues_only(self):
@@ -121,7 +139,7 @@ class CompactHookTest(unittest.TestCase):
             with mock.patch.object(st, "resolve_seat", return_value=seat):
                 st.run_hook("claude", "compact", f"sid-{kind}", phase="after", compact_summary=f"{kind} card",
                             cwd=str(self.cwd), env=self.env, now=1000)
-            card = st.read_latest_card(seat)
+            card = st.read_latest_card(st.session_seat(seat, "claude", f"sid-{kind}"))
             self.assertEqual((card["compact"]["summary"], card["origin"]), (f"{kind} card", "runtime-compact"))
         project = st.Seat("project", "fixture-project", harness="codex", project_key="fixture")
         with mock.patch.object(st, "resolve_seat", return_value=project):
@@ -140,7 +158,7 @@ class CompactHookTest(unittest.TestCase):
         summary = "진행 중: " + "가" * (st.CARD_BODY_MAX_BYTES // 3 + 500)
         st.run_hook("claude", "compact", "sid-main", phase="after", compact_summary=summary,
                     cwd=str(self.cwd), env=self.env, now=1000)
-        card = st.read_latest_card(self.seat)
+        card = st.read_latest_card(self.session_seat("sid-main"))
         self.assertEqual(card["compact"]["summary"], summary)
         self.assertGreater(len(card["compact"]["summary"].encode("utf-8")), st.CARD_BODY_MAX_BYTES)
         self.assertLessEqual(len(card["compact"]["summary"].encode("utf-8")), st.COMPACT_SUMMARY_MAX_BYTES)
@@ -151,14 +169,14 @@ class CompactHookTest(unittest.TestCase):
             summary = "x" * size
             st.run_hook("claude", "compact", f"sid-{size}", phase="after", compact_summary=summary,
                         compact_context={"trigger": "manual"}, cwd=str(self.cwd), env=self.env, now=1000 + size)
-            card = st.read_latest_card(self.seat)
+            card = st.read_latest_card(self.session_seat(f"sid-{size}"))
             self.assertEqual(card["compact"]["summary"], summary)
             self.assertLessEqual(len(card["body"].encode("utf-8")), st.COMPACT_CARD_BODY_MAX_BYTES)
-        before = st.read_latest_card(self.seat)
+        before = st.read_latest_card(self.session_seat(f"sid-{st.COMPACT_SUMMARY_MAX_BYTES}"))
         too_large = "x" * (st.COMPACT_SUMMARY_MAX_BYTES + 1)
         st.run_hook("claude", "compact", "sid-too-large", phase="after", compact_summary=too_large,
                     compact_context={"trigger": "auto"}, cwd=str(self.cwd), env=self.env, now=5000)
-        self.assertEqual(st.read_latest_card(self.seat), before)
+        self.assertEqual(st.read_latest_card(self.session_seat(f"sid-{st.COMPACT_SUMMARY_MAX_BYTES}")), before)
         self.assertEqual(self.enqueue_mock.call_count, 4)
 
     def test_auto_compact_uses_shared_snapshot_and_three_hour_booking(self):
@@ -200,8 +218,9 @@ class CompactHookTest(unittest.TestCase):
                     with st.seat_lock(self.seat.key):
                         st.write_card(self.seat, "claude", "sid-duplicate", "later manual card",
                                       cwd=str(self.cwd), now=1000.5)
-        self.assertEqual(st.read_latest_card(self.seat)["generation"], 2)
-        self.assertEqual(st.read_latest_card(self.seat)["body"], "later manual card")
+        duplicate_seat = self.session_seat("sid-duplicate")
+        self.assertEqual(st.read_latest_card(duplicate_seat)["generation"], 2)
+        self.assertEqual(st.read_latest_card(duplicate_seat)["body"], "later manual card")
         self.assertEqual(self.enqueue_mock.call_count, 2)  # both retries carry one operation identity
         self.assertEqual([call.kwargs.get("operation_id") for call in self.enqueue_mock.call_args_list],
                          [self.enqueue_mock.call_args_list[0].kwargs.get("operation_id")] * 2)
@@ -264,7 +283,7 @@ class CompactHookTest(unittest.TestCase):
              mock.patch.object(st, "atomic_write", side_effect=fail_text):
             st.run_hook("claude", "compact", "sid-main", phase="after", compact_summary="new summary",
                         compact_context={"trigger": "auto"}, cwd=str(self.cwd), env=self.env, now=1000)
-        self.assertEqual(st.read_latest_card(self.seat)["generation"], previous["generation"])
+        self.assertEqual(st.read_latest_card(self.session_seat("sid-main"))["generation"], previous["generation"])
         self.assertIsNone(clear.read_reservation(self.seat.key))
 
     def test_start_compact_then_after_keeps_one_epoch_and_excludes_author_card(self):
@@ -273,7 +292,7 @@ class CompactHookTest(unittest.TestCase):
         st.run_hook("claude", "compact", "sid-main", phase="after", compact_summary="summary",
                     cwd=str(self.cwd), env=self.env, now=1001)
         row = st.session_summary(self.seat)[("claude", "sid-main")]
-        card = st.read_latest_card(self.seat)
+        card = st.read_latest_card(self.session_seat("sid-main"))
         self.assertEqual(row["epoch"], 1)
         self.assertEqual(card["author"]["epoch"], 1)
         self.assertEqual(card["origin"], "runtime-compact")
@@ -286,7 +305,7 @@ class CompactHookTest(unittest.TestCase):
                     cwd=str(self.cwd), env=self.env, now=1000)
         st.run_hook("claude", "compact", "sid-main", phase="after", compact_summary="second",
                     cwd=str(self.cwd), env=self.env, now=1010)
-        card = st.read_latest_card(self.seat)
+        card = st.read_latest_card(self.session_seat("sid-main"))
         self.assertEqual(card["generation"], 2)
         self.assertEqual(card["compact"]["summary"], "second")
         self.assertEqual(st.session_summary(self.seat)[("claude", "sid-main")]["epoch"], 1)
@@ -314,7 +333,7 @@ class CompactHookTest(unittest.TestCase):
                 self.assertEqual(output.getvalue(), "booking=pending reason=compact-state-BlockingIOError\n")
         self.assertEqual(self.enqueue_mock.call_count, 1)
         self.assertEqual(self.enqueue_mock.call_args.args[-1], "payload.jsonl")
-        self.assertIsNone(st.read_latest_card(self.seat))
+        self.assertIsNone(st.read_latest_card(self.session_seat("sid-main")))
 
     def test_bounded_seat_lock_waits_for_a_short_holder(self):
         import threading
@@ -332,7 +351,7 @@ class CompactHookTest(unittest.TestCase):
         st.run_hook("claude", "compact", "sid-main", phase="after", compact_summary="summary",
                     cwd=str(self.cwd), env=self.env, now=1000)
         thread.join()
-        self.assertEqual(st.read_latest_card(self.seat)["compact"]["summary"], "summary")
+        self.assertEqual(st.read_latest_card(self.session_seat("sid-main"))["compact"]["summary"], "summary")
         self.assertEqual(self.enqueue_mock.call_count, 1)
 
     def test_card_write_failure_does_not_suppress_queue(self):
@@ -344,7 +363,7 @@ class CompactHookTest(unittest.TestCase):
     def test_legacy_compact_remains_ledger_only(self):
         st.run_hook("claude", "compact", "sid-main", cwd=str(self.cwd), env=self.env, now=1000)
         self.assertEqual(self.enqueue_mock.call_count, 0)
-        self.assertIsNone(st.read_latest_card(self.seat))
+        self.assertIsNone(st.read_latest_card(self.session_seat("sid-main")))
         self.assertEqual(st.session_summary(self.seat)[("claude", "sid-main")]["epoch"], 1)
 
     def test_worker_hooks_emit_nothing_and_never_queue(self):
@@ -395,7 +414,7 @@ class CompactHookTest(unittest.TestCase):
         env = {key: value for key, value in os.environ.items()
                if not key.startswith(("AGENT_", "MEM_", "CODEX_", "OPENCODE_", "FLEET_"))}
         env.update({"AGENT_HOME": str(fake_home), "XDG_STATE_HOME": str(self.state),
-                    "PYTHONDONTWRITEBYTECODE": "1"})
+                    "PYTHONDONTWRITEBYTECODE": "1", "CODEX_THREAD_ID": "inherited-other-session"})
         bridge = ROOT / "utilities/worker-state-hook.py"
         payloads = {
             "claude": {"session_id": "sid-c", "cwd": str(self.cwd), "transcript_path": "c.jsonl",
