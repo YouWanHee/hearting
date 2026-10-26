@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -566,6 +567,221 @@ class MetricSourcesTest(unittest.TestCase):
         paged_complete = {**paged, "samples": list(accumulated.values())}
         assert_complete_observation(paged_complete)
 
+    def test_multi_sibling_listing_keeps_identity_last_target_cache_and_all_samples(self):
+        root = self.root / "sibling-listing-cost"
+        target = root / "00-selected-context"
+        target.mkdir(parents=True)
+        registry = root / "registry.data"
+        registry.write_text("{}\n")
+        for index in range(270):
+            (target / f"decision-{index:03d}.data").write_text(json.dumps({
+                "admitted": index >= 7, "sample_index": index,
+                "snapshot": {"t": 1000 + index}}))
+        (target / "zz-plain-run-declaration.data").write_text(
+            json.dumps({"run_id": "selected-run", "started_at": 1}))
+        for sibling_index in range(8):
+            sibling = root / f"10-sibling-{sibling_index:02d}"
+            sibling.mkdir()
+            for item_index in range(24):
+                (sibling / f"decision-{item_index:02d}.data").write_text(json.dumps({
+                    "admitted": False, "sample_index": item_index,
+                    "snapshot": {"t": 10 + item_index}}))
+
+        clock = [0.0]
+        listing_calls = {}
+        original_scandir = os.scandir
+
+        class TimedScandir:
+            def __init__(self, entries, path):
+                self.entries = entries
+                self.path = str(path)
+                self.index = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.index >= len(self.entries):
+                    raise StopIteration
+                item = self.entries[self.index]
+                self.index += 1
+                clock[0] += 0.0007
+                return item
+
+        def timed_scandir(path):
+            listing_calls[str(path)] = listing_calls.get(str(path), 0) + 1
+            return TimedScandir(list(original_scandir(path)), path)
+
+        cursor = None
+        accumulated = {}
+        page_count = 0
+        with mock.patch.object(metrics.os, "scandir", timed_scandir), \
+                mock.patch.object(metrics, "MAX_ADMISSION_BYTES_PER_PASS", 8 * 1024), \
+                mock.patch.object(metrics, "MAX_ADMISSION_CACHED_ENTRIES", 350):
+            for page_count in range(1, 65):
+                before = clock[0]
+                result = metrics.read_admission_sources([root], run_id="selected-run",
+                    registry_path=registry, started_at=1, now=2000, cursor=cursor,
+                    monotonic=lambda: clock[0], time_budget=0.25)
+                self.assertLessEqual(clock[0] - before, 0.2507)
+                self.assertLessEqual(result["bytes"], 8 * 1024)
+                self.assertLessEqual(result["entries"], metrics.MAX_ADMISSION_ENTRIES)
+                accumulated.update({row["sample_id"]: row for row in result["samples"]})
+                cursor = result["cursor"]
+                if page_count >= 2:
+                    self.assertEqual(listing_calls[str(target)], 1,
+                        "a sibling turn must not discard the target's listing")
+                if result["coverage"] == "observed":
+                    break
+
+        self.assertLessEqual(page_count, 64)
+        self.assertEqual(len(accumulated), 270)
+        self.assertEqual(sum(row["state"] == "denied" for row in accumulated.values()), 7)
+        self.assertEqual(sum(row["state"] == "admitted" for row in accumulated.values()), 263)
+        self.assertGreater(sum(listing_calls.get(str(root / f"10-sibling-{i:02d}"), 0)
+                               for i in range(8)), 0)
+
+    def test_listing_cache_entry_and_byte_limits_apply_across_bundle_cursors(self):
+        root = self.root / "bounded-cross-bundle-cache"
+        for bundle_index in range(2):
+            bundle = root / f"context-{bundle_index}"
+            bundle.mkdir(parents=True)
+            for item_index in range(4):
+                (bundle / f"sample-{item_index}.data").write_text(json.dumps({
+                    "admitted": bool(item_index % 2), "snapshot": {"t": 10 + item_index}}))
+
+        with mock.patch.object(metrics, "MAX_ADMISSION_CACHED_ENTRIES", 6), \
+                mock.patch.object(metrics, "MAX_ADMISSION_PENDING_BYTES", 4096):
+            result = metrics.read_admission_sources([root], run_id="unrelated-run", now=50)
+        scan = result["cursor"]["scan"][str(root)]
+        root_listing = scan.get("root_listing", {})
+        cached_entries = len(root_listing.get("entries", []))
+        cached_bytes = len(json.dumps(root_listing, sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False).encode()) if root_listing else 0
+        bundle_cursors = scan.get("bundle_cursors", {})
+        for progress_state in bundle_cursors.values():
+            listing = progress_state.get("listing") if isinstance(progress_state, dict) else None
+            if isinstance(listing, dict):
+                cached_entries += len(listing.get("files", []))
+                cached_bytes += len(json.dumps(listing, sort_keys=True,
+                    separators=(",", ":"), ensure_ascii=False).encode())
+            binding = progress_state.get("binding_state", {}) \
+                if isinstance(progress_state, dict) else {}
+            self.assertLessEqual(len(json.dumps(binding, sort_keys=True,
+                separators=(",", ":"), ensure_ascii=False).encode()), 4096)
+        self.assertLessEqual(cached_entries, 6)
+        self.assertLessEqual(cached_bytes, 4096)
+        self.assertLessEqual(len(bundle_cursors), metrics.MAX_ADMISSION_ENTRIES)
+
+    def test_ambiguous_population_resolves_once_across_exact_source_pages(self):
+        root = self.root / "paged-ambiguity-resolution"
+        for bundle_name, first_stamp in (("candidate-a", 100), ("candidate-b", 200)):
+            bundle = root / bundle_name
+            bundle.mkdir(parents=True)
+            (bundle / "run-context.data").write_text(
+                json.dumps({"run_id": "ambiguous-run", "started_at": 1}))
+            for index in range(8):
+                (bundle / f"sample-{index:02d}.data").write_text(json.dumps({
+                    "admitted": index % 3 != 0, "sample_index": index,
+                    "snapshot": {"t": first_stamp + index}}))
+
+        ambiguous = metrics.read_admission_sources([root], run_id="ambiguous-run",
+            started_at=1, now=500)
+        self.assertEqual(ambiguous["coverage"], "unknown")
+        self.assertEqual(len(ambiguous["samples"]), 16)
+        self.assertEqual({row["state"] for row in ambiguous["samples"]}, {"unknown"})
+        replay = metrics.read_admission_sources([root], run_id="ambiguous-run",
+            started_at=1, now=501, cursor=ambiguous["cursor"])
+        self.assertEqual(replay["samples"], [])
+
+        removed = root / "candidate-b"
+        for path in removed.iterdir():
+            path.unlink()
+        removed.rmdir()
+        previous = {"admission_counts": {"admitted": 0, "denied": 0, "unknown": 16},
+            "admission_generation": ambiguous["generation"],
+            "admission_cursor": ambiguous["cursor"]}
+        cursor = ambiguous["cursor"]
+        pages, seen = [], {}
+        with mock.patch.object(metrics, "MAX_ADMISSION_BYTES_PER_PASS", 384):
+            for index in range(32):
+                page = metrics.read_admission_sources([root], run_id="ambiguous-run",
+                    started_at=1, now=510 + index, cursor=cursor)
+                summary, update = __import__("resource_progress")._admission_summary(
+                    previous, page, 510 + index, "ambiguous-run", "run", 1)
+                previous.update(update)
+                cursor = page["cursor"]
+                pages.append((page, summary))
+                seen.update({row["sample_id"]: row for row in page["samples"]})
+                if page["coverage"] == "observed":
+                    break
+        self.assertEqual(len(seen), 8)
+        self.assertEqual(pages[0][1]["unknown_samples"], 0)
+        exact_generation = pages[0][0]["generation"]
+        self.assertNotEqual(exact_generation, ambiguous["generation"])
+        counts = [page[1]["sample_count"] for page in pages]
+        self.assertEqual(counts, sorted(counts))
+        self.assertEqual(counts[-1], 8)
+        self.assertTrue(all(page[0]["generation"] == exact_generation for page in pages))
+        reread = metrics.read_admission_sources([root], run_id="ambiguous-run",
+            started_at=1, now=550, cursor=cursor)
+        stable, stable_state = __import__("resource_progress")._admission_summary(
+            previous, reread, 550, "ambiguous-run", "run", 1)
+        self.assertEqual(reread["samples"], [])
+        self.assertEqual(stable["sample_count"], 8)
+        self.assertEqual(stable_state["admission_counts"], previous["admission_counts"])
+
+    def test_delivery_envelope_mirror_is_not_a_new_admission_and_nested_samples_survive(self):
+        root = self.root / "delivery-envelope"
+        bundle = root / "arbitrary-context"
+        bundle.mkdir(parents=True)
+        (bundle / "context.data").write_text(json.dumps({"run_id": "receipt-run"}))
+        source = {"admitted": False, "snapshot": {"t": 30}, "sample_key": "origin"}
+        (bundle / "observation.data").write_text(json.dumps(source))
+        (bundle / "receipt-copy.data").write_text(json.dumps({
+            "delivered": True, "error": None, "evidence": source,
+            "message": "delivery receipt", "run_id": "receipt-run",
+            "admitted": False, "snapshot": {"t": 30}}))
+        (bundle / "nested-observation.data").write_text(json.dumps({
+            "payload": {"admission": {"state": "denied", "snapshot": {"t": 31},
+                                       "sample_key": "nested-origin"}}}))
+
+        result = metrics.read_admission_sources([root], run_id="receipt-run",
+            started_at=1, now=40)
+        self.assertEqual(len(result["samples"]), 2)
+        self.assertEqual({row["at"] for row in result["samples"]}, {30.0, 31.0})
+        self.assertEqual({row["state"] for row in result["samples"]}, {"denied"})
+
+    def test_equal_time_independent_and_row_scoped_samples_remain_distinct(self):
+        root = self.root / "equal-time-row-samples"
+        bundle = root / "context"
+        bundle.mkdir(parents=True)
+        (bundle / "context.data").write_text(json.dumps({"run_id": "row-run"}))
+        for row_id, token in (("row-a", "alpha"), ("row-a", "beta"), ("row-b", "gamma")):
+            (bundle / f"sample-{token}.data").write_text(json.dumps({
+                "row_id": row_id, "admitted": True, "snapshot": {"t": 70},
+                "independent_sample": token}))
+
+        run = metrics.read_admission_sources([root], run_id="row-run",
+            started_at=1, now=80)
+        row_a = metrics.read_admission_sources([root], run_id="row-run", row_key="row-a",
+            started_at=1, now=80)
+        row_b = metrics.read_admission_sources([root], run_id="row-run", row_key="row-b",
+            started_at=1, now=80)
+        self.assertEqual(len(run["samples"]), 3)
+        self.assertEqual(len({row["sample_id"] for row in run["samples"]}), 3)
+        self.assertEqual({row["at"] for row in run["samples"]}, {70.0})
+        self.assertEqual(len(row_a["samples"]), 2)
+        self.assertEqual(len(row_b["samples"]), 1)
+        self.assertTrue(all(row["state"] == "admitted"
+                            for row in row_a["samples"] + row_b["samples"]))
+
     def test_rootless_target_survives_poisoned_cursor_large_changing_sibling(self):
         root = self.root / "registry-parent-without-output-root"
         registry = root / "resource-runs.json"
@@ -672,6 +888,46 @@ class MetricSourcesTest(unittest.TestCase):
         self.assertEqual(continued["coverage"], "observed")
         self.assertEqual(continued["latest"]["state"], "denied")
         self.assertEqual(continued["samples"], [])
+
+    def test_v4_single_slot_listing_and_sample_dedup_are_adopted(self):
+        root = self.root / "v4-cache-adoption"
+        target = root / "selected-child"
+        target.mkdir(parents=True)
+        registry = root / "resource-runs.data"
+        registry.write_text("{}\n")
+        identity = target / "identity.data"
+        identity.write_text('{"run_id":"legacy-run","started_at":1}')
+        decision = target / "unrelated-decision.data"
+        decision_doc = {"admitted": False, "snapshot": {"t": 20}}
+        decision.write_text(json.dumps(decision_doc))
+        first = metrics.read_admission_sources([root], run_id="legacy-run",
+            registry_path=registry, started_at=1, now=30)
+        cursor = first["cursor"]
+        root_state = cursor["scan"][str(root)]
+        bundle_progress = root_state["bundle_cursors"][target.name]
+        listing = bundle_progress.pop("listing")
+        root_state["bundle_listing"] = {"bundle": target.name, **listing}
+        cursor["schema_version"] = 4
+        cursor.pop("dedup_population", None)
+        raw_sample_id = metrics._admission_decisions([decision_doc])[0][0]["sample_id"]
+        cursor["sample_ids"] = [hashlib.sha256(
+            (first["generation"] + ":" + raw_sample_id).encode()).hexdigest()]
+
+        original_scandir = os.scandir
+        def no_target_relisting(path):
+            if Path(path) == target:
+                raise OSError("the saved v4 listing should be adopted")
+            return original_scandir(path)
+
+        with mock.patch.object(metrics.os, "scandir", no_target_relisting):
+            adopted = metrics.read_admission_sources([root], run_id="legacy-run",
+                registry_path=registry, started_at=1, now=31, cursor=cursor)
+        self.assertEqual(adopted["samples"], [])
+        self.assertEqual(adopted["generation"], first["generation"])
+        self.assertEqual(adopted["cursor"]["schema_version"], 5)
+        migrated = adopted["cursor"]["scan"][str(root)]
+        self.assertNotIn("bundle_listing", migrated)
+        self.assertIn("listing", migrated["bundle_cursors"][target.name])
 
     def test_multiple_exact_target_bundles_are_unknown_until_one_remains(self):
         root = self.root / "duplicate-exact-bindings"

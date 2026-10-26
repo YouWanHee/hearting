@@ -708,7 +708,6 @@ def _admission_summary(previous, decoded, now, run_id, row_key, started_at):
     decoded = decoded if isinstance(decoded, dict) else {}
     counts = dict(previous.get("admission_counts", {}))
     if (decoded.get("generation") is not None
-            and previous.get("admission_generation") is not None
             and decoded.get("generation") != previous.get("admission_generation")):
         # A replacement exact source starts a new sample population. Do not
         # carry counts/latest freshness across a different run/row/source.

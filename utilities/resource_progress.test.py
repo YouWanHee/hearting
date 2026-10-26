@@ -559,6 +559,22 @@ class DeclaredResourceProgressTest(unittest.TestCase):
 
 
 class ExperimentObservationTest(unittest.TestCase):
+    def test_first_selected_population_drops_unbound_unknown_accumulation(self):
+        previous = {"admission_counts": {"admitted": 0, "denied": 0, "unknown": 223},
+            "admission_generation": None, "admission_from_at": 10,
+            "admission_to_at": 90, "admission_current_state": "unknown"}
+        decoded = {"generation": "selected-source", "coverage": "partial",
+            "samples": [{"state": "denied", "at": 100, "sample_id": "new-page"}],
+            "latest": {"state": "denied", "at": 100, "sample_id": "new-page"},
+            "cursor": {"schema_version": 5}, "warnings": []}
+        summary, state = progress._admission_summary(previous, decoded, 110,
+            "run-a", "run", 0)
+        self.assertEqual((summary["admitted_samples"], summary["denied_samples"],
+                          summary["unknown_samples"]), (0, 1, 0))
+        self.assertEqual((summary["observed_from_at"], summary["observed_to_at"]),
+                         (100, 100))
+        self.assertEqual(state["admission_generation"], "selected-source")
+
     def test_admission_generation_replacement_resets_counts_and_survives_unknown_gap(self):
         previous = {"admission_counts": {"admitted": 4, "denied": 6, "unknown": 1},
             "admission_generation": "generation-a", "admission_from_at": 10,
@@ -718,8 +734,14 @@ class ExperimentObservationTest(unittest.TestCase):
                 first = progress.observe_experiment(run, registry, 1000, row_key="run",
                     started_at=0)
                 first_state = progress._read_observation_state(state)
+                first_public = progress.read_public_run_record(artifact, "generic-run")
                 first_episode = first["admission"]["episode_id"]
                 first_event = first_state["outbox"][0]["key"]
+                self.assertEqual(first_state["admission_counts"],
+                    {"admitted": 0, "denied": 1, "unknown": 0})
+                self.assertEqual(first_public["admission"]["denied_samples"], 1)
+                self.assertIsNone(first_public["progress"]["reached"])
+                self.assertEqual(len(first_state["outbox"]), 1)
                 second = progress.observe_experiment(run, registry, 1061, row_key="run",
                     started_at=0)
                 self.assertEqual(second["admission"]["denied_samples"], 1)
