@@ -599,6 +599,30 @@ def _mode_entries(source: Path, dest: Path) -> List[dict]:
     return entries
 
 
+_OPENCODE_V2_SERVER_IMPORT = 'from "../hearting-guards.js"'
+
+
+def _opencode_v2_plugin_entry(entrypoint: Path, server: Path, dest: Path) -> dict:
+    """The OpenCode 2 package entry as an activation-owned file, never a link.
+
+    OpenCode 2 drops a plugin package whose entry resolves outside the package
+    directory (v2.0.32 `config/plugin/source.ts`), so a link into the bundle is
+    silently never loaded. The rendered entry stays inside the package and
+    imports the activated server export by absolute path; each release renders
+    a new import, so the server's config watcher sees the change.
+    """
+    if not entrypoint.is_file():
+        return _entry(entrypoint, dest, "hook_config")
+    text = entrypoint.read_text(encoding="utf-8")
+    if _OPENCODE_V2_SERVER_IMPORT not in text:
+        raise ActivationError(f"{entrypoint} lacks {_OPENCODE_V2_SERVER_IMPORT}")
+    content = text.replace(_OPENCODE_V2_SERVER_IMPORT, f"from {json.dumps(str(server))}", 1)
+    entry = _entry(entrypoint, dest, "hook_config", kind="render")
+    entry["content"] = content
+    entry["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return entry
+
+
 def _kernel_agents(source_root: Path) -> set[str]:
     manifest_path = source_root / harness_manifest.MANIFEST_NAME
     if not manifest_path.is_file():
@@ -875,7 +899,8 @@ def _linked_entries(
         plugin = source_root / "adapters/opencode/plugins/hearting-guards.js"
         entries.append(_entry(plugin, home / "plugins/hearting-guards.js", "hook_config"))
         v2_plugin = source_root / "adapters/opencode/plugins/hearting-guards/index.ts"
-        entries.append(_entry(v2_plugin, home / "plugins/hearting-guards/index.ts", "hook_config"))
+        entries.append(_opencode_v2_plugin_entry(
+            v2_plugin, plugin, home / "plugins/hearting-guards/index.ts"))
         herdr_plugin = source_root / "adapters/opencode/plugins/herdr-agent-state.js"
         entries.append(_entry(herdr_plugin, home / "plugins/herdr-agent-state.js", "hook_config", kind="copy"))
         tui_entry = source_root / "adapters/opencode/tui/hearting-tui-identity.ts"
