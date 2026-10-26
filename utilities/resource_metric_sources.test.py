@@ -1238,8 +1238,15 @@ class MetricSourcesTest(unittest.TestCase):
             (bundle / f"sample-{index:03d}.json").write_text(json.dumps({
                 "admitted": index % 2 == 0, "sample_index": index,
                 "snapshot": {"t": 100}}))
-        first = metrics.read_admission_sources([root], run_id="target",
-            started_at=0, now=110)
+        cursor = None
+        first = None
+        for poll in range(16):
+            first = metrics.read_admission_sources([root], run_id="target",
+                started_at=0, now=110 + poll, cursor=cursor)
+            cursor = first["cursor"]
+            if first["coverage"] == "observed":
+                break
+        self.assertEqual(first["coverage"], "observed")
         self.assertEqual(first["latest"]["at"], 100.0)
         self.assertEqual(len(first["cursor"]["historical_latest_ids"]), 140)
 
