@@ -24,7 +24,13 @@ FIXTURE = SCRIPT.parent / "fixtures" / "tick_benchmark" / "v1" / "fixture.json"
 
 
 def _sample(edge_builds=None, cwd_parses=6, cursor_initializations=0,
-            exact_scans=0):
+            exact_scans=0, phase="unchanged-warm"):
+    paths = {
+        name: {"helper_calls": 0, "costly_evaluations": 0,
+               "physical_reads": 0, "rows_parsed": 0,
+               "file_touches": 0, "unique_keys": 0, "by_phase": {}}
+        for name in ("registry", "tcp", "seat-ledger", "route-gate", "owner-lifecycle")
+    }
     return {
         "wall_ns": 100,
         "cpu_ns": 90,
@@ -36,6 +42,8 @@ def _sample(edge_builds=None, cwd_parses=6, cursor_initializations=0,
             "cache_evictions": 0,
             "roots_visited": 1,
             "files_visited": 1,
+            "phase": phase,
+            "five_paths": paths,
         },
     }
 
@@ -47,8 +55,9 @@ def _valid_result():
         "fixture_schema": benchmark_tick.FIXTURE_SCHEMA,
         "fixture_sha256": "fixture-digest",
         "iterations": 20,
-        "cold_sample": _sample(cursor_initializations=3),
+        "cold_sample": _sample(cursor_initializations=3, phase="cold"),
         "warm_samples": [_sample() for _index in range(20)],
+        "append_warm_sample": _sample(phase="append-warm"),
         "warm_summary": {
             "wall_median_ns": 100,
             "wall_p95_ns": 100,
@@ -64,6 +73,26 @@ def _valid_result():
 
 
 class BenchmarkComparisonGateTest(unittest.TestCase):
+
+    def test_phase_counter_separates_calls_unique_keys_and_tcp_scans(self):
+        counters = benchmark_tick._Counters("/tmp/fixture")
+        counters.reset("cold")
+        counters.record("registry", "helper_calls", key=("jobs.log",))
+        counters.record("registry", "helper_calls", key=("jobs.log",))
+        counters.record("registry", "costly_evaluations", key=("jobs.log",))
+        counters.record("tcp", "helper_calls", key=("initial", "43123"))
+        counters.record("tcp", "costly_evaluations", key=("initial", "43123"))
+        counters.record("tcp", "helper_calls", key=("recheck", "43123"))
+        result = counters.snapshot()
+        self.assertEqual(result["phase"], "cold")
+        self.assertEqual(result["five_paths"]["registry"]["helper_calls"], 2)
+        self.assertEqual(result["five_paths"]["registry"]["unique_keys"], 1)
+        self.assertEqual(set(result["five_paths"]), {
+            "registry", "tcp", "seat-ledger", "route-gate", "owner-lifecycle",
+        })
+        self.assertEqual(set(result["five_paths"]["tcp"]["by_phase"]), {
+            "initial", "recheck",
+        })
 
     def test_invalid_cold_structural_counter_fails_comparison(self):
         baseline = _valid_result()

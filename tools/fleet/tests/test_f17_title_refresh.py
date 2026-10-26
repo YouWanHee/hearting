@@ -1309,40 +1309,59 @@ class SecurityTest(_ConfigHomeMixin, unittest.TestCase):
             _shutil.which = orig_which
 
     def test_provider_order_is_reused_within_its_ttl(self):
-        """Title refreshes reuse one computed order instead of rescanning the registry."""
+        """Unchanged, fixture-pinned evidence reuses one order without provider probes."""
         state = tempfile.TemporaryDirectory()
         self.addCleanup(state.cleanup)
+        self._pin_quality_boundary_config()
         calls = []
-        real_run = rt.subprocess.run
-        def counting_run(argv, *args, **kwargs):
-            if argv and str(argv[0]).endswith("usage-check.sh"):
-                calls.append(argv)
-            return real_run(argv, *args, **kwargs)
-        saved = {k: os.environ.get(k) for k in ("XDG_STATE_HOME", "FLEET_PROVIDER_ORDER_TTL_SECONDS", "HARNESS_CAPACITY_SCORES")}
-        os.environ["XDG_STATE_HOME"] = state.name
-        os.environ["FLEET_PROVIDER_ORDER_TTL_SECONDS"] = "60"
-        os.environ["HARNESS_CAPACITY_SCORES"] = "claude:80,codex:50"
-        rt.subprocess.run = counting_run
-        try:
+        def fixed_usage(argv, *args, **kwargs):
+            if not argv or not str(argv[0]).endswith("usage-check.sh"):
+                raise AssertionError("unexpected subprocess in provider-order fixture")
+            calls.append(argv)
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="claude ok\ncodex ok\nopencode ok\n", stderr="")
+
+        with mock.patch.dict(os.environ, {
+            "XDG_STATE_HOME": state.name,
+            "FLEET_PROVIDER_ORDER_TTL_SECONDS": "60",
+            "HARNESS_CAPACITY_SCORES": "claude:80,codex:50",
+        }), mock.patch.object(rt, "_opencode_model_evidence", return_value=[]), \
+                mock.patch.object(rt.subprocess, "run", side_effect=fixed_usage):
             first = rt.selected_providers()
             real_spec = rt.importlib.util.spec_from_file_location
             loaded = []
+
             def recording_spec(name, location, *args, **kwargs):
                 loaded.append(str(location))
                 return real_spec(name, location, *args, **kwargs)
+
             with mock.patch.object(rt.importlib.util, "spec_from_file_location", side_effect=recording_spec):
                 second = rt.selected_providers()
-        finally:
-            rt.subprocess.run = real_run
-            for key, value in saved.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
         self.assertEqual(first, second)
         self.assertLessEqual(len(calls), 1)
         self.assertFalse(any(path.endswith("harness-capacity.py") or path.endswith("dispatch_allocation.py")
                              for path in loaded))
+
+    def test_provider_order_cache_key_changes_when_availability_evidence_changes(self):
+        """An unknown-to-usable evidence transition must not reuse the prior cached order."""
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        self._pin_quality_boundary_config()
+        unknown = [{"state": "unknown", "reason": "no-observation", "observed_at": None,
+                    "automatic_eligible": False}]
+        usable = [{"state": "usable", "reason": None, "observed_at": 1.0,
+                   "automatic_eligible": True}]
+        with mock.patch.dict(os.environ, {
+            "XDG_STATE_HOME": state.name,
+            "FLEET_PROVIDER_ORDER_TTL_SECONDS": "60",
+        }), mock.patch.object(rt, "_opencode_model_evidence", side_effect=(unknown, usable)):
+            jobs = Path(os.environ["AGENT_DISPATCH_JOBS"])
+            stale_key = rt._provider_order_cache("mini", Path(_REPO_ROOT), jobs)
+            rt._store_provider_order(stale_key, ("claude", "codex"))
+            current_key = rt._provider_order_cache("mini", Path(_REPO_ROOT), jobs)
+            self.assertNotEqual(stale_key, current_key)
+            self.assertEqual(rt._cached_provider_order(stale_key), ("claude", "codex"))
+            self.assertIsNone(rt._cached_provider_order(current_key))
 
     def test_cascade_skips_an_uninstalled_leader(self):
         """An absent first quality peer must fall through, not go blank."""

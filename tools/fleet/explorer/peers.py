@@ -418,11 +418,15 @@ def draw_peers(grid, vm, state, x=34, y=3):
     _draw_markers(grid, vm, edges, session_boxes, frame_boxes, right)
 
     y = cursor_y
+    if not placements:
+        # Keep the same single row between the empty peer graph and LINKS as the
+        # populated graph path leaves after its last repository frame.
+        y += 1
     links = tuple(edges.get("links", ()))
     if opened:
         links = tuple(link for link in links
                       if any(isinstance(end, (list, tuple)) and str(end[0]) == opened for end in link[:2]))
-    if use < 75:
+    if use < 75 and links:
         if y + 2 < bottom:
             _draw_links_compact(grid, vm, state, links, opened, x, y, use, right, bottom)
         return

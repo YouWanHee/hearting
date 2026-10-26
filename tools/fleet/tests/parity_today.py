@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import dataclasses
 import importlib
@@ -9,6 +10,8 @@ import json
 import sys
 import subprocess
 import time
+import unicodedata
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +20,243 @@ sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
 WIDTHS = (80, 100, 140, 168)
 VIEWS = ("OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "COMPUTE",
          "MEMORY", "MODELS", "SYSTEM")
+
+# The narrow-width exceptions belong to this observed R14/v87 renderer. Runtime
+# put-tracing below emits the exact changed-cell mask; these source hashes prevent
+# a different reference tree from inheriting that mask accidentally.
+REFERENCE_MASK_VERSION = "r14-v87-explicit-cell-mask-v2"
+REFERENCE_MASK_COMPAT_VERSIONS = frozenset({REFERENCE_MASK_VERSION, "r14-v87-explicit-cell-mask-v1"})
+R14_REFERENCE_PROFILE = "mock-r14-v87"
+R14_REFERENCE_MODULE_SHA256 = {
+    "mock2.py": "79f93bb6c0ceb7e1d17849e994bccde01e268178f123cf445eac50c51c7b6a4e",
+    "mock3.py": "ed6cbfce9f6a3fe44df9297c6963b7c662846be94e10b8096ab7d2437786d70b",
+    "mock4.py": "6fa3b4aa36e93708b3d5e59ea82e16f5422a936551fa3bbfc79f2c0766e58aa1",
+    "mock5.py": "9e5cde92861179368aa3e2c465cd59b2ff1163bc45240acac7107dcddd369055",
+    "mock6.py": "17ce91195a69665bcbc531df3bc84076038244e18ad8d47b0da739192786a19e",
+    "mock7.py": "042671dfdd570147e78da3d7e5b18e0b0ce9ae8af8dd90eb0d70f51d2250b428",
+    "mock8.py": "079f75e994e36034153b771666476be054fc6e84c704e31c5b17290340f5f3fe",
+    "mock9.py": "5cecf395c0530c6f20d72d0bb5b63dce3c6931ce1a4240d1f31ea59b13c188c6",
+    "mock10.py": "84bb17169f969fdaef3bb55428e056666fef71be98fb5fadabc9a2e5a6992cbb",
+    "mock11.py": "821af2919bc650f6a789a1f7810d8d066bb824246880c70567e3561e75917deb",
+    "mock12.py": "ce8fffd59f720f5e42369c0488a9d06ba1c2dab810c7088ca7a2b90de9036eae",
+    "mock13.py": "f59e426cd0cb613760d935f7487c0ef8cbe0aae0b183abfeeb832d7cbb501234",
+}
+_MODEL_TIERS = ("top", "deep", "balanced-deep", "balanced", "light", "mini")
+R14_MODELS_HIT_MASKS = {
+    80: {
+        "missing": tuple((row, 71, 88, ("ui", "sel", f"{tier}/codex")) for row, tier in enumerate(_MODEL_TIERS, 6)) +
+                   tuple((row, 90, 107, ("ui", "sel", f"{tier}/opencode")) for row, tier in enumerate(_MODEL_TIERS, 6)),
+        "extra": tuple((row, 71, 78, ("ui", "sel", f"{tier}/codex")) for row, tier in enumerate(_MODEL_TIERS, 6)),
+    },
+    100: {
+        "missing": tuple((row, 90, 107, ("ui", "sel", f"{tier}/opencode")) for row, tier in enumerate(_MODEL_TIERS, 6)),
+        "extra": tuple((row, 90, 98, ("ui", "sel", f"{tier}/opencode")) for row, tier in enumerate(_MODEL_TIERS, 6)),
+    },
+}
+R14_UNKNOWN_GPU_TRACK_LAST_COLUMN = {80: 78, 100: 81, 140: 81, 168: 81}
+R14_RESIDUAL_COORDINATES = {
+    ("OVERVIEW", 80, 4): (64, 65, 66, 67, 68),
+    ("MODELS", 80, 22): (77, 78, 79),
+    ("MODELS", 80, 26): (59, 79),
+    ("MODELS", 80, 32): (78, 79),
+    ("MODELS", 100, 22): (97, 98, 99),
+    ("MODELS", 100, 26): (59, 86, 99),
+}
+R14_MODELS_BLANK_KEY_CELLS = {80: (59,), 100: (59, 86)}
+R14_RESIDUAL_CELL_PAIRS = {
+    ("OVERVIEW", 80, 4): {
+        64: (("T", "section_head", 234), ("C", "section_head", 234)),
+        65: (("C", "section_head", 234), ("T", "section_head", 234)),
+        66: (("T", "section_head", 234), ("X", "section_head", 234)),
+        67: (("X", "section_head", 234), (" ", None, 234)),
+        68: (("E", "section_head", 234), (" ", None, 234)),
+    },
+    ("MODELS", 80, 22): {
+        77: (("s", "dim", None), (" ", "branch_s", None)),
+        78: ((" ", "dim", None), ("┘", "dim", None)),
+        79: (("a", "dim", None), (" ", None, None)),
+    },
+    ("MODELS", 80, 26): {
+        59: ((" ", "dim", None), (" ", "branch_s", None)),
+        79: (("p", "hb_opencode", None), (" ", None, None)),
+    },
+    ("MODELS", 80, 32): {
+        78: (("n", "dim", None), (" ", "branch_s", None)),
+        79: (("s", "dim", None), (" ", None, None)),
+    },
+    ("MODELS", 100, 22): {
+        97: (("·", "dim", None), (" ", "branch_s", None)),
+        98: ((" ", "dim", None), ("┘", "dim", None)),
+        99: (("s", "dim", None), (" ", None, None)),
+    },
+    ("MODELS", 100, 26): {
+        59: ((" ", "dim", None), (" ", "branch_s", None)),
+        86: ((" ", "dim", None), (" ", "branch_s", None)),
+        99: (("c", "hb_claude", None), (" ", None, None)),
+    },
+}
+R14_MODELS_FOOT_TEXT = "→ .bak backup · new sessions and launches only · sealed routes keep their choice"
+R14_MODELS_SECTION_META = "  input tokens · new sessions only"
+
+# Exact root-view R14 cells whose final-column text the narrow Fleet2 pane clips.
+# Candidate cells are the fixed blank suffix produced by frame.draw's width-80/100
+# pane_clip, except MODELS 80x45 row 20 which keeps the real right divider as a pair.
+_R14_CLIPPED_BLANK = (" ", None, None)
+R14_GENERIC_OVERFLOW_CASES = {
+    ("OVERVIEW", 80, 5): {79: (("p", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("PEERS", 80, 5): {79: (("v", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("PEERS", 100, 6): {99: (("O", "section_head", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 4): {79: (("H", "section_head", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 6): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 9): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 11): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 14): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 16): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 18): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 19): {79: (("c", "h_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 20): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 23): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 24): {79: (("c", "h_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 25): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 27): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 29): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 31): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 33): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 80, 35): {79: (("c", "hb_codex", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("ROUTES", 100, 4): {99: (("E", "section_head", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("QUESTIONS", 80, 7): {79: (("n", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("HISTORY", 80, 4): {79: (("N", "section_head", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 7): {79: (("━", "g_idle", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 9): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 11): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 14): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 20): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 24): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 26): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 29): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 80, 31): {79: (("─", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 100, 7): {99: (("B", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 100, 24): {99: (("W", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("COMPUTE", 100, 32): {99: (("r", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MEMORY", 80, 5): {79: (("0", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 4): {79: (("e", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 12): {79: (("d", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 20): {
+        78: (("n", "dim", None), ("│", "dim", None), ("text-overlap",)),
+        79: (("c", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",)),
+    },
+    ("MODELS", 80, 24): {79: (("s", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 27): {79: (("w", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 28): {79: (("s", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 29): {79: (("s", "loc_repo", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 80, 30): {79: (("e", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 6): {99: (("t", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 7): {99: (("t", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 8): {99: (("r", "hb_opencode", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 9): {99: (("t", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 10): {99: (("-", "hb_opencode", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 11): {99: (("-", "hb_opencode", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 12): {99: (("p", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 25): {99: (("s", "loc_repo", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 27): {99: (("d", "loc_repo", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("MODELS", 100, 30): {99: (("A", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("SYSTEM", 80, 7): {79: (("e", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("SYSTEM", 80, 8): {79: (("e", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("SYSTEM", 80, 11): {79: (("2", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("SYSTEM", 80, 12): {79: (("r", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("SYSTEM", 80, 18): {79: (("E", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+    ("SYSTEM", 100, 8): {99: (("d", "dim", None), _R14_CLIPPED_BLANK, ("text-beyond-pane",))},
+}
+
+
+def _reference_profile(reference):
+    """Return the pinned R14 profile only when every renderer module matches the cycle trace."""
+    root = Path(reference)
+    try:
+        for name, expected in R14_REFERENCE_MODULE_SHA256.items():
+            if hashlib.sha256((root / name).read_bytes()).hexdigest() != expected:
+                return None
+    except OSError:
+        return None
+    return R14_REFERENCE_PROFILE
+
+
+def _reference_trace_mask(reference, renderer, width, state, profile=None):
+    """Trace reference puts and return a versioned mask of exact narrow reference-defect cells."""
+    from tools.fleet.tests.parity_matrix import _overwrites
+
+    if profile is None:
+        profile = _reference_profile(reference)
+    grid_class = renderer.mock2.Grid
+    original_put = grid_class.put
+    owners, mask, serial = {}, {}, [0]
+    top = 4 if state.usage_open else 2
+
+    def add(row, column, kind):
+        if width not in (80, 100) or column < 33 or column >= width:
+            return
+        final_row = row + 1 if row >= top else row
+        mask.setdefault((final_row, column), set()).add(kind)
+
+    def traced(self, x, y, text, key=None, limit=None, style=None):
+        serial[0] += 1
+        call = serial[0]
+        x, y = int(x), int(y)
+        start_x, start_y = x, y
+        right = self.W if limit is None else min(self.W, int(limit))
+        rendered = str(text)
+        trace_models_foot = (profile == R14_REFERENCE_PROFILE and state.view == "MODELS" and
+                             width in (80, 100) and y + 1 == 22 and rendered == R14_MODELS_FOOT_TEXT)
+        trace_models_section_edge = (profile == R14_REFERENCE_PROFILE and state.view == "MODELS" and
+                                     width == 80 and y + 1 == 32 and rendered == R14_MODELS_SECTION_META)
+        if 0 <= y < len(self.c):
+            for char in rendered:
+                cells = renderer.mock2.cw(char)
+                if cells <= 0:
+                    continue
+                if x + cells > right:
+                    if right >= self.W and x < self.W and 2 <= y <= 39:
+                        for column in range(max(33, x), self.W):
+                            add(y, column, "text-beyond-width")
+                    break
+                overlaps = False
+                for offset in range(cells):
+                    column = x + offset
+                    previous = owners.get((y, column))
+                    glyph = char if offset == 0 else ""
+                    if previous and previous[0] != call and _overwrites(previous[1], glyph):
+                        overlaps = True
+                    if (trace_models_foot and column == width - 3 and previous and
+                            previous[1] in "─━═┈┄┅┉╌╍"):
+                        add(y, column, "text-on-box-rule")
+                if overlaps and 2 <= y <= 39 and x + cells - 1 >= 33:
+                    for column in range(max(33, x), min(self.W, x + cells)):
+                        add(y, column, "text-overlap")
+                if 2 <= y <= 39 and x + cells > self.W - 1:
+                    for column in range(max(33, x), min(self.W, x + cells)):
+                        add(y, column, "text-beyond-pane")
+                    if trace_models_section_edge and x == width - 1:
+                        previous = owners.get((y, x - 1))
+                        if previous and previous[0] == call:
+                            add(y, x - 1, "text-edge-predecessor")
+                for offset in range(cells):
+                    owners[(y, x + offset)] = (call, char if offset == 0 else "")
+                x += cells
+        return original_put(self, start_x, start_y, text, key=key, limit=limit, style=style)
+
+    grid_class.put = traced
+    try:
+        from tools.fleet.tests.freeze_explorer import capture
+        ref_scope = state.scope if state.scope != "-" else None
+        if ref_scope and ref_scope.startswith("session:"):
+            ref_scope = ref_scope.split(":", 1)[1]
+        row = capture(reference, width, renderer=renderer, scrub=False, view=state.view,
+                      scope=ref_scope, uopen=state.usage_open)
+    finally:
+        grid_class.put = original_put
+    cells = [{"row": row, "column": column, "kinds": sorted(kinds)}
+             for (row, column), kinds in sorted(mask.items())]
+    return row, {"version": REFERENCE_MASK_VERSION, "profile": profile, "cells": cells}
 
 
 def _jsonable(value):
@@ -78,20 +318,16 @@ def _slug(label):
     return label.replace("/", "_").replace(":", "-")
 
 
-def _capture_pair(reference, vm, state, width, rows, outdir, label):
+def _capture_pair(reference, vm, state, width, rows, outdir, label, reference_profile=None,
+                  validated_header_identity=None, validated_header_hosts=None):
     """Draw one state at one width from the copy (fed this view model) and from fleet2."""
     from tools.fleet.explorer.frame import draw
-    from tools.fleet.tests.freeze_explorer import capture
     from tools.fleet.tests.parity_compare import diff_frames
     from tools.fleet.tests.reference_injection import inject_live, load_isolated
     fleet_render = importlib.import_module("tools.fleet.render")
-    ref_scope = state.scope if state.scope != "-" else None
-    if ref_scope and ref_scope.startswith("session:"):
-        ref_scope = ref_scope.split(":", 1)[1]
     ref_module = load_isolated(reference)
-    inject_live(ref_module, vm.to_mapping())
-    ref_row = capture(reference, width, renderer=ref_module, scrub=False, view=state.view,
-                      scope=ref_scope, uopen=state.usage_open)
+    injection = inject_live(ref_module, vm.to_mapping())
+    ref_row, overflow_mask = _reference_trace_mask(reference, ref_module, width, state, reference_profile)
     fleet_frame = draw(vm, state, width, rows, beat=1)
     reference_frame = _frame_from_reference(ref_row)
     diffs = diff_frames(reference_frame, fleet_frame)
@@ -100,10 +336,17 @@ def _capture_pair(reference, vm, state, width, rows, outdir, label):
                   f"{label} {width}x{rows} - {len(diffs)} differences", target)
     return {"state": _slug(label), "width": width, "rows": rows, "equal": not diffs,
             "difference_count": len(diffs), "png": str(target),
+            "reference_copy_limitations": injection.get("reference_copy_limitations", []),
+            "reference_profile": reference_profile,
+            "reference_overflow_mask": overflow_mask,
+            "reference_cells": [[list(cell) for cell in row] for row in reference_frame.cells],
+            "fleet2_cells": [[list(cell) for cell in row] for row in fleet_frame.cells],
             "reference_rows": ["".join(cell[0] for cell in row) for row in reference_frame.cells],
             "reference_edge": [bool(row and (row[-1][0].strip() or (row[-1][0] == "" and len(row) > 1 and row[-2][0].strip())))
                                for row in reference_frame.cells],
             "fleet2_rows": ["".join(cell[0] for cell in row) for row in fleet_frame.cells],
+            "validated_header_identity": dict(validated_header_identity or {}),
+            "validated_header_hosts": [dict(row) for row in (validated_header_hosts or ())],
             "differences": diffs}
 
 
@@ -168,14 +411,19 @@ def build_live_vm(capture_dir):
     seats_path, config_path = capture_dir / "seat-reads.json", capture_dir / "model-config.json"
     seats = json.loads(seats_path.read_text(encoding="utf-8")) if seats_path.exists() else None
     config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else None
-    detail = _merged_detail(details, seats, config) if details else None
+    # A capture can have no per-session detail reads and still contain an independent
+    # model-config observation. Keep that source in the VM instead of letting the reference
+    # renderer's hand-written model tables stand in for missing data.
+    detail = _merged_detail(details, seats, config) if details or seats is not None or config is not None else None
     return build_view_model(snapshot, accepted_detail=detail, now=now), now
 
 
-def compare_vm(vm, reference, out_dir, widths=WIDTHS, rows=45, only=None):
+def compare_vm(vm, reference, out_dir, widths=WIDTHS, rows=45, only=None,
+               validated_header_identity=None, validated_header_hosts=None):
     """Every root view plus one repo, session and route page at every width."""
     out_dir.mkdir(parents=True, exist_ok=True)
     states = [(view, "-", view) for view in VIEWS]
+    reference_profile = _reference_profile(reference)
     try:
         repo, session, route = _state_jobs(vm)
         states.extend((view, scope, name) for name, scope, view in (repo, session, route))
@@ -186,8 +434,53 @@ def compare_vm(vm, reference, out_dir, widths=WIDTHS, rows=45, only=None):
         if only and label not in only:
             continue
         for width in widths:
-            records.append(_capture_pair(Path(reference), vm, _nav(scope, view), width, rows, out_dir, label))
+            records.append(_capture_pair(Path(reference), vm, _nav(scope, view), width, rows, out_dir, label,
+                                         reference_profile=reference_profile,
+                                         validated_header_identity=validated_header_identity,
+                                         validated_header_hosts=validated_header_hosts))
     return records
+
+
+def _validated_header_identity(capture_dir):
+    """Read the canonical identity straight from captured Fleet JSON, outside the render helper."""
+    payload = json.loads((Path(capture_dir) / "fleet-json.json").read_text(encoding="utf-8"))
+    source = payload.get("hearting") if isinstance(payload, dict) else None
+    if not isinstance(source, dict):
+        source = {}
+    version = source.get("version")
+    method = source.get("install_method")
+    return {
+        "version": version if isinstance(version, str) and version else "unknown",
+        "install_method": method if isinstance(method, str) and method else "unmanaged",
+    }
+
+
+def _validated_header_hosts(capture_dir):
+    """Read the captured, configured host names independently of the candidate frame."""
+    payload = json.loads((Path(capture_dir) / "fleet-json.json").read_text(encoding="utf-8"))
+    compute = payload.get("compute_hosts") if isinstance(payload, dict) else None
+    hosts = compute.get("hosts") if isinstance(compute, dict) else None
+    if not isinstance(hosts, list):
+        return []
+    result = []
+    for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        name = host.get("host")
+        if not isinstance(name, str) or not name:
+            name = "·"
+        result.append({"mark": "⌂" if host.get("self") is True else "◇", "name": name})
+    return result
+
+
+def _unique_reference_copy_limitations(records):
+    """Keep narrow reference-cell limits visible without classifying them as parity exemptions."""
+    unique = {}
+    for record in records:
+        for item in record.get("reference_copy_limitations", ()):
+            key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            unique[key] = item
+    return [unique[key] for key in sorted(unique)]
 
 
 def _bands(record):
@@ -202,13 +495,9 @@ def _bands(record):
             ("left" if diff["column"] < split else "right")
         cells.setdefault((pane, diff["row"]), []).append(diff["column"])
         samples.setdefault((pane, diff["row"]), []).append(diff)
-    bands, current = [], None
+    bands = []
     for (pane, row) in sorted(cells, key=lambda key: (key[0], key[1])):
-        if current and current["pane"] == pane and row == current["rows"][-1] + 1:
-            current["rows"].append(row)
-        else:
-            current = {"pane": pane, "rows": [row]}
-            bands.append(current)
+        bands.append({"pane": pane, "rows": [row]})
     for band in bands:
         lo, hi = (0, split) if band["pane"] == "left" else (split, width) if band["pane"] == "right" else (0, width)
         band["cells"] = sum(len(cells[(band["pane"], row)]) for row in band["rows"])
@@ -220,6 +509,7 @@ def _bands(record):
                                       for d in found})
         band["blank_only"] = band["text_equal"] and all((diff["expected"] or [" "])[0] in (" ", "") for diff in found)
         band["ref_edge"] = any(record["reference_edge"][row] for row in band["rows"])
+        band["diffs"] = found
         band["samples"] = [{"row": diff["row"], "column": diff["column"], "reference": diff["expected"],
                             "fleet2": diff["actual"]} for diff in found[:3]]
     hits = [diff for diff in record["differences"] if diff["kind"] == "hits"]
@@ -254,13 +544,662 @@ def _collapse(text):
     return " ".join(text.split())
 
 
-def _rows_shifted(band):
-    """Rows were added or removed on one side: the non-blank row counts of the band differ."""
-    return sum(1 for x in band["reference"] if x.strip()) != sum(1 for x in band["fleet2"] if x.strip())
-
-
 def _has(pattern, text):
     return re.search(pattern, text) is not None
+
+
+def _answered_repo_count(text):
+    """Return an answered header's explicit repo/count pair, when both are present."""
+    if "ANSWERED TODAY" not in text:
+        return None
+    tail = _collapse(text.split("ANSWERED TODAY", 1)[1])
+    match = re.match(r"([A-Za-z0-9_.-]+)\s+(\d+)\s+·\s+\d+\s+decision records", tail)
+    return (match.group(1), int(match.group(2))) if match else None
+
+
+def _answered_count_diff(record, band):
+    if record["state"] != "QUESTIONS" or band["pane"] != "right":
+        return False
+    reference, fleet2 = _band_text(band)
+    ref_value, fleet_value = _answered_repo_count(reference), _answered_repo_count(fleet2)
+    return bool(ref_value and fleet_value and ref_value[0] == fleet_value[0]
+                and ref_value[1] != fleet_value[1])
+
+
+def _system_pending_diff(record, band):
+    if record["state"] != "SYSTEM" or band["pane"] != "frame":
+        return False
+    reference, fleet2 = _band_text(band)
+    pattern = r"(\d+|·) deliveries pending"
+    ref_value, fleet_value = re.search(pattern, reference), re.search(pattern, fleet2)
+    return bool(ref_value and fleet_value and ref_value.group(1) != fleet_value.group(1))
+
+
+def _has_pinned_reference_trace(record, *, current=False):
+    trace = record.get("reference_overflow_mask") or {}
+    versions = {REFERENCE_MASK_VERSION} if current else REFERENCE_MASK_COMPAT_VERSIONS
+    return (record.get("reference_profile") == R14_REFERENCE_PROFILE and
+            trace.get("profile") == R14_REFERENCE_PROFILE and trace.get("version") in versions)
+
+
+def _r14_residual_key(record, band):
+    if band.get("pane") != "right" or len(band.get("rows") or ()) != 1:
+        return None
+    key = (record.get("state"), record.get("width"), band["rows"][0])
+    return key if key in R14_RESIDUAL_COORDINATES else None
+
+
+def _row_cell_diffs(record, row):
+    return sorted((diff for diff in record.get("differences", ())
+                   if diff.get("kind") == "cell" and diff.get("row") == row),
+                  key=lambda diff: diff.get("column", -1))
+
+
+def _trace_cells_for_row(record, row):
+    trace = record.get("reference_overflow_mask") or {}
+    return {item.get("column"): tuple(sorted(item.get("kinds") or ()))
+            for item in trace.get("cells", ()) if item.get("row") == row}
+
+
+def _row_matches_residual_pairs(record, key):
+    pairs = R14_RESIDUAL_CELL_PAIRS[key]
+    row = key[2]
+    diffs = _row_cell_diffs(record, row)
+    if [diff.get("column") for diff in diffs] != sorted(pairs):
+        return False
+    reference_cells = record.get("reference_cells") or ()
+    fleet2_cells = record.get("fleet2_cells") or ()
+    if row >= len(reference_cells) or row >= len(fleet2_cells):
+        return False
+    for diff in diffs:
+        column = diff["column"]
+        expected, actual = pairs[column]
+        if (tuple(diff.get("expected") or ()) != expected or tuple(diff.get("actual") or ()) != actual or
+                tuple(reference_cells[row][column]) != expected or tuple(fleet2_cells[row][column]) != actual):
+            return False
+    return all(tuple(reference_cells[row][column]) == tuple(fleet2_cells[row][column])
+               for column in range(record["width"]) if column not in pairs)
+
+
+def _r14_residual_reference_mask(record, band):
+    """Mask only the captured header collision and MODELS note overprint, with exact cells and traces."""
+    key = _r14_residual_key(record, band)
+    if key not in (("OVERVIEW", 80, 4), ("MODELS", 80, 22), ("MODELS", 100, 22)):
+        return []
+    if not _has_pinned_reference_trace(record, current=True) or not _row_matches_residual_pairs(record, key):
+        return []
+    row = key[2]
+    width = key[1]
+    if [diff.get("column") for diff in band.get("diffs") or ()] != list(R14_RESIDUAL_COORDINATES[key]):
+        return []
+    if key == ("OVERVIEW", 80, 4):
+        if _trace_cells_for_row(record, row) != {65: ("text-overlap",), 67: ("text-overlap",)}:
+            return []
+        if (band.get("reference") != ["      ID       HARNESS         TCTXE       AGE"] or
+                band.get("fleet2") != ["      ID       HARNESS         CTX         AGE"]):
+            return []
+        reference_cells = record["reference_cells"][row]
+        fleet2_cells = record["fleet2_cells"][row]
+        if any(tuple(reference_cells[column]) != tuple(fleet2_cells[column]) or
+               tuple(fleet2_cells[column]) != (glyph, "section_head", 234)
+               for column, glyph in zip((76, 77, 78), "AGE")):
+            return []
+    else:
+        expected_trace = {width - 3: ("text-on-box-rule",), width - 2: ("text-overlap",),
+                          width - 1: ("text-beyond-pane",)}
+        if _trace_cells_for_row(record, row) != expected_trace:
+            return []
+        reference_text = record["reference_rows"][row][33:width - 3]
+        fleet2_text = record["fleet2_rows"][row][33:width - 3]
+        if (reference_text != fleet2_text or
+                not reference_text.startswith("  └─ models.conf → .bak backup · new session")):
+            return []
+    return [{"row": row, "column": column, "kinds": list(_trace_cells_for_row(record, row).get(column, ())) or
+             ["exact-r14-residual-cell"]} for column in R14_RESIDUAL_COORDINATES[key]]
+
+
+def _reference_overflow_mask(record, band):
+    """Accept only the exact R14 root clips and retained right-divider pair."""
+    if band.get("pane") != "right" or len(band.get("rows") or ()) != 1:
+        return []
+    key = (record.get("state"), record.get("width"), band["rows"][0])
+    contract = R14_GENERIC_OVERFLOW_CASES.get(key)
+    if not contract or not _has_pinned_reference_trace(record, current=True):
+        return []
+    width, row = key[1], key[2]
+    columns = sorted(contract)
+    if (record.get("rows") != 45 or columns != sorted(set(columns)) or
+            [diff.get("column") for diff in band.get("diffs") or ()] != columns):
+        return []
+    row_diffs = _row_cell_diffs(record, row)
+    if [diff.get("column") for diff in row_diffs] != columns:
+        return []
+
+    reference_cells, fleet2_cells = record.get("reference_cells") or (), record.get("fleet2_cells") or ()
+    reference_rows, fleet2_rows = record.get("reference_rows") or (), record.get("fleet2_rows") or ()
+    if (row >= len(reference_cells) or row >= len(fleet2_cells) or
+            row >= len(reference_rows) or row >= len(fleet2_rows) or
+            len(reference_cells[row]) != width or len(fleet2_cells[row]) != width):
+        return []
+    if ("".join(cell[0] or "" for cell in reference_cells[row]) != reference_rows[row] or
+            "".join(cell[0] or "" for cell in fleet2_cells[row]) != fleet2_rows[row]):
+        return []
+    if any(tuple(reference_cells[row][column]) != tuple(fleet2_cells[row][column])
+           for column in range(width) if column not in contract):
+        return []
+
+    trace = record.get("reference_overflow_mask") or {}
+    row_trace = [item for item in trace.get("cells", ()) if item.get("row") == row]
+    if len({item.get("column") for item in row_trace}) != len(row_trace):
+        return []
+    trace_by_column = {item.get("column"): tuple(sorted(item.get("kinds") or ())) for item in row_trace}
+    accepted = []
+    for diff in row_diffs:
+        column = diff.get("column")
+        expected, actual, kinds = contract[column]
+        if (trace_by_column.get(column) != kinds or
+                tuple(diff.get("expected") or ()) != expected or
+                tuple(diff.get("actual") or ()) != actual or
+                tuple(reference_cells[row][column]) != expected or
+                tuple(fleet2_cells[row][column]) != actual):
+            return []
+        accepted.append({"row": row, "column": column, "kinds": list(kinds)})
+
+    if not (_wide_continuation_pair_is_complete(reference_cells, row, columns) and
+            _wide_continuation_pair_is_complete(fleet2_cells, row, columns)):
+        return []
+    if key == ("MODELS", 80, 20):
+        if (columns != [78, 79] or contract[78][1] != ("│", "dim", None) or
+                contract[79][1] != _R14_CLIPPED_BLANK):
+            return []
+    elif (len(columns) != 1 or columns[0] != width - 1 or
+          contract[columns[0]][1] != _R14_CLIPPED_BLANK or
+          contract[columns[0]][0][0] in ("", " ") or
+          contract[columns[0]][2] != ("text-beyond-pane",)):
+        return []
+    return accepted
+
+
+def _wide_continuation_pair_is_complete(cells, row, columns):
+    """A traced suffix cannot split a wide glyph from its continuation cell."""
+    allowed = set(columns)
+    if row >= len(cells):
+        return False
+    row_cells = cells[row]
+    for column in allowed:
+        if column < 0 or column >= len(row_cells):
+            return False
+        glyph = row_cells[column][0]
+        if glyph == "":
+            lead_column = column - 1
+            if lead_column not in allowed:
+                return False
+            lead = row_cells[lead_column][0]
+            if not lead or unicodedata.east_asian_width(lead[0]) not in ("W", "F"):
+                return False
+        elif isinstance(glyph, str) and glyph and unicodedata.east_asian_width(glyph[0]) in ("W", "F"):
+            continuation = column + 1
+            if continuation not in allowed or row_cells[continuation][0] != "":
+                return False
+    return True
+
+
+def _split_r14_models_row26(record, bands):
+    """Separate the recorded row-26 blank-key cells from its independent clipped suffix."""
+    result = []
+    for band in bands:
+        key = _r14_residual_key(record, band)
+        if (key not in (("MODELS", 80, 26), ("MODELS", 100, 26)) or
+                not _has_pinned_reference_trace(record, current=True) or
+                not _row_matches_residual_pairs(record, key)):
+            result.append(band)
+            continue
+        row_diffs = _row_cell_diffs(record, key[2])
+        if [diff.get("column") for diff in row_diffs] != list(R14_RESIDUAL_COORDINATES[key]):
+            result.append(band)
+            continue
+        if _trace_cells_for_row(record, key[2]) != {key[1] - 1: ("text-beyond-pane",)}:
+            result.append(band)
+            continue
+        for diff in band.get("diffs") or ():
+            piece = dict(band)
+            piece["cells"] = 1
+            piece["diffs"] = [diff]
+            expected = diff.get("expected") or (None, None, None)
+            actual = diff.get("actual") or (None, None, None)
+            piece["text_equal"] = expected[0] == actual[0]
+            piece["blank_only"] = (piece["text_equal"] and expected[0] in (" ", "") and
+                                   actual[0] in (" ", ""))
+            piece["style_pairs"] = [(json.dumps(expected[1]), json.dumps(actual[1]))]
+            piece["samples"] = [{"row": diff["row"], "column": diff["column"],
+                                 "reference": diff.get("expected"), "fleet2": diff.get("actual")}]
+            result.append(piece)
+    return result
+
+
+def _r14_models_safe_edge_clip(record, band):
+    key = _r14_residual_key(record, band)
+    if key not in (("MODELS", 80, 26), ("MODELS", 100, 26), ("MODELS", 80, 32)):
+        return False
+    if not _has_pinned_reference_trace(record, current=True) or not _row_matches_residual_pairs(record, key):
+        return False
+    row, width = key[2], key[1]
+    row_diffs = _row_cell_diffs(record, row)
+    if [diff.get("column") for diff in row_diffs] != list(R14_RESIDUAL_COORDINATES[key]):
+        return False
+    trace = ({width - 1: ("text-beyond-pane",)} if row == 26 else
+             {78: ("text-edge-predecessor",), 79: ("text-beyond-pane",)})
+    if _trace_cells_for_row(record, row) != trace:
+        return False
+    band_columns = [diff.get("column") for diff in band.get("diffs") or ()]
+    if row == 26:
+        if band_columns != [width - 1]:
+            return False
+    elif band_columns != [78, 79]:
+        return False
+    return True
+
+
+def _reserved_terminal_column(record, band):
+    """Accept only an exact visible suffix clipped from an approved edge row."""
+    width = record["width"]
+    diffs = band.get("diffs") or ()
+    if not diffs or any(d.get("column", -1) < width - 2 for d in diffs):
+        return False
+    by_row = defaultdict(list)
+    for diff in diffs:
+        by_row[diff["row"]].append(diff)
+    if len(by_row) != 1:
+        return False
+    row, row_diffs = next(iter(by_row.items()))
+    if band["pane"] == "frame" and record["state"] in {
+            "OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "COMPUTE", "MEMORY", "MODELS", "SYSTEM"}:
+        if row != 42 or not record["reference_rows"][row].lstrip().startswith("≋ "):
+            return False
+    elif band["pane"] == "right" and record["state"] == "SYSTEM":
+        if row != 8 or "collectors:" not in record["reference_rows"][row]:
+            return False
+    else:
+        return False
+    reference_cells, fleet2_cells = record.get("reference_cells") or (), record.get("fleet2_cells") or ()
+    if row >= len(reference_cells) or row >= len(fleet2_cells):
+        return False
+    columns = sorted(diff["column"] for diff in row_diffs)
+    if columns != list(range(columns[0], width)):
+        return False
+    visible_suffix = False
+    for diff in row_diffs:
+        column = diff["column"]
+        if column >= len(reference_cells[row]) or column >= len(fleet2_cells[row]):
+            return False
+        expected, actual = diff.get("expected") or (), diff.get("actual") or ()
+        if list(expected) != list(reference_cells[row][column]) or list(actual) != list(fleet2_cells[row][column]):
+            return False
+        glyph = expected[0] if expected else None
+        clipped = actual[0] if actual else None
+        if clipped not in (None, "", " ") or (actual[2] if len(actual) > 2 else None) is not None:
+            return False
+        if isinstance(glyph, str) and glyph not in ("", " "):
+            visible_suffix = True
+            continue
+        if glyph != "" or column == 0 or column - 1 not in columns:
+            return False
+        lead = reference_cells[row][column - 1][0]
+        if not lead or unicodedata.east_asian_width(lead[0]) not in ("W", "F"):
+            return False
+    return visible_suffix
+
+
+_SPINNER_GLYPHS = frozenset("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠯⠷⠻")
+
+
+def _spinner_row_order(record, band):
+    """Normalize only the spinner coordinate; every remaining glyph, style and row order must match."""
+    if band["pane"] != "frame" or band["rows"] != [0]:
+        return False
+    reference = (record.get("reference_cells") or [[]])[0]
+    fleet2 = (record.get("fleet2_cells") or [[]])[0]
+    ref_positions = [i for i, cell in enumerate(reference) if cell and cell[0] in _SPINNER_GLYPHS]
+    live_positions = [i for i, cell in enumerate(fleet2) if cell and cell[0] in _SPINNER_GLYPHS]
+    if len(ref_positions) != 1 or len(live_positions) != 1:
+        return False
+    if reference[ref_positions[0]][1:] != fleet2[live_positions[0]][1:]:
+        return False
+    for row in (record.get("reference_rows") or (), record.get("fleet2_rows") or ()):
+        if not row or not re.search(r"\d+ working", row[0]) or not re.search(r"hearting\s+v", row[0]) or not re.search(r"\d{2}:\d{2}", row[0]):
+            return False
+    return ([cell for i, cell in enumerate(reference) if i != ref_positions[0]] ==
+            [cell for i, cell in enumerate(fleet2) if i != live_positions[0]])
+
+
+_REFERENCE_NARROW_HEADER = re.compile(
+    r"^\s*(?P<working>\d+)\s+working\s*●\s*(?P<idle>\d+)\s+idle\s*●\s*"
+    r"(?P<blocked>\d+)\s+answer needed\s+(?:hearting\s+)?(?P<version>\S+)\s+"
+    r"(?P<clock>\d{2}:\d{2})\s*$")
+_CANDIDATE_NARROW_HEADER = re.compile(
+    r"^\s*(?P<working>\d+)\s+●\s*(?P<idle>\d+)\s+●\s*(?P<blocked>\d+)\s+"
+    r"hearting\s+(?P<version>\S+)\s+·\s+(?P<method>\S+)\s+"
+    r"(?P<clock>\d{2}:\d{2})\s*$")
+_CANDIDATE_WIDE_HEADER = re.compile(
+    r"^\s*(?P<working>\d+)\s+working\s*●\s*(?P<idle>\d+)\s+idle\s*●\s*"
+    r"(?P<blocked>\d+)\s+answer needed\s+hearting\s+(?P<version>\S+)\s+·\s+"
+    r"(?P<method>\S+)\s+(?P<clock>\d{2}:\d{2})\s*$")
+_F70_METHODS = frozenset({"managed/stable", "managed/pinned", "linked", "packaged",
+                          "mixed", "unmanaged", "unknown"})
+R14_HEADER_IDENTITY_PRD_SHA256 = "5391e658c94fc575fb39ffbc85b6cff76a742c47dec1132cedaa1aa6cde42386"
+
+
+def _header_identity_from_record(record):
+    value = record.get("validated_header_identity")
+    if not isinstance(value, dict):
+        return None
+    version, method = value.get("version"), value.get("install_method")
+    if not isinstance(version, str) or not version or method not in _F70_METHODS:
+        return None
+    return version, method
+
+
+def _header_hosts_from_record(record):
+    hosts = record.get("validated_header_hosts")
+    if not isinstance(hosts, list) or not hosts:
+        return None
+    clean = []
+    for host in hosts:
+        if (not isinstance(host, dict) or host.get("mark") not in ("⌂", "◇") or
+                not isinstance(host.get("name"), str) or not host["name"]):
+            return None
+        clean.append((host["mark"], host["name"]))
+    return clean
+
+
+def _header_row_text(cells, width):
+    if len(cells) != width or any(not isinstance(cell, (list, tuple)) or len(cell) < 3 or
+                                  len(str(cell[0] or "")) != 1 for cell in cells):
+        return None
+    return "".join(str(cell[0] or "") for cell in cells)
+
+
+def _compact_host_prefix(hosts):
+    mark, name = hosts[0]
+    return f"{mark} {name}" + (f" +{len(hosts) - 1}" if len(hosts) > 1 else "")
+
+
+def _full_host_prefix(hosts):
+    parts = [" hosts "]
+    for index, (mark, name) in enumerate(hosts):
+        parts.append(f"{mark} {name}")
+        parts.append(f" {len(hosts)}/{len(hosts)}" if index == len(hosts) - 1 else "  ")
+    return "".join(parts)
+
+
+def _r14_narrow_host_identity(record, band):
+    """Allow the exact source-backed compact host/count/F70 tuple on 80/100/140 cells."""
+    trace = record.get("reference_overflow_mask") or {}
+    width = record.get("width")
+    if (width not in (80, 100, 140) or record.get("rows") != 45 or record.get("state") not in VIEWS or
+            band.get("pane") != "frame" or band.get("rows") != [0] or
+            record.get("reference_profile") != R14_REFERENCE_PROFILE or
+            trace.get("profile") != R14_REFERENCE_PROFILE or trace.get("version") != REFERENCE_MASK_VERSION or
+            any(diff.get("kind") != "cell" or diff.get("row") != 0 for diff in band.get("diffs", ()))):
+        return False
+    references, candidates = record.get("reference_cells") or (), record.get("fleet2_cells") or ()
+    if not references or not candidates or not references[0] or not candidates[0]:
+        return False
+    reference = _header_row_text(references[0], width)
+    candidate = _header_row_text(candidates[0], width)
+    identity = _header_identity_from_record(record)
+    hosts = _header_hosts_from_record(record)
+    if reference is None or candidate is None or identity is None or hosts is None:
+        return False
+    expected_version, expected_method = identity
+    host_prefix = _compact_host_prefix(hosts)
+    if not candidate.startswith(host_prefix):
+        return False
+    if width == 80 and (not record.get("reference_edge", [False])[0] or
+                        reference[-1] not in _SPINNER_GLYPHS or hosts[0] != ("⌂", "moving4") or
+                        "moving4" in reference):
+        return False
+    reference_spinner = [index for index, char in enumerate(reference) if char in _SPINNER_GLYPHS]
+    candidate_spinner = [index for index, char in enumerate(candidate) if char in _SPINNER_GLYPHS]
+    if (len(reference_spinner) != 1 or len(candidate_spinner) != 1 or
+            reference[reference_spinner[0]] != candidate[candidate_spinner[0]]):
+        return False
+    ref_spin = reference_spinner[0]
+    reference_census = (reference[:ref_spin] if ref_spin == width - 1 else reference[ref_spin + 1:])
+    candidate_census = candidate[candidate_spinner[0] + 1:]
+    reference_match = _REFERENCE_NARROW_HEADER.fullmatch(reference_census)
+    candidate_match = _CANDIDATE_NARROW_HEADER.fullmatch(candidate_census)
+    if not reference_match or not candidate_match:
+        return False
+    if candidate_match.group("method") != expected_method:
+        return False
+    names = ("working", "idle", "blocked", "version", "clock")
+    if (any(reference_match.group(name) != candidate_match.group(name) for name in names) or
+            candidate_match.group("version") != expected_version):
+        return False
+
+    # The actual Fleet JSON hosts and identity are independent of the candidate frame.
+    mark, name = hosts[0]
+    host_style = "g_work" if mark == "⌂" else "dim"
+    name_style = "g_work" if mark == "⌂" else "loc_repo"
+    expected_host = [(mark, host_style), (" ", host_style)] + [(char, name_style) for char in name]
+    if len(hosts) > 1:
+        expected_host += [(" ", "dim"), ("+", "dim")] + [(char, "dim") for char in str(len(hosts) - 1)]
+    for column, (glyph, style) in enumerate(expected_host):
+        if tuple(candidates[0][column][:3]) != (glyph, style, None):
+            return False
+    spinner = candidate_spinner[0]
+    if spinner < len(expected_host) or any(
+            tuple(candidates[0][column][:3]) != (" ", None, None)
+            for column in range(len(expected_host), spinner)):
+        return False
+    census_parts = [
+        ("⠏", "g_spin"), (" " + candidate_match.group("working"), "g_spin"), (" ", None),
+        ("●", "g_work_off"), (" " + candidate_match.group("idle"), "g_work_off"), (" ", None),
+        ("●", "g_blocked"), (" " + candidate_match.group("blocked"), "g_blocked"), (" ", None),
+        ("hearting", "hearting_name"), (" " + expected_version, "version_release"),
+        (" · ", "dim"),
+        (expected_method, "version_method"), ("  " + candidate_match.group("clock"), "dim"),
+    ]
+    column = spinner
+    for text, style in census_parts:
+        for glyph in text:
+            if column >= width or tuple(candidates[0][column][:3]) != (glyph, style, None):
+                return False
+            column += 1
+    return column == width
+
+
+def _r14_wide_f70_method(record, band):
+    """Allow only the exact F70 method insertion at the full-host 168-cell layout."""
+    trace = record.get("reference_overflow_mask") or {}
+    if (record.get("width") != 168 or record.get("rows") != 45 or record.get("state") not in VIEWS or
+            band.get("pane") != "frame" or band.get("rows") != [0] or
+            record.get("reference_profile") != R14_REFERENCE_PROFILE or
+            trace.get("profile") != R14_REFERENCE_PROFILE or trace.get("version") != REFERENCE_MASK_VERSION or
+            any(diff.get("kind") != "cell" or diff.get("row") != 0 for diff in band.get("diffs", ()))):
+        return False
+    references, candidates = record.get("reference_cells") or (), record.get("fleet2_cells") or ()
+    if not references or not candidates:
+        return False
+    reference = _header_row_text(references[0], 168)
+    candidate = _header_row_text(candidates[0], 168)
+    identity = _header_identity_from_record(record)
+    hosts = _header_hosts_from_record(record)
+    if reference is None or candidate is None or identity is None or hosts is None:
+        return False
+    version, method = identity
+    host_prefix = _full_host_prefix(hosts)
+    if not candidate.startswith(host_prefix):
+        return False
+    ref_spinners = [index for index, char in enumerate(reference) if char in _SPINNER_GLYPHS]
+    candidate_spinners = [index for index, char in enumerate(candidate) if char in _SPINNER_GLYPHS]
+    if (len(ref_spinners) != 1 or len(candidate_spinners) != 1 or
+            reference[ref_spinners[0]] != candidate[candidate_spinners[0]]):
+        return False
+    ref_match = _REFERENCE_NARROW_HEADER.fullmatch(reference[ref_spinners[0] + 1:])
+    candidate_match = _CANDIDATE_WIDE_HEADER.fullmatch(candidate[candidate_spinners[0] + 1:])
+    if not ref_match or not candidate_match:
+        return False
+    if (candidate_match.group("method") != method or candidate_match.group("version") != version or
+            any(ref_match.group(name) != candidate_match.group(name)
+                for name in ("working", "idle", "blocked", "version", "clock"))):
+        return False
+    identity_text = f"hearting {version} · {method}"
+    if candidate.count(identity_text) != 1:
+        return False
+    identity_start = candidate.index("hearting")
+    version_start = identity_start + len("hearting ")
+    method_start = version_start + len(version)
+    method_text = " · " + method
+    method_end = method_start + len(method_text)
+    candidate_cells = candidates[0]
+    for begin, count, style in (
+            (identity_start, len("hearting"), "hearting_name"),
+            (version_start - 1, len(" ") + len(version), "version_release"),
+            (method_start, len(" · "), "dim"),
+            (method_start + len(" · "), len(method), "version_method")):
+        if any(tuple(candidate_cells[index][1:3]) != (style, None)
+               for index in range(begin, begin + count)):
+            return False
+
+    # Exact method removal plus the matching right-alignment shift must reproduce all 168 R14 tuples.
+    inserted = len(method_text)
+    spinner = candidate_spinners[0]
+    normalized = (list(candidate_cells[:spinner]) + [(" ", None, None)] * inserted +
+                  list(candidate_cells[spinner:method_start]) + list(candidate_cells[method_end:]))
+    return (len(normalized) == 168 and
+            [tuple(cell) for cell in normalized] == [tuple(cell) for cell in references[0]])
+
+
+def _unknown_compute_track(record, band):
+    unknown_cells = frozenset({"UTIL", "COMPUTE block VRAM percent", "VRAM gauge", "VRAM used/total"})
+    limitations = {(item.get("gpu"), frozenset(item.get("unknown_cells") or ()))
+                   for item in record.get("reference_copy_limitations", ())
+                   if item.get("reference_file") == "mock13.py" and item.get("host") == "moving4"}
+    trace = record.get("reference_overflow_mask") or {}
+    if not (record["state"] == "COMPUTE" and record["width"] in R14_UNKNOWN_GPU_TRACK_LAST_COLUMN
+            and band["pane"] == "right" and len(band["rows"]) == 1 and band["rows"][0] in (5, 6)
+            and record.get("reference_profile") == R14_REFERENCE_PROFILE
+            and trace.get("profile") == R14_REFERENCE_PROFILE and trace.get("version") in REFERENCE_MASK_COMPAT_VERSIONS
+            and limitations == {(0, unknown_cells), (1, unknown_cells)}
+            and len(band["reference"]) == len(band["fleet2"]) == 1):
+        return False
+    reference_tail = {80: "     ·    ·", 100: "     ·    ·            ·",
+                      140: "     ·    ·            ·", 168: "     ·    ·            ·"}[record["width"]]
+    fleet2_tail = {80: "    ·     ·······", 100: "    ·     ··········   ·",
+                   140: "    ·     ··········   ·", 168: "    ·     ··········   ·"}[record["width"]]
+    row = band["rows"][0]
+    gpu = row - 5
+    reference, fleet2 = band["reference"][0], band["fleet2"][0]
+    model = "RTX 6000 Ada"
+    if f"● {gpu}" not in reference or f"● {gpu}" not in fleet2 or model not in reference or model not in fleet2:
+        return False
+    reference_prefix, reference_suffix = reference.split(model, 1)
+    fleet2_prefix, fleet2_suffix = fleet2.split(model, 1)
+    if reference_prefix != fleet2_prefix or reference_suffix != reference_tail or fleet2_suffix != fleet2_tail:
+        return False
+    known = {(row, 66, (" ", "dim", None), ("·", "dim", None)),
+             (row, 67, ("·", "dim", None), (" ", "dim", None))}
+    for column in range(73, R14_UNKNOWN_GPU_TRACK_LAST_COLUMN[record["width"]] + 1):
+        known.add((row, column, (" ", None, None), ("·", "dim", None)))
+    actual = {(diff["row"], diff["column"], tuple(diff.get("expected") or ()), tuple(diff.get("actual") or ()))
+              for diff in band.get("diffs", ())}
+    return actual == known
+
+
+def _same_backgrounds(band):
+    return all((diff.get("expected") or [None, None, None])[2:] ==
+               (diff.get("actual") or [None, None, None])[2:] for diff in band.get("diffs", ()))
+
+
+def _blank_cell_key(record, band):
+    key = _r14_residual_key(record, band)
+    if key in (("MODELS", 80, 26), ("MODELS", 100, 26)):
+        if (not _has_pinned_reference_trace(record, current=True) or
+                not _row_matches_residual_pairs(record, key) or len(band.get("diffs") or ()) != 1):
+            return False
+        diff = band["diffs"][0]
+        expected, actual = R14_RESIDUAL_CELL_PAIRS[key].get(diff.get("column"), ((), ()))
+        return (diff.get("column") in R14_MODELS_BLANK_KEY_CELLS[key[1]] and
+                tuple(diff.get("expected") or ()) == expected and tuple(diff.get("actual") or ()) == actual and
+                expected == (" ", "dim", None) and actual == (" ", "branch_s", None))
+    return (band["blank_only"] and _same_backgrounds(band) and
+            all((diff.get("expected") or [None])[0] in (" ", "") and
+                (diff.get("actual") or [None])[0] in (" ", "") for diff in band.get("diffs", ())))
+
+
+def _unknown_state_glyph(record, band):
+    if record["state"] != "PEERS" or not band.get("diffs") or not _same_backgrounds(band):
+        return False
+    for reference, fleet2 in zip(band["reference"], band["fleet2"]):
+        if not re.search(r"● \[[0-9a-f]{2}\]", reference) or fleet2 != reference.replace("●", "·", 1):
+            return False
+    return all((diff.get("expected") or [None])[0] == "●" and
+               (diff.get("actual") or [None])[0] == "·" for diff in band["diffs"])
+
+
+def _peers_glyph_style(record, band):
+    return (record["state"] == "PEERS" and band["pane"] == "right" and band["text_equal"] and
+            bool(band.get("diffs")) and _same_backgrounds(band) and
+            all((diff.get("expected") or [None])[0] in "├┤" and
+                (diff.get("actual") or [None])[0] == (diff.get("expected") or [None])[0]
+                for diff in band["diffs"]))
+
+
+def _worker_no_effort(record, band):
+    if band["pane"] != "right" or not band.get("diffs") or not _same_backgrounds(band):
+        return False
+    spans = {}
+    for index, row in enumerate(band["rows"]):
+        reference = band["reference"][index]
+        fleet2 = band["fleet2"][index]
+        marker = "opencode (de…"
+        start = reference.find(marker)
+        if start < 0 or fleet2 != reference[:start] + "opencode":
+            return False
+        spans[row] = (33 + start, 33 + start + len(marker))
+    return all(diff["row"] in spans and spans[diff["row"]][0] <= diff["column"] < spans[diff["row"]][1]
+               for diff in band["diffs"])
+
+
+def _worker_row_empty(record, band):
+    if band["pane"] != "right" or not band.get("diffs") or not _same_backgrounds(band):
+        return False
+    spans = {}
+    for index, row in enumerate(band["rows"]):
+        reference = band["reference"][index].rstrip()
+        fleet2 = band["fleet2"][index].rstrip()
+        match = re.search(r"report(\s+·(?:\s+·)?)$", reference)
+        if not match or fleet2 != reference[:match.start()] + "report":
+            return False
+        spans[row] = (33 + match.start(1), 33 + len(reference))
+    return all(diff["row"] in spans and spans[diff["row"]][0] <= diff["column"] < spans[diff["row"]][1] and
+               (diff.get("expected") or [None])[0] == "·" and
+               (diff.get("actual") or [None])[0] in (" ", "") for diff in band["diffs"])
+
+
+def _question_empty_now(record, band):
+    if record["state"] != "QUESTIONS" or not band.get("diffs") or not _same_backgrounds(band):
+        return False
+    if len(band["reference"]) != 1 or len(band["fleet2"]) != 1:
+        return False
+    reference, fleet2 = band["reference"][0].rstrip(), band["fleet2"][0].rstrip()
+    return (reference.endswith("now:") and fleet2.endswith("now: ·") and
+            fleet2[:-1].rstrip() == reference and
+            all((diff.get("expected") or [None])[0] in (" ", "") and
+                (diff.get("actual") or [None])[0] == "·" for diff in band["diffs"]))
+
+
+def _hard_cut_vs_ellipsis(record, band):
+    if record["width"] not in (80, 100) or band["pane"] != "right" or len(band["rows"]) != 1:
+        return False
+    reference, fleet2 = band["reference"][0].rstrip(), band["fleet2"][0].rstrip()
+    if not (fleet2.endswith("…") and not reference.endswith("…") and reference[:20] == fleet2[:20]):
+        return False
+    diffs = band.get("diffs") or ()
+    return (len(diffs) == 1 and (diffs[0].get("expected") or [None])[0] != "…" and
+            (diffs[0].get("actual") or [None])[0] == "…")
 
 
 CHROME = "tools/fleet/explorer/chrome.py"
@@ -284,15 +1223,31 @@ RULES = [
      lambda r, b: b["pane"] == "left" and _style_is(b, "g_dead", "g_blocked")),
     ("blank-cell-key", "intended", None,
      "only blank cells differ, and only in their foreground key: a space has no glyph and no background, so nothing visible differs",
-     lambda r, b: b["blank_only"]),
-    ("legend-overflow-80", "excluded", None,
-     "80 columns: the reference's key legend is 91 cells wide and is cut at the screen edge (`F feed`); fleet2 drops the "
-     "hint keys by priority (chrome.py draw_chrome) - reference self-defect, narrow-width intent",
-     lambda r, b: r["width"] == 80 and b["pane"] == "frame" and b["ref_edge"] and _has("F feed", b["reference"][0]) and _has("q quit", b["fleet2"][0])),
-    ("status-clip-80", "excluded", None,
-     "80 columns: the reference's bottom status line runs to the screen edge and is cut mid-word; fleet2 cuts it earlier",
-     lambda r, b: r["width"] == 80 and b["pane"] == "frame" and b["ref_edge"] and b["rows"][-1] >= 43 and
-     any(_has("esc: back|›", x) for x in b["reference"])),
+     _blank_cell_key),
+    ("prd-narrow-host-identity", "intended", None,
+     "at 80/100/140 columns the PRD-sized header uses its compact host and existing colored glyph/count form to keep "
+     "connected host, census, clock, and the F70 `hearting <version> · <install-method>` identity together "
+     "(SHA256 " + R14_HEADER_IDENTITY_PRD_SHA256 + "). The exact host/count comes from captured Fleet JSON; version/method "
+     "must match its independent identity, reference counts/clock, approved styles, and bounded row-0 tuples",
+     _r14_narrow_host_identity),
+    ("prd-f70-install-method", "intended", None,
+     "at 168 columns the R14 census/host tuple remains unchanged; the exact F70 method field is appended to the validated "
+     "hearting/version identity and right-alignment shifts only the preceding header group. Every tuple matches the "
+     "reference after removing that exact field (PRD v87 SHA256 " + R14_HEADER_IDENTITY_PRD_SHA256 + "); the identity and "
+     "full host inventory come from captured Fleet JSON",
+     _r14_wide_f70_method),
+    ("prd-census-spinner-order", "intended", None,
+     "the current PRD moves only the spinner; census, version, clock and every other styled cell match after its position is normalized",
+     _spinner_row_order),
+    ("right-edge-safe-clip", "intended", None,
+     "fleet2 reserves the final terminal column on the shared feed and SYSTEM collector row; the frozen reference writes into that cell",
+     _reserved_terminal_column),
+    ("r14-models-safe-edge-clip", "intended", None,
+     "the pinned R14 MODELS row has an exact visible suffix at its pane edge; Fleet2 keeps the unchanged prefix and the recorded blank suffix",
+     _r14_models_safe_edge_clip),
+    ("unknown-gpu-track", "copy-limitation", None,
+     "moving4 GPU 0/1 UTIL and VRAM values are None: the reference copy can show · but cannot draw fleet2's empty 10-cell unknown track; no zero is synthesized",
+     _unknown_compute_track),
     ("hosts-fold-100", "fleet2-defect", CHROME,
      "100 columns: when the host list does not fit before the census the reference folds it to `⌂ moving4 +4 · 5/5`; "
      "fleet2 clips the list mid-name (chrome.py draw_chrome host loop)",
@@ -326,15 +1281,10 @@ RULES = [
     ("worker-no-effort", "copy-limitation", None,
      "a worker harness cell with a model but no effort (opencode): the reference's narrow fold only handles the six-part cell, so it clips "
      "`opencode (de…`; fleet2 shows the harness name alone",
-     lambda r, b: b["pane"] == "right" and any(_has(r"opencode \(de", x) for x in b["reference"])),
+     _worker_no_effort),
     ("worker-row-empty", "copy-limitation", None,
      "a route with no worker record: the reference always draws a worker line and fills it with `·`; fleet2 leaves the cells empty",
-     lambda r, b: b["pane"] == "right" and any(_has(r"report +· +·|report +·$", x) for x in b["reference"]) and
-     any(_has("report", x) for x in b["fleet2"])),
-    ("peers-narrow-frame", "excluded", None,
-     "80/100 columns: the reference's repo frames and session boxes are laid out one cell wider than the pane and run to the screen edge; "
-     "fleet2 keeps its frames inside the pane",
-     lambda r, b: r["width"] in (80, 100) and r["state"] == "PEERS" and b["pane"] == "right" and b["ref_edge"]),
+     _worker_row_empty),
     ("unknown-context-gauge-peers", "fleet2-defect", PEERS,
      "PEERS card for a session whose context is unknown: fleet2 draws an empty gauge (`────────`); its OVERVIEW draws nothing "
      "for the same unknown context (tables.py), as the reference does",
@@ -343,42 +1293,29 @@ RULES = [
     ("unknown-state-glyph", "copy-limitation", None,
      "a session whose state is `unknown`/`stale`: the reference has five session states and draws these as an idle dot; fleet2's PEERS card "
      "draws `·` for them (peers.py STATE_MARKS fallback) while its tree and OVERVIEW draw the idle dot",
-     lambda r, b: r["state"] == "PEERS" and any(_has(r"● \[[0-9a-f]{2}\]", x) and _has(r"· \[[0-9a-f]{2}\]", y)
-                                                for x, y in zip(b["reference"], b["fleet2"]))),
+     _unknown_state_glyph),
     ("peers-glyph-style", "copy-limitation", None,
      "PEERS lane/link junction colour: the reference colours a lane by the upper/lower session's harness hue; the live pair's link "
      "colour in fleet2 follows the other session",
-     lambda r, b: r["state"] == "PEERS" and b["pane"] == "right" and b["text_equal"] and
-     all((d["reference"] or [""])[0] in "├┤" for d in b["samples"])),
+     _peers_glyph_style),
     ("answered-head", "fleet2-defect", TABLES,
-     "ANSWERED TODAY header: `<first repo> <n>` where n is that repo's answered rows in the reference; fleet2 writes the total of all repos "
-     "(20) after the first repo's name (tables.py:904)",
-     lambda r, b: _has("ANSWERED TODAY", b["reference"][0]) and _has("ANSWERED TODAY", b["fleet2"][0])),
+     "ANSWERED TODAY shows a different count for the same explicit repo in the reference and Fleet2",
+     _answered_count_diff),
     ("question-empty-now", "copy-limitation", None,
      "a waiting question whose `now` text is empty: the reference draws nothing after `now:` (all 22:53 questions carried text); fleet2 draws `·`",
-     lambda r, b: r["state"] == "QUESTIONS" and _has(r"now:\s*$", b["reference"][0]) and _has(r"now:\s+·", b["fleet2"][0])),
-    ("question-header-overflow", "excluded", None,
-     "80/100 columns: the reference's QUESTIONS header runs to the screen edge; fleet2 keeps its header inside the pane",
-     lambda r, b: r["width"] in (80, 100) and r["state"] == "QUESTIONS" and b["pane"] == "right" and b["ref_edge"]),
-    ("question-answer-line-80", "excluded", None,
-     "80 columns: the question detail line `answer: ⏎ go to its pane and answer there` is cut by the reference at the pane edge",
-     lambda r, b: r["width"] == 80 and r["state"] == "QUESTIONS" and any(_has("answer:", x) for x in b["reference"])),
+     _question_empty_now),
     ("compute-command-args", "fleet2-defect", RES,
      "COMPUTE process line: fleet2 cuts the command at ` --` (`script.py`); the reference keeps the script and its short options "
      "(`script.py --request A2.json`, its short_cmd())",
      lambda r, b: r["state"] == "COMPUTE" and b["pane"] == "right" and all(
          _collapse(re.sub(r" --.*?(?=\s+\d+(\.\d)? GB)", "", x)) == _collapse(y) for x, y in zip(b["reference"], b["fleet2"]))),
-    ("compute-cpu-row-clip", "excluded", None,
-     "80/100 columns: the reference's CPU/MEM/SWP row, GPU rows and host summary run to the screen edge and are cut there",
-     lambda r, b: r["width"] in (80, 100) and r["state"] == "COMPUTE" and b["ref_edge"]),
     ("session-context-line", "fleet2-defect", PAGES,
      "session page context line: with an unknown last-clear time fleet2 drops the `· last clear ·` clause that its own seat line "
      "(and the reference's context line) print",
      lambda r, b: r["state"] == "session" and any(_has("context:", x) for x in b["reference"])),
     ("hard-cut-vs-ellipsis", "fleet2-defect", PAGES,
      "a seat/field line longer than the pane: the reference cuts it hard at the pane edge, fleet2 ends it with `…`",
-     lambda r, b: r["width"] in (80, 100) and b["pane"] == "right" and any(
-         y.rstrip().endswith("…") and not x.rstrip().endswith("…") and x[:20] == y[:20] for x, y in zip(b["reference"], b["fleet2"]))),
+     _hard_cut_vs_ellipsis),
     ("route-page-stage-line", "fleet2-defect", PAGES,
      "route page leg box: fleet2 prints `stage <name> n/m` above the owner line; the reference's leg box lists the owner line first and puts "
      "`stage` second",
@@ -394,98 +1331,114 @@ RULES = [
      "context_alert.py), so fleet2 paints the whole bar red (g_blocked) while its own chips still show 500K/700K as current "
      "(models.py:80-84)",
      lambda r, b: r["state"] == "MODELS" and _style_in(b, [("g_work_off", "g_blocked"), ("g_idle", "g_blocked")])),
-    ("models-narrow", "excluded", None,
-     "80/100 columns: MODELS rows, the edit panel foot and the CONTEXT bars run to the screen edge in the reference and are cut there",
-     lambda r, b: r["width"] in (80, 100) and r["state"] == "MODELS" and b["ref_edge"]),
     ("system-status", "fleet2-defect", CHROME,
-     "SYSTEM status line with an unread `pending` count: fleet2 prints `· deliveries pending`, the reference prints the number",
-     lambda r, b: r["state"] == "SYSTEM" and b["pane"] == "frame"),
-    ("overview-80", "excluded", None,
-     "80 columns: the reference's OVERVIEW draws NOW text over the CTX column and header (`TCTXE`), the known 80-column OVERVIEW self-defect",
-     lambda r, b: r["width"] == 80 and r["state"] in ("OVERVIEW", "repo") and b["pane"] == "right" and
-     any(_has(r"TCTXE|\S+ \d+%…|… ", x) for x in b["reference"])),
-    ("routes-narrow", "excluded", None,
-     "80/100 columns: the reference's ROUTES header and worker rows overflow the pane (`AGEH`, `c` cut), a known narrow-width overflow",
-     lambda r, b: r["width"] in (80, 100) and b["pane"] == "right" and r["state"] in ("ROUTES", "repo", "route", "session") and
-     (b["ref_edge"] or any(_has("AGEH|TCTXE", x) for x in b["reference"]))),
+     "SYSTEM status line shows an observed pending-delivery count differently between renderers",
+     _system_pending_diff),
     ("gauge-min-one-cell", "fleet2-defect", TABLES,
      "a small percentage (6%) on a 6-cell gauge: the reference's gauge() always fills at least one cell for a value above 0; "
      "fleet2 rounds it to an empty gauge",
      lambda r, b: b["pane"] == "right" and any(_has(r"━─{5}\s+\d%", x) and _has(r"─{6}\s+\d%", y)
                                               for x, y in zip(b["reference"], b["fleet2"]))),
-    ("memory-narrow-clip", "excluded", None,
-     "80 columns: the reference's MEMORY record rows run to the screen edge (`artifact-point…` cut at column 80); fleet2 cuts the TYPE column one cell earlier",
-     lambda r, b: r["width"] == 80 and r["state"] == "MEMORY" and b["pane"] == "right" and b["ref_edge"]),
-    ("narrow-header-overflow", "excluded", None,
-     "80/100 columns: the reference's table header / field line is wider than the pane and runs to the screen edge; "
-     "fleet2 cuts it at the pane edge (with `…` on field lines)",
-     lambda r, b: r["width"] in (80, 100) and r["state"] in ("HISTORY", "SYSTEM", "session") and b["pane"] == "right" and b["ref_edge"]),
-    ("sessionless-route", "copy-limitation", None,
-     "a running route whose owner session is not on the board: the reference's OVERVIEW/repo page lists only routes that have an owner session "
-     "(its past routes are not listed); fleet2 lists it, so the rows below it move down",
-     lambda r, b: r["state"] in ("repo", "OVERVIEW") and b["pane"] == "right" and
-     (_rows_shifted(b) or any(_has("HISTORY|RECENT", x) for x in b["reference"]))),
 ]
 
 
+def _hit_delta(expected, actual):
+    expected_counts = Counter(json.dumps(hit, ensure_ascii=False, separators=(",", ":")) for hit in expected)
+    actual_counts = Counter(json.dumps(hit, ensure_ascii=False, separators=(",", ":")) for hit in actual)
+    missing = list((expected_counts - actual_counts).elements())
+    extra = list((actual_counts - expected_counts).elements())
+    return ([json.loads(hit) for hit in missing], [json.loads(hit) for hit in extra])
+
+
+def _r14_hit_mask_matches(record, expected_hits, actual_hits, missing, extra):
+    trace = record.get("reference_overflow_mask") or {}
+    if (record.get("state") != "MODELS" or record.get("reference_profile") != R14_REFERENCE_PROFILE or
+            trace.get("profile") != R14_REFERENCE_PROFILE or trace.get("version") not in REFERENCE_MASK_COMPAT_VERSIONS):
+        return False
+    expected = R14_MODELS_HIT_MASKS.get(record.get("width"))
+    if expected is None:
+        return False
+    key = lambda hit: json.dumps(hit, ensure_ascii=False, separators=(",", ":"))
+    missing_mask, extra_mask = expected["missing"], expected["extra"]
+    if (Counter(map(key, missing)) != Counter(map(key, missing_mask)) or
+            Counter(map(key, extra)) != Counter(map(key, extra_mask))):
+        return False
+    paired_actions = {key(hit[3]) for hit in missing_mask} & {key(hit[3]) for hit in extra_mask}
+
+    def normalize(sequence, masks):
+        counts = Counter(map(key, masks))
+        normalized = []
+        for hit in sequence:
+            ident = key(hit)
+            if counts[ident]:
+                counts[ident] -= 1
+                action = key(hit[3])
+                if action in paired_actions:
+                    normalized.append(("masked-hit", action))
+            else:
+                normalized.append(("hit", ident))
+        return normalized
+
+    return normalize(expected_hits, missing_mask) == normalize(actual_hits, extra_mask)
+
+
 def classify(records):
-    """Attach a reason to every differing band and hit difference; return the classified document."""
+    """Classify only exact rules, source-traced reference cells and the versioned R14 hit mask."""
     entries, counts = [], {}
     for record in records:
         bands, hits = _bands(record)
-        explained_rows = {row for band in bands for row in band["rows"]}
-        for band in bands:
+        for band in _split_r14_models_row26(record, bands):
             matched = []
-            for rule in RULES:
-                try:
-                    if rule[4](record, band):
-                        matched.append(rule)
-                except (KeyError, IndexError, TypeError):
-                    continue
-            if matched:
-                # For narrow captures, an observed reference-edge/overlap rule takes
-                # precedence over content rules that can describe the same band.
-                # This keeps the reference's own layout defects out of fleet2 counts.
-                narrow_reference_defect = record["width"] in (80, 100) and (
-                    band["ref_edge"] or any(_has(r"AGEH|TCTXE", line) for line in band["reference"]))
-                selected = next((rule for rule in matched if rule[1] == "excluded"), matched[0]) \
-                    if narrow_reference_defect else matched[0]
-                rule_id, cls, owner, reason = selected[:4]
+            selected = None
+            residual_cells = _r14_residual_reference_mask(record, band)
+            masked_cells = residual_cells or _reference_overflow_mask(record, band)
+            if masked_cells:
+                rule_id = "r14-reference-residual-mask" if residual_cells else "r14-reference-overflow-mask"
+                cls, owner = "excluded", None
+                reason = (("the pinned R14 trace and exact row cells prove this header collision or MODELS box-note overprint; "
+                           "candidate glyphs, styles, prefixes and adjacent cells are checked against the residual contract")
+                          if residual_cells else
+                          ("the exact R14 state/width/row, reference tuple, trace kind and safe blank clip or retained divider pair "
+                           "match the fixed case; every other cell in the row remains equal"))
             else:
-                rule_id, cls, owner, reason = "unexplained", "unexplained", None, "no rule explains this band"
-            entries.append({"state": record["state"], "width": record["width"], "kind": "cells", "pane": band["pane"],
-                            "rows": [band["rows"][0], band["rows"][-1]], "cells": band["cells"],
-                            "text_equal": band["text_equal"], "rule": rule_id, "class": cls, "owner": owner,
-                            "also": [rule[0] for rule in matched if rule is not selected] if matched else [],
-                            "reason": reason, "reference": band["reference"][:3], "fleet2": band["fleet2"][:3]})
+                for rule in RULES:
+                    try:
+                        if rule[4](record, band):
+                            matched.append(rule)
+                    except (KeyError, IndexError, TypeError):
+                        continue
+                if matched:
+                    selected = matched[0]
+                    rule_id, cls, owner, reason = selected[:4]
+                else:
+                    selected = None
+                    rule_id, cls, owner, reason = "unexplained", "unexplained", None, "no rule explains this band"
+            entry = {"state": record["state"], "width": record["width"], "kind": "cells", "pane": band["pane"],
+                     "rows": [band["rows"][0], band["rows"][-1]], "cells": band["cells"],
+                     "difference_cells": [[diff["row"], diff["column"]] for diff in band.get("diffs", ())],
+                     "text_equal": band["text_equal"], "rule": rule_id, "class": cls, "owner": owner,
+                     "also": [rule[0] for rule in matched if rule is not selected] if matched else [],
+                     "reason": reason, "reference": band["reference"][:3], "fleet2": band["fleet2"][:3]}
+            if masked_cells:
+                entry["reference_mask_cells"] = masked_cells
+            entries.append(entry)
             counts[cls] = counts.get(cls, 0) + 1
         if hits:
-            # a hit area that differs must sit on a row where cells differ too (a moved, resized or missing row
-            # moves its hit rows with it); a hit difference on a row whose cells are equal stays unexplained
-            expected = [json.dumps(hit) for hit in hits[0]["expected"]]
-            actual = [json.dumps(hit) for hit in hits[0]["actual"]]
-            only = [json.loads(hit) for hit in expected if hit not in actual] + \
-                   [json.loads(hit) for hit in actual if hit not in expected]
-            stray = [hit for hit in only if hit[0] not in explained_rows and hit[0] != -1]
-            if only and all(hit[2] > record["width"] for hit in only):
-                cls, rule_id = "excluded", "hit-outside-screen"
-                reason = ("the reference's own hit areas end beyond the %d-column screen (x1 up to %d): the known narrow-width "
-                          "self-defect recorded in evidence/parity/matrix/reference-defects.json (MODELS 80/100)"
-                          % (record["width"], max(hit[2] for hit in only)))
-            elif only and not stray:
-                cls, rule_id = "derived", "hits-follow-cells"
-                reason = ("hit areas that differ lie on rows whose cells differ and are explained above: a moved, resized "
-                          "or missing row takes its hit rows with it (%d differing hit areas)" % len(only))
-            elif not only:
-                cls, rule_id, reason = "derived", "hits-reordered", "the same hit areas in a different order (rows moved)"
+            expected, actual = hits[0]["expected"], hits[0]["actual"]
+            missing, extra = _hit_delta(expected, actual)
+            if _r14_hit_mask_matches(record, expected, actual, missing, extra):
+                cls, rule_id = "excluded", "r14-models-overflow-hit-mask"
+                reason = "the ordered hit changes exactly match the versioned R14 MODELS overflow ledger"
             else:
                 cls, rule_id = "unexplained", "unexplained"
-                reason = "hit areas differ on rows whose cells are equal: " + json.dumps(stray[:3])
+                reason = "the ordered click map differs outside the exact R14 reference-hit mask"
             entries.append({"state": record["state"], "width": record["width"], "kind": "hits", "rule": rule_id,
-                            "class": cls, "owner": None, "reason": reason, "differing_hit_areas": only[:20]})
+                            "class": cls, "owner": None, "reason": reason,
+                            "differing_hit_areas": (missing + extra)[:20]})
             counts[cls] = counts.get(cls, 0) + 1
-    return {"schema": "fleet-today-classified-v1", "summary": {"bands": len(entries), "by_class": counts,
-            "unexplained": counts.get("unexplained", 0)}, "entries": entries}
+    return {"schema": "fleet-today-classified-v1", "reference_mask_version": REFERENCE_MASK_VERSION,
+            "summary": {"bands": len(entries), "by_class": counts,
+                        "unexplained": counts.get("unexplained", 0)}, "entries": entries}
 
 
 def write_classified(document, out_dir, capture_name):
@@ -533,15 +1486,21 @@ def run_capture(out, reference, approved=None, source_bundle=None, from_capture=
         augment_capture(capture_dir)
         vm, now = build_live_vm(capture_dir)
     side_dir = Path(out) / "evidence/parity/side-by-side/today"
-    records = compare_vm(vm, reference, side_dir)
+    header_identity = _validated_header_identity(capture_dir)
+    header_hosts = _validated_header_hosts(capture_dir)
+    records = compare_vm(vm, reference, side_dir, validated_header_identity=header_identity,
+                         validated_header_hosts=header_hosts)
+    copy_limitations = _unique_reference_copy_limitations(records)
     summary = [{key: row[key] for key in ("state", "width", "rows", "equal", "difference_count", "png")}
                for row in records]
     (side_dir / "manifest.json").write_text(json.dumps({"schema": "fleet-side-by-side-v1",
         "source": f"today host capture {capture_dir.name}: one live view model injected into the copy and drawn by fleet2",
+        "reference_copy_limitations": copy_limitations,
         "captures": summary}, ensure_ascii=False, indent=2) + "\n")
     (capture_dir / "diff.json").write_text(json.dumps({"schema": "fleet-today-diff-v1", "captured_at": now,
-        "captures": summary}, ensure_ascii=False, indent=2) + "\n")
+        "reference_copy_limitations": copy_limitations, "captures": summary}, ensure_ascii=False, indent=2) + "\n")
     document = classify(records)
+    document["reference_copy_limitations"] = copy_limitations
     write_classified(document, capture_dir, capture_dir.name)
     if approved:
         _capture_2253(Path(out), Path(approved), Path(reference), capture_dir, now)
@@ -656,9 +1615,14 @@ def main(argv=None):
     capture_dir, records = run_capture(args.out, args.reference, args.approved, args.source_bundle,
                                        args.from_capture)
     write_index(args.out)
+    strict = classify(records)
+    strict_pass = (strict["summary"]["unexplained"] == 0 and
+                   strict["summary"]["by_class"].get("fleet2-defect", 0) == 0)
     print(json.dumps({"capture_dir": str(capture_dir), "capture_count": len(records),
-                      "differences": sum(row["difference_count"] for row in records)}))
-    return 0
+                      "differences": sum(row["difference_count"] for row in records),
+                      "strict_parity": strict["summary"], "strict_pass": strict_pass,
+                      "reference_copy_limitations": _unique_reference_copy_limitations(records)}))
+    return 0 if strict_pass else 1
 
 
 if __name__ == "__main__":

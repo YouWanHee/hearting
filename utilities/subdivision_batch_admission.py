@@ -15,6 +15,7 @@ child row or model process exists; it does not own the completion marker.
 from __future__ import annotations
 
 import dataclasses
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib.util
 import json
@@ -378,11 +379,12 @@ def start_admitted_batch(
     close_unclaimed: Callable[[Path, str], int] | None = None,
 ) -> list[dict[str, Any]]:
     """Register every admitted slice first; only start ANY slice once EVERY
-    registration has succeeded (F-4, impl-review round 1). Registration and
-    start each run sequentially -- this fixes the all-or-nothing invariant a
-    prior register-then-immediately-start loop violated (a mid-batch
+    registration has succeeded (F-4, impl-review round 1). Registration is
+    sequential and all admitted starts are launched concurrently only after
+    that fence and the manifest seal. This fixes the all-or-nothing invariant
+    a prior register-then-immediately-start loop violated (a mid-batch
     registration failure used to leave earlier slices already started while
-    later ones never registered), not the sequencing itself. Typed
+    later ones never registered). Typed
     partial-start recovery: a registration failure anywhere in the batch
     means zero slices start, including ones that themselves registered
     cleanly -- their reservation token is simply never consumed by a start
@@ -456,13 +458,32 @@ def start_admitted_batch(
     # Every slice registered: seal the manifest once, before the first start
     # (F3 precondition; see `persist_chain_manifest`).
     persist_chain_manifest(Path(jobs), admission.manifest)
+    def start_one(pair):
+        session, token = pair
+        cmd = []
+        try:
+            env = os.environ.copy()
+            env[governor_reservation_env] = token
+            # Slices share one worktree: `git status` must not take index.lock.
+            env["GIT_OPTIONAL_LOCKS"] = "0"
+            cmd = dispatch_command(admission.manifest, session, "start", parent, jobs)
+            start = runner(cmd, env)
+        except Exception as exc:
+            # A spawn failure is this slice's failed start, not a reason to
+            # abandon results from siblings that have already launched.
+            code = getattr(exc, "errno", None)
+            start = subprocess.CompletedProcess(
+                cmd, code if isinstance(code, int) and code else 1,
+                "", "%s: %s" % (type(exc).__name__, str(exc)[:240]),
+            )
+        return session, start
+
+    with ThreadPoolExecutor(max_workers=max(1, len(admission.sessions)),
+                            thread_name_prefix="subsession-start") as pool:
+        starts = list(pool.map(start_one, zip(admission.sessions, admission.tokens)))
+
     results = []
-    for session, token in zip(admission.sessions, admission.tokens):
-        env = os.environ.copy()
-        env[governor_reservation_env] = token
-        # Slices share one worktree: `git status` must not take index.lock.
-        env["GIT_OPTIONAL_LOCKS"] = "0"
-        start = runner(dispatch_command(admission.manifest, session, "start", parent, jobs), env)
+    for session, start in starts:
         closed = (close_unclaimed or _close_unclaimed_row)(jobs, session["attempt_id"]) if start.returncode else 0
         results.append({
             "subsession_id": session["subsession_id"],
