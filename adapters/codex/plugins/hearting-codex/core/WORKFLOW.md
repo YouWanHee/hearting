@@ -652,7 +652,9 @@ registered part catalog row in `capabilities/topologies.json`. Native and
 borrowed route nodes resolve the same row from their sealed stage identity;
 the need is not copied into sealed nodes or inferred from the outer
 capability, node name, or task text. Routes without a declared compute stage
-retain their ordinary execution access.
+retain their ordinary execution access. The `host-process` need is a separate
+vocabulary entry for a GPU-free resource payload: it grants no compute-host
+storage or GPU scope and only selects that node's payload launch.
 
 Before approval, choose from compact manifest routing metadata and §0.2; do not
 load the full entry Skill body or its references merely to propose a route. At
@@ -1068,7 +1070,16 @@ blocks verification.
 A supervised route owner starts its ordinary detached resource through the same
 runner. A sandboxed Codex owner tool records only the exact launch intent;
 its outer controller owns the observable watch and exit wrapper, and runs the
-payload with the owner's selected native sandbox. Intent admission is not a
+payload with the owner's selected native sandbox. A GPU-free long-running host
+measurement, benchmark, browser test or memory-capped command borrows
+`autopilot-lab:host-run` (`execution_needs: host-process`, a detached supervised
+resource-runner with no GPU lease, start approval or smoke attestation): the
+Codex owner and its model children stay at their ordinary `workspace-write`, and
+only that registered node's controller-built payload command runs as a host
+process, so a payload-level `systemd-run --user --scope -p MemoryMax=… -p
+MemorySwapMax=0` can reach the user manager. A caller or forced sandbox keeps
+precedence, and an already delivered strict `os-sandbox` request is refused at
+start instead of being weakened; no new gate, approval or input is added. Intent admission is not a
 payload start. An exact controller-owned wrapper awaiting its parent's reap is
 nonterminal; an independent watch cannot settle it from empty cmdline or sentinel
 alone. Other runner paths retain their existing launch boundary. The

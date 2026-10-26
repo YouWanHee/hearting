@@ -134,6 +134,8 @@ created: {YYYY-MM-DD}
 
 For GPU measurements or training in a code route, place the work in a borrowed compute part such as `autopilot-lab:smoke` or `autopilot-lab:full-run`.
 
+For a GPU-free long measurement, benchmark, browser test or memory-capped command, borrow `autopilot-lab:host-run` after the preparing stage and before the model verify/report successor (`execute,autopilot-lab:host-run,test,report`). It adds no gate, question or input; the payload command owns its memory cap.
+
 - **Produce the direction brief only** — no plan steps, no implementation, no
   source edits. Section 8 names which parts run in which order, not what each
   part does. Plan decomposition belongs to the planning stage of whichever route

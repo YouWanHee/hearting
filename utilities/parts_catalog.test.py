@@ -33,6 +33,8 @@ def _load(name, filename):
 T = _load("producer_test_for_sd165", "artifact_producer.test.py")
 R, P, TOPO = T.R, T.P, T.R.TOPO
 import dispatch_stage_advance as ADVANCE  # noqa: E402
+import execution_access as EA  # noqa: E402
+import gpu_execution_sandbox as G  # noqa: E402
 
 GOLDEN = HERE / "fixtures" / "sd165-route-golden.json"
 GPU_EVAL_ADVISORY = (
@@ -423,6 +425,7 @@ RETRIEVAL = "shards/parts/autopilot-research/retrieval/shards/retrieval/**"
 AUDIT_BORROW = "inspect,autopilot-research:retrieval,autopilot-research:synthesis,report"
 LAB_EVAL_PARTS = "eval-spec,eval-smoke,eval-run,metrics,diagnose,report"
 CODE_RESOURCE = "execute,autopilot-lab:smoke,autopilot-lab:full-run,test,report"
+CODE_HOST = "execute,autopilot-lab:host-run,test,report"
 
 
 class BorrowTest(CatalogBase):
@@ -716,11 +719,11 @@ class StagesTest(unittest.TestCase):
             "autopilot-apply:handback": "handback",
             "autopilot-refine:transaction": "preview"})
         self.assertEqual(sorted(part for part, node in parts.items() if node["shareable"]), [
-            "autopilot-lab:diagnose", "autopilot-lab:full-run", "autopilot-lab:smoke",
-            "autopilot-research:retrieval", "autopilot-research:synthesis"])
+            "autopilot-lab:diagnose", "autopilot-lab:full-run", "autopilot-lab:host-run",
+            "autopilot-lab:smoke", "autopilot-research:retrieval", "autopilot-research:synthesis"])
         self.assertEqual(sorted(part for part, node in parts.items() if node["optional"]), [
             "autopilot-lab:diagnose", "autopilot-lab:eval-smoke", "autopilot-lab:eval-spec",
-            "autopilot-lab:resume-run"])
+            "autopilot-lab:host-run", "autopilot-lab:resume-run"])
         self.assertFalse(parts["autopilot-code:execute"]["shareable"])
         self.assertEqual(parts["autopilot-lab:metrics"]["unit_choices"], ["material/data-script", "qa/ml-debug"])
         self.assertEqual(parts["audit:report"]["unit_choices"], ["editorial/polish", "research/research-survey"])
@@ -744,8 +747,11 @@ class StagesTest(unittest.TestCase):
         parts = registry["part_catalog"]["parts"]
         expected = {f"autopilot-lab:{stage}" for stage in (
             "smoke", "full-run", "run-verify", "eval-run", "eval-smoke", "resume-run")}
-        actual = {part for part, row in parts.items() if row.get("execution_needs")}
+        actual = {part for part, row in parts.items() if "compute-hosts" in (row.get("execution_needs") or [])}
         self.assertEqual(actual, expected)
+        self.assertEqual({part for part, row in parts.items() if row.get("execution_needs")},
+                         expected | {"autopilot-lab:host-run"})
+        self.assertEqual(parts["autopilot-lab:host-run"]["execution_needs"], ["host-process"])
         for recipe in registry["recipes"]:
             for node in recipe["standard_plus"]["nodes"]:
                 self.assertNotIn("execution_needs", node)
@@ -811,6 +817,65 @@ class ResourceShareTest(CatalogBase):
         card = R.compose_card(route)
         self.assertIn("빌린 부품 autopilot-lab:smoke·autopilot-lab:full-run", card)
         self.assertIn("시작 승인 full-run (autopilot-lab:full-run)", card)
+
+    def test_code_route_borrows_the_gpu_free_host_run(self):
+        route = self.compose(graph=CODE_HOST)
+        R.verify_route(route, R.ROOT)
+        host = self.node(route, "autopilot-lab-host-run")
+        self.assertEqual((host["kind"], host["unit"], host["resource_transport"], host["resource_class"]),
+                         ("resource-runner", "_kernel/resource", "detached-process", "long-running"))
+        self.assertEqual(host["continuation"], {"kind": "supervised"})
+        self.assertEqual(host["completion_gate"], "resource-exit")
+        self.assertEqual(host["write_scope"], [
+            "parts/autopilot-lab/host-run/run.json", "parts/autopilot-lab/host-run/logs/**",
+            "parts/autopilot-lab/host-run/raw-results/**"])
+        self.assertEqual(host["outputs"], [
+            "parts/autopilot-lab/host-run/run.json", "parts/autopilot-lab/host-run/logs/**"])
+        for key in ("start_approval", "resource_policy"):
+            self.assertNotIn(key, host)
+        # No new gate, approval, or compute claim: only the model-bound check after it reads the result.
+        self.assertEqual(route["human_gates"], [])
+        self.assertEqual(route["human_gate_bindings"], [])
+        self.assertEqual(R.route_start_approvals(route), [])
+        self.assertEqual(self.node(route, "test")["inputs"], [
+            "source-diff", "parts/autopilot-lab/host-run/run.json", "parts/autopilot-lab/host-run/logs/**"])
+        self.assertFalse(EA.compute_execution_scope(route, node=host["id"], owner=False))
+        self.assertTrue(EA.execution_need_scope(route, "host-process", node=host["id"], owner=False))
+        # Compose seals only GPU routes; the host choice reads the typed part, never a GPU target.
+        self.assertNotIn("codex_execution_sandbox", route)
+        self.assertEqual(G.gpu_resource_nodes(route), [])
+        self.assertEqual(G.host_payload_nodes(route), [host["id"]])
+        choice = G.select_fresh(route)
+        self.assertEqual((choice["sandbox"], choice["gpu_scope"]), ("workspace-write", False))
+        self.assertEqual(G.select_fresh(route, owner=False, node=host["id"])["sandbox"], "workspace-write")
+        self.assertIn("빌린 부품 autopilot-lab:host-run", R.compose_card(route))
+        self.assertNotIn("시작 승인", R.compose_card(route))
+
+    def test_a_new_gpu_and_host_route_seals_both_target_sets(self):
+        route = self.compose(graph="execute,autopilot-lab:smoke,autopilot-lab:full-run,"
+                                   "autopilot-lab:host-run,test,report")
+        sealed = route["codex_execution_sandbox"]
+        self.assertEqual(sealed["host_process_payload_nodes"], ["autopilot-lab-host-run"])
+        self.assertEqual(sealed["gpu_resource_nodes"], ["autopilot-lab-smoke", "autopilot-lab-full-run"])
+        self.assertNotIn("autopilot-lab-host-run", sealed["gpu_resource_nodes"])
+        self.assertEqual(G.host_payload_nodes(route), ["autopilot-lab-host-run"])
+        self.assertEqual(G.gpu_resource_nodes(route), sealed["gpu_resource_nodes"])
+
+    def test_lab_setup_and_eval_graphs_assemble_the_host_run(self):
+        for mode, graph, successor in (
+            ("setup", "scaffold,host-run,run-verify,handoff", "run-verify"),
+            ("eval", "host-run,metrics,report,independent-verify", "metrics"),
+        ):
+            route = self.compose("autopilot-lab", mode, graph)
+            R.verify_route(route, R.ROOT)
+            host = self.node(route, "host-run")
+            self.assertEqual((host["kind"], host["resource_transport"], host["continuation"]),
+                             ("resource-runner", "detached-process", {"kind": "supervised"}), mode)
+            self.assertEqual(self.node(route, successor)["depends_on"][-1], "host-run", mode)
+            self.assertNotIn("start_approval", host)
+            self.assertEqual(G.host_payload_nodes(route), ["host-run"], mode)
+            self.assertNotIn("host-run", G.gpu_resource_nodes(route), mode)
+            self.assertFalse(EA.compute_execution_scope(route, node="host-run", owner=False), mode)
 
     def test_host_parts_show_start_approval_and_unmarked_routes_do_not(self):
         for capability, mode, mark, part in (
