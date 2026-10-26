@@ -718,21 +718,27 @@ def seat_ledger_readonly_scope():
 def _invalidate_ledger_read(seat: Seat) -> None:
     scope = _LEDGER_READ_SCOPE.get()
     if scope is not None:
-        for path in (_ledger_path(seat), _physical_ledger_path(seat)):
+        for path in (_native_ledger_path(seat), _physical_ledger_path(seat)):
             key = os.fspath(path)
             scope.pop(key, None)
             scope.pop(key + "#lineage", None)
-
-def _ledger_path(seat: Seat) -> Path:
-    return state_root() / "sessions" / f"{seat_state_key(seat)}.jsonl"
-
 
 def _physical_ledger_path(seat: Seat) -> Path:
     return state_root() / "sessions" / f"{seat.key}.jsonl"
 
 
+def _ledger_path(seat: Seat) -> Path:
+    """Keep the shared legacy ledger boundary addressed to its physical seat."""
+    return _physical_ledger_path(seat)
+
+
+def _native_ledger_path(seat: Seat) -> Path:
+    """Return the exact logical ledger used by this module's native session state."""
+    return state_root() / "sessions" / f"{seat_state_key(seat)}.jsonl"
+
+
 def _read_ledger_lines(seat: Seat, *, include_physical_relations: bool = True) -> list[dict]:
-    path = _ledger_path(seat)
+    path = _native_ledger_path(seat)
     physical = _physical_ledger_path(seat)
     scope = _LEDGER_READ_SCOPE.get()
     read_only = _LEDGER_READ_ONLY.get()
@@ -775,13 +781,12 @@ def _append_ledger_entry(seat: Seat, entry: dict) -> None:
     harness, sid = str(entry.get("harness") or ""), str(entry.get("sid") or "")
     if _native_session_key(harness, sid):
         seat = session_seat(seat, harness, sid)
-    paths = [_ledger_path(seat)]
+    paths = [_native_ledger_path(seat)]
     physical = _physical_ledger_path(seat)
     if physical != paths[0]:
         paths.append(physical)
     encoded = (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-    transition = (entry.get("event") in {"handover", "succession"}
-                  and isinstance(entry.get("snapshot_id"), str) and bool(entry.get("snapshot_id")))
+    transition = entry.get("event") in {"handover", "succession"}
     for path in paths:
         ensure_dir(path.parent)
         _reject_symlink(path)
@@ -810,7 +815,7 @@ def _append_ledger_entry(seat: Seat, entry: dict) -> None:
             os.close(fd)
     _invalidate_ledger_read(seat)
     _fold_ledger(seat)
-    if physical != _ledger_path(seat):
+    if physical != _native_ledger_path(seat):
         _fold_ledger(physical_seat(seat))
 
 
@@ -1529,7 +1534,15 @@ def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str 
 
 def _fold_ledger(seat: Seat) -> None:
     """Keep the ledger small: old sessions become one summary line each."""
-    lines = _read_ledger_lines(seat, include_physical_relations=False)
+    native_path = _native_ledger_path(seat)
+    physical_path = _physical_ledger_path(seat)
+    if native_path == physical_path:
+        # Physical-seat folding reads one existing ledger and preserves the
+        # unary reader contract used by its observers.
+        lines = _read_ledger_lines(seat)
+    else:
+        # A native ledger is distinct from its physical relation projection.
+        lines = _read_ledger_lines(seat, include_physical_relations=False)
     if len(lines) <= LEDGER_FOLD_LINES:
         return
     # Registered handovers keep the existing bounded retention. Steward lineage is
@@ -1618,7 +1631,7 @@ def _fold_ledger(seat: Seat) -> None:
                     for r in list(folded.values()) + relations + provenance
                     + list(native_addresses.values()) + recent)
     try:
-        atomic_write(_ledger_path(seat), body.encode("utf-8"))
+        atomic_write(native_path, body.encode("utf-8"))
     finally:
         _invalidate_ledger_read(seat)
 
@@ -1834,7 +1847,7 @@ def prepare_native_session_state(seat: Seat) -> bool:
             if exact or targeted:
                 rows.append(row)
         if rows:
-            ledger_target = _ledger_path(seat)
+            ledger_target = _native_ledger_path(seat)
             atomic_write(ledger_target, b"".join(
                 (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
                 for row in rows))
@@ -2606,9 +2619,8 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                 import dispatch_seat_handover as handover
                 handed = handover.record_locked(seat, harness, sid, event, source, now)
                 if handed:
-                    # The handover writer commits its lineage row to the logical ledger.
-                    # Keep that same confirmed edge in the existing physical seat ledger
-                    # so current seat-scoped readers retain the original provenance.
+                    # Keep the shared writer's confirmed edge in this exact native ledger
+                    # as well as its physical seat ledger for current seat-scoped readers.
                     _append_ledger_entry(physical_seat(seat), handed)
         epoch = int(row.get("epoch", 0) or 0)
         parts: list[str] = []
