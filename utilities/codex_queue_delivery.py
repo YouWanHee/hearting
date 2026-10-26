@@ -387,13 +387,13 @@ class DeliverySession:
             self.path = endpoint
             raise QueueDeliveryError("queue-session-endpoint-changed")
         if self.client is None:
-            self.client = _connect(endpoint, timeout, deadline=deadline)
+            self.client = _connect(endpoint, timeout, **_deadline_kwargs(deadline))
         client = self.client
         client.timeout = timeout
         client.deadline = deadline
         client.socket.settimeout(_rpc_timeout(timeout, deadline))
         try:
-            return client.request(method, params, deadline=deadline)
+            return client.request(method, params, **_deadline_kwargs(deadline))
         except QueueDeliveryError as exc:
             if not exc.reason.startswith("queue-rpc-refused:"):
                 self.close()
@@ -409,15 +409,20 @@ def _session_kwargs(session):
     return {"session": session} if session is not None else {}
 
 
+def _deadline_kwargs(deadline):
+    # Callers without a deadline keep the original call shape.
+    return {"deadline": deadline} if deadline is not None else {}
+
+
 def _rpc(path: Path, method: str, params: dict[str, Any], *, timeout: float,
          session: DeliverySession | None = None,
          deadline: float | None = None) -> dict[str, Any]:
     if session is not None:
         return session.request(path, method, params, timeout=timeout,
-                               deadline=deadline)
-    client = _connect(path, timeout, deadline=deadline)
+                               **_deadline_kwargs(deadline))
+    client = _connect(path, timeout, **_deadline_kwargs(deadline))
     try:
-        return client.request(method, params, deadline=deadline)
+        return client.request(method, params, **_deadline_kwargs(deadline))
     except QueueDeliveryError as exc:
         if exc.ambiguous:
             raise
@@ -451,7 +456,7 @@ def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0,
             params["cursor"] = cursor
         response = _rpc(path, "thread/queue/list", params,
                         timeout=_rpc_timeout(timeout, deadline),
-                        **_session_kwargs(session), deadline=deadline)
+                        **_session_kwargs(session), **_deadline_kwargs(deadline))
         page = response.get("data")
         if not isinstance(page, list):
             raise QueueDeliveryError("queue-list-response-invalid")
@@ -473,7 +478,7 @@ def delete_queue_item(path: Path, thread_id: str, submission_id: str, *,
     result = _rpc(path, "thread/queue/delete", {
         "threadId": thread_id, "queuedSubmissionId": submission_id,
     }, timeout=_rpc_timeout(timeout, deadline),
-                  **_session_kwargs(session), deadline=deadline)
+                  **_session_kwargs(session), **_deadline_kwargs(deadline))
     deleted = result.get("deleted")
     if not isinstance(deleted, bool):
         raise QueueDeliveryError("queue-delete-response-invalid")

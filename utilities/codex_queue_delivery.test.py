@@ -341,7 +341,7 @@ class QueueDeliveryTest(unittest.TestCase):
                                  {"first": True})
                 self.assertEqual(QUEUE._rpc(SOCKET, "thread/queue/list", {}, timeout=1, session=session),
                                  {"second": True})
-        connect.assert_called_once_with(SOCKET, 1, deadline=None)
+        connect.assert_called_once_with(SOCKET, 1)
         self.assertEqual(client.request.call_count, 2)
         client.close.assert_called_once()
 
