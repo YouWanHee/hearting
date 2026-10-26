@@ -220,12 +220,10 @@ def _log(run_dir: Path, text: str) -> None:
 
 
 def _card_seat(item: dict) -> "st.Seat":
-    """Restore the project author's card identity, including for older queue rows."""
-    seat = st.Seat(**item["seat"])
-    if seat.kind == "project":
-        return dataclasses.replace(seat, harness=item.get("harness") or seat.harness,
-                                       sid=item.get("sid") or seat.sid)
-    return seat
+    """Restore the exact logical author beside the queue's unchanged physical seat."""
+    seat = st.seat_from_dict(item["seat"])
+    return st.session_seat(seat, item.get("harness") or seat.harness,
+                           item.get("sid") or seat.sid)
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +285,7 @@ def enqueue_item(seat: "st.Seat", harness: str, sid: str, cwd: str, transcript: 
         existing = _existing_operation(operation_id)
         if existing:
             return _start_queued(existing) if start else existing
-    queue_seat = dataclasses.replace(seat, harness=harness, sid=sid) if seat.kind == "project" else seat
+    queue_seat = st.session_seat(seat, harness, sid)
     if queue_id is None and operation_id:
         queue_id = operation_queue_id(operation_id)
     if queue_id:
@@ -318,7 +316,8 @@ def reconcile_queued(seat: "st.Seat", harness: str, sid: str) -> int:
     for item in list_items():
         if item.get("status") not in UNFINISHED or (item.get("harness"), item.get("sid")) != (harness, sid):
             continue
-        if (item.get("seat") or {}).get("key") != seat.key:
+        if st.seat_state_key(_card_seat(item)) != st.seat_state_key(
+                st.session_seat(seat, harness, sid)):
             continue
         before = item.get("runner_start_error")
         started = _start_queued(item)
@@ -505,7 +504,7 @@ def _target_sessions(item: dict, seat) -> list:
         caller["transcript"] = str(located) if located else ""
     targets = [caller]
     try:
-        recent = tt.select_recent_sessions(seat, cwd=item["cwd"])
+        recent = tt.select_recent_sessions(st.physical_seat(seat), cwd=item["cwd"])
     except BaseException:  # noqa: BLE001
         recent = []
     for row in recent:
@@ -524,7 +523,7 @@ def _unread_entry(target: dict, chunk) -> dict:
 
 
 def assemble(item: dict, batch: str, run_dir: Path) -> Bundle:
-    seat = st.Seat(**item["seat"])
+    seat = st.physical_seat(st.seat_from_dict(item["seat"]))
     card_seat = _card_seat(item)
     project_key = st.project_key_for(item["cwd"])
     sessions, cursors, choices, skipped, unread = [], [], [], [], []
@@ -957,7 +956,9 @@ def advance_watermarks(bundle: Bundle) -> None:
 
 def notify(item: dict, text: str) -> None:
     with contextlib.suppress(BaseException):
-        st.write_notice(st.Seat(**item["seat"]), text, author_harness=item["harness"], author_sid=item["sid"])
+        stable = str(item.get("id") or item.get("operation_id") or "")
+        st.write_notice(_card_seat(item), text, author_harness=item["harness"],
+                        author_sid=item["sid"], notice_id=f"tidy:{stable}" if stable else "")
 
 
 def applied_writes(run_dir: Path) -> tuple:

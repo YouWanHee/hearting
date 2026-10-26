@@ -1042,6 +1042,54 @@ class WorkerHomes(unittest.TestCase):
         self.assertIn('profiles/code-report.yaml', (home / 'CLAUDE.md').read_text())
         self.assertEqual(json.loads((home / 'settings.json').read_text())['permissions']['deny'], ['Read(secret)'])
 
+    def test_claude_worker_root_resolves_hook_links_and_skips_memory_injection(self):
+        import re
+        import shlex
+
+        source_hooks = self.source / 'hooks'
+        source_hooks.symlink_to(ROOT / 'adapters/claude/hooks', target_is_directory=True)
+        (self.source / 'settings.json').write_bytes(
+            (ROOT / 'adapters/claude/settings.json').read_bytes()
+        )
+        source_env = {
+            **self.env, 'HOME': str(self.base), 'CLAUDE_CONFIG_DIR': str(self.source),
+            'AGENT_HOME': str(ROOT),
+        }
+        worker_env = prepare_worker_home(
+            ROOT, 'claude', 'stage', 'custom-config-hook-root',
+            env=source_env,
+            destination=self.base / 'worker-home',
+        )
+        home = Path(worker_env['CLAUDE_CONFIG_DIR'])
+        self.assertEqual((home / 'hooks').resolve(), source_hooks.resolve())
+        self.assertEqual({**source_env, **worker_env}['AGENT_HOME'], str(ROOT))
+
+        settings = json.loads((home / 'settings.json').read_text(encoding='utf-8'))
+        hook_commands = [hook['command'] for groups in settings['hooks'].values()
+                         for group in groups for hook in group.get('hooks', [])]
+        hook_root = '${CLAUDE_CONFIG_DIR:-$HOME/.claude}'
+        hook_paths = [match for command in hook_commands
+                      for match in re.findall(
+                          re.escape(hook_root) + r'/hooks/[^\s"\']+', command
+                      )]
+        self.assertEqual(len(hook_paths), 39)
+        for token in hook_paths:
+            path = Path(token.replace(hook_root, str(home), 1))
+            self.assertTrue(path.is_file(), path)
+            self.assertEqual(path.resolve(), (source_hooks / path.name).resolve())
+
+        memory_commands = [command for command in hook_commands if 'tools/memory/mem.py' in command]
+        self.assertEqual(len(memory_commands), 1)
+        argv = shlex.split(memory_commands[0])
+        self.assertEqual(argv[:2], ['sh', '-c'])
+        self.assertFalse((home / 'tools/memory/mem.py').exists())
+        result = subprocess.run(
+            ['/bin/sh', '-c', argv[2]],
+            env={**os.environ, **source_env, **worker_env, 'AGENT_SESSION_ROLE': 'worker'},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '', ''))
+
     def test_opencode_isolation_keeps_the_user_inventory_through_descendants(self):
         config = self.base / 'user-config'
         inventory = config / 'hearting/compute-hosts.yaml'
