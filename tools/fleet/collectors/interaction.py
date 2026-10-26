@@ -20,14 +20,13 @@ def enrich(sess, now=None):
     )
     if not record:
         return
-    current = time.time() if now is None else float(now)
-    if current - float(record["waiting_since"]) >= 7 * 86400:
-        return
     candidate = {
         "kind": record["kind"],
         "source": record["source"],
         "waiting_since": record["waiting_since"],
     }
+    candidate.update({key: record[key] for key in ("request_id", "turn_id", "item_id")
+                      if key in record})
     existing = getattr(sess, "interaction_state", None)
     priorities = {"codex-appserver": 2, "codex-rollout": 1}
     if isinstance(existing, dict):

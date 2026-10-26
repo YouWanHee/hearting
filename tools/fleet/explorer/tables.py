@@ -1,4 +1,5 @@
 """Overview and list-view tables for the immutable explorer projection."""
+from collections.abc import Mapping
 from .grid import CellGrid
 
 X = 34
@@ -772,14 +773,19 @@ def draw_routes(grid, vm, state, x=34, y=3):
 def draw_questions(grid, vm, state, x=34, y=3):
     use = max(0, grid.cols - x - 2)
     right, bottom = x + use + 1, grid.rows - 5
-    questions = tuple(vm.questions or ())
+    all_questions = tuple(vm.questions or ())
+    current_questions = tuple(item for item in all_questions if not item.get("older"))
+    older_questions = tuple(item for item in all_questions if item.get("older"))
+    older_open = state.opened_for("qolder:QUESTIONS", "") == "open"
+    questions = current_questions + (older_questions if older_open else ())
     system = vm.system if hasattr(vm.system, "get") else {}
     waits = system.get("answer_waits") if hasattr(system, "get") else None
     if not hasattr(waits, "get"):
-        waits = {"state": "complete", "total": len(questions), "older": 0}
+        waits = {"state": "complete", "total": len(current_questions), "older": len(older_questions)}
     known = waits.get("state") == "complete"
     total = waits.get("total") if known else None
     older = waits.get("older") if known else None
+    older_count = len(older_questions)
     grid.put(x, y, "── ", "line")
     cursor = grid.put(x + 3, y, "WAITING", "sect")
     cursor = grid.put(cursor, y, "  " + (str(total) if total is not None else "?") + " question" +
@@ -805,15 +811,35 @@ def draw_questions(grid, vm, state, x=34, y=3):
         grid.put(x + off, y, name, "head", tint=234, limit=right)
     y += 1
     closed = state.opened_for("qshut:" + state.view, "")
+    selected = state.opened_for("qsel:QUESTIONS", "")
+    overlay = getattr(state, "question_overlay", None)
+    overlay = overlay if hasattr(overlay, "get") else {}
+    older_heading_drawn = False
     for question in questions:
         if y >= bottom:
             grid.put(right - 18, bottom, "↓ more below", "dim", limit=right)
             return
+        if question.get("older") and not older_heading_drawn:
+            grid.put(x + 3, y, f"OLDER WAITS · {older_count}", "sect", limit=right)
+            toggle = "[ hide ]"
+            end = grid.put(right - len(toggle), y, toggle, "hearting", limit=right)
+            grid.add_hit(y, right - len(toggle), end, ("question.older.toggle",))
+            grid.add_hit(y, x, right, ("question.older.toggle",))
+            y += 1
+            older_heading_drawn = True
+            if y >= bottom:
+                return
         tag = str(question.get("tag") or "·")
         tag_text = _clip(tag, 5)
         tag_x = x + 4
         is_open = closed != tag
-        grid.add_hit(y, x, right, ("fold", "qshut:" + state.view, tag))
+        current_ref = question.get("ref")
+        can_select = (isinstance(current_ref, Mapping)
+                      and all(current_ref.get(key) for key in ("id", "harness", "session_id")))
+        grid.add_hit(y, x, x + 2 if can_select else right,
+                     ("fold", "qshut:" + state.view, tag))
+        if can_select:
+            grid.add_hit(y, x + 2, right, ("question.select", tag, current_ref))
         if is_open:
             grid.fill(x - 1, right, y, " ", tint=236)
             grid.put(x, y, "▶", "soft")
@@ -843,6 +869,8 @@ def draw_questions(grid, vm, state, x=34, y=3):
         row_label = question.get("session_tag") or question.get("title") or "·"
         grid.put(x + session_x, y, _clip(str(row_label),
                                          use - session_x), "hb_" + harness)
+        if tag == selected:
+            grid.put(x, y, "◆", "hearting")
         if is_open:
             _tint_row(grid, y, x - 1, right, 236)
         y += 1
@@ -884,7 +912,196 @@ def draw_questions(grid, vm, state, x=34, y=3):
         y += 1
         grid.put(x + 10, y, "answer:", "label")
         grid.put(x + 20, y, "⏎", "hearting")
-        grid.put(x + 21, y, " go to its pane and answer there", "dim", limit=x + use)
+        guide = (" select to answer here · open ▸ native fallback" if can_select
+                 else " go to its pane and answer there")
+        grid.put(x + 21, y, guide, "dim", limit=x + use)
+        y += 1
+        current_ref = question.get("ref")
+        overlay_ref = overlay.get("ref")
+        same_request = (hasattr(current_ref, "get") and hasattr(overlay_ref, "get")
+                        and overlay_ref.get("id") == question.get("id")
+                        and all(current_ref.get(key) == overlay_ref.get(key)
+                                for key in ("harness", "session_id", "request_id", "turn_id",
+                                            "route_id", "question_id")))
+        private = overlay if tag == selected and same_request else None
+        if private:
+            detail = private.get("detail")
+            envelope = detail if hasattr(detail, "get") else {}
+            from .state import question_items
+            question_specs = question_items(envelope)
+            kind = str(envelope.get("kind") or "").lower()
+            approval = ("approval" in kind or "permission" in kind or
+                        any(word in kind for word in ("commandexecution", "filechange")))
+            private_detail = envelope.get("detail") if envelope.get("state") != "unknown" else None
+            content_x = x + (10 if narrow else 20)
+            if question_specs and not approval:
+                detail_lines = []
+            elif isinstance(private_detail, dict) or hasattr(private_detail, "items"):
+                detail_lines = []
+                for name, value in list(private_detail.items())[:12]:
+                    if str(name).replace("_", "").casefold() in {
+                            "availabledecisions", "threadid", "turnid", "itemid", "requestid",
+                            "sessionid", "questionid", "isblocking", "autoresolutionms"}:
+                        continue
+                    label = str(name).replace("_", " ") + ": "
+                    if isinstance(value, (str, int, float)):
+                        detail_lines.append(label + str(value))
+                    elif isinstance(value, (list, tuple)):
+                        import json
+                        detail_lines.append(label + json.dumps(value, ensure_ascii=False))
+                    elif isinstance(value, Mapping):
+                        import json
+                        detail_lines.append(label + json.dumps(dict(value), ensure_ascii=False,
+                                                               sort_keys=True))
+            elif isinstance(private_detail, (str, int, float)):
+                detail_lines = [str(private_detail)]
+            else:
+                detail_lines = []
+            for line in detail_lines:
+                for wrapped in _wrap(line, max(1, right - content_x)):
+                    if y >= bottom:
+                        break
+                    if not narrow:
+                        grid.put(x + 10, y, "detail:", "label")
+                    grid.put(content_x, y, wrapped, "soft", limit=right)
+                    y += 1
+            status = str(private.get("status") or private.get("state") or "")
+            if status and y < bottom:
+                if narrow:
+                    grid.put(x + 10, y, _clip("status: " + status, max(1, right - x - 10)),
+                             "lvl_y" if private.get("state") in ("unknown", "expired", "cancelled")
+                             else "dim", limit=right)
+                else:
+                    grid.put(x + 10, y, "status:", "label")
+                    grid.put(x + 20, y, _clip(status, max(1, use - 20)),
+                             "lvl_y" if private.get("state") in ("unknown", "expired", "cancelled")
+                             else "dim", limit=right)
+                y += 1
+            request_state = str(private.get("state") or envelope.get("state") or "unknown")
+            request_state = (request_state if envelope.get("state") == request_state else "unknown")
+            from .state import (question_action_supported, question_answer_supported,
+                                question_choice_click_allowed, question_decisions,
+                                question_free_text_available, question_multiple_select,
+                                question_values_valid)
+            supported = question_action_supported(envelope)
+            if request_state == "open" and supported and approval and y < bottom:
+                for decision in question_decisions(envelope):
+                    cursor = x + 10
+                    label = "[ " + decision + " ]"
+                    end = grid.put(cursor, y, label, "hearting" if decision != "defer" else "dim",
+                                   limit=right)
+                    if end > cursor:
+                        grid.add_hit(y, cursor, end, ("question.decision", decision))
+                    y += 1
+                    if y >= bottom:
+                        break
+            elif not approval and question_specs:
+                draft = private.get("draft")
+                answers = draft.get("answers", {}) if hasattr(draft, "get") else {}
+                can_answer = question_answer_supported(envelope)
+                complete = True
+                for index, question_spec in enumerate(question_specs, 1):
+                    qid = question_spec["id"]
+                    prompt = (question_spec.get("question") or question_spec.get("prompt")
+                              or question_spec.get("header") or question_spec.get("title")
+                              or question_spec.get("text") or "Question")
+                    if hasattr(prompt, "get"):
+                        prompt = prompt.get("text") or prompt.get("question") or "Question"
+                    prompt_lines = _wrap(str(prompt), max(1, right - (x + 20)))
+                    if y < bottom:
+                        grid.put(x + 10, y, f"Q{index}:", "label")
+                        grid.put(x + 20, y, prompt_lines[0] if prompt_lines else "Question",
+                                 "soft", limit=right)
+                        y += 1
+                    for extra_line in prompt_lines[1:]:
+                        if y >= bottom:
+                            break
+                        grid.put(x + 20, y, extra_line, "soft", limit=right)
+                        y += 1
+                    choices = question_spec.get("choices", question_spec.get("options", ()))
+                    values = answers.get(qid, ()) if hasattr(answers, "get") else ()
+                    values = tuple(values) if isinstance(values, (list, tuple)) else ()
+                    multi_select = question_multiple_select(envelope, qid)
+                    choice_labels = {}
+                    for choice in choices if isinstance(choices, (list, tuple)) else ():
+                        if isinstance(choice, Mapping):
+                            value = choice.get("value")
+                            if value is None:
+                                value = choice.get("label", choice.get("text"))
+                            label = choice.get("label") or choice.get("text") or value
+                        else:
+                            value = label = choice
+                        if not isinstance(value, str) or not value:
+                            continue
+                        choice_labels[value] = label if isinstance(label, str) else value
+                        if y >= bottom:
+                            break
+                        cursor = x + 20
+                        selected_choice = value in values
+                        shown = ("[" + ("x" if selected_choice else " ") + "] "
+                                 + str(label if isinstance(label, str) else value)
+                                 if multi_select else
+                                 "[ " + str(label if isinstance(label, str) else value) + " ]")
+                        selectable = (can_answer and request_state == "open"
+                                      and question_choice_click_allowed(
+                                          envelope, qid, value, values))
+                        end = grid.put(cursor, y, shown,
+                                       "hearting" if selectable else
+                                       "soft" if selected_choice else "dim",
+                                       limit=right)
+                        if selectable and end > cursor:
+                            grid.add_hit(y, cursor, end, ("question.choice", qid, value))
+                        y += 1
+                    answer_text = " · ".join(str(value) for value in values) if values else ""
+                    display_answer = " · ".join(choice_labels.get(value, value)
+                                                for value in values)
+                    if question_spec.get("is_secret") or question_spec.get("isSecret"):
+                        answer_text = "•" * min(len(answer_text), 32)
+                        display_answer = "•" * min(len(display_answer), 32)
+                    if not question_values_valid(envelope, qid, values):
+                        complete = False
+                    if (y < bottom and question_free_text_available(envelope, qid, values)):
+                        label = "answer: " + (answer_text or "press e or click to type")
+                        end = grid.put(x + 10, y, _clip(label, max(0, right - x - 10)),
+                                       "soft", limit=right)
+                        if can_answer and request_state == "open":
+                            grid.add_hit(y, x + 10, max(x + 11, end),
+                                         ("question.edit", qid))
+                        y += 1
+                    elif display_answer and y < bottom:
+                        grid.put(x + 10, y, _clip("selected: " + display_answer,
+                                                  max(0, right - x - 10)), "soft", limit=right)
+                        y += 1
+                no_native_input = any(
+                    not question_free_text_available(envelope, item["id"],
+                        answers.get(item["id"], ()) if hasattr(answers, "get") else ())
+                    and not (item.get("choices", item.get("options")))
+                    for item in question_specs)
+                if (not can_answer or no_native_input) and y < bottom:
+                    fallback = ("Multiple question response is unavailable; use the native prompt."
+                                if len(question_specs) > 1 else
+                                "No native answer input is available; use the native prompt.")
+                    grid.put(x + 10, y, fallback, "dim", limit=right)
+                    y += 1
+                elif (complete and can_answer and request_state == "open"
+                      and not private.get("pending") and y < bottom):
+                    label = "[ submit answer ]"
+                    end = grid.put(x + 10, y, label, "hearting", limit=right)
+                    grid.add_hit(y, x + 10, end, ("question.submit",))
+                    y += 1
+            elif request_state == "open" and approval and y < bottom:
+                grid.put(x + 10, y, "Approval response unavailable; use the native prompt.",
+                         "dim", limit=right)
+                y += 1
+            if y < bottom and private.get("editing"):
+                grid.put(x + 10, y, "typing · Enter submits · Esc pauses", "dim", limit=right)
+                y += 1
+    if older_count > 0 and not older_heading_drawn:
+        label = f"OLDER WAITS · {older_count}"
+        grid.put(x + 3, y, label, "sect", limit=right)
+        toggle = "[ show ]" if not older_open else "[ hide ]"
+        end = grid.put(right - len(toggle), y, toggle, "hearting", limit=right)
+        grid.add_hit(y, right - len(toggle), end, ("question.older.toggle",))
         y += 1
     y += 1
     answered = tuple(vm.answered or ())
