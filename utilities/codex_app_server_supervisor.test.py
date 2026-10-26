@@ -656,6 +656,11 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                 command,selection=module.resource_sandbox_command(args,row)
                 self.assertEqual(command[command.index("-P")+1],"hearting_linked_commit")
                 self.assertEqual(selection["enforcement"],"os-sandbox")
+            # An invalid caller value stays on the owner profile; the runner start check refuses it.
+            with mock.patch.dict(os.environ,{"CODEX_DISPATCH_SANDBOX_FORCE":"bogus"}):
+                command,selection=module.resource_sandbox_command(args,row)
+                self.assertEqual(command[command.index("-P")+1],"hearting_linked_commit")
+                self.assertEqual(selection["enforcement"],"os-sandbox")
             # The builder never raises for access; the runner start check settles a strict request.
             request=self.base/"access-request.json"
             request.write_text(json.dumps({"schema_version":1,"writable_roots":[],"read_roots":[],

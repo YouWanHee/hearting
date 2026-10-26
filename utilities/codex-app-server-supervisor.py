@@ -840,8 +840,8 @@ def configure_permission_profiles(args: argparse.Namespace, command: list[str]) 
 def host_payload_selection(row):
     """The payload-only choice of a sealed host node; None leaves the owner's policy in force.
 
-    Never raises for access: the runner's own start check refuses a strict request, so a refusal
-    settles the queued row instead of escaping the controller before the runner can."""
+    Never raises: the runner's own start check refuses a strict request or an invalid caller
+    sandbox, so a refusal settles the queued row instead of escaping the controller first."""
     route_path, node = row.get("route"), row.get("node")
     if not route_path or not node:
         return None
@@ -852,7 +852,10 @@ def host_payload_selection(row):
     if not isinstance(route, dict):
         return None
     import gpu_execution_sandbox as SANDBOX
-    return SANDBOX.select_payload(route, node=node)
+    try:
+        return SANDBOX.select_payload(route, node=node)
+    except ValueError:
+        return None
 
 
 def resource_sandbox_command(args, row):
