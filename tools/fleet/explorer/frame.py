@@ -263,6 +263,8 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
         shift = 1 + pushed_rows
         keep_start = max(0, content_top - shift + offset)
         keep_end = max(keep_start, body_end - shift + offset)
+        # Each page is a separate logical canvas, not a repaint of the sidebar.
+        grid.mark_moved()
         page, overflow = _page_canvas(vm, state, int(cols), logical_rows, pane_x,
                                       (keep_start, keep_end), complete_page)
         overflow = overflow or page.page_incomplete
@@ -288,7 +290,7 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
     shift = 1 + pushed_rows
     for dest_y in range(content_top, body_end):
         source_y = dest_y - shift + effective
-        if 0 <= source_y < page.rows:
+        if 0 <= source_y < page.rows and pane_x < grid.cols:
             grid.cells[dest_y][pane_x:] = page.cells[source_y][pane_x:]
             edge = grid.cells[dest_y][pane_x - 1]
             first = grid.cells[dest_y][pane_x]
@@ -301,6 +303,8 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
         if content_top <= screen_y < body_end:
             grid.hits.append(Hit(screen_y, hit.x0, hit.x1, hit.action))
     grid.hits = [hit for hit in grid.hits if hit.y < body_end or hit.y == -1]
+    # The page cells above were copied into their final viewport coordinates.
+    grid.mark_moved()
     chrome.draw_chrome(grid, vm, state, beat)
     if page.probe_overflow and body_end < grid.rows:
         grid.put(max(0, grid.cols - 18), body_end, " ↓ more below ", "dim", limit=grid.cols - 1)

@@ -554,9 +554,9 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
               ("u", "usage"), ("F", "feed"), ("q", "quit")]
     for key, label in legend:
         if x > 1:
-            x = grid.put(x, height - 2, " · ", "line")
-        x = grid.put(x, height - 2, key, "hearting")
-        x = grid.put(x + 1, height - 2, label, "dim")
+            x = grid.put(x, height - 2, " · ", "line", limit=width - 1)
+        x = grid.put(x, height - 2, key, "hearting", limit=width - 1)
+        x = grid.put(x + 1, height - 2, label, "dim", limit=width - 1)
     return grid
 
 

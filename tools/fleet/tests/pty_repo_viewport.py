@@ -472,7 +472,9 @@ class PtyRun:
         child_env["TERM"] = os.environ.get("TERM") or "xterm-256color"
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
         child_env["XDG_CONFIG_HOME"] = str(self.evidence_dir / "xdg-config")
-        if child_env.get("FLEET_PTY_DRAG") != "1" or not child_env.get("XDG_STATE_HOME"):
+        # An explicit fixture state root is shared across process restarts.
+        # A standalone invocation still gets its own isolated default.
+        if not child_env.get("XDG_STATE_HOME"):
             child_env["XDG_STATE_HOME"] = str(self.evidence_dir / "xdg-state")
         if self.live_capture:
             command = [sys.executable, str(TOOLS_DIR / "fleet" / "fleet.py"), "--explorer"]
