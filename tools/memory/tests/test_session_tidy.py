@@ -4008,8 +4008,9 @@ class ClearHelperTest(TidyCase):
             return clear.run_helper(seat.key, req["nonce"], wait=fake_wait, steward=fake_steward,
                                     sleep=lambda _s: None)
 
-    def notices(self, seat):
-        req = st.read_json(self.state / "clear" / f"{seat.key}.json")
+    def notices(self, seat, req=None):
+        if req is None:
+            req = st.read_json(self.state / "clear" / f"{seat.key}.json")
         self.assertIsInstance(req, dict, f"booking missing for {seat.key}")
         caller = st.session_seat(seat, req["harness"], req["sid"])
         with self.iso.patched_environ(self.extra):
@@ -4233,7 +4234,7 @@ class ClearHelperTest(TidyCase):
         with self.iso.patched_environ(self.extra):
             clear.cancel(seat)                                                        # then --no-clear
             self.assertEqual(clear.run_helper(seat.key, "whatever", wait=lambda *_a: "idle"), "superseded")
-        self.assertEqual(self.notices(seat), [])
+        self.assertEqual(self.notices(seat, req), [])
 
     def test_the_memory_notice_survives_and_the_clear_line_is_added_after_it(self):
         seat, req = self.booked()
