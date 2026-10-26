@@ -1465,7 +1465,8 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
         event_specs = []
         if notify_events and final:
             event_specs.append(("final", f"final:{identity}"))
-        elif notify_events and observation["attention"]:
+        if (notify_events and observation["attention"]
+                and (not final or source_signal_changed and source_observations)):
             attention_identity = [{key: item.get(key) for key in
                 ("kind", "metric", "epoch", "op", "threshold", "episode_id",
                  "generation", "since", "source_value_hash")}

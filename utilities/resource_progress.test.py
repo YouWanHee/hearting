@@ -1568,6 +1568,232 @@ class ExperimentObservationTest(unittest.TestCase):
                              ["checkpoint", "final"])
             self.assertTrue(terminal["available"])
 
+    def _terminal_source_fixture(self, root, *, run_id="counter-target"):
+        artifact = root / "artifact"
+        artifact.mkdir()
+        source = root / "writer" / "observation.json"
+        source.parent.mkdir()
+        registration = root / "proofs" / "writer-registration.json"
+        registration.parent.mkdir()
+        writer_proof = root / "proofs" / "writer.py"
+        registry = root / "registry.json"
+        registry.write_text("{}\n")
+        state = root / "runtime" / "observation.json"
+        state.parent.mkdir()
+        target_id, writer_id = run_id, "independent-writer"
+        registration.write_text(json.dumps({"target": target_id, "writer": writer_id,
+            "argv": ["writer", "--target", target_id]}))
+        writer_proof.write_bytes(b"def write_observation():\n    return True\n")
+        proof_raw = registration.read_bytes()
+        writer_raw = writer_proof.read_bytes()
+        binding = {"target_run_id": target_id, "row_key": "run",
+            "path": "/fixture/writer/observation.json", "writer_run_id": writer_id,
+            "timestamp_pointer": "/observed_at", "scope": "shared-results",
+            "counters": [{"name": "finished_items", "pointer": "/finished_items",
+                          "comparison_eligible": False}],
+            "proofs": [{"path": "/fixture/proofs/writer-registration.json",
+                "sha256": hashlib.sha256(proof_raw).hexdigest(),
+                "assertions": [{"pointer": "/target", "equals": target_id},
+                               {"pointer": "/writer", "equals": writer_id},
+                               {"pointer": "/argv/2", "equals": target_id}]},
+                {"path": "/fixture/proofs/writer.py",
+                 "sha256": hashlib.sha256(writer_raw).hexdigest(), "assertions": []}]}
+        run = {"run_id": target_id, "started_at": 100, "ended_at": 999,
+            "status": "succeeded", "artifact_root": str(artifact),
+            "route_id": "fixture-route", "path_namespace": {"/fixture": str(root)},
+            "observation": {"source_bindings": [binding]},
+            "owner_wait": {"harness": "codex", "session_id": "fixture-owner"}}
+
+        def write_source(value, observed_at):
+            source.write_text(json.dumps({"observed_at": observed_at,
+                                          "finished_items": value}))
+
+        return {"artifact": artifact, "binding": binding, "registry": registry,
+                "run": run, "source": source, "state": state,
+                "write_source": write_source}
+
+    @staticmethod
+    def _expected_source_attention_key(observation):
+        identity = [{key: item.get(key) for key in
+            ("kind", "metric", "epoch", "op", "threshold", "episode_id",
+             "generation", "since", "source_value_hash")}
+            for item in observation["attention"]]
+        digest = hashlib.sha256(json.dumps(identity, sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()[:16]
+        if observation["checkpoint_due"]:
+            return f"attention-checkpoint:run:{int(observation['due_checkpoint_at'])}:{digest}"
+        return f"attention:run:{digest}"
+
+    def test_final_source_change_creates_attention_and_preserves_pending_or_acked_final(self):
+        for final_receipt in ("pending", "acked"):
+            with self.subTest(final_receipt=final_receipt), tempfile.TemporaryDirectory() as tmp:
+                fixture = self._terminal_source_fixture(Path(tmp))
+                fixture["write_source"](21, 950)
+                notices = []
+
+                def send(*args, **kwargs):
+                    state = (final_receipt if kwargs["subject"].startswith("experiment final ")
+                             else "acked")
+                    notices.append({"args": args, **kwargs})
+                    return {"state": state}
+
+                def observe(value, observed_at, now):
+                    fixture["write_source"](value, observed_at)
+                    return progress.observe_experiment(fixture["run"], fixture["registry"], now,
+                        row_key="run", started_at=100, final=True, status="succeeded")
+
+                with mock.patch.object(progress, "_observation_state_path",
+                        return_value=fixture["state"]), \
+                        mock.patch("session_notice.notify", side_effect=send):
+                    first = observe(21, 950, 1000)
+                    first_state = progress._read_observation_state(fixture["state"])
+                    first_public = progress.read_public_run_record(
+                        fixture["artifact"], fixture["run"]["run_id"])
+                    first_final_event = next((item for item in first_state["outbox"]
+                                              if item.get("kind") == "final"), None)
+                    initial_final_calls = [item.copy() for item in notices
+                        if item["subject"].startswith("experiment final ")]
+                    final_delivery = next(item for item in first["delivery"]
+                                          if item.get("key") == "final:run")
+
+                    changed = observe(22, 1050, 1060)
+                    changed_state = progress._read_observation_state(fixture["state"])
+                    changed_public = progress.read_public_run_record(
+                        fixture["artifact"], fixture["run"]["run_id"])
+                    changed_attention_key = self._expected_source_attention_key(
+                        changed["observation"])
+                    changed_attention_delivery = [item for item in changed["delivery"]
+                        if item.get("key", "").startswith("attention")]
+                    self.assertEqual(len(changed_attention_delivery), 1)
+                    self.assertEqual(changed_attention_delivery[0]["key"],
+                                     changed_attention_key)
+                    self.assertEqual(changed["observation"]["source_observations"][0]["value"], 22)
+                    self.assertEqual(changed_state["source_observations"][0]["value"], 22)
+                    self.assertEqual(changed_public["progress"]["observed_counters"][0]["value"], 22)
+                    self.assertEqual(changed_public["progress"]["observed_counters"][0]["writer_run_id"],
+                                     "independent-writer")
+                    self.assertEqual(changed_public["progress"]["observed_counters"][0]["target_run_id"],
+                                     fixture["run"]["run_id"])
+                    self.assertFalse(changed_public["progress"]["observed_counters"][0][
+                                     "comparison_eligible"])
+                    attention_notices = [item for item in notices
+                        if f":{changed_attention_key}:" in item["key"]]
+                    self.assertTrue(attention_notices)
+                    self.assertTrue(any("raw counter=finished_items:22" in item["text"]
+                                        and "writer=independent-writer" in item["text"]
+                                        and f"target={fixture['run']['run_id']}" in item["text"]
+                                        for item in attention_notices))
+
+                    first_final = initial_final_calls[0]
+                    self.assertEqual(first_final["args"], ("codex", "fixture-owner"))
+                    self.assertEqual(first_final["lineage"], {"kind": "provenance",
+                        "harness": "codex", "session_id": "fixture-owner"})
+                    self.assertEqual(first_final["route_id"], "fixture-route")
+                    self.assertEqual(first_final["required_action"], "read-notice")
+                    self.assertEqual(final_delivery["recipients"][0]["state"], final_receipt)
+                    if final_receipt == "pending":
+                        self.assertIsNotNone(first_final_event)
+                        self.assertEqual(first_final_event["key"], "final:run")
+                        self.assertEqual(first_final_event["recipients"], [{
+                            "harness": "codex", "session_id": "fixture-owner",
+                            "lineage": {"kind": "provenance", "harness": "codex",
+                                         "session_id": "fixture-owner"}}])
+                        changed_final_event = next(item for item in changed_state["outbox"]
+                                                   if item.get("kind") == "final")
+                        self.assertEqual(changed_final_event, first_final_event)
+                    else:
+                        self.assertIsNone(first_final_event)
+                        self.assertIn("final:run", first_state["event_keys"])
+                        self.assertIn("final:run", changed_state["event_keys"])
+                        self.assertEqual(len([item for item in notices
+                            if item["subject"].startswith("experiment final ")]),
+                            len(initial_final_calls))
+
+                    first_attention_key = next(item["key"] for item in first["delivery"]
+                                               if item.get("key", "").startswith("attention"))
+                    self.assertNotEqual(changed_attention_key, first_attention_key)
+                    self.assertEqual(changed["observation"]["source_observations"][0][
+                                     "source_generation"], first["observation"][
+                                     "source_observations"][0]["source_generation"])
+
+                    repeated = observe(22, 1050, 1121)
+                    equal_fresh = observe(22, 1170, 1183)
+                    final_calls = [item for item in notices
+                        if item["subject"].startswith("experiment final ")]
+                    initial_final_signatures = [(initial["args"], initial["key"],
+                        initial["subject"], initial["text"], initial["route_id"],
+                        initial["required_action"], initial["lineage"])
+                        for initial in initial_final_calls]
+                    self.assertTrue(all((item["args"], item["key"], item["subject"],
+                                         item["text"], item["route_id"], item["required_action"],
+                                         item["lineage"]) in initial_final_signatures
+                                        for item in final_calls))
+                    final_state = progress._read_observation_state(fixture["state"])
+                    final_public = progress.read_public_run_record(
+                        fixture["artifact"], fixture["run"]["run_id"])
+                    attention_keys = [key for key in final_state["event_keys"]
+                                      if key.startswith("attention")]
+                    self.assertEqual(len(attention_keys), 2)
+                    self.assertEqual(len(set(attention_keys)), 2)
+                    self.assertEqual(final_state["source_observations"][0]["value"], 22)
+                    self.assertEqual(final_state["source_observations"][0]["observed_at"], 1170)
+                    self.assertEqual(final_public["progress"]["observed_counters"][0]["value"], 22)
+                    self.assertFalse(any(item.get("key", "").startswith("attention")
+                                         for item in repeated["delivery"]))
+                    self.assertFalse(any(item.get("key", "").startswith("attention")
+                                         for item in equal_fresh["delivery"]))
+                    for result in (first, changed, repeated, equal_fresh):
+                        observation = result["observation"]
+                        self.assertIsNone(observation.get("reached"))
+                        self.assertIsNone(observation.get("total"))
+                        self.assertIsNone(observation.get("unit"))
+                        self.assertIsNone(observation.get("rate_per_second"))
+                        self.assertIsNone(observation.get("eta_seconds"))
+                        self.assertIsNone(observation.get("predicted_total_seconds"))
+                    self.assertIsNone(final_public["progress"].get("rate_per_second"))
+                    self.assertIsNone(final_public["progress"].get("eta_seconds"))
+                    self.assertNotIn("completed", final_public["progress"])
+
+    def test_notify_events_false_keeps_final_and_source_events_suppressed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._terminal_source_fixture(Path(tmp), run_id="suppressed-target")
+            fixture["write_source"](31, 950)
+            with mock.patch.object(progress, "_observation_state_path",
+                    return_value=fixture["state"]), \
+                    mock.patch("session_notice.notify", return_value={"state": "acked"}) as notify:
+                suppressed_first = progress.observe_experiment(fixture["run"],
+                    fixture["registry"], 1000, row_key="run", started_at=100,
+                    final=True, status="succeeded", notify_events=False)
+                fixture["write_source"](32, 1050)
+                suppressed_change = progress.observe_experiment(fixture["run"],
+                    fixture["registry"], 1060, row_key="run", started_at=100,
+                    final=True, status="succeeded", notify_events=False)
+                suppressed_state = progress._read_observation_state(fixture["state"])
+                suppressed_public = progress.read_public_run_record(
+                    fixture["artifact"], fixture["run"]["run_id"])
+                self.assertEqual(notify.call_count, 0)
+                self.assertFalse(suppressed_state["outbox"])
+                self.assertFalse(suppressed_state["event_keys"])
+                self.assertEqual(suppressed_state["source_observations"][0]["value"], 32)
+                self.assertEqual(suppressed_public["progress"]["observed_counters"][0]["value"], 32)
+                self.assertTrue(any(item["kind"] == "source-observation"
+                                    for item in suppressed_change["observation"]["attention"]))
+
+                enabled = progress.observe_experiment(fixture["run"], fixture["registry"],
+                    1121, row_key="run", started_at=100, final=True, status="succeeded")
+                enabled_state = progress._read_observation_state(fixture["state"])
+                self.assertEqual([item["key"] for item in enabled["delivery"]], ["final:run"])
+                self.assertEqual(notify.call_count, 1)
+                self.assertTrue(notify.call_args.kwargs["subject"].startswith("experiment final "))
+                self.assertIn("raw counter=finished_items:32", notify.call_args.kwargs["text"])
+                self.assertEqual(enabled_state["event_keys"], ["final:run"])
+                repeated = progress.observe_experiment(fixture["run"], fixture["registry"],
+                    1182, row_key="run", started_at=100, final=True, status="succeeded")
+                self.assertFalse(repeated["delivery"])
+                self.assertEqual(notify.call_count, 1)
+                self.assertEqual(progress._read_observation_state(
+                    fixture["state"])["event_keys"], ["final:run"])
+
     def test_unavailable_notice_recipient_does_not_block_the_other_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
