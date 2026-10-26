@@ -57,14 +57,16 @@ def _fleet_cache_path() -> Path:
 
 
 @contextmanager
-def _projection_lock():
+def _cache_write_lock():
     root = state_root()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     meta = os.lstat(root)
     if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.getuid():
         raise OSError("answer-wait directory is not private owner state")
     os.chmod(root, 0o700)
-    fd = os.open(root / ".projection.lock", os.O_CREAT | os.O_RDWR |
+    # The producer holds .projection.lock for its whole lifetime. Cache writes
+    # and selected-action claims need a separate short transaction lock.
+    fd = os.open(root / ".cache-write.lock", os.O_CREAT | os.O_RDWR |
                  getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         os.fchmod(fd, 0o600)
@@ -375,7 +377,7 @@ def publish_cache(result: dict) -> bool:
                                         if not item["session_id"] or not item["harness"]],
                        "health": [{"source": row.get("source"), "state": row.get("state")}
                                   for row in result.get("health", ()) if isinstance(row, dict)]}
-        with _projection_lock():
+        with _cache_write_lock():
             previous = _read_cache_file()
             selected = previous.get("selected_responses", {}) if previous else {}
             if not isinstance(selected, dict) or len(selected) > _SELECTED_RESPONSE_MAX:
@@ -562,7 +564,7 @@ def _store_selected_entry(envelope, entry):
     if not _valid_selected_overlay({key: entry}):
         return False
     try:
-        with _projection_lock():
+        with _cache_write_lock():
             projection = _read_cache_file()
             if projection is None:
                 return False
@@ -620,7 +622,7 @@ def _claim_selected_action(envelope, action_id, response):
         return False, None
     key = _selected_entry_key(identity)
     try:
-        with _projection_lock():
+        with _cache_write_lock():
             projection = _read_cache_file()
             if projection is None:
                 return False, None
@@ -1395,6 +1397,8 @@ def _selected_actions(kind, detail, native_ref):
     if (isinstance(request, dict)
             and request.get("method") == "item/commandExecution/requestApproval"):
         available = detail.get("availableDecisions") if isinstance(detail, dict) else None
+        if available is None:
+            return ["approve", "reject", "defer"]  # legacy native one-request decisions
         if not isinstance(available, list):
             return ["defer"]
         actions = []
@@ -1600,7 +1604,8 @@ def _native_response_error(envelope, portable):
                 and request_ref.get("method") == "item/commandExecution/requestApproval"):
             available = detail.get("availableDecisions") if isinstance(detail, dict) else None
             native_decision = "accept" if decision == "approve" else "decline"
-            if not isinstance(available, list) or native_decision not in available:
+            if available is not None and (
+                    not isinstance(available, list) or native_decision not in available):
                 return "codex-command-decision-not-available"
         if decision not in _selected_actions("approval", detail, native_ref):
             return "native-approval-decision-not-available"

@@ -617,6 +617,28 @@ class FleetQuestionActionTests(unittest.TestCase):
             self.assertIn("disabled", render._EXPLORER_STATE.question_overlay["status"])
 
 
+    def test_legacy_command_choices_and_explicit_backend_limits_stay_distinct(self):
+        from fleet.explorer.state import question_decisions, reduce
+
+        for native_detail in ({"operation": "Run requested command"},
+                              {"operation": "Run requested command", "availableDecisions": None}):
+            legacy = self.envelope(kind="approval", detail=native_detail)
+            legacy["native_ref"] = {"transport": "codex-managed-control",
+                                     "request": {"method": "item/commandExecution/requestApproval"}}
+            legacy["actions"] = ["approve", "reject", "defer"]
+            self.assertEqual(question_decisions(legacy), ("approve", "reject", "defer"))
+            _state, effects = reduce(self.state(legacy), {"type": "click", "action":
+                                                         ("question.decision", "approve")})
+            self.assertEqual(effects[0][2], {"decision": "approve"})
+        limited = dict(legacy, detail={"availableDecisions": []}, actions=["defer"])
+        self.assertEqual(question_decisions(limited), ("defer",))
+        file_missing = self.envelope(kind="approval", detail={"operation": "Apply file changes"})
+        file_missing["actions"] = ["reject", "defer"]
+        self.assertEqual(question_decisions(file_missing), ("reject", "defer"))
+        _state, effects = reduce(self.state(file_missing), {"type": "click", "action":
+                                                           ("question.decision", "approve")})
+        self.assertEqual(effects, ())
+
     def test_nested_permission_targets_are_visible_only_in_selected_private_detail(self):
         from fleet.explorer.frame import draw
         from fleet.explorer.state import serialize
@@ -839,6 +861,11 @@ class FleetQuestionBackendIntegrationTests(unittest.TestCase):
         from fleet.explorer.runtime import ExplorerRuntime
         from fleet.explorer.state import reduce
 
+        self._install_wait(questions=[{
+            "id": self.question_id, "question": "Which route should run?",
+            "isOther": True,
+            "options": [{"label": "Green route"}, {"label": "Blue route"}],
+        }])
         state, envelope = self._read_into_ui()
         state, _ = reduce(state, {"type": "click", "action": ("question.edit", self.question_id)})
         state, effects = reduce(state, {"type": "key", "key": "text:free text answer"})

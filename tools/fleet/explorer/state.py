@@ -269,6 +269,7 @@ def question_choice_click_allowed(detail, question_id, answer, values=()):
 def question_decisions(detail):
     if not _question_is_approval(detail):
         return ()
+    result = ["approve", "reject", "defer"]
     native_ref = detail.get("native_ref")
     request = native_ref.get("request") if isinstance(native_ref, Mapping) else None
     if (isinstance(request, Mapping)
@@ -276,15 +277,18 @@ def question_decisions(detail):
         native_detail = detail.get("detail")
         available = (native_detail.get("availableDecisions")
                      if isinstance(native_detail, Mapping) else None)
-        result = []
-        if isinstance(available, list):
-            if "accept" in available:
-                result.append("approve")
-            if "decline" in available:
-                result.append("reject")
-        result.append("defer")
-        return tuple(result)
-    return ("approve", "reject", "defer")
+        if available is not None:
+            result = []
+            if isinstance(available, list):
+                if "accept" in available:
+                    result.append("approve")
+                if "decline" in available:
+                    result.append("reject")
+            result.append("defer")
+    actions = detail.get("actions")
+    if isinstance(actions, (list, tuple)):
+        result = [decision for decision in result if decision in actions]
+    return tuple(result)
 
 
 def _question_action_ref(overlay):

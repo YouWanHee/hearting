@@ -71,9 +71,12 @@ class HumanWaitStateTests(unittest.TestCase):
         path = next(Path(self.tmp.name).rglob("*.json"))
         before = path.read_bytes()
         result = observation.read_answer_waits(jobs_paths=(), now=10 + 8 * 86400)
-        self.assertEqual(result["items"], [])
-        self.assertEqual((result["total"], result["stale_total"]), (0, 0))
+        self.assertEqual(len(result["items"]), 1)
+        self.assertTrue(result["items"][0]["stale"])
+        self.assertEqual((result["total"], result["stale_total"]), (0, 1))
         self.assertEqual(path.read_bytes(), before)
+        self.assertTrue(state.close_signal("seat-3"))
+        self.assertEqual(observation.read_answer_waits(jobs_paths=(), now=10 + 8 * 86400)["items"], [])
 
     def test_s4_current_older_and_expired_windows_match_shared_policy(self):
         now = 10 * 86400
@@ -84,10 +87,13 @@ class HumanWaitStateTests(unittest.TestCase):
                                               "[답변 필요] fixture", now=since))
         result = observation.read_answer_waits(jobs_paths=(), now=now)
         by_id = {item["owner"]["session_id"]: item for item in result["items"]}
-        self.assertEqual(set(by_id), {"s-current", "s-older"})
+        # F104 supersedes the former seven-day disappearance. The historical
+        # "expired" fixture name remains to track the original CI failure.
+        self.assertEqual(set(by_id), {"s-current", "s-older", "s-expired"})
         self.assertFalse(by_id["s-current"]["stale"])
         self.assertTrue(by_id["s-older"]["stale"])
-        self.assertEqual((result["total"], result["stale_total"]), (1, 1))
+        self.assertTrue(by_id["s-expired"]["stale"])
+        self.assertEqual((result["total"], result["stale_total"]), (1, 2))
 
     def test_s1_windows_kind_mapping_and_stale_activity_fixture(self):
         from tools.fleet import interaction
@@ -101,8 +107,8 @@ class HumanWaitStateTests(unittest.TestCase):
                                                      "codex-rollout", now=since))
             result = observation.read_answer_waits(jobs_paths=(), now=now)
             by_session = {item["owner"]["session_id"]: item for item in result["items"]}
-            self.assertEqual(set(by_session), {"s1-current", "s1-older"})
-            self.assertEqual((result["total"], result["stale_total"]), (1, 1))
+            self.assertEqual(set(by_session), {"s1-current", "s1-older", "s1-expired"})
+            self.assertEqual((result["total"], result["stale_total"]), (1, 2))
             self.assertEqual(by_session["s1-current"]["kind"], "approval")
             self.assertEqual(by_session["s1-older"]["kind"], "permission")
             self.assertTrue(state.publish_cache(result))
@@ -112,6 +118,8 @@ class HumanWaitStateTests(unittest.TestCase):
             self.assertEqual(mapped["s1-current"]["kind"], "approval")
             self.assertEqual(mapped["s1-older"]["source"], "S1-approval")
             self.assertEqual(mapped["s1-older"]["stale"], "older")
+            self.assertEqual(mapped["s1-expired"]["source"], "S1-question")
+            self.assertEqual(mapped["s1-expired"]["stale"], "older")
             # A real later session activity closes a stale rollout sidecar; an empty
             # producer session set cannot establish that closure (investigated below).
             active = SimpleNamespace(harness="codex", session_id="s1-current",
