@@ -757,9 +757,14 @@ class NativeSessionContinuityTest(unittest.TestCase):
                               encoding="utf-8")
         self.herdr.chmod(0o755)
 
-    def environment(self, sid=None):
+    def environment(self, sid=None, *, no_herdr=False):
         extra = {"HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
                  "HEARTING_TIDY_HERDR": str(self.herdr)}
+        if no_herdr:
+            empty_path = self.iso.root / "empty-path"
+            empty_path.mkdir(exist_ok=True)
+            extra["PATH"] = str(empty_path)
+            extra["HEARTING_TIDY_HERDR"] = str(self.iso.root / "missing-herdr")
         if sid:
             extra["CODEX_THREAD_ID"] = sid
         return extra
@@ -771,9 +776,9 @@ class NativeSessionContinuityTest(unittest.TestCase):
             self.B: {"pid": 42102, "pid_start": "start-b", "session_id": self.B,
                      "pane": self.PANE_B, "socket_path": ""},
         }
-        process = lambda pid: (int(pid), 1, int(pid), 1, int(pid),
-                               "start-a" if int(pid) == 42101 else "start-b")
-        return (
+        process = lambda pid: (int(pid), 1, int(pid), 1, int(pid), {
+            42101: "start-a", 42102: "start-b", 42103: "restart-a"}.get(int(pid), "unknown-start"))
+        patchers = (
             mock.patch.object(pane_ownership, "_registered_worker", return_value=False),
             mock.patch.object(pane_ownership, "_caller_runtime",
                               return_value=((os.getpid(), 1, 1, 1, 1, "caller"), True)),
@@ -781,6 +786,7 @@ class NativeSessionContinuityTest(unittest.TestCase):
                               side_effect=lambda sid, **_kw: [bindings[sid]] if sid in bindings else []),
             mock.patch.object(pane_ownership, "_process", side_effect=process),
         )
+        return bindings, patchers
 
     def _legacy_seat(self, pane):
         return st.Seat("pane", st._digest("pane", pane), pane=pane, harness="codex")
@@ -795,7 +801,7 @@ class NativeSessionContinuityTest(unittest.TestCase):
         return card
 
     def test_payload_sid_keeps_legacy_card_generation_and_next_input_across_env_drift(self):
-        imports = self._binding_inputs()
+        bindings, imports = self._binding_inputs()
         for patcher in imports:
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -821,8 +827,8 @@ class NativeSessionContinuityTest(unittest.TestCase):
         transcript = self.iso.root / "rollout.jsonl"
         transcript.write_text("fixture transcript", encoding="utf-8")
         with mock.patch.object(runner, "start_detached", return_value=42199):
-            for sid, inherited in ((self.A, None), (self.B, self.A)):
-                with self.iso.patched_environ(self.environment(inherited)):
+            for sid, inherited, no_herdr in ((self.A, None, True), (self.B, self.A, False)):
+                with self.iso.patched_environ(self.environment(inherited, no_herdr=no_herdr)):
                     result = st.run_hook(
                         "codex", "compact", sid, phase="after", compact_summary="",
                         compact_context={"trigger": "auto", "turn_id": f"turn-{sid}",
@@ -871,6 +877,13 @@ class NativeSessionContinuityTest(unittest.TestCase):
         self.assertIn("tidy-result-a", result_a)
         self.assertEqual(replay_a, "")
         self.assertIn("card-b-generation-28", got_b)
+        bindings[self.A] = {"pid": 42103, "pid_start": "restart-a", "session_id": self.A,
+                            "pane": "fixture:pane-a-moved", "socket_path": ""}
+        with self.iso.patched_environ(self.environment(self.A)):
+            moved = st.resolve_seat("codex", str(self.cwd), sid=self.A)
+            self.assertEqual((moved.kind, moved.pane), ("pane", "fixture:pane-a-moved"))
+            self.assertEqual(st.run_hook("codex", "start", self.A, source="resume",
+                                         cwd=str(self.cwd), env=os.environ, now=5006), "")
         with self.iso.patched_environ(self.environment(None)):
             self.assertEqual(st.read_latest_card(st.resolve_seat(
                 "codex", str(self.cwd), env=os.environ, sid=self.B))["generation"], 28)
