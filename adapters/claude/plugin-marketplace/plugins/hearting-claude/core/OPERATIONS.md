@@ -2714,10 +2714,10 @@ repository is plumbing, not a user tool call.
 After a resource exits, an owner without a current model summary or tool shows
 the last resource result and log age in NOW.
 
-`fleet` keeps the group and process screen described above for both live use and `--once`.
-The B explorer compose (a work ledger and output view with navigation) is still in development
-and opens only through `fleet2` or `fleet --explorer`; it becomes the default only after it
-reads well on real sessions.
+`fleet-monitor` keeps the group and process screen described above for live use and `--once`.
+The B explorer compose (a work ledger and output view with navigation) is still in development;
+the approved public command `fleet` opens it, and `fleet2` remains a compatibility alias.
+This command choice does not mark the Explorer's visual or interaction acceptance complete.
 For a live local resource, bounded reads of its exact process and descendants
 show GPU selection separately from use: `moving4:1 지정 · GPU 사용 전`.
 Observed GPU use takes precedence; selection alone creates no GPU usage

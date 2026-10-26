@@ -82,11 +82,19 @@ def _production_order(replicates=3):
     return [list(orders[index % len(orders)]) for index in range(replicates)]
 
 
+def _production_launcher(role, tree):
+    fleet_dir = Path(tree) / "tools" / "fleet"
+    if role == "legacy":
+        monitor = fleet_dir / "fleet-monitor.sh"
+        if monitor.is_file():
+            return monitor
+        return fleet_dir / "fleet.sh"
+    return fleet_dir / "fleet2.sh"
+
+
 def _production_argv(role, trees):
     tree = Path(trees[role]).resolve()
-    launcher = tree / "tools" / "fleet" / (
-        "fleet.sh" if role == "legacy" else "fleet2.sh")
-    return [str(launcher)]
+    return [str(_production_launcher(role, tree))]
 
 
 def _percentile(values, percentile):
@@ -2377,8 +2385,8 @@ def main():
             parser.error("--event-timeout must be positive")
         for label, path in (("source", args.source_tree), ("base", args.base_tree),
                             ("legacy", args.legacy_tree)):
-            if not (Path(path).expanduser() / "tools/fleet" /
-                    ("fleet.sh" if label == "legacy" else "fleet2.sh")).is_file():
+            role = "candidate" if label == "source" else label
+            if not _production_launcher(role, Path(path).expanduser()).is_file():
                 parser.error("%s tree is missing its production launcher" % label)
         value = _production_campaign(args)
         print(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))

@@ -53,6 +53,7 @@ REQUIRED_RELEASE_FILES = (
     "utilities/compute-hosts",
     "utilities/compute-hosts.py",
     "tools/fleet/fleet.sh",
+    "tools/fleet/fleet-monitor.sh",
     "tools/fleet/fleet2.sh",
     "tools/memory/mem.py",
     "tools/memory/protocol_v2.py",
@@ -62,6 +63,7 @@ REQUIRED_RELEASE_FILES = (
 )
 TOOL_LAUNCHERS = (
     ("fleet", "tools/fleet/fleet.sh"),
+    ("fleet-monitor", "tools/fleet/fleet-monitor.sh"),
     ("fleet2", "tools/fleet/fleet2.sh"),
     ("mem", "tools/memory/mem.py"),
     ("compute-hosts", "utilities/compute-hosts"),

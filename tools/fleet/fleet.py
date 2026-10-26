@@ -39,14 +39,18 @@ else:
 def parse_args(argv):
     p = argparse.ArgumentParser(
         prog="fleet",
-        description="Cross-harness live agent-session, dispatch, and lab-resource dashboard.",
+        description=(
+            "Cross-harness live agent-session, dispatch, and lab-resource dashboard. "
+            "The `fleet` command selects Explorer; `fleet-monitor` selects the "
+            "group/process screen. Direct fleet.py defaults to group/process."
+        ),
     )
     p.add_argument("--interval", type=float, default=2.0,
                    help="live tick interval in seconds (default 2)")
     p.add_argument("--once", action="store_true",
-                   help="render one snapshot then exit (plain text if not a TTY)")
+                   help="render one snapshot of the selected screen then exit (plain text if not a TTY)")
     p.add_argument("--no-tmux", action="store_true",
-                   help="run the TUI directly (this flag is honored by fleet.sh, not fleet.py)")
+                   help="run the TUI directly (honored by the shell launchers, not fleet.py)")
     p.add_argument("--section", choices=["fleet", "dispatch", "both"], default="both",
                    help="row-type filter within each project group: fleet=session rows only, "
                         "dispatch=job rows (dispatch + resource), both=full group (default both)")
@@ -70,7 +74,7 @@ def parse_args(argv):
                         "the same state either way (plan §P3 — this is --once's ONLY entry "
                         "point into the process view, since `p` is a curses-live-only key).")
     p.add_argument("--explorer", action="store_true",
-                   help="use the Fleet explorer screen; `fleet2` launches this. "
+                   help="use Fleet Explorer (selected by the public `fleet` and compatibility `fleet2` launchers); "
                         "--view does not apply to it.")
     return p.parse_args(argv)   # argparse exits 2 on bad args (matches PRD §3 exit codes)
 
@@ -355,8 +359,8 @@ def main(argv=None):
     render.set_show_all(args.show_all)
     render.set_api_disabled(disabled["api_disabled"])
     render.set_hearting(hearting)
-    # The explorer remains opt-in (`--explorer`, launched as `fleet2`); plain `fleet` keeps
-    # the group/process screen.
+    # Public `fleet` and compatibility `fleet2` select Explorer; `fleet-monitor`
+    # and direct fleet.py retain the group/process default.
     render.set_explorer_mode(args.explorer)
     # F-30 (v10, plan §P3/§9): --view is additive and honors the SAME single _PROCESS_VIEW
     # state the `p` key flips — never a second decision path. FLEET_VIEW env is the reduction
