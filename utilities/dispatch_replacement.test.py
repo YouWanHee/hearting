@@ -4210,12 +4210,28 @@ class ClosedNativeFrameCapacityRecoveryTest(unittest.TestCase):
              mock.patch("start_receipt.save", side_effect=lambda result, _jobs: result):
             return W.start_work(self.route, self.path, self.jobs, run=launch)
 
+    @contextlib.contextmanager
+    def _current_capacity(self, headroom):
+        source = "unknown:no-fresh-taps" if headroom is None else "fixture-headroom"
+        report = {"scores": {"claude": headroom, "codex": headroom, "opencode": 0},
+                  "sources": {"claude": source, "codex": source}}
+        # A released quota does not imply fresh headroom. Control both inputs
+        # instead of borrowing the developer's real taps outside the fixture.
+        capacity = R._capacity_reader()
+        with mock.patch("dispatch_capacity_evidence.harness_hold", return_value=None), \
+             mock.patch("dispatch_capacity_evidence.usage_states", return_value={
+                 harness: "unknown" if headroom is None else "ok"
+                 for harness in ("claude", "codex", "opencode")}), \
+             mock.patch.object(R, "_capacity_reader", return_value=capacity), \
+             mock.patch.object(capacity, "capacity_report", return_value=report):
+            yield
+
     def test_public_start_resumes_released_capacity_once_and_preserves_successful_peer(self):
         before = self.jobs.read_bytes()
         peer = self.rows()["att-peer"][0]
         terminal = self.log_path.read_bytes()
         launches = []
-        with mock.patch("dispatch_capacity_evidence.harness_hold", return_value=None):
+        with self._current_capacity(80):
             result = self._public_start(launches)
             self.assertEqual(result["state"], "preparing", result)
             self.assertEqual(len(launches), 1)
@@ -4251,7 +4267,7 @@ class ClosedNativeFrameCapacityRecoveryTest(unittest.TestCase):
     def test_passive_batch_keeps_capacity_wait_without_claim_after_limit_clears(self):
         before = self.jobs.read_bytes()
         run = mock.Mock(side_effect=AssertionError("passive batch launched a frame"))
-        with mock.patch("dispatch_capacity_evidence.harness_hold", return_value=None):
+        with self._current_capacity(80):
             effective, lineage, attention = R.advance_batch(
                 self.jobs, {"att-source", "att-peer"}, run=run)
         self.assertEqual(effective, {"att-source", "att-peer"})
@@ -4261,6 +4277,19 @@ class ClosedNativeFrameCapacityRecoveryTest(unittest.TestCase):
         self.assertEqual(self.jobs.read_bytes(), before)
         self.assertFalse((R._directory(self.jobs) / "claims").exists())
         run.assert_not_called()
+
+    def test_public_start_keeps_unknown_headroom_waiting_without_claim(self):
+        before = self.jobs.read_bytes()
+        launches = []
+        with self._current_capacity(None):
+            result = self._public_start(launches)
+        self.assertEqual((result["state"], result["usage_state"]),
+                         ("waiting-capacity", "allocation-usage-gate"), result)
+        self.assertEqual(result["replacement_attention"][0]["capacity_source"], "unknown:no-fresh-taps")
+        self.assertNotIn("retry_at", result)
+        self.assertEqual(launches, [])
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertFalse((R._directory(self.jobs) / "claims").exists())
 
     def test_closed_row_reuses_exact_capacity_raw_and_successful_peer_without_mutation(self):
         from review_round_cap import logical_round_records
