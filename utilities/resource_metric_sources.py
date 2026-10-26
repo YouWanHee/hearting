@@ -1137,24 +1137,48 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
         return result
 
     def revalidate_listing_entries(listing, key, directory, root_entries=False):
-        """Retain progress only while each cached path still has its token."""
+        """Retain progress only while each cached path still has its token.
+
+        A cached listing can be larger than one poll's time budget. Keep a
+        lexical continuation inside that listing so repeated bounded polls do
+        not restart validation at its first child.
+        """
         rows = listing.get(key, []) if isinstance(listing, dict) else []
         if not isinstance(rows, list):
             return "refresh", []
+        resume_after = listing.get("revalidation_after")
+        if not isinstance(resume_after, str) or not any(
+                isinstance(item, dict) and item.get("name") == resume_after
+                for item in rows):
+            resume_after = ""
+            listing.pop("revalidation_after", None)
+        resume_pending = bool(resume_after)
+        last_revalidated = resume_after
         changed = []
         for item in rows:
             if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                listing.pop("revalidation_after", None)
                 return "refresh", changed
+            if resume_pending:
+                if item["name"] == resume_after:
+                    resume_pending = False
+                continue
             if monotonic() >= deadline:
+                if last_revalidated:
+                    listing["revalidation_after"] = last_revalidated
+                else:
+                    listing.pop("revalidation_after", None)
                 return "deadline", changed
             try:
                 info = (directory / item["name"]).lstat()
             except OSError:
+                listing.pop("revalidation_after", None)
                 return "refresh", [*changed, item["name"]]
             is_directory = (root_entries and item.get("directory") is True)
             if (stat.S_ISLNK(info.st_mode)
                     or not (stat.S_ISDIR(info.st_mode) if is_directory
                             else stat.S_ISREG(info.st_mode))):
+                listing.pop("revalidation_after", None)
                 return "refresh", [*changed, item["name"]]
             token = _admission_stat_token(info)
             if token != item.get("token"):
@@ -1162,6 +1186,8 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                 item["token"] = token
                 item.pop("p", None)
                 item.pop("d", None)
+            last_revalidated = item["name"]
+        listing.pop("revalidation_after", None)
         return "ok", changed
 
     def listing_entry_token(listing, key, name):
