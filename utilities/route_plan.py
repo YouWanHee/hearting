@@ -352,8 +352,9 @@ def _plan_fields(raw, index, notes):
 
     `done_when`: 1-5 checks that the leg is finished, each a sentence or `{text, check}` (`check` is a
     command), sealed with stable ids `d1`, `d2`... in the order written. `verify`: one line saying
-    what verification looks at. `hands_over`: what the next leg reads. `parallel`: work the owner may
-    split through the plan's slices. `extra_stages`: `{id, unit, after, verify}` stages the compiler
+    what verification looks at. `hands_over`: what the next leg reads. `parallel`: approved slices the
+    owner may use when assigning workers or permitted sub-sessions; these are not compiled as nodes.
+    `extra_stages`: `{id, unit, after, verify}` stages the compiler
     adds as `plan-<id>` nodes (`compose_subgraph_recipe`)."""
     fields = {}
 
@@ -384,14 +385,27 @@ def _plan_fields(raw, index, notes):
             fields["verify"] = line(raw["verify"])
         else:
             bad("verify")
-    for name in ("hands_over", "parallel"):
-        if name in raw:
-            values = raw[name] if isinstance(raw[name], list) else [raw[name]]
-            kept = [line(v, 200) for v in values]
-            if values and len(values) <= MAX_PLAN_NOTES and all(kept):
-                fields[name] = kept
+    if "hands_over" in raw:
+        values = raw["hands_over"] if isinstance(raw["hands_over"], list) else [raw["hands_over"]]
+        kept = [line(v, 200) for v in values]
+        if values and len(values) <= MAX_PLAN_NOTES and all(kept):
+            fields["hands_over"] = kept
+        else:
+            bad("hands_over")
+    if "parallel" in raw:
+        values = raw["parallel"] if isinstance(raw["parallel"], list) else [raw["parallel"]]
+        kept = []
+        for item_index, value in enumerate(values):
+            item = line(value, 200)
+            if item is None:
+                if notes is not None:
+                    notes.append(f"ignored:legs[{index}].parallel[{item_index}]")
             else:
-                bad(name)
+                kept.append(item)
+        if kept:
+            fields["parallel"] = kept
+        elif not values:
+            bad("parallel")
     if "extra_stages" in raw:
         values, kept = raw["extra_stages"], []
         for value in values if isinstance(values, list) else []:
