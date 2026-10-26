@@ -99,6 +99,144 @@ class TidyCase(unittest.TestCase):
                     "source": "clear"})
 
 
+class LegacyNativeMigrationAccessTest(TidyCase):
+
+    def test_prompt_hook_probes_only_the_exact_known_card_source_once(self):
+        sid = "known-source-author"
+        with self.library():
+            caller = st.resolve_seat("claude", str(self.cwd), sid=sid)
+            source = st.physical_seat(caller)
+            off_path = st.Seat("pane", st._digest("pane", "fixture:unrelated-known-source"),
+                               pane="fixture:unrelated-known-source", harness="claude")
+
+            def write_legacy(seat, body):
+                card = {"schema": st.SCHEMA, "seat": seat.as_dict(),
+                        "author": {"harness": "claude", "sid": sid, "epoch": 0},
+                        "authored_at": st.iso_utc(1001), "authored_at_epoch": 1001,
+                        "generation": 5, "cwd": str(self.cwd), "body": body}
+                with st.seat_lock(seat.key):
+                    st._write_card_pair(seat, card)
+
+            write_legacy(source, "exact source card")
+            write_legacy(off_path, "same-author off-path card")
+            source_path = st.card_json_path(source)
+            off_path_json = st.card_json_path(off_path)
+            off_path_before = off_path_json.read_bytes()
+            card_reads = []
+            card_enumerations = []
+            original_read_bytes = st.read_bytes
+            original_glob = Path.glob
+            original_iterdir = Path.iterdir
+
+            def track_read(path):
+                path = Path(path)
+                if path.parent == self.state / "cards" and path.suffix == ".json":
+                    card_reads.append(path)
+                return original_read_bytes(path)
+
+            def track_glob(path, pattern):
+                if Path(path) == self.state / "cards":
+                    card_enumerations.append(str(pattern))
+                return original_glob(path, pattern)
+
+            def track_iterdir(path):
+                if Path(path) == self.state / "cards":
+                    card_enumerations.append("iterdir")
+                return original_iterdir(path)
+
+            with mock.patch.object(st, "read_bytes", side_effect=track_read), \
+                    mock.patch.object(Path, "glob", track_glob), \
+                    mock.patch.object(Path, "iterdir", track_iterdir):
+                st.run_hook("claude", "prompt", sid, cwd=str(self.cwd), env=os.environ,
+                            now=5000, emit=lambda _text: None)
+                st.run_hook("claude", "prompt", sid, cwd=str(self.cwd), env=os.environ,
+                            now=5001, emit=lambda _text: None)
+
+            self.assertEqual(card_enumerations, [])
+            project_path = self.state / "cards" / (
+                st._digest("project", "claude", st.project_key_for(str(self.cwd))) + ".json")
+            known_addresses = {source_path, project_path, st.card_json_path(caller)}
+            self.assertEqual(card_reads.count(source_path), 1)
+            self.assertTrue(set(card_reads).issubset(known_addresses), card_reads)
+            self.assertNotIn(off_path_json, card_reads)
+            native = st.read_latest_card(caller)
+            self.assertEqual((native["body"], native["generation"]), ("exact source card", 5))
+            self.assertEqual(off_path_json.read_bytes(), off_path_before)
+
+    def test_unconfirmed_off_path_author_is_not_read_or_adopted_by_prompt_hook(self):
+        sid = "unconfirmed-off-path-author"
+        output = []
+        with self.library():
+            caller = st.resolve_seat("claude", str(self.cwd), sid=sid)
+            off_path = st.Seat("pane", st._digest("pane", "fixture:unrelated-pane"),
+                               pane="fixture:unrelated-pane", harness="claude")
+            card = {"schema": st.SCHEMA, "seat": off_path.as_dict(),
+                    "author": {"harness": "claude", "sid": sid, "epoch": 0},
+                    "authored_at": st.iso_utc(1001), "authored_at_epoch": 1001,
+                    "generation": 7, "memory_refs": {"revision": 9, "batch": "off-path"},
+                    "cwd": str(self.cwd), "body": "off-path must stay private"}
+            with st.seat_lock(off_path.key):
+                st._write_card_pair(off_path, card)
+                st._write_consumed(off_path, generation=7,
+                                   receipts=[st._receipt("claude", sid, 0)])
+            history = self.state / "card-history" / off_path.key / "00000006.json"
+            history.parent.mkdir(parents=True, exist_ok=True)
+            history.write_text(json.dumps({**card, "generation": 6, "body": "old off-path"}) + "\n",
+                               encoding="utf-8")
+            unrelated_state = {
+                self.state / "sessions" / f"{off_path.key}.jsonl":
+                    (json.dumps({"harness": "claude", "sid": sid, "event": "prompt"}) + "\n").encode(),
+                self.state / "notices" / f"{off_path.key}.json":
+                    json.dumps({"schema": st.SCHEMA, "items": [{"author": {"harness": "claude", "sid": sid},
+                                                                   "text": "off-path notice"}]}).encode(),
+                self.state / "prompt-seq" / f"{off_path.key}.json":
+                    json.dumps({"harness": "claude", "sid": sid, "seq": 4}).encode(),
+            }
+            for path, raw in unrelated_state.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(raw)
+
+            watched = {st.card_json_path(off_path), st._consumed_path(off_path), history,
+                       *unrelated_state.keys()}
+            before = {path: path.read_bytes() for path in watched}
+            reads = []
+            card_enumerations = []
+            original_read_bytes = st.read_bytes
+            original_glob = Path.glob
+            original_iterdir = Path.iterdir
+
+            def track_read(path):
+                path = Path(path)
+                if path in watched:
+                    reads.append(path)
+                return original_read_bytes(path)
+
+            def track_glob(path, pattern):
+                if Path(path) == self.state / "cards":
+                    card_enumerations.append(str(pattern))
+                return original_glob(path, pattern)
+
+            def track_iterdir(path):
+                if Path(path) == self.state / "cards":
+                    card_enumerations.append("iterdir")
+                return original_iterdir(path)
+
+            with mock.patch.object(st, "read_bytes", side_effect=track_read), \
+                    mock.patch.object(Path, "glob", track_glob), \
+                    mock.patch.object(Path, "iterdir", track_iterdir):
+                st.run_hook("claude", "prompt", sid, cwd=str(self.cwd), env=os.environ,
+                            now=5000, emit=output.append)
+                # Exercise the established native address through the next hook too.
+                st.run_hook("claude", "prompt", sid, cwd=str(self.cwd), env=os.environ,
+                            now=5001, emit=output.append)
+
+            self.assertEqual(card_enumerations, [])
+            self.assertEqual(reads, [])
+            self.assertIsNone(st.read_json(st.card_json_path(caller)))
+            self.assertNotIn("off-path must stay private", "".join(output))
+            self.assertEqual({path: path.read_bytes() for path in watched}, before)
+
+
 class AnswerWaitHookTest(TidyCase):
 
     def test_start_does_not_replay_cached_own_seat_s4_after_close(self):
@@ -187,6 +325,43 @@ class CardWriteTest(TidyCase):
 
 
 class CardConsumeTest(TidyCase):
+
+    def test_confirmed_successor_migrates_the_exact_legacy_pane_card_once(self):
+        predecessor, successor = "legacy-pane-predecessor", "confirmed-pane-successor"
+        source = st.Seat("pane", st._digest("pane", PANE), pane=PANE, harness="claude")
+        card = {"schema": st.SCHEMA, "seat": source.as_dict(),
+                "author": {"harness": "claude", "sid": predecessor, "epoch": 0},
+                "authored_at": st.iso_utc(1001), "authored_at_epoch": 1001,
+                "generation": 3, "memory_refs": {"revision": 2, "batch": "legacy-batch",
+                                                    "status": "applied", "refs": []},
+                "cwd": str(self.cwd), "body": "confirmed legacy pane card"}
+        with self.library():
+            with st.seat_lock(source.key):
+                st._write_card_pair(source, card)
+            history_source = self.state / "card-history" / source.key / "00000002.json"
+            history_source.parent.mkdir(parents=True, exist_ok=True)
+            history_card = {**card, "generation": 2, "body": "legacy pane history"}
+            st.atomic_write_json(history_source, history_card)
+            history_bytes = history_source.read_bytes()
+            source_bytes = st.read_bytes(st.card_json_path(source))
+            self.confirmed_handover("claude", predecessor, successor)
+
+        delivered = self.hook("claude", "start", successor, "--source", "clear")
+        self.assertIn("confirmed legacy pane card", delivered)
+        self.assertIn("legacy-batch", delivered)
+        with self.library():
+            native_predecessor = st.session_seat(source, "claude", predecessor)
+            native_card = st.read_latest_card(native_predecessor)
+            self.assertEqual(native_card["generation"], 3)
+            self.assertEqual(native_card["memory_refs"]["revision"], 2)
+            self.assertEqual(st.read_bytes(self.state / "card-history" / st.card_key(native_predecessor)
+                                           / "00000002.json"), history_bytes)
+            receipt = st.read_json(st._consumed_path(native_predecessor))
+            self.assertEqual(receipt["generation"], 3)
+            self.assertIn(st._receipt("claude", successor, 0), receipt["receipts"])
+            self.assertEqual(st.read_bytes(st.card_json_path(source)), source_bytes)
+        self.assertEqual(self.hook("claude", "prompt", successor), "")
+        self.assertEqual(self.hook("claude", "prompt", successor), "")
 
     def test_new_session_receives_the_card_once_at_start_and_not_again(self):
         self.hook("claude", "start", "sid-A")
@@ -841,6 +1016,15 @@ class NativeSessionContinuityTest(unittest.TestCase):
         self.assertEqual((card_a["generation"], card_b["generation"]), (1, 28))
         self.assertNotEqual(st.card_key(legacy_a), st.card_key(seat_a))
 
+        # Perform the one-time legacy read while each exact caller physical key
+        # is available. Later hooks exercise no-Herdr and inherited-ID drift
+        # against the established native address, without rediscovering panes.
+        for sid in (self.A, self.B):
+            with self.iso.patched_environ(self.environment(sid)):
+                self.assertEqual(st.run_hook("codex", "prompt", sid, cwd=str(self.cwd),
+                                             env=os.environ, now=4990,
+                                             emit=lambda _text: None), "")
+
         transcript = self.iso.root / "rollout.jsonl"
         transcript.write_text("fixture transcript", encoding="utf-8")
         with mock.patch.object(runner, "start_detached", return_value=42199):
@@ -906,13 +1090,17 @@ class NativeSessionContinuityTest(unittest.TestCase):
                 "codex", str(self.cwd), env=os.environ, sid=self.B))["generation"], 28)
 
     def test_conflicting_legacy_author_cards_are_not_merged_or_selected(self):
-        legacy_a, legacy_b = self._legacy_seat(self.PANE_A), self._legacy_seat(self.PANE_B)
+        project_key = st.project_key_for(str(self.cwd))
+        legacy_a = st.dataclasses.replace(self._legacy_seat(self.PANE_A), project_key=project_key)
+        legacy_b = st.seat_for_project("codex", project_key)
         with self.iso.patched_environ(self.environment(None)):
             self._write_legacy_card(legacy_a, self.A, "legacy-source-a", 1, 1001)
             self._write_legacy_card(legacy_b, self.A, "legacy-source-b", 1, 1002)
             old_a = st.read_bytes(st.card_json_path(legacy_a))
             old_b = st.read_bytes(st.card_json_path(legacy_b))
-            logical = st.resolve_seat("codex", str(self.cwd), sid=self.A)
+            # The two candidates are explicit: this caller's exact pane key and
+            # its known legacy project-author slot. Unrelated panes are not searched.
+            logical = st.session_seat(legacy_a, "codex", self.A)
             with st.session_state_lock(logical):
                 self.assertFalse(st.prepare_native_session_state(logical))
                 self.assertIsNone(st.read_latest_card(logical))
@@ -924,14 +1112,31 @@ class NativeSessionContinuityTest(unittest.TestCase):
     def test_legacy_consumed_receipt_survives_compact_without_replay(self):
         legacy = self._legacy_seat(self.PANE_A)
         with self.iso.patched_environ(self.environment(None)):
-            self._write_legacy_card(legacy, self.A, "already-consumed", 1, 1001)
+            card = self._write_legacy_card(legacy, self.A, "already-consumed", 1, 1001)
+            card["memory_refs"] = {"revision": 4, "batch": "legacy-memory",
+                                   "status": "applied", "refs": []}
             with st.seat_lock(legacy.key):
-                st._write_consumed(legacy, generation=1, receipts=[st._receipt("codex", self.A, 0)])
+                st._write_card_pair(legacy, card)
+            history_card = {**card, "generation": 0, "body": "legacy generation zero"}
+            history_source = self.state / "card-history" / legacy.key / "00000000.json"
+            history_source.parent.mkdir(parents=True, exist_ok=True)
+            st.atomic_write_json(history_source, history_card)
+            legacy_history = history_source.read_bytes()
+            with st.seat_lock(legacy.key):
+                st._write_consumed(legacy, generation=1, receipts=[st._receipt("codex", self.A, 0)],
+                                   memory_revision=4, memory_receipts=[st._receipt("codex", self.A, 0)])
             legacy_receipt = st.read_bytes(st._consumed_path(legacy))
-            logical = st.resolve_seat("codex", str(self.cwd), sid=self.A)
+            # Migration is authorized by the exact physical card source carried
+            # by this caller, independent of whether Herdr can resolve it later.
+            logical = st.session_seat(legacy, "codex", self.A)
             with st.session_state_lock(logical):
                 self.assertTrue(st.prepare_native_session_state(logical))
             self.assertEqual(st.read_bytes(st._consumed_path(logical)), legacy_receipt)
+            self.assertEqual(st.read_bytes(st.card_json_path(logical)),
+                             st.read_bytes(st.card_json_path(legacy)))
+            self.assertEqual(st.read_bytes(self.state / "card-history" / st.card_key(logical)
+                                           / "00000000.json"), legacy_history)
+            self.assertEqual(st.read_latest_card(logical)["memory_refs"]["revision"], 4)
             transcript = self.iso.root / "rollout.jsonl"
             transcript.write_text("fixture", encoding="utf-8")
             with mock.patch.object(runner, "start_detached", return_value=42199):
@@ -944,6 +1149,8 @@ class NativeSessionContinuityTest(unittest.TestCase):
                 self.assertEqual(st.run_hook("codex", "prompt", self.A, cwd=str(self.cwd),
                                              env=os.environ, now=5001), "")
             self.assertEqual(st.read_bytes(st._consumed_path(logical)), legacy_receipt)
+            self.assertEqual(st.read_bytes(self.state / "card-history" / st.card_key(logical)
+                                           / "00000000.json"), legacy_history)
 
 
 class NativeSessionConsumerTest(TidyCase):

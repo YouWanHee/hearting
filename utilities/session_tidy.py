@@ -446,10 +446,7 @@ def session_state_lock(seat: Seat, *, wait: Optional[float] = None) -> Iterator[
     native_key = _native_session_key(harness, sid)
     if (native_key and not (state_root() / "cards" / f"{native_key}.json").exists()
             and not _native_address_status(seat)):
-        for _path, _raw, card in _legacy_native_cards(seat):
-            source_key = str(((card.get("seat") or {}).get("key") or ""))
-            if re.fullmatch(r"[0-9a-f]{20,64}", source_key):
-                keys.add(source_key)
+        keys.update(_legacy_native_source_keys(seat))
     keys = sorted(keys)
     with contextlib.ExitStack() as stack:
         for key in keys:
@@ -1676,18 +1673,41 @@ def _remember_native_address_status(seat: Seat, status: str) -> None:
         cache[(os.fspath(state_root()), card_key(seat), harness, sid)] = status
 
 
-def _legacy_native_cards(seat: Seat) -> list[tuple[Path, bytes, dict]]:
+def _legacy_native_source_keys(seat: Seat) -> list[str]:
+    """Return only legacy card addresses already named by this caller or its ledger."""
+    harness, sid = session_identity(seat)
+    keys = set()
+    if re.fullmatch(r"[0-9a-f]{20,64}", seat.key):
+        # The caller's exact physical/project key is read-only provenance for migration.
+        keys.add(seat.key)
+    if harness in HARNESSES and seat.project_key:
+        # Older project cards used the shared project-author slot.
+        keys.add(_digest("project", harness, seat.project_key))
+    if harness and sid:
+        for row in _read_ledger_lines(seat):
+            if (row.get("event") != "native-address"
+                    or (row.get("harness"), row.get("sid")) != (harness, sid)):
+                continue
+            source_key = row.get("legacy_source")
+            if isinstance(source_key, str) and re.fullmatch(r"[0-9a-f]{20,64}", source_key):
+                keys.add(source_key)
+    return sorted(keys)
+
+
+def _legacy_native_cards(seat: Seat, source_keys=None) -> list[tuple[Path, bytes, dict]]:
+    """Read exact known legacy card addresses; never enumerate the card store."""
     harness, sid = session_identity(seat)
     root = state_root() / "cards"
-    try:
-        paths = sorted(root.glob("*.json"))
-    except OSError:
-        return []
+    if source_keys is None:
+        source_keys = _legacy_native_source_keys(seat)
     logical = card_key(seat)
     out = []
-    for path in paths:
-        if path.stem == logical:
+    for source_key in sorted(set(source_keys)):
+        if (not isinstance(source_key, str)
+                or not re.fullmatch(r"[0-9a-f]{20,64}", source_key)
+                or source_key == logical):
             continue
+        path = root / f"{source_key}.json"
         try:
             if not stat.S_ISREG(path.lstat().st_mode):
                 continue
@@ -1701,9 +1721,11 @@ def _legacy_native_cards(seat: Seat) -> list[tuple[Path, bytes, dict]]:
         except (ValueError, UnicodeError):
             continue
         author = card.get("author") if isinstance(card, dict) else None
+        card_seat = card.get("seat") if isinstance(card, dict) else None
         if (isinstance(card, dict) and card.get("schema") == SCHEMA
                 and isinstance(card.get("body"), str) and isinstance(author, dict)
-                and (author.get("harness"), author.get("sid")) == (harness, sid)):
+                and (author.get("harness"), author.get("sid")) == (harness, sid)
+                and isinstance(card_seat, dict) and card_seat.get("key") == source_key):
             out.append((path, raw, card))
     return out
 
@@ -1731,7 +1753,8 @@ def prepare_native_session_state(seat: Seat) -> bool:
     if status:
         return status == "ready"
 
-    candidates = _legacy_native_cards(seat)
+    source_keys = _legacy_native_source_keys(seat)
+    candidates = _legacy_native_cards(seat, source_keys)
     if not candidates:
         _append_ledger_entry(seat, {"ts": now_epoch(), "harness": harness, "sid": sid,
                                     "event": "native-address", "legacy_status": "ready"})
