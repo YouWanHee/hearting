@@ -160,6 +160,185 @@ def launch_request(args):
     return request
 
 
+def _resource_payload_env(argv):
+    """Return explicit env assignments carried by the launched argv."""
+    import shlex
+
+    tokens = list(argv)
+    has_env = False
+    if tokens and Path(tokens[0]).name == "env":
+        tokens = tokens[1:]
+        has_env = True
+    elif len(tokens) >= 3 and Path(tokens[0]).name in {"bash", "sh"} and tokens[1] == "-c":
+        try:
+            tokens = shlex.split(tokens[2])
+        except ValueError:
+            return None
+        if tokens and tokens[0] == "exec":
+            tokens = tokens[1:]
+        if tokens and Path(tokens[0]).name == "env":
+            tokens = tokens[1:]
+            has_env = True
+    environment = {"inherit": True, "unset": [], "set": {}}
+    if not has_env:
+        return environment
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            break
+        if token in {"-i", "--ignore-environment"}:
+            environment["inherit"] = False
+            index += 1
+            continue
+        if token in {"-u", "--unset"}:
+            if index + 1 >= len(tokens):
+                return None
+            environment["unset"].append(tokens[index + 1])
+            index += 2
+            continue
+        if isinstance(token, str) and token.startswith("--unset="):
+            environment["unset"].append(token.split("=", 1)[1])
+            index += 1
+            continue
+        if not isinstance(token, str) or "=" not in token:
+            break
+        name, value = token.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            if token.startswith("-"):
+                return None
+            break
+        environment["set"][name] = value
+        index += 1
+    return environment
+
+
+def _resource_input_sha256(path):
+    """Hash one stable, regular, non-symlink input file."""
+    try:
+        candidate = Path(path)
+        if not candidate.is_absolute() or candidate.is_symlink():
+            return None
+        before = candidate.lstat()
+        if not stat.S_ISREG(before.st_mode):
+            return None
+        raw = candidate.read_bytes()
+        after = candidate.lstat()
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            return None
+        return hashlib.sha256(raw).hexdigest()
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _resource_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate resource request key")
+        value[key] = item
+    return value
+
+
+def _resource_payload_input_hashes(request, launch_request_value, argv, command):
+    """Validate and return all declared input hashes for an operation payload."""
+    provenance = request.get("provenance")
+    if provenance is None:
+        provenance = {}
+    if not isinstance(provenance, dict):
+        return None
+    hashes = {}
+
+    def option_path(flag):
+        values = []
+        for index, value in enumerate(argv):
+            if value == flag:
+                if index + 1 >= len(argv):
+                    return None
+                values.append(argv[index + 1])
+            elif isinstance(value, str) and value.startswith(flag + "="):
+                values.append(value[len(flag) + 1:])
+        return values[0] if len(values) == 1 else None
+
+    def add_hash(name, path, expected):
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            return False
+        if _resource_input_sha256(path) != expected:
+            return False
+        hashes[name] = expected
+        return True
+
+    for name in ("smoke_attestation", "config_manifest"):
+        path = request.get(name)
+        launch_path = launch_request_value.get(name)
+        expected = launch_request_value.get(name + "_sha256")
+        request_hash = request.get(name + "_sha256")
+        if path != launch_path:
+            return None
+        if path is None:
+            if expected is not None or request_hash is not None:
+                return None
+            continue
+        if not add_hash(name, path, expected) or (
+                request_hash is not None and request_hash != expected):
+            return None
+        provenance_hash = provenance.get(name + "_sha256")
+        if provenance_hash is not None and provenance_hash != expected:
+            return None
+
+    argv_hash_fields = {
+        "config_sha256": "--config",
+        "data_lock_sha256": "--data-lock",
+        "gpu_smoke_sha256": "--smoke",
+    }
+    recognized_provenance_hashes = {
+        *argv_hash_fields, "smoke_attestation_sha256", "config_manifest_sha256",
+        "bridge_sha256", "bridge_base_sha256",
+    }
+    for field, flag in argv_hash_fields.items():
+        expected = provenance.get(field)
+        if expected is not None:
+            path = option_path(flag)
+            if path is None or not add_hash(field, path, expected):
+                return None
+    for field in ("smoke_attestation_sha256", "config_manifest_sha256"):
+        expected = provenance.get(field)
+        if expected is not None:
+            path = request.get(field[:-7])
+            if path is None or _resource_input_sha256(path) != expected:
+                return None
+            hashes[field] = expected
+    bridge_base_hash = provenance.get("bridge_base_sha256")
+    if bridge_base_hash is not None:
+        if not add_hash("bridge_base_sha256", provenance.get("bridge_base"), bridge_base_hash):
+            return None
+    bridge_hash = provenance.get("bridge_sha256")
+    if bridge_hash is not None:
+        candidates = []
+        for token in command:
+            if not isinstance(token, str) or not token.endswith(".py"):
+                continue
+            digest = _resource_input_sha256(token)
+            if digest == bridge_hash:
+                candidates.append(token)
+        if len(candidates) != 1:
+            return None
+        hashes["bridge_sha256"] = bridge_hash
+
+    for field, expected in provenance.items():
+        if field.endswith("_sha256") and field not in recognized_provenance_hashes:
+            return None
+    for field, expected in request.items():
+        if not field.endswith("_sha256") or field in {
+                "smoke_attestation_sha256", "config_manifest_sha256"}:
+            continue
+        path = request.get(field[:-7]) or request.get(field[:-7] + "_path")
+        if not add_hash(field, path, expected):
+            return None
+    return hashes
+
+
 def supervisor_resource_watches(supervisor, ledger, node=None):
     reader = getattr(supervisor, "read_resource_watches", None)
     if callable(reader):
@@ -191,9 +370,10 @@ def resource_operation_binding(route, route_file, node, run_id, command, cwd,
     """Bind an existing operation request to this exact supervised launch.
 
     Ordinary one-at-a-time runs need no new request format. A second live run
-    can use only an existing request JSON named in its payload argv, tied to an
-    exact input already recorded for this live owner. The run id or
-    ``user_direction_id`` by itself is never sufficient.
+    can use only an existing request JSON whose full decoded content is the
+    accepted owner input and whose declared argv/cwd/environment/input hashes
+    match this launch. The run id or ``user_direction_id`` by itself is never
+    sufficient; an unbound legacy request remains sequential.
     """
     if not isinstance(owner_wait, dict):
         return None
@@ -229,7 +409,7 @@ def resource_operation_binding(route, route_file, node, run_id, command, cwd,
             if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
                     after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
                 raise ValueError("resource-operation-request-changed")
-            value = json.loads(raw)
+            value = json.loads(raw, object_pairs_hook=_resource_json_object)
         except (OSError, ValueError, TypeError):
             continue
         if isinstance(value, dict) and "user_direction_id" in value:
@@ -263,11 +443,13 @@ def resource_operation_binding(route, route_file, node, run_id, command, cwd,
     compute_argv = request["compute_argv"]
     if any(not isinstance(part, str) for part in compute_argv):
         return None
-    for option, expected in (("--cwd", str(Path(cwd).resolve(strict=True))),):
-        if option in compute_argv:
-            index = compute_argv.index(option)
-            if index + 1 >= len(compute_argv) or str(Path(compute_argv[index + 1]).resolve(strict=False)) != expected:
-                return None
+    if compute_argv != list(command):
+        return None
+    cwd_indexes = [index for index, value in enumerate(compute_argv) if value == "--cwd"]
+    if (len(cwd_indexes) != 1 or cwd_indexes[0] + 1 >= len(compute_argv)
+            or str(Path(compute_argv[cwd_indexes[0] + 1]).resolve(strict=False))
+                != str(Path(cwd).resolve(strict=True))):
+        return None
 
     command_record = None
     command_record_path = None
@@ -281,7 +463,7 @@ def resource_operation_binding(route, route_file, node, run_id, command, cwd,
                 continue
             try:
                 raw_record = candidate_path.read_bytes()
-                record_value = json.loads(raw_record)
+                record_value = json.loads(raw_record, object_pairs_hook=_resource_json_object)
             except (OSError, ValueError, TypeError):
                 continue
             if (isinstance(record_value, dict)
@@ -302,9 +484,10 @@ def resource_operation_binding(route, route_file, node, run_id, command, cwd,
     if len(argv) < 2 or not Path(argv[1]).is_absolute() \
             or Path(argv[1]).resolve(strict=False) != Path(__file__).resolve():
         return None
+    separator = argv.index("--")
     def option_value(flag):
-        indexes = [index for index, value in enumerate(argv) if value == flag]
-        return argv[indexes[0] + 1] if len(indexes) == 1 and indexes[0] + 1 < len(argv) else None
+        indexes = [index for index, value in enumerate(argv[:separator]) if value == flag]
+        return argv[indexes[0] + 1] if len(indexes) == 1 and indexes[0] + 1 < separator else None
     expected_values = {
         "--registry": str(Path(registry_path).resolve(strict=False)) if registry_path else None,
         "--run-id": run_id,
@@ -317,7 +500,6 @@ def resource_operation_binding(route, route_file, node, run_id, command, cwd,
         "--smoke-attestation": launch_request_value.get("smoke_attestation"),
         "--config-manifest": launch_request_value.get("config_manifest"),
     }
-    separator = argv.index("--")
     if (argv[separator + 1:] != list(command)
             or any(option_value(flag) != expected for flag, expected in expected_values.items())):
         return None
@@ -355,6 +537,13 @@ def resource_operation_binding(route, route_file, node, run_id, command, cwd,
                 or not item.get("source_session")
                 or not (accepted & completed)):
             return None
+        try:
+            approved_request = json.loads(
+                item["text"], object_pairs_hook=_resource_json_object)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(approved_request, dict) or approved_request != request:
+            return None
 
     try:
         import route_plan as ROUTE_PLAN
@@ -369,6 +558,12 @@ def resource_operation_binding(route, route_file, node, run_id, command, cwd,
                 raise ValueError("resource-operation-route-plan-changed")
             plan_digest = binding["digest"]
     except (OSError, ValueError, KeyError, TypeError) as error:
+        return None
+
+    payload_environment = _resource_payload_env(compute_argv)
+    input_hashes = _resource_payload_input_hashes(
+        request, launch_request_value, compute_argv, command)
+    if payload_environment is None or input_hashes is None:
         return None
 
     request_sha256 = hashlib.sha256(request_bytes).hexdigest()
@@ -389,14 +584,22 @@ def resource_operation_binding(route, route_file, node, run_id, command, cwd,
         name_index = stable_argv.index("--name")
         if name_index + 1 < len(stable_argv):
             stable_argv[name_index + 1] = "<operation-name>"
+    stable_argv = ["<resource-operation-request>" if token == str(request_path) else token
+                   for token in stable_argv]
     stable_request["compute_argv"] = stable_argv
     stable_command = ["<resource-operation-request>" if token == str(request_path) else token
                       for token in command]
     stable_launch_request = {name + "_sha256": launch_request_value.get(name + "_sha256")
                              for name in ("smoke_attestation", "config_manifest")}
+    resolved_cwd = str(Path(cwd).resolve(strict=True))
+    payload_binding = {"argv": stable_argv, "cwd": resolved_cwd,
+                       "environment": payload_environment, "input_hashes": input_hashes}
     operation_body = {"route_id": route["route_id"], "route_hash": route["route_hash"],
         "node": node, "command": stable_command,
-        "cwd": str(Path(cwd).resolve(strict=True)),
+        "cwd": resolved_cwd,
+        "approval_scope_sha256": hashlib.sha256(
+            request["requested_scope"].encode("utf-8")).hexdigest(),
+        "payload": payload_binding,
         "launch_input_hashes": stable_launch_request, "request": stable_request}
     operation_id = hashlib.sha256(json.dumps(
         operation_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
@@ -405,12 +608,19 @@ def resource_operation_binding(route, route_file, node, run_id, command, cwd,
             "command_record_path": str(command_record_path),
             "command_record_sha256": hashlib.sha256(command_record_bytes).hexdigest(),
             "requested_scope": request["requested_scope"],
+            "payload": {"argv_sha256": hashlib.sha256(json.dumps(
+                stable_argv, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest(),
+                "cwd": resolved_cwd,
+                "environment_sha256": hashlib.sha256(json.dumps(
+                    payload_environment, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False).encode("utf-8")).hexdigest(),
+                "input_hashes": input_hashes},
             "input": {**input_binding, "state": "turn-completed"},
             "route_plan_digest": plan_digest,
             "work_request_sha256": work_request_sha256,
             "body_sha256": hashlib.sha256(json.dumps(
                 {"command": list(command), "cwd": operation_body["cwd"],
-                 "launch_request": launch_request_value},
+                 "payload": payload_binding, "launch_request": launch_request_value},
                 sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()}
 
 

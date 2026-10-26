@@ -490,21 +490,24 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
 
     def authorized_body(self, route, path, jobs, registry, owner_attempt, owner_input,
                         name, output, *, scope="independent approved resource operation",
-                        payload_code="import time; time.sleep(20)", payload_args=()):
+                        payload_code="import time; time.sleep(20)", payload_args=(),
+                        provenance=None, approved_text=None, require_binding=True):
         import dispatch_owner_input as INPUT
         body = self.next_body(registry, name, output)
         body.update(parent_attempt_id=owner_attempt)
         request_path = self.base / f'{name}-request.json'
         admission_dir = self.base / f'{name}-admission'
         admission_dir.mkdir(parents=True, exist_ok=True)
-        command = [sys.executable, '-c', payload_code, *map(str, payload_args), str(request_path)]
+        command = ['env', 'HEARTING_TEST_PAYLOAD=approved', sys.executable, '-c', payload_code,
+                   *map(str, payload_args), '--cwd', str(Path(body['cwd']).resolve()),
+                   str(request_path)]
         request = {
             'user_direction_id': f'input-{name}', 'parent_attempt_id': owner_attempt,
             'run_id': name, 'requested_scope': scope,
-            'compute_argv': ['compute-hosts', 'run', '--cwd', body['cwd'], '--name', name],
+            'compute_argv': command,
             'config_manifest': None, 'smoke_attestation': None,
             'Dev_admission_evidence': str(admission_dir / 'admission-evidence.json'),
-            'provenance': {},
+            'provenance': provenance or {},
         }
         request_bytes = json.dumps(request, sort_keys=True).encode()
         request_path.write_bytes(request_bytes)
@@ -519,7 +522,9 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             'argv': argv, 'request_path': str(request_path),
             'request_sha256': hashlib.sha256(request_bytes).hexdigest()}, sort_keys=True))
         with mock.patch.object(RA, 'correction_source_session', return_value='fixture-user-session'):
-            INPUT.submit(jobs, owner_attempt, scope, request_id=f'input-{name}')
+            INPUT.submit(jobs, owner_attempt,
+                         request_bytes.decode() if approved_text is None else approved_text,
+                         request_id=f'input-{name}')
             owner_input.prepare('continue the approved work')
             turn = f'turn-{name}'
             owner_input.started(turn)
@@ -528,8 +533,10 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             route, path, body['node'], name, command, body['cwd'],
             dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
             registry_path=registry, log_path=body['log'])
-        self.assertIsNotNone(operation)
-        body['resource_operation'] = operation
+        if require_binding:
+            self.assertIsNotNone(operation)
+        if operation is not None:
+            body['resource_operation'] = operation
         return body
 
     def arm(self, path, registry, *, node='full-run', run_id='fixture-run', extra=()):
@@ -1835,6 +1842,108 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             for proc in processes:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=5)
+
+    def test_full_approved_request_binds_payload_environment_cwd_and_replay(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        release = self.base / 'approved.release'
+        body = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+            'bound-payload', output,
+            scope='run the isolated approved resource operation',
+            payload_code=('import sys,time\nfrom pathlib import Path\n'
+                          'p=Path(sys.argv[1])\nwhile not p.exists(): time.sleep(.01)\n'),
+            payload_args=[str(release)])
+        binding = body['resource_operation']
+        self.assertEqual(binding['requested_scope'], 'run the isolated approved resource operation')
+        self.assertEqual(binding['payload']['cwd'], str(Path(body['cwd']).resolve()))
+        self.assertEqual(binding['payload']['input_hashes'], {})
+        self.assertEqual(len(binding['payload']['argv_sha256']), 64)
+        self.assertEqual(len(binding['payload']['environment_sha256']), 64)
+        replay = SUP.runner().resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
+            registry_path=registry, log_path=body['log'])
+        self.assertEqual(replay['operation_id'], binding['operation_id'])
+        self.assertIsNone(SUP.runner().resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], str(self.base.parent),
+            dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
+            registry_path=registry, log_path=body['log']))
+
+    def test_legacy_freeform_approval_does_not_authorize_parallel_overlap(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        body = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+            'legacy-freeform', output, payload_code='pass',
+            approved_text='Run the variable model while preserving the fixed model.',
+            require_binding=False)
+        self.assertNotIn('resource_operation', body)
+
+    def test_changed_payload_argv_is_refused_even_with_updated_command_receipt(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        body = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+                                    'changed-payload', output, payload_code='pass')
+        request_path = Path(body['command'][-1])
+        request = json.loads(request_path.read_text())
+        receipt_path = Path(request['Dev_admission_evidence']).parent / \
+            'changed-payload-resource-start-command.json'
+        receipt = json.loads(receipt_path.read_text())
+        body['command'][1] = 'HEARTING_TEST_PAYLOAD=changed'
+        request['compute_argv'] = body['command']
+        request_bytes = json.dumps(request, sort_keys=True).encode()
+        request_path.write_bytes(request_bytes)
+        receipt['request_sha256'] = hashlib.sha256(request_bytes).hexdigest()
+        separator = receipt['argv'].index('--')
+        receipt['argv'][separator + 1:] = body['command']
+        receipt_path.write_text(json.dumps(receipt, sort_keys=True))
+
+        self.assertIsNone(SUP.runner().resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
+            registry_path=registry, log_path=body['log']))
+
+    def test_request_scope_not_exactly_covered_by_accepted_input_is_refused(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        body = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+                                    'uncovered-scope', output, payload_code='pass')
+        request_path = Path(body['command'][-1])
+        request = json.loads(request_path.read_text())
+        request['requested_scope'] = 'different operation scope'
+        request_bytes = json.dumps(request, sort_keys=True).encode()
+        request_path.write_bytes(request_bytes)
+        receipt_path = Path(request['Dev_admission_evidence']).parent / \
+            'uncovered-scope-resource-start-command.json'
+        receipt = json.loads(receipt_path.read_text())
+        receipt['request_sha256'] = hashlib.sha256(request_bytes).hexdigest()
+        receipt_path.write_text(json.dumps(receipt, sort_keys=True))
+
+        self.assertIsNone(SUP.runner().resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
+            registry_path=registry, log_path=body['log']))
+
+    def test_payload_input_hash_must_match_the_effective_argv_input(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        config = self.base / 'approved-config.yaml'
+        config.write_text('model: approved\n')
+        config_hash = hashlib.sha256(config.read_bytes()).hexdigest()
+        body = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
+            'payload-input-hash', output, payload_code='pass',
+            payload_args=['--config', str(config)],
+            provenance={'config_sha256': config_hash})
+        binding = SUP.runner().resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
+            registry_path=registry, log_path=body['log'])
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding['payload']['input_hashes'], {'config_sha256': config_hash})
+        config.write_text('model: changed\n')
+        self.assertIsNone(SUP.runner().resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
+            registry_path=registry, log_path=body['log']))
 
     def test_user_direction_id_without_exact_command_receipt_does_not_authorize_overlap(self):
         route, path, jobs, registry, output, ledger = self.fixture()
