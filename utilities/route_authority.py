@@ -1481,12 +1481,11 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
         raise _contract_error("pin-ignored-for-replacement", pinned)
     drift = candidate.get("launch_home") != history.get("launch_home")
     old, new = history.get("resolved") or {}, candidate.get("resolved") or {}
-    if route and worker_type == "frame":
+    if frame_peer:
         node = next((row for row in route.get("nodes", [])
                      if isinstance(row, dict) and row.get("id") == candidate.get("route_node")), None)
         expected_profile = transition["to"] if transition else (node or {}).get("model_profile")
-        if (not node or node.get("worker_type") != "frame"
-                or new.get("model_profile") != expected_profile
+        if (not node or new.get("model_profile") != expected_profile
                 or new.get("model_role") != node.get("role")):
             raise _contract_error("replacement-input-tuple-mismatch", "frame-model-role-profile")
     if transition and new.get("model_profile") != transition["to"]:

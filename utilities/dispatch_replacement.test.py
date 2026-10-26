@@ -4094,9 +4094,12 @@ class ClosedNativeFrameCapacityRecoveryTest(unittest.TestCase):
         policy = {"primary": ["codex", "claude"], "relief": ["opencode"],
                   "last_resort": [], "promote_relief_below": 25}
         self.node.update(role="deep maker", harness_policy=policy)
-        peer = {"id": "frame-alternative", "worker_type": "frame", "dispatch_depth": 1,
+        frame = {**self.node, "kind": "map-worker", "unit": "plan/frame"}
+        peer = {"id": "frame-alternative", "kind": "map-worker", "unit": "plan/frame",
+                "worker_type": "frame",
+                "dispatch_depth": 1,
                 "role": "deep maker", "model_profile": "top", "harness_policy": dict(policy)}
-        self.route.update(effective_intensity="standard", nodes=[self.node, peer],
+        self.route.update(effective_intensity="standard", nodes=[frame, peer],
             profile_selection_contract_version=1,
             dispatch_evidence={"tuples": [{"status": "supported", "child_harness": harness}
                                             for harness in ("claude", "codex", "opencode")]},
@@ -4204,10 +4207,16 @@ class ClosedNativeFrameCapacityRecoveryTest(unittest.TestCase):
         history, candidate, metadata = self._candidate_input(record)
         import route_authority as RA
         self.assertEqual(R.admission(self.jobs, self.jobs.read_text().splitlines(), metadata), record)
-        for field, value in (("model_profile", "deep"), ("model_role", "fast reviewer")):
-            changed = {**candidate, "resolved": {**candidate["resolved"], field: value}}
-            with self.subTest(field=field), self.assertRaises(D.DispatchContractError):
-                RA.require_recovery_work(changed, history, route=self.route, worker_type="frame")
+        canonical_route = copy.deepcopy(self.route)
+        for node in canonical_route["nodes"]:
+            node.pop("worker_type", None)
+        with mock.patch.object(RA, "_frame_peer_recovery_harness", return_value=True):
+            self.assertIsNone(RA.require_recovery_work(
+                candidate, history, route=canonical_route, worker_type="frame"))
+            for field, value in (("model_profile", "deep"), ("model_role", "fast reviewer")):
+                changed = {**candidate, "resolved": {**candidate["resolved"], field: value}}
+                with self.subTest(field=field), self.assertRaises(D.DispatchContractError):
+                    RA.require_recovery_work(changed, history, route=canonical_route, worker_type="frame")
 
         current = self.rows()
         source_fields_after, source_meta_after = current["att-source"]
