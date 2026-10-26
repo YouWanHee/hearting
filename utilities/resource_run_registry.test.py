@@ -412,6 +412,20 @@ class ResourceRegistryTest(unittest.TestCase):
             route = artifact / "route.json"
             route.write_text(json.dumps({"route_id": "route-fixture",
                                          "artifact_root": str(artifact)}))
+            source = root / "writer" / "observation.json"
+            source.parent.mkdir()
+            source.write_text(json.dumps({"observed_at": 7190, "finished_cells": 21}))
+            proof = root / "proof.json"
+            proof.write_text(json.dumps({"target": "run-view", "writer": "writer-view"}))
+            binding = {"target_run_id": "run-view", "row_key": "run",
+                "path": str(source), "writer_run_id": "writer-view",
+                "timestamp_pointer": "/observed_at", "scope": "shared-results",
+                "counters": [{"name": "finished_cells", "pointer": "/finished_cells",
+                              "comparison_eligible": False}],
+                "proofs": [{"path": str(proof),
+                    "sha256": hashlib.sha256(proof.read_bytes()).hexdigest(),
+                    "assertions": [{"pointer": "/target", "equals": "run-view"},
+                                   {"pointer": "/writer", "equals": "writer-view"}]}]}
             state_path = root / "runtime" / "state.json"
             state_path.parent.mkdir()
             identity = {"pid": 77, "starttime": "9", "command_hash": "a" * 64,
@@ -419,7 +433,8 @@ class ResourceRegistryTest(unittest.TestCase):
             row = {**identity, "cwd": str(project), "status": "running",
                    "started_at": 0, "route": str(route), "route_id": "route-fixture",
                    "command": ["python", "train.py", "--config", "configs/run.json"],
-                   "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest()}
+                   "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+                   "observation": {"source_bindings": [binding]}}
             with mock.patch.object(resource_progress, "_observation_state_path", return_value=state_path), \
                     mock.patch.object(registry, "proc_identity", return_value=identity):
                 view = registry.normalize_run("run-view", row, root / "resource-runs.json",
@@ -432,11 +447,16 @@ class ResourceRegistryTest(unittest.TestCase):
                     mock.patch.object(registry, "proc_identity", return_value=identity):
                 observed = registry.observe_run_if_due(
                     "run-view", row, root / "resource-runs.json", now=7200)
+                unchanged = {key: value for key, value in row.items() if key != "observation"}
+                resumed = registry.observe_run_if_due(
+                    "run-view", unchanged, root / "resource-runs.json", now=7261)
                 view = registry.normalize_run("run-view", row, root / "resource-runs.json",
                     identity_reader=lambda _pid: identity, now=7201)
             self.assertEqual(observed["experiment_run_record"]["route_id"], "route-fixture")
             self.assertEqual(view["experiment_run_record"]["output_dir"], str(output))
             self.assertEqual(view["experiment_run_record"]["metric_summary"]["latest"]["value"], -8.77)
+            self.assertEqual(resumed["experiment_observation"]["observation"]
+                ["source_observations"][0]["value"], 21)
 
     def test_explicit_observer_requires_exact_terminal_evidence_and_reuses_one_notice(self):
         import resource_progress

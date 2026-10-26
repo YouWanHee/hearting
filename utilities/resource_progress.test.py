@@ -559,6 +559,36 @@ class DeclaredResourceProgressTest(unittest.TestCase):
 
 
 class ExperimentObservationTest(unittest.TestCase):
+    def test_admission_generation_replacement_resets_counts_and_survives_unknown_gap(self):
+        previous = {"admission_counts": {"admitted": 4, "denied": 6, "unknown": 1},
+            "admission_generation": "generation-a", "admission_from_at": 10,
+            "admission_to_at": 90, "admission_current_state": "waiting",
+            "admission_wait_episode_id": "old-episode"}
+        decoded = {"generation": "generation-b", "coverage": "observed",
+            "samples": [{"state": "admitted", "at": 1000, "sample_id": "b1"}],
+            "latest": {"state": "admitted", "at": 1000, "sample_id": "b1"},
+            "cursor": {"schema_version": 4}, "warnings": []}
+        summary, state = progress._admission_summary(previous, decoded, 1000,
+            "run-a", "row-a", 0)
+        self.assertEqual((summary["admitted_samples"], summary["denied_samples"],
+                          summary["unknown_samples"]), (1, 0, 0))
+        self.assertEqual(state["admission_generation"], "generation-b")
+        missing_summary, missing_state = progress._admission_summary(state,
+            {"generation": None, "coverage": "partial", "samples": [],
+             "latest": None, "cursor": state["admission_cursor"], "warnings": []},
+            1001, "run-a", "row-a", 0)
+        self.assertEqual(missing_summary["state"], "unknown")
+        self.assertEqual(missing_state["admission_generation"], "generation-b")
+        next_summary, next_state = progress._admission_summary(missing_state,
+            {"generation": "generation-c", "coverage": "observed",
+             "samples": [{"state": "denied", "at": 1002, "sample_id": "c1"}],
+             "latest": {"state": "denied", "at": 1002, "sample_id": "c1"},
+             "cursor": {"schema_version": 4}, "warnings": []},
+            1002, "run-a", "row-a", 0)
+        self.assertEqual((next_summary["admitted_samples"], next_summary["denied_samples"]),
+                         (0, 1))
+        self.assertEqual(next_state["admission_generation"], "generation-c")
+
     def test_total_less_counter_rate_stays_separate_from_eta(self):
         no_total = progress.evaluate_observation(now=300, started_at=0,
             progress={"completed": 3, "unit": "item", "age_s": 0},
@@ -733,6 +763,80 @@ class ExperimentObservationTest(unittest.TestCase):
             self.assertEqual(public["admission"]["state"], "unknown")
             self.assertEqual(public["rows"][0]["admission"]["denied_samples"], 2)
             self.assertIsNone(public["output_dir"])
+
+    def test_independent_raw_counter_binding_persists_without_canonical_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            artifact = base / "artifact"
+            artifact.mkdir()
+            registry = base / "registry.json"
+            registry.write_text("{}\n")
+            source = base / "writer" / "observation.json"
+            source.parent.mkdir()
+            source.write_text(json.dumps({"observed_at": 950, "finished_cells": 21}))
+            proof = base / "proof" / "writer-registration.json"
+            proof.parent.mkdir()
+            proof.write_text(json.dumps({"target": "target-run", "writer": "writer-run",
+                "argv": ["writer", "--target", "target-run"]}))
+            proof_hash = hashlib.sha256(proof.read_bytes()).hexdigest()
+            binding = {"target_run_id": "target-run", "row_key": "row-a",
+                "path": "/nas/writer/observation.json", "writer_run_id": "writer-run",
+                "timestamp_pointer": "/observed_at", "scope": "shared-results",
+                "counters": [{"name": "finished_cells", "pointer": "/finished_cells",
+                              "comparison_eligible": False}],
+                "proofs": [{"path": "/nas/proof/writer-registration.json",
+                    "sha256": proof_hash,
+                    "assertions": [{"pointer": "/target", "equals": "target-run"},
+                                   {"pointer": "/writer", "equals": "writer-run"},
+                                   {"pointer": "/argv/2", "equals": "target-run"}]}]}
+            state = base / "runtime" / "state.json"
+            state.parent.mkdir()
+            run = {"run_id": "target-run", "started_at": 100,
+                "artifact_root": str(artifact), "route_id": "route-a",
+                "path_namespace": {"/nas": str(base)},
+                "observation": {"source_bindings": [binding]},
+                "owner_wait": {"harness": "codex", "session_id": "owner-session"}}
+            with mock.patch.object(progress, "_observation_state_path", return_value=state), \
+                    mock.patch("session_notice.notify", return_value={"state": "pending"}):
+                first = progress.observe_experiment(run, registry, 1000,
+                    row_key="row-a", started_at=100, row_scoped=True)
+                first_state = progress._read_observation_state(state)
+                self.assertEqual(first["observation"]["source_observations"][0]["value"], 21)
+                self.assertEqual(first["observation"]["source_observations"][0]["writer_run_id"],
+                                 "writer-run")
+                self.assertEqual(first["observation"]["source_observations"][0]["target_run_id"],
+                                 "target-run")
+                self.assertIsNone(first["observation"]["reached"])
+                self.assertIsNone(first["observation"]["eta_seconds"])
+                self.assertEqual(first_state["source_bindings"], [binding])
+                persisted = progress.read_public_run_record(artifact, "target-run")
+                self.assertEqual(persisted["progress"]["observed_counters"][0]["value"], 21)
+                self.assertEqual(persisted["rows"][0]["observed_counters"][0]["name"],
+                                 "finished_cells")
+                self.assertEqual(persisted["sources"][0]["format"], "independent-counter")
+                self.assertEqual(persisted["sources"][0]["writer_run_id"], "writer-run")
+                self.assertEqual(persisted["progress"]["observed_counters"][0]["source_path"],
+                                 "/nas/writer/observation.json")
+                self.assertIn("raw counter=finished_cells:21 scope=shared-results",
+                              first_state["outbox"][0]["text"])
+                self.assertIn("writer=writer-run target=target-run",
+                              first_state["outbox"][0]["text"])
+                self.assertIn("ETA 총 미상", first_state["outbox"][0]["text"])
+                resumed = progress.observe_experiment({"run_id": "target-run",
+                    "started_at": 100, "artifact_root": str(artifact),
+                    "path_namespace": {"/nas": str(base)}}, registry, 1061,
+                    row_key="row-a", started_at=100, row_scoped=True)
+                self.assertEqual(resumed["observation"]["source_observations"][0]["value"], 21)
+                proof.write_text(json.dumps({"target": "other-run", "writer": "writer-run",
+                    "argv": ["writer", "--target", "target-run"]}))
+                withdrawn = progress.observe_experiment({"run_id": "target-run",
+                    "started_at": 100, "artifact_root": str(artifact),
+                    "path_namespace": {"/nas": str(base)}}, registry, 1122,
+                    row_key="row-a", started_at=100, row_scoped=True)
+                self.assertEqual(withdrawn["observation"]["source_observations"][0]["state"],
+                                 "unknown")
+                self.assertIsNone(withdrawn["observation"]["reached"])
+                self.assertIsNone(withdrawn["observation"]["eta_seconds"])
 
     def test_admission_recovery_starts_a_new_stagnation_grace(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -18,6 +19,8 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent / "tools" / "install"))
+import fixture_env
 
 
 def load(name):
@@ -147,6 +150,11 @@ class ObserverTest(FIX.WorkflowFixture):
 
 
 class AdoptionTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name)
+
     def test_compute_adoption_does_not_inherit_installer_project_identity(self):
         import resource_progress as progress
         with tempfile.TemporaryDirectory() as directory:
@@ -222,6 +230,65 @@ class AdoptionTest(unittest.TestCase):
                     if proc.poll() is None:
                         proc.terminate()
                     proc.wait(timeout=3)
+
+    def test_installed_current_subprocess_observes_rootless_exact_source(self):
+        import resource_progress
+
+        source_bundle = self.base / "bundle-source"
+        (source_bundle / "utilities").mkdir(parents=True)
+        shutil.copytree(HERE, source_bundle / "utilities", dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.test.py", "*.test.sh"))
+        install_root = self.base / "fixture-home" / ".local" / "share" / "hearting"
+        release = install_root / "releases" / "fixture-release"
+        install_root.mkdir(parents=True)
+        shutil.copytree(source_bundle, release)
+        current = install_root / "current"
+        current.symlink_to(release, target_is_directory=True)
+        self.assertEqual(current.resolve(), release.resolve())
+
+        registry = self.base / "registry" / "resource-runs.json"
+        registry.parent.mkdir()
+        artifact = self.base / "artifacts"
+        artifact.mkdir()
+        source = self.base / "writer" / "observation.json"
+        source.parent.mkdir()
+        source.write_text(json.dumps({"observed_at": time.time() - 30,
+                                     "finished_cells": 21}))
+        proof = self.base / "writer-proof.json"
+        proof.write_text(json.dumps({"target": "installed-run", "writer": "writer-run"}))
+        binding = {"target_run_id": "installed-run", "row_key": "run",
+            "path": str(source), "writer_run_id": "writer-run",
+            "timestamp_pointer": "/observed_at", "scope": "shared-results",
+            "counters": [{"name": "finished_cells", "pointer": "/finished_cells",
+                          "comparison_eligible": False}],
+            "proofs": [{"path": str(proof),
+                "sha256": hashlib.sha256(proof.read_bytes()).hexdigest(),
+                "assertions": [{"pointer": "/target", "equals": "installed-run"},
+                               {"pointer": "/writer", "equals": "writer-run"}]}]}
+        sentinel = self.base / "absent-sentinel"
+        row = {"status": "failed", "workflow_state": "FAILED_RETRYABLE",
+            "failure_class": "resource-launch-incomplete", "resource_policy": "supervised-owner",
+            "exit_code": None, "sentinel": str(sentinel), "started_at": time.time() - 30,
+            "artifact_root": str(artifact), "observation": {"source_bindings": [binding]}}
+        registry_bytes = json.dumps({"schema_version": 1,
+            "runs": {"installed-run": row}}, sort_keys=True).encode() + b"\n"
+        registry.write_bytes(registry_bytes)
+        source_before, proof_before = source.read_bytes(), proof.read_bytes()
+        env = fixture_env.build_environment(self.base / "fixture-env", current)
+        env.pop("PYTHONPATH", None)
+        command = [sys.executable, str(current / "utilities" / "resource-observers.py"),
+                   "watch", str(registry), "installed-run"]
+        completed = subprocess.run(command, cwd=self.base, env=env,
+            capture_output=True, text=True, timeout=20)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(registry.read_bytes(), registry_bytes)
+        self.assertEqual((source.read_bytes(), proof.read_bytes()), (source_before, proof_before))
+        record = resource_progress.read_public_run_record(artifact, "installed-run")
+        self.assertEqual(record["progress"]["observed_counters"][0]["value"], 21)
+        self.assertEqual(record["progress"]["observed_counters"][0]["writer_run_id"],
+                         "writer-run")
+        self.assertIsNone(record["progress"]["reached"])
+        self.assertIsNone(record["eta"])
 
     def test_hash_bound_request_discovery_and_invalid_digest(self):
         import resource_progress as progress
