@@ -3154,7 +3154,8 @@ def resolve_caller(harness, sid, cwd: str, *, project: bool = True) -> Optional[
     if not sid:
         harness, sid = session_from_env(harness)
     detected = harness or session_from_env(None)[0]
-    seat = resolve_seat(detected, cwd, sid=sid, project=project)
+    seat = (resolve_seat(detected, cwd, sid=sid) if project else
+            resolve_seat(detected, cwd, sid=sid, project=False))
     if seat.native:
         # The inherited Claude session variable can still name the previous
         # conversation after /clear. This exact process declares the current id.
