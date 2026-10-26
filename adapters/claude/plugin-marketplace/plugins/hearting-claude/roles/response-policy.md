@@ -185,8 +185,17 @@ an unnecessary question just to make the UI more visible.
 - **Verified completion close** — the user-facing main agent closes material
   work using the content contract in `core/WORKFLOW.md §0.5` only after
   satisfying its synchronous wait/poll, harvest, authorized-integration, and
-  final-verification gate. The card is optional; a worker handoff alone never
-  closes material work. *Violation signal:* a material-work close is issued
+  final-verification gate. Satisfy final verification by assessing applicable
+  existing results and any uncovered change; a parent's independent full audit
+  is not required after the selected independent review. Read results at handoff and
+  preserve their failures, limits, and unresolved required checks; a change of
+  stage, person, folder, or interruption alone does not call for all checks to
+  run again. Verify affected work and add checks only for a remaining defect,
+  impact, or decision. Once the requested outcome has sufficient evidence, advance
+  to the authorized handoff, integration, or closure; cosmetic suggestions do not
+  reopen completed work or move its completion criteria.
+  The card is optional; a worker handoff alone never closes material work.
+  *Violation signal:* a material-work close is issued
   while dispatched or long-running work is still pending, unharvested,
   unintegrated when authorized, or unverified.
 - **Continuation registered before the turn ends** — obey the acting-agent obligation in `core/WORKFLOW.md §0.6` (registered continuation or plain fallback in the same turn; a promise is not a continuation). *Violation signal:* a turn

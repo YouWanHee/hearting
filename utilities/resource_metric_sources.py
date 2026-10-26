@@ -1062,6 +1062,29 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         item["d"] = decisions
         return listing
 
+    def listing_prefix_fingerprint(listing, key, through):
+        """Compactly prove that a cached lexical prefix still names the same files."""
+        if (not isinstance(listing, dict) or listing.get("partial") is True
+                or not isinstance(through, str) or not through):
+            return None
+        rows = listing.get(key)
+        if not isinstance(rows, list):
+            return None
+        prefix = [item for item in rows if isinstance(item, dict)
+                  and isinstance(item.get("name"), str)
+                  and item["name"] <= through]
+        if not any(item.get("name") == through for item in prefix):
+            return None
+        material = []
+        for item in sorted(prefix, key=lambda row: row["name"]):
+            token = item.get("token")
+            if not isinstance(token, str):
+                return None
+            material.append((item["name"], token, item.get("directory") is True))
+        encoded = json.dumps(material, ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     def mark_listing_entry(listing, key, name, listed_token, phase):
         """Record one stable read in its existing bounded listing."""
         rows = listing.get(key, []) if isinstance(listing, dict) else []
@@ -1850,6 +1873,16 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         partial = True
                         break
 
+                if (binding_state.get("phase") == "decisions"
+                        and bundle_progress.get("binding_listing_generation")
+                            != bundle_listing_generation):
+                    # A changed directory listing may add a foreign identity.
+                    # Recheck binding before accepting more decision pages.
+                    binding_state["phase"] = "binding"
+                    binding_state["binding_complete"] = False
+                    binding_state["page_decisions"] = []
+                    bundle_progress.pop("binding_listing_generation", None)
+
                 latest_row_prior = binding_state.get("latest") \
                     if isinstance(binding_state, dict) else None
                 latest_source_name = (latest_row_prior.get("source_file")
@@ -1868,6 +1901,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                 listing_partial = False
                 bundle_incomplete = False
                 revalidation_incomplete = False
+                listing_from_prior = False
                 bundle_listing = bundle_progress.get("listing")
                 if bundle == root:
                     bundle_listing = root_state.get("root_listing")
@@ -1896,6 +1930,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                                  if isinstance(item, dict)
                                  and isinstance(item.get("name"), str)]
                         warnings.extend(bundle_listing.get("warnings", []))
+                        listing_from_prior = True
                     if listing_revalidation == "deadline":
                         partial = True
                 if files is None:
@@ -1994,7 +2029,8 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         partial = True
                     bundle_incomplete = listing_partial
                 listing_key = "entries" if bundle == root else "files"
-                progress_source = previous_listing or bundle_listing
+                progress_source = (previous_listing or
+                    (bundle_listing if listing_from_prior else None))
                 source_rows = (progress_source.get(listing_key, [])
                                if isinstance(progress_source, dict) else [])
                 source_tokens = {(item.get("name"), item.get("token"), item.get("directory"))
@@ -2006,6 +2042,30 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     if isinstance(item, dict) and isinstance(item.get("name"), str)} \
                     if isinstance(listing_rows, list) else {}
                 phase_code = 2 if binding_state.get("phase") == "decisions" else 1
+                prefix_resumed = False
+                saved_prefix = bundle_progress.get("scan_prefix")
+                if file_cursor and not source_tokens:
+                    current_prefix = listing_prefix_fingerprint(
+                        bundle_listing, listing_key, file_cursor)
+                    if (isinstance(saved_prefix, dict)
+                            and saved_prefix.get("through") == file_cursor
+                            and isinstance(saved_prefix.get("digest"), str)
+                            and saved_prefix.get("digest") == current_prefix):
+                        prefix_resumed = True
+                    else:
+                        # Older cursors kept only last_file after their bounded
+                        # listing was evicted. Re-scan once to establish a
+                        # compact token proof before resuming past that prefix.
+                        source_epoch = bundle_progress.get("source_epoch")
+                        binding_state = new_binding_state(bundle_key, bundle_identity)
+                        if source_epoch:
+                            bundle_progress["source_epoch"] = source_epoch
+                        bundle_progress["binding_state"] = binding_state
+                        bundle_progress["last_file"] = ""
+                        bundle_progress.pop("binding_listing_generation", None)
+                        bundle_progress.pop("scan_prefix", None)
+                        file_cursor = ""
+                        phase_code = 1
                 if file_cursor and source_tokens:
                     # Adopt the prior lexical cursor only for entries whose
                     # identity token is still present in the validated listing.
@@ -2013,6 +2073,14 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         row = row_by_name.get(file_name)
                         if (row is not None and file_name <= file_cursor
                                 and (file_name, token, row.get("directory")) in source_tokens
+                                and type(row.get("p")) is not int):
+                            row["p"] = phase_code
+                elif file_cursor and prefix_resumed:
+                    # The digest covers every current token through the cursor;
+                    # prior pages can be skipped without retaining their rows.
+                    for file_name, _path, _is_dir, _token in files:
+                        row = row_by_name.get(file_name)
+                        if (row is not None and file_name <= file_cursor
                                 and type(row.get("p")) is not int):
                             row["p"] = phase_code
                 pending_files = []
@@ -2185,7 +2253,16 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     add_binding_document(binding_state, document, file_name, file_token)
                 if invalid_bundle_record:
                     binding_state["partial"] = True
-                if (isinstance(bundle_listing, dict)
+                binding_listing_is_stable = (
+                    binding_state.get("phase") == "decisions"
+                    and binding_state.get("binding_complete") is True
+                    and bundle_progress.get("binding_listing_generation")
+                        == bundle_listing_generation)
+                if binding_listing_is_stable:
+                    # Identity was completely checked for this unchanged
+                    # listing. Keep that proof while decision pages stream.
+                    binding_state["binding_complete"] = True
+                elif (isinstance(bundle_listing, dict)
                         and bundle_listing.get("partial") is not True
                         and not listing_partial and not preserve_stale_listing
                         and not source_changed and not revalidation_incomplete
@@ -2202,6 +2279,15 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         binding_state["binding_complete"] = False
                 else:
                     binding_state["binding_complete"] = not bundle_incomplete
+                if (binding_state.get("phase") == "binding"
+                        and binding_state.get("binding_complete") is True
+                        and not bundle_incomplete
+                        and current_identity == bundle_identity
+                        and current_listing_generation == bundle_listing_generation):
+                    bundle_progress["binding_listing_generation"] = \
+                        bundle_listing_generation
+                elif binding_state.get("phase") == "binding":
+                    bundle_progress.pop("binding_listing_generation", None)
                 if binding_state.get("overflow"):
                     warnings.append("admission-binding-summary-limit")
                     partial = True
@@ -2216,6 +2302,13 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                 root_state["last_root_entry"] = last_root_entry
                 root_state["bundle_generation"] = next_bundle_generation
                 if bundle_incomplete:
+                    prefix_digest = listing_prefix_fingerprint(
+                        bundle_listing, listing_key, next_file)
+                    if prefix_digest is not None:
+                        bundle_progress["scan_prefix"] = {
+                            "through": next_file, "digest": prefix_digest}
+                    else:
+                        bundle_progress.pop("scan_prefix", None)
                     bundle_progress.update(last_file=next_file,
                         binding_state=binding_state, identity=bundle_identity)
                     bundle_cursors[bundle_key] = bundle_progress
@@ -2223,6 +2316,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                 else:
                     bundle_progress.update(last_file="",
                         binding_state=binding_state, identity=bundle_identity)
+                    bundle_progress.pop("scan_prefix", None)
                     bundle_cursors[bundle_key] = bundle_progress
                     root_state["bundle_cursors"] = bundle_cursors
                 scan_state[root_key] = root_state
@@ -2267,6 +2361,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                             # Revisit them now that binding is exact.
                             bundle_progress.update(last_file="",
                                 binding_state=binding_state, identity=bundle_identity)
+                            bundle_progress.pop("scan_prefix", None)
                             bundle_cursors[bundle_key] = bundle_progress
                             root_state["bundle_cursors"] = bundle_cursors
                             partial = True
