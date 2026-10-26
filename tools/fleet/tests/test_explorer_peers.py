@@ -31,12 +31,20 @@ class PeerPaneReference(unittest.TestCase):
             for name, folds in (("PEERS", ()), ("PEERS-pick-f5", (("pfocus:PEERS", "f5"),))):
                 with self.subTest(cols=cols, state=name):
                     state = NavState(view="PEERS", title="PEERS", folds=folds)
-                    actual_cells, actual_hits = _pane(draw(vm, state, cols, 45, beat=1))
+                    frame = draw(vm, state, cols, 45, beat=1)
+                    actual_cells, actual_hits = _pane(frame)
                     expected = capture["list_states"][name]
                     expected_cells = _expand(expected["cells"])
+                    # The pane slice includes the shared key guide. Apply the
+                    # same exact, approved scroll-help delta as the full oracle.
+                    from tools.fleet.tests.test_explorer_oracle import normalize_new_tree_viewport_row
+                    expected_cells, expected_full_hits = normalize_new_tree_viewport_row(
+                        [[list(cell) for cell in row] for row in frame.cells], expected_cells,
+                        [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in frame.hits],
+                        expected["hits"], frame.tree_scroll)
                     expected_cells = [row[SEPARATOR:] for row in expected_cells[5:]]
                     expected_hits = [[hit[0] - 5, hit[1] - SEPARATOR, hit[2] - SEPARATOR, hit[3]]
-                                     for hit in expected["hits"]
+                                     for hit in expected_full_hits
                                      if hit[0] >= 5 and hit[1] >= SEPARATOR]
                     if actual_cells != expected_cells:
                         mismatch = next(((row, col, expected_cells[row][col], actual_cells[row][col])
@@ -59,6 +67,20 @@ class PeerPaneReference(unittest.TestCase):
             self.assertGreaterEqual(hit.x0, 0)
             self.assertLessEqual(hit.x1, 80)
             self.assertLess(hit.x0, hit.x1)
+
+    def test_empty_narrow_links_keep_the_reference_heading_and_columns(self):
+        from tools.fleet.explorer.view_model import ExplorerViewModel
+
+        values = load_fixture(FIXTURES / "view_model.json").to_mapping()
+        values["peer_nodes"] = []
+        values["peer_edges"] = {"links": [], "cross": [], "side_lanes": [], "cards": {}, "watches": []}
+        vm = ExplorerViewModel.from_mapping(values)
+        for cols in (80, 100):
+            with self.subTest(cols=cols):
+                text = "\n".join(draw(vm, NavState(view="PEERS", title="PEERS"), cols, 45).text_rows())
+                self.assertIn("LINKS  communication", text)
+                self.assertIn("FROM", text)
+                self.assertIn("KIND", text)
 
     def test_cards_use_each_harness_palette(self):
         base = load_fixture(FIXTURES / "view_model.json").to_mapping()
@@ -146,6 +168,15 @@ class PeerDerivedElements(unittest.TestCase):
             text = "\n".join(frame.text_rows())
             self.assertIn("[a3]→[f5] steer 3h 17m", text)
             self.assertIn("→[f5] steer 3h 22m", text)
+
+    def test_empty_narrow_links_keep_the_reference_heading_and_columns(self):
+        vm = _variant(peer_nodes=[], peer_edges={"links": [], "cross": [], "side_lanes": [], "cards": {}, "watches": []})
+        for cols in (80, 100):
+            with self.subTest(cols=cols):
+                text = "\n".join(draw(vm, NavState(view="PEERS", title="PEERS"), cols, 45).text_rows())
+                self.assertIn("LINKS  communication", text)
+                self.assertIn("FROM", text)
+                self.assertIn("KIND", text)
 
     def test_cards_never_overlap_and_hits_stay_in_the_pane(self):
         base = load_fixture(FIXTURES / "view_model.json").to_mapping()

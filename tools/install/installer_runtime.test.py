@@ -366,6 +366,43 @@ class LauncherCommitBoundaryTest(unittest.TestCase):
         self.assertFalse(status["installed"])
         self._assert_protected_surfaces_untouched()
 
+    def test_full_global_uninstall_removes_managed_fleet_names_and_preserves_foreign(self):
+        bin_dir = self.home / ".local" / "bin"
+        bin_dir.mkdir(parents=True)
+        foreign_target = self.home / "user-tools" / "fleet-monitor"
+        foreign_target.parent.mkdir()
+        foreign_target.write_text("user-owned\n", encoding="utf-8")
+        (bin_dir / "fleet-monitor").symlink_to(foreign_target)
+
+        installed = {
+            row["name"]: row
+            for row in bootstrap.install_launchers(home=self.home)
+        }
+        self.assertEqual(installed["fleet"]["status"], "created")
+        self.assertEqual(installed["fleet-monitor"]["status"], "skipped-collision")
+        self.assertEqual(installed["fleet2"]["status"], "created")
+        fleet = bin_dir / "fleet"
+        fleet2 = bin_dir / "fleet2"
+
+        partial = installer.cmd_uninstall(self._uninstall_args())
+        self.assertEqual(partial["exit"], installer.EXIT_OK)
+        self.assertTrue(fleet.is_symlink())
+        self.assertTrue(fleet2.is_symlink())
+
+        full = installer.cmd_uninstall(Namespace(
+            runtimes=["claude", "codex", "opencode"], target="all",
+            scope="global", dry_run=False,
+        ))
+        self.assertEqual(full["exit"], installer.EXIT_OK, full["lines"])
+        self.assertFalse(fleet.exists() or fleet.is_symlink())
+        self.assertFalse(fleet2.exists() or fleet2.is_symlink())
+        self.assertEqual((bin_dir / "fleet-monitor").resolve(), foreign_target.resolve())
+        self.assertTrue(any(
+            "common fleet-monitor launcher — preserved-foreign" in line
+            for line in full["lines"]
+        ))
+        self._assert_protected_surfaces_untouched()
+
     def test_partial_uninstall_fault_injection_restores_exact_launcher_state(self):
         with _stubbed_runtime_projection():
             first = installer.cmd_runtime(self._args("activate"))

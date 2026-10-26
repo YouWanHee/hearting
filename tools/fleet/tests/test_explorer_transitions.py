@@ -26,7 +26,6 @@ def _expected_nav(st):
 
 
 def _frame_json(frame):
-    from tools.fleet.tests.test_explorer_oracle import expand_rows
     cells = [[list(cell) for cell in row] for row in frame.cells]
     hits = [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in frame.hits]
     return cells, hits
@@ -71,10 +70,19 @@ class ViewerByteTrace(unittest.TestCase):
                         actual = draw(vm, state, case["cols"], 45, beat=1)
                         actual_cells, actual_hits = _frame_json(actual)
                         expected_cells = _expand([row_pool[index] for index in expected_frame["cells"]])
+                        from tools.fleet.tests.test_explorer_oracle import (
+                            _fixture_header_identity, normalize_f70_method_delta,
+                            normalize_new_tree_viewport_row)
+                        version, method = _fixture_header_identity(vm)
+                        actual_cells = normalize_f70_method_delta(
+                            actual_cells, expected_cells, version=version, method=method)
+                        expected_cells, expected_hits = normalize_new_tree_viewport_row(
+                            actual_cells, expected_cells, actual_hits, expected_frame["hits"],
+                            actual.tree_scroll)
                         difference = _first_cell_difference(expected_cells, actual_cells)
                         self.assertIsNone(difference, f"{context}: {difference or 'cell grids differ'}")
-                        if actual_hits != expected_frame["hits"]:
-                            self.fail(f"{context}: {_first_hit_difference(expected_frame['hits'], actual_hits)}")
+                        if actual_hits != expected_hits:
+                            self.fail(f"{context}: {_first_hit_difference(expected_hits, actual_hits)}")
                         if event.get("type") == "key" and event.get("key") in ("/", "F"):
                             self.assertIn(("command", "filter" if event["key"] == "/" else "feed"), effects)
 
@@ -152,6 +160,30 @@ class CoreTransitions(unittest.TestCase):
         drag = decoder.feed(b"\x1b[<0;10;8M\x1b[<32;10;11M\x1b[<0;10;11m")
         self.assertEqual([row["phase"] for row in drag], ["press", "press", "release"])
         self.assertEqual([row["motion"] for row in drag], [False, True, False])
+
+    def test_page_and_home_end_sequences_decode_as_explorer_scroll_keys(self):
+        decoder = ExplorerInput()
+        events = decoder.feed(b"\x1b[5~\x1b[6~\x1b[H\x1b[F")
+        self.assertEqual([row["key"] for row in events],
+                         ["pageup", "pagedown", "home", "end"])
+
+    def test_body_keys_and_tree_wheel_use_separate_viewport_offsets(self):
+        from types import SimpleNamespace
+        frame = SimpleNamespace(
+            hits=(),
+            pane_scroll=(34, 4, 100, 36, 0, 28, 28, True),
+            tree_scroll=(0, 13, 32, 20, 0, 12, 24, 12, {}),
+        )
+        state = NavState()
+        state, _ = reduce(state, {"type": "key", "key": "pagedown"}, frame)
+        self.assertEqual(dict(state.scroll)["pane"], 28)
+        state, _ = reduce(state, {"type": "key", "key": "home"}, frame)
+        self.assertEqual(dict(state.scroll)["pane"], 0)
+        state, _ = reduce(state, {"type": "key", "key": "end", "max_scroll": 46}, frame)
+        self.assertEqual(dict(state.scroll)["pane"], 46)
+        state, _ = reduce(state, {"type": "wheel", "direction": -1, "x": 4, "y": 14}, frame)
+        self.assertEqual(dict(state.scroll)["tree"], 3)
+        self.assertEqual(dict(state.scroll)["pane"], 46)
 
     def test_fold_reopens_on_second_activation(self):
         state, _ = reduce(NavState(), {"type": "click", "action": ("fold", "sopen:OVERVIEW", "s1")})

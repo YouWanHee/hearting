@@ -819,10 +819,20 @@ def apply_gpu_execution_sandbox(args: argparse.Namespace) -> None:
     if not selection["gpu_scope"]:
         return
     if owner:
-        for row in (route.get("dispatch_evidence") or {}).get("tuples", []):
-            if row.get("parent_harness") == "codex" and row.get("parent_sandbox") != selection["sandbox"]:
-                raise DispatchContractError("dispatch-evidence-parent-runtime-mismatch",
-                                            "selected GPU owner sandbox differs from its checked tuple")
+        rows = [row for row in (route.get("dispatch_evidence") or {}).get("tuples", [])
+                if row.get("parent_harness") == "codex"]
+        # Pin history may retain other sandbox variants. Admission needs a
+        # supported tuple for this actual owner, not agreement of every row.
+        if rows and not any(
+                row.get("parent_sandbox") == selection["sandbox"]
+                and row.get("parent_transport") == "headless"
+                and row.get("launch_authority") == "conductor"
+                and row.get("status") == "supported"
+                and row.get("checked_worktree")
+                and Path(row["checked_worktree"]).resolve() == Path(args.worktree).resolve()
+                for row in rows):
+            raise DispatchContractError("dispatch-evidence-parent-runtime-mismatch",
+                                        "selected GPU owner sandbox differs from its checked tuple")
     args.gpu_execution_selection = selection
     args.gpu_execution_scope = bool(selection["gpu_scope"])
     args.sandbox = selection["sandbox"]

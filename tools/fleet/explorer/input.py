@@ -5,6 +5,10 @@ import re
 
 _SGR = re.compile(rb"^\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 _KEYS = {b"\x1b[A": "up", b"\x1b[B": "down", b"\x1b[C": "right", b"\x1b[D": "left",
+         b"\x1b[5~": "pageup", b"\x1b[6~": "pagedown",
+         b"\x1b[H": "home", b"\x1b[F": "end",
+         b"\x1b[1~": "home", b"\x1b[4~": "end",
+         b"\x1b[7~": "home", b"\x1b[8~": "end",
          b"\x1b[Z": "shift-tab", b"\t": "tab", b"\r": "enter", b"\n": "enter",
          b"\x1b": "escape"}
 

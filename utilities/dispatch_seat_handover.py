@@ -151,8 +151,10 @@ def _all_snapshots_uncached() -> list[dict]:
 def handover_rows(seat, *, read_context=None) -> list[dict]:
     """The seat ledger's handover rows, oldest first."""
     def load():
-        return [e for e in _st()._read_ledger_lines(seat)
-                if e.get("event") == ROW_EVENT and e.get("from")]
+        st = _st()
+        with st.seat_ledger_readonly_scope():
+            return [e for e in st._read_ledger_lines(seat)
+                    if e.get("event") == ROW_EVENT and e.get("from")]
 
     rows = (read_context.handover_rows(seat, load) if read_context is not None else load())
     return sorted(rows, key=lambda r: float(r.get("ts", 0) or 0))
@@ -183,9 +185,10 @@ def _transition_rows(seat_key: Optional[str] = None) -> list[tuple[str, dict]]:
         if path.is_symlink():
             continue
         key = path.stem
-        for row in st._read_ledger_lines(st.Seat("pane", key)):
-            if row.get("event") in {ROW_EVENT, "steward-release"}:
-                out.append((key, row))
+        with st.seat_ledger_readonly_scope():
+            for row in st._read_ledger_lines(st.Seat("pane", key)):
+                if row.get("event") in {ROW_EVENT, "steward-release"}:
+                    out.append((key, row))
     return out
 
 
@@ -1523,17 +1526,19 @@ def record_locked(seat, harness: str, sid: str, event: str, source: str, now: fl
 def record_retire_handover(predecessor_sid: str, predecessor_harness: str, successor_sid: str,
                            successor_harness: str, *, env=None, jobs=None,
                            now: Optional[float] = None, successor_seat=None) -> Optional[dict]:
-    """Hand a retired predecessor's routes to its seat successor, across harnesses.
+    """Record the current holder's transfer to its exact seat successor.
 
-    Called after ``peer-steward retire`` proved the predecessor exited and the caller runs in the
-    pane started beside it.  The predecessor's unfinished depth-1 work (registered or inherited)
-    are bound to the successor in the successor's seat: one ledger row, whose bindings name the
-    registered parent their pending records stay stored under, and the seat's snapshot (now
-    naming the successor) that lets :func:`effective_parent` find it.  Registry rows are untouched.
-    Returns the row (the existing one when repeated), or None when there is nothing to hand over
-    -- including attempts the predecessor already handed to another session.
-    A deferred retire supplies the seat proven by its immutable requester and
-    original successor mark; its observer need not own that physical pane.
+    A validated typed acceptance may call this before reply delivery or physical
+    retirement; retained retire settlement also calls it for legacy and missed
+    transitions. The predecessor's unfinished depth-1 work (registered or
+    inherited) is bound in the successor's existing seat ledger. Bindings retain
+    the registered parent under which pending records stay stored, and registry
+    rows remain untouched. ``source=retire`` keeps its exact binding-selection
+    meaning for both callers. Returns the existing row on replay, or None when
+    there is nothing currently owned to hand over, including attempts already
+    handed to another session. Deferred retire uses the seat proved by its
+    immutable requester and original successor mark; its observer need not own
+    that physical pane.
     """
     if not predecessor_sid or not successor_sid or predecessor_sid == successor_sid:
         return None

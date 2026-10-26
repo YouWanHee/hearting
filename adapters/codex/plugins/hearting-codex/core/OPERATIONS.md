@@ -302,6 +302,28 @@ completion is `exited`, not workflow success; missing evidence is unknown.
 Large snapshots name their sampled scope, so a bounded display never implies
 that omitted jobs have ended.
 
+Execution presence is an additive observation separate from the governed
+process set used for quiescence, cleanup, and terminal decisions. It may call
+an open attempt absent only when the attempt's exact PID/start identities,
+recorded namespace, helper census, and runtime/command lineage prove that no
+work process remains; a surviving carrier does not prove execution, and an
+incomplete or reused identity remains unknown. The existing watchdog's
+two-window observation (300 seconds per window by default) may likewise create
+an `attempt-stalled` advisory when no comparable tool, declared-file, or result
+progress occurs; the same advisory may identify an exact terminal result whose
+existing route settlement or completion marker remains pending. Normal long
+commands, verification leases, explicit human waits, and uncertain process or
+progress evidence are not declared stalled.
+
+`attempt-stalled` uses the existing supervision receipt, retained duty, and
+carrier path to reach the current effective parent. The exact storage recipient,
+delivery digest, claim, receipt, and ACK identities stay bound to their original
+records. Currentness is rechecked before delivery; queued or accepted is not
+receipt, and ACK is not recovery. This advisory grants no start, retry, signal,
+gate-release, row-close, marker, or cleanup authority. The older `no-progress`
+reason retains its existing resultless-replacement meaning and parent-resume
+behavior.
+
 Dispatch same-work identity gates are opt-in: only `HEARTING_GATES=on`
 enforces sealed-versus-current route, parent, lineage, runtime and review
 bindings. Otherwise `utilities/hearting_gates.py` emits `hearting: gate-off`
@@ -872,6 +894,24 @@ the exact row and prints its `apply_command`, which carries that row's digest
 releases consumption.
 A different conflict invalidates that disposition; classifier ranks grant no override.
 
+An explicit FAIL or BLOCKED in bound completion evidence cannot publish a
+normal success marker. Structured verdict evidence and a review report's declared
+result share this rule; an evidence-bound owner closure keeps its separate,
+reduced-independence meaning. A legacy marker that committed BLOCKED evidence
+does not make that review a PASS. The existing terminal-conflict review may
+retain a previous independent PASS only after proving exact history, preserved
+evidence, unchanged reviewed inputs, settled attempts and current owner/parent
+authority, together with the later attempt’s retained PASS and explicit record
+of no scientific review or input change. Runtime appends the verified
+judgment's provenance, preserves the later BLOCKED result, original marker
+history, canonical verdict bytes and round census, and records the rejected
+correction as BLOCKED rather than independent PASS. Missing or contradictory
+proof leaves the conflict pending. This reuses an existing judgment without a
+reviewer launch, new round or budget reset.
+Older readers retain their unreviewed hold for this semantic recovery; only a
+capable installed reader consumes it. No legacy success receipt is reclassified
+as a new independent PASS.
+
 `dispatch_supervision.wait_for_batch` owns repeated join checkpoints across
 session supervisors, serial chains, and the managed completion carrier. It
 keeps execution alive, schedules exact recovery, and uses the existing
@@ -1025,7 +1065,7 @@ A legacy hash collision is diagnostic
      Launch settings and records share one captured Git permission projection across adapters. Existing pre-seal and fenced pre-spawn checks compare a fresh projection; changed or unknown state refuses spawn with axis and old/new values. Read-root-only registry summaries use the read enforcement grade, so `os-sandbox` can coexist with file/network `none`; same-session turns reproject while launch effective remains immutable.
      Historical recovery compares `runtime_sandbox` as a permission value and refuses changed values. Its read-only diagnosis includes the axis, predecessor/candidate and verified canonical evidence digests; missing evidence cannot supply equality.
    - **Ship deployment by the parent (2026-10-11):** an approved ship route can hand only its deploy command to its actual interactive parent through `hearting run ship-parent-deploy prepare|run`. The common utility checks parent identity and host context, existing reviews/arbitration/stop fences and exact command inputs, records one execution in the existing `deploy-record.json`, and prints the ordinary correction command for the owner to continue post-deploy verification. It preserves the route, user approval, access grants and attempt ceilings on all three harnesses. This is an explicit parent host action, not an owner grant or OS sandbox guarantee; service activation happens only if the parent invokes a reviewed command that does it. Retained running/failure/interruption results prevent automatic replay. The [common ship procedure](../capabilities/autopilot-ship.md#deployment-by-the-interactive-parent) owns request preparation and handback; the existing BLOCKED/correction lifecycle supplies the wait without another gate or supervisor.
-   - **GPU compute execution sandbox:** Catalog parts declaring `execution_needs: compute-hosts` select the existing Codex `danger-full-access` mode for their registered owner and compute node launches, including eval, resume, borrowed parts, extra stages and parallel legs. Explicit typed GPU resources (`resource_class=gpu`, or the existing `gpu` promotion signal on a resource runner) keep the same selection. One fresh selection feeds prospective readiness, the route's sealed `codex_execution_sandbox`, exec/App Server execution and GPU lease admission; an existing sandbox seal remains authoritative. A pre-seal route keeps its ordinary owner sandbox behavior: checked parent tuples alone neither replace that choice nor add GPU targets or leases. Caller sandbox choices and forced settings keep their existing precedence. Frames and non-compute children retain their defaults. Full access removes Codex filesystem and network enforcement; approved `enforcement_required=any` roots remain a logical parent/child request boundary, recorded with grade `none` and unmet enforcement. Strict OS enforcement requests retain refusal. Compose and launch receipts show the selection and device limitation; outer or managed runtime constraints still apply. GPU availability is measured by a read-only device query, rather than inferred from the selected mode. User configuration and existing routes remain untouched.
+   - **GPU compute execution sandbox:** Catalog parts declaring `execution_needs: compute-hosts` select the existing Codex `danger-full-access` mode for their registered owner and compute node launches, including eval, resume, borrowed parts, extra stages and parallel legs. Explicit typed GPU resources (`resource_class=gpu`, or the existing `gpu` promotion signal on a resource runner) keep the same selection. One fresh selection feeds prospective readiness, the route's sealed `codex_execution_sandbox`, exec/App Server execution and GPU lease admission; an existing sandbox seal remains authoritative. Pin readiness for an existing route keeps that sealed or historical owner selection, including a continuation that omits completed compute nodes. The launch uses a supported checked tuple for its actual owner sandbox; historical tuples for another sandbox remain recorded without substituting for that match. A pre-seal route keeps its ordinary owner sandbox behavior: checked parent tuples alone neither replace that choice nor add GPU targets or leases. Caller sandbox choices and forced settings keep their existing precedence. Frames and non-compute children retain their defaults. Full access removes Codex filesystem and network enforcement; approved `enforcement_required=any` roots remain a logical parent/child request boundary, recorded with grade `none` and unmet enforcement. Strict OS enforcement requests retain refusal. Compose and launch receipts show the selection and device limitation; outer or managed runtime constraints still apply. GPU availability is measured by a read-only device query, rather than inferred from the selected mode. User configuration and existing routes remain untouched.
    - **Codex owner write advisory (SD-162):** mutating routes show a read-only sandbox/Git/external-path advisory in compose, explain and start/resume receipts; the Codex wrapper reports its applied sandbox and existing grants before registration. Primary protected `.git` and the linked-worktree owner's narrow Git grant remain distinct from the declared sub-session no-commit contract; this notice neither grants access nor changes approval, launch decisions, or user settings.
    - **Registered headless permission posture:** a registered Claude worker or owner is a `claude -p` turn. Without a start flag `claude -p` inherits `permissions.defaultMode` from the settings scopes (managed, project-local, project, user), and only when nothing is configured does it start in `default` (Manual) — the plan's built-in `auto` default applies to interactive sessions, not to `-p`. The harness's own settings template writes `permissions.defaultMode: "auto"` into `~/.claude/settings.json`, so a Hearting-launched `claude -p` inherited auto mode with the permission classifier. A non-interactive run has no prompt to fall back to when the classifier blocks repeatedly, so a headless owner whose harness commands are blocked in sequence dies as a cascade of denials with no typed cause. Hearting-launched sessions are unattended by design, so the Claude wrapper pins the start mode itself. The shipped default `headless.claude_permission_mode: bypass` in `profiles/dispatch-defaults.yaml` (user copy `~/.config/hearting/dispatch-defaults.yaml`; per-launch override `--permission-mode` / `CLAUDE_DISPATCH_PERMISSION_MODE`) adds `--permission-mode bypassPermissions` to every registered `claude -p` and to the session-resume supervisor's first and resumed turns. `allowlist` is the opt-out and the automatic fallback where bypass cannot apply — root/sudo, or `permissions.disableBypassPermissionsMode: "disable"` read from **any** settings scope the runtime honours (managed, `<worktree>/.claude/settings.local.json`, `<worktree>/.claude/settings.json`, user) — and it pins `--permission-mode acceptEdits` (file edits and common filesystem commands inside the working directory and the added artifact root are approved without the classifier) plus `--allowedTools` naming what a registered worker contractually needs and nothing broader: the harness utilities (`capability-route`, `dispatch-node`, `dispatch-batch`, `dispatch-owner`, `dispatch-harvest`, `stage-dispatch-fallback`, `artifact_producer`, `spec-transaction`) under the sealed `AGENT_HOME`, read-only git, `git add`/`git commit` for a commit-expected owner or single-session stage, the harness test runners, and `Edit(//<worktree>/**)` / `Edit(//<artifact-root>/**)` (Edit rules also govern Write). The same allow rules ride along under `bypass` too — they have no effect while bypass holds and take over if the runtime demotes the session. The applied posture is evidence, not intent: the wrapper records `permission_mode=`, `permission_mode_reason=`, and `permission_inherited_mode=` (the settings `defaultMode` the turn would otherwise have started in) in the attempt row and its receipt. Deny rules apply in every mode, so the proven-fatal async deny (`--disallowedTools`, SD-71/78) is unchanged. Codex parity already holds — `codex exec` runs with `approval_policy=never` (it never prompts) while the sandbox stays the security boundary, and `--dangerously-bypass-approvals-and-sandbox` is never used on this registered-dispatch surface. That prohibition is scoped to registered dispatch: a **managed interactive** Codex session the harness launches (bare `codex`, `resume`, `fork`, through `utilities/codex-launcher.py`) does start in bypass by default, the interactive-surface counterpart of `steward.child_permission_mode` rather than of this key, with `AGENT_CODEX_INTERACTIVE_PERMISSION_MODE=inherit` and any caller-stated posture as its opt-outs (`adapters/codex/ADAPTATION.md`). OpenCode parity is the wrapper's `permission` config (`external_directory` deny plus scoped allow): the headless auto-reject that truncates a session is avoided by `deny`, not by a bypass.
    - **Checked evidence probe — whose parent and worktree are being probed:** create the final isolated source worktree first, then run every standard+ eligibility probe from and against that exact canonical path. Automatic compose and proposal assembly inspect the enabled prospective-owner pool; exact-target pin and sandbox rechecks remain targeted. Every emitted tuple records the owner actually checked and seals `checked_worktree`. `utilities/nested-dispatch-eligibility.py` emits one tuple per child harness, and `capability-route.py compile` rejects a tuple whose path differs from the route `cwd`. Evidence from the primary checkout, a staging directory, or a worktree that will later be replaced is never reusable for the final route. Every `--parent-*` value describes **the process that will launch the dispatch-depth-2 node — the dispatch-depth-1 registered-headless capability owner — not the session running the probe.** A dispatch-depth-0 caller sealing its own runtime is the recurring failure mode, so all three fields resolve or fail closed rather than defaulting to the caller: `--parent-transport` defaults to `auto` and is always `headless` for a dispatch-depth-2 tuple (an explicit `interactive` is canonical vocabulary for the caller and a contradiction here); `--parent-sandbox` defaults to `auto` and resolves the parent harness wrapper's canonical `AGENT_DISPATCH_CURRENT_SANDBOX` export; `--parent-harness` stays required because the owner's adapter is a later `dispatch-owner` decision, and its `auto` resolves only inside a wrapper that already exports its identity. A probe running inside an active Codex owner still requires its checked `AGENT_NESTED_HEADLESS_NETWORK=1` marker. A dispatch-depth-0 caller checking a Codex owner that has not started uses the explicit `--prospective-standard-owner --jobs <canonical-jobs.log>` mode instead; that mode proves the exact registry and lock are writable, evaluates the same standard+ dispatch-depth-1 owner predicate used by the Codex launcher, labels the evidence as prospective, and never fabricates the runtime marker. A missing marker without that mode means only that the active-owner runtime is unconfirmed, not that an explicit Codex dispatch-depth-1 selection is unsupported. `utilities/dispatch-readiness.py` is the required depth-0 pre-owner surface: it applies that prospective mode automatically with the exact registry and atomically emits the complete checked evidence object, so callers never assemble tuples manually. Calling the raw active-owner surface without an active marker is typed `prospective-owner-check-required`, not a runtime-global network failure. The same parent fields, exact worktree, canonical registry, and final owner sandbox projection are cross-checked before launch, so a wrong subject or unwritable registry fails before an owner is paid for. Because the owner's adapter and the sealed `parent_harness` must agree, pass the compiled route to `dispatch-owner --route-evidence <route.json>`; that selector-only option constrains the adapter cascade to the harnesses the checked tuples actually probed and never crosses the wrapper boundary. Sealing dispatch-depth-0 values instead blocks hop 1 and 2 for every node and every adapter with `dispatch-evidence-parent-runtime-mismatch` or `parent-attempt-not-found`; it never authorizes inline execution.
@@ -2366,14 +2406,19 @@ Resumed retirement determines self-target from its recorded requester's session
 and pane identity. A cancelled request is terminal history:
 a new explicit request for the same lifetime accepts a fresh duty while retaining
 the cancelled record; repeated active or completed requests share that fresh duty.
-When the retire succeeds from the pane started beside the predecessor, the
-predecessor's open depth-1 routes pass to the successor, on any harness: it may
-`start` and `correct` them, and their stored completion records reach it
-(`retire ... handover=<n>`). Registry rows, their registered parent and worker
-identities stay as they are; cards and notices are not moved.
-Deferred retirement resolves succession from the recorded requester session and
-pane, with the original successor mark predating acceptance and matching both
-requester and predecessor. Proven loss of the booked predecessor
+An explicitly accepted typed cross-seat handoff records the predecessor's
+open depth-1 routes to the exact successor through the common seat ledger,
+before reply delivery or physical retirement settles. The successor may then
+`start` and `correct` them, and their stored completion records reach it. The
+registered parent, worker, receipt, claim, and ACK identities stay anchored to
+their original storage; cards and notices are not moved. Physical retirement
+remains a separate retained duty and still observes the original process
+birth, executor work, busy state, drafts, and forms. A later retire replay
+reuses the same ledger row rather than creating another transfer.
+Deferred retirement uses the same early cutover when the original successor
+mark predates acceptance and its current native process proves the recorded
+requester. The mark stays available while exit waits. Past parent delivery
+uncertainty is separate from actual executor liveness. Proven loss of the booked predecessor
 lifetime can finish this same handover even when its pane has disappeared; it
 grants nothing to a later occupant. A completed retirement whose handover was
 missed is consumed by the ordinary lifecycle callback or the same
@@ -2705,10 +2750,10 @@ repository is plumbing, not a user tool call.
 After a resource exits, an owner without a current model summary or tool shows
 the last resource result and log age in NOW.
 
-`fleet` keeps the group and process screen described above for both live use and `--once`.
-The B explorer compose (a work ledger and output view with navigation) is still in development
-and opens only through `fleet2` or `fleet --explorer`; it becomes the default only after it
-reads well on real sessions.
+`fleet-monitor` keeps the group and process screen described above for live use and `--once`.
+The B explorer compose (a work ledger and output view with navigation) is still in development;
+the approved public command `fleet` opens it, and `fleet2` remains a compatibility alias.
+This command choice does not mark the Explorer's visual or interaction acceptance complete.
 For a live local resource, bounded reads of its exact process and descendants
 show GPU selection separately from use: `moving4:1 지정 · GPU 사용 전`.
 Observed GPU use takes precedence; selection alone creates no GPU usage
@@ -2859,9 +2904,12 @@ handoff supplies the existing `session_tidy.py handoff accept <ref>` command.
 After reading the card and referenced documents, the receiver uses that exact
 command; it binds the current receiver and transfer ref. Ordinary messages and
 cards have no accept command or successor authority. A confirmed same-seat clear
-uses the existing seat handover automatically. Explicit acceptance schedules the
-retained reply and normal predecessor retire reservation using the original exact
-identities. Delivery is receipt, not acceptance.
+uses the existing seat handover automatically. Explicit acceptance records the
+current parent and completion recipient in the common seat ledger, then schedules
+the retained reply and normal predecessor retire reservation with the original
+exact identities. Reply delivery and physical retire remain separate retained
+duties; an unknown reply does not delay the accepted authority transfer. Delivery
+is receipt, not acceptance.
 For an actionable peer request that can be completed now, reply once with the
 result. For work that will wait or take sustained effort, send one short receipt and
 continue through the existing registered continuation. Informational/no-reply

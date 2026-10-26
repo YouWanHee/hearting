@@ -61,6 +61,72 @@ class LiveSnapshot:
         # Keep the existing sessions, jobs unpacking surface for CLI readers.
         return iter((self.sessions, self.jobs))
 
+    @property
+    def required_details_ready(self):
+        return required_details_complete(self.observations)
+
+    @property
+    def required_details_all_new(self):
+        return required_details_all_new(self.observations)
+
+
+_BASIC_COMPLETE_STATES = frozenset(("ok", "complete", "success"))
+_DETAIL_COMPLETE_STATES = _BASIC_COMPLETE_STATES | {"continued"}
+
+
+def _observation_identity(item):
+    if not isinstance(item, dict):
+        return None
+    return item.get("generation_identity", item.get("identity"))
+
+
+def required_details_complete(observations):
+    """Require successful detail work tied to the exact published basic generation."""
+    if not isinstance(observations, dict):
+        return False
+    basic = observations.get("basic")
+    detail = observations.get("required-details")
+    if not isinstance(basic, dict) or not isinstance(detail, dict):
+        return False
+    identity = _observation_identity(basic)
+    detail_state = str(detail.get("state", "")).lower()
+    return bool(
+        identity is not None
+        and identity == _observation_identity(detail)
+        and str(basic.get("state", "")).lower() in _BASIC_COMPLETE_STATES
+        and detail_state in _DETAIL_COMPLETE_STATES
+        and (detail_state != "continued" or detail.get("continuation_validated") is True)
+    )
+
+
+def required_details_all_new(observations):
+    if not required_details_complete(observations):
+        return False
+    detail = observations["required-details"]
+    return detail.get("all_new", True) is True and str(detail.get("state", "")).lower() != "continued"
+
+
+def set_required_details(snapshot, state, *, reason=None, all_new=None, observed_at=None,
+                         continuation_validated=None):
+    """Record required-detail completion without mutating an already published observation."""
+    observations = dict(getattr(snapshot, "observations", None) or {})
+    basic = observations.get("basic")
+    identity = _observation_identity(basic)
+    item = {"state": str(state)}
+    if identity is not None:
+        item["generation_identity"] = identity
+    if observed_at is not None:
+        item["observed_at"] = observed_at
+    if reason:
+        item["reason"] = str(reason)[:160]
+    if all_new is not None:
+        item["all_new"] = bool(all_new)
+    if continuation_validated is not None:
+        item["continuation_validated"] = bool(continuation_validated)
+    observations["required-details"] = item
+    snapshot.observations = observations
+    return snapshot
+
 
 def as_snapshot(value):
     """Legacy/test collectors may still return just their two row lists."""

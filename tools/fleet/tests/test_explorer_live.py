@@ -95,6 +95,7 @@ class ConfigFields(unittest.TestCase):
 
     def test_first_tick_process_row_is_kept_and_gpu_processes_use_renderer_record_shape(self):
         snapshot = {"sessions": [{"harness": "codex", "pid": 44, "proc_start": 100,
+                                  "session_id": "sid-exact", "session_tag": "a3",
                                   "cwd": "/work/SR_CorrNet-wt/branch", "liveness": "working"}],
                     "resources": [], "compute_hosts": {"hosts": [{"host": "host-a", "gpus": [
                         {"index": 0, "processes": [{"command": "python -B /tmp/resume.py --request-sha256 0123456789abcdef",
@@ -105,9 +106,23 @@ class ConfigFields(unittest.TestCase):
         vm = build_view_model(snapshot, now=2_000_000_000)
         self.assertEqual(len(vm.sessions), 1)
         self.assertEqual(vm.system["gpu_processes"][0]["session_id"], "sid-exact")
+        self.assertEqual(vm.system["gpu_processes"][0]["session_tag"], "a3")
         self.assertEqual(vm.system["gpu_processes"][0]["command"], "resume.py")
         self.assertEqual(vm.system["gpu_processes"][0]["vram"], "2.5 GB")
         self.assertEqual(vm.system["gpu_processes"][0]["age"], "1h 0m")
+
+    def test_unmatched_gpu_owner_keeps_exact_id_but_has_no_display_tag(self):
+        snapshot = {"sessions": [], "resources": [], "compute_hosts": {"hosts": [{"host": "host-a", "gpus": [
+            {"index": 0, "processes": [{"command": "python train.py", "used_memory_mib": 1024,
+                "elapsed_s": 60, "cwd": "/work/repo",
+                "session_owner": {"harness": "codex", "session_id": "departed-session"}}]}]}]},
+            "unregistered_gpu": []}
+
+        vm = build_view_model(snapshot, now=2_000_000_000)
+        process = vm.system["gpu_processes"][0]
+
+        self.assertEqual(process["session_id"], "departed-session")
+        self.assertIsNone(process["session_tag"])
 
     def test_compute_host_uses_per_thread_cpu_and_swap_telemetry(self):
         host = {"host": "host-a", "self": True, "reachable": True, "cpu_count": 4,
@@ -175,6 +190,8 @@ class RealDataFidelity(unittest.TestCase):
                         hearting={"version": "v3.42.0-2-gdc406c55a-dirty", "install_method": "unmanaged"},
                         usage_snapshots=usage)
         self.assertEqual(vm.system["install"]["version"], "v3.42.0-2-gdc406c55a-dirty")
+        self.assertEqual(vm.hearting, {"version": "v3.42.0-2-gdc406c55a-dirty",
+                                       "install_method": "unmanaged"})
         self.assertRegex(vm.system["usage_api"]["freshness"], r"^\d\d:\d\d$")
 
     def test_route_uses_recorded_result_name_and_default_version_helper_keeps_build(self):
@@ -259,10 +276,25 @@ class SourceBackedRecords(unittest.TestCase):
     def test_install_flags_and_runtimes_come_from_the_install_record(self):
         vm = self.vm(hearting={"version": "v3.41.1", "install_method": "managed/pinned",
                                "source": "distribution", "runtimes": ["claude", "codex"]})
+        self.assertEqual(vm.hearting, {"version": "v3.41.1", "install_method": "managed/pinned"})
         self.assertEqual(vm.system["install"]["managed"], True)
         self.assertEqual(vm.system["install"]["pinned"], True)
         self.assertEqual(vm.system["install"]["distribution"], True)
         self.assertEqual(tuple(vm.system["runtimes"]), ("claude", "codex"))
+
+    def test_unbounded_configured_host_stays_full_in_compute_projection(self):
+        host_name = "trainer-west-gpu-node-01"
+        host = {"host": host_name, "self": True, "reachable": True, "cpu_count": 4,
+                "cpu_utilization_pct": 25, "memory_total_mib": 8192,
+                "memory_used_mib": 4096, "gpus": []}
+        vm = self.vm(hearting={"version": "v3.50.3-20-gad247e2b6",
+                               "install_method": "managed/stable"},
+                     compute_hosts={"hosts": [host]})
+
+        self.assertEqual(vm.hosts[0]["name"], host_name)
+        self.assertEqual(vm.compute[0][0], host_name)
+        self.assertEqual(vm.hearting, {"version": "v3.50.3-20-gad247e2b6",
+                                       "install_method": "managed/stable"})
 
     def test_memory_rows_drop_bookkeeping_and_the_provenance_header(self):
         memory = {"by_repo": {"demo-app": [

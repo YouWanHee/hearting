@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import time
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -129,6 +130,97 @@ class ResponsibilityTest(unittest.TestCase):
              mock.patch("route_parent_close.row_requested", return_value=False):
             self.assertFalse(supervision._pending({"att-owner": ("done", metadata)},
                 ["att-owner"], jobs, reason="no-progress"))
+
+    def test_attempt_stall_is_not_a_parent_start_or_retry_authorization(self):
+        record = {"receipt": {"kind": supervision.KIND, "reason": "attempt-stalled",
+                               "owner_attempt_id": "att-owner",
+                               "job_registry": str(self.jobs)}}
+        arm = mock.Mock(side_effect=AssertionError("stall advisory must not arm"))
+        self.assertIsNone(supervision.continue_for_parent(
+            record, session_id="parent", recipient_kind="codex-managed-gateway", arm=arm))
+        arm.assert_not_called()
+
+    def test_stall_notice_explains_the_observation_with_read_only_next_command(self):
+        metadata = {**CURRENT, "attempt_id": "att-worker", "parent_sid": "parent",
+                    "parent_completion_delivery": "codex-managed-gateway"}
+        self.jobs.write_text(row("att-worker", **metadata))
+        receipt = {"schema_version": 1, "kind": supervision.KIND, "state": "attention",
+            "owner_attempt_id": "att-worker", "monitored_attempt_ids": ["att-worker"],
+            "recipient_thread_id": "parent", "sealed_batch_id": "",
+            "job_registry": str(self.jobs), "reason": "attempt-stalled",
+            "obligation_revision": "revision", "responsible": "supervision-controller",
+            "required_action": "inspect-recovery", "pending_delivery_id": "delivery-stall"}
+        observation = {"state": "stalled", "reason": "no-comparable-progress",
+                       "quiet_windows": 2, "last_progress_at": 10.0}
+        with mock.patch.object(supervision, "_rows", return_value={
+                "att-worker": ("open", metadata)}), \
+             mock.patch.object(supervision, "update_attempt_stall_observation",
+                               return_value=observation), \
+             mock.patch("dispatch_replacement._replacement_in_flight", return_value=False), \
+             mock.patch("dispatch_replacement._plain_retry_successor", return_value=False), \
+             mock.patch("route_parent_close.row_requested", return_value=False):
+            text = supervision.render_text(receipt)
+        self.assertIn("no comparable progress for 2 watchdog windows", text)
+        self.assertIn("dispatch-registry.py reconcile --jobs", text)
+        self.assertNotIn("start --route", text)
+        self.assertIn("did not start, retry, signal, approve", text)
+
+    def test_current_marker_or_successor_retires_an_older_stall_episode(self):
+        route_file = self.root / "route.json"
+        marker = self.root / "execute.json"
+        route_file.write_text(json.dumps({"route_id": "rt-policy", "route_hash": "route-hash",
+                                          "nodes": [{"id": "test"}]}))
+        marker.write_text(json.dumps({"attempt_id": "att-worker"}))
+        metadata = {**CURRENT, "attempt_id": "att-worker", "route_file": str(route_file),
+                    "route_hash": "route-hash", "completion_marker": str(marker)}
+        self.jobs.write_text(row("att-worker", **metadata))
+        with mock.patch("dispatch_replacement._replacement_in_flight", return_value=False), \
+             mock.patch("dispatch_replacement._plain_retry_successor", return_value=False), \
+             mock.patch.object(contract, "completion_marker_is_current", return_value=True):
+            self.assertTrue(supervision._attempt_stall_superseded(self.jobs, "att-worker", metadata))
+        with mock.patch("dispatch_replacement._replacement_in_flight", return_value=True), \
+             mock.patch("dispatch_replacement._plain_retry_successor", return_value=False):
+            self.assertTrue(supervision._attempt_stall_superseded(self.jobs, "att-worker", metadata))
+
+    def test_effective_parent_receives_actual_needs_attention_reason_and_existing_command(self):
+        import route_identity
+        route = {"route_id": "rt-attention", "artifact_root": str(self.root),
+                 "nodes": [{"id": "execute", "depends_on": []}]}
+        route["route_hash"] = route_identity.route_hash(route)
+        route_file = self.root / "route.json"
+        route_file.write_text(json.dumps(route), encoding="utf-8")
+        metadata = {**CURRENT, "attempt_id": "att-worker", "route_id": route["route_id"],
+            "route_hash": route["route_hash"], "route_node": "execute",
+            "route_file": str(route_file), "parent_sid": "parent",
+            "parent_harness": "codex", "parent_completion_delivery": "codex-managed-gateway",
+            "parent_attempt_id": "-"}
+        self.jobs.write_text(row("att-worker", **metadata), encoding="utf-8")
+        receipt_path = self.root / "start-receipts"
+        receipt_path.mkdir()
+        key = hashlib.sha256(b"codex\0parent").hexdigest()
+        command = "python3 utilities/capability-route.py start --route /safe/route.json"
+        (receipt_path / (key + ".json")).write_text(json.dumps({
+            "schema": "start_receipt_v1", "id": "receipt", "saved_at": time.time(),
+            "harness": "codex", "session_id": "parent",
+            "receipt": {"state": "needs-attention", "route_id": route["route_id"],
+                        "reason": "work-parent-recovery-required",
+                        "required_action": "resume-route", "resume_command": command},
+        }), encoding="utf-8")
+        execution = contract.AttemptExecutionObservation("active", "runtime-command-live")
+        with mock.patch.object(contract, "attempt_execution_observation", return_value=execution), \
+             mock.patch("peer_obligations.ensure_normal_runner"):
+            observation = supervision.update_attempt_stall_observation(
+                self.jobs, "att-worker", now=time.time(),
+                row=("open", metadata), worktree=str(self.root))
+            notices = supervision.materialize(self.jobs, {"att-worker"}, reason="attempt-stalled")
+        self.assertEqual(observation["reason"], "route-needs-attention")
+        self.assertEqual(observation["route_attention"]["reason"],
+                         "work-parent-recovery-required")
+        text = supervision.render_text(notices[0]["receipt"])
+        self.assertIn("reason=work-parent-recovery-required", text)
+        self.assertIn("required_action=resume-route", text)
+        self.assertIn(command, text)
+        self.assertIn("not human approval", text)
 
     def test_identity_refusal_hands_answerless_duty_to_parent_without_new_receipt_kind(self):
         refusal = {"state": "needs-attention", "reason": "replacement-parent-identity-unproven"}

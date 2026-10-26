@@ -50,6 +50,7 @@ import json
 import os
 import sys
 import time
+import copy
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -336,6 +337,42 @@ class RoundScope:
     node_evidence: dict
     jobs: tuple = ()
     _memo: dict = field(default_factory=dict)
+    _pass_memo: dict = field(default_factory=dict)
+
+    def memoized(self, namespace, key, producer):
+        """Return a defensive copy of one result cached only for this observation pass."""
+        memo_key = (namespace, key)
+        if memo_key not in self._pass_memo:
+            self._pass_memo[memo_key] = producer()
+        return copy.deepcopy(self._pass_memo[memo_key])
+
+    def gate_marks_for(self, record, route_id=None, home=None):
+        """Resolve completion gates once per exact route/evidence/state-root pass."""
+        rid = route_id or (record or {}).get("route_id")
+        if not rid or not isinstance(record, dict):
+            return {}
+        raw_evidence = (self.node_evidence or {}).get(rid)
+        evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
+        state_roots = tuple(_route_state_roots(
+            rid, self.jobs, home=home, node_evidence=evidence))
+        home_key = os.path.realpath(home) if home else None
+        jobs_key = tuple((id(job), getattr(job, "_registry_path", None),
+                          getattr(job, "attempt_id", None), getattr(job, "route_id", None),
+                          getattr(job, "owner_route_id", None)) for job in self.jobs)
+        key = (rid, record.get("route_hash"), home_key, state_roots,
+               id(self), id(self.node_evidence),
+               id(raw_evidence) if raw_evidence is not None else None, jobs_key)
+
+        def resolve():
+            marks = {}
+            for node in (record.get("nodes") or ()):
+                node_id = node.get("id") if isinstance(node, dict) else None
+                if isinstance(node_id, str) and gate_mark(
+                        record, node_id, home=home, state_roots=state_roots):
+                    marks[node_id] = True
+            return marks
+
+        return self.memoized("gate-marks", key, resolve)
 
 
 def round_history(record, scope):
@@ -1203,6 +1240,18 @@ def _node_state(node_id, route_jobs, ev_by_node, now, completion_marked=False, d
 
     live = [j for j in route_jobs if getattr(j, "route_node", None) == node_id]
     active = [j for j in live if j.liveness == "working"]
+    stalled = [j for j in live
+               if isinstance(getattr(j, "stall_observation", None), dict)
+               and not _is_reconciling_attempt(j)]
+    if stalled and (active or not completion_marked):
+        current = _best(stalled)
+        observation = {**current.stall_observation, "observed_at": now}
+        reason = observation.get("reason") or "attempt-stalled"
+        return {"state": "attention", "elapsed_min": current.elapsed_min,
+                "model": current.model, "harness": current.harness,
+                "effort": current.effort, "pid": None,
+                "note": reason, "job": current,
+                "stall_observation": observation}
     if active:
         j = _best(active)
         return {"state": "active", "elapsed_min": j.elapsed_min, "model": j.model,

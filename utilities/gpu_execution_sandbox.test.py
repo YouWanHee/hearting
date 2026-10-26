@@ -252,6 +252,95 @@ class GpuSandboxTest(unittest.TestCase):
                 self.assertEqual(policy["type"], "dangerFullAccess" if args.sandbox == "danger-full-access" else "workspaceWrite")
             self.route.pop("codex_execution_sandbox")
 
+    def enable_readiness_cli(self):
+        # Only the model CLI is fake; selection, readiness, registry probe,
+        # pin journal and wrapper admission use their real implementation.
+        bindir = self.root / "fake-bin"
+        bindir.mkdir(exist_ok=True)
+        command = bindir / "claude"
+        command.write_text('#!/bin/sh\nprintf \'%s\\n\' \'{"loggedIn":true}\'\n')
+        command.chmod(0o700)
+        patch = mock.patch.dict(os.environ, {"PATH": str(bindir) + os.pathsep + "/usr/bin:/bin"})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_pin_probe_of_gpu_suffix_keeps_sealed_owner_selection(self):
+        self.enable_readiness_cli()
+        choice = G.select(self.route)
+        suffix = {**self.route, "continuation_contract_version": 1,
+                  "codex_execution_sandbox": choice, "nodes": [self.route["nodes"][0]],
+                  "dispatch_evidence": {"tuples": [{"parent_harness": "codex",
+                      "child_harness": "claude", "parent_sandbox": choice["sandbox"],
+                      "parent_transport": "headless", "launch_authority": "conductor",
+                      "status": "supported"}]}}
+        self.assertEqual(G.fresh_gpu_resource_nodes(suffix), [])
+        # Every owner family shares the same readiness entry; only Codex's
+        # declared sandbox changes for this sealed GPU owner.
+        for parent in ("codex", "claude", "opencode"):
+            with self.subTest(parent=parent):
+                tuples, candidates = R._pin_change_probe(
+                    suffix, self.state / "jobs.log", "owner", parent, "codex")
+                self.assertEqual(candidates, [])
+                self.assertTrue(tuples)
+                self.assertTrue(all(row["status"] == "supported" for row in tuples))
+                expected = choice["sandbox"] if parent == "codex" else "adapter-default"
+                self.assertTrue(all(row["parent_sandbox"] == expected for row in tuples))
+                self.assertTrue(all(row["checked_worktree"] == str(self.worktree) for row in tuples))
+
+    def test_pin_probe_does_not_retroactively_promote_preseal_compute(self):
+        self.enable_readiness_cli()
+        self.route["nodes"] = [{"id": "eval-run", "kind": "resource-runner"}]
+        self.route["dispatch_evidence"] = {"tuples": [{
+            "parent_harness": "codex", "child_harness": "claude",
+            "parent_sandbox": "workspace-write", "parent_transport": "headless",
+            "launch_authority": "conductor", "status": "supported"}]}
+        self.assertTrue(G.fresh_gpu_resource_nodes(self.route))
+        tuples, _ = R._pin_change_probe(self.route, self.state / "jobs.log", "owner", "codex", "codex")
+        self.assertTrue(all(row["status"] == "supported" for row in tuples))
+        self.assertTrue(all(row["parent_sandbox"] == "workspace-write" for row in tuples))
+        self.assertFalse(G.select(self.route)["gpu_scope"])
+
+    def test_owner_uses_matching_tuple_despite_historical_pin_sandbox(self):
+        choice = G.select(self.route)
+        evidence = self.evidence(choice)
+        self.route.update(route_id="rt-pin-fixture", route_hash="sha256:pin-fixture",
+            artifact_root=str(self.artifact), codex_execution_sandbox=choice,
+            dispatch_evidence=evidence)
+        stale = {**evidence["tuples"][0], "parent_sandbox": "workspace-write"}
+        auth = C.route_authority
+        auth.record_pin_change(self.route, target="owner", pin={"harness": "codex"},
+            by={"harness": "codex", "session_id": "fixture-parent"},
+            source="fixture", tuples=[stale], candidates=[])
+        before = auth.pin_changes_path(self.route).read_bytes()
+        args = self.args()
+        sealed = self.route_file.read_bytes()
+        C.apply_gpu_execution_sandbox(args)
+        self.assertEqual(args.sandbox, choice["sandbox"])
+        self.assertTrue(args.gpu_execution_scope)
+        self.assertEqual(sealed, self.route_file.read_bytes())
+        self.assertEqual(before, auth.pin_changes_path(self.route).read_bytes())
+        view = auth.route_in_force(self.route)
+        self.assertEqual({r["parent_sandbox"] for r in view["dispatch_evidence"]["tuples"]},
+                         {"workspace-write", "danger-full-access"})
+        node = {"dispatch_depth": 2, "fallback_hops": R._fallback_chain(
+            view["dispatch_evidence"], expected_worktree=self.worktree, require_scope=True)}
+        D.resolve_checked_tuple(view, node, "codex", {"parent_harness": "codex",
+            "parent_transport": "headless", "parent_sandbox": args.sandbox})
+
+    def test_mismatched_tuple_is_not_rescued_by_unusable_full_access_evidence(self):
+        choice = G.select(self.route)
+        matching = self.evidence(choice)["tuples"][0]
+        mismatch = {**matching, "parent_sandbox": "workspace-write"}
+        for change in ({"status": "unsupported"}, {"parent_harness": "claude"},
+                       {"parent_transport": "interactive"}, {"launch_authority": "ancestor-broker"},
+                       {"checked_worktree": str(self.root / "foreign")}):
+            with self.subTest(change=change):
+                self.route["codex_execution_sandbox"] = choice
+                self.route["dispatch_evidence"] = {"tuples": [mismatch, {**matching, **change}]}
+                with self.assertRaises(C.DispatchContractError) as caught:
+                    C.apply_gpu_execution_sandbox(self.args())
+                self.assertEqual(caught.exception.reason, "dispatch-evidence-parent-runtime-mismatch")
+
     def test_original_workspace_tuple_full_parent_failure_is_preserved(self):
         choice = {**G.select(self.route), "sandbox": "workspace-write"}
         evidence = self.evidence(choice)

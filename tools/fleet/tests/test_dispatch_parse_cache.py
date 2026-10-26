@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from fleet import model, render
+from fleet import collectors, model, render
 from fleet.collectors import dispatch, parse_cache, procscan
 
 
@@ -25,6 +25,34 @@ class ParseCacheTest(unittest.TestCase):
         self.path = self.root / "attempt.jsonl"
         self.path.write_text(json.dumps({"type": "thread.started", "thread_id": "thread-a"}) + "\n")
         dispatch._CODEX_ATTEMPT_CACHE.clear()
+
+    def test_job_failure_fallback_copies_mutable_fields_and_shares_node_evidence(self):
+        jobs = [{"attempt_id": "att-1", "history": [{"status": "done"}]}]
+        node_evidence = {"rt-1": {"execute": {"attempt_history": [{"order": 1}]}}}
+        degradations = {"rt-1": {"state": "partial"}}
+        pending_delivery = {"count": 2}
+        cached = collectors._copy_job_observation_fallback(
+            jobs, node_evidence, degradations, pending_delivery, malformed=3)
+
+        jobs[0]["history"][0]["status"] = "changed"
+        self.assertEqual(cached.jobs[0]["history"][0]["status"], "done")
+        self.assertIs(cached.node_evidence, node_evidence)
+        self.assertEqual(cached.malformed, 3)
+        self.assertFalse(hasattr(cached, "resources"))
+
+        cached.degradations["rt-1"]["state"] = "changed"
+        cached.pending_delivery["count"] = 0
+        self.assertEqual(degradations["rt-1"]["state"], "partial")
+        self.assertEqual(pending_delivery["count"], 2)
+
+    def test_fast_first_defers_optional_steward_enrichment(self):
+        from fleet.collectors import steward
+        sessions = [object()]
+        with mock.patch.object(steward, "enrich") as enrich:
+            collectors._enrich_steward(sessions, fast_first=True)
+            enrich.assert_not_called()
+            collectors._enrich_steward(sessions, fast_first=False)
+        enrich.assert_called_once_with(sessions)
 
     def test_second_process_cache_does_not_read_source(self):
         cold = dispatch._parse_codex_attempt_tail(str(self.path))

@@ -130,6 +130,35 @@ def parse_meta(pipe):
     return dict(part.split("=", 1) for part in pipe.split(",") if "=" in part)
 
 
+def _row_from_fields(order, fields, *, meta=None, meta_owned=False):
+    """Build the established row contract from an already split six-field line."""
+    if len(fields) != 6:
+        return None
+    if meta is None:
+        meta = parse_meta(fields[5])
+    elif meta_owned:
+        if type(meta) is not dict:
+            raise TypeError("owned registry metadata must be a dict")
+    else:
+        meta = dict(meta)
+    raw_schema = meta.get("attempt_schema_version")
+    legacy = raw_schema in (None, "", "1")
+    contract_status = (
+        "legacy-read-only" if legacy
+        else "current" if raw_schema == "2"
+        else "invalid:attempt-schema-version"
+    )
+    if contract_status == "current":
+        try:
+            validate_attempt_metadata(meta)
+        except DispatchContractError as exc:
+            contract_status = f"invalid:{exc.reason}"
+    return {"order": order, "timestamp": fields[0], "status": fields[1],
+            "repo": fields[2], "worktree": fields[3], "slug": fields[4],
+            "pipe": fields[5], "meta": meta, "raw": "\t".join(fields),
+            "legacy_read_only": legacy, "attempt_contract_status": contract_status}
+
+
 def read_rows(jobs, *, lines=None):
     rows = []
     if lines is None:
@@ -138,25 +167,12 @@ def read_rows(jobs, *, lines=None):
     else:
         source = lines
     for order, line in enumerate(source):
-        fields = line.split("\t")
-        if len(fields) != 6: continue
-        meta = parse_meta(fields[5])
-        raw_schema = meta.get("attempt_schema_version")
-        legacy = raw_schema in (None, "", "1")
-        contract_status = (
-            "legacy-read-only" if legacy
-            else "current" if raw_schema == "2"
-            else "invalid:attempt-schema-version"
-        )
-        if contract_status == "current":
-            try:
-                validate_attempt_metadata(meta)
-            except DispatchContractError as exc:
-                contract_status = f"invalid:{exc.reason}"
-        rows.append({"order": order, "timestamp": fields[0], "status": fields[1],
-                     "repo": fields[2], "worktree": fields[3], "slug": fields[4],
-                     "pipe": fields[5], "meta": meta, "raw": line,
-                     "legacy_read_only": legacy, "attempt_contract_status": contract_status})
+        row = _row_from_fields(order, line.split("\t"))
+        if row is not None:
+            # Preserve the source line bytes/text exactly as before, including
+            # any tabs that the six-field split rejoins.
+            row["raw"] = line
+            rows.append(row)
     return rows
 
 
@@ -3169,6 +3185,10 @@ def main(argv):
                   "conflicting_note": row["meta"].get("conflicting_terminal_note", ""),
                   "conflicts": terminal_conflicts(row["meta"]),
                   "disposition": "keep-committed-after-review", "applied": False}
+        import retained_review_completion as retained
+        recovery = retained.preview(args.jobs, args.attempt)
+        if recovery:
+            result.update(recovery)
         if args.apply:
             if not args.review_evidence or not args.expected_row_sha256:
                 print("check=failed\nreason=terminal-conflict-review-and-row-required"); return 64
@@ -3177,8 +3197,10 @@ def main(argv):
                     expected_row_sha256=args.expected_row_sha256, review=args.review_evidence.absolute())
             except (OSError, DispatchContractError) as exc:
                 print(f"check=failed\nreason={exc}"); return 65
-            result.update(pending=False, applied=True)
-        elif result["pending"]:
+            fresh = [r for r in read_rows(args.jobs) if r["meta"].get("attempt_id") == args.attempt][0]
+            result.update(pending=False, applied=True,
+                          outcome=committed_outcome(fresh["status"], fresh["meta"]))
+        elif (result["pending"] or result.get("recovery_state") == "publication-pending") and result.get("can_reuse_prior_review", True):
             # The digest pins this exact row; only the review report is the parent's to supply.
             import shlex
             from parent_next_directive import entrypoint

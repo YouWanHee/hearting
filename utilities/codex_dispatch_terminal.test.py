@@ -222,6 +222,19 @@ class CodexDispatchTerminalTest(unittest.TestCase):
         self.assertEqual(result["review_artifact_verdict"], "FAIL")
         self.assertEqual(result["review_verdict_conflict"], "artifact-fail-envelope-pass")
 
+    def test_structured_review_verdict_cannot_hide_behind_a_pass_envelope(self):
+        artifact = self.root / "review.json"
+        for value,declared in (({"verdict":"BLOCKED"},"BLOCKED"),
+                               ({"verdict":"PASS","io":{"verdict":"FAIL"}},"FAIL"),
+                               ({"verdict":"PASS"},"PASS")):
+            with self.subTest(value=value):
+                artifact.write_text(json.dumps(value),encoding="utf-8")
+                result=inspect_terminal_attempt(
+                    self.write_log(verdict="PASS",blocker="none",artifact=str(artifact),sandbox=False),
+                    worktree=self.worktree,artifact_root_metadata=self.root,worker_type="review")
+                self.assertEqual(result["review_artifact_verdict"],declared)
+                self.assertEqual(bool(result.get("review_verdict_conflict")),declared!="PASS")
+
     def test_only_a_review_worker_and_only_the_harmful_direction_conflict(self):
         fail_artifact = self.root / "review-fail.md"
         fail_artifact.write_text("## 평결: FAIL\n", encoding="utf-8")

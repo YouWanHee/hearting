@@ -1558,7 +1558,11 @@ def _gpu_process_records(snapshot):
                 elapsed = _num(process.get("elapsed_s"))
                 gib = _gib(process.get("used_memory_mib"))
                 processes.append({"host": host.get("host"), "gpu": gpu.get("index"),
-                    "session_id": session_tags.get((owner_harness, owner_sid), owner_sid),
+                    # Keep the source identity for JSON/evidence, and carry only an exact
+                    # current-board tag for the display. A departed or unmatched owner has
+                    # no visible session tag; the full ID is not a display label.
+                    "session_id": owner_sid,
+                    "session_tag": session_tags.get((owner_harness, owner_sid)),
                     "cwd": _gpu_repo(process.get("cwd")),
                     "command": _short_gpu_command(process.get("command")),
                     "vram": (f"{gib:.1f} GB" if gib is not None else None),
@@ -1812,6 +1816,17 @@ def _install_record(snapshot):
     return record
 
 
+def _header_identity(snapshot):
+    """Keep the collector's already validated public install identity for the Explorer header."""
+    install = _get(snapshot, "hearting")
+    if not isinstance(install, Mapping):
+        return None
+    return {
+        "version": _text(install.get("version")) or "unknown",
+        "install_method": _text(install.get("install_method")) or "unmanaged",
+    }
+
+
 def build_view_model(snapshot, accepted_detail=None, cached_config=None, now=None):
     """Project facts only; identity and liveness decisions stay with their source builders."""
     fixture_values = _get(snapshot, "values")
@@ -1903,6 +1918,7 @@ def build_view_model(snapshot, accepted_detail=None, cached_config=None, now=Non
         system["answered_total"] = sum(len(rows) for _repo, rows in answered)
     data = {
         "identity": _get(snapshot, "generation", "identity"),
+        "hearting": _header_identity(snapshot),
         "clock": clock,
         "hosts": hosts, "usage": usage, "census": None,
         "repos": repos, "sessions": session_rows, "routes": routes, "nodes": nodes,
