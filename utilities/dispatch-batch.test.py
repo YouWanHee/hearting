@@ -686,6 +686,420 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertTrue(any(json.loads(path.read_text())["options"]["prompt_text"] == next_prompt
                             for path in payloads))
 
+    def test_producer_revision_second_approved_correction_replays_completed_generations(self):
+        """Exercise two successive real revisions across completed batch generations.
+
+        Only batch launch/provider scaffolding is a stand-in. The producer
+        completion and revision publishers, currency checks, admission, and
+        sealed batch input readers all use their production implementations.
+        """
+        import copy
+
+        marker_spec = importlib.util.spec_from_file_location(
+            "dispatch_completion_marker_fixture",
+            ROOT / "utilities" / "dispatch_completion_marker.test.py",
+        )
+        marker_module = importlib.util.module_from_spec(marker_spec)
+        marker_spec.loader.exec_module(marker_module)
+        marker_fixture = marker_module.CompletionMarkerTest()
+        marker_fixture.setUp()
+        self.addCleanup(marker_fixture.tearDown)
+
+        import artifact_producer
+
+        route_module = BATCH.ROUTE_MODULE
+        compiled_route = marker_fixture.compile_route(intensity="standard")
+        compiled_route_path = marker_fixture.write_route(
+            compiled_route, "route-real-second-producer-revision.json")
+        marker_fixture.jobs = marker_fixture.stable_dispatch / "jobs.log"
+        marker_fixture.jobs.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker_fixture.jobs.parent.chmod(0o700)
+        marker_fixture.jobs.touch(mode=0o600)
+        fixture_env = {
+            **marker_fixture.base_env(),
+            "AGENT_DISPATCH_JOBS": str(marker_fixture.jobs),
+            "HEARTING_GATES": "on",
+        }
+
+        with mock.patch.dict(os.environ, fixture_env, clear=True):
+            cycle = artifact_producer.begin(
+                marker_fixture.artifact,
+                route_file=compiled_route_path,
+                capability=compiled_route["capability"],
+                intensity=compiled_route["effective_intensity"],
+                require_cycle=True,
+                jobs=marker_fixture.jobs,
+            )
+            artifact_dir = Path(cycle["cycle_dir"]) / "artifacts"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+
+            compiled_nodes = {node["id"]: node for node in compiled_route["nodes"]}
+            plan_node = copy.deepcopy(compiled_nodes["plan"])
+            plan_node.update(replica_node("plan", "codex"))
+            plan_node.update(parallel_group="plan", replica_group="plan",
+                             parallel_leg_index=0, parallel_leg_count=2,
+                             unit="plan/plan-author")
+            plan_node["completion_gate"] = compiled_nodes["plan"]["completion_gate"]
+            plan_node.pop("profile_selection", None)
+            plan_node.pop("profile_demand", None)
+
+            replica = copy.deepcopy(plan_node)
+            replica.update(replica_node("plan-replica", "claude"))
+            replica.update(parallel_group="plan", replica_group="plan",
+                           parallel_leg_index=1, parallel_leg_count=2,
+                           unit="plan/plan-author")
+            replica["completion_gate"] = plan_node["completion_gate"]
+            replica["depends_on"] = list(plan_node["depends_on"])
+            replica["outputs"] = ["plan-replica.md", "checklist-replica.md"]
+            replica["write_scope"] = ["plan-replica.md", "checklist-replica.md"]
+            replica.pop("profile_selection", None)
+            replica.pop("profile_demand", None)
+
+            primary_review = copy.deepcopy(compiled_nodes["plan-check"])
+            primary_review["worker_type"] = "review"
+            alternative_review = copy.deepcopy(primary_review)
+            alternative_review.update(
+                id="plan-check-replica",
+                depends_on=["plan-replica"],
+                outputs=["_internal/plan_reviews/replica/round_1.md"],
+                write_scope=["_internal/plan_reviews/replica/**"],
+            )
+            batch_route = copy.deepcopy(compiled_route)
+            batch_route["nodes"] = [
+                plan_node,
+                replica,
+                primary_review,
+                alternative_review,
+                *[node for node in compiled_route["nodes"]
+                  if node["id"] not in {"plan", "plan-check"}],
+            ]
+
+            # Keep the batch test's sealed identity/manifest helpers, while
+            # pointing every fixture path at this independently compiled,
+            # temporary route and its real producer cycle.
+            self.route = batch_route
+            self.base = Path(compiled_route["cwd"])
+            self.jobs = marker_fixture.jobs
+            self.route_path.write_text(json.dumps(batch_route), encoding="utf-8")
+            producer_nodes = [plan_node, replica]
+            evidence = {
+                "plan": artifact_dir / "plan.md",
+                "plan-replica": artifact_dir / "plan-replica.md",
+            }
+            checklist_inputs = {
+                artifact_dir / name: f"sealed {name}\n"
+                for name in ("checklist.md", "checklist-replica.md")
+            }
+            for path, contents in checklist_inputs.items():
+                path.write_text(contents, encoding="utf-8")
+            evidence["plan"].write_text("initial plan\n", encoding="utf-8")
+            evidence["plan-replica"].write_text("initial replica plan\n", encoding="utf-8")
+            original_inputs = {
+                path: path.read_bytes()
+                for path in (*evidence.values(), *checklist_inputs.keys())
+            }
+
+            initial_prompt = "original plan and checklist inputs"
+            first_correction_prompt = "first approved correction"
+            second_correction_prompt = "current approved review-findings correction"
+            parent_attempt = "att-parent-fixture"
+            initial_legs = self.legs(prompt=initial_prompt, parent_attempt=parent_attempt)
+            self.seal_original_input(prompt=initial_prompt, source_legs=initial_legs)
+            initial_rows = []
+            for leg in initial_legs:
+                self.write_existing(
+                    leg, status="done", note="completed-marker", claimed="0",
+                    live_identity=False, all_legs=initial_legs,
+                )
+                initial_rows.append(self.jobs.read_text(encoding="utf-8").splitlines()[-1])
+
+            inline_metadata = {
+                "attempt_schema_version": 2,
+                "dispatch_depth": 2,
+                "transport": "interactive",
+                "execution_surface": "inline",
+                "registered_worker": False,
+                "fallback_hop": "inline",
+            }
+
+            def publish_completion(node_id, evidence_path, attempt_id):
+                node = next(node for node in self.route["nodes"] if node["id"] == node_id)
+                return route_module._publish_completion_locked(
+                    self.route, node, node_id, evidence_path,
+                    attempt_id=attempt_id, attempt_metadata=inline_metadata,
+                    jobs=self.jobs,
+                )
+
+            def publish_owner_correction(node_id, evidence_path, label):
+                return route_module.publish_revision_locked(
+                    self.route, node_id, evidence_path,
+                    basis="owner-correction",
+                    reason=f"fixture: {label}",
+                    author_attempt_id="att-owner-fixture",
+                    jobs=self.jobs,
+                )
+
+            def complete_generation(legs, paths):
+                by_node = {leg["node"]: leg for leg in legs}
+                for node_id, path in paths.items():
+                    publish_completion(node_id, path, by_node[node_id]["attempt_id"])
+                    self.write_existing(
+                        by_node[node_id], status="done", note="completed-marker",
+                        claimed="0", live_identity=False, all_legs=legs,
+                    )
+
+            initial_markers = {}
+            for node_id, path in evidence.items():
+                initial_markers[node_id] = publish_completion(
+                    node_id, path, next(leg["attempt_id"] for leg in initial_legs
+                                        if leg["node"] == node_id),
+                )
+            for node_id in ("plan", "plan-replica"):
+                marker_path = route_module.completion_dir(
+                    batch_route["route_id"], jobs=self.jobs) / f"{node_id}.json"
+                currency = route_module.gate_currency(
+                    batch_route, next(node for node in producer_nodes if node["id"] == node_id),
+                    marker_path, initial_markers[node_id], observe=True, jobs=self.jobs,
+                )
+                self.assertEqual(currency.state, "current", currency)
+
+            first_batch_input_dir = self.jobs.parent / "automatic-replacements" / "batch-inputs"
+            first_batch_inputs = {
+                path.name: path.read_bytes()
+                for path in first_batch_input_dir.glob("*.json")
+            }
+            first_marker_history = {
+                node_id: (route_module.completion_dir(batch_route["route_id"], jobs=self.jobs)
+                          / f"{node_id}.1.json").read_bytes()
+                for node_id in ("plan", "plan-replica")
+            }
+
+            initial_admission = route_module.producer_revision_admission(
+                batch_route, producer_nodes, self.jobs)
+            self.assertEqual(initial_admission["generation"], "1")
+            self.assertFalse(initial_admission["pending"])
+            self.assertEqual(set(initial_admission["current_attempt_ids"].values()),
+                             {leg["attempt_id"] for leg in initial_legs})
+
+            for node_id, old_contents in (("plan", "initial plan\n"),
+                                          ("plan-replica", "initial replica plan\n")):
+                correction_path = artifact_dir / f"{node_id}-first-correction.md"
+                correction_path.write_text(old_contents.replace("initial", "first approved"),
+                                           encoding="utf-8")
+                publish_owner_correction(node_id, correction_path, "first approved correction")
+
+            first_admission = route_module.producer_revision_admission(
+                batch_route, producer_nodes, self.jobs)
+            first_generation = first_admission["generation"]
+            self.assertTrue(first_generation.startswith("rev-"))
+            self.assertTrue(first_admission["pending"])
+
+            def start_batch(prompt):
+                output = io.StringIO()
+                spawned = []
+
+                class FakeProcess:
+                    returncode = 0
+                    pid = 12001
+
+                    def __init__(self, command, **kwargs):
+                        self.command = command
+                        spawned.append(self)
+
+                    def communicate(self):
+                        return success_receipt(self.command), ""
+
+                    def poll(self):
+                        return 0
+
+                assignments = self.common_patches()[1]
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(mock.patch.object(BATCH, "load_route", return_value=batch_route))
+                    stack.enter_context(mock.patch.object(BATCH, "resolve_agent_home",
+                                                          return_value=marker_fixture.agent_home))
+                    stack.enter_context(mock.patch.object(
+                        BATCH, "resolve_global_registry", return_value=SimpleNamespace(path=self.jobs)))
+                    stack.enter_context(mock.patch.object(
+                        BATCH, "assign_harnesses", return_value=(assignments, "cross-harness", {})))
+                    stack.enter_context(mock.patch.object(BATCH, "reserve_batch", return_value=["a" * 32, "b" * 32]))
+                    stack.enter_context(mock.patch.object(BATCH, "resolve_live_parent_attempt"))
+                    stack.enter_context(mock.patch.object(BATCH, "completion_marker_gate"))
+                    stack.enter_context(mock.patch.object(BATCH, "cancel_unclaimed"))
+                    stack.enter_context(mock.patch.object(
+                        BATCH.subprocess, "check_output", return_value=str(marker_fixture.agent_home)))
+                    stack.enter_context(mock.patch.object(BATCH.subprocess, "Popen", side_effect=FakeProcess))
+                    stack.enter_context(mock.patch.dict(os.environ, {
+                        "AGENT_DISPATCH_SELF_SLUG": "owner",
+                        "AGENT_DISPATCH_ATTEMPT_ID": parent_attempt,
+                        "AGENT_DISPATCH_CURRENT_HARNESS": "codex",
+                        "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
+                        "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write",
+                    }))
+                    with contextlib.redirect_stdout(output):
+                        result = BATCH.main(self.argv() + ["--prompt-text", prompt])
+                return result, json.loads(output.getvalue()), spawned
+
+            first_start, first_receipt, first_spawned = start_batch(first_correction_prompt)
+            self.assertEqual(first_start, 0, first_receipt)
+            self.assertEqual(first_receipt["newly_started"], 2)
+            self.assertEqual(len(first_spawned), 2)
+            first_generation_legs = self.legs(
+                prompt=first_correction_prompt, parent_attempt=parent_attempt,
+                producer_generation=first_generation,
+            )
+            self.assertEqual(
+                {leg["attempt_id"] for leg in first_receipt["legs"]},
+                {leg["attempt_id"] for leg in first_generation_legs},
+            )
+
+            first_corrected_evidence = {}
+            for node_id, path in evidence.items():
+                corrected = artifact_dir / f"{node_id}-first-correction.md"
+                first_corrected_evidence[node_id] = corrected
+            complete_generation(first_generation_legs, first_corrected_evidence)
+            first_completed_admission = route_module.producer_revision_admission(
+                batch_route, producer_nodes, self.jobs)
+            self.assertEqual(first_completed_admission["generation"], first_generation)
+            self.assertFalse(first_completed_admission["pending"])
+            self.assertEqual(set(first_completed_admission["current_attempt_ids"].values()),
+                             {leg["attempt_id"] for leg in first_generation_legs})
+            first_replay = BATCH.prior_batch_input(
+                self.jobs, batch_route, producer_nodes, "plan", parent_attempt,
+                first_correction_prompt, producer_managed=True,
+                producer_generation=first_generation,
+                current_attempt_ids=first_completed_admission["current_attempt_ids"],
+            )
+            self.assertIsNotNone(first_replay)
+            self.assertEqual({member["attempt_id"] for member in first_replay["manifest"]["members"]},
+                             {leg["attempt_id"] for leg in first_generation_legs})
+            self.assertEqual(first_replay["options"]["prompt_text"], first_correction_prompt)
+
+            review_rows = (
+                ("plan-check", "att-primary-review-fail", "completed-review-blocking"),
+                ("plan-check-replica", "att-alternative-overloaded", "serverOverloaded"),
+            )
+            for node_id, attempt_id, note in review_rows:
+                metadata = (
+                    f"capability=autopilot-code,route_id={batch_route['route_id']},"
+                    f"route_hash={batch_route['route_hash']},route_node={node_id},"
+                    f"worker_type=review,note={note},attempt_id={attempt_id}"
+                )
+                with self.jobs.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        f"2026-10-27T00:00:00Z\tdone\t{batch_route['cwd']}\t{batch_route['cwd']}\t"
+                        f"{node_id}\t{metadata}\n"
+                    )
+            self.assertEqual(route_module.REVIEW_ROUND_CAP.classify_round_row(
+                "done", {"note": "completed-review-blocking", "worker_type": "review"},
+                worker_type="review"), "verdict")
+            self.assertEqual(route_module.REVIEW_ROUND_CAP.classify_round_row(
+                "done", {"note": "serverOverloaded", "worker_type": "review"},
+                worker_type="review"), "verdict-less")
+
+            second_plan_evidence = artifact_dir / "plan-second-review-findings-correction.md"
+            second_plan_evidence.write_text("plan after second approved correction\n", encoding="utf-8")
+            route_module.publish_revision_locked(
+                batch_route, "plan", second_plan_evidence,
+                basis="review-findings", answers=["att-primary-review-fail"],
+                author_attempt_id="att-owner-fixture", jobs=self.jobs,
+            )
+            plan_history = route_module.completion_dir(
+                batch_route["route_id"], jobs=self.jobs) / "plan.4.json"
+            self.assertEqual(json.loads(plan_history.read_text(encoding="utf-8"))["revision"]["answers"],
+                             ["att-primary-review-fail"])
+
+            invalid_evidence = artifact_dir / "plan-invalid-verdictless-basis.md"
+            invalid_evidence.write_text("must remain unpublished\n", encoding="utf-8")
+            canonical_plan = route_module.completion_dir(
+                batch_route["route_id"], jobs=self.jobs) / "plan.json"
+            before_invalid = {
+                path.name: path.read_bytes()
+                for path in route_module.completion_dir(batch_route["route_id"], jobs=self.jobs)
+                    .glob("plan.*.json")
+            }
+            with self.assertRaisesRegex(ValueError, "revision-basis-unverified"):
+                route_module.publish_revision_locked(
+                    batch_route, "plan", invalid_evidence,
+                    basis="review-findings", answers=["att-alternative-overloaded"],
+                    author_attempt_id="att-owner-fixture", jobs=self.jobs,
+                )
+            self.assertEqual(canonical_plan.read_bytes(),
+                             (route_module.completion_dir(batch_route["route_id"], jobs=self.jobs)
+                              / "plan.4.json").read_bytes())
+            self.assertEqual(before_invalid, {
+                path.name: path.read_bytes()
+                for path in route_module.completion_dir(batch_route["route_id"], jobs=self.jobs)
+                    .glob("plan.*.json")
+            })
+
+            second_admission = route_module.producer_revision_admission(
+                batch_route, producer_nodes, self.jobs)
+            second_generation = second_admission["generation"]
+            self.assertTrue(second_generation.startswith("rev-"))
+            self.assertNotEqual(second_generation, first_generation)
+            self.assertTrue(second_admission["pending"])
+
+            second_start, second_receipt, second_spawned = start_batch(second_correction_prompt)
+            self.assertEqual(second_start, 0, second_receipt)
+            self.assertEqual(second_receipt["newly_started"], 2)
+            self.assertEqual(len(second_spawned), 2)
+            second_generation_legs = self.legs(
+                prompt=second_correction_prompt, parent_attempt=parent_attempt,
+                producer_generation=second_generation,
+            )
+            self.assertEqual(
+                {leg["attempt_id"] for leg in second_receipt["legs"]},
+                {leg["attempt_id"] for leg in second_generation_legs},
+            )
+            self.assertTrue(
+                {leg["attempt_id"] for leg in second_generation_legs}.isdisjoint(
+                    leg["attempt_id"] for leg in first_generation_legs))
+
+            second_corrected_evidence = {
+                "plan": second_plan_evidence,
+                "plan-replica": first_corrected_evidence["plan-replica"],
+            }
+            complete_generation(second_generation_legs, second_corrected_evidence)
+            second_completed_admission = route_module.producer_revision_admission(
+                batch_route, producer_nodes, self.jobs)
+            self.assertEqual(second_completed_admission["generation"], second_generation)
+            self.assertFalse(second_completed_admission["pending"])
+            self.assertEqual(set(second_completed_admission["current_attempt_ids"].values()),
+                             {leg["attempt_id"] for leg in second_generation_legs})
+
+            registry_before_replay = self.jobs.read_bytes()
+            second_replay = BATCH.prior_batch_input(
+                self.jobs, batch_route, producer_nodes, "plan", parent_attempt,
+                second_correction_prompt, producer_managed=True,
+                producer_generation=second_generation,
+                current_attempt_ids=second_completed_admission["current_attempt_ids"],
+            )
+            duplicate_replay = BATCH.prior_batch_input(
+                self.jobs, batch_route, producer_nodes, "plan", parent_attempt,
+                second_correction_prompt, producer_managed=True,
+                producer_generation=second_generation,
+                current_attempt_ids=second_completed_admission["current_attempt_ids"],
+            )
+            self.assertIsNotNone(second_replay)
+            self.assertEqual(second_replay["manifest"], duplicate_replay["manifest"])
+            self.assertEqual(second_replay["manifest"]["members"],
+                             duplicate_replay["manifest"]["members"])
+            self.assertEqual({member["attempt_id"] for member in second_replay["manifest"]["members"]},
+                             {leg["attempt_id"] for leg in second_generation_legs})
+            self.assertEqual(second_replay["options"]["prompt_text"], second_correction_prompt)
+            self.assertEqual(self.jobs.read_bytes(), registry_before_replay)
+
+            self.assertEqual({path: path.read_bytes() for path in original_inputs}, original_inputs)
+            self.assertEqual(first_marker_history, {
+                node_id: (route_module.completion_dir(batch_route["route_id"], jobs=self.jobs)
+                          / f"{node_id}.1.json").read_bytes()
+                for node_id in first_marker_history
+            })
+            self.assertTrue(all(row in self.jobs.read_text(encoding="utf-8").splitlines()
+                                for row in initial_rows))
+            for name, content in first_batch_inputs.items():
+                self.assertEqual((first_batch_input_dir / name).read_bytes(), content)
+
     def test_producer_revision_zero_row_replay_and_unapproved_prompt_drift(self):
         token = "rev-" + "b" * 64
         prompt = "approved producer revision input"
