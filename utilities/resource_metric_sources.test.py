@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import hashlib
 import json
 import os
@@ -1153,6 +1154,8 @@ class MetricSourcesTest(unittest.TestCase):
         vanished = metrics.read_admission_sources([root], run_id="target",
             started_at=0, now=111, cursor=first["cursor"])
         self.assertIsNone(vanished["latest"])
+        self.assertTrue(vanished["cursor"]["generation_revalidation_required"])
+        self.assertEqual(vanished["cursor"]["historical_latest_at"], 100.0)
         bundle.mkdir()
         (bundle / "record.json").write_text(
             '{"run_id":"target","started_at":0}')
@@ -1160,6 +1163,8 @@ class MetricSourcesTest(unittest.TestCase):
         reappeared = metrics.read_admission_sources([root], run_id="target",
             started_at=0, now=112, cursor=vanished["cursor"])
         self.assertEqual(reappeared["latest"]["state"], "unknown")
+        self.assertTrue(reappeared["cursor"]["generation_revalidation_required"])
+        self.assertEqual(reappeared["cursor"]["historical_latest_at"], 100.0)
         decision.write_text('{"admitted":true,"snapshot":{"t":50}}')
         backward = metrics.read_admission_sources([root], run_id="target",
             started_at=0, now=110, cursor=reappeared["cursor"])
@@ -1173,7 +1178,90 @@ class MetricSourcesTest(unittest.TestCase):
         recovered = metrics.read_admission_sources([root], run_id="target",
             started_at=0, now=121, cursor=repeat["cursor"])
         self.assertEqual(recovered["latest"]["state"], "admitted")
+        self.assertFalse(recovered["cursor"]["generation_revalidation_required"])
+        self.assertEqual(recovered["cursor"]["historical_latest_at"], 120.0)
         self.assertIsNone(recovered["cursor"]["uncertainty_reason"])
+
+    def test_same_stat_replay_after_transition_stays_unknown_until_fresh_equal_sample(self):
+        root = self.root / "same-stat-replay"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        identity = bundle / "identity.json"
+        decision = bundle / "decision.json"
+        identity.write_text('{"run_id":"target","started_at":0}')
+        decision.write_text('{"admitted":false,"snapshot":{"t":100}}')
+        cursor = None
+        first = None
+        for poll in range(16):
+            first = metrics.read_admission_sources([root], run_id="target",
+                started_at=0, now=110 + poll, cursor=cursor)
+            cursor = first["cursor"]
+            if first["coverage"] == "observed":
+                break
+        self.assertEqual(first["coverage"], "observed")
+        self.assertEqual(first["latest"]["state"], "denied")
+        source_tokens = {path.name: metrics._admission_stat_token(path.lstat())
+                         for path in (identity, decision)}
+
+        # Model an already observed disappearance/replacement whose filesystem
+        # reuses every stat token and whose old JSON has the same timestamp.
+        transitioned = copy.deepcopy(first["cursor"])
+        transitioned.update(uncertainty_reason="generation-changed",
+            generation_revalidation_required=True,
+            generation_baseline_at=100.0,
+            generation_baseline_ids=list(first["cursor"]["historical_latest_ids"]),
+            generation_baseline_overflow=False, generation_baseline_ready=True)
+        replay = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=111, cursor=transitioned)
+        self.assertEqual(replay["latest"]["state"], "unknown")
+        self.assertTrue(replay["cursor"]["generation_revalidation_required"])
+        self.assertEqual(replay["cursor"]["historical_latest_at"], 100.0)
+        self.assertEqual(source_tokens, {path.name: metrics._admission_stat_token(path.lstat())
+                                        for path in (identity, decision)})
+
+        fresh = bundle / "independent-equal-sample.json"
+        fresh.write_text('{"admitted":true,"sample_key":"fresh",'
+                         '"snapshot":{"t":100}}')
+        recovered = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=112, cursor=replay["cursor"])
+        self.assertEqual(recovered["latest"]["state"], "admitted")
+        self.assertEqual(recovered["latest"]["at"], 100.0)
+        self.assertFalse(recovered["cursor"]["generation_revalidation_required"])
+
+    def test_equal_time_revalidation_keeps_historical_ids_within_existing_sample_cap(self):
+        root = self.root / "equal-time-transition-history"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "identity.json").write_text(
+            '{"run_id":"target","started_at":0}')
+        for index in range(140):
+            (bundle / f"sample-{index:03d}.json").write_text(json.dumps({
+                "admitted": index % 2 == 0, "sample_index": index,
+                "snapshot": {"t": 100}}))
+        first = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=110)
+        self.assertEqual(first["latest"]["at"], 100.0)
+        self.assertEqual(len(first["cursor"]["historical_latest_ids"]), 140)
+
+        transitioned = copy.deepcopy(first["cursor"])
+        transitioned.update(uncertainty_reason="generation-changed",
+            generation_revalidation_required=True,
+            generation_baseline_at=100.0,
+            generation_baseline_ids=list(first["cursor"]["historical_latest_ids"]),
+            generation_baseline_overflow=False, generation_baseline_ready=True)
+        (bundle / "sample-fresh-equal.json").write_text(json.dumps({
+            "admitted": True, "sample_index": 1000, "snapshot": {"t": 100}}))
+        cursor = transitioned
+        recovered = None
+        for poll in range(16):
+            recovered = metrics.read_admission_sources([root], run_id="target",
+                started_at=0, now=130 + poll, cursor=cursor)
+            cursor = recovered["cursor"]
+            if not cursor["generation_revalidation_required"]:
+                break
+        self.assertEqual(recovered["latest"]["state"], "admitted")
+        self.assertEqual(recovered["latest"]["at"], 100.0)
+        self.assertFalse(recovered["cursor"]["generation_revalidation_required"])
 
     def test_older_timestamp_in_a_different_file_is_not_a_counter_regression(self):
         root = self.root / "historical-file-order"

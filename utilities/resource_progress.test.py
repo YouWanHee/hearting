@@ -557,6 +557,134 @@ class DeclaredResourceProgressTest(unittest.TestCase):
                                         self.root / "runs.json", identity_reader=lambda _pid: None, now=10000)
         self.assertEqual((exited["progress"], exited["liveness"], exited["exit_code"]), (None, "exited", 0))
 
+    def test_observer_production_budget_advances_through_large_changing_bundle(self):
+        base = self.root / "production-admission-continuation"
+        bundle = base / "bundle"
+        bundle.mkdir(parents=True)
+        registry = base / "resource-runs.json"
+        registry.write_text("{}\n")
+        state_path = self.root / "production-admission-state" / "observation.json"
+        state_path.parent.mkdir()
+        run_id = "production-budget-exact-run"
+        expected = {"admitted": 0, "denied": 0}
+
+        def write_decision(path, sample_index, stamp, admitted):
+            document = {"admitted": admitted, "sample_index": sample_index,
+                "snapshot": {"t": stamp}, "padding": "x" * 2200}
+            path.write_text(json.dumps(document))
+            expected["admitted" if admitted else "denied"] += 1
+
+        for index in range(500):
+            write_decision(bundle / f"decision-{index:04d}.json",
+                index, 100 + index, index % 10 != 0)
+        identity = bundle / "zzzz-exact-identity.json"
+        identity.write_text(json.dumps({"run_id": run_id, "started_at": 1}))
+        sample_size = (bundle / "decision-0000.json").stat().st_size
+        self.assertGreater(sample_size * 500,
+                           metric_sources.MAX_ADMISSION_BYTES_PER_PASS)
+        self.assertEqual(metric_sources.MAX_ADMISSION_BYTES_PER_PASS, 1024 * 1024)
+        self.assertEqual(metric_sources.MAX_ADMISSION_ENTRIES, 4096)
+        self.assertEqual(metric_sources.ADMISSION_TIME_BUDGET_SECONDS, 0.250)
+        registry_before = registry.read_bytes()
+        run = {"run_id": run_id, "started_at": 1}
+        summaries = []
+        foreign_path = bundle / "!foreign-identity.json"
+        foreign_seen = False
+        foreign_injected = False
+
+        def observe(poll):
+            return progress.observe_experiment(run, registry, 5000 + 60 * poll,
+                row_key="run", started_at=1, notify_events=False)
+
+        def current_binding():
+            if not state_path.exists():
+                return {}
+            saved = progress._read_observation_state(state_path)
+            cursor = saved.get("admission_cursor", {})
+            scan = cursor.get("scan", {}).get(str(base), {})
+            return scan.get("bundle_cursors", {}).get("bundle", {}).get(
+                "binding_state", {})
+
+        with mock.patch.object(progress, "_observation_state_path",
+                                return_value=state_path):
+            for poll in range(30):
+                write_decision(bundle / f"!decision-before-{poll:03d}.json",
+                    1000 + poll * 2, 700 + poll * 2, poll % 2 == 0)
+                write_decision(bundle / f"decision-z-after-{poll:03d}.json",
+                    1001 + poll * 2, 701 + poll * 2, poll % 2 != 0)
+                if poll == 4:
+                    identity.unlink()
+                elif poll == 5:
+                    identity.write_text(json.dumps({"run_id": run_id, "started_at": 1}))
+                if foreign_seen:
+                    foreign_path.unlink()
+                    foreign_seen = False
+                elif (poll >= 6 and not foreign_injected and not foreign_path.exists()
+                      and current_binding().get("phase") == "decisions"
+                      and current_binding().get("binding_complete") is True):
+                    foreign_path.write_text(json.dumps({
+                        "run_id": "foreign-budget-sibling", "started_at": 1}))
+                    foreign_seen = True
+                    foreign_injected = True
+                result = observe(poll)
+                self.assertTrue(result["available"])
+                if poll == 4:
+                    self.assertNotEqual(result["admission"]["coverage"], "observed")
+                    self.assertEqual(result["admission"]["state"], "unknown")
+                    invalidated = progress._read_observation_state(state_path)
+                    self.assertTrue(invalidated["admission_cursor"][
+                        "generation_revalidation_required"])
+                    self.assertTrue(any("admission-bundle-generation-changed" in warning
+                                        for warning in result["warnings"]))
+                if foreign_seen:
+                    self.assertEqual(result["admission"]["state"], "unknown")
+                    conflicted = progress._read_observation_state(state_path)
+                    conflict_binding = conflicted["admission_cursor"]["scan"][
+                        str(base)]["bundle_cursors"]["bundle"]["binding_state"]
+                    self.assertTrue(conflict_binding["foreign_seen"])
+                summaries.append(result["admission"])
+
+            final = summaries[-1]
+            for poll in range(30, 60):
+                if (final["coverage"] == "observed"
+                        and final["sample_count"] == sum(expected.values())):
+                    break
+                result = observe(poll)
+                final = result["admission"]
+                summaries.append(final)
+
+            state = progress._read_observation_state(state_path)
+            cursor = state["admission_cursor"]
+            root_state = cursor["scan"][str(base)]
+            bundle_state = root_state["bundle_cursors"]["bundle"]
+            binding = bundle_state["binding_state"]
+            self.assertEqual(final["coverage"], "observed")
+            self.assertEqual(final["sample_count"], sum(expected.values()))
+            self.assertEqual(final["admitted_samples"], expected["admitted"],
+                             f"summary={final!r} expected={expected!r} "
+                             f"persisted={state.get('admission_counts')!r} "
+                             f"history={[(row['coverage'], row['sample_count'], row['admitted_samples'], row['denied_samples'], row['unknown_samples']) for row in summaries]!r}")
+            self.assertEqual(final["denied_samples"], expected["denied"],
+                             f"summary={final!r} expected={expected!r} "
+                             f"persisted={state.get('admission_counts')!r} "
+                             f"history={[(row['coverage'], row['sample_count'], row['admitted_samples'], row['denied_samples'], row['unknown_samples']) for row in summaries]!r}")
+            self.assertEqual(final["unknown_samples"], 0)
+            self.assertTrue(binding["target_seen"])
+            self.assertFalse(binding["foreign_seen"])
+            self.assertEqual(binding["phase"], "decisions")
+            self.assertTrue(binding["binding_complete"])
+            self.assertGreater(final["sample_count"], summaries[0]["sample_count"])
+
+            stable_ids = list(cursor["sample_ids"])
+            replay = observe(len(summaries) + 20)
+            replay_state = progress._read_observation_state(state_path)
+            self.assertEqual(replay["admission"]["sample_count"], final["sample_count"])
+            self.assertEqual(replay["admission"]["admitted_samples"], expected["admitted"])
+            self.assertEqual(replay["admission"]["denied_samples"], expected["denied"])
+            self.assertEqual(replay_state["admission_cursor"]["sample_ids"], stable_ids)
+
+        self.assertEqual(registry.read_bytes(), registry_before)
+
 
 class ExperimentObservationTest(unittest.TestCase):
     def test_first_selected_population_drops_unbound_unknown_accumulation(self):
