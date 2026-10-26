@@ -822,6 +822,48 @@ class ExplorerRuntime:
             self._order_signature = object()
         return result
 
+    @staticmethod
+    def execute_question_action(effect):
+        """Call the shared selected-request API for one typed UI action."""
+        if not isinstance(effect, (tuple, list)) or not effect:
+            return {"state": "unknown", "reason": "invalid selected request action"}
+        kind = effect[0]
+        names = {"questions.read": "read_selected_request",
+                 "questions.draft": "write_selected_draft",
+                 "questions.submit": "submit_selected_response"}
+        method_name = names.get(kind)
+        if method_name is None:
+            return {"state": "unknown", "reason": "unsupported selected request action"}
+        if len(effect) < 2 or not isinstance(effect[1], Mapping):
+            return {"state": "unknown", "reason": "selected request binding is unavailable"}
+        # Read starts from a body-free row locator. Draft and submit carry the
+        # selected private envelope, including native transport incarnation/state.
+        ref = dict(effect[1])
+        if not all(ref.get(key) for key in ("id", "harness", "session_id")):
+            return {"state": "unknown", "reason": "selected request has no exact session binding"}
+        try:
+            import importlib
+            module = importlib.import_module("human_wait_state")
+            method = getattr(module, method_name, None)
+            if not callable(method):
+                return {"state": "unknown",
+                        "reason": "selected request backend is not available; use the native prompt"}
+            if kind == "questions.read":
+                result = method(ref)
+            elif kind == "questions.draft":
+                if len(effect) != 3 or not isinstance(effect[2], str):
+                    return {"state": "unknown", "reason": "invalid answer draft"}
+                result = method(ref, effect[2])
+            else:
+                if len(effect) != 3 or not isinstance(effect[2], Mapping):
+                    return {"state": "unknown", "reason": "invalid selected response"}
+                result = method(ref, dict(effect[2]), action_id=None)
+        except Exception:
+            return {"state": "unknown", "reason": "selected request backend failed; use the native prompt"}
+        if not isinstance(result, Mapping):
+            return {"state": "unknown", "reason": "selected request backend returned no status"}
+        return dict(result)
+
     def loading_frame(self, cols, rows):
         """Return a small terminal-safe loading frame while a source is pending."""
         from .frame import CellFrame

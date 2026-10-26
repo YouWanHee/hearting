@@ -942,7 +942,9 @@ def _question_records(snapshot, session_rows, session_index, now):
         if not isinstance(item, Mapping):
             continue
         stale = item.get("stale")
-        if stale not in (False, "current"):
+        older = stale == "older"
+        source = _text(item.get("source"))
+        if stale not in (False, "current") and not (older and source.startswith("S1-")):
             continue
         ident = _text(item.get("id"))
         if ident and ident in seen:
@@ -953,10 +955,25 @@ def _question_records(snapshot, session_rows, session_index, now):
         harness = _text(item.get("harness")) or _text(owner.get("harness"))
         sid = _text(item.get("session_id")) or _text(owner.get("session_id"))
         session = by_identity.get((harness, sid)) if harness and sid else None
-        source = _text(item.get("source"))
         tag = ident or f"current-{index}"
+        ref = {"id": ident} if ident else {}
+        for name, value in (("harness", harness), ("session_id", sid),
+                            ("request_id", item.get("request_id")),
+                            ("turn_id", item.get("turn_id")),
+                            ("route_id", item.get("route_id")),
+                            ("question_id", item.get("question_id"))):
+            if name == "request_id" and type(value) is int:
+                ref[name] = value
+                continue
+            if name == "request_id" and not isinstance(value, str):
+                continue
+            value = _text(value)
+            if value:
+                ref[name] = value
         questions.append({
             "id": ident, "tag": tag, "h": session["harness"] if session else harness,
+            "ref": ref,
+            "older": older,
             "kind": _text(item.get("kind")) or source or "wait",
             "source": source, "wait": _since(item.get("since"), now),
             "project": session["repo"] if session else None,

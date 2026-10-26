@@ -35,9 +35,10 @@ import os
 import re
 import shlex
 import sys
+import threading
 import time
 import unicodedata
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Mapping
 from .display import label as _user_label, project as _user_project, gpu_owner as _gpu_owner_label
 
@@ -6715,6 +6716,11 @@ _EXPLORER_PUBLISHED_MODEL = None
 _EXPLORER_REPLAY_ACTIVE = False
 _EXPLORER_DETAIL_CONTINUATION = None
 _EXPLORER_REMOTE_OBSERVATION = None
+_EXPLORER_QUESTION_QUEUE = None
+_EXPLORER_QUESTION_QUEUE_LOCK = threading.Lock()
+_EXPLORER_QUESTION_PUMP = None
+_EXPLORER_QUESTION_GENERATION = 0
+_EXPLORER_QUESTION_REFRESH_AT = 0.0
 
 
 def set_explorer_mode(enabled=True):
@@ -7173,10 +7179,18 @@ def _explorer_click_current(size, snapshot):
 
 
 def _explorer_apply_effects(effects, vm):
-    """Run accepted live effects and publish MODELS action feedback immediately."""
+    """Run typed explorer effects and publish immediate action feedback."""
     from dataclasses import replace as _replace_state
 
     effects = tuple(effects or ())
+    question_effects = tuple(effect for effect in effects
+                             if effect and isinstance(effect[0], str)
+                             and effect[0].startswith("questions."))
+    effects = tuple(effect for effect in effects
+                    if not (effect and isinstance(effect[0], str)
+                            and effect[0].startswith("questions.")))
+    for effect in question_effects:
+        _explorer_queue_question_effect(effect)
     model_actions = tuple(effect for effect in effects
                           if effect and effect[0] == "models.apply")
     if _EXPLORER_REPLAY_ACTIVE:
@@ -7215,6 +7229,277 @@ def _explorer_apply_effects(effects, vm):
                 except (TypeError, ValueError):
                     pass
     return result
+
+
+def _explorer_question_status(value, fallback):
+    reason = value.get("reason") if isinstance(value, Mapping) else None
+    if isinstance(reason, str) and reason.strip():
+        return " ".join(reason.split())[:220]
+    return fallback
+
+
+def _explorer_same_question_request(left, right):
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    for key in ("id", "harness", "session_id", "request_id", "turn_id", "route_id", "question_id"):
+        a, b = left.get(key), right.get(key)
+        if a != b or (key == "request_id" and type(a) is not type(b)):
+            return False
+    return left.get("native_ref") == right.get("native_ref")
+
+
+def _explorer_queue_question_effect(effect):
+    """Queue one exact selected-request action on the bounded background pump."""
+    global _EXPLORER_STATE, _EXPLORER_QUESTION_QUEUE
+    from dataclasses import replace as _replace_state
+    state = _explorer_state_for(_EXPLORER_STATE, 0)
+    overlay = dict(state.question_overlay) if isinstance(state.question_overlay, Mapping) else {}
+    if _EXPLORER_REPLAY_ACTIVE or os.environ.get("FLEET_DEMO"):
+        overlay.update(state="unknown", pending=False,
+                       status="Direct answers are disabled in demo or replay; use a live native prompt.")
+        _EXPLORER_STATE = _replace_state(state, question_overlay=overlay)
+        return
+    if _EXPLORER_QUESTION_QUEUE is None or _EXPLORER_QUESTION_PUMP is None:
+        overlay.update(state="unknown", pending=False,
+                       status="Direct answer worker is unavailable; use the native prompt.")
+        _EXPLORER_STATE = _replace_state(state, question_overlay=overlay)
+        return
+    if effect[0] == "questions.draft":
+        overlay["status"] = "Saving private draft…"
+        _EXPLORER_STATE = _replace_state(state, question_overlay=overlay)
+    with _EXPLORER_QUESTION_QUEUE_LOCK:
+        if effect[0] == "questions.draft":
+            _EXPLORER_QUESTION_QUEUE = deque(
+                queued for queued in _EXPLORER_QUESTION_QUEUE
+                if not (queued[0] == "questions.draft" and len(queued) > 1
+                        and isinstance(queued[1], Mapping)
+                        and _explorer_same_question_request(queued[1], effect[1])))
+        if len(_EXPLORER_QUESTION_QUEUE) >= 16:
+            if effect[0] == "questions.submit":
+                overlay.update(state="open", pending=False,
+                               status="Action queue is busy; no response was sent. Submit again when ready.")
+            elif effect[0] == "questions.read":
+                overlay.update(state="unknown", pending=False,
+                               status="Action queue is busy; use the native prompt.")
+            else:
+                overlay.update(status="Draft save is delayed; edit remains on screen.")
+            _EXPLORER_STATE = _replace_state(state, question_overlay=overlay)
+            return
+        _EXPLORER_QUESTION_QUEUE.append(tuple(effect))
+    _EXPLORER_QUESTION_PUMP.request(force=True)
+
+
+def _explorer_question_worker():
+    if _EXPLORER_QUESTION_QUEUE is None:
+        return None
+    with _EXPLORER_QUESTION_QUEUE_LOCK:
+        if not _EXPLORER_QUESTION_QUEUE:
+            return None
+        effect = _EXPLORER_QUESTION_QUEUE.popleft()
+    ref = effect[1] if len(effect) > 1 and isinstance(effect[1], Mapping) else None
+    state = _explorer_state_for(_EXPLORER_STATE, 0)
+    # A draft is a local save for its original envelope, even after navigation.
+    # Reads and responses still require the current visible selection.
+    if (_EXPLORER_REPLAY_ACTIVE or os.environ.get("FLEET_DEMO") or ref is None
+            or (effect[0] != "questions.draft" and (
+                state.view != "QUESTIONS"
+                or state.opened_for("qsel:QUESTIONS", "") != ref.get("id")
+                or not _explorer_question_ref_current(ref)))):
+        return {"effect": effect, "result": {
+            "state": "unknown", "reason": "selected request changed before the action ran"}}
+    from .explorer.runtime import ExplorerRuntime
+    return {"effect": effect, "result": ExplorerRuntime.execute_question_action(effect)}
+
+
+def _explorer_question_ref_current(ref):
+    model = _EXPLORER_MODEL
+    rows = getattr(model, "questions", ()) if model is not None else ()
+    row = next((item for item in rows if item.get("id") == ref.get("id")), None)
+    if row is None:
+        return False
+    current = row.get("ref")
+    if not isinstance(current, Mapping):
+        return False
+    selected_row = ref.get("_fleet_row_ref")
+    selected_row = selected_row if isinstance(selected_row, Mapping) else ref
+    for key in ("harness", "session_id", "request_id", "turn_id", "route_id", "question_id"):
+        old, new = selected_row.get(key), current.get(key)
+        if ((old is not None or new is not None)
+                and (old != new or (key == "request_id" and type(old) is not type(new)))):
+            return False
+    return True
+
+
+def _explorer_question_envelope(ref, value):
+    if not isinstance(value, Mapping):
+        return None
+    envelope = value.get("request") if isinstance(value.get("request"), Mapping) else value
+    state = envelope.get("state")
+    if state not in ("open", "submitted", "received", "applied", "cancelled", "expired", "unknown"):
+        return None
+    expected = dict(ref)
+    row_ref = expected.get("_fleet_row_ref")
+    if isinstance(row_ref, Mapping):
+        expected.update({key: value for key, value in row_ref.items() if key not in expected})
+    if (expected.get("selected_id") and envelope.get("selected_id")
+            and expected["selected_id"] != envelope["selected_id"]):
+        return None
+    expected_native = ref.get("native_ref")
+    actual_native = envelope.get("native_ref")
+    if (isinstance(expected_native, Mapping) and actual_native is not None
+            and dict(expected_native) != actual_native):
+        return None
+    for key in ("request_id", "turn_id", "route_id", "question_id"):
+        expected_value, actual_value = expected.get(key), envelope.get(key)
+        if (expected_value is not None and actual_value is not None
+                and (expected_value != actual_value
+                     or (key == "request_id" and type(expected_value) is not type(actual_value)))):
+            return None
+        if state != "unknown" and expected_value is not None and actual_value != expected_value:
+            return None
+    if state != "unknown":
+        if (envelope.get("v") != 1 or envelope.get("harness") != ref.get("harness")
+                or envelope.get("session_id") != ref.get("session_id")
+                or type(envelope.get("request_id")) not in (str, int)
+                or envelope.get("request_id") == ""
+                or not isinstance(envelope.get("turn_id"), str)
+                or not envelope.get("turn_id")
+                or not envelope.get("kind") or "detail" not in envelope):
+            return None
+    return dict(envelope)
+
+
+def _explorer_accept_question_result(update):
+    """Adopt a private response only while its exact row and selection are current."""
+    global _EXPLORER_STATE, _EXPLORER_QUESTION_REFRESH_AT
+    if not isinstance(update, Mapping) or not isinstance(update.get("effect"), (tuple, list)):
+        return
+    effect = update["effect"]
+    result = update.get("result")
+    if len(effect) < 2 or not isinstance(effect[1], Mapping):
+        return
+    ref = dict(effect[1])
+    state = _explorer_state_for(_EXPLORER_STATE, 0)
+    overlay = dict(state.question_overlay) if isinstance(state.question_overlay, Mapping) else {}
+    current_ref = overlay.get("ref")
+    if (not isinstance(current_ref, Mapping) or current_ref.get("id") != ref.get("id")
+            or state.opened_for("qsel:QUESTIONS", "") != ref.get("id")
+            or not _explorer_question_ref_current(ref)):
+        if isinstance(current_ref, Mapping) and dict(current_ref) == ref:
+            overlay.update(state="unknown", detail=None, pending=False,
+                           status="The selected request changed; reopen its current native prompt.")
+            from dataclasses import replace
+            _EXPLORER_STATE = replace(state, question_overlay=overlay)
+        return
+    operation = effect[0]
+    envelope = _explorer_question_envelope(ref, result)
+    if operation == "questions.read":
+        if envelope is None:
+            overlay.update(state="unknown", detail=None, pending=False,
+                           status=_explorer_question_status(
+                               result, "Exact current request unavailable; use the native prompt."))
+        else:
+            from .explorer.state import question_draft_from_backend
+            draft = question_draft_from_backend(envelope, envelope.get("draft"))
+            if draft is None:
+                draft = overlay.get("draft")
+            overlay.update(detail=envelope, draft=draft, state=envelope["state"],
+                           pending=False, editing=False,
+                           status=_explorer_question_status(
+                               result, "Selected request is ready." if envelope["state"] == "open"
+                               else "Request state: " + envelope["state"]))
+    elif operation == "questions.draft":
+        if envelope is not None and envelope.get("state") == "open":
+            from .explorer.state import question_draft_from_backend
+            draft = question_draft_from_backend(envelope, envelope.get("draft"))
+            if draft is None:
+                draft = overlay.get("draft")
+            overlay.update(detail=envelope, draft=draft,
+                           state="open", status="Private draft saved; submit explicitly to send.")
+        else:
+            overlay.update(state="unknown", pending=False,
+                           status=_explorer_question_status(
+                               result, "Draft remains on screen; persistence was not confirmed."))
+    elif operation == "questions.submit":
+        if envelope is not None:
+            from .explorer.state import question_draft_from_backend
+            draft = question_draft_from_backend(envelope, envelope.get("draft"))
+            if draft is None:
+                draft = overlay.get("draft")
+            overlay.update(detail=envelope, draft=draft,
+                           state=envelope["state"], pending=False, editing=False,
+                           status=_explorer_question_status(
+                               result, "Request state: " + envelope["state"]))
+            if isinstance(result, Mapping) and result.get("action_id"):
+                overlay["action_id"] = str(result["action_id"])
+        else:
+            overlay.update(state="unknown", pending=False, editing=False,
+                           status=_explorer_question_status(
+                               result, "Delivery is unknown; it will not be sent again automatically."))
+    from dataclasses import replace
+    _EXPLORER_STATE = replace(state, question_overlay=overlay)
+    _EXPLORER_QUESTION_REFRESH_AT = (
+        time.monotonic() + 1.0 if overlay.get("state") in ("submitted", "received") else 0.0)
+    if (operation == "questions.submit" and envelope is not None
+            and envelope.get("state") in ("submitted", "received", "applied")):
+        _explorer_queue_question_effect(("questions.read", ref))
+
+
+def _explorer_question_pump_tick():
+    global _EXPLORER_QUESTION_GENERATION, _EXPLORER_QUESTION_REFRESH_AT
+    pump = _EXPLORER_QUESTION_PUMP
+    if pump is None:
+        return
+    update = pump.poll(_EXPLORER_QUESTION_GENERATION)
+    if update is not None:
+        _EXPLORER_QUESTION_GENERATION, value = update
+        _explorer_accept_question_result(value)
+    with _EXPLORER_QUESTION_QUEUE_LOCK:
+        pending = bool(_EXPLORER_QUESTION_QUEUE)
+    if pending:
+        pump.request(force=True)
+    else:
+        state = _explorer_state_for(_EXPLORER_STATE, 0)
+        overlay = state.question_overlay if isinstance(state.question_overlay, Mapping) else {}
+        if state.view != "QUESTIONS" or overlay.get("state") not in ("submitted", "received"):
+            _EXPLORER_QUESTION_REFRESH_AT = 0.0
+            return
+        now = time.monotonic()
+        if not _EXPLORER_QUESTION_REFRESH_AT:
+            _EXPLORER_QUESTION_REFRESH_AT = now + 1.0
+        if now >= _EXPLORER_QUESTION_REFRESH_AT and not pump.running:
+            from .explorer.state import _question_action_ref
+            ref = _question_action_ref(overlay)
+            _EXPLORER_QUESTION_REFRESH_AT = now + 1.0
+            if _explorer_question_ref_current(ref):
+                _explorer_queue_question_effect(("questions.read", ref))
+
+
+def _explorer_stop_question_pump():
+    """Drain local drafts at shutdown without executing queued native actions."""
+    global _EXPLORER_QUESTION_QUEUE, _EXPLORER_QUESTION_PUMP, _EXPLORER_QUESTION_REFRESH_AT
+    if _EXPLORER_QUESTION_PUMP is not None:
+        _EXPLORER_QUESTION_PUMP.stop(join_timeout=1.0)
+    with _EXPLORER_QUESTION_QUEUE_LOCK:
+        drafts = [effect for effect in (_EXPLORER_QUESTION_QUEUE or ())
+                  if effect[0] == "questions.draft"]
+        _EXPLORER_QUESTION_QUEUE = _EXPLORER_QUESTION_PUMP = None
+    _EXPLORER_QUESTION_REFRESH_AT = 0.0
+    if _EXPLORER_REPLAY_ACTIVE or os.environ.get("FLEET_DEMO"):
+        return []
+    from .explorer.state import _question_action_ref, _question_draft_for_backend
+    state = _explorer_state_for(_EXPLORER_STATE, 0)
+    overlay = state.question_overlay if isinstance(state.question_overlay, Mapping) else {}
+    if isinstance(overlay.get("draft"), Mapping) and isinstance(overlay.get("detail"), Mapping):
+        drafts.append(("questions.draft", _question_action_ref(overlay),
+                       _question_draft_for_backend(overlay["draft"], overlay["detail"])))
+    latest = []
+    for effect in drafts:
+        latest = [old for old in latest
+                  if not _explorer_same_question_request(old[1], effect[1])]
+        latest.append(effect)
+    from .explorer.runtime import ExplorerRuntime
+    return [ExplorerRuntime.execute_question_action(effect) for effect in latest]
 
 
 def _explorer_reveal(state, rows):
@@ -11258,9 +11543,24 @@ def _explorer_text_key(ch):
     return None
 
 
+def _explorer_question_refs():
+    questions = getattr(_EXPLORER_MODEL, "questions", ()) if _EXPLORER_MODEL is not None else ()
+    older_open = getattr(_EXPLORER_STATE, "opened_for", lambda *_: "")(
+        "qolder:QUESTIONS", "") == "open"
+    return tuple(dict(item.get("ref") or {}) for item in questions
+                 if isinstance(item, Mapping) and isinstance(item.get("ref"), Mapping)
+                 and (not item.get("older") or older_open))
+
+
+def _explorer_question_editing():
+    overlay = getattr(_EXPLORER_STATE, "question_overlay", None)
+    return bool(getattr(_EXPLORER_STATE, "view", None) == "QUESTIONS"
+                and isinstance(overlay, Mapping) and overlay.get("editing"))
+
+
 def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
     """Apply one decoded event to the explorer's view-local reducer."""
-    global _EXPLORER_STATE
+    global _EXPLORER_STATE, _EXPLORER_TEXT
     from .explorer.state import reduce
     state = _explorer_state_for(_EXPLORER_STATE, (size or (0, 100))[1])
     if ch == curses.KEY_MOUSE:
@@ -11301,11 +11601,18 @@ def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
             _EXPLORER_STATE = state
             _explorer_apply_effects(_effects, _EXPLORER_MODEL)
         return
-    key = _explorer_key_name(ch)
+    editing = (state.view == "QUESTIONS" and _explorer_question_editing())
+    if editing and isinstance(ch, int) and (32 <= ch < 127 or 128 <= ch < 256):
+        key = _explorer_text_key(ch)
+    else:
+        key = _explorer_key_name(ch)
     if key:
         from .explorer.runtime import tag_cycle
         order = tag_cycle(getattr(_EXPLORER_MODEL, "ordering", None))
-        event = {"type": "key", "key": key, "order": order}
+        event = {"type": "key", "key": key, "order": order,
+                 "question_refs": _explorer_question_refs()}
+        if key == "e" and state.view == "QUESTIONS":
+            _EXPLORER_TEXT = bytearray()
         if key == "end" and _EXPLORER_MODEL is not None and size is not None:
             from .explorer.frame import measure_pane_max
             event["max_scroll"] = measure_pane_max(
@@ -11381,6 +11688,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     global _EXPLORER_GENERATION, _EXPLORER_MODEL, _EXPLORER_PUBLISHED_MODEL
     global _EXPLORER_REPLAY_ACTIVE, _EXPLORER_SHOWN, _EXPLORER_DETAIL_CONTINUATION
     global _EXPLORER_READINESS, _EXPLORER_REMOTE_OBSERVATION
+    global _EXPLORER_QUESTION_QUEUE, _EXPLORER_QUESTION_PUMP, _EXPLORER_QUESTION_GENERATION
     curses.curs_set(0)
     _init_colors()
     if _EXPLORER_ENABLED:
@@ -11524,6 +11832,14 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     install_generation, install_target = 0, None
     # Existing coalescing/last-good semantics, independent of basic refresh.
     detail_pump = RefreshPump(collect_details, interval, name="fleet-detail-refresh")
+    if _EXPLORER_ENABLED:
+        _EXPLORER_QUESTION_QUEUE = deque()
+        _EXPLORER_QUESTION_PUMP = RefreshPump(
+            _explorer_question_worker, 0.1, name="fleet-question-interaction")
+        _EXPLORER_QUESTION_GENERATION = 0
+    else:
+        _EXPLORER_QUESTION_QUEUE = _EXPLORER_QUESTION_PUMP = None
+        _EXPLORER_QUESTION_GENERATION = 0
     basic_snapshot = snapshot
     latest_detail = None
     compute_host_refresh = getattr(collect_all, "compute_hosts_refresh", None)
@@ -11656,6 +11972,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 if (_EXPLORER_ENABLED and latest_detail is not None and next_detail is not None):
                     next_detail = details.retain_optional_last_good(latest_detail, next_detail)
                 latest_detail = next_detail
+            _explorer_question_pump_tick()
             _EXPLORER_GENERATION = generation
             if update is not None or detail_update is not None:
                 snapshot = details.merge(basic_snapshot, latest_detail)
@@ -11693,7 +12010,9 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _EXPLORER_RESULT = focus_result
                     _HIT_VALID = False
 
-            if ch in (ord("q"), ord("Q")) and not _explorer_searching():
+            question_editing = _explorer_question_editing()
+            if (ch in (ord("q"), ord("Q")) and not _explorer_searching()
+                    and not question_editing):
                 return 0
             # Idle input boundary only: never discard a key or an in-flight action.
             if (install_target is not None and ch == curses.ERR
@@ -11740,7 +12059,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _EXPLORER_EARLIER = False
                     if selection_feed is not None:
                         selection_feed.pump.load_earlier()
-                if ch in (ord("r"), ord("R")) and not _explorer_searching():
+                if (ch in (ord("r"), ord("R")) and not _explorer_searching()
+                        and not question_editing):
                     pump.request(force=True)
                     if latest_basic[0] is not None:
                         detail_pump.request(force=True)
@@ -11808,6 +12128,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 pass
         if selection_feed is not None:
             selection_feed.stop()
+        _explorer_stop_question_pump()
         pump.stop(join_timeout=1.0)
         detail_pump.stop(join_timeout=1.0)
         if compute_host_pump is not None:
