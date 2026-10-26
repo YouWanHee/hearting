@@ -254,6 +254,192 @@ class LegacyRouteCompatibilityTest(unittest.TestCase):
                 with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
                     with self.assertRaises(ValueError): R.verify_route(route)
 
+    def test_exact_inverse_reconstructs_sealed_pair_without_mutating_inputs(self):
+        registry=R.TOPO.load_registry(); registry_before=copy.deepcopy(registry)
+        blocks=R._capture_unit_frontmatter(); blocks_before=copy.deepcopy(blocks)
+        historical=R._sd160_legacy_registry(registry)
+        unit_result=R._sd160_legacy_unit_catalog(blocks)
+        self.assertEqual(R.TOPO.registry_digest(historical),LEGACY_REGISTRY)
+        self.assertEqual(unit_result[0],'sha256:a565c51b6d07e301836027295e3e49d01dcb2b2bdacb98845441711c73188314')
+        self.assertEqual(registry,registry_before); self.assertEqual(blocks,blocks_before)
+        self.assertEqual(R.TOPO.registry_digest(R._sd160_legacy_registry(historical)),LEGACY_REGISTRY)
+        self.assertEqual(R._sd160_legacy_unit_catalog({k:v for k,v in blocks.items()
+            if k!='ops/session-tidy-memory.md'})[0],unit_result[0])
+        self.assertEqual(unit_result[1]['editorial/report']['role'],'fast writer')
+        self.assertEqual(R.TOPO._unit_frontmatter('editorial/report')['role'],'deep editor')
+        for intensity in FIXTURE_SHA256:
+            path,raw,route=self.fixture(intensity); original=copy.deepcopy(route)
+            with mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}): R.verify_route(route)
+            self.unchanged(path,raw,route,original)
+        self.assertEqual(registry,registry_before); self.assertEqual(blocks,blocks_before)
+
+    def test_pre_862_audit_registry_is_identified_exactly(self):
+        registry=copy.deepcopy(R.TOPO.load_registry())
+        audit=next(r for r in registry['recipes'] if r['capability']=='audit')
+        report=next(n for n in audit['standard_plus']['nodes'] if n['id']=='report')
+        self.assertEqual(report['unit'],'editorial/report'); report['unit']='editorial/polish'
+        catalog=registry['part_catalog']['parts']['audit:report']['unit_choices']
+        self.assertEqual(catalog[0],'editorial/report'); del catalog[0]
+        self.assertEqual(R.TOPO.registry_digest(registry),'sha256:df88162c05b296aaae1bf626287b353535502e7531392434e4ee7a84f52b6c23')
+        before=copy.deepcopy(registry)
+        self.assertEqual(R.TOPO.registry_digest(R._sd160_legacy_registry(registry)),LEGACY_REGISTRY)
+        self.assertEqual(registry,before)
+        for intensity in FIXTURE_SHA256:
+            _,_,route=self.fixture(intensity)
+            with mock.patch.object(R.TOPO,'load_registry',return_value=registry), mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+                R.verify_route(route)
+        for mutation in ('audit-unit','catalog-choice','catalog-row'):
+            changed=copy.deepcopy(registry)
+            a=next(r for r in changed['recipes'] if r['capability']=='audit')
+            n=next(n for n in a['standard_plus']['nodes'] if n['id']=='report')
+            choices=changed['part_catalog']['parts']['audit:report']['unit_choices']
+            if mutation=='audit-unit': n['unit']='invented/unit'
+            elif mutation=='catalog-choice': choices.append('invented/unit')
+            else: changed['part_catalog']['parts']['audit:report']['summary']='changed'
+            frozen=copy.deepcopy(changed)
+            self.assertIsNone(R._sd160_legacy_registry(changed),mutation)
+            self.assertEqual(changed,frozen)
+
+    def test_tampered_deleted_registry_subtrees_are_refused(self):
+        def cases():
+            base=R.TOPO.load_registry()
+            for label,mutate in (
+                ('package nested role',lambda r: next(n for n in next(x for x in r['recipes'] if x['capability']=='autopilot-ship' and x['modes']==['package'])['standard_plus']['nodes'] if n['id']=='package').update(role='changed')),
+                ('route-frame node',lambda r: next(n for n in next(x for x in r['recipes'] if x['capability']=='route-frame')['standard_plus']['nodes'] if n['id']=='frame').update(role='changed')),
+                ('part catalogue choice',lambda r: r['part_catalog']['parts']['audit:report']['unit_choices'].append('invented/unit')),
+                ('part catalogue unknown',lambda r: r['part_catalog']['unexpected'].__setitem__('x',1) if 'unexpected' in r['part_catalog'] else r['part_catalog'].__setitem__('unexpected',{'x':1})),
+            ):
+                changed=copy.deepcopy(base); mutate(changed); yield label,changed
+            hashes={
+                'compose-owner-close':'9d5f75756ceebc9563f2fbd53077efd4763ab3aecae3cae2b8665e3ef4b47eb9',
+                'lab-diagnose':'49f683a6103ae6665a30bdee3cfb89f109af558bae8a827f865f2298fbce97f3',
+                'lab-eval-spec':'25cbaaa60d8660027ac1d2946bba140b760907b1a7f288b48590af1398ae61ee',
+                'route-frame':'dee2dbe2c9f12d7ac60d7434ec9681ee5f759f164405bba1b0cf444f9671ec71',
+                'route-decision':'696cc0d812817c7225797bc90d741102396cadb7207eeb29d4a8d356cf582525',
+                'resource-exit':'599c06cf374c4d7de6514e11b130f7e0b76bc752c63fc8264221013807d7d041',
+            }
+            for gate in hashes:
+                for unknown in (False,True):
+                    changed=copy.deepcopy(base); row=changed['completion_gate_contracts'][gate]
+                    if unknown: row['unexpected']={'nested':True}
+                    else: row['tampered']=True
+                    yield f'{gate} unknown={unknown}',changed
+        for label,registry in cases():
+            with self.subTest(case=label):
+                self.assertIsNone(R._sd160_legacy_registry(registry))
+                _,_,route=self.fixture('standard')
+                with mock.patch.object(R.TOPO,'load_registry',return_value=registry), mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+                    with self.assertRaises(ValueError): R.verify_route(route)
+                self.assertEqual(self.jobs.read_text(),'')
+
+    def test_tampered_registry_values_and_unit_frontmatter_are_refused(self):
+        base=R.TOPO.load_registry()
+        mutations=[]
+        def add(label,fn):
+            altered=copy.deepcopy(base); fn(altered); mutations.append((label,altered))
+        def rcp(r,cap,modes): return next(x for x in r['recipes'] if x['capability']==cap and x['modes']==modes)
+        def nd(r,cap,modes,ident): return next(n for n in rcp(r,cap,modes)['standard_plus']['nodes'] if n['id']==ident)
+        add('authorized gate doc',lambda r:r['completion_gate_contracts']['authorized-full-run'].__setitem__('doc','third'))
+        add('ship gate doc',lambda r:r['completion_gate_contracts']['ship-setup'].__setitem__('doc','third'))
+        for cap,modes,ident in [('autopilot-code',['audit','debug','dev'],'report'),('autopilot-design',['default'],'handoff'),('autopilot-draft',['doc','paper','presentation'],'finalize'),('autopilot-lab',['eval'],'report')]:
+            add(f'{cap}:{ident} role',lambda r,c=cap,m=modes,i=ident:nd(r,c,m,i).__setitem__('role','third'))
+            add(f'{cap}:{ident} profile',lambda r,c=cap,m=modes,i=ident:nd(r,c,m,i).__setitem__('model_profile','third'))
+        add('code report judgment requirement',lambda r:nd(r,'autopilot-code',['audit','debug','dev'],'report')['profile_demand'].__setitem__('judgment_requirement','third'))
+        add('code report judgment reason',lambda r:nd(r,'autopilot-code',['audit','debug','dev'],'report')['profile_demand'].__setitem__('judgment_reason','third'))
+        add('code quick scope',lambda r:rcp(r,'autopilot-code',['audit','debug','dev'])['quick'].__setitem__('write_scope',['third']))
+        add('code quick guard',lambda r:rcp(r,'autopilot-code',['audit','debug','dev'])['quick'].__setitem__('guard_preconditions',['third']))
+        add('code execute scope',lambda r:nd(r,'autopilot-code',['audit','debug','dev'],'execute').__setitem__('write_scope',['third']))
+        add('code execute guard',lambda r:nd(r,'autopilot-code',['audit','debug','dev'],'execute').__setitem__('guard_preconditions',['third']))
+        for cap,modes,ident in [('autopilot-apply',['default'],'verify'),('autopilot-lab',['setup'],'smoke'),('autopilot-ship',['default'],'security-review'),('autopilot-ship',['default'],'release-review')]:
+            add(f'{cap}:{ident} continuation',lambda r,c=cap,m=modes,i=ident:nd(r,c,m,i)['continuation'].__setitem__('extra',True))
+        add('apply gates',lambda r:rcp(r,'autopilot-apply',['default']).__setitem__('human_gates',['third']))
+        add('lab bindings',lambda r:rcp(r,'autopilot-lab',['setup']).__setitem__('human_gate_bindings',[{'gate':'third'}]))
+        add('ship gates',lambda r:rcp(r,'autopilot-ship',['default']).__setitem__('human_gates',['third']))
+        add('lab promotion',lambda r:rcp(r,'autopilot-lab',['setup']).__setitem__('promotion_signals',['third']))
+        add('refine outputs',lambda r:nd(r,'autopilot-refine',['default'],'review').__setitem__('outputs',['third']))
+        add('independence axes',lambda r:next(g for g in rcp(r,'autopilot-code',['audit','debug','dev'])['standard_plus']['parallel_groups'] if g['id']=='plan').__setitem__('independence_axes',['third']))
+        for label,registry in mutations:
+            with self.subTest(registry=label):
+                self.assertIsNone(R._sd160_legacy_registry(registry))
+                _,_,route=self.fixture('standard')
+                with mock.patch.object(R.TOPO,'load_registry',return_value=registry), mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+                    with self.assertRaises(ValueError): R.verify_route(route)
+                self.assertEqual(self.jobs.read_text(),'')
+
+        original=R._capture_unit_frontmatter()
+        for label,path,mutator in (
+            ('report role','editorial/report.md',lambda s:s.replace('role: deep editor','role: invented')),
+            ('polish bootstrap','editorial/polish.md',lambda s:s.replace('memory: [report-format]','memory: [invented]')),
+            ('report bootstrap','editorial/report.md',lambda s:s.replace('exemplar: deliverable','exemplar: invented')),
+            ('survey bootstrap','research/research-survey.md',lambda s:s.replace('gates: [research-report]','gates: [invented]')),
+            ('added unit field','ops/session-tidy-memory.md',lambda s:s.replace('role: deep editor','role: invented')),
+        ):
+            altered=dict(original); altered[path]=mutator(altered[path])
+            _,_,route=self.fixture('standard')
+            with self.subTest(unit=label), mock.patch.object(R,'_capture_unit_frontmatter',return_value=altered), mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+                with self.assertRaises(ValueError): R.verify_route(route)
+            self.assertEqual(self.jobs.read_text(),'')
+        malformed=dict(original); malformed['editorial/report.md']=None
+        missing=dict(original); del missing['editorial/polish.md']
+        unrelated=dict(original); unrelated_path=next(p for p,v in unrelated.items() if v is not None and p not in ('editorial/polish.md','editorial/report.md','research/research-survey.md','ops/session-tidy-memory.md'))
+        unrelated[unrelated_path]=unrelated[unrelated_path].replace('role:','role: changed-',1)
+        for label,altered in [('malformed original',malformed),('missing original',missing),('unrelated unit drift',unrelated)]:
+            _,_,route=self.fixture('standard')
+            with self.subTest(unit=label), mock.patch.object(R,'_capture_unit_frontmatter',return_value=altered), mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+                with self.assertRaises(ValueError): R.verify_route(route)
+        malformed_added=dict(original); malformed_added['ops/session-tidy-memory.md']=None
+        for label,altered in [('malformed added unit',malformed_added)]:
+            _,_,route=self.fixture('standard')
+            with self.subTest(unit=label), mock.patch.object(R,'_capture_unit_frontmatter',return_value=altered), mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+                with self.assertRaises(ValueError): R.verify_route(route)
+
+    def test_original_unit_digest_graph_tampering_still_reaches_validation(self):
+        _,_,original=self.fixture('strong')
+        mutations=(
+            ('route role',lambda r:r['nodes'][0].__setitem__('role','invented'),False),
+            ('embedded recipe profile',lambda r:next(n for n in r['composed_recipe']['standard_plus']['nodes'] if n['id']=='plan').__setitem__('model_profile','light'),True),
+            ('embedded recipe role',lambda r:next(n for n in r['composed_recipe']['standard_plus']['nodes'] if n['id']=='plan').__setitem__('role','invented'),True),
+            ('realized leg count',lambda r:next(n for n in r['nodes'] if n.get('parallel_group')=='plan').__setitem__('parallel_leg_count',7),True),
+            ('embedded group width',lambda r:next(g for g in r['composed_recipe']['standard_plus']['parallel_groups'] if g['id']=='impl-review')['width_by_intensity'].__setitem__('strong',7),True),
+        )
+        for label,mutate,recipe_expected in mutations:
+            route=copy.deepcopy(original); mutate(route); self.reseal(route)
+            with self.subTest(graph=label), mock.patch.object(R.TOPO,'_validate_recipe',wraps=R.TOPO._validate_recipe) as validate, mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+                with self.assertRaises(ValueError): R.verify_route(route)
+                if recipe_expected: validate.assert_called()
+
+    def test_historical_unit_view_is_scoped_and_persona_version_never_enters(self):
+        import contextvars
+        topo=R.TOPO
+        self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'deep editor')
+        _,_,route=self.fixture('standard')
+        with mock.patch.object(topo,'_validate_recipe',side_effect=RuntimeError('validator failure')), mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+            with self.assertRaisesRegex(RuntimeError,'validator failure'): R.verify_route(route)
+        self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'deep editor')
+        observed=[]; real=topo._validate_recipe
+        def inspect(*args,**kwargs):
+            observed.append(topo._unit_frontmatter('editorial/report')['role'])
+            return real(*args,**kwargs)
+        _,_,route=self.fixture('standard')
+        with mock.patch.object(topo,'_validate_recipe',side_effect=inspect), mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}): R.verify_route(route)
+        self.assertEqual(observed,['fast writer'])
+        self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'deep editor')
+        fields={'editorial/report':dict(topo._unit_frontmatter('editorial/report'),role='fast writer')}
+        independent=contextvars.Context()
+        with topo._unit_contract_view(fields):
+            returned=topo._unit_frontmatter('editorial/report'); returned['role']='changed'
+            self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'fast writer')
+            self.assertEqual(independent.run(topo._unit_frontmatter,'editorial/report')['role'],'deep editor')
+            with topo._unit_contract_view({'editorial/report':dict(returned,role='nested')}):
+                self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'nested')
+            self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'fast writer')
+        self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'deep editor')
+        route=copy.deepcopy(self.fixture('standard')[2]); route['persona_independence_contract_version']=1; self.reseal(route)
+        with mock.patch.object(R,'_sd160_legacy_registry',wraps=R._sd160_legacy_registry) as registry_inverse, mock.patch.object(R,'_sd160_legacy_unit_catalog',wraps=R._sd160_legacy_unit_catalog) as unit_inverse, mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+            with self.assertRaises(ValueError): R.verify_route(route)
+        registry_inverse.assert_not_called(); unit_inverse.assert_not_called()
+        self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'deep editor')
+
 
 class LegacyDesignRegistryBasisTest(unittest.TestCase):
     @staticmethod

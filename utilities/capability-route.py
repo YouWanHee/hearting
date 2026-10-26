@@ -2,7 +2,7 @@
 """Compile, verify, and complete immutable capability routes."""
 from __future__ import annotations
 
-import argparse, base64, contextlib, fcntl, functools, hashlib, importlib.util, json, locale, os, re, shlex, shutil, stat, subprocess, sys, tempfile, uuid
+import argparse, base64, contextlib, copy, fcntl, functools, hashlib, importlib.util, json, locale, os, re, shlex, shutil, stat, subprocess, sys, tempfile, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -2751,13 +2751,59 @@ def _validation_basis():
 
 def unit_catalog_digest(units_root=None):
     """Digest of unit frontmatter blocks (machine contracts); unit BODY prose stays un-hashed."""
+    return _unit_blocks_digest(_capture_unit_frontmatter(units_root))
+
+
+def _capture_unit_frontmatter(units_root=None):
+    """Capture the exact hashed blocks, retaining malformed files as None."""
     units_root=Path(units_root) if units_root else ROOT/"roles"/"units"
-    blocks=[]
+    captured={}
     for path in sorted(units_root.glob("*/*.md")):
         if path.name.startswith("_"): continue
         match=re.match(r"\A---\n.*?\n---\n", path.read_text(encoding="utf-8"), re.DOTALL)
-        if match: blocks.append(f"{path.relative_to(units_root)}\n{match.group(0)}")
+        captured[path.relative_to(units_root).as_posix()] = match.group(0) if match else None
+    return captured
+
+
+def _unit_blocks_digest(captured):
+    blocks=[f"{path}\n{block}" for path,block in sorted(captured.items()) if block is not None]
     return "sha256:"+hashlib.sha256("\n".join(blocks).encode()).hexdigest()
+
+
+def _sd160_legacy_unit_catalog(captured):
+    """Reconstruct the one authenticated historical frontmatter catalogue."""
+    if not isinstance(captured,dict): return None
+    legacy=dict(captured)
+    originals={
+        "editorial/polish.md": ("0b2c4140794cae2911828078290fdf98a778d0e0d5c47f8fae4323fe884700fe",
+            "a238181ef63a5f843a3a2ac6cf92b7d4c1cf85a970e6a91136b21fc580a22a7e",
+            "---\nunit: editorial/polish\nfamily: editorial\nrole: deep editor\nworker_type: stage\nfloor: low\nread_only: false\nstance: none\nio:\n  verdict: [DONE, BLOCKED]\n  return: _shared/dual-io.md\ntools: []\nbranches: [direct, pipeline]\naliases: {}\n---\n"),
+        "editorial/report.md": ("ad3c707ee5c5f09b9973c3a6edf387ddb64b7f4bbfe80fecd09226dedbe709f1",
+            "b5aa21d2c98cccf613b3b5b45fa563c0ba240b43285a5398ec821889ded5994c",
+            "---\nunit: editorial/report\nfamily: editorial\nrole: fast writer\nworker_type: stage\nfloor: low\nread_only: false\nstance: none\nio:\n  verdict: [done, blocked]\n  return: _shared/dual-io.md\ntools: []\nbranches: [pipeline]\naliases: {}\n---\n"),
+        "research/research-survey.md": ("c7f0b793191d6988a8c9139f46be64b4d9eae9da74001672de937b06ca7c63b9",
+            "25d8a84da3cfa8eec75b72e59e947ce94e0f5df58673a2cdffcf5616877b401b",
+            "---\nunit: research/research-survey\nfamily: research\nrole: deep maker\nworker_type: stage\nfloor: high\nread_only: false\nstance: none\nio:\n  verdict: [complete, partial, error]\n  return: _shared/dual-io.md\ntools: []\nbranches: [search, analysis, chaining, code-search, compile, report]\naliases: {}\n---\n"),
+    }
+    for path,(current_hash,old_hash,old_block) in originals.items():
+        block=legacy.get(path)
+        if not isinstance(block,str): return None
+        digest=hashlib.sha256(block.encode()).hexdigest()
+        if digest==old_hash: continue
+        if digest!=current_hash: return None
+        legacy[path]=old_block
+    added="ops/session-tidy-memory.md"
+    if added in legacy:
+        block=legacy[added]
+        if not isinstance(block,str) or hashlib.sha256(block.encode()).hexdigest()!="9abf4004ed96a916176e9949ce2bb5c29e1ef43d35ee193aeec70f8bce7046aa":
+            return None
+        del legacy[added]
+    digest=_unit_blocks_digest(legacy)
+    if digest!="sha256:a565c51b6d07e301836027295e3e49d01dcb2b2bdacb98845441711c73188314":
+        return None
+    fields=TOPO._unit_frontmatter("editorial/report").copy()
+    fields["role"]="fast writer"
+    return digest,{"editorial/report":fields}
 
 def compile_route(capability, capability_mode, requested_intensity, cwd, artifact_root,
                   predicates=(), signals=(), transport=None,
@@ -5499,21 +5545,211 @@ def _validate_campaign_selection(key, value):
 
 
 def _sd160_legacy_registry(registry):
-    """Reconstruct only the immediately preceding cross-harness declaration.
-
-    This is an exact digest bridge, never a general stale-registry exemption.
-    Any changed node, width, budget, role or other registry byte changes its
-    digest and remains refused. Old sealed documents themselves are untouched.
-    """
+    """Authenticate and reconstruct the exact registry sealed by SD-160 routes."""
+    if not isinstance(registry, dict) or not isinstance(registry.get("recipes"), list):
+        return None
     legacy = json.loads(json.dumps(registry))
-    changed = False
-    for recipe in legacy["recipes"]:
-        for graph in (v for v in recipe.values() if isinstance(v, dict)):
-            for group in graph.get("parallel_groups", []):
-                if group.get("independence_axes") == ["model-profile", "perspective"]:
-                    group["independence_axes"] = ["cross-harness", "model-profile", "perspective"]
-                    changed = True
-    return legacy if changed else None
+    missing = object()
+
+    def subtree_hash(value):
+        return hashlib.sha256(TOPO.canonical_registry_bytes(value)).hexdigest()
+
+    def delete_hashed(parent, key, accepted):
+        if key not in parent:
+            return True
+        value = parent[key]
+        if subtree_hash(value) not in accepted:
+            return False
+        del parent[key]
+        return True
+
+    def recipe(capability, modes):
+        found=[item for item in legacy["recipes"] if isinstance(item,dict)
+               and item.get("capability")==capability and item.get("modes")==modes]
+        return found[0] if len(found)==1 else None
+
+    def selected(items, key, value):
+        if not isinstance(items,list): return None
+        found=[item for item in items if isinstance(item,dict) and item.get(key)==value]
+        return found[0] if len(found)==1 else None
+
+    def graph(capability, modes, graph_name="standard_plus"):
+        r=recipe(capability,modes)
+        value=r.get(graph_name) if isinstance(r,dict) else None
+        return value if isinstance(value,dict) else None
+
+    def node(capability,modes,ident,graph_name="standard_plus"):
+        g=graph(capability,modes,graph_name)
+        return selected(g.get("nodes"),"id",ident) if g is not None else None
+
+    def group(capability,modes,ident):
+        g=graph(capability,modes)
+        return selected(g.get("parallel_groups"),"id",ident) if g is not None else None
+
+    def set_old(parent,key,current,old):
+        if not isinstance(parent,dict): return False
+        value=parent.get(key,missing)
+        if value == old: return True
+        if value != current: return False
+        if old is missing: parent.pop(key)
+        else: parent[key]=json.loads(json.dumps(old))
+        return True
+
+    # Authenticate deleted whole objects before any transformations touch them.
+    catalog_hashes={
+        "ef308fc8b2ecc6177872047d6bef7e4e1030f146a4b0b52e6f6283420817dcc7",
+        "e2b32ca23b24a01e151275a6cf72787373a660dd608928c091961f48f43ada8b",
+    }
+    if not delete_hashed(legacy,"part_catalog",catalog_hashes): return None
+    deletions=(
+        ("autopilot-ship",["package"],"cf18b6d54de38f70de225b47aaf5c54fc657a1659a77400a4c04136cac169ef9"),
+        ("route-frame",["default"],"a4d3143d99cb2a6c5adb57d35a24700e9b59e1ac35bec23031a8e4ad673ea4d4"),
+    )
+    for capability,modes,digest in deletions:
+        matches=[r for r in legacy["recipes"] if isinstance(r,dict) and r.get("capability")==capability and r.get("modes")==modes]
+        if len(matches)>1: return None
+        if matches:
+            if subtree_hash(matches[0])!=digest: return None
+            legacy["recipes"].remove(matches[0])
+    gate_hashes={
+        "compose-owner-close":"9d5f75756ceebc9563f2fbd53077efd4763ab3aecae3cae2b8665e3ef4b47eb9",
+        "lab-diagnose":"49f683a6103ae6665a30bdee3cfb89f109af558bae8a827f865f2298fbce97f3",
+        "lab-eval-spec":"25cbaaa60d8660027ac1d2946bba140b760907b1a7f288b48590af1398ae61ee",
+        "route-frame":"dee2dbe2c9f12d7ac60d7434ec9681ee5f759f164405bba1b0cf444f9671ec71",
+        "route-decision":"696cc0d812817c7225797bc90d741102396cadb7207eeb29d4a8d356cf582525",
+        "resource-exit":"599c06cf374c4d7de6514e11b130f7e0b76bc752c63fc8264221013807d7d041",
+    }
+    contracts=legacy.get("completion_gate_contracts")
+    if not isinstance(contracts,dict): return None
+    for name,digest in gate_hashes.items():
+        if name in contracts and subtree_hash(contracts[name])!=digest: return None
+        if name in contracts: del contracts[name]
+
+    # Restore exact scalar/list declarations. A value already old is a valid no-op.
+    if not isinstance(legacy.get("completion_gate_contracts"),dict): return None
+    docs=(
+        ("authorized-full-run","supervised detached resource run; approval is obtained at route start","human-gated detached resource run; not an agent gate"),
+        ("ship-setup","owner release configuration or verified delivery archive (package mode); conductor-owned","owner release configuration; conductor-owned"),
+    )
+    for name,current,old in docs:
+        row=legacy["completion_gate_contracts"].get(name)
+        if not set_old(row,"doc",current,old): return None
+
+    # The audit catalogue choice is part of the authenticated deleted catalogue.
+    # Recognize and normalize the #862 audit declaration before removing catalog.
+    # The current or exact pre-#862 catalogue hashes above were authenticated first.
+    # (The copied catalogue is reloaded from the original solely for this normalization.)
+    source_catalog=registry.get("part_catalog",missing)
+    if source_catalog is not missing:
+        cat=copy.deepcopy(source_catalog)
+        parts=cat.get("parts") if isinstance(cat,dict) else None
+        audit=parts.get("audit:report") if isinstance(parts,dict) else None
+        if isinstance(audit,dict):
+            choices=audit.get("unit_choices")
+            if choices==["editorial/report","editorial/polish","research/research-survey"]:
+                audit["unit_choices"]=["editorial/polish","research/research-survey"]
+            elif choices != ["editorial/polish","research/research-survey"]:
+                return None
+        elif audit is not None:
+            return None
+        if (subtree_hash(source_catalog) not in catalog_hashes
+                or subtree_hash(cat)!="e2b32ca23b24a01e151275a6cf72787373a660dd608928c091961f48f43ada8b"):
+            return None
+
+    # Code authoring scope and the removed precondition.
+    code=recipe("autopilot-code",["audit","debug","dev"])
+    if not isinstance(code,dict): return None
+    quick=code.get("quick"); execute=node("autopilot-code",["audit","debug","dev"],"execute")
+    for obj,key,current,old in (
+        (quick,"write_scope",["source-scoped","plans/<cycle>/**","spec/**"],["source-scoped","plans/<cycle>/**"]),
+        (execute,"write_scope",["source/**","spec/**","checklist.md","dev_logs/**","evidence/**"],["source/**","checklist.md","dev_logs/**","evidence/**"]),
+    ):
+        if not set_old(obj,key,current,old): return None
+    for obj in (quick,execute):
+        if not isinstance(obj,dict): return None
+        value=obj.get("guard_preconditions",missing)
+        if value is missing: continue
+        if value != ["artifact-order-prechecked"]: return None
+        del obj["guard_preconditions"]
+
+    report=node("autopilot-code",["audit","debug","dev"],"report")
+    current_reason="The report is the reader-facing artifact; its readability and faithful synthesis are the judgment the user asked to prioritize (2026-09-30)."
+    old_reason="The accepted plan and completed checks fix the decisions; new judgment returns to the owner."
+    for obj,key,current,old in (
+        (report,"role","deep editor","fast writer"),(report,"model_profile","balanced-deep","balanced"),
+        (report.get("profile_demand") if isinstance(report,dict) else None,"judgment_requirement","important","predetermined"),
+        (report.get("profile_demand") if isinstance(report,dict) else None,"judgment_reason",current_reason,old_reason),
+    ):
+        if not set_old(obj,key,current,old): return None
+    for cap,modes,ident,old_profile in (
+        ("autopilot-design",["default"],"handoff","light"),
+        ("autopilot-draft",["doc","paper","presentation"],"finalize","light"),
+        ("autopilot-lab",["eval"],"report","light"),
+    ):
+        obj=node(cap,modes,ident)
+        if not set_old(obj,"role","deep editor","fast writer") or not set_old(obj,"model_profile","balanced-deep",old_profile): return None
+
+    # Hand-gate declarations removed since the sealed routes.
+    gate_edits=(
+        ("autopilot-apply",["default"],"verify","explicit-handback"),
+        ("autopilot-lab",["setup"],"smoke","full-run-authorization"),
+        ("autopilot-ship",["default"],"security-review","deploy-authorization"),
+        ("autopilot-ship",["default"],"release-review","deploy-authorization"),
+    )
+    for cap,modes,ident,gate_name in gate_edits:
+        obj=node(cap,modes,ident); continuation=obj.get("continuation") if isinstance(obj,dict) else None
+        current={"kind":"inline-next"}; old={"kind":"human-gate","gate":gate_name}
+        if not set_old(obj,"continuation",current,old): return None
+        if not isinstance(continuation,dict):
+            continuation=obj.get("continuation")
+        if isinstance(continuation,dict) and continuation.get("kind")=="human-gate" and continuation.get("gate")==gate_name:
+            # Already-old continuation needs no mutation.
+            pass
+        graph_obj=recipe(cap,modes)
+        bindings=[{"gate":gate_name,"node":("handback" if cap=="autopilot-apply" else "full-run" if cap=="autopilot-lab" else "deploy"),"position":"entry"}]
+        if not set_old(graph_obj,"human_gates",[],[gate_name]): return None
+        if not set_old(graph_obj,"human_gate_bindings",[],bindings): return None
+
+    lab=recipe("autopilot-lab",["setup"])
+    if not set_old(lab,"promotion_signals",["resource-run","gpu","session-independent-lifecycle","smoke-required","human-gate","stage-resume"],["resource-run","session-independent-lifecycle","smoke-required","human-gate","stage-resume"]): return None
+    refine=node("autopilot-refine",["default"],"review")
+    if not set_old(refine,"outputs",["reviews/refine-verdict.json","reviews/refine/preview.md"],["reviews/refine-verdict.json"]): return None
+    audit=node("audit",["default"],"report")
+    if not set_old(audit,"unit","editorial/report","editorial/polish"): return None
+
+    # Restore cycle-qualified design paths only in the design recipe and bucket declaration.
+    buckets=legacy.get("artifact_buckets")
+    if isinstance(buckets,dict) and not set_old(buckets,"designs","designs","designs/<cycle>"): return None
+    design=recipe("autopilot-design",["default"])
+    def restore_design(value):
+        if isinstance(value,str):
+            if value=="designs": return "designs/<cycle>"
+            if value.startswith("designs/") and not value.startswith("designs/<cycle>"):
+                return "designs/<cycle>/"+value[len("designs/"):]
+            return value
+        if isinstance(value,list): return [restore_design(v) for v in value]
+        if isinstance(value,dict): return {k:restore_design(v) for k,v in value.items()}
+        return value
+    if not isinstance(design,dict): return None
+    restored=restore_design(design)
+    # Either exact current flat declarations or already restored historical values are accepted;
+    # any suffix/value drift survives and is rejected by the sealed full digest.
+    legacy["recipes"][legacy["recipes"].index(design)]=restored
+    design=restored
+
+    # Independence axes are the only cross-harness delta in all current graphs.
+    for recipe_row in legacy["recipes"]:
+        if not isinstance(recipe_row,dict): return None
+        for graph_row in (v for v in recipe_row.values() if isinstance(v,dict)):
+            groups=graph_row.get("parallel_groups",[])
+            if not isinstance(groups,list): return None
+            group_ids=[item.get("id") for item in groups if isinstance(item,dict)]
+            if (len(group_ids)!=len(groups) or any(not isinstance(ident,str) for ident in group_ids)
+                    or len(group_ids)!=len(set(group_ids))): return None
+            for item in groups:
+                if not isinstance(item,dict) or "independence_axes" not in item: return None
+                if not set_old(item,"independence_axes",["model-profile","perspective"],["cross-harness","model-profile","perspective"]): return None
+    return legacy
 
 
 def _entry_scope_legacy_registry(registry):
@@ -5716,29 +5952,45 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
     if isinstance(route.get("capability_registry_digest"), str) and isinstance(route.get("capability"), str):
         extra=[route["composed_recipe"]] if route.get("composed") and isinstance(route.get("composed_recipe"), dict) else ()
         capability_digest_now=TOPO.capability_registry_digest(registry, route["capability"], extra)
+    current_units_digest=unit_catalog_digest()
     classification=classify_validation_basis(
         route, registry_digest_now=TOPO.registry_digest(registry),
-        units_digest_now=unit_catalog_digest(),
+        units_digest_now=current_units_digest,
         registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
         capability_digest_now=capability_digest_now,
     )
     persona_version = route.get("persona_independence_contract_version")
     if persona_version is not None and (type(persona_version) is not int or persona_version != 1):
         raise ValueError("unsupported-persona-independence-contract-version")
-    if (classification["registry"]["verdict"] != "current"
-            and classification["unit_catalog"]["verdict"] == "current"
-            and persona_version is None):
-        legacy_registry = _sd160_legacy_registry(registry)
-        if (legacy_registry is not None
-                and route.get("registry_digest") == TOPO.registry_digest(legacy_registry)):
-            # Reconstruct the old graph under its exact authenticated declaration;
-            # launch/receipt consumers apply SD-160's effective persona policy.
-            registry = legacy_registry
-            classification = classify_validation_basis(
-                route, registry_digest_now=TOPO.registry_digest(registry),
-                units_digest_now=unit_catalog_digest(),
-                registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
-            )
+    legacy_unit_view=None
+    if (persona_version is None
+            and (classification["registry"]["verdict"] != "current"
+                 or classification["unit_catalog"]["verdict"] != "current")
+            and route.get("registry_digest") == "sha256:4260c26aebc1ab2f5bbb722d1b77a0d3fe555504a4122ec5dd3c891dd8071f10"
+            and route.get("unit_catalog_digest") == "sha256:a565c51b6d07e301836027295e3e49d01dcb2b2bdacb98845441711c73188314"):
+        legacy_registry=_sd160_legacy_registry(registry)
+        current_unit_blocks=_capture_unit_frontmatter()
+        captured_units_digest=_unit_blocks_digest(current_unit_blocks)
+        unit_inverse=(_sd160_legacy_unit_catalog(current_unit_blocks)
+                      if captured_units_digest==current_units_digest else None)
+        if legacy_registry is not None and unit_inverse is not None:
+            legacy_units_digest,legacy_unit_view=unit_inverse
+            if (TOPO.registry_digest(legacy_registry)==route.get("registry_digest")
+                    and legacy_units_digest==route.get("unit_catalog_digest")):
+                extra=[route["composed_recipe"]] if route.get("composed") and isinstance(route.get("composed_recipe"),dict) else ()
+                legacy_capability_digest=(TOPO.capability_registry_digest(legacy_registry,route["capability"],extra)
+                                          if route.get("capability_registry_digest") is not None else None)
+                candidate=classify_validation_basis(
+                    route,registry_digest_now=TOPO.registry_digest(legacy_registry),
+                    units_digest_now=legacy_units_digest,registry_root_now=TOPO.ROOT,
+                    unit_catalog_root_now=ROOT,capability_digest_now=legacy_capability_digest)
+                if candidate["verdict"]=="current":
+                    registry=legacy_registry
+                    classification=candidate
+                else:
+                    legacy_unit_view=None
+            else:
+                legacy_unit_view=None
     if (classification["registry"]["verdict"] != "current"
             and classification["unit_catalog"]["verdict"] == "current"):
         legacy_registry = _entry_scope_legacy_registry(registry)
@@ -5787,10 +6039,12 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         composed_recipe=route.get("composed_recipe")
         if not isinstance(composed_recipe, dict):
             raise ValueError("composed route lacks embedded composed_recipe")
-        TOPO._validate_recipe(
-            composed_recipe, registry,
-            registry["owner_profile_by_intensity"]["standard"],
-        )
+        with (TOPO._unit_contract_view(legacy_unit_view)
+              if legacy_unit_view is not None else contextlib.nullcontext()):
+            TOPO._validate_recipe(
+                composed_recipe, registry,
+                registry["owner_profile_by_intensity"]["standard"],
+            )
         _validate_compose_owner_close(registry, composed_recipe, route["effective_intensity"])
         if resume_recipe and not _versioned_subgraph(registry, composed_recipe):
             raise ValueError("resume recipe differs from the declared catalog")
