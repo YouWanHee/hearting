@@ -340,6 +340,13 @@ the prefix at that review and schedules the ordinary independent review there.
 The old marker remains historical, and legacy source is not inferred from
 `launch_head`.
 
+A verdict-less child may retry under the original owner's verified, launched
+replacement on the same route. Admission reads the existing immutable owner
+replacement chain and both owners' current route bindings; a claim or an
+unlaunched reservation alone does not transfer the child. The retry retains its
+predecessor link, exact route and node, and the existing process-quiescence,
+semantic-result and single-successor checks. No original row or verdict changes.
+
 Completion evidence has two moments. First close proves the current readable
 evidence for the exact route, owner/attempt and terminal claim; an unreadable
 or conflicting record cannot establish completion. Once the existing outcome
