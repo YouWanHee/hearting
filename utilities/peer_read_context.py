@@ -103,3 +103,7 @@ class PeerReadContext:
         if key not in self._lineage_graphs:
             self._lineage_graphs = {key: loader()}
         return self._lineage_graphs[key]
+
+    def invalidate_lineage_graph(self):
+        """An unavailable current dependency cannot leave authority cached."""
+        self._lineage_graphs.clear()

@@ -78,15 +78,22 @@ class LineageGraph:
     ledger_keys: object
     ledger_rows: object
     binding_rows: object
+    generation: tuple
+
+
+def _lineage_generation(info):
+    return (info.st_dev, info.st_ino, info.st_ctime_ns, info.st_mtime_ns,
+            info.st_size, info.st_mode)
 
 
 def _lineage_signature(directory: Path):
+    """Identify file and directory incarnations, including permission changes."""
     location = str(directory.resolve(strict=False))
     try:
-        info = directory.stat()
+        directory_info = directory.stat()
     except FileNotFoundError:
-        return location, ()
-    if not stat.S_ISDIR(info.st_mode):
+        return location, (), None
+    if not stat.S_ISDIR(directory_info.st_mode):
         raise OSError("lineage-directory-unavailable")
     files = []
     # glob/is_file can suppress observation failures and resemble an empty scan.
@@ -96,35 +103,63 @@ def _lineage_signature(directory: Path):
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode):
             raise OSError("lineage-ledger-unavailable")
-        files.append((path.name, info.st_mtime_ns, info.st_size))
-    return location, tuple(files)
+        files.append((path.name, *_lineage_generation(info)))
+    generation = _lineage_generation(directory_info)
+    if _lineage_generation(directory.stat()) != generation:
+        raise OSError("lineage-directory-changed")
+    return location, tuple(files), generation
+
+
+def _readable_lineage_signature(directory: Path):
+    """Only parsing survives a pass; current readable bytes remain an input.
+
+    Stat alone cannot expose transient read failures. Use the normal no-follow
+    reader even on cache hits, binding its bytes to the observed generation.
+    """
+    location, files, generation = _lineage_signature(directory)
+    observed = []
+    for filename, *file_generation in files:
+        path = directory / filename
+        raw = _st().read_bytes(path)
+        if (raw is None or len(raw) != file_generation[4]
+                or _lineage_generation(path.lstat()) != tuple(file_generation)):
+            raise OSError("lineage-ledger-unavailable")
+        observed.append((filename, *file_generation, hashlib.sha256(raw).hexdigest()))
+    if generation is not None and _lineage_generation(directory.stat()) != generation:
+        raise OSError("lineage-directory-changed")
+    return location, tuple(observed), generation
 
 
 def _build_lineage_graph(read_context=None) -> LineageGraph:
     directory = _st().state_root() / "sessions"
-    signature = _lineage_signature(directory)
-    cached = _LINEAGE_GRAPH_CACHE.get(signature)
-    if read_context is not None:
+    try:
+        signature = _readable_lineage_signature(directory)
+        cached = _LINEAGE_GRAPH_CACHE.get(signature)
+
         def load():
             if cached is not None:
                 return cached
             graph = _build_lineage_graph_uncached(signature)
+            # A replacement while the parser was reading must not publish a
+            # graph under the earlier observation's identity.
+            if _readable_lineage_signature(directory) != signature:
+                raise OSError("lineage-observation-changed")
             _LINEAGE_GRAPH_CACHE.clear()
             _LINEAGE_GRAPH_CACHE[signature] = graph
             return graph
-        return read_context.lineage_graph(signature, load)
-    if cached is not None:
-        return cached
-    graph = _build_lineage_graph_uncached(signature)
-    _LINEAGE_GRAPH_CACHE.clear()
-    _LINEAGE_GRAPH_CACHE[signature] = graph
-    return graph
+
+        return read_context.lineage_graph(signature, load) if read_context is not None else load()
+    except (OSError, ValueError, TypeError):
+        _LINEAGE_GRAPH_CACHE.clear()
+        if read_context is not None:
+            read_context.invalidate_lineage_graph()
+        raise
 
 
 def _build_lineage_graph_uncached(signature) -> LineageGraph:
     st = _st()
     edges, keys_by_vertex, rows_by_key, latest_bindings = set(), {}, {}, {}
-    for filename, _mtime_ns, _size in signature[1]:
+    for filename, *_generation in signature[1]:
         ledger_key = Path(filename).stem
         seat = st.Seat("pane", ledger_key)
         rows = st._read_ledger_lines(seat)
@@ -191,7 +226,7 @@ def _build_lineage_graph_uncached(signature) -> LineageGraph:
     return LineageGraph(tuple(sorted(edges)), frozenset(unresolved),
                         MappingProxyType({vertex: tuple(sorted(keys))
                                           for vertex, keys in keys_by_vertex.items()}), frozen_rows,
-                        frozen_bindings)
+                        frozen_bindings, signature)
 
 
 def lineage_graph(*, read_context=None) -> LineageGraph:

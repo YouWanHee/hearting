@@ -1979,9 +1979,10 @@ for (let i = 0; i < 100 && !prompts.length; i++) await new Promise(r => setTimeo
 
     def test_internal_recipients_action_returns_lineage_digest_and_generation(self):
         output = io.StringIO()
+        graph = SimpleNamespace(generation=("/isolated/sessions", (("a.jsonl", 1, 2, 3, 7, 9, 0o100600,
+                                                                  "readable-bytes-digest"),), (1, 2, 3, 4, 5, 0o40700)))
         with mock.patch.object(SWEEP, "_state_roots", return_value=[self.root]), \
-                mock.patch("dispatch_seat_handover._lineage_signature",
-                           return_value=("/isolated/sessions", (("a.jsonl", 7, 9),))), \
+                mock.patch("dispatch_seat_handover.lineage_graph", return_value=graph), \
                 mock.patch("dispatch_seat_handover.storage_recipients",
                            return_value=[(self.SID, None), ("ses-predecessor", frozenset())]), \
                 mock.patch.dict(os.environ, {"HARNESS_STATE_ROOT": str(self.root)}), \

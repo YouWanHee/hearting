@@ -1114,14 +1114,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "recipients":
         if args.recipient_kind != "opencode-turn":
             parser.error("recipients is an internal OpenCode carrier action")
-        from dispatch_seat_handover import _lineage_signature, storage_recipients, _st
-        sessions = _st().state_root() / "sessions"
-        # Use the same file generation consumed by the shared lineage reader.
-        signature = _lineage_signature(sessions)
-        generation = hashlib.sha256(json.dumps(signature, separators=(",", ":")).encode()).hexdigest()
+        from dispatch_seat_handover import lineage_graph, storage_recipients
+        # Project the generation that was actually readable by the shared
+        # graph, so a warm observation failure cannot preserve old digests.
+        graph = lineage_graph()
+        generation = hashlib.sha256(json.dumps(graph.generation, separators=(",", ":")).encode()).hexdigest()
         digests = sorted({hashlib.sha256(storage.encode()).hexdigest()
                           for storage, _allowed in storage_recipients(
                               args.session, harness="opencode")})
+        if lineage_graph() is not graph:
+            raise OSError("lineage-observation-changed")
         print(json.dumps({"generation": generation, "digests": digests}))
         return 0
     if args.action == "settle":

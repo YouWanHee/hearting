@@ -5,6 +5,7 @@ Uses real ledger, pending-record, courier and preparation paths; native I/O is f
 """
 import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -277,6 +278,254 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
         print(json.dumps({"ledgers": 337, "rows": 337 * 38, "resolutions": 100,
                           "reads": reads.call_count, "elapsed": time.monotonic() - started}))
 
+    def test_warm_current_observation_invalidates_both_caches_and_same_bytes_recover(self):
+        for harness, target in (("claude", "claude"), ("codex", "codex"),
+                                ("opencode", "opencode"), ("claude", "codex")):
+            for explicit in (False, True):
+                for context_kind in ("same", "new", "none"):
+                    tag = f"warm-{harness}-{target}-{explicit}-{context_kind}"
+                    if explicit:
+                        meta, record, seat = self.handoff(tag, harness, target)
+                        expected = (target, tag + "-Z")
+                    else:
+                        meta = None
+                        record = self.notice(harness=harness, sid=tag + "-A", key=tag)
+                        seat = self.edge(harness, tag + "-A", tag + "-B")
+                        expected = (harness, tag + "-B")
+                    path = tidy._ledger_path(seat)
+                    before = self.snapshot(path)
+                    registry = self.snapshot(self.jobs_path)
+                    context = PeerReadContext()
+
+                    def resolve():
+                        return handover.record_recipient_binding(record, tag + "-A",
+                            harness=harness, jobs=self.jobs_path, read_context=context)
+
+                    self.assertEqual(resolve(), expected)
+                    if context_kind != "same":
+                        context = PeerReadContext() if context_kind == "new" else None
+                    real_read = tidy.read_bytes
+                    for fault in ("open", "short-read", "corrupt", "permission"):
+                        self.assertEqual(resolve(), expected)
+                        with self.subTest(tag=tag, fault=fault), contextlib.ExitStack() as stack:
+                            if fault in {"open", "permission"}:
+                                if fault == "permission":
+                                    mode = path.stat().st_mode & 0o777
+                                    path.chmod(0)
+                                    stack.callback(path.chmod, mode)
+                                stack.enter_context(self.unreadable(path))
+                            else:
+                                raw = before[0][:-1] + (b"{" if fault == "corrupt" else b"")
+                                stack.enter_context(mock.patch.object(tidy, "read_bytes",
+                                    side_effect=lambda candidate: raw if candidate == path else real_read(candidate)))
+                            for _ in range(2):
+                                self.assertIsNone(resolve())
+                            self.assertEqual(handover._LINEAGE_GRAPH_CACHE, {})
+                            if context is not None:
+                                self.assertEqual(context._lineage_graphs, {})
+                            if meta is not None:
+                                self.assertEqual(handover.effective_parent(meta, self.jobs_path,
+                                    read_context=context), "")
+                                for actor in (tag + "-A", tag + "-B", tag + "-Z"):
+                                    self.assertFalse(handover.owns(meta, actor, self.jobs_path,
+                                        read_context=context))
+                        with mock.patch.object(tidy, "_read_ledger_lines", wraps=tidy._read_ledger_lines) as reads:
+                            self.assertEqual(resolve(), expected)
+                            parsed = reads.call_count
+                            self.assertGreater(parsed, 0)
+                            self.assertEqual(resolve(), expected)
+                            self.assertEqual(reads.call_count, parsed)
+                        self.assertEqual(self.snapshot(path), before)
+                        self.assertEqual(self.snapshot(self.jobs_path), registry)
+
+    @staticmethod
+    def replace_ledger(path, old, new):
+        before = path.stat()
+        raw = path.read_bytes()
+        changed = raw.replace(old.encode(), new.encode())
+        assert raw != changed and len(raw) == len(changed)
+        replacement = path.with_suffix(".replacement")
+        replacement.write_bytes(changed)
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, path)
+        assert path.stat().st_ino != before.st_ino
+        assert path.stat().st_size == before.st_size
+        assert path.stat().st_mtime_ns == before.st_mtime_ns
+
+    def test_equal_metadata_replacement_updates_implicit_and_explicit_current_authority(self):
+        for source, target in (("claude", "claude"), ("codex", "codex"),
+                               ("opencode", "opencode"), ("codex", "claude")):
+            for explicit in (False, True):
+                tag = f"replace-{source}-{target}-{explicit}"
+                if explicit:
+                    meta, record, seat = self.handoff(tag, source, target)
+                    old = tag + "-Z"
+                else:
+                    meta = None
+                    record = self.notice(harness=source, sid=tag + "-A", key=tag)
+                    seat = self.edge(source, tag + "-A", tag + "-B")
+                    old = tag + "-B"
+                path, current = tidy._ledger_path(seat), tag + "-Y"
+                current_harness = target if explicit else source
+                context = PeerReadContext()
+                self.assertEqual(handover.record_recipient_binding(record, tag + "-A",
+                    harness=source, read_context=context), (current_harness, old))
+                self.replace_ledger(path, old, current)
+                for reader in (context, PeerReadContext(), None):
+                    with self.subTest(source=source, target=target, explicit=explicit):
+                        self.assertEqual(handover.record_recipient_binding(record, tag + "-A",
+                            harness=source, read_context=reader), (current_harness, current))
+                        self.assertFalse(handover.record_for_session(record, None, session=old,
+                            harness=current_harness, storage_key=tag + "-A", read_context=reader))
+                        if meta is not None:
+                            self.assertFalse(handover.owns(meta, old, self.jobs_path, read_context=reader))
+                            self.assertTrue(handover.owns(meta, current, self.jobs_path, read_context=reader))
+
+    def test_replacement_during_warm_read_or_cold_parse_is_not_cached(self):
+        notice = self.notice(sid="race-A", key="race")
+        path = tidy._ledger_path(self.edge("claude", "race-A", "race-B"))
+        context = PeerReadContext()
+        self.assertEqual(handover.record_recipient(notice, "race-A", harness="claude",
+                                                   read_context=context), "race-B")
+        real_read = tidy.read_bytes
+        changed = False
+
+        def read(candidate):
+            nonlocal changed
+            raw = real_read(candidate)
+            if candidate == path and not changed:
+                changed = True
+                self.replace_ledger(path, "race-B", "race-C")
+            return raw
+
+        with mock.patch.object(tidy, "read_bytes", side_effect=read):
+            self.assertIsNone(handover.record_recipient(notice, "race-A", harness="claude",
+                                                       read_context=context))
+        self.assertEqual(handover._LINEAGE_GRAPH_CACHE, {})
+        self.assertEqual(context._lineage_graphs, {})
+        real_parse = tidy._read_ledger_lines
+        changed = False
+
+        def parse(seat):
+            nonlocal changed
+            rows = real_parse(seat)
+            if tidy._ledger_path(seat) == path and not changed:
+                changed = True
+                self.replace_ledger(path, "race-C", "race-D")
+            return rows
+
+        with mock.patch.object(tidy, "_read_ledger_lines", side_effect=parse):
+            self.assertIsNone(handover.record_recipient(notice, "race-A", harness="claude",
+                                                       read_context=context))
+        self.assertEqual(handover._LINEAGE_GRAPH_CACHE, {})
+        self.assertEqual(context._lineage_graphs, {})
+        self.assertEqual(handover.record_recipient(notice, "race-A", harness="claude",
+                                                   read_context=context), "race-D")
+
+    def test_warm_fleet_and_history_are_unknown_during_outage_and_recover_read_only(self):
+        notice = self.notice(sid="view-A", key="view")
+        seat = self.edge("claude", "view-A", "view-B")
+        for sid, ts in (("view-A", 1), ("view-B", 2)):
+            tidy._append_ledger_entry(seat, dict(event="start", harness="claude", sid=sid, ts=ts))
+        path = tidy._ledger_path(seat)
+        hidden = tidy._ledger_path(tidy.Seat("pane", "view-hidden"))
+        hidden.write_text(json.dumps(dict(event="start", harness="claude", sid="unrelated", ts=1)) + "\n")
+        record_path = pending.record_path(self.tmp_root, "view-A", notice["delivery_id"])
+        paths = (path, hidden, record_path, self.jobs_path)
+        before = [self.snapshot(p) for p in paths]
+
+        def history():
+            with mock.patch.object(tidy, "_lineage_transcript", return_value={"path": None, "status": "missing"}):
+                return tidy.seat_lineage(seat, harness="claude", sid="view-B")
+
+        self.assertEqual(history()[0]["relation"], "confirmed")
+        self.assertEqual(self.counts({("claude", "view-B")})["no_recipient"], 0)
+        with self.unreadable(hidden):
+            self.assertIsNone(self.counts({("claude", "view-B")})["no_recipient"])
+            rows = history()
+            self.assertTrue(rows)
+            self.assertTrue(all(row["relation"] == "unknown" and row["predecessor"] is None for row in rows))
+        self.assertEqual(history()[0]["relation"], "confirmed")
+        self.assertEqual(self.counts({("claude", "view-B")})["no_recipient"], 0)
+        self.assertEqual([self.snapshot(p) for p in paths], before)
+
+    def test_opencode_projection_uses_the_current_readable_graph_generation(self):
+        seat = self.edge("opencode", "projection-A", "projection-B")
+        path = tidy._ledger_path(seat)
+
+        def project():
+            output = io.StringIO()
+            with mock.patch.object(handover, "pane_seat", return_value=seat), contextlib.redirect_stdout(output):
+                self.assertEqual(sweep.main(["recipients", "--recipient-kind", "opencode-turn",
+                                             "--session", "projection-B"]), 0)
+            return json.loads(output.getvalue())
+
+        import hashlib
+        digest = hashlib.sha256(b"projection-A").hexdigest()
+        before = project()
+        self.assertIn(digest, before["digests"])
+        with self.unreadable(path), self.assertRaises(OSError):
+            project()
+        self.assertEqual(project(), before)
+        self.replace_ledger(path, "projection-B", "projection-C")
+        after = project()
+        self.assertNotEqual(after["generation"], before["generation"])
+        self.assertNotIn(digest, after["digests"])
+
+    def test_opencode_projection_rechecks_a_replacement_after_storage_discovery(self):
+        seat = self.edge("opencode", "project-race-A", "project-race-B")
+        path = tidy._ledger_path(seat)
+        original = handover.storage_recipients
+
+        def discover(*args, **kwargs):
+            scopes = original(*args, **kwargs)
+            self.replace_ledger(path, "project-race-B", "project-race-C")
+            return scopes
+
+        output = io.StringIO()
+        with mock.patch.object(handover, "pane_seat", return_value=seat), \
+                mock.patch.object(handover, "storage_recipients", side_effect=discover), \
+                contextlib.redirect_stdout(output), self.assertRaises(OSError):
+            sweep.main(["recipients", "--recipient-kind", "opencode-turn", "--session", "project-race-B"])
+        self.assertEqual(output.getvalue(), "")
+
+    def test_warm_atomic_replacement_at_real_first_write_keeps_original_records(self):
+        import codex_queue_delivery
+        import codex_queue_dispatch
+        for harness in ("claude", "opencode", "codex"):
+            old, current, new = (harness + "-write-" + suffix for suffix in ("A", "B", "C"))
+            notice, ref, recipient = self.prepared_notice(harness, old, current, old)
+            path = tidy._ledger_path(self.edge(harness, old, current))
+            record = pending.read(self.tmp_root, old, notice["delivery_id"])
+            identity = pending.received_ack_identity(record, old, notice["delivery_id"])
+            self.assertEqual(handover.record_recipient(notice, old, harness=harness), current)
+            if harness != "codex":
+                reserved = steward.peer_message.reserve_pending_herdr(ref, recipient)
+                self.assertIsNotNone(reserved)
+                transfer = steward.peer_message._read_pending(ref)
+                self.replace_ledger(path, current, new)
+                self.assertIsNone(steward.peer_message.begin_pending_write(reserved, recipient=recipient))
+                self.assertEqual(steward.peer_message._read_pending(ref), transfer)
+            else:
+                added = []
+
+                def send(*args, **kwargs):
+                    if kwargs["allow_add"]:
+                        self.replace_ledger(path, current, new)
+                        kwargs["before_add"]()
+                        added.append(current)
+                    return {"status": "queued"}
+
+                with mock.patch.object(codex_queue_dispatch, "resolve_queue_socket",
+                                       return_value=self.tmp_root / "fake-queue.sock"), \
+                        mock.patch.object(codex_queue_delivery, "send_at_least_once", side_effect=send):
+                    result = steward.peer_message.deliver_pending_codex(ref)
+                self.assertEqual(result["status"], "unverified")
+                self.assertEqual(added, [])
+            self.assertEqual(pending.read(self.tmp_root, old, notice["delivery_id"]), record)
+            self.assertEqual(pending.received_ack_identity(record, old, notice["delivery_id"]), identity)
+            self.assertIsNone(pending.read(self.tmp_root, new, notice["delivery_id"]))
+
     def test_absent_and_empty_legacy_state_differ_from_failed_stat_and_enumeration(self):
         notice = self.notice()
         self.assertEqual(handover.record_recipient(notice, "A", harness="claude"), "A")
@@ -389,7 +638,6 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
             def outage():
                 nonlocal failed
                 failed = True
-                handover._LINEAGE_GRAPH_CACHE.clear()
 
             def readiness(*args, **kwargs):
                 if boundary == "readiness":
@@ -421,7 +669,6 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
             record = pending.read(self.tmp_root, old, notice["delivery_id"])
             if harness != "codex":
                 reserved = steward.peer_message.reserve_pending_herdr(ref, recipient)
-                handover._LINEAGE_GRAPH_CACHE.clear()
                 with self.subTest(harness=harness), self.unreadable(path):
                     self.assertIsNone(steward.peer_message.begin_pending_write(reserved, recipient=recipient))
                 self.assertEqual(steward.peer_message.begin_pending_write(reserved, recipient=recipient)["state"],
@@ -432,7 +679,6 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
 
                 def send(*args, **kwargs):
                     if kwargs["allow_add"]:
-                        handover._LINEAGE_GRAPH_CACHE.clear()
                         with self.unreadable(path):
                             kwargs["before_add"]()
                         added.append(current)
@@ -457,7 +703,6 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
             duty = next(d for d in self.duties() if d["intent"]["identity"]["storage_sid"] == old)
             ref = duty["observation"]["transfer_ref"]
             transfer = steward.peer_message._read_pending(ref)
-            handover._LINEAGE_GRAPH_CACHE.clear()
             with self.unreadable(path), mock.patch.object(pending, "ack_received",
                     side_effect=OSError("fixture ACK write") if ack_error else None,
                     wraps=None if ack_error else pending.ack_received):
@@ -486,7 +731,6 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
                 elif state == "missing":
                     steward.peer_message._pending_path(ref).unlink()
             path = tidy._ledger_path(self.edge("claude", old, current))
-            handover._LINEAGE_GRAPH_CACHE.clear()
             before = pending.read(self.tmp_root, old, notice["delivery_id"])
             with self.subTest(state=state), self.unreadable(path), self.transport(current) as native:
                 steward._resume_session_notice_obligations(self.duties(), self.store())
