@@ -220,6 +220,20 @@ subtract admission samples or spans from elapsed time, or infer a rate or ETA
 from them. Existing lifecycle, optional-failure, recipient, and delivery-receipt
 semantics remain authoritative.
 
+The normal observer may additionally receive bounded optional `source_bindings`
+metadata for an independently written raw counter. A binding names its exact
+target run and row separately from the writer identity, source path, timestamp
+and counter JSON pointers, comparison eligibility, and bounded proof files with
+exact assertions. The common reader revalidates the proof on later polls and
+reattachment, and resumes legacy cursors without a manual recovery step. Partial
+listing/time slices continue on later polls; unrelated sibling changes leave a
+still-valid target binding intact. Public observation preserves the raw
+name, value, scope, source, writer, target, timestamp, and freshness. A
+non-comparable shared-results counter never supplies canonical progress, unit,
+total, rate, ETA, stagnation, or completion. Invalid or stale proof makes that
+source unknown while the existing lifecycle and outbox authority remains in
+force.
+
 For matrix plans, the default is to queue each completed row's decision-metric
 evaluation on the existing approved queue while the next row trains, then update
 the leaderboard artifact; successive halving is a default option for many rows.

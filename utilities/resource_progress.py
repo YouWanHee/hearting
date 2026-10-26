@@ -25,6 +25,11 @@ import time
 
 MAX_BYTES = 65536
 MAX_PUBLIC_RUN_RECORD_BYTES = 4 * 1024 * 1024
+MAX_SOURCE_BINDINGS = 8
+MAX_SOURCE_BINDING_BYTES = 64 * 1024
+MAX_SOURCE_BINDING_PROOFS = 8
+MAX_SOURCE_BINDING_COUNTERS = 8
+MAX_SOURCE_BINDING_ASSERTIONS = 8
 MAX_ARMS = 32
 OBSERVATION_VERSION = 2
 CHECKPOINT_INTERVAL = 12 * 60 * 60
@@ -325,6 +330,23 @@ def public_run_record(run, *, status=None, observation=None, metrics=None,
     declared = run.get("observation") if isinstance(run.get("observation"), dict) else {}
     decision_metric = run.get("decision_metric", declared.get("decision_metric"))
     proxy = run.get("proxy", declared.get("proxy"))
+    source_observations = (observation.get("source_observations")
+                           if isinstance(observation.get("source_observations"), list) else [])
+    source_descriptors = []
+    descriptor_keys = set()
+    for item in source_observations:
+        if not isinstance(item, dict):
+            continue
+        descriptor = {key: item.get(key) for key in
+            ("source_path", "writer_run_id", "target_run_id", "row_key", "scope",
+             "source_generation")}
+        descriptor["format"] = "independent-counter"
+        descriptor["keys"] = [item.get("name")] if isinstance(item.get("name"), str) else []
+        identity = json.dumps(descriptor, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False)
+        if identity not in descriptor_keys:
+            descriptor_keys.add(identity)
+            source_descriptors.append(descriptor)
     result = {
         "schema_version": 1,
         "run_id": run.get("run_id"),
@@ -340,10 +362,12 @@ def public_run_record(run, *, status=None, observation=None, metrics=None,
         "ended_at": ended_at if ended_at is not None else run.get("ended_at"),
         "progress": {"reached": observation.get("reached", progress.get("completed")),
                      "total": observation.get("total", progress.get("total")),
-                     "unit": observation.get("unit", progress.get("unit"))},
+                     "unit": observation.get("unit", progress.get("unit")),
+                     "observed_counters": observation.get("source_observations", [])},
         "eta": observation.get("eta_seconds"),
         "planned_seconds": observation.get("planned_seconds", run.get("planned_seconds")),
         "metrics": record_metrics,
+        "sources": source_descriptors,
         "admission": observation.get("admission"),
         "stagnation": observation.get("stagnation"),
         "decision_metric": decision_metric,
@@ -683,6 +707,15 @@ def _admission_summary(previous, decoded, now, run_id, row_key, started_at):
     previous = previous if isinstance(previous, dict) else {}
     decoded = decoded if isinstance(decoded, dict) else {}
     counts = dict(previous.get("admission_counts", {}))
+    if (decoded.get("generation") is not None
+            and decoded.get("generation") != previous.get("admission_generation")):
+        # A replacement exact source starts a new sample population. Do not
+        # carry counts/latest freshness across a different run/row/source.
+        counts = {}
+        previous = {**previous, "admission_from_at": None,
+                    "admission_to_at": None, "admission_latest": None,
+                    "admission_current_state": None,
+                    "admission_wait_episode_id": None}
     for key in ("admitted", "denied", "unknown"):
         counts[key] = max(0, int(counts.get(key, 0))) if type(counts.get(key, 0)) is int else 0
     observed_from, observed_to = previous.get("admission_from_at"), previous.get("admission_to_at")
@@ -733,13 +766,197 @@ def _admission_summary(previous, decoded, now, run_id, row_key, started_at):
             if current == "waiting" and latest else [],
         "wait_duration_seconds": None, "time_ratio": None,
         "episode_id": episode, "generation": generation}
+    generation_for_state = (generation if generation is not None else
+                            previous.get("admission_generation"))
     return summary, {"admission_counts": counts,
         "admission_from_at": observed_from, "admission_to_at": observed_to,
-        "admission_generation": generation,
+        "admission_generation": generation_for_state,
         "admission_current_state": current,
         "admission_wait_episode_id": episode,
         "admission_cursor": decoded.get("cursor", previous.get("admission_cursor")),
         "admission_warnings": decoded.get("warnings", [])}
+
+
+def _json_pointer(value, pointer):
+    if not isinstance(pointer, str) or not pointer.startswith("/") or len(pointer) > 512:
+        raise ValueError("source-pointer-invalid")
+    current = value
+    for token in pointer[1:].split("/"):
+        if re.search(r"~(?![01])", token):
+            raise ValueError("source-pointer-escape-invalid")
+        token = token.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict) and token in current:
+            current = current[token]
+        elif (isinstance(current, list)
+              and (token == "0" or re.fullmatch(r"[1-9][0-9]*", token))
+              and int(token) < len(current)):
+            current = current[int(token)]
+        else:
+            raise ValueError("source-pointer-missing")
+    return current
+
+
+def _bounded_source_file(raw_path, remaining, path_namespace=None):
+    if not isinstance(raw_path, str) or not raw_path or len(raw_path) > 4096:
+        raise ValueError("source-path-invalid")
+    declared = Path(raw_path)
+    path, _mapped = _reverse_namespace_path(declared, path_namespace)
+    if not declared.is_absolute() or not path.is_absolute() or _path_has_symlink(path):
+        raise ValueError("source-path-invalid")
+    path = Path(os.path.abspath(path))
+    root = path.parent
+    try:
+        raw, info = __import__("resource_metric_sources")._read_file(
+            path, root, min(MAX_SOURCE_BINDING_BYTES, max(0, int(remaining))))
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        raise ValueError("source-file-unavailable") from exc
+    return path, raw, info
+
+
+def _observe_source_bindings(bindings, run_id, row_key, now, path_namespace=None):
+    """Validate caller-declared exact provenance without importing its writer."""
+    if not isinstance(bindings, list):
+        return [], [], ["source-bindings-invalid"]
+    if len(bindings) > MAX_SOURCE_BINDINGS:
+        return [], [], ["source-bindings-limit"]
+    observations, retained, warnings = [], [], []
+    total_bytes = metadata_bytes = 0
+    for raw_binding in bindings:
+        if not isinstance(raw_binding, dict):
+            warnings.append("source-binding-invalid")
+            continue
+        binding = {key: raw_binding.get(key) for key in
+            ("target_run_id", "row_key", "path", "writer_run_id", "timestamp_pointer",
+             "scope", "counters", "proofs")}
+        try:
+            binding_bytes = len(json.dumps(binding, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            if binding_bytes > MAX_SOURCE_BINDING_BYTES \
+                    or metadata_bytes + binding_bytes > MAX_SOURCE_BINDING_BYTES:
+                raise ValueError("source-binding-metadata-limit")
+            metadata_bytes += binding_bytes
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            warnings.append("source-binding-unknown:" + str(exc)[:96])
+            continue
+        retained.append(binding)
+        name = None
+        first_counter = (binding.get("counters", [None])[0]
+                         if isinstance(binding.get("counters"), list)
+                         and binding.get("counters") else None)
+        if isinstance(first_counter, dict) and isinstance(first_counter.get("name"), str):
+            name = first_counter["name"][:128]
+        base = {"name": name, "value": None, "source_path": binding.get("path"),
+                "json_pointer": first_counter.get("pointer")
+                    if isinstance(first_counter, dict) else None,
+                "writer_run_id": binding.get("writer_run_id"),
+                "target_run_id": binding.get("target_run_id"),
+                "row_key": binding.get("row_key"),
+                "scope": binding.get("scope"), "comparison_eligible": False,
+                "observed_at": None, "source_generation": None,
+                "freshness": "unknown", "state": "unknown"}
+        try:
+            if (binding.get("target_run_id") != run_id
+                    or binding.get("row_key") != str(row_key)
+                    or not isinstance(binding.get("writer_run_id"), str)
+                    or not binding.get("writer_run_id")
+                    or len(binding["writer_run_id"]) > 256
+                    or binding.get("writer_run_id") == run_id
+                    or not isinstance(binding.get("scope"), str)
+                    or len(binding["scope"]) > 128):
+                raise ValueError("source-binding-target-mismatch")
+            counters = binding.get("counters")
+            proofs = binding.get("proofs")
+            if (not isinstance(counters, list) or not counters
+                    or len(counters) > MAX_SOURCE_BINDING_COUNTERS
+                    or not isinstance(proofs, list)
+                    or not proofs or len(proofs) > MAX_SOURCE_BINDING_PROOFS):
+                raise ValueError("source-binding-shape-invalid")
+            source_path, source_raw, source_info = _bounded_source_file(
+                binding.get("path"), MAX_SOURCE_BINDING_BYTES - total_bytes,
+                path_namespace)
+            total_bytes += len(source_raw)
+            source_doc = __import__("resource_metric_sources")._admission_json_object(source_raw)
+            if not isinstance(source_doc, dict):
+                raise ValueError("source-json-not-object")
+            observed_at = _json_pointer(source_doc, binding.get("timestamp_pointer"))
+            if (not isinstance(observed_at, (int, float)) or isinstance(observed_at, bool)
+                    or not math.isfinite(float(observed_at))):
+                raise ValueError("source-timestamp-invalid")
+            proof_hashes = []
+            asserted_identity_values = set()
+            for proof in proofs:
+                if not isinstance(proof, dict) or not isinstance(proof.get("sha256"), str):
+                    raise ValueError("source-proof-invalid")
+                expected_hash = proof["sha256"].lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+                    raise ValueError("source-proof-hash-invalid")
+                assertions = proof.get("assertions", [])
+                if (not isinstance(assertions, list)
+                        or len(assertions) > MAX_SOURCE_BINDING_ASSERTIONS):
+                    raise ValueError("source-proof-assertions-invalid")
+                _proof_path, proof_raw, _proof_info = _bounded_source_file(
+                    proof.get("path"), MAX_SOURCE_BINDING_BYTES - total_bytes,
+                    path_namespace)
+                total_bytes += len(proof_raw)
+                if total_bytes > MAX_SOURCE_BINDING_BYTES:
+                    raise ValueError("source-proof-byte-limit")
+                actual_hash = hashlib.sha256(proof_raw).hexdigest()
+                if actual_hash != expected_hash:
+                    raise ValueError("source-proof-changed")
+                if assertions:
+                    proof_doc = __import__("resource_metric_sources")._admission_json_object(proof_raw)
+                    for assertion in assertions:
+                        if not isinstance(assertion, dict) or "equals" not in assertion:
+                            raise ValueError("source-proof-assertion-invalid")
+                        proved = _json_pointer(proof_doc, assertion.get("pointer"))
+                        expected = assertion["equals"]
+                        if type(proved) is not type(expected) or proved != expected:
+                            raise ValueError("source-proof-assertion-mismatch")
+                        if (isinstance(expected, str)
+                                and expected in {binding["target_run_id"],
+                                                 binding["writer_run_id"]}):
+                            asserted_identity_values.add(expected)
+                proof_hashes.append(actual_hash)
+            required_identity_values = {binding["target_run_id"], binding["writer_run_id"]}
+            if not required_identity_values.issubset(asserted_identity_values):
+                raise ValueError("source-proof-identity-incomplete")
+            generation_material = {"run_id": run_id, "row_key": str(row_key),
+                "writer_run_id": binding["writer_run_id"], "path": binding.get("path"),
+                "timestamp_pointer": binding["timestamp_pointer"],
+                "scope": binding["scope"],
+                "counters": [{"name": item.get("name"), "pointer": item.get("pointer"),
+                              "comparison_eligible": item.get("comparison_eligible")}
+                    for item in counters if isinstance(item, dict)],
+                "proofs": sorted(proof_hashes)}
+            generation = hashlib.sha256(json.dumps(generation_material, sort_keys=True,
+                separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()[:24]
+            for counter in counters:
+                if (not isinstance(counter, dict)
+                        or not isinstance(counter.get("name"), str)
+                        or len(counter["name"]) > 128
+                        or not isinstance(counter.get("comparison_eligible"), bool)):
+                    raise ValueError("source-counter-invalid")
+                value = _json_pointer(source_doc, counter.get("pointer"))
+                if (not (value is None or isinstance(value, (str, int, float, bool)))
+                        or isinstance(value, float) and not math.isfinite(value)
+                        or isinstance(value, str) and len(value) > 256):
+                    raise ValueError("source-counter-value-invalid")
+                age = float(now) - float(observed_at)
+                fresh = 0 <= age <= 600
+                observations.append({**base, "name": counter["name"], "value": value,
+                    "source_path": binding.get("path"), "read_path": str(source_path),
+                    "json_pointer": counter["pointer"],
+                    "comparison_eligible": counter["comparison_eligible"],
+                    "observed_at": float(observed_at), "source_generation": generation,
+                    "source_stat_generation": f"{source_info.st_dev}:{source_info.st_ino}",
+                    "freshness_seconds": age if fresh else None,
+                    "freshness": "fresh" if fresh else "stale", "state": "observed" if fresh else "unknown"})
+        except (OSError, ValueError, TypeError, UnicodeError, OverflowError,
+                RecursionError) as exc:
+            reason = str(exc) if isinstance(exc, ValueError) else "source-proof-unavailable"
+            warnings.append("source-binding-unknown:" + reason[:96])
+            observations.append({**base, "reason": reason[:96]})
+    return observations, retained, sorted(set(warnings))
 
 
 def _notice_targets(run):
@@ -859,6 +1076,15 @@ def _notice_texts(run, event_kind, observation, record_path, sources):
             admission_line += "; observed blockers=" + " | ".join(labels)
     if admission.get("sample_count", 0) or admission.get("coverage") != "unknown":
         entries.append(admission_line)
+    for counter in observation.get("source_observations", [])[:3]:
+        if not isinstance(counter, dict):
+            continue
+        value = counter.get("value") if counter.get("state") == "observed" else "unknown"
+        entries.append("raw counter=" + str(counter.get("name") or "unknown")
+            + ":" + str(value) + " scope=" + str(counter.get("scope") or "unknown")
+            + " writer=" + str(counter.get("writer_run_id") or "unknown")
+            + " target=" + str(counter.get("target_run_id") or "unknown")
+            + " at=" + str(counter.get("observed_at") or "unknown"))
     if stagnation.get("state") == "stagnant":
         anchor = ("last actual increase" if stagnation.get("since") == "last-increase"
                   else "first comparable observation")
@@ -969,8 +1195,21 @@ def read_experiment_observation(run, registry, row_key):
         if (value.get("run_id") != run.get("run_id")
                 or value.get("row_key") != str(row_key)):
             return None
+        counts = value.get("admission_counts")
+        has_admission_history = (
+            isinstance(value.get("admission_cursor"), dict)
+            and bool(value["admission_cursor"])) or (
+            isinstance(counts, dict) and any(type(counts.get(key)) is int
+                and counts[key] > 0 for key in ("admitted", "denied", "unknown"))) or (
+            isinstance(value.get("admission_latest"), dict)
+            or isinstance(value.get("admission_summary"), dict)
+            or isinstance(value.get("admission_generation"), str)
+            and bool(value["admission_generation"]))
+        source_observations = value.get("source_observations")
         return {"available": True, "observation": value.get("observation"),
                 "metrics": value.get("sources", []), "metric_root": None,
+                "has_persisted_observation": bool(has_admission_history
+                    or isinstance(source_observations, list) and source_observations),
                 "record_path": None, "delivery": [], "warnings": value.get("warnings", []),
                 "state_path": str(path)}
     except (OSError, ValueError, TypeError, RuntimeError):
@@ -1032,11 +1271,16 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                 previous = {}
         except (OSError, ValueError, TypeError):
             previous = {}
+        declared_observation = (run.get("observation")
+            if isinstance(run.get("observation"), dict) else {})
+        incoming_source_bindings = declared_observation.get("source_bindings")
         previous_poll = previous.get("last_observer_poll_at")
         if (not final and isinstance(previous_poll, (int, float))
                 and not isinstance(previous_poll, bool)
                 and float(now) - float(previous_poll) < max(1.0, float(poll_interval_seconds))
-                and status == previous.get("public_status")):
+                and status == previous.get("public_status")
+                and not (isinstance(incoming_source_bindings, list)
+                         and incoming_source_bindings)):
             cached_observation = dict(previous.get("observation") or {})
             cached_observation["checkpoint_due"] = False
             cached_observation["due_checkpoint_at"] = None
@@ -1107,6 +1351,19 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             ("state", "coverage", "admitted_samples", "denied_samples", "unknown_samples",
              "denied_sample_ratio", "observed_from_at", "observed_to_at", "latest_at",
              "reasons", "priority_blockers", "episode_id", "generation"))
+        source_bindings = (incoming_source_bindings if isinstance(incoming_source_bindings, list)
+                           else previous.get("source_bindings", []))
+        source_observations, retained_bindings, source_binding_warnings = _observe_source_bindings(
+            source_bindings, run_id, str(identity), now, run.get("path_namespace"))
+        warnings.extend(source_binding_warnings)
+        previous_counters = previous.get("source_observations", [])
+        old_counter_identity = [(item.get("name"), item.get("value"),
+            item.get("source_generation"), item.get("state")) for item in previous_counters
+            if isinstance(item, dict)] if isinstance(previous_counters, list) else []
+        new_counter_identity = [(item.get("name"), item.get("value"),
+            item.get("source_generation"), item.get("state")) for item in source_observations]
+        source_observations_changed = source_observations != previous_counters
+        source_signal_changed = old_counter_identity != new_counter_identity
         samples = _merge_samples(previous.get("samples"), new_samples)
         sources = _merge_metric_sources(previous.get("sources"), sources, samples)
         clock_known = started is not None
@@ -1178,6 +1435,15 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             stagnation = {"state": "unknown"}
         observation["admission"] = admission_summary
         observation["stagnation"] = stagnation
+        observation["source_observations"] = source_observations
+        if source_signal_changed and source_observations:
+            for item in source_observations[:MAX_SOURCE_BINDINGS * MAX_SOURCE_BINDING_COUNTERS]:
+                observation["attention"].append({"kind": "source-observation",
+                    "generation": item.get("source_generation"),
+                    "source_value_hash": hashlib.sha256(json.dumps(
+                        item.get("value"), sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=False, allow_nan=False).encode()).hexdigest()[:16]
+                        if item.get("state") == "observed" else "unknown"})
         if stagnation.get("state") == "stagnant" and stagnation.get("episode_id"):
             observation["attention"].append({"kind": "progress-stagnation",
                 "episode_id": stagnation["episode_id"],
@@ -1199,10 +1465,11 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
         event_specs = []
         if notify_events and final:
             event_specs.append(("final", f"final:{identity}"))
-        elif notify_events and observation["attention"]:
+        if (notify_events and observation["attention"]
+                and (not final or source_signal_changed and source_observations)):
             attention_identity = [{key: item.get(key) for key in
                 ("kind", "metric", "epoch", "op", "threshold", "episode_id",
-                 "generation", "since")}
+                 "generation", "since", "source_value_hash")}
                 for item in observation["attention"]]
             attention_digest = hashlib.sha256(json.dumps(attention_identity, sort_keys=True,
                 separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()[:16]
@@ -1250,6 +1517,8 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                       "admission_latest": admission_decoded.get("latest"),
                       "admission_coverage": admission_decoded.get("coverage", "unknown"),
                       "admission_summary": admission_summary,
+                      "source_bindings": retained_bindings,
+                      "source_observations": source_observations,
                       "last_checkpoint_at": (float(now) if observation["checkpoint_due"]
                                              else previous.get("last_checkpoint_at")),
                       "last_public_write_at": previous.get("last_public_write_at"),
@@ -1265,6 +1534,7 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             or status != previous.get("public_status")
             or observation["checkpoint_due"] or new_event
             or bool(new_samples) or sources != previous.get("sources", [])
+            or source_observations_changed
             or admission_changed or stagnation_changed
             or should_read_admission and bool(admission_summary.get("sample_count"))))
         if publish_public:
@@ -1278,6 +1548,8 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                          "clock_scope": "row" if clock_known else "unknown",
                          "output_dir": str(metric_root) if metric_root else None,
                          "metrics": next_state["sources"],
+                         "sources": record["sources"],
+                         "observed_counters": source_observations,
                          "last_checkpoint": record["last_checkpoint"],
                          "metric_summary": record["metric_summary"],
                          "elapsed_seconds": observation.get("elapsed_seconds"),
@@ -1299,6 +1571,7 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                               or sources != previous.get("sources", []))
                          or next_progress != previous.get("progress_sample")
                          or admission_changed or stagnation_changed
+                         or source_observations_changed
                          or should_read_admission
                          or observation["checkpoint_due"] or final
                          or warnings != []

@@ -1671,6 +1671,115 @@ class ReplacementTest(unittest.TestCase):
         with self.assertRaises(D.DispatchContractError) as caught:R.admission(self.jobs,spawned,second)
         self.assertEqual(caught.exception.reason,'retry-already-claimed')
 
+    def _sr_child_retry(self):
+        # Real owner rows bind through owner_route_*, not the child's route_id.
+        self.meta.update(worker_type='owner', route_id='', route_hash='', route_node='',
+                         owner_route_file=str(self.path), owner_route_id='rt-test',
+                         owner_route_hash='sha256:test')
+        self._owner()
+        owner=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        successor=self._successor(self.claim(), owner, status='open', launch_started='1')
+        child={
+            'attempt_schema_version':'2', 'dispatch_depth':'2', 'transport':'headless',
+            'execution_surface':'registered-headless', 'registered_worker':'1',
+            'fallback_hop':'same-harness-headless', 'worker_type':'stage', 'harness':'codex',
+            'attempt_id':'att-child', 'parent_attempt_id':'att-source',
+            'route_id':'rt-test', 'route_hash':'sha256:test', 'route_node':'execute',
+            'note':'dead-parent-terminated', 'failure_class':'runtime',
+            'launch_started':'1',
+        }
+        self.write(child, append=True)
+        candidate={k:v for k,v in child.items() if k not in {'note','failure_class','launch_started'}}
+        candidate.update(attempt_id='att-child-next', automatic_retry_of='att-child',
+                         parent_attempt_id=successor['attempt_id'])
+        return child, candidate, successor
+
+    def _sr_retry_admission(self, candidate):
+        before=self.jobs.read_bytes()
+        try:
+            return D._automatic_retry_admission(
+                self.jobs.read_text().splitlines(), candidate, jobs=self.jobs)
+        finally:
+            self.assertEqual(self.jobs.read_bytes(), before)
+
+    def test_sr_child_retry_registers_once_under_launched_owner_successor(self):
+        child, candidate, _=self._sr_child_retry()
+        before=self.jobs.read_bytes()
+        claims={p:p.read_bytes() for p in R._directory(self.jobs).rglob('*.json')}
+        # The real registration boundary holds the jobs lock during lineage reads.
+        row='now\topen\t'+str(self.root)+'\t'+str(self.root)+'\tchild-next\t'+','.join(
+            k+'='+v for k,v in candidate.items())
+        self.assertTrue(D.claim_attempt_row(self.jobs, candidate['attempt_id'], row, launch=True))
+        self.assertFalse(D.claim_attempt_row(self.jobs, candidate['attempt_id'], row, launch=True))
+        self.assertTrue(self.jobs.read_bytes().startswith(before))
+        self.assertEqual({p:p.read_bytes() for p in claims}, claims)
+        with self.assertRaises(D.DispatchContractError) as caught:
+            self._sr_retry_admission({**candidate, 'attempt_id':'att-child-duplicate'})
+        self.assertEqual(caught.exception.reason, 'retry-already-claimed')
+
+    def test_sr_child_retry_keeps_same_parent_and_follows_multiple_owner_generations(self):
+        child, candidate, successor=self._sr_child_retry()
+        self._sr_retry_admission({**candidate, 'parent_attempt_id':child['parent_attempt_id']})
+        source=self._die(successor, note='dead-exact-pid', failure_class='contract',
+                         launch_outcome='never-launched')
+        final=self._successor(R.claim(self.jobs, source['attempt_id']), source,
+                              status='open', launch_started='1')
+        self._sr_retry_admission({**candidate, 'parent_attempt_id':final['attempt_id']})
+        with self.assertRaises(D.DispatchContractError):
+            self._sr_retry_admission(candidate)  # An intermediate owner is no longer current.
+
+    def test_sr_child_retry_rejects_foreign_route_node_parent_and_non_owner(self):
+        child, candidate, successor=self._sr_child_retry()
+        for changes in ({'parent_attempt_id':'att-unrelated'}, {'route_id':'rt-other'},
+                        {'route_hash':'sha256:other'}, {'route_node':'test'},
+                        {'dispatch_depth':'1'}):
+            with self.subTest(changes=changes), self.assertRaises(D.DispatchContractError) as caught:
+                self._sr_retry_admission({**candidate, **changes})
+            self.assertEqual(caught.exception.reason, 'retry-predecessor-binding-mismatch')
+        original=self.jobs.read_bytes()
+        for changes in ({'owner_route_id':'rt-other'}, {'owner_route_hash':'sha256:other'},
+                        {'worker_type':'frame'}, {'registered_worker':'0'}):
+            self.jobs.write_bytes(original)
+            self._die(successor, **changes)
+            with self.subTest(changes=changes), self.assertRaises(D.DispatchContractError) as caught:
+                self._sr_retry_admission(candidate)
+            self.assertEqual(caught.exception.reason, 'retry-predecessor-binding-mismatch')
+        self.jobs.write_bytes(original)
+        self._die(child, route_node='')
+        with self.assertRaises(D.DispatchContractError) as caught:
+            self._sr_retry_admission({**candidate, 'route_node':''})
+        self.assertEqual(caught.exception.reason, 'retry-predecessor-binding-mismatch')
+
+    def test_sr_child_retry_rejects_unlaunched_damaged_and_competing_owner_claims(self):
+        _, candidate, successor=self._sr_child_retry()
+        original=self.jobs.read_bytes()
+        for changes in ({'launch_started':'0', 'launch_claimed':'0',
+                         'launch_outcome':'never-launched'},
+                        {'replacement_claim_digest':'wrong-digest'}):
+            self.jobs.write_bytes(original)
+            self._die(successor, **changes)
+            with self.subTest(changes=changes), self.assertRaises(D.DispatchContractError):
+                self._sr_retry_admission(candidate)
+        self.jobs.write_bytes(original)
+        self.write({**successor, 'attempt_id':'att-competing-owner'}, status='open', append=True)
+        with self.assertRaises(D.DispatchContractError):
+            self._sr_retry_admission(candidate)
+
+    def test_sr_child_retry_preserves_process_and_semantic_result_refusals(self):
+        child, candidate, _=self._sr_child_retry()
+        for state in ('live', 'unverifiable'):
+            with self.subTest(state=state), mock.patch.object(
+                    D, 'attempt_process_quiescence',
+                    return_value=SimpleNamespace(state=state, reason='fixture')):
+                with self.assertRaises(D.DispatchContractError) as caught:
+                    self._sr_retry_admission(candidate)
+                self.assertEqual(caught.exception.reason, 'retry-predecessor-not-retryable')
+        for verdict in ('fail', 'blocked'):
+            self._die(child, note='dead-worker-'+verdict, failure_class=verdict)
+            with self.subTest(verdict=verdict), self.assertRaises(D.DispatchContractError) as caught:
+                self._sr_retry_admission(candidate)
+            self.assertEqual(caught.exception.reason, 'retry-predecessor-not-retryable')
+
     # -- an owner stopped at a usage limit: a pause with its own family, never the silent budget ----
     def _owner(self,**changes):
         self.write({**self.meta,'worker_type':'owner','launch_started':'1',**changes})
