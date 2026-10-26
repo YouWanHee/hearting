@@ -764,6 +764,21 @@ def pin_harness_available(route, node, harness, jobs, recheck=True):
     return True
 
 
+def validate_producer_generation(route, node, jobs, generation):
+ """Recheck the plan group's exact approved revision at the node launch fence."""
+ group = node.get("parallel_group") or node.get("replica_group")
+ group_nodes = [candidate for candidate in route.get("nodes", [])
+                if (candidate.get("parallel_group") or candidate.get("replica_group")) == group]
+ try:
+  admission = ROUTE.producer_revision_admission(route, group_nodes, jobs)
+ except (ValueError, OSError) as exc:
+  raise DispatchNodeError("producer-revision-generation-unverifiable", detail=str(exc)) from exc
+ if not admission.get("managed") or str(admission.get("generation")) != str(generation):
+  raise DispatchNodeError("producer-revision-generation-drift",
+                          expected=admission.get("generation"), received=generation)
+ return admission
+
+
 def replacement_task(args, route, node, jobs):
  """A verified death replacement replays its original semantic round verbatim."""
  import dispatch_replacement as replacement
@@ -789,7 +804,7 @@ def replacement_task(args, route, node, jobs):
 
 
 def main():
- p=argparse.ArgumentParser(); p.add_argument("--route",help="default: this owner's current route"); p.add_argument("--node",required=True); p.add_argument("--adapter",choices=("claude","codex","opencode"),required=True); p.add_argument("--action",choices=("dry-run","register","start"),default="dry-run"); p.add_argument("--start",dest="action",action="store_const",const="start",help="same as --action start"); p.add_argument("--slug",help="default: <parent>-<node>"); p.add_argument("--qa",default=None); p.add_argument("--parent"); p.add_argument("--jobs"); p.add_argument("--prompt-text",default="Execute the selected immutable route node and emit its completion evidence."); p.add_argument("--subsession-id"); p.add_argument("--subsession-index",type=int); p.add_argument("--subsession-count",type=int); p.add_argument("--subsession-mode",choices=("serial","parallel")); p.add_argument("--subsession-purpose",choices=("planned","gap-retry"),default="planned"); p.add_argument("--session-chain-id"); p.add_argument("--phase-brief"); p.add_argument("--stage-authority",choices=(0,1),type=int,default=1); p.add_argument("--fixed-file",action="append",default=[]); p.add_argument("--narrow-verify"); p.add_argument("--expected-round-trips",type=int); p.add_argument("--state-dir"); p.add_argument("--subsession-worktree"); p.add_argument("--attempt-id"); p.add_argument("--pair-model-profile"); p.add_argument("adapter_args",nargs=argparse.REMAINDER)
+ p=argparse.ArgumentParser(); p.add_argument("--route",help="default: this owner's current route"); p.add_argument("--node",required=True); p.add_argument("--adapter",choices=("claude","codex","opencode"),required=True); p.add_argument("--action",choices=("dry-run","register","start"),default="dry-run"); p.add_argument("--start",dest="action",action="store_const",const="start",help="same as --action start"); p.add_argument("--slug",help="default: <parent>-<node>"); p.add_argument("--qa",default=None); p.add_argument("--parent"); p.add_argument("--jobs"); p.add_argument("--prompt-text",default="Execute the selected immutable route node and emit its completion evidence."); p.add_argument("--subsession-id"); p.add_argument("--subsession-index",type=int); p.add_argument("--subsession-count",type=int); p.add_argument("--subsession-mode",choices=("serial","parallel")); p.add_argument("--subsession-purpose",choices=("planned","gap-retry"),default="planned"); p.add_argument("--session-chain-id"); p.add_argument("--phase-brief"); p.add_argument("--stage-authority",choices=(0,1),type=int,default=1); p.add_argument("--fixed-file",action="append",default=[]); p.add_argument("--narrow-verify"); p.add_argument("--expected-round-trips",type=int); p.add_argument("--state-dir"); p.add_argument("--subsession-worktree"); p.add_argument("--attempt-id"); p.add_argument("--producer-generation"); p.add_argument("--pair-model-profile"); p.add_argument("adapter_args",nargs=argparse.REMAINDER)
  from review_input import add_arguments, drop_inapplicable, resolve_input
  add_arguments(p)
  a=p.parse_args()
@@ -873,6 +888,14 @@ def main():
       ROOT,requested_jobs,int(node.get("dispatch_depth",1)),a.action,child_env())
  except DispatchContractError as e:
   print("check=failed");print(f"reason={e.reason}");print(f"detail={e.detail}");print("child_spawned=0");raise SystemExit(65)
+ if a.producer_generation is not None:
+  try:
+   validate_producer_generation(route, node, registry.path, a.producer_generation)
+  except DispatchNodeError as exc:
+   print("check=failed"); print(f"reason={exc.reason}")
+   for key, value in exc.fields.items(): print(f"{key}={value}")
+   print("child_spawned=0")
+   raise SystemExit(65)
  # Every worker launches in the route cwd. A slice launches in the worktree its
  # sealed manifest names (the route cwd, or a linked worktree of the same
  # repository); the route itself is still verified at the route cwd above.

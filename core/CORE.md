@@ -35,6 +35,14 @@ completion and registry locks, so a historical replay cannot replace a tombstone
 | Adapter | tool bootstrap, hook schema, slash commands, status UI, permission model, concrete model mapping, runtime-home projection | no |
 | Local runtime | credentials, session state, caches, daemon logs | no |
 
+Interactive work uses the exact `(harness, native conversation/thread ID)` as
+the logical address for saved context, results and supported continuation,
+even if a window is absent, moved or unknown. A different native ID carries
+work only through confirmed task/handover lineage; proximity, repository
+recency and a shared session-tree root are not lineage. Pane, endpoint,
+PID/start and native attachment records remain separate physical transport
+authority, required for window operations and message sends.
+
 `adapters/claude/CLAUDE.md`, `adapters/codex/AGENTS.md`, and `adapters/opencode/AGENTS.md` are runtime adapter entry files. Runtime-specific adapter notes live under `adapters/`; future adapters should keep their own bootstrap instructions there and point back to this core contract.
 
 ## 2. Agent Home

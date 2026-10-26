@@ -107,6 +107,8 @@ class NativeIdentityTest(NativeCase):
         os.environ["HERDR_PANE_ID"] = "another:pane"
         seat = st.resolve_seat("claude", self.cwd, sid="session-A")
         self.assertEqual(seat, self.seat)
+        self.assertEqual(seat.sid, "")
+        self.assertEqual(st.session_identity(seat), ("claude", "session-A"))
         self.assertEqual(seat.pane, "")
         self.assertNotEqual(seat.key, st._digest("pane", "another:pane"))
 

@@ -8314,12 +8314,14 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
         with st.seat_lock(seat.key):
             card = st.write_card(seat, harness, sid, "card body", prompt_seq=seq)
             if receipt and harness == "claude":
-                st._write_consumed(seat, generation=card["generation"], receipts=[f"claude:{new}:0"])
+                st._write_consumed(st.session_seat(seat, harness, sid),
+                                   generation=card["generation"], receipts=[f"claude:{new}:0"])
             clear._write_reservation({
                 "schema": 1, "nonce": "n0nce", "status": "cleared", "created": now - 30,
                 "deadline": now + 570,
                 "seat": {"kind": "pane", "key": seat.key, "pane": pane,
-                         "harness": harness, "project_key": ""},
+                         "harness": harness, "project_key": "",
+                         "session": {"harness": harness, "sid": sid}},
                 "harness": harness, "sid": sid, "cwd": str(self.tmp_root), "new_session": new,
                 "card_generation": card["generation"], "prompt_seq": seq, "continue_off": False,
                 "continued": {"state": "pending", "deadline": now + window}})
@@ -8503,7 +8505,7 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
 
         def rewrite(seat):
             with self.st.seat_lock(seat.key):
-                self.st.write_card(seat, "claude", "sid-B", "new card")
+                self.st.write_card(seat, "claude", self.booking()["sid"], "new card")
 
         def expired(_seat):
             data = self.booking()
@@ -8511,7 +8513,9 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
             self.path.write_text(json.dumps(data), encoding="utf-8")
 
         for change, reason in ((bump, "new-input"), (rewrite, "card-changed"),
-                               (self.st.mark_card_handed_off, "handed-off"), (expired, "expired")):
+                               (lambda seat: self.st.mark_card_handed_off(
+                                   self.st.session_seat(seat, "claude", self.booking()["sid"])),
+                                "handed-off"), (expired, "expired")):
             with self.subTest(reason=reason):
                 change(self.cleared())
                 with mock.patch.object(peer_steward, "_herdr_prompt",

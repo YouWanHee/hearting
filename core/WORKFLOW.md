@@ -379,9 +379,12 @@ a next leg that could not be prepared is named in `plan_advance` beside it. The
 main session may still change the plan or stop; §0.4 says when a card comes first.
 A replayed `start` of the closed frame route answers for the furthest leg already
 started from its decision, so after the last leg it reports that leg's completion
-and no `next_leg`. A leg's optional `done_when` (sealed as `d1`, `d2`…), `verify`
-and `hands_over`, and the brief whose route the person chose, reach the owner and
-every stage worker of that leg from the sealed decision; a `qa/*` stage records
+and no `next_leg`. A leg's optional `done_when` (sealed as `d1`, `d2`…), `verify`,
+`hands_over` and approved `parallel` slices, and the brief whose route the person
+chose, reach the owner and every stage worker of that leg from the sealed decision.
+The owner may use `parallel` to assign workers or permitted sub-sessions; these
+notes are owner guidance, not route nodes or parallel groups, and a slice without
+a result is unfinished. A `qa/*` stage records
 each item beside its artifact as `<artifact>.items.json` (`leg_items_v1`, read by
 `route_plan.read_leg_items`). A leg may name its existing worktree with optional
 `cwd`; validation, first launch, later legs and the printed compose command use
