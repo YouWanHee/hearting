@@ -8474,6 +8474,12 @@ def _marker_link_current(
     node_id = str(node["id"])
     evidence_record = marker.get("evidence") or {}
 
+    if "retained_review" in marker:
+        from retained_review_completion import verify_marker
+        verify_marker(route, node, marker, marker_path,
+                      historical=marker_path.name != f"{node['id']}.json")
+        return True
+
     if "reviewer_disposition" in marker:
         review_self_disposition_origin(route, node, marker, marker_path)
         return True
@@ -8891,6 +8897,10 @@ def evidence_currency(
                                     route_state_next_action(reason, str(node.get("id")), None, node)
                                     if state == "superseded" else None)
     evidence_record = marker.get("evidence")
+    from codex_dispatch_terminal import artifact_declared_verdict
+    if (isinstance(evidence_record, dict) and not owner_closure_shape(marker)
+            and artifact_declared_verdict(Path(str(evidence_record.get("path", "")))) in {"BLOCKED", "FAIL"}):
+        return GateCurrency("integrity-broken:identity-mismatch", "completion-evidence-verdict-not-pass")
     if not isinstance(evidence_record, dict):
         return GateCurrency("integrity-broken:identity-mismatch", "completion-marker-evidence-missing")
     evidence_path_str = str(evidence_record.get("path") or "")
@@ -10317,6 +10327,10 @@ def row_is_subsession(metadata: dict[str, str]) -> bool:
 
 
 def _marker_bound_row_verdict(metadata: dict[str, str]) -> str:
+    from dispatch_attempt_policy import readable_result
+    result = readable_result(metadata)
+    if result:
+        return result
     failure_class = metadata.get("failure_class", "").lower()
     if verdict_pass(metadata) or success_note(metadata):
         return "PASS"
@@ -10384,6 +10398,15 @@ def _marker_bound_prepare_marker_proof(
     evidence_path = Path(str(evidence_record.get("path", "")))
     history_path = marker_path.parent / f"{metadata.get('route_node', '')}.{marker.get('sequence', 0)}.json"
     dependency_paths = [route_path, evidence_path, history_path]
+    if "retained_review" in marker:
+        try:
+            from retained_review_completion import verify_marker
+            recovery = verify_marker(route, nodes[0], marker, marker_path)
+            record = marker["retained_review"]
+            dependency_paths.extend(Path(e["path"]) for e in recovery["dependencies"])
+            dependency_paths.extend((Path(record["review"]["path"]), Path(record["jobs"])))
+        except (IndexError, KeyError, OSError, TypeError, ValueError):
+            return None
     if "reviewer_disposition" in marker:
         try:
             _, origin_path = review_self_disposition_origin(route, nodes[0], marker, marker_path)
@@ -10435,6 +10458,8 @@ def _marker_bound_prepare_marker_proof(
             marker_path.parent
             / f"{metadata.get('route_node', '')}.{safe_attempt}.attempt.json"
         )
+    if "retained_review" in marker:
+        dependency_paths = list(dict.fromkeys(dependency_paths))
     dependency_bytes: list[tuple[Path, bytes]] = []
     try:
         for dependency_path in dependency_paths:
@@ -10499,7 +10524,7 @@ def _marker_bound_current_marker(
         return None, ""
     if marker != proof.marker:
         return None, ""
-    if "reviewer_disposition" in marker:
+    if "reviewer_disposition" in marker or "retained_review" in marker:
         try:
             if any(hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest
                    for path, digest in proof.immutable_file_digests):
@@ -11455,9 +11480,14 @@ def resolve_terminal_conflict(
 ) -> dict[str, str]:
     """Record an explicit review of an exact conflict, preserving its result.
 
-    This never selects a different verdict. A changed conflict or live process
-    invalidates the disposition; its caller must inspect the current evidence.
+    Ordinary conflict review never selects a different verdict. A legacy
+    non-PASS publication instead uses the evidence-bound retained-review
+    recovery, preserving both original judgments. Changed or live evidence
+    invalidates either disposition.
     """
+    import retained_review_completion as retained
+    if retained.candidate(jobs, attempt_id):
+        return retained.apply(jobs, attempt_id, expected_row_sha256=expected_row_sha256, review=review)
     review_bytes = review.read_bytes()
     if not review.is_absolute() or review.is_symlink() or not review_bytes.strip():
         raise DispatchContractError("terminal-conflict-review-required")
