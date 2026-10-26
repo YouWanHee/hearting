@@ -113,6 +113,279 @@ def forked_sharing(hold=3):
     return [sys.executable, "-c", code, str(hold)]
 
 
+class ScratchLifetimeTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.parent = self.root / "inherited-tmp"
+        self.parent.mkdir()
+        self.sibling = self.parent / "sibling"
+        self.sibling.mkdir()
+        (self.sibling / "keep").write_text("sibling", encoding="utf-8")
+        self.child_pids: list[int] = []
+        self.addCleanup(self.kill_children)
+
+    def kill_children(self):
+        for pid in self.child_pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def lease_env(self):
+        return {**os.environ, "TMPDIR": str(self.parent)}
+
+    def run_lease(self, code, *args, timeout=5, env=None):
+        environment = self.lease_env()
+        if env:
+            environment.update(env)
+        command = [sys.executable, "-c", code, *(str(arg) for arg in args)]
+        return subprocess.run([sys.executable, str(LEASE), "--timeout", str(timeout),
+                               "--", *command], env=environment, capture_output=True,
+                              text=True, timeout=30)
+
+    def run_driver(self, code, *args, timeout=30):
+        return subprocess.run([sys.executable, "-c", code, str(LEASE),
+                               *(str(arg) for arg in args)], env=self.lease_env(),
+                              capture_output=True, text=True, timeout=timeout)
+
+    def assert_parent_preserved(self):
+        self.assertTrue((self.sibling / "keep").exists())
+        self.assertEqual(list(self.parent.iterdir()), [self.sibling])
+
+    def test_success_nonzero_and_timeout_remove_only_the_private_root(self):
+        marker = self.root / "scratch.path"
+        command = (
+            "import os,pathlib,sys,time\n"
+            "scratch=pathlib.Path(os.environ['TMPDIR'])\n"
+            "(scratch/'sentinel').write_text('owned',encoding='utf-8')\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(scratch),encoding='utf-8')\n"
+            "if sys.argv[2]=='timeout': time.sleep(60)\n"
+            "if sys.argv[2]=='nonzero': raise SystemExit(7)\n"
+        )
+        for outcome, expected, timeout in (("success", 0, 5), ("nonzero", 7, 5),
+                                           ("timeout", 124, .3)):
+            with self.subTest(outcome=outcome):
+                done = self.run_lease(command, marker, outcome, timeout=timeout)
+                self.assertEqual(done.returncode, expected, done.stderr)
+                scratch = Path(marker.read_text(encoding="utf-8"))
+                self.assertFalse(scratch.exists())
+                self.assert_parent_preserved()
+
+    def test_sigint_and_sigterm_remove_scratch_after_descendant_settlement(self):
+        marker = self.root / "scratch.path"
+        command = (
+            "import os,pathlib,sys,time\n"
+            "scratch=pathlib.Path(os.environ['TMPDIR'])\n"
+            "(scratch/'sentinel').write_text('owned',encoding='utf-8')\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(scratch),encoding='utf-8')\n"
+            "time.sleep(60)\n"
+        )
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=signum):
+                lease = subprocess.Popen(
+                    [sys.executable, str(LEASE), "--timeout", "60", "--", sys.executable,
+                     "-c", command, str(marker)], env=self.lease_env(),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                deadline = time.monotonic() + 10
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(marker.exists())
+                scratch = Path(marker.read_text(encoding="utf-8"))
+                lease.send_signal(signum)
+                _stdout, stderr = lease.communicate(timeout=20)
+                self.assertIn(lease.returncode, (128 + signum, -signum), stderr)
+                self.assertFalse(scratch.exists())
+                self.assert_parent_preserved()
+
+    def test_descendant_last_scratch_use_finishes_before_reap_and_removal(self):
+        ready = self.root / "child.ready"
+        last_use = self.root / "child.last-use"
+        scratch_path = self.root / "scratch.path"
+        child = (
+            "import os,pathlib,signal,sys,time\n"
+            "ready,last_use,scratch_path=sys.argv[1:]\n"
+            "scratch=pathlib.Path(os.environ['TMPDIR'])\n"
+            "def finish(_signal,_frame):\n"
+            " (scratch/'last-use').write_text('finished',encoding='utf-8')\n"
+            " pathlib.Path(last_use).write_text('reaped',encoding='utf-8')\n"
+            " raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM,finish)\n"
+            "pathlib.Path(ready).write_text('ready',encoding='utf-8')\n"
+            "pathlib.Path(scratch_path).write_text(str(scratch),encoding='utf-8')\n"
+            "time.sleep(60)\n"
+        )
+        command = (
+            "import pathlib,subprocess,sys,time\n"
+            "child,ready,last_use,scratch_path=sys.argv[1:]\n"
+            "subprocess.Popen([sys.executable,'-c',child,ready,last_use,scratch_path])\n"
+            "deadline=time.monotonic()+8\n"
+            "while not pathlib.Path(ready).exists() and time.monotonic()<deadline: time.sleep(.01)\n"
+            "if not pathlib.Path(ready).exists(): raise SystemExit('child did not become ready')\n"
+        )
+        done = self.run_lease(command, child, ready, last_use, scratch_path)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(last_use.read_text(encoding="utf-8"), "reaped")
+        scratch = Path(scratch_path.read_text(encoding="utf-8"))
+        self.assertFalse(scratch.exists())
+        self.assert_parent_preserved()
+
+    def test_owned_live_child_keeps_scratch_and_reports_the_path(self):
+        pid_file = self.root / "owned.pid"
+        scratch_file = self.root / "scratch.path"
+        driver = r'''import importlib.util,os,pathlib,sys
+lease_path,pid_file,scratch_file=sys.argv[1:]
+sys.path.insert(0,str(pathlib.Path(lease_path).parent))
+spec=importlib.util.spec_from_file_location("scratch_live_lease",lease_path)
+lease=importlib.util.module_from_spec(spec);spec.loader.exec_module(lease)
+real_kill=lease.os.kill
+def ignore_owned(pid,signum):
+    try: owned=int(pathlib.Path(pid_file).read_text())
+    except (OSError,ValueError): owned=-1
+    if pid==owned: return
+    return real_kill(pid,signum)
+lease.os.kill=ignore_owned
+real_end=lease.end_scope
+lease.end_scope=lambda scope,**kwargs: real_end(scope,grace=.02,**kwargs)
+child="import time; time.sleep(60)"
+command="import os,pathlib,subprocess,sys,time; child=subprocess.Popen(['setsid',sys.executable,'-c',sys.argv[1]],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); pathlib.Path(sys.argv[2]).write_text(str(child.pid)); pathlib.Path(sys.argv[3]).write_text(os.environ['TMPDIR']); time.sleep(60)"
+raise SystemExit(lease.main(["--timeout",".4","--",sys.executable,"-c",command,child,pid_file,scratch_file]))
+'''
+        done = self.run_driver(driver, pid_file, scratch_file, timeout=20)
+        self.assertEqual(done.returncode, L.SCOPE_CLEANUP_FAILED_EXIT, done.stderr)
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        self.child_pids.append(pid)
+        scratch = Path(scratch_file.read_text(encoding="utf-8"))
+        self.assertTrue(scratch.is_dir())
+        self.assertIn(f"verification-scratch-preserved path={scratch}", done.stderr)
+        self.assertIn(f"{pid}:live", done.stderr)
+
+    def test_owned_unreadable_child_keeps_scratch(self):
+        pid_file = self.root / "owned.pid"
+        scratch_file = self.root / "scratch.path"
+        driver = r'''import importlib.util,os,pathlib,sys
+lease_path,pid_file,scratch_file=sys.argv[1:]
+sys.path.insert(0,str(pathlib.Path(lease_path).parent))
+spec=importlib.util.spec_from_file_location("scratch_unknown_lease",lease_path)
+lease=importlib.util.module_from_spec(spec);spec.loader.exec_module(lease)
+real_read=lease._read_process_stat
+real_end=lease.end_scope
+def hide_owned(scope,observed=None,**kwargs):
+    pid=int(pathlib.Path(pid_file).read_text())
+    def unreadable(candidate):
+        if candidate==pid: raise PermissionError("fixture unreadable owned pid")
+        return real_read(candidate)
+    lease._read_process_stat=unreadable
+    return real_end(scope,observed=observed,grace=.02,**kwargs)
+lease.end_scope=hide_owned
+child="import time; time.sleep(60)"
+command="import os,pathlib,subprocess,sys,time; child=subprocess.Popen(['setsid',sys.executable,'-c',sys.argv[1]],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); pathlib.Path(sys.argv[2]).write_text(str(child.pid)); pathlib.Path(sys.argv[3]).write_text(os.environ['TMPDIR']); time.sleep(60)"
+raise SystemExit(lease.main(["--timeout",".4","--",sys.executable,"-c",command,child,pid_file,scratch_file]))
+'''
+        done = self.run_driver(driver, pid_file, scratch_file, timeout=20)
+        self.assertEqual(done.returncode, L.SCOPE_CLEANUP_FAILED_EXIT, done.stderr)
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        self.child_pids.append(pid)
+        scratch = Path(scratch_file.read_text(encoding="utf-8"))
+        self.assertTrue(scratch.is_dir())
+        self.assertIn(f"verification-scratch-preserved path={scratch}", done.stderr)
+        self.assertIn(f"{pid}:unreadable", done.stderr)
+
+    def test_unrelated_unreadable_process_does_not_keep_scratch(self):
+        unrelated = subprocess.Popen(["sleep", "60"])
+        def stop_unrelated():
+            if unrelated.poll() is None:
+                unrelated.kill()
+            unrelated.wait(timeout=5)
+        self.addCleanup(stop_unrelated)
+        marker = self.root / "scratch.path"
+        driver = r'''import importlib.util,os,pathlib,sys
+lease_path,unrelated,marker=sys.argv[1:]
+sys.path.insert(0,str(pathlib.Path(lease_path).parent))
+spec=importlib.util.spec_from_file_location("scratch_unrelated_lease",lease_path)
+lease=importlib.util.module_from_spec(spec);spec.loader.exec_module(lease)
+real_read=lease._read_process_stat
+def unreadable(candidate):
+    if candidate==int(unrelated): raise PermissionError("fixture unrelated pid")
+    return real_read(candidate)
+lease._read_process_stat=unreadable
+code="import os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(os.environ['TMPDIR'])"
+raise SystemExit(lease.main(["--timeout","5","--",sys.executable,"-c",code,marker]))
+'''
+        done = self.run_driver(driver, unrelated.pid, marker)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        scratch = Path(marker.read_text(encoding="utf-8"))
+        self.assertFalse(scratch.exists())
+        self.assertIsNone(unrelated.poll())
+        self.assert_parent_preserved()
+
+    def test_replaced_root_symlink_and_external_target_are_preserved(self):
+        marker = self.root / "scratch.path"
+        external = self.root / "external"
+        external.mkdir()
+        target = external / "keep"
+        target.write_text("external", encoding="utf-8")
+        command = (
+            "import os,pathlib,sys\n"
+            "scratch=pathlib.Path(os.environ['TMPDIR'])\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(scratch),encoding='utf-8')\n"
+            "scratch.rmdir()\n"
+            "scratch.symlink_to(sys.argv[2],target_is_directory=True)\n"
+        )
+        done = self.run_lease(command, marker, external)
+        self.assertEqual(done.returncode, L.SCOPE_CLEANUP_FAILED_EXIT, done.stderr)
+        scratch = Path(marker.read_text(encoding="utf-8"))
+        self.assertTrue(scratch.is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), "external")
+        self.assertIn("reason=root-replaced", done.stderr)
+
+    def test_spawn_and_lease_publication_failures_finalize_private_scratch(self):
+        marker = self.root / "scratch.path"
+        spawn_driver = r'''import importlib.util,pathlib,sys
+lease_path,marker=sys.argv[1:]
+sys.path.insert(0,str(pathlib.Path(lease_path).parent))
+spec=importlib.util.spec_from_file_location("scratch_spawn_failure",lease_path)
+lease=importlib.util.module_from_spec(spec);spec.loader.exec_module(lease)
+import verification_runtime
+real_prepare=verification_runtime.verification_command
+def prepare(command):
+    resolved,env=real_prepare(command)
+    def fail(command,**kwargs):
+        pathlib.Path(marker).write_text(kwargs["env"]["TMPDIR"])
+        raise OSError("fixture spawn failure")
+    lease.subprocess.Popen=fail
+    return resolved,env
+verification_runtime.verification_command=prepare
+try: lease.main(["--timeout","5","--",sys.executable,"-c","pass"])
+except OSError: raise SystemExit(0)
+raise SystemExit("spawn unexpectedly succeeded")
+'''
+        failed_spawn = self.run_driver(spawn_driver, marker)
+        self.assertEqual(failed_spawn.returncode, 0, failed_spawn.stderr)
+        self.assertFalse(Path(marker.read_text(encoding="utf-8")).exists())
+
+        lease_file = self.root / "verification-lease.json"
+        publish_driver = r'''import importlib.util,pathlib,sys
+lease_path,marker,lease_file=sys.argv[1:]
+sys.path.insert(0,str(pathlib.Path(lease_path).parent))
+spec=importlib.util.spec_from_file_location("scratch_publish_failure",lease_path)
+lease=importlib.util.module_from_spec(spec);spec.loader.exec_module(lease)
+lease.lease_context=lambda *_args:(pathlib.Path(lease_file),{})
+def fail_write(*_args): raise OSError("fixture publication failure")
+lease.atomic_json=fail_write
+code="import os,pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text(os.environ['TMPDIR']); time.sleep(60)"
+try: lease.main(["--timeout","5","--",sys.executable,"-c",code,marker])
+except OSError: raise SystemExit(0)
+raise SystemExit("lease publication unexpectedly succeeded")
+'''
+        failed_publish = self.run_driver(publish_driver, marker, lease_file)
+        self.assertEqual(failed_publish.returncode, 0, failed_publish.stderr)
+        self.assertFalse(Path(marker.read_text(encoding="utf-8")).exists())
+        self.assertFalse(lease_file.exists())
+        self.assert_parent_preserved()
+
+
 class LeaseScopeTest(unittest.TestCase):
     def setUp(self):
         self.marker = f"{300 + os.getpid() % 1000}.{time.monotonic_ns() % 10**6}"
