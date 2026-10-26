@@ -71,6 +71,11 @@ class ViewerByteTrace(unittest.TestCase):
                         actual = draw(vm, state, case["cols"], 45, beat=1)
                         actual_cells, actual_hits = _frame_json(actual)
                         expected_cells = _expand([row_pool[index] for index in expected_frame["cells"]])
+                        from tools.fleet.tests.test_explorer_oracle import (
+                            _fixture_header_identity, normalize_f70_method_delta)
+                        version, method = _fixture_header_identity(vm)
+                        actual_cells = normalize_f70_method_delta(
+                            actual_cells, expected_cells, version=version, method=method)
                         difference = _first_cell_difference(expected_cells, actual_cells)
                         self.assertIsNone(difference, f"{context}: {difference or 'cell grids differ'}")
                         if actual_hits != expected_frame["hits"]:

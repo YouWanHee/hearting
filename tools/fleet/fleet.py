@@ -266,8 +266,12 @@ def main(argv=None):
         else:
             from . import demo
 
-        def collector(harness_filter=None, usage="cache-only", fast_first=False):      # LIVE real data + injected demo fixtures (merged)
+        def collector(harness_filter=None, usage="cache-only", fast_first=False,
+                      include_report_verification=True):      # LIVE real data + injected demo fixtures (merged)
+            report_option = ({"include_report_verification": False}
+                             if not include_report_verification else {})
             observed = as_snapshot(collect_all(harness_filter=harness_filter, usage="cache-only",
+                                               **report_option,
                                                **({"fast_first": True} if fast_first else {})))
             rs, rj = observed
             ds, dj = demo.collect(harness_filter=harness_filter)
@@ -277,16 +281,20 @@ def main(argv=None):
                 from fleet.projection import attach_projections
             else:
                 from .projection import attach_projections
-            ds, dj = attach_projections(ds, dj)
+            ds, dj = attach_projections(ds, dj, **report_option)
             return replace(observed, sessions=rs + ds, jobs=rj + dj)
 
-    def projected_collector(harness_filter=None, usage="cache-only", fast_first=False):
+    def projected_collector(harness_filter=None, usage="cache-only", fast_first=False,
+                            include_report_verification=True):
         fast_kw = {"fast_first": True} if fast_first else {}
+        report_option = ({"include_report_verification": False}
+                         if not include_report_verification else {})
         if usage == "cache-only":
-            observed = as_snapshot(collector(harness_filter=harness_filter, **fast_kw))
+            observed = as_snapshot(collector(harness_filter=harness_filter,
+                                             **report_option, **fast_kw))
         else:
             observed = as_snapshot(collector(harness_filter=harness_filter, usage=usage,
-                                            **fast_kw))
+                                            **report_option, **fast_kw))
         projected_collector.last_resource_jobs = list(
             observed.resources)
         projected_collector.last_resource_diagnostics = list(observed.resource_diagnostics)
@@ -371,15 +379,18 @@ def main(argv=None):
     base_collector = projected_collector
     previous_sessions = []
 
-    def live_collector(harness_filter=None, fast_first=False):
+    def live_collector(harness_filter=None, fast_first=False, include_report_verification=True):
         nonlocal previous_sessions
         effective = set(harness_filter) if harness_filter is not None else {"claude", "codex", "opencode"}
         live = set()
         if not disabled["api_disabled"] and args.section in ("fleet", "both"):
             live = render.live_harnesses(previous_sessions) & effective & {"claude", "codex"}
         usage = "refresh" if live else "cache-only"
-        observed = base_collector(harness_filter=harness_filter, usage=usage,
-                                   **({"fast_first": True} if fast_first else {}))
+        collector_options = {"harness_filter": harness_filter, "usage": usage,
+                             **({"fast_first": True} if fast_first else {})}
+        if not include_report_verification or args.explorer:
+            collector_options["include_report_verification"] = False
+        observed = base_collector(**collector_options)
         sessions, jobs = observed
         live_collector.last_resource_jobs = list(
             getattr(base_collector, "last_resource_jobs", []))
@@ -401,7 +412,11 @@ def main(argv=None):
         from fleet import details
     else:
         from . import details
-    live_collector.detail_refresh = details.enrich
+    live_collector.detail_refresh = lambda source: details.enrich(
+        source, include_report_verification=not args.explorer)
+    if args.explorer:
+        live_collector.required_detail_refresh = lambda source: details.enrich(
+            source, include_report_verification=False, required_only=True)
     live_collector.hearting_refresh = lambda: installinfo.collect(
         refresh_remote=True, fast_local=True)
     # F-83: SSH/GPU polling has its own slower pump in render. Never put it in

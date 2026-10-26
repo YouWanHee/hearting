@@ -1,4 +1,6 @@
 """Header, navigation rail, feed, key legend and status rows."""
+import datetime
+import math
 from collections.abc import Mapping
 from .grid import CellGrid, cell_width, clip_cells
 from .tables import repo_label
@@ -16,10 +18,187 @@ def _clip(text, width):
     return clip(str(text), max(0, int(width)))
 
 
+def _compact_census_parts(parts):
+    """Normalize only fragment separators and dedicated padding fragments."""
+    compacted = []
+    for text, key in parts:
+        text = str(text)
+        if not text.strip(" "):
+            continue
+        text = text.lstrip(" ")
+        separator = " " if compacted and not text.startswith("●") else ""
+        compacted.append((separator + text, key))
+    return compacted
+
+
+def _host_parts(hosts, *, compact=False):
+    if not hosts:
+        return []
+    selected = hosts[:1] if compact else hosts
+    parts = [] if compact else [("hosts ", "label")]
+    for host in selected:
+        if isinstance(host, Mapping):
+            mark, name = host.get("mark", "◇"), host.get("name") or "·"
+        else:
+            mark, name = (tuple(host) + ("◇", "·"))[:2]
+        parts += [(f"{mark} ", "dim" if mark == "◇" else "work"),
+                  (str(name), "soft" if mark == "◇" else "work")]
+        if not compact:
+            parts.append(("  ", "branch_s"))
+    if compact and len(hosts) > 1:
+        parts.append((f" +{len(hosts) - 1}", "dim"))
+    elif not compact:
+        parts[-1] = (f" {len(hosts)}/{len(hosts)}", "dim")
+    return parts
+
+
+def _parts_width(parts):
+    return sum(cell_width(text) for text, _key in parts)
+
+
+def _clock_freshness(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        if not math.isfinite(float(value)):
+            return None
+        return datetime.datetime.fromtimestamp(value).strftime("%H:%M")
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
+_SPINNER_GLYPHS = frozenset("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠯⠷⠻")
+_CENSUS_STATUS_KEYS = {
+    "spin": "spin", "g_spin": "spin",
+    "idle": "idle", "g_work_off": "idle",
+    "blocked": "blocked", "g_blocked": "blocked",
+}
+_CENSUS_LABELS = frozenset({"working", "idle", "answer needed"})
+
+
+def _compact_status_parts(parts):
+    """Keep each existing colored state glyph and its observed count; shed only its repeated word."""
+    compacted, count_indexes, extra_indexes = [], [], []
+    found_status = False
+    for text, key in parts:
+        text = str(text)
+        token = text.strip(" ")
+        if not token or token.lower() in _CENSUS_LABELS:
+            continue
+        if token == "hearting" and key == "hearting":
+            # The canonical validated identity is appended below; do not trust a duplicate census label.
+            continue
+        status = _CENSUS_STATUS_KEYS.get(key)
+        marker = token[:1]
+        if ((status == "spin" and marker in _SPINNER_GLYPHS) or
+                (status in ("idle", "blocked") and marker == "●")):
+            found_status = True
+            if compacted:
+                compacted.append((" ", None))
+            compacted.append((marker, key))
+            value = token[1:].strip(" ")
+            if value:
+                count_indexes.append(len(compacted))
+                compacted.append((" " + value, key))
+            continue
+        if compacted:
+            compacted.append((" ", None))
+        extra_indexes.append(len(compacted))
+        compacted.append((token, key))
+    if not found_status:
+        compacted = _compact_census_parts(parts)
+        count_indexes, extra_indexes = [], list(range(len(compacted)))
+    return compacted, count_indexes, extra_indexes
+
+
+def _clip_part(parts, index, width):
+    if index is None or not 0 <= index < len(parts):
+        return
+    text, key = parts[index]
+    parts[index] = (_clip(text, max(0, width)), key)
+
+
+def _minimum_compact_width(parts, version_index, count_indexes, extra_indexes,
+                           method_index, freshness_index):
+    minimum = list(parts)
+    _clip_part(minimum, version_index, 2)       # keep the version separator and a visible ellipsis
+    for index in (*count_indexes, *extra_indexes):
+        _clip_part(minimum, index, 1)           # keep each observed marker and mark a clipped value
+    _clip_part(minimum, method_index, 1)
+    if freshness_index is not None and 0 <= freshness_index < len(minimum):
+        text, key = minimum[freshness_index]
+        raw = str(text).lstrip(" ")
+        if len(raw) >= 5 and raw[2] == ":" and raw[:2].isdigit() and raw[3:5].isdigit():
+            minimum[freshness_index] = (" " + raw[:5], key)
+        else:
+            minimum[freshness_index] = (_clip(text, 1), key)
+    return _parts_width(minimum)
+
+
+def _clip_freshness(text, width):
+    raw = str(text).lstrip(" ")
+    if len(raw) < 5 or raw[2] != ":" or not raw[:2].isdigit() or not raw[3:5].isdigit():
+        return _clip(text, width)
+    clock = raw[:5]
+    tail = raw[5:].lstrip(" ")
+    if not tail:
+        return _clip(" " + clock, width)
+    if width >= 8:
+        room = width - 7
+        suffix = _clip(tail, room)
+        return " " + clock + " " + suffix
+    if width >= 6:
+        return clock + "…"
+    return _clip(clock, width)
+
+
+def _join_compact_groups(groups):
+    parts, starts = [], []
+    for group in groups:
+        if not group:
+            starts.append(None)
+            continue
+        if parts and not str(group[0][0]).startswith(" "):
+            parts.append((" ", None))
+        starts.append(len(parts))
+        parts.extend(group)
+    return parts, starts
+
+
+def _fit_compact_host(hosts, width):
+    """Bound only the header token; the original host record remains in the VM/Compute data."""
+    parts = _host_parts(hosts, compact=True)
+    if _parts_width(parts) <= width:
+        return parts
+    if not parts or width <= 0:
+        return []
+    if len(parts) < 2:
+        return [(_clip("".join(text for text, _key in parts), width), parts[0][1])]
+    prefix, name = parts[0], parts[1]
+    suffix = parts[2] if len(parts) > 2 else None
+    prefix_width = cell_width(prefix[0])
+    if width < prefix_width + 1:
+        return [(_clip("".join(text for text, _key in parts), width), prefix[1])]
+    suffix_width = cell_width(suffix[0]) if suffix else 0
+    name_width = max(0, width - prefix_width - suffix_width)
+    fitted_name = (_clip(name[0], name_width), name[1]) if name_width else ("", name[1])
+    fitted = [prefix, fitted_name]
+    if suffix:
+        fitted.append(suffix)
+    while _parts_width(fitted) > width and suffix:
+        suffix_width = max(0, width - prefix_width - cell_width(fitted_name[0]))
+        fitted[2] = (_clip(suffix[0], suffix_width), suffix[1])
+        suffix = None
+    if _parts_width(fitted) > width:
+        fitted = [( _clip("".join(text for text, _key in fitted), width), prefix[1])]
+    return fitted
+
+
 def draw_chrome(grid: CellGrid, vm, state, beat=1):
     width, height = grid.cols, grid.rows
+    if width <= 0:
+        return
     hosts = tuple(vm.hosts or ())
-    census_x = width - 1
     census_parts = []
     census = vm.census or {}
     if isinstance(census, Mapping) and census:
@@ -34,42 +213,98 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
                         (f"  ● {blocked}", "blocked"), (" answer needed", "dim"),
                         ("   ", "branch_s")]
     system = vm.system or {}
-    install = system.get("install", {}) if isinstance(system, Mapping) else {}
+    fallback_install = system.get("install", {}) if isinstance(system, Mapping) else {}
+    if not isinstance(fallback_install, Mapping):
+        fallback_install = {}
+    install = vm.hearting if isinstance(getattr(vm, "hearting", None), Mapping) else fallback_install
+    version = str(install.get("version") or fallback_install.get("version") or "unknown")
+    method = str(install.get("install_method") or "unmanaged")
     freshness = (system.get("usage_api", {}).get("freshness")
                  if isinstance(system, Mapping) and isinstance(system.get("usage_api"), Mapping) else None)
-    if install:
-        census_parts.extend([("hearting", "hearting"),
-                             (" " + str(install.get("version", "")), "ver")])
-    if freshness:
-        census_parts.append(("  " + str(freshness), "dim"))
-    census_width = sum(len(part[0]) for part in census_parts)
-    census_x = max(1, width - 1 - census_width)
-    parts = [("hosts ", "label")]
-    for host in hosts:
-        if isinstance(host, Mapping):
-            mark, name = host.get("mark", "◇"), host.get("name", "·")
-            key = host.get("key", "base_host")
-        else:
-            mark, name, key = (tuple(host) + ("base_host",))[:3]
-        parts += [(f"{mark} ", "dim" if mark == "◇" else "work"),
-                  (str(name), "soft" if mark == "◇" else "work"), ("  ", "branch_s")]
-    if hosts:
-        parts[-1] = (f" {len(hosts)}/{len(hosts)}", "dim")
-    if 1 + sum(len(text) for text, _key in parts) > census_x - 2 and hosts:
-        first = hosts[0]
-        mark, name = ((first.get("mark", "◇"), first.get("name", "·")) if isinstance(first, Mapping)
-                      else (tuple(first) + ("◇", "·"))[:2])
-        parts = [("hosts ", "label"), (f"{mark} ", "dim" if mark == "◇" else "work"),
-                 (str(name), "soft" if mark == "◇" else "work"),
-                 (f" +{len(hosts) - 1} · {len(hosts)}/{len(hosts)}", "dim")]
-    x = 1
-    for text, key in parts:
-        x = grid.put(x, 0, text, key, limit=census_x - 2)
-    cx = max(x + 1, width - 1 - census_width)
-    for text, key in census_parts:
-        if cx >= width - 1:
-            break
-        cx = grid.put(cx, 0, text, key, limit=width - 1)
+    if not freshness:
+        freshness = _clock_freshness(getattr(vm, "clock", None))
+    identity_parts = [("hearting", "hearting"), (" " + version, "ver"),
+                      (" · ", "dim"), (method, "version_method")]
+    freshness_parts = [("  " + str(freshness), "dim")] if freshness else []
+    full_census_parts = list(census_parts) + identity_parts + freshness_parts
+    full_width = _parts_width(full_census_parts)
+    full_hosts = _host_parts(hosts)
+    right_edge = width - 1 if width > 1 else width
+    host_start = 1 if hosts else 0
+    host_end = host_start + _parts_width(full_hosts)
+    full_start = max(host_end + 1, right_edge - full_width) if hosts else max(0, right_edge - full_width)
+    full_fits = (full_width <= right_edge and full_start + full_width <= right_edge and
+                 (not hosts or host_end + 1 <= full_start))
+    if full_fits:
+        x = host_start
+        for text, key in full_hosts:
+            x = grid.put(x, 0, text, key, limit=full_start - 1 if hosts else right_edge)
+        x = full_start
+        for text, key in full_census_parts:
+            x = grid.put(x, 0, text, key, limit=right_edge)
+    else:
+        compact_status, count_indexes, extra_indexes = _compact_status_parts(census_parts)
+        identity = list(identity_parts)
+        right_parts, starts = _join_compact_groups((compact_status, identity, freshness_parts))
+        status_start, identity_start, freshness_start = starts
+        version_index = identity_start + 1 if identity_start is not None else None
+        method_index = identity_start + 3 if identity_start is not None else None
+        count_indexes = [status_start + index for index in count_indexes] if status_start is not None else []
+        extra_indexes = [status_start + index for index in extra_indexes] if status_start is not None else []
+
+        compact_host = _host_parts(hosts, compact=True)
+        host_width = _parts_width(compact_host)
+        right_width = _parts_width(right_parts)
+        if compact_host and right_width <= width and host_width + right_width + 1 > width:
+            compact_host = _fit_compact_host(hosts, max(0, width - right_width - 1))
+            host_width = _parts_width(compact_host)
+        if (compact_host and right_width > width and
+                host_width + 1 + _minimum_compact_width(
+                    right_parts, version_index, count_indexes, extra_indexes, method_index, freshness_start) > width):
+            compact_host = _fit_compact_host(hosts, 2)
+            host_width = _parts_width(compact_host)
+        group_budget = max(0, width - host_width - (1 if compact_host else 0))
+
+        overflow = _parts_width(right_parts) - group_budget
+        if overflow > 0:
+            current = cell_width(right_parts[version_index][0]) if version_index is not None else 0
+            _clip_part(right_parts, version_index, max(2, current - overflow))
+        for index in count_indexes:
+            overflow = _parts_width(right_parts) - group_budget
+            if overflow <= 0:
+                break
+            current = cell_width(right_parts[index][0])
+            _clip_part(right_parts, index, max(1, current - overflow))
+        for index in extra_indexes:
+            overflow = _parts_width(right_parts) - group_budget
+            if overflow <= 0:
+                break
+            current = cell_width(right_parts[index][0])
+            _clip_part(right_parts, index, max(1, current - overflow))
+        if _parts_width(right_parts) > group_budget and method_index is not None:
+            overflow = _parts_width(right_parts) - group_budget
+            current = cell_width(right_parts[method_index][0])
+            _clip_part(right_parts, method_index, max(1, current - overflow))
+        if _parts_width(right_parts) > group_budget and freshness_start is not None:
+            clock_index = freshness_start
+            overflow = _parts_width(right_parts) - group_budget
+            current = cell_width(right_parts[clock_index][0])
+            fitted = _clip_freshness(right_parts[clock_index][0], max(1, current - overflow))
+            right_parts[clock_index] = (fitted, right_parts[clock_index][1])
+        if _parts_width(right_parts) > group_budget:
+            right_parts = [(_clip("".join(text for text, _key in right_parts), group_budget), "dim")]
+
+        right_width = _parts_width(right_parts)
+        host_budget = max(0, width - right_width - (1 if compact_host else 0))
+        if _parts_width(compact_host) > host_budget:
+            compact_host = _fit_compact_host(hosts, host_budget)
+        group_start = width - right_width
+        x = 0
+        for text, key in compact_host:
+            x = grid.put(x, 0, text, key, limit=max(0, group_start - 1))
+        x = group_start
+        for text, key in right_parts:
+            x = grid.put(x, 0, text, key, limit=width)
     usage = tuple(vm.usage or ())
     if not state.usage_open:
         more_x = width - 9
@@ -147,7 +382,6 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
         grid.put(NAV_WIDTH + 2, title_y, " { ", "dim")
         title_text = str(state.title or state.view)
         grid.put(NAV_WIDTH + 5, title_y, title_text, "head", limit=width - 1)
-        from .grid import cell_width
         title_end = NAV_WIDTH + 5 + cell_width(title_text)
         grid.put(title_end, title_y, " ", "dim", limit=width - 1)
         grid.put(title_end + 1, title_y, "} ", "dim", limit=width - 1)

@@ -38,6 +38,12 @@ class IdleObserverTests(unittest.TestCase):
         self.pane_patch = mock.patch.object(pane_ownership, "verified_pane", side_effect=lambda pane, *a, **kw: pane or "")
         self.pane_patch.start()
         self.addCleanup(self.pane_patch.stop)
+        # These idle-policy fixtures supply a synthetic pane. A real Codex
+        # parent must not turn that fixture into an unrelated caller proof.
+        self.caller_patch = mock.patch.object(pane_ownership, "_caller_runtime",
+                                               return_value=(None, False))
+        self.caller_patch.start()
+        self.addCleanup(self.caller_patch.stop)
         self.started = []
 
     def transcript(self, sid: str, tokens: int | None):

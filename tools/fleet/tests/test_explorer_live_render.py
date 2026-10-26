@@ -1,7 +1,11 @@
 """Renderer rules for live view models, each reproduced on a small scrubbed synthetic view model."""
+import contextlib
+import io
+import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tools.fleet.explorer.frame import draw
 from tools.fleet.explorer.resources import short_cmd
@@ -113,6 +117,19 @@ class HeaderRule(unittest.TestCase):
 
 
 class CutRule(unittest.TestCase):
+    def test_route_header_uses_the_cell_before_age_without_overlapping_it(self):
+        frame = _frame(_vm(), "ROUTES", cols=100)
+        header = next(index for index, row in enumerate(frame.text_rows()) if "HARNESS" in row)
+        self.assertEqual(frame.cells[header][94][0], "P")
+        self.assertEqual(frame.cells[header][95][0], "R")
+        self.assertEqual(frame.cells[header][96][0], "A")
+
+    def test_route_kind_uses_the_cell_before_age_instead_of_dropping_its_last_glyph(self):
+        route = _route(capability="lab", mode="eval", intensity="standard", age="22h 32m")
+        rows = _frame(_vm(routes=[route], repos=[]), "ROUTES", cols=80).text_rows()
+        line = next(row for row in rows if "lab(eval" in row)
+        self.assertIn("lab(eval·s22h 32m", line)
+
     def test_system_field_lines_are_cut_at_the_pane_edge_without_an_ellipsis(self):
         system = dict(_mapping()["system"], install={"version": "v1.2.3", "managed": True, "pinned": True,
                                                        "distribution": True},
@@ -167,6 +184,83 @@ class PeersRule(unittest.TestCase):
 class UsageRule(unittest.TestCase):
     def test_unknown_usage_is_a_dot(self):
         self.assertEqual(usage_text(SimpleNamespace(usage_snapshots={}, sessions=())), "·")
+
+
+class HeaderCallerFallback(unittest.TestCase):
+    @staticmethod
+    def snapshot():
+        from tools.fleet.model import Session
+        from tools.fleet.refresh import LiveSnapshot
+
+        states = ["working"] * 15 + ["idle"] * 2 + ["blocked"]
+        sessions = [Session(harness="codex", pid=index + 1, session_tag=f"h{index}",
+                             cwd="/synthetic/repo", liveness=state)
+                    for index, state in enumerate(states)]
+        snapshot = LiveSnapshot(sessions=sessions, hearting={
+            "version": "v3.50.3-20-gad247e2b6", "install_method": "unmanaged"})
+        snapshot.usage_snapshots = {"codex": {"payload": {"rl_5h": 20, "rl_7d": 30},
+                                               "observed_at": 2_000_000_000}}
+        names = ("trainer-west-gpu-node-01", "cnn", "xavier", "larynx", "mpwav")
+        snapshot.compute_hosts = {"hosts": [
+            {"host": name, "self": index == 0, "reachable": True, "cpu_count": 4,
+             "cpu_utilization_pct": 25, "memory_total_mib": 8192,
+             "memory_used_mib": 4096, "gpus": []}
+            for index, name in enumerate(names)
+        ]}
+        return snapshot, names[0]
+
+    @staticmethod
+    def runtime():
+        return SimpleNamespace(prepare=lambda snapshot, detail, *, vm, generation, now: (vm, {}))
+
+    def test_live_compose_keeps_source_host_and_draws_bounded_valid_header(self):
+        from tools.fleet import render
+        from tools.fleet.explorer.grid import cell_width
+
+        snapshot, host_name = self.snapshot()
+        with patch.object(render, "_explorer_runtime", return_value=self.runtime()):
+            frame = render._explorer_compose(snapshot, 80, 45,
+                                              NavState(view="OVERVIEW", scope="-"), now=2_000_000_000)
+        row = frame.text_rows()[0]
+
+        self.assertEqual(render._EXPLORER_MODEL.hosts[0]["name"], host_name)
+        self.assertEqual(render._EXPLORER_MODEL.compute[0][0], host_name)
+        self.assertTrue(row.startswith("⌂ trainer"), row)
+        self.assertIn("…", row)
+        self.assertIn("⠏ 15", row)
+        self.assertIn("● 2", row)
+        self.assertIn("● 1", row)
+        self.assertIn("hearting v3.50.3-20-gad247e2b6 · unmanaged", row)
+        self.assertRegex(row.rstrip(), r"\d{2}:\d{2}$")
+        self.assertEqual(cell_width(row), 80)
+
+    def test_render_once_caller_handles_a_valid_overbudget_compute_host(self):
+        from tools.fleet import render
+        from tools.fleet.explorer.grid import cell_width
+
+        snapshot, host_name = self.snapshot()
+        previous_mode = render._EXPLORER_ENABLED
+        render.set_explorer_mode(True)
+        try:
+            with patch.object(render, "_explorer_runtime", return_value=self.runtime()), \
+                    patch.object(render, "_collect_memory", return_value=None), \
+                    patch.object(render, "_collect_governor", return_value=None), \
+                    patch.object(render.gitinfo, "enrich_entities"), \
+                    patch.dict(os.environ, {"FLEET_DEMO": "1", "COLUMNS": "80", "LINES": "45"}):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    result = render.render_once(lambda harness_filter=None: snapshot, None, None)
+        finally:
+            render.set_explorer_mode(previous_mode)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(result, 0)
+        self.assertEqual(len(lines), 45)
+        self.assertEqual(cell_width(lines[0]), 80)
+        self.assertTrue(lines[0].startswith("⌂ trainer"), lines[0])
+        self.assertIn("…", lines[0])
+        self.assertIn("hearting v3.50.3-20-gad247e2b6 · unmanaged", lines[0])
+        self.assertRegex(lines[0].rstrip(), r"\d{2}:\d{2}$")
+        self.assertEqual(snapshot.compute_hosts["hosts"][0]["host"], host_name)
 
 
 if __name__ == "__main__":

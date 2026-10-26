@@ -1,8 +1,10 @@
 """File-generation reuse contract for parsed registry rows."""
 import os
+import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -10,6 +12,275 @@ from fleet.collectors import dispatch
 
 
 class ParsedRegistryRowsTest(unittest.TestCase):
+    def test_fast_spacing_guard_matches_the_legacy_regex(self):
+        legacy_pattern = re.compile(r"(?:^|,)[^=,]*\s[^=,]*=|=\s|\s+[^\s,]*=")
+        examples = (
+            "capability=code,mode=dev",
+            "model_role=deep  maker,mode=dev",
+            "model_role=deep maker=fast",
+            "model_role=deep\t maker",
+            "capability=code, model_role=deep maker",
+            "capability=code,note=foo,bar",
+            "capability:code(x)",
+            "a=wide\u2003b=value",
+            "a=wide\u2003value",
+            "a=\u2003wide",
+            "capability=code,,mode=dev",
+            "capability=code=alias,missing",
+            "capability=code,=mode",
+            "capability=code,mode=dev,",
+        )
+        for raw in examples:
+            eq_pos, colon_pos = raw.find("="), raw.find(":")
+            has_whitespace = bool(re.search(r"\s", raw))
+            expected = ("(" in raw or eq_pos < 0
+                        or colon_pos >= 0 and colon_pos < eq_pos
+                        or any("=" not in part for part in raw.split(","))
+                        or bool(legacy_pattern.search(raw)))
+            self.assertEqual(dispatch._registry_metadata_needs_legacy_parser(raw),
+                             expected, raw)
+            self.assertEqual(dispatch._registry_metadata_shape(raw),
+                             (expected, has_whitespace), raw)
+
+    def test_single_scan_analysis_matches_split_and_regex_oracle(self):
+        legacy_pattern = re.compile(r"(?:^|,)[^=,]*\s[^=,]*=|=\s|\s+[^\s,]*=")
+        value_pattern = re.compile(r"(?:^|,)([^=,]*)=([^,]*\s[^,]*)(?=,|$)")
+        examples = [
+            "capability=code,,mode=dev", "capability=code,mode=dev,",
+            "capability=code, model_role=deep maker",
+            "capability=code model_role=deep maker",
+            "capability=code,note=foo =bar", "capability=code,note=foo,bar",
+            "capability:code(x)", "a=wide\u2003b=value", "a=wide\u2003value",
+            "a=\u2003wide", "a=foo bar=baz", "a=foo bar baz=baz",
+            "a=foo, b=bar", "a=foo, b", "a=foo,=bar",
+        ]
+        keys = ("a", "a b", " a", "_name", "")
+        values = ("", "plain", "two words", " two", "two ", "two  words",
+                  "wide\u2003value", "foo=bar", "foo bar=baz", "foo =bar")
+        examples.extend(f"{key}={value},mode=dev" for key in keys for value in values)
+        for raw in examples:
+            eq_pos, colon_pos = raw.find("="), raw.find(":")
+            needs_legacy = ("(" in raw or eq_pos < 0
+                            or colon_pos >= 0 and colon_pos < eq_pos
+                            or any("=" not in part for part in raw.split(","))
+                            or bool(re.search(r"\s", raw)
+                                    and legacy_pattern.search(raw)))
+            keys_with_whitespace = (() if needs_legacy else tuple(
+                match.group(1) for match in value_pattern.finditer(raw)))
+            expected = (needs_legacy, keys_with_whitespace)
+            actual = dispatch._registry_metadata_analysis(raw)
+            self.assertEqual(actual[0], expected[0], raw)
+            self.assertEqual(set(actual[1]), set(expected[1]), raw)
+
+    def test_canonical_metadata_normalizes_only_values_with_whitespace(self):
+        class CountingWhitespace:
+            def __init__(self):
+                self.calls = 0
+
+            def search(self, value):
+                self.calls += 1
+                return re.search(r"\s", value)
+
+        pairs = {"key%d" % index: "value%d" % index for index in range(120)}
+        pairs["note"] = "first\t  value"
+        raw = ",".join("%s=%s" % (key, value) for key, value in pairs.items())
+        record = mock.Mock(fields=("t", "open", "/repo", "/work", "owner", raw))
+        record.completion_metadata.return_value = pairs
+        whitespace = CountingWhitespace()
+        with mock.patch.object(dispatch, "_REGISTRY_METADATA_WHITESPACE_RE", whitespace):
+            metadata = dispatch._registry_record_metadata(record)
+        self.assertEqual(whitespace.calls, 0)
+        self.assertEqual(metadata["key119"], "value119")
+        self.assertEqual(metadata["note"], "first value")
+        self.assertEqual(metadata["_name"], None)
+
+    def test_whitespace_normalization_matches_legacy_parser_oracle(self):
+        examples = (
+            "capability=autopilot-code,model_role=deep  maker,mode=dev",
+            "capability=code,note=wide\u2003value,mode=dev",
+            "capability=code,note=tail\t  ,mode=dev",
+            "capability=code,note=pre=post  value,mode=dev",
+            "capability=code,note=first  value,note=last",
+            "capability=code,note=first,note=last  value",
+            "capability=code model_role=deep maker",
+            "capability:code(x)",
+        )
+        for raw in examples:
+            pairs = {}
+            for part in raw.split(","):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    pairs[key] = value
+            record = mock.Mock(fields=("t", "open", "/repo", "/work", "owner", raw))
+            record.completion_metadata.return_value = pairs
+            self.assertEqual(dispatch._registry_record_metadata(record),
+                             dispatch._parse_pipe_meta_uncached(raw), raw)
+
+    def test_nonlegacy_whitespace_values_keep_normalization(self):
+        raw = "capability=autopilot-code,model_role=deep\t maker"
+        record = mock.Mock(fields=("t", "open", "/repo", "/work", "owner", raw))
+        record.completion_metadata.return_value = {
+            "capability": "autopilot-code", "model_role": "deep\t maker"}
+        self.assertEqual(dispatch._registry_record_metadata(record), {
+            "capability": "autopilot-code", "model_role": "deep maker",
+            "_name": "code"})
+
+    def test_comma_delimited_role_values_reuse_the_existing_generation_parse(self):
+        raw = "capability=autopilot-code,model_role=deep  maker,mode=dev"
+        expected = dispatch._parse_pipe_meta_uncached(raw)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            path.write_text("t\topen\t/repo\t/work\towner\t" + raw + "\n")
+            with dispatch._dispatch_registry_cache.registry_read_scope(), \
+                 mock.patch.object(dispatch, "_parse_pipe_meta", side_effect=AssertionError("reparsed")):
+                rows = dispatch.parsed_registry_rows(path)
+        self.assertEqual(dict(rows[0][2]), expected)
+
+    def test_noncanonical_metadata_keeps_the_legacy_parser_semantics(self):
+        examples = ["capability=autopilot-code model_role=deep maker",
+                    "capability=autopilot-code,model_role= deep maker",
+                    "capability=autopilot-code,note=foo =bar",
+                    "capability=autopilot-code,note=foo,bar",
+                    "capability=autopilot-code, model_role=deep maker"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            path.write_text("".join("t\topen\t/repo\t/work\towner\t" + raw + "\n"
+                                    for raw in examples))
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                rows = dispatch.parsed_registry_rows(path)
+        self.assertEqual([dict(row[2]) for row in rows],
+                         [dispatch._parse_pipe_meta_uncached(raw) for raw in examples])
+
+    def test_collection_adapts_registry_records_without_reparsing_common_metadata(self):
+        dispatch._parse_pipe_meta_cached.cache_clear()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            path.write_text(
+                "open\tslug\t/repo\t/work\tstamp\tcapability=autopilot-code,mode=dev\n")
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                rows = dispatch.parsed_registry_rows(path)
+            self.assertEqual(rows[0][2]["capability"], "autopilot-code")
+            self.assertEqual(rows[0][2]["_name"], "code")
+            self.assertEqual(rows[0][2]["mode"], "dev")
+            self.assertEqual(dispatch._parse_pipe_meta_cached.cache_info().misses, 0)
+
+    def test_canonical_metadata_skips_legacy_whitespace_pattern(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            raw = "capability=autopilot-code,mode=dev,attempt_id=att-1"
+            path.write_text("t\topen\t/repo\t/work\towner\t" + raw + "\n")
+            with (dispatch._dispatch_registry_cache.registry_read_scope(),
+                  mock.patch.object(dispatch, "_parse_pipe_meta",
+                                    side_effect=AssertionError("canonical metadata reparsed"))):
+                rows = dispatch.parsed_registry_rows(path)
+        self.assertEqual(dict(rows[0][2]), dispatch._parse_pipe_meta_uncached(raw))
+
+    def test_attempt_index_preserves_first_duplicate_registry_row(self):
+        first = {"order": 1, "meta": {"attempt_id": "att-1", "value": "first"}}
+        duplicate = {"order": 2, "meta": {"attempt_id": "att-1", "value": "later"}}
+        missing = {"order": 3, "meta": {"value": "missing-attempt"}}
+        index = dispatch._index_registry_rows_by_attempt([first, duplicate, missing])
+        self.assertIs(index["att-1"], first)
+        self.assertIs(index[None], missing)
+
+    def test_orphan_row_adapter_matches_dispatch_registry_contract(self):
+        registry = dispatch._orphan_registry_module()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            path.write_text(
+                "t\topen\t/repo\t/work\towner\tcapability=code,attempt_id=att-1\n"
+                "malformed\trow\n"
+                "t\tdone\t/repo\t/work\tlegacy\tcapability:code(x)\n"
+                "t\topen\t/repo\t/work\tworker\tmodel_role=deep  maker,attempt_id=att-2\n"
+                "t\topen\t/repo\t/work\tlegacy-name\tcapability=code,_name=explicit\n",
+                encoding="utf-8")
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                parsed = dispatch.parsed_registry_rows(path)
+                expected_lines = ["\t".join(fields) for _order, fields, _meta in parsed]
+                expected = registry.read_rows(path, lines=expected_lines)
+                for row, (physical_order, fields, _meta) in zip(expected, parsed):
+                    row["order"] = physical_order
+                    row["raw"] = "\t".join(fields)
+                actual = dispatch._orphan_registry_rows(path, registry)
+        self.assertEqual(actual, expected)
+
+    def test_owned_row_metadata_keeps_contract_validation_without_copy(self):
+        registry = dispatch._orphan_registry_module()
+        metadata = {
+            "_name": "code", "attempt_schema_version": "2", "dispatch_depth": "99",
+            "transport": "headless", "execution_surface": "registered-headless",
+            "registered_worker": "1", "fallback_hop": "same-harness-headless",
+        }
+        fields = ("t", "open", "/repo", "/work", "owner",
+                  "attempt_schema_version=2,dispatch_depth=99,transport=headless,"
+                  "execution_surface=registered-headless,registered_worker=1,"
+                  "fallback_hop=same-harness-headless")
+        row = registry._row_from_fields(0, fields, meta=metadata, meta_owned=True)
+        self.assertIs(row["meta"], metadata)
+        self.assertEqual(row["attempt_contract_status"], "invalid:invalid-dispatch-depth")
+        self.assertEqual(metadata["_name"], "code")
+
+    def test_orphan_rows_are_shared_only_through_explicit_pass_cache(self):
+        registry = object()
+        rows = [{"order": 0, "meta": {"attempt_id": "att-1"}}]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            cache = {}
+            with mock.patch.object(dispatch, "_orphan_registry_rows",
+                                   return_value=rows) as reader:
+                first = dispatch._orphan_registry_rows_for_pass(path, registry, cache)
+                second = dispatch._orphan_registry_rows_for_pass(
+                    os.path.abspath(path), registry, cache)
+                self.assertIs(first, second)
+                self.assertEqual(reader.call_count, 1)
+                dispatch._orphan_registry_rows_for_pass(path, registry, None)
+                dispatch._orphan_registry_rows_for_pass(path, registry, None)
+                self.assertEqual(reader.call_count, 3)
+
+    def test_orphan_rows_cache_is_bounded_and_overflow_reads_without_eviction(self):
+        registry = object()
+        cache = {
+            f"/registry/{index}": [{"order": index, "meta": {"attempt_id": str(index)}}]
+            for index in range(dispatch._ORPHAN_ROWS_PASS_CACHE_LIMIT)
+        }
+        retained = dict(cache)
+        fresh = [{"order": 999, "meta": {"attempt_id": "fresh"}}]
+        with mock.patch.object(dispatch, "_orphan_registry_rows", return_value=fresh) as reader:
+            first = dispatch._orphan_registry_rows_for_pass("/registry/overflow", registry, cache)
+            second = dispatch._orphan_registry_rows_for_pass("/registry/overflow", registry, cache)
+        self.assertIs(first, fresh)
+        self.assertIs(second, fresh)
+        self.assertEqual(reader.call_count, 2)
+        self.assertEqual(len(cache), dispatch._ORPHAN_ROWS_PASS_CACHE_LIMIT)
+        self.assertEqual(cache, retained)
+
+    def test_orphan_rows_cache_is_fresh_for_each_pinned_pass(self):
+        registry = object()
+        path = "/registry/shared"
+        first_rows = [{"order": 0, "meta": {"attempt_id": "first"}}]
+        second_rows = [{"order": 0, "meta": {"attempt_id": "second"}}]
+        with mock.patch.object(dispatch, "_orphan_registry_rows",
+                               side_effect=[first_rows, second_rows]) as reader:
+            first = dispatch._orphan_registry_rows_for_pass(path, registry, {})
+            second = dispatch._orphan_registry_rows_for_pass(path, registry, {})
+        self.assertIs(first, first_rows)
+        self.assertIs(second, second_rows)
+        self.assertEqual(reader.call_count, 2)
+
+    def test_collection_falls_back_for_legacy_and_whitespace_continuation_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            legacy = "open\tlegacy\t/repo\t/work\tstamp\tautopilot-code:dev(x)\n"
+            continuation = (
+                "open\tworker\t/repo\t/work\tstamp\t"
+                "capability=autopilot-code model_role=deep maker\n")
+            path.write_text(legacy + continuation)
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                rows = dispatch.parsed_registry_rows(path)
+            self.assertEqual(rows[0][2]["_name"], "code")
+            self.assertEqual(rows[0][2]["mode"], "dev")
+            self.assertEqual(rows[1][2]["model_role"], "deep maker")
+
     def test_reuses_immutable_rows_until_file_generation_changes(self):
         dispatch._parse_pipe_meta_cached.cache_clear()
         with tempfile.TemporaryDirectory() as directory:
@@ -106,6 +377,37 @@ class ParsedRegistryRowsTest(unittest.TestCase):
     def test_missing_registry_is_empty(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(dispatch.parsed_registry_rows(Path(directory) / "missing"), ())
+
+    def test_large_generation_keeps_every_unique_row_after_parser_lru_rollover(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            count = 8205
+            path.write_text("".join(
+                f"open\tslug-{index}\t/repo\t/work\tstamp\tkey=value-{index}\n"
+                for index in range(count)))
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                rows = dispatch.parsed_registry_rows(path)
+            self.assertEqual(len(rows), count)
+            self.assertEqual(rows[0][0], 0)
+            self.assertEqual(rows[-1][0], count - 1)
+            self.assertEqual(rows[0][2]["key"], "value-0")
+            self.assertEqual(rows[-1][2]["key"], f"value-{count - 1}")
+
+    def test_incomplete_tail_is_omitted_until_its_newline_arrives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.log"
+            first = "stamp\topen\t/repo\t/work\tfirst\tkey=first\n"
+            tail = "stamp\topen\t/repo\t/work\tsecond\tkey=second"
+            path.write_text(first + tail)
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                rows = dispatch.parsed_registry_rows(path)
+            self.assertEqual([row[1][4] for row in rows], ["first"])
+
+            with path.open("a") as stream:
+                stream.write("\n")
+            with dispatch._dispatch_registry_cache.registry_read_scope():
+                completed = dispatch.parsed_registry_rows(path)
+            self.assertEqual([row[1][4] for row in completed], ["first", "second"])
 
 
 if __name__ == "__main__":
