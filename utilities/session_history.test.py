@@ -212,8 +212,10 @@ class HistoryTests(unittest.TestCase):
                  patch.object(viewer.session_tidy, "codex_pane_for_session", return_value=""), \
                  patch.object(viewer.session_tidy, "_lineage_transcript",
                               return_value={"path": None, "status": "missing"}):
-                logical = viewer.session_tidy.Seat(
-                    "project", "project-key", harness="codex", sid="native-current")
+                caller = viewer.session_tidy.resolve_caller("codex", "native-current", str(Path.cwd()))
+                self.assertIsNotNone(caller)
+                physical, harness, sid = caller
+                logical = viewer.session_tidy.session_seat(physical, harness, sid)
                 with viewer.session_tidy.session_state_lock(logical):
                     viewer.session_tidy.record_event(logical, "codex", "native-current", "start",
                                                      source="clear", now=200)
@@ -224,8 +226,9 @@ class HistoryTests(unittest.TestCase):
                 actual, pane, socket = viewer._identity(args)
                 rows = viewer.session_tidy.seat_lineage(actual)
 
-            self.assertEqual((actual.harness, actual.sid, pane, socket),
-                             ("codex", "native-current", "", ""))
+            self.assertEqual(viewer.session_tidy.session_identity(actual),
+                             ("codex", "native-current"))
+            self.assertEqual((actual.sid, pane, socket), ("", "", ""))
             self.assertEqual(viewer.session_tidy.seat_state_key(actual),
                              viewer.session_tidy._digest("native-session", "codex", "native-current"))
             self.assertEqual(viewer.session_tidy._confirmed_predecessor(

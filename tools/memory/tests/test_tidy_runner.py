@@ -557,16 +557,24 @@ class ProjectCardSlotRunTest(RunnerCase):
 
     def test_project_queue_round_trip_uses_the_callers_card_slot(self):
         with self.iso.patched_environ({"HERDR_PANE_ID": ""}):
-            seat_b = st.resolve_seat("claude", str(self.cwd), sid="runner-B")
-            seat_a = st.resolve_seat("claude", str(self.cwd), sid="runner-A")
+            seat_b = st.session_seat(st.resolve_seat("claude", str(self.cwd), sid="runner-B"),
+                                     "claude", "runner-B")
+            seat_a = st.session_seat(st.resolve_seat("claude", str(self.cwd), sid="runner-A"),
+                                     "claude", "runner-A")
             with st.seat_lock(seat_b.key):
                 st.write_card(seat_b, "claude", "runner-B", "B card", cwd=str(self.cwd))
             with st.seat_lock(seat_a.key):
                 st.write_card(seat_a, "claude", "runner-A", "A card", cwd=str(self.cwd))
+            project_seat = st.seat_for_project("claude", seat_b.project_key)
             with mock.patch.object(runner, "start_detached", return_value=0):
-                item = runner.enqueue_item(st.seat_for_project("claude", seat_b.project_key),
-                                           "claude", "runner-B", str(self.cwd))
-            self.assertEqual((item["seat"]["sid"], item["card_generation"]), ("runner-B", 1))
+                item = runner.enqueue_item(project_seat, "claude", "runner-B", str(self.cwd))
+            queued_physical_seat = st.seat_from_dict(item["seat"])
+            queued_session_seat = st.session_seat(
+                queued_physical_seat, item["harness"], item["sid"])
+            self.assertEqual(st.session_identity(queued_session_seat), ("claude", "runner-B"))
+            self.assertEqual(queued_physical_seat, project_seat)
+            self.assertNotIn("sid", item["seat"])
+            self.assertEqual(item["card_generation"], 1)
             run_dir = st.state_root() / "runs" / "batch-project"
             run_dir.mkdir(parents=True)
             bundle = runner.assemble(item, "batch-project", run_dir)
