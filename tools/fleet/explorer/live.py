@@ -944,7 +944,7 @@ def _question_records(snapshot, session_rows, session_index, now):
         stale = item.get("stale")
         older = stale == "older"
         source = _text(item.get("source"))
-        if stale not in (False, "current") and not (older and source.startswith("S1-")):
+        if stale not in (False, "current") and not older:
             continue
         ident = _text(item.get("id"))
         if ident and ident in seen:
