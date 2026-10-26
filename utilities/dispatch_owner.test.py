@@ -1139,6 +1139,59 @@ class DispatchOwnerTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(self._snapshot_side_effects(), before)
 
+    def test_no_eligible_candidate_audit_includes_tap_freshness(self):
+        stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self.jobs.write_text(
+            "\n".join(
+                f"{stamp}\tdone\trepo\t{ROOT}\tx\tnote=dead-session-limit,harness={h}"
+                for h in ("claude", "codex")
+            ) + "\n", encoding="utf-8"
+        )
+        freshness = {
+            "claude": {
+                "basis": "file-mtime", "age_seconds": 12.0,
+                "stale_after_seconds": 3600, "observation_time": "unknown",
+            }
+        }
+        report = {
+            "scores": {"claude": 42.0, "codex": 80.0, "opencode": 80.0},
+            "sources": {"claude": "taps"},
+            "freshness": freshness,
+        }
+        real_run = OWNER.subprocess.run
+        wrapper_calls = []
+
+        def reject_wrapper(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and "dispatch-headless.py" in str(cmd[0]):
+                wrapper_calls.append(cmd)
+                raise AssertionError(f"wrapper invoked unexpectedly: {cmd}")
+            return real_run(cmd, *args, **kwargs)
+
+        output = io.StringIO()
+        env = self.base_env()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        with mock.patch.object(OWNER._capacity, "capacity_report", return_value=report), \
+             mock.patch.object(OWNER.subprocess, "run", side_effect=reject_wrapper), \
+             mock.patch.dict(os.environ, env, clear=True), \
+             contextlib.redirect_stdout(output):
+            rc = OWNER.main(self.base_argv())
+
+        stdout = output.getvalue()
+        self.assertEqual(rc, 65, stdout)
+        self.assertIn("status=unavailable", stdout)
+        self.assertIn("eligibility.claude=limited", stdout)
+        self.assertIn("eligibility.codex=limited", stdout)
+        self.assertIn("capacity_headroom.claude=42.0", stdout)
+        self.assertIn("capacity_source.claude=taps", stdout)
+        self.assertIn(
+            "capacity_freshness.claude=basis:file-mtime;age-seconds:12.0;"
+            "stale-after-seconds:3600;observation-time:unknown",
+            stdout,
+        )
+        self.assertIn("reason=no-eligible-candidate", stdout)
+        self.assertIn("child_spawned=0", stdout)
+        self.assertEqual(wrapper_calls, [])
+
 
 class RouteEvidenceOwnerHarnessTest(unittest.TestCase):
     """--route-evidence binds the adapter cascade to the probed harnesses.

@@ -1001,7 +1001,9 @@ def main(argv):
             print("\n".join(_audit(
                 "unavailable", None, "none", configured, requested, states,
                 allocation=allocation, counts=counts, rejected=rejected,
-                capacity=capacity, relief_promoted=relief_promoted, top_excluded=top_excluded,
+                capacity=capacity, capacity_sources=capacity_sources,
+                capacity_freshness=capacity_freshness,
+                relief_promoted=relief_promoted, top_excluded=top_excluded,
             )))
             if dropped and not configured:
                 # Every candidate was left out for not declaring `top`; say that
