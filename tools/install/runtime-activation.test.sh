@@ -371,8 +371,13 @@ test -L "$HOME/.config/opencode/agents/demo.md" || fail "OpenCode plural agents 
 test -L "$HOME/.config/opencode/commands/demo.md" || fail "OpenCode plural commands projection missing"
 test -L "$HOME/.config/opencode/plugins/hearting-guards.js" \
   || fail "OpenCode local plugin projection missing"
-test -L "$HOME/.config/opencode/plugins/hearting-guards/index.ts" \
-  || fail "OpenCode V2 package plugin projection missing"
+# OpenCode 2 skips a package whose entry resolves outside the package
+# directory, so the V2 entry is a rendered file importing the active bundle.
+v2_entry="$HOME/.config/opencode/plugins/hearting-guards/index.ts"
+{ test -f "$v2_entry" && test ! -L "$v2_entry"; } \
+  || fail "OpenCode V2 package plugin entry must be a regular file"
+grep -Fq "from \"$(readlink "$HOME/.config/opencode/plugins/hearting-guards.js")\"" "$v2_entry" \
+  || fail "OpenCode V2 package plugin entry must import the activated server export"
 test -L "$HOME/.claude/tools" || fail "Claude tools projection missing"
 test -L "$HOME/.claude/utilities" || fail "Claude utilities projection missing"
 test -L "$HOME/.claude/statusline.sh" || fail "Claude statusline projection missing"
