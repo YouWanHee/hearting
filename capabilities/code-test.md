@@ -15,15 +15,17 @@ This is the portable capability contract for `code-test`. It defines runtime-neu
 
 ## Invocation Semantics
 
-Run graduated verification after `code-execute` or on demand to verify code
+Assess graduated verification after `code-execute` or on demand to verify code
 correctness. Intensity-derived rigor scales final verification and test-adequacy review; it does
 not force a separate parallel QA loop by itself. The capability resolves a plan path, changed-file list, or test
-scope, runs the applicable test levels, stops on the first failing level, and
+scope, assesses the applicable test levels, runs only checks whose evidence is
+missing or invalidated by the change, stops on the first failing new check, and
 records durable evidence before reporting a verdict.
 
-When the verification target includes a report spectrogram, the graduated
-levels include the fail-closed figure semantic verifier against its manifest
-and report. Missing exact 48 kHz full-band metadata, range-compatible claims,
+When the verification target includes a report spectrogram, assess the
+fail-closed figure semantic verifier against its manifest and report. Reuse its
+result only while the manifest, report, PNG hash, and visual-review evidence
+still match. Missing exact 48 kHz full-band metadata, range-compatible claims,
 shared-scale evidence, or a hash-current visual review is a failed level.
 
 For a planned QA leg with sealed `done_when` items, its `<primary-report>.items.json`
@@ -49,6 +51,19 @@ content's budget and source epoch, and its old PASS remains historical. A legacy
 PASS without a verified subject binding cannot satisfy a changed-source test
 gate. Live and unsettled attempts still protect the whole node lineage, and a
 test gate cannot use review owner-closure.
+
+Before selecting new commands, read available execution logs, independent
+review, prior test, and CI evidence. A result is reusable only for the source,
+test target and scope, relevant inputs and dependencies, and execution
+conditions it actually covered; a change of stage, person, worktree, or an
+interruption alone does not invalidate it. Check changed behavior, unresolved
+failures, and required dimensions not covered by that evidence. Report reused
+evidence by its existing artifact path, command, scope, and verdict in the
+existing report body. This evidence informs the current assessment but does not
+transfer a historical PASS or bypass the current subject binding and verdict
+budget. Preserve known FAIL and BLOCKED results; rerun only a check affected by
+a fix or newly relevant delta, and leave required evidence BLOCKED when it
+cannot be established.
 
 
 ## Artifact Ownership
@@ -119,12 +134,21 @@ Additional test-entry gates:
    - if changed files are provided, use them directly;
    - otherwise infer recent changed files from git state and report the
      inference.
-2. Select the applicable graduated levels from `roles/units/qa/test.md`:
-   syntax, import, smoke, functional, integration, and behavioral runtime
-   observation for user-facing surfaces.
-   If changed outputs include a spectrogram report, also run the fail-closed
-   figure semantic verifier against its manifest and report.
-3. Run each applicable level in order and stop on the first failure.
+2. Assess the applicable levels from `roles/units/qa/test.md`: syntax, import,
+   smoke, functional, integration, and behavioral runtime observation for
+   user-facing surfaces. These levels classify evidence; they do not require a
+   restart at syntax when valid evidence already covers a level. Use existing
+   execution, review, test, and CI artifacts when their source, scope, inputs,
+   dependencies, and run conditions still apply. Identify the changed delta,
+   any known failure, and any required unverified dimension.
+   If changed outputs include a spectrogram report, assess the fail-closed
+   figure semantic verifier against its manifest and report, reusing its result
+   only when the evidence remains current.
+3. Run only selected checks whose evidence is missing or invalidated, in level
+   order, and stop at the first failure. Preserve known unresolved failures;
+   after a fix, rerun the check affected by that fix. A handoff or a historical
+   PASS marker alone neither invalidates command evidence nor satisfies the
+   current test gate.
 4. Record commands, outputs or excerpts, skips, blockers, and the first
    actionable failure in `test_logs/`.
 5. Emit the final verdict as a handoff to `code-report`; in a `standard+` stage

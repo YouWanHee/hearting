@@ -481,6 +481,13 @@ def main() -> int:
             transcript=nested_string(payload, "transcript_path", "transcriptPath"),
             anchor_text=current_prompt
         )
+        # Codex runs no Stop hook when a turn fails; this turn's own observer
+        # continues it after a transient model-capacity failure.
+        try:
+            from codex_capacity_resume import launch as launch_capacity_resume
+            launch_capacity_resume(payload)
+        except Exception:
+            pass
     sd111_first_prompt_sweep(sid)
 
     # The card hook runs first: it is where a cleared window's successor is recorded, and the

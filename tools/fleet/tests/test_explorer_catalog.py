@@ -53,12 +53,90 @@ class ModelCatalogTests(unittest.TestCase):
                 json.dump({"models": [{"id": "listed", "visibility": "list"},
                                        {"id": "hidden", "visibility": "hide"}]}, stream)
             env = {"HEARTING_MODEL_CONFIG_HOME": config, "XDG_CACHE_HOME": cache,
-                   "XDG_DATA_HOME": data}
+                   "XDG_DATA_HOME": data, "XDG_CONFIG_HOME": os.path.join(root, "empty-config"),
+                   "OPENCODE_CONFIG": ""}
             with mock.patch.dict(os.environ, env, clear=False):
                 self.assertEqual(model_catalog.read_catalog("claude").models, ("claude-cache-model",))
                 catalog = model_catalog.read_catalog("opencode")
                 with mock.patch.object(model_catalog, "_candidates", return_value=(codex_path,)):
                     codex = model_catalog.read_catalog("codex")
-            self.assertEqual(catalog.models, ("allowed",))
+            self.assertEqual(catalog.models, ("ready/allowed",))
             self.assertEqual(catalog.source, os.path.join(cache, "opencode", "models.json"))
             self.assertEqual(codex.models, ("listed",))
+
+    def test_opencode_keeps_provider_identity_and_uses_local_connection_evidence(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = os.path.abspath(root)
+            cache = os.path.join(root, "cache", "opencode")
+            data = os.path.join(root, "data", "opencode")
+            config = os.path.join(root, "config", "opencode")
+            os.makedirs(cache)
+            os.makedirs(data)
+            os.makedirs(config)
+            cache_path = os.path.join(cache, "models.json")
+            with open(cache_path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "provider-auth": {"models": {
+                        "shared": {"id": "shared"}, "upstream/model": {"id": "upstream/model"}}},
+                    "provider-env": {"env": ["HEARTING_CATALOG_TEST_KEY"],
+                                     "models": {"shared": {"name": "display only"}}},
+                    "provider-configured": {"models": {"local": {"id": "local"}}},
+                    "provider-unconnected": {"env": ["HEARTING_CATALOG_MISSING_KEY"],
+                                             "models": {"hidden": {"id": "hidden"}}},
+                    "provider-empty-env": {"env": ["HEARTING_CATALOG_EMPTY_KEY"],
+                                           "models": {"also-hidden": {"id": "also-hidden"}}},
+                }, stream)
+            with open(os.path.join(data, "auth.json"), "w", encoding="utf-8") as stream:
+                json.dump({"provider-auth": {"token": "never-output-secret"}}, stream)
+            with open(os.path.join(config, "opencode.json"), "w", encoding="utf-8") as stream:
+                json.dump({"provider": {"provider-configured": {
+                    "options": {"baseURL": "http://local"}}}}, stream)
+            env = {"XDG_CACHE_HOME": os.path.join(root, "cache"),
+                   "XDG_DATA_HOME": os.path.join(root, "data"),
+                   "XDG_CONFIG_HOME": os.path.join(root, "config"),
+                   "OPENCODE_CONFIG": "", "HEARTING_CATALOG_TEST_KEY": "fixture-credential",
+                   "HEARTING_CATALOG_MISSING_KEY": "", "HEARTING_CATALOG_EMPTY_KEY": "  "}
+            with mock.patch.dict(os.environ, env, clear=False):
+                catalog = model_catalog.read_catalog("opencode")
+            self.assertEqual(catalog.models, (
+                "provider-auth/shared", "provider-auth/upstream/model",
+                "provider-env/shared", "provider-configured/local",
+            ))
+            self.assertNotIn("never-output-secret", repr(catalog))
+            self.assertNotIn("fixture-credential", repr(catalog))
+
+    def test_opencode_empty_cache_is_empty_and_malformed_cache_stays_unknown(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "models.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({}, stream)
+            with mock.patch.object(model_catalog, "_candidates", return_value=(path,)):
+                empty = model_catalog.read_catalog("opencode")
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write("{")
+                malformed = model_catalog.read_catalog("opencode")
+        self.assertEqual((empty.state, empty.models), ("empty", ()))
+        self.assertEqual((malformed.state, malformed.models), ("unknown", ()))
+
+    def test_opencode_config_directory_and_inline_config_are_connection_evidence(self):
+        with tempfile.TemporaryDirectory() as root:
+            config_dir = os.path.join(root, "runtime-config")
+            os.makedirs(config_dir)
+            config_path = os.path.join(root, "override.json")
+            with open(os.path.join(config_dir, "opencode.json"), "w", encoding="utf-8") as stream:
+                json.dump({"provider": {"directory-provider": {}}}, stream)
+            with open(config_path, "w", encoding="utf-8") as stream:
+                json.dump({"provider": {"file-provider": {}}}, stream)
+            env = {
+                "OPENCODE_CONFIG": "",
+                "OPENCODE_CONFIG_DIR": config_dir,
+                "OPENCODE_CONFIG_CONTENT": json.dumps({"provider": {"inline-provider": {
+                    "options": {"apiKey": "never-output-secret"}}}}),
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                configured = model_catalog._opencode_configured_providers()
+            self.assertEqual(configured, {"directory-provider", "inline-provider"})
+            self.assertNotIn("never-output-secret", repr(configured))
+            with mock.patch.dict(os.environ, {**env, "OPENCODE_CONFIG": config_path}, clear=False):
+                overridden = model_catalog._opencode_configured_providers()
+            self.assertEqual(overridden, {"file-provider", "inline-provider"})
