@@ -3573,13 +3573,16 @@ def _compose_readiness(cwd, jobs, parent_harness, children, *, gpu_route=None,
         "hearting_dispatch_readiness", ROOT / "utilities" / "dispatch-readiness.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # Compose drafts have no historical seal; pin probes pass the existing
+    # route, whose owner selection survives completed compute-node omission.
+    selection = GPU_SANDBOX.select(gpu_route) if gpu_route else None
     try:
         return module.generate(
             worktree=Path(cwd), jobs=Path(jobs),
             owner_harnesses=list(owner_harnesses) if owner_harnesses is not None else [parent_harness],
             child_harnesses=list(children),
-            **({"codex_execution_selection": GPU_SANDBOX.select_fresh(gpu_route)}
-               if gpu_route and GPU_SANDBOX.fresh_gpu_resource_nodes(gpu_route) else {}),
+            **({"codex_execution_selection": selection}
+               if selection and selection["gpu_scope"] else {}),
         )
     except module.ReadinessError as exc:
         raise ValueError(f"compose-readiness-unavailable:{exc}") from exc
