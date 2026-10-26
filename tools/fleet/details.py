@@ -32,8 +32,13 @@ def binding(row):
 def _observed_wait(row):
     observed = ((getattr(row, "state_evidence", None) or {}).get("inputs") or {}).get(
         "observed_liveness")
+    stall = getattr(row, "stall_observation", None)
+    stall = ({key: stall.get(key) for key in (
+        "state", "reason", "attempt_id", "route_id", "route_node",
+        "last_progress_at", "episode_id", "delivery_id", "notice_digest")}
+        if isinstance(stall, dict) else None)
     return json.dumps((observed, getattr(row, "resource_wait", None),
-                       getattr(row, "attention_reason", None), getattr(row, "note", None),
+                       getattr(row, "attention_reason", None), stall, getattr(row, "note", None),
                        getattr(row, "resume_boundary", None)), sort_keys=True, default=str)
 
 

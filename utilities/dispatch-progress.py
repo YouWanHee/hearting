@@ -6,9 +6,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import fcntl
-import glob
 import json
-import hashlib
 import os
 from pathlib import Path
 import signal
@@ -35,6 +33,7 @@ from dispatch_contract import (  # noqa: E402
     resolve_agent_home,
     validate_attempt_metadata,
 )
+import dispatch_supervision as supervision  # noqa: E402
 from dispatch_supervision import materialize as materialize_supervision
 from codex_dispatch_terminal import carrier_terminal_note  # noqa: E402
 from dispatch_completion_join import (  # noqa: E402
@@ -118,54 +117,13 @@ def state_paths(state_root, attempt):
 
 def verification_lease(args, now):
     """Return one exact live runtime verification lease, else ``None``."""
-
-    path = (
-        dispatch_state_root(args.jobs)
-        / "verification-leases"
-        / f"{args.attempt_id.replace('/', '_')}.json"
-    )
-    value = read_json(path)
-    digest = value.get("command_digest")
-    pid = value.get("pid")
-    pgid = value.get("pgid")
-    deadline = value.get("deadline")
-    if (
-        value.get("schema_version") != 1
-        or value.get("attempt_id") != args.attempt_id
-        or value.get("route_id") != args.route_id
-        or value.get("route_node") != args.route_node
-        or not isinstance(digest, str)
-        or len(digest) != 64
-        or any(char not in "0123456789abcdef" for char in digest)
-        or not isinstance(pid, int)
-        or not isinstance(pgid, int)
-        or pid <= 0
-        or pgid != pid
-        or not isinstance(deadline, (int, float))
-        or deadline < now
-        or process_start_ticks(pid) != str(value.get("pid_start") or "")
-        or process_state(pid) == "Z"
-        or verification_process_digest(pid) != digest
-    ):
-        return None
-    try:
-        if os.getpgid(pid) != pgid:
-            return None
-    except OSError:
-        return None
-    return value
+    return supervision.verification_lease(args.jobs, args.attempt_id,
+        args.route_id, args.route_node, now)
 
 
 def verification_process_digest(pid):
     """Hash the exact live argv without trusting the lease's copied command."""
-
-    try:
-        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes().rstrip(b"\0")
-    except OSError:
-        return ""
-    if not raw:
-        return ""
-    return hashlib.sha256(raw).hexdigest()
+    return supervision.verification_process_digest(pid)
 
 
 # One definition of the owner node name, imported rather than restated: the
@@ -298,75 +256,7 @@ def signal_authoritative_process_group(args, sig):
 
 def scoped_file_signature(metadata, worktree=""):
     """Bounded signature of declared write-scope paths; never reads file prose."""
-    entries = []
-    roots = []
-    for raw_root in (worktree, metadata.get("artifact_root", "")):
-        root = Path(raw_root)
-        if root.is_absolute() and root not in roots:
-            roots.append(root)
-    declared = metadata.get("write_scope", "").split(";")
-    route_file = Path(metadata.get("route_file", ""))
-    if route_file.is_absolute() and route_file.is_file():
-        cycle_root = route_file.parent.parent if route_file.parent.name == "_internal" else route_file.parent
-        if cycle_root not in roots:
-            roots.append(cycle_root)
-        try:
-            route = json.loads(route_file.read_text(encoding="utf-8"))
-            node = next((item for item in route.get("nodes", [])
-                         if item.get("id") == metadata.get("route_node")), {})
-            declared.extend(str(item) for item in node.get("outputs", []))
-        except (OSError, TypeError, ValueError):
-            pass
-    for raw in declared:
-        raw = raw.strip()
-        if not raw:
-            continue
-        relative = not Path(raw).is_absolute()
-        if relative and ".." in Path(raw).parts:
-            continue
-        patterns = [raw] if not relative else [str(root / raw) for root in roots]
-        for pattern in patterns:
-            candidates = glob.iglob(pattern, recursive=True) if glob.has_magic(pattern) else iter((pattern,))
-            for candidate in candidates:
-                item = Path(candidate)
-                if item.is_dir() and not glob.has_magic(pattern):
-                    nested = item.rglob("*")
-                else:
-                    nested = (item,)
-                for item in nested:
-                    if not item.is_file():
-                        continue
-                    if relative:
-                        try:
-                            resolved = item.resolve(strict=False)
-                            inside = False
-                            for root in roots:
-                                try:
-                                    resolved.relative_to(root.resolve(strict=False))
-                                    inside = True
-                                    break
-                                except ValueError:
-                                    continue
-                            if not inside:
-                                continue
-                        except OSError:
-                            continue
-                    try:
-                        stat = item.stat()
-                    except OSError:
-                        continue
-                    entries.append((str(item), stat.st_size, stat.st_mtime_ns))
-                    if len(entries) >= 256:
-                        break
-                if len(entries) >= 256:
-                    break
-            if len(entries) >= 256:
-                break
-        if len(entries) >= 256:
-            break
-    if not entries:
-        return ""
-    return hashlib.sha256(json.dumps(sorted(entries), separators=(",", ":")).encode()).hexdigest()
+    return supervision.scoped_file_signature(metadata, worktree)
 
 
 def runtime_tool_progress(metadata, previous=None):
@@ -376,49 +266,7 @@ def runtime_tool_progress(metadata, previous=None):
     event when a prose-only tail displaces it or reading is temporarily unavailable.
     A log replay of the same tool id/status grants no fresh progress.
     """
-    latest = previous or None
-    raw_path = metadata.get("log_file", "")
-    if not raw_path or not Path(raw_path).is_absolute():
-        return latest
-    try:
-        with Path(raw_path).open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            start = max(0, handle.tell() - 262144)
-            handle.seek(start)
-            if start:
-                handle.readline()
-            lines = handle.read(262144).splitlines()
-    except OSError:
-        return latest
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except (ValueError, UnicodeDecodeError):
-            continue
-        if not isinstance(event, dict):
-            continue
-        kind = event.get("type")
-        item = event.get("item")
-        if kind in {"item.started", "item.completed"} and isinstance(item, dict):
-            if item.get("type") in {"command_execution", "file_change", "mcp_tool_call", "web_search"} and item.get("id"):
-                latest = ["codex", str(item["id"])[:256], kind]
-        if kind in {"assistant", "user"} and isinstance(event.get("message"), dict):
-            content = event["message"].get("content")
-            for block in content if isinstance(content, list) else []:
-                if not isinstance(block, dict):
-                    continue
-                block_type = block.get("type")
-                identity = block.get("id") if block_type == "tool_use" else block.get("tool_use_id")
-                if block_type in {"tool_use", "tool_result"} and identity:
-                    latest = ["claude", str(identity)[:256], block_type]
-        part = event.get("part")
-        if kind == "tool_use" and isinstance(part, dict) and part.get("type") == "tool":
-            state = part.get("state")
-            status = state.get("status") if isinstance(state, dict) else None
-            identity = part.get("callID") or part.get("id")
-            if identity and status in {"pending", "running", "completed", "error"}:
-                latest = ["opencode", str(identity)[:256], status]
-    return latest
+    return supervision.runtime_tool_progress(metadata, previous)
 
 
 def inspect(args, now):
@@ -494,6 +342,13 @@ def capacity_log_evidence(state_root, slug, metadata):
 
 def watchdog(args, now):
     fields, metadata = require_row(args)
+    if fields[1] in {"open", "running"}:
+        supervision.update_attempt_stall_observation(
+            args.jobs, args.attempt_id, now=now,
+            progress_window_seconds=args.progress_window_seconds,
+            max_quiet_windows=args.watchdog_max_windows,
+            worktree=fields[3],
+        )
     verdict = inspect(args, now)
     hb_path, wd_path, lock_path = state_paths(dispatch_state_root(args.jobs), args.attempt_id)
     hb = read_json(hb_path)
@@ -706,9 +561,12 @@ def watchdog(args, now):
     # No-progress is an observation, never failure or signal authority. The
     # execution boundary retains its finite lifetime budget and cleanup duty.
     # Queue publication runs outside the progress lock and is idempotent.
-    if state["action"] == "no-progress" and args.apply and not state.get("supervision_notice_ids"):
+    stall = state.get("stall_observation")
+    if (args.apply and isinstance(stall, dict)
+            and stall.get("state") in {"stalled", "unknown"}
+            and not state.get("supervision_notice_ids")):
         try:
-            notices = materialize_supervision(args.jobs, {args.attempt_id}, reason="no-progress")
+            notices = materialize_supervision(args.jobs, {args.attempt_id}, reason="attempt-stalled")
             state["supervision_notice_ids"] = [record["delivery_id"] for record in notices]
             state.pop("supervision_notice_error", None)
         except (OSError, ValueError, RuntimeError) as error:
