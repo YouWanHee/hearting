@@ -1263,6 +1263,66 @@ class MetricSourcesTest(unittest.TestCase):
         self.assertEqual(recovered["latest"]["at"], 100.0)
         self.assertFalse(recovered["cursor"]["generation_revalidation_required"])
 
+    def test_validated_target_recovers_after_fair_sibling_turn_without_new_sample(self):
+        root = self.root / "fair-sibling-replay"
+        target = root / "z-target"
+        target.mkdir(parents=True)
+        (target / "identity.json").write_text(
+            '{"run_id":"target","started_at":0}')
+        (target / "decision.json").write_text(
+            '{"admitted":false,"snapshot":{"t":100}}')
+        first = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=110)
+        self.assertEqual(first["latest"]["state"], "denied")
+        (root / "a-sibling").mkdir()
+        (root / "a-sibling" / "noise.data").write_text(
+            '{"padding":"' + "x" * 240 + '"}')
+
+        with mock.patch.object(metrics, "MAX_ADMISSION_BYTES_PER_PASS", 64):
+            sibling_turn = metrics.read_admission_sources([root], run_id="target",
+                started_at=0, now=111, cursor=first["cursor"])
+            self.assertIsNone(sibling_turn["latest"])
+            self.assertIn(sibling_turn["cursor"]["uncertainty_reason"],
+                          {None, "partial"})
+            self.assertFalse(sibling_turn["cursor"]["generation_revalidation_required"])
+            resumed = metrics.read_admission_sources([root], run_id="target",
+                started_at=0, now=112, cursor=sibling_turn["cursor"])
+
+        self.assertEqual(resumed["coverage"], "observed")
+        self.assertEqual(resumed["samples"], [])
+        self.assertEqual(resumed["latest"]["state"], "denied")
+        self.assertIsNone(resumed["cursor"]["uncertainty_reason"])
+
+    def test_replaced_latest_decision_stays_unknown_until_new_equal_evidence(self):
+        root = self.root / "latest-decision-replacement"
+        bundle = root / "bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "identity.json").write_text(
+            '{"run_id":"target","started_at":0}')
+        decision = bundle / "decision.json"
+        old = '{"admitted":false,"snapshot":{"t":100}}'
+        decision.write_text(old)
+        first = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=110)
+        old_token = metrics._admission_stat_token(decision.lstat())
+        self.assertEqual(first["latest"]["state"], "denied")
+
+        decision.write_text(old)
+        self.assertNotEqual(metrics._admission_stat_token(decision.lstat()), old_token)
+        replay = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=111, cursor=first["cursor"])
+        self.assertEqual(replay["latest"]["state"], "unknown")
+        self.assertTrue(replay["cursor"]["generation_revalidation_required"])
+        self.assertIn("admission-bundle-generation-changed", replay["warnings"])
+
+        decision.write_text('{"admitted":true,"sample_key":"fresh-equal",'
+                            '"snapshot":{"t":100}}')
+        recovered = metrics.read_admission_sources([root], run_id="target",
+            started_at=0, now=112, cursor=replay["cursor"])
+        self.assertEqual(recovered["latest"]["state"], "admitted")
+        self.assertEqual(recovered["latest"]["at"], 100.0)
+        self.assertFalse(recovered["cursor"]["generation_revalidation_required"])
+
     def test_older_timestamp_in_a_different_file_is_not_a_counter_regression(self):
         root = self.root / "historical-file-order"
         bundle = root / "bundle"

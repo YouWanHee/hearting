@@ -1117,27 +1117,36 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
         """Retain progress only while each cached path still has its token."""
         rows = listing.get(key, []) if isinstance(listing, dict) else []
         if not isinstance(rows, list):
-            return "refresh"
+            return "refresh", []
+        changed = []
         for item in rows:
             if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-                return "refresh"
+                return "refresh", changed
             if monotonic() >= deadline:
-                return "deadline"
+                return "deadline", changed
             try:
                 info = (directory / item["name"]).lstat()
             except OSError:
-                return "refresh"
+                return "refresh", [*changed, item["name"]]
             is_directory = (root_entries and item.get("directory") is True)
             if (stat.S_ISLNK(info.st_mode)
                     or not (stat.S_ISDIR(info.st_mode) if is_directory
                             else stat.S_ISREG(info.st_mode))):
-                return "refresh"
+                return "refresh", [*changed, item["name"]]
             token = _admission_stat_token(info)
             if token != item.get("token"):
+                changed.append(item["name"])
                 item["token"] = token
                 item.pop("p", None)
                 item.pop("d", None)
-        return "ok"
+        return "ok", changed
+
+    def listing_entry_token(listing, key, name):
+        rows = listing.get(key, []) if isinstance(listing, dict) else []
+        if isinstance(rows, list):
+            return next((item.get("token") for item in rows
+                         if isinstance(item, dict) and item.get("name") == name), None)
+        return None
 
     def note_generation_change(warning):
         nonlocal uncertainty_reason, generation_revalidation_required
@@ -1153,6 +1162,13 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
         warnings.append(warning)
         uncertainty_reason = uncertainty_reason or "generation-changed"
         generation_revalidation_required = True
+
+    def valid_latest_evidence(row):
+        if not isinstance(row, dict) or row.get("state") not in {"admitted", "denied"}:
+            return False
+        stamp = row.get("at")
+        return (isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+                and math.isfinite(float(stamp)))
 
     def binding_summary_size(state):
         summary = {"fields": state["generation_fields"],
@@ -1427,8 +1443,19 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                 root_state.pop("root_listing", None)
                 root_listing = None
             if isinstance(root_listing, dict) and root_listing.get("partial") is not True:
-                root_revalidation = revalidate_listing_entries(
+                root_cursor = root_state.get("bundle_cursors", {}).get("@root", {}) \
+                    if isinstance(root_state.get("bundle_cursors"), dict) else {}
+                root_binding = root_cursor.get("binding_state", {}) \
+                    if isinstance(root_cursor, dict) else {}
+                root_latest = root_binding.get("latest", {}) \
+                    if isinstance(root_binding, dict) else {}
+                root_latest_name = root_latest.get("source_file") \
+                    if isinstance(root_latest, dict) else None
+                root_revalidation, changed_root_entries = revalidate_listing_entries(
                     root_listing, "entries", root, root_entries=True)
+                if (root_latest_name in changed_root_entries
+                        and valid_latest_evidence(root_latest)):
+                    note_generation_change("admission-bundle-generation-changed")
                 if root_revalidation == "deadline":
                     partial = exhausted = True
                     scan_state[root_key] = root_state
@@ -1574,6 +1601,20 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                                 "warnings": sorted(set(listing_warnings))}
                 if not listing_partial:
                     merge_listing_progress(root_listing, previous_root_listing, "entries")
+                    root_cursor = root_state.get("bundle_cursors", {}).get("@root", {}) \
+                        if isinstance(root_state.get("bundle_cursors"), dict) else {}
+                    root_binding = root_cursor.get("binding_state", {}) \
+                        if isinstance(root_cursor, dict) else {}
+                    root_latest = root_binding.get("latest", {}) \
+                        if isinstance(root_binding, dict) else {}
+                    root_latest_name = root_latest.get("source_file") \
+                        if isinstance(root_latest, dict) else None
+                    old_latest_token = listing_entry_token(previous_root_listing,
+                        "entries", root_latest_name) if root_latest_name else None
+                    new_latest_token = listing_entry_token(root_listing,
+                        "entries", root_latest_name) if root_latest_name else None
+                    if old_latest_token is not None and old_latest_token != new_latest_token:
+                        note_generation_change("admission-bundle-generation-changed")
                 root_state.pop("root_entry_inventory", None)
                 root_state["root_listing_complete"] = False
                 if not listing_partial and store_listing(
@@ -1809,6 +1850,20 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         partial = True
                         break
 
+                latest_row_prior = binding_state.get("latest") \
+                    if isinstance(binding_state, dict) else None
+                latest_source_name = (latest_row_prior.get("source_file")
+                    if isinstance(latest_row_prior, dict) else None)
+                latest_source_token_before = (binding_state.get("latest_source_token")
+                    if isinstance(binding_state, dict) else None)
+                latest_listing_key = "entries" if bundle == root else "files"
+                if latest_source_name and not isinstance(latest_source_token_before, str):
+                    prior_listing = previous_listing or bundle_progress.get("listing")
+                    if bundle == root:
+                        prior_listing = root_state.get("root_listing")
+                    latest_source_token_before = listing_entry_token(
+                        prior_listing, latest_listing_key, latest_source_name)
+
                 files = listed
                 listing_partial = False
                 bundle_incomplete = False
@@ -1820,8 +1875,11 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         and bundle_listing.get("identity") == bundle_identity \
                         and bundle_listing.get("generation") == bundle_listing_generation \
                         and bundle_listing.get("partial") is not True:
-                    listing_revalidation = revalidate_listing_entries(
+                    listing_revalidation, changed_file_names = revalidate_listing_entries(
                         bundle_listing, "files", bundle)
+                    if (latest_source_name in changed_file_names
+                            and valid_latest_evidence(latest_row_prior)):
+                        note_generation_change("admission-bundle-generation-changed")
                     if listing_revalidation == "deadline":
                         files = []
                         bundle_incomplete = True
@@ -1915,6 +1973,13 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                                       for item in files],
                             "partial": False,
                             "warnings": sorted(set(listing_warnings))}
+                        if latest_source_name and latest_source_token_before is not None:
+                            current_latest_token = listing_entry_token(
+                                listing_cache, "files", latest_source_name)
+                            if (current_latest_token != latest_source_token_before
+                                    and valid_latest_evidence(latest_row_prior)):
+                                note_generation_change(
+                                    "admission-bundle-generation-changed")
                         merge_listing_progress(listing_cache, previous_listing, "files")
                         if not store_listing(root_key, root_state, bundle_key,
                                              bundle_progress, listing_cache):
@@ -2419,6 +2484,11 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         row.get("sample_id", "")), default=None)
                 if latest_row is not None:
                     binding_state["latest"] = latest_row
+                    latest_source_name = latest_row.get("source_file")
+                    latest_source_entry = row_by_name.get(latest_source_name)
+                    if isinstance(latest_source_entry, dict) \
+                            and isinstance(latest_source_entry.get("token"), str):
+                        binding_state["latest_source_token"] = latest_source_entry["token"]
                 candidate_latest = binding_state.get("latest")
                 if not exact_binding and isinstance(candidate_latest, dict):
                     candidate_latest = {**candidate_latest, "state": "unknown",
@@ -2531,10 +2601,25 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
             binding_sources = binding.get("binding_sources", {})
             if not isinstance(binding_sources, dict):
                 continue
-            if context_proof_checks + len(binding_sources) > MAX_ADMISSION_SOURCE_FILES:
+            latest = binding.get("latest")
+            latest_source_name = (latest.get("source_file")
+                if isinstance(latest, dict) else None)
+            latest_source_token = binding.get("latest_source_token")
+            if latest_source_name and not isinstance(latest_source_token, str):
+                cached_listing = progress.get("listing")
+                if bundle_key == "@root":
+                    cached_listing = root_state.get("root_listing")
+                listing_key = "entries" if bundle_key == "@root" else "files"
+                latest_source_token = listing_entry_token(cached_listing,
+                    listing_key, latest_source_name)
+            latest_checks = 1 if latest_source_name else 0
+            if latest_source_name and not isinstance(latest_source_token, str):
+                continue
+            if (context_proof_checks + len(binding_sources) + latest_checks
+                    > MAX_ADMISSION_SOURCE_FILES):
                 context_scan_limited = True
                 break
-            context_proof_checks += len(binding_sources)
+            context_proof_checks += len(binding_sources) + latest_checks
             proof_valid = True
             for source_name, source_token in binding_sources.items():
                 try:
@@ -2544,6 +2629,19 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                 if observed != source_token:
                     proof_valid = False
                     break
+            if proof_valid and latest_source_name:
+                try:
+                    latest_info = (bundle / latest_source_name).lstat()
+                    latest_observed = _admission_stat_token(latest_info)
+                    if stat.S_ISLNK(latest_info.st_mode) \
+                            or not stat.S_ISREG(latest_info.st_mode):
+                        latest_observed = ""
+                except OSError:
+                    latest_observed = ""
+                if latest_observed != latest_source_token:
+                    if valid_latest_evidence(latest):
+                        note_generation_change("admission-bundle-generation-changed")
+                    proof_valid = False
             if not proof_valid:
                 continue
             generation_material = binding_generation_material(binding, progress)
@@ -2646,7 +2744,11 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
     elif partial or exhausted:
         uncertainty_reason = uncertainty_reason or "partial"
     elif not selected:
-        if uncertainty_reason not in {"source-invalid", "timestamp-invalid"}:
+        if known_exact_contexts:
+            if (not generation_revalidation_required
+                    and uncertainty_reason == "source-missing"):
+                uncertainty_reason = None
+        elif uncertainty_reason not in {"source-invalid", "timestamp-invalid"}:
             uncertainty_reason = "source-missing"
     if new_invalid_timestamp:
         uncertainty_reason = "timestamp-invalid"
