@@ -8554,7 +8554,13 @@ def _commit_sealed(
                    cycle_path=os.path.relpath(str(directory), str(root)))
     _remove_journal(root, record["cycle_id"])
     remove_interim(root, record["cycle_id"])
-    artifact_locator.update_indexes(root, [record["campaign_id"]])
+    # The seal is committed above.  The campaign locator index is a rebuildable view (readers scan
+    # the records), so a failed write only warns; the next update of this campaign rescans it.
+    try:
+        artifact_locator.update_indexes(root, [record["campaign_id"]])
+    except (OSError, artifact_locator.LocatorError) as exc:
+        print(f"locator_index_update skipped campaign={record['campaign_id']} "
+              f"error={type(exc).__name__}", file=sys.stderr)
     if already_closed:
         return
     artifact_cycle_titles.emit_after_seal_locked(root, sealed, document, directory / "manifest.json")
