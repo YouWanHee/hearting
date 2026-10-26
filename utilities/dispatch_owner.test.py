@@ -2067,18 +2067,23 @@ class RouteOwnerPinTest(unittest.TestCase):
         path.write_text(json.dumps(doc), encoding="utf-8")
         return path
 
-    def _launch(self, path, adapter, usage=None, extra=(), scores=None):
+    def _launch(self, path, adapter, usage=None, extra=(), scores=None, freshness=None):
         jobs = path.parent / "jobs.log"
         jobs.touch()
         calls = []
         binding = SimpleNamespace(route_file=str(path), route_id="rt-x", route_hash="sha256:x")
         buf = io.StringIO()
+        capacity_report = {
+            "scores": scores or {"claude": 3.0, "codex": 80.0, "opencode": 80.0},
+            "sources": {"claude": "taps"} if freshness is not None else {},
+        }
+        if freshness is not None:
+            capacity_report["freshness"] = freshness
         with mock.patch.object(OWNER.subprocess, "run",
                                side_effect=lambda cmd, **kw: (calls.append(cmd), SimpleNamespace(returncode=0))[1]), \
              mock.patch.object(OWNER, "_usage", return_value=usage or {"claude": "ok", "codex": "ok", "opencode": "ok"}), \
              mock.patch.object(OWNER._capacity, "capacity_report",
-                               return_value={"scores": scores or {"claude": 3.0, "codex": 80.0, "opencode": 80.0},
-                                             "sources": {}}), \
+                               return_value=capacity_report), \
              mock.patch.object(OWNER, "validate_owner_route_binding", return_value=binding), \
              mock.patch.object(OWNER, "export_owner_route_env", return_value=None), \
              mock.patch("artifact_producer.prepare_route_artifact_env", return_value={}), \
@@ -2134,9 +2139,23 @@ class RouteOwnerPinTest(unittest.TestCase):
 
     def test_requesting_the_pinned_owner_records_no_override(self):
         # what `work_start._start` actually does: the request is already the pin
-        got = self._launch(self._route(pin="claude"), "claude")
+        got = self._launch(
+            self._route(pin="claude"), "claude",
+            scores={"claude": 3.0, "codex": 80.0, "opencode": 80.0},
+            freshness={"claude": {
+                "basis": "file-mtime", "age_seconds": 12.0,
+                "stale_after_seconds": 3600, "observation_time": "unknown",
+            }},
+        )
         self.assertEqual((got.wrapper, got.flag), ("claude", None), got.out)
         self.assertRegex(got.out, r"(?m)^selection_source=explicit$")
+        self.assertRegex(got.out, r"(?m)^capacity_source\.claude=taps$")
+        self.assertRegex(got.out, r"(?m)^capacity_warning\.claude=headroom-below-gate:3\.0<10\.0$")
+        self.assertRegex(
+            got.out,
+            r"(?m)^capacity_freshness\.claude=basis:file-mtime;age-seconds:12\.0;"
+            r"stale-after-seconds:3600;observation-time:unknown$",
+        )
 
     def test_an_owner_pin_without_any_request_is_followed_and_records_no_request(self):
         got = self._launch(self._route(pin="claude"), None)
