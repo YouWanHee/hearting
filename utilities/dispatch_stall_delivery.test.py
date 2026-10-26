@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Closed-loop fixtures for advisory attempt stalls and exact parent receipts."""
 import importlib.util
+import copy
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,9 @@ import dispatch_supervision as supervision
 import peer_obligations
 from harness_capabilities import parent_completion
 from fleet.collectors.dispatch import _attempt_stall_attention
+from fleet.collectors import dispatch as fleet_dispatch
+from fleet import render as fleet_render
+from fleet import route as fleet_route
 from fleet.model import DispatchJob
 
 
@@ -92,6 +96,160 @@ class StallDeliveryLoopTest(unittest.TestCase):
         self.assertEqual(duty["intent"]["notice_delivery_id"], record["delivery_id"])
         self.assertEqual(duty["intent"]["notice_digest"], record["receipt_digest"])
         return metadata, carrier, record, duty
+
+    def _materialize_nested_stall(self, harness):
+        self.owner_attempt = "att-stall-owner-" + harness
+        self.attempt = "att-stall-child-" + harness
+        self.parent = "idle-parent-" + harness
+        self.immediate_parent = "owner-session-" + harness
+        carrier = parent_completion(harness)["carrier"]
+        common = {
+            "attempt_schema_version": "2", "transport": "headless",
+            "execution_surface": "registered-headless", "registered_worker": "1",
+            "fallback_hop": "same-harness-headless", "harness": harness,
+            "route_id": "rt-nested-stall", "route_hash": "sha256:" + "b" * 64,
+            "parent_harness": harness,
+            "pid_ns": dispatch_contract.process_namespace_identity() or "",
+            "pid_observer_ns": dispatch_contract.process_namespace_identity() or "",
+            "pid_scope": "host-visible",
+        }
+        owner = {**common, "dispatch_depth": "1", "worker_type": "owner",
+            "unit": "_kernel/owner", "route_node": "_owner",
+            "attempt_id": self.owner_attempt, "parent_sid": self.parent,
+            "parent_completion_delivery": carrier, "managed_sealed_batch_id": ""}
+        child = {**common, "dispatch_depth": "2", "worker_type": "stage",
+            "unit": "dev/backend", "route_node": "execute",
+            "attempt_id": self.attempt, "parent_attempt_id": self.owner_attempt,
+            "parent_sid": self.immediate_parent,
+            "parent_completion_delivery": carrier, "managed_sealed_batch_id": ""}
+        lines = []
+        for slug, metadata in (("owner", owner), ("child", child)):
+            lines.append("2026-10-26T00:00:00Z\topen\t/repo\t" + str(self.root)
+                + "\t" + slug + "\t" + ",".join(f"{key}={value}"
+                    for key, value in metadata.items()))
+        self.jobs.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        before_registry = self.jobs.read_bytes()
+        with mock.patch.dict(os.environ, {
+                "XDG_STATE_HOME": str(self.root / "xdg-state"),
+                "AGENT_PEER_LEDGER_ROOT": str(self.root / "peer-state")}), \
+             mock.patch.object(supervision, "_attempt_human_wait", return_value=False):
+            observation = supervision.update_attempt_stall_observation(
+                self.jobs, self.attempt, now=100.0, row=("open", child),
+                worktree=str(self.root))
+        self.assertEqual(observation["state"], "stalled")
+        with mock.patch.dict(os.environ, {
+                "XDG_STATE_HOME": str(self.root / "xdg-state"),
+                "AGENT_PEER_LEDGER_ROOT": str(self.root / "peer-state")}), \
+             mock.patch.object(dispatch_contract, "attempt_execution_observation",
+                return_value=dispatch_contract.AttemptExecutionObservation(
+                    "absent", "carrier-only")), \
+             mock.patch.object(supervision, "_attempt_human_wait", return_value=False), \
+             mock.patch("peer_obligations.ensure_normal_runner"):
+            records = supervision.materialize(
+                self.jobs, {self.attempt}, reason="attempt-stalled")
+        self.assertEqual(self.jobs.read_bytes(), before_registry)
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["recipient_kind"], carrier)
+        self.assertEqual(record["recipient_digest"], pending.recipient_digest(self.parent))
+        self.assertEqual(record["receipt"]["owner_attempt_id"], self.owner_attempt)
+        self.assertEqual(record["receipt"]["monitored_attempt_ids"], [self.attempt])
+        self.assertEqual(record["receipt"]["recipient_thread_id"], self.parent)
+        with mock.patch.object(supervision, "_attempt_human_wait", return_value=False):
+            self.assertTrue(supervision.notice_is_current(record))
+        duty_id = peer_obligations.stable_duty_id("registered-batch", {
+            "jobs": str(self.jobs.resolve()), "attempt_id": self.owner_attempt,
+            "session_id": self.parent, "harness": harness, "server": "default",
+        }, record["delivery_id"])
+        duty = peer_obligations.ObligationStore(self.jobs.parent).get(duty_id)
+        self.assertEqual(duty["intent"]["notice_delivery_id"], record["delivery_id"])
+        return child, record
+
+    def _collect_fleet_jobs(self):
+        with mock.patch.object(fleet_dispatch, "_scan_processes", return_value=[]), \
+             mock.patch.object(fleet_dispatch, "_live_attempt_ids", return_value=set()), \
+             mock.patch.object(fleet_dispatch, "_dispatch_liveness", return_value="working"), \
+             mock.patch.object(fleet_dispatch, "_note_home_view", return_value=True), \
+             mock.patch.object(fleet_dispatch, "_build_codex_rollout_index", return_value=None), \
+             mock.patch.object(fleet_dispatch, "_reconcile_drill_rows", side_effect=lambda jobs, *a, **k: jobs), \
+             mock.patch.object(supervision, "_attempt_human_wait", return_value=False), \
+             mock.patch.object(fleet_dispatch, "_enrich_claude_stream_session"), \
+             mock.patch.object(fleet_dispatch, "_enrich_codex_attempt_session"), \
+             mock.patch.object(fleet_dispatch, "_enrich_opencode_attempt_session"), \
+             mock.patch.object(fleet_dispatch, "_enrich_attempt_summary"):
+            return fleet_dispatch.collect(jobs_path=str(self.jobs), fast_first=True)
+
+    def test_nested_child_notice_projects_through_fleet_and_clears_after_recovery(self):
+        child_metadata, record = self._materialize_nested_stall("codex")
+        jobs = self._collect_fleet_jobs()
+        child_job = next(job for job in jobs if job.attempt_id == self.attempt)
+        self.assertEqual(child_job.parent_sid, self.immediate_parent)
+        self.assertEqual(child_job.stall_observation["delivery_id"], record["delivery_id"])
+        node = fleet_route._node_state("execute", [child_job], {}, now=200.0)
+        self.assertEqual(node["state"], "attention")
+        text, _color, _mark = fleet_render._route_node_text({"id": "execute", **node})
+        self.assertIn("! stalled", text)
+
+        with mock.patch.object(dispatch_contract, "attempt_execution_observation",
+                return_value=dispatch_contract.AttemptExecutionObservation(
+                    "active", "runtime-command-live")), \
+             mock.patch.object(supervision, "_attempt_human_wait", return_value=False):
+            recovered = supervision.update_attempt_stall_observation(
+                self.jobs, self.attempt, now=200.0, row=("open", child_metadata),
+                worktree=str(self.root))
+        self.assertEqual(recovered["state"], "active")
+        recovered_jobs = self._collect_fleet_jobs()
+        recovered_child = next(job for job in recovered_jobs if job.attempt_id == self.attempt)
+        self.assertIsNone(recovered_child.stall_observation)
+        recovered_node = fleet_route._node_state(
+            "execute", [recovered_child], {}, now=300.0)
+        self.assertEqual(recovered_node["state"], "active")
+        recovered_text, _color, _mark = fleet_render._route_node_text(
+            {"id": "execute", **recovered_node})
+        self.assertNotIn("! stalled", recovered_text)
+
+    def test_nested_fleet_binding_rejects_wrong_member_digest_and_recipient(self):
+        _child, record = self._materialize_nested_stall("codex")
+        state_path = self.root / "watchdog" / f"{self.attempt}.json"
+        original_bytes = state_path.read_bytes()
+        original_state = json.loads(original_bytes)
+        original_stall = original_state["stall_observation"]
+        import dispatch_supervision
+
+        def collect_with(stall, retained_record, *, current=True, reader=None):
+            state = dict(original_state)
+            state["stall_observation"] = stall
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            read = reader or (lambda *_args, **_kwargs: retained_record)
+            with mock.patch("dispatch_pending_delivery.read", side_effect=read), \
+                 mock.patch.object(dispatch_supervision, "notice_is_current",
+                                   return_value=current):
+                jobs = self._collect_fleet_jobs()
+            return next(job for job in jobs if job.attempt_id == self.attempt)
+
+        try:
+            wrong_member = copy.deepcopy(record)
+            wrong_member["receipt"]["monitored_attempt_ids"] = ["att-other-member"]
+            wrong_member["receipt_digest"] = supervision.receipt_digest(wrong_member["receipt"])
+            stall = dict(original_stall, notice_digest=wrong_member["receipt_digest"])
+            self.assertIsNone(collect_with(stall, wrong_member).stall_observation)
+
+            wrong_digest = copy.deepcopy(record)
+            wrong_digest["receipt_digest"] = "sha256:" + "0" * 64
+            self.assertIsNone(collect_with(original_stall, wrong_digest).stall_observation)
+
+            wrong_recipient_stall = dict(original_stall,
+                delivery_recipient_thread_id=self.immediate_parent,
+                delivery_recipient_digest=pending.recipient_digest(self.immediate_parent))
+            requested = []
+            def exact_key_read(root, recipient, delivery_id):
+                requested.append(recipient)
+                return record
+            self.assertIsNone(collect_with(
+                wrong_recipient_stall, record, reader=exact_key_read).stall_observation)
+            self.assertEqual(requested, [self.immediate_parent])
+        finally:
+            state_path.write_bytes(original_bytes)
 
     def test_observation_retention_courier_exact_receive_and_recovery_for_each_adapter(self):
         for harness in ("claude", "codex", "opencode"):

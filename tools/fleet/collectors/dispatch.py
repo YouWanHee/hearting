@@ -993,21 +993,39 @@ def _attempt_stall_attention(job):
         return None
     delivery_id = stall.get("delivery_id")
     digest = stall.get("notice_digest")
-    storage = getattr(job, "parent_sid", None)
+    owner_attempt_id = stall.get("delivery_owner_attempt_id")
+    storage = stall.get("delivery_recipient_thread_id")
+    recipient_digest = stall.get("delivery_recipient_digest")
+    recipient_kind = stall.get("delivery_recipient_kind")
     registry = Path(getattr(job, "_registry_path", ""))
-    if not (delivery_id and digest and storage and registry.is_absolute()):
+    if (not all(isinstance(value, str) and value for value in (
+            delivery_id, digest, owner_attempt_id, storage, recipient_digest, recipient_kind))
+            or not re.fullmatch(r"delivery-[0-9a-f]{64}", delivery_id)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+            or not re.fullmatch(r"[0-9a-f]{64}", recipient_digest)
+            or len(storage) > 512 or any(ord(char) < 32 for char in storage)
+            or not registry.is_absolute()):
         return None
     try:
         import dispatch_pending_delivery as pending
         record = pending.read(registry.parent, storage, delivery_id)
-        if (not record or record.get("receipt_digest") != digest
-                or record.get("receipt", {}).get("reason") != "attempt-stalled"
-                or job.attempt_id not in (record.get("receipt", {}).get("monitored_attempt_ids") or [])):
+        receipt = (record or {}).get("receipt")
+        if (not record or not isinstance(receipt, dict)
+                or record.get("delivery_id") != delivery_id
+                or record.get("receipt_digest") != digest
+                or record.get("recipient_digest") != recipient_digest
+                or recipient_digest != pending.recipient_digest(storage)
+                or record.get("recipient_kind") != recipient_kind
+                or receipt.get("owner_attempt_id") != owner_attempt_id
+                or receipt.get("recipient_thread_id") != storage
+                or receipt.get("pending_delivery_id") != delivery_id
+                or receipt.get("reason") != "attempt-stalled"
+                or job.attempt_id not in (receipt.get("monitored_attempt_ids") or [])):
             return None
         import dispatch_supervision
         if not dispatch_supervision.notice_is_current(record):
             return None
-    except (OSError, ValueError, RuntimeError):
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         return None
     result = {key: stall.get(key) for key in (
         "state", "reason", "attempt_id", "route_id", "route_node",

@@ -591,6 +591,19 @@ def update_open_attempt_stall_observations(jobs):
 def _attach_stall_delivery(jobs, attempt_id, record):
     """Bind the read-only Fleet projection to the exact retained delivery."""
     from dispatch_contract import dispatch_state_root
+    receipt = record.get("receipt") if isinstance(record, dict) else None
+    recipient = receipt.get("recipient_thread_id") if isinstance(receipt, dict) else None
+    monitored = receipt.get("monitored_attempt_ids") if isinstance(receipt, dict) else None
+    delivery_id = record.get("delivery_id") if isinstance(record, dict) else None
+    digest = record.get("receipt_digest") if isinstance(record, dict) else None
+    recipient_digest = record.get("recipient_digest") if isinstance(record, dict) else None
+    if (not isinstance(receipt, dict)
+            or not isinstance(monitored, list) or attempt_id not in monitored
+            or not receipt.get("owner_attempt_id") or not recipient
+            or delivery_id != receipt.get("pending_delivery_id")
+            or digest != receipt_digest(receipt)
+            or recipient_digest != pending_delivery.recipient_digest(recipient)):
+        return
     name = attempt_id.replace("/", "_")
     path = dispatch_state_root(jobs) / "watchdog" / f"{name}.json"
     lock_path = path.with_suffix(".lock")
@@ -599,12 +612,17 @@ def _attach_stall_delivery(jobs, attempt_id, record):
         state = _observation_read(path)
         observation = state.get("stall_observation")
         if (not isinstance(observation, dict)
-                or observation.get("attempt_id") != attempt_id
-                or record.get("receipt", {}).get("owner_attempt_id") != attempt_id):
+                or observation.get("attempt_id") != attempt_id):
             return
-        observation.update({"delivery_id": record.get("delivery_id"),
-                            "notice_digest": record.get("receipt_digest"),
-                            "obligation_revision": (record.get("receipt") or {}).get("obligation_revision")})
+        observation.update({
+            "delivery_id": delivery_id,
+            "notice_digest": digest,
+            "delivery_owner_attempt_id": receipt["owner_attempt_id"],
+            "delivery_recipient_thread_id": recipient,
+            "delivery_recipient_digest": recipient_digest,
+            "delivery_recipient_kind": record.get("recipient_kind"),
+            "obligation_revision": receipt.get("obligation_revision"),
+        })
         state["stall_observation"] = observation
         _observation_write(path, state)
     finally:
