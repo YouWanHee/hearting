@@ -705,11 +705,11 @@ class MetricSourcesTest(unittest.TestCase):
 
         self.assertEqual(result["coverage"], "observed",
             f"warnings={result['warnings']} continuation={trace!r}")
-        self.assertEqual(len(trace), 4,
+        self.assertEqual(len(trace), 2,
             f"unexpected bounded poll count: {trace!r}")
         self.assertEqual([item["coverage"] for item in trace],
-                         ["partial", "observed", "partial", "observed"])
-        self.assertEqual([item["samples"] for item in trace], [0, 2, 0, 2])
+                         ["partial", "observed"])
+        self.assertEqual([item["samples"] for item in trace], [0, 4])
         self.assertFalse(trace[0]["target_seen"])
         final_binding = cursor["scan"][root_key]["bundle_cursors"][bundle.name][
             "binding_state"]
@@ -733,6 +733,118 @@ class MetricSourcesTest(unittest.TestCase):
             if item["name"] == "admission-0003-00.json")
         self.assertEqual(listing_row["token"], metrics._admission_stat_token(
             (bundle / "admission-0003-00.json").lstat()))
+
+    def test_resumed_listing_revalidates_prefix_before_current_admission(self):
+        root = self.root / "slow-cached-prefix-mutation"
+        bundle = root / "selected-bundle"
+        bundle.mkdir(parents=True)
+        registry = root / "resource-runs.json"
+        run_id = "ami-leg2__leg2-run-config__8ec838ee14c4__a8"
+        registry.write_text(json.dumps({"runs": {run_id: {
+            "run_id": run_id, "started_at": 1}}}) + "\n")
+        for index in range(4):
+            (bundle / f"admission-{index:04d}.json").write_text(json.dumps({
+                "admitted": index in {1, 2},
+                "snapshot": {"t": 10 + index},
+                "shared_admission": {"authorized_run_id": "other-smoke-run"},
+            }))
+        (bundle / "entry.json").write_text(json.dumps({
+            "run_id": run_id, "selection_sha256": "a" * 64,
+            "selection_replay_sha256": "b" * 64}))
+
+        cursor = metrics.read_admission_sources([root], run_id=run_id,
+            row_key="run", registry_path=registry, started_at=1, now=200)["cursor"]
+        previous = {}
+        clock = [0.0]
+        original_lstat = Path.lstat
+
+        def slow_cached_lstat(path):
+            result = original_lstat(path)
+            if (sys._getframe(1).f_code.co_name == "revalidate_listing_entries"
+                    and path.parent == bundle):
+                clock[0] += 0.1
+            return result
+
+        trace = []
+        results = []
+        with mock.patch.object(Path, "lstat", slow_cached_lstat):
+            for turn in range(6):
+                clock[0] = 0.0
+                result = metrics.read_admission_sources([root], run_id=run_id,
+                    row_key="run", registry_path=registry, started_at=1,
+                    now=201 + turn, cursor=cursor, monotonic=lambda: clock[0],
+                    time_budget=0.25)
+                summary, state = progress._admission_summary(previous, result,
+                    201 + turn, run_id, "run", 1)
+                previous = {**previous, **state}
+                results.append(result)
+                trace.append({"turn": turn, "coverage": result["coverage"],
+                    "latest": result["latest"], "current": summary["state"],
+                    "freshness_seconds": summary["freshness_seconds"],
+                    "revalidation_after": state["admission_cursor"]["scan"][
+                        str(root)]["bundle_cursors"][bundle.name]["listing"].get(
+                            "revalidation_after")})
+                # Re-adopt exactly as resource_progress does at each poll boundary.
+                cursor = progress._restore_special_numbers(json.loads(json.dumps(
+                    progress._json_safe(state["admission_cursor"]))))
+                if turn == 0:
+                    self.assertEqual(result["coverage"], "partial")
+                    listing = cursor["scan"][str(root)]["bundle_cursors"][
+                        bundle.name]["listing"]
+                    self.assertEqual(listing.get("revalidation_after"),
+                                     "admission-0002.json")
+                    directory_token = metrics._admission_stat_token(bundle.lstat())
+                    prefix = bundle / "admission-0000.json"
+                    replacement = json.loads(prefix.read_text())
+                    replacement["admitted"] = True
+                    replacement["snapshot"]["t"] = 99
+                    prefix.write_text(json.dumps(replacement))
+                    self.assertEqual(metrics._admission_stat_token(bundle.lstat()),
+                                     directory_token)
+
+                latest = result.get("latest")
+                if (result["coverage"] == "observed"
+                        and isinstance(latest, dict)
+                        and latest.get("state") == "admitted"
+                        and latest.get("at") == 99):
+                    break
+
+        resumed = results[1]
+        self.assertEqual(len(results), 2,
+            f"continuation did not retain bounded progress: {trace!r}")
+        resumed_summary, _ = progress._admission_summary({}, resumed,
+            202, run_id, "run", 1)
+        self.assertFalse(resumed["coverage"] == "observed"
+            and resumed.get("latest") is not None
+            and resumed["latest"].get("state") == "denied"
+            and resumed["latest"].get("at") == 13
+            and resumed_summary["state"] == "waiting"
+            and resumed_summary["freshness_seconds"] == 202 - 13,
+            f"stale prefix decision escaped continuation: {trace!r}")
+        self.assertNotEqual((resumed_summary["state"],
+                             resumed_summary["freshness_seconds"]),
+                            ("waiting", 202 - 13),
+            f"stale current freshness escaped continuation: {trace!r}")
+        self.assertEqual(results[-1]["coverage"], "observed",
+            f"bounded prefix continuation did not finish: {trace!r}")
+        self.assertEqual(resumed["coverage"], "observed")
+        self.assertEqual(results[-1]["latest"]["state"], "admitted",
+            f"current prefix decision was not selected: {trace!r}")
+        self.assertEqual(results[-1]["latest"]["at"], 99,
+            f"prefix rewrite was not adopted: {trace!r}")
+        self.assertEqual(previous["admission_current_state"], "admitted")
+        self.assertEqual(resumed_summary["state"], "admitted")
+        self.assertEqual(resumed_summary["freshness_seconds"], 202 - 99)
+        final_listing = cursor["scan"][str(root)]["bundle_cursors"][
+            bundle.name]["listing"]
+        prefix_entry = next(item for item in final_listing["files"]
+                            if item["name"] == "admission-0000.json")
+        self.assertEqual(prefix_entry["token"], metrics._admission_stat_token(
+            (bundle / "admission-0000.json").lstat()))
+        emitted_ids = [sample["sample_id"] for result in results
+                       for sample in result["samples"]]
+        self.assertEqual(len(emitted_ids), len(set(emitted_ids)),
+            f"continued prefix sample was emitted more than once: {trace!r}")
 
     def test_evicted_listing_cursor_resumes_exact_binding_without_restarting(self):
         root = self.root / "installed-cursor-without-bundle-cache"
