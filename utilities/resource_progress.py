@@ -1195,8 +1195,21 @@ def read_experiment_observation(run, registry, row_key):
         if (value.get("run_id") != run.get("run_id")
                 or value.get("row_key") != str(row_key)):
             return None
+        counts = value.get("admission_counts")
+        has_admission_history = (
+            isinstance(value.get("admission_cursor"), dict)
+            and bool(value["admission_cursor"])) or (
+            isinstance(counts, dict) and any(type(counts.get(key)) is int
+                and counts[key] > 0 for key in ("admitted", "denied", "unknown"))) or (
+            isinstance(value.get("admission_latest"), dict)
+            or isinstance(value.get("admission_summary"), dict)
+            or isinstance(value.get("admission_generation"), str)
+            and bool(value["admission_generation"]))
+        source_observations = value.get("source_observations")
         return {"available": True, "observation": value.get("observation"),
                 "metrics": value.get("sources", []), "metric_root": None,
+                "has_persisted_observation": bool(has_admission_history
+                    or isinstance(source_observations, list) and source_observations),
                 "record_path": None, "delivery": [], "warnings": value.get("warnings", []),
                 "state_path": str(path)}
     except (OSError, ValueError, TypeError, RuntimeError):

@@ -1382,6 +1382,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     uncertainty_reason = uncertainty_reason or "generation-changed"
                     bundle_progress = {}
                 cached_bundle = bundle_progress.get("listing")
+                previous_listing = None
                 if isinstance(cached_bundle, dict) and (
                         cached_bundle.get("identity") != bundle_identity
                         or cached_bundle.get("generation") != bundle_listing_generation):
@@ -1389,12 +1390,13 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     binding_state = bundle_progress.get("binding_state")
                     if (cached_bundle.get("identity") == bundle_identity
                             and isinstance(binding_state, dict)
-                            and binding_state.get("target_seen") is True
                             and binding_state.get("foreign_seen") is not True):
-                        # Re-read the selected population after an append while
-                        # retaining its validated identity and dedup history.
-                        bundle_progress["last_file"] = ""
-                        binding_state["phase"] = "decisions"
+                        # The directory inode still names the same bundle. Keep
+                        # pre-binding progress, then reconcile changed entries
+                        # before its cursor against the refreshed listing.
+                        previous_listing = cached_bundle
+                        binding_state["phase"] = "binding"
+                        binding_state["binding_complete"] = False
                     else:
                         if cached_bundle.get("identity") != bundle_identity:
                             warnings.append("admission-bundle-generation-changed")
@@ -1552,6 +1554,18 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     if listing_partial:
                         partial = True
                     bundle_incomplete = listing_partial
+                if previous_listing is not None and file_cursor:
+                    old_tokens = {item.get("name"): item.get("token")
+                        for item in previous_listing.get("files", [])
+                        if isinstance(item, dict) and isinstance(item.get("name"), str)}
+                    changed_before_cursor = [index for index, item in enumerate(files)
+                        if item[0] <= file_cursor and old_tokens.get(item[0]) != item[3]]
+                    if changed_before_cursor:
+                        # Rewind to the file immediately before the first added
+                        # or replaced entry. The normal per-bundle cursor then
+                        # carries that bounded reconciliation across pages.
+                        first_changed = min(changed_before_cursor)
+                        file_cursor = files[first_changed - 1][0] if first_changed else ""
                 if file_cursor:
                     files = [item for item in files if item[0] > file_cursor]
                 documents = []
@@ -1671,14 +1685,24 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         uncertainty_reason = uncertainty_reason or "generation-changed"
                         documents = []
                         binding_state = new_binding_state(bundle_key, bundle_identity)
-                    file_cursor = ""
-                    last_file_processed = ""
+                        bundle_progress.pop("listing", None)
+                        if bundle == root:
+                            root_state.pop("root_listing", None)
+                        file_cursor = ""
+                        last_file_processed = ""
+                    else:
+                        # An append during this page invalidates completeness,
+                        # but not the directory or prior identity proof. Keep
+                        # the scan position and the listing snapshot so the next
+                        # refresh can reconcile additions before this cursor.
+                        binding_state["phase"] = "binding"
+                        binding_state["binding_complete"] = False
                     bundle_incomplete = True
                 for document, file_name, file_token in documents:
                     add_binding_document(binding_state, document, file_name, file_token)
                 if invalid_bundle_record:
                     binding_state["partial"] = True
-                if binding_state.get("phase") == "binding" and not bundle_incomplete:
+                if not bundle_incomplete:
                     binding_state["binding_complete"] = True
                 if binding_state.get("overflow"):
                     warnings.append("admission-binding-summary-limit")
@@ -1716,6 +1740,7 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     .encode("utf-8")).hexdigest()[:24]
                 exact_binding = (binding_state.get("target_seen") is True
                                  and binding_state.get("foreign_seen") is not True
+                                 and binding_state.get("binding_complete") is True
                                  and binding_state.get("partial") is not True
                                  and binding_state.get("overflow") is not True)
                 if (binding_state.get("phase") == "binding"
@@ -1743,6 +1768,14 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                             for document, source_name, _token in documents
                             for sample, row_ids in _admission_decisions([document]))
                     elif bundle_incomplete:
+                        if isinstance(binding_state.get("latest"), dict):
+                            prior_latest = {**binding_state["latest"],
+                                "state": "unknown", "reasons": [],
+                                "priority_blockers": []}
+                            candidates.append({"ambiguous": True,
+                                "generation": bundle_generation, "samples": [],
+                                "all_samples": [], "latest": prior_latest,
+                                "partial": True, "path": str(bundle)})
                         if exhausted:
                             break
                         continue

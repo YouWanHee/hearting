@@ -458,6 +458,132 @@ class ResourceRegistryTest(unittest.TestCase):
             self.assertEqual(resumed["experiment_observation"]["observation"]
                 ["source_observations"][0]["value"], 21)
 
+    def test_rootless_stale_observer_resumes_exact_admission_only_history(self):
+        import resource_metric_sources as metrics
+        import resource_progress
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            artifact = base / "artifacts"
+            artifact.mkdir()
+            route = artifact / "route.data"
+            route.write_text(json.dumps({"route_id": "route-admission-only",
+                                         "artifact_root": str(artifact)}))
+            registry_dir = base / "registry"
+            bundle = registry_dir / "arbitrary-admission-bundle"
+            bundle.mkdir(parents=True)
+            registry_path = registry_dir / "resource-runs.json"
+            run_id = "rootless-admission-only-run"
+            (bundle / "arbitrary-context.data").write_text(json.dumps({
+                "run_id": run_id, "started_at": 800}))
+            (bundle / "prior-admission-record.data").write_text(json.dumps({
+                "admitted": False, "snapshot": {"t": 850}}))
+            identity = {"pid": 77, "starttime": "9", "command_hash": "a" * 64,
+                        "process_group": 77}
+            raw_row = {**identity, "run_id": run_id, "status": "running",
+                "started_at": 800, "pid_namespace": "pid:[foreign-fixture]",
+                "route": str(route), "route_id": "route-admission-only",
+                "jobs": str(base / "dispatch" / "jobs.log"),
+                "execution": {"kind": "local-resource", "run_id": "execution-admission"},
+                "owner_wait": {"harness": "codex", "session_id": "fixture-owner"}}
+            registry_bytes = json.dumps({"schema_version": 1,
+                "runs": {run_id: raw_row}}, sort_keys=True).encode() + b"\n"
+            registry_path.write_bytes(registry_bytes)
+
+            decoded = metrics.read_admission_sources([registry_dir], run_id=run_id,
+                registry_path=registry_path, now=900)
+            self.assertEqual(decoded["coverage"], "observed")
+            self.assertEqual(len(decoded["samples"]), 1)
+            summary, admission_state = resource_progress._admission_summary(
+                {}, decoded, 900, run_id, "run", None)
+            observation = {"admission": summary, "reached": None, "total": None,
+                "unit": None, "rate_per_second": None, "eta_seconds": None,
+                "elapsed_seconds": None, "stagnation": {"state": "unknown"},
+                "attention": []}
+            state_path = resource_progress._observation_state_path(
+                raw_row, registry_path, "run")
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            resource_progress._write_observation_state(state_path, {
+                "schema_version": resource_progress.OBSERVATION_VERSION,
+                "run_id": run_id, "row_key": "run", **admission_state,
+                "admission_summary": summary, "admission_coverage": decoded["coverage"],
+                "last_admission_observed_at": 900, "last_observer_poll_at": 900,
+                "public_status": "stale", "clock_scope": "unknown",
+                "row_started_at": None, "schedule_started_at": None,
+                "cursor": None, "samples": [], "sources": [],
+                "observation": observation, "event_keys": [], "outbox": []})
+            self.assertNotIn("source_bindings", resource_progress._read_observation_state(state_path))
+            self.assertNotIn("source_observations", resource_progress._read_observation_state(state_path))
+            state_before_read = state_path.read_bytes()
+
+            jobs_path = Path(raw_row["jobs"])
+            jobs_path.parent.mkdir(parents=True, exist_ok=True)
+            jobs_path.touch()
+            notices = []
+
+            def capture_notice(*args, **kwargs):
+                notices.append(kwargs)
+                return {"state": "pending"}
+
+            with mock.patch.object(registry, "proc_identity", return_value=identity), \
+                    mock.patch("session_notice.notify", side_effect=capture_notice):
+                normalized = registry.normalize_run(run_id, raw_row, registry_path,
+                    identity_reader=lambda _pid: identity, now=901)
+                self.assertEqual(state_path.read_bytes(), state_before_read)
+                self.assertEqual(normalized["liveness"], "stale")
+                self.assertEqual(normalized["state_evidence"]["reason"],
+                                 "process-namespace-mismatch")
+                self.assertEqual(normalized["experiment_observation"]["observation"],
+                                 observation)
+
+                (bundle / "unrelated-admission-record.data").write_text(json.dumps({
+                    "admitted": False, "snapshot": {"t": 950},
+                    "preceding_evaluation_leases": [{"task": "evaluation",
+                                                       "host": "fixture-host"}]}))
+                due = registry.observe_run_if_due(run_id, raw_row, registry_path, now=1000)
+                final_state = resource_progress._read_observation_state(state_path)
+                public = resource_progress.read_public_run_record(artifact, run_id)
+
+            self.assertEqual(registry_path.read_bytes(), registry_bytes)
+            self.assertNotIn("output_dir", raw_row)
+            self.assertNotIn("progress_file", raw_row)
+            self.assertNotIn("observation", raw_row)
+            self.assertEqual(due["liveness"], "stale")
+            self.assertEqual(due["state_evidence"]["reason"],
+                             "process-namespace-mismatch")
+            self.assertEqual(final_state["admission_counts"],
+                             {"admitted": 0, "denied": 2, "unknown": 0})
+            self.assertEqual(final_state["admission_current_state"], "waiting")
+            self.assertEqual(final_state["clock_scope"], "row")
+            self.assertEqual(final_state["row_started_at"], 800)
+            self.assertEqual(final_state["source_bindings"], [])
+            self.assertEqual(final_state["source_observations"], [])
+            final_observation = final_state["observation"]
+            self.assertEqual(final_observation["admission"]["denied_sample_ratio"], 1.0)
+            self.assertIsNone(final_observation["admission"]["wait_duration_seconds"])
+            self.assertIsNone(final_observation["admission"]["time_ratio"])
+            self.assertIsNone(final_observation["reached"])
+            self.assertIsNone(final_observation["total"])
+            self.assertIsNone(final_observation["unit"])
+            self.assertIsNone(final_observation["eta_seconds"])
+            self.assertEqual(final_observation["elapsed_seconds"], 200)
+            self.assertIsNone(final_observation["rate_per_second"])
+            self.assertIsNone(final_observation["predicted_total_seconds"])
+            self.assertEqual(public["status"], "stale")
+            self.assertEqual(public["admission"]["denied_samples"], 2)
+            self.assertEqual(public["progress"]["observed_counters"], [])
+            self.assertIsNone(public["progress"]["reached"])
+            self.assertIsNone(public["progress"]["total"])
+            self.assertIsNone(public["progress"].get("eta_seconds"))
+            self.assertEqual(public["rows"][0]["started_at"], 800)
+            self.assertEqual(public["rows"][0]["clock_scope"], "row")
+            self.assertEqual(len(notices), 1)
+            self.assertIn("admission=waiting", notices[0]["text"])
+            event = next(item for item in final_state["outbox"]
+                         if item.get("kind") == "attention")
+            self.assertEqual(event["recipients"][0]["session_id"], "fixture-owner")
+            self.assertEqual(notices[0]["lineage"], event["recipients"][0]["lineage"])
+
     def test_rootless_stale_observer_resumes_exact_persisted_generic_binding(self):
         import hashlib
         import resource_progress

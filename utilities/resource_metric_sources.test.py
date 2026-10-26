@@ -445,6 +445,115 @@ class MetricSourcesTest(unittest.TestCase):
                 self.assertEqual([sample["state"] for sample in emitted], ["denied"])
                 self.assertEqual(pages[-1]["latest"]["state"], "denied")
 
+    def test_initial_binding_continues_across_additions_before_and_after_cursor(self):
+        root = self.root / "changing-initial-binding"
+        bundle = root / "arbitrary-bundle"
+        bundle.mkdir(parents=True)
+        run_id = "fixture-run-41"
+        for index in range(40):
+            (bundle / f"decision-{index:03d}.data").write_text(json.dumps({
+                "admitted": index % 3 != 0, "sample_index": index,
+                "snapshot": {"t": 100 + index}}))
+        (bundle / "zzzzzz-run-context.data").write_text(json.dumps({
+            "run_id": run_id, "started_at": 1}))
+
+        additions = 0
+        expected_admitted = sum(index % 3 != 0 for index in range(40))
+
+        def add_decision(name, index):
+            nonlocal additions, expected_admitted
+            admitted = index % 3 != 0
+            (bundle / name).write_text(json.dumps({
+                "admitted": admitted, "sample_index": index,
+                "snapshot": {"t": 1000 + index}}))
+            additions += 1
+            expected_admitted += admitted
+
+        cursor = None
+        seen = {}
+        with mock.patch.object(metrics, "MAX_ADMISSION_BYTES_PER_PASS", 160):
+            page = metrics.read_admission_sources([root], run_id=run_id,
+                started_at=1, now=10000, cursor=cursor)
+            self.assertEqual(page["coverage"], "partial")
+            initial_state = page["cursor"]["scan"][str(root)]["bundle_cursors"][
+                bundle.name]["binding_state"]
+            self.assertFalse(initial_state["target_seen"])
+            file_cursor = page["cursor"]["scan"][str(root)]["bundle_cursors"][
+                bundle.name]["last_file"]
+            self.assertTrue(file_cursor)
+            add_decision("!before-cursor.data", 100)
+            add_decision("zzzz-000-after-cursor.data", 101)
+
+            for turn in range(1, 120):
+                bundle_cursor = page["cursor"]["scan"][str(root)]["bundle_cursors"][
+                    bundle.name]
+                binding = bundle_cursor["binding_state"]
+                if not binding["target_seen"]:
+                    add_decision(f"zzzz-{turn:03d}-live-addition.data", 1000 + turn)
+                page = metrics.read_admission_sources([root], run_id=run_id,
+                    started_at=1, now=10000, cursor=page["cursor"])
+                seen.update({row["sample_id"]: row for row in page["samples"]})
+                if page["coverage"] == "observed":
+                    break
+
+        self.assertEqual(page["coverage"], "observed")
+        final_binding = page["cursor"]["scan"][str(root)]["bundle_cursors"][
+            bundle.name]["binding_state"]
+        self.assertTrue(final_binding["target_seen"])
+        self.assertTrue(final_binding["binding_complete"])
+        self.assertFalse(final_binding["foreign_seen"])
+        self.assertGreaterEqual(additions, 20)
+        expected_total = 40 + additions
+        self.assertEqual(len(seen), expected_total)
+        self.assertEqual(sum(row["state"] == "admitted" for row in seen.values()),
+                         expected_admitted)
+        self.assertTrue(all(row["state"] in {"admitted", "denied"}
+                            for row in seen.values()))
+        replay = metrics.read_admission_sources([root], run_id=run_id,
+            started_at=1, now=10001, cursor=page["cursor"])
+        self.assertEqual(replay["coverage"], "observed")
+        self.assertEqual(replay["samples"], [])
+        self.assertEqual(replay["latest"], page["latest"])
+
+    def test_new_foreign_binding_before_cursor_blocks_exact_attribution(self):
+        root = self.root / "new-foreign-context-before-cursor"
+        bundle = root / "ordinary-child"
+        bundle.mkdir(parents=True)
+        for index in range(12):
+            (bundle / f"decision-{index:03d}.data").write_text(json.dumps({
+                "admitted": True, "sample_index": index,
+                "snapshot": {"t": 100 + index}}))
+        (bundle / "zzzz-target-context.data").write_text(
+            '{"run_id":"selected-identity","started_at":1}')
+
+        with mock.patch.object(metrics, "MAX_ADMISSION_BYTES_PER_PASS", 120):
+            page = metrics.read_admission_sources([root], run_id="selected-identity",
+                started_at=1, now=1000)
+            self.assertEqual(page["coverage"], "partial")
+            self.assertFalse(page["cursor"]["scan"][str(root)]["bundle_cursors"]
+                [bundle.name]["binding_state"]["target_seen"])
+            (bundle / "!new-context.data").write_text(
+                '{"run_id":"foreign-identity","started_at":1}')
+            seen = {}
+            for _ in range(40):
+                page = metrics.read_admission_sources([root], run_id="selected-identity",
+                    started_at=1, now=1000, cursor=page["cursor"])
+                seen.update({row["sample_id"]: row for row in page["samples"]})
+                binding = page["cursor"]["scan"][str(root)]["bundle_cursors"][
+                    bundle.name]["binding_state"]
+                if page["coverage"] == "unknown" and binding["binding_complete"]:
+                    break
+
+        self.assertEqual(page["coverage"], "unknown")
+        binding = page["cursor"]["scan"][str(root)]["bundle_cursors"][
+            bundle.name]["binding_state"]
+        self.assertTrue(binding["target_seen"])
+        self.assertTrue(binding["foreign_seen"])
+        self.assertTrue(binding["binding_complete"])
+        self.assertEqual(len(seen), 12)
+        self.assertTrue(seen)
+        self.assertTrue(all(row["state"] == "unknown" for row in seen.values()))
+
     def test_admission_reader_invalidates_replaced_foreign_binding_file(self):
         root = self.root / "replaced-binding-file"
         bundle = root / "bundle"

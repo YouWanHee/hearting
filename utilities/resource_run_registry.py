@@ -697,7 +697,7 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         and bool(observation_meta.get("source_bindings"))
     if (artifact_root or run.get("output_dir")
             or (training_progress and training_progress.get("directory"))
-            or has_source_bindings):
+            or has_source_bindings or liveness == "stale"):
         from resource_progress import read_experiment_observation
         observation_rows = []
         if training_progress and training_progress.get("directory"):
@@ -716,16 +716,13 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         elif not observation_rows and liveness == "stale":
             # A prior exact observation can outlive local process visibility.
             # The bounded reader derives the state path from run/process/
-            # execution/row identity and never creates state; only retain a
-            # projection that already records source observations.
+            # execution/row identity and never creates state; retain only
+            # exact state that already contains source or admission history.
             candidate_run = {**run, "run_id": str(run_id), "artifact_root": artifact_root}
             row_key = run.get("row_id") or "run"
             result = read_experiment_observation(candidate_run, registry, str(row_key))
-            prior_observation = (result.get("observation") if isinstance(result, dict)
-                                 else None)
-            if (result and result.get("available") and isinstance(prior_observation, dict)
-                    and isinstance(prior_observation.get("source_observations"), list)
-                    and prior_observation["source_observations"]):
+            if (result and result.get("available")
+                    and result.get("has_persisted_observation")):
                 experiment_observation = result
         for metric_root, row_key, row_start in observation_rows:
             candidate_run = {**run, "run_id": str(run_id), "artifact_root": artifact_root}
@@ -794,15 +791,12 @@ def observe_run_if_due(run_id: str, run: dict, registry: Path, *, now=None,
     has_source_bindings = isinstance(observation_meta.get("source_bindings"), list) \
         and bool(observation_meta.get("source_bindings"))
     prior_observation = view.get("experiment_observation")
-    prior_observation = (prior_observation.get("observation")
-                         if isinstance(prior_observation, dict) else None)
-    has_persisted_source_observation = (
-        view.get("liveness") == "stale" and isinstance(prior_observation, dict)
-        and isinstance(prior_observation.get("source_observations"), list)
-        and bool(prior_observation["source_observations"]))
+    has_persisted_observation = (view.get("liveness") == "stale"
+        and isinstance(prior_observation, dict)
+        and prior_observation.get("has_persisted_observation") is True)
     if not (artifact_root or run.get("output_dir")
             or (view.get("training_progress") or {}).get("directory")
-            or has_source_bindings):
+            or has_source_bindings or has_persisted_observation):
         return view
     started_at = view.get("started_at")
     if view.get("liveness") == "stale":
@@ -827,7 +821,7 @@ def observe_run_if_due(run_id: str, run: dict, registry: Path, *, now=None,
     if not observation_rows and run.get("output_dir"):
         observation_rows.append((run["output_dir"], run.get("row_id") or "run", started_at, progress))
     if not observation_rows and (view.get("liveness") in {"working", "exited"}
-                                 or has_source_bindings or has_persisted_source_observation):
+                                 or has_source_bindings or has_persisted_observation):
         observation_rows.append((None, run.get("row_id") or "run", started_at, progress))
     for metric_root, row_key, row_start, row_progress in observation_rows:
         candidate_run = {**run, "run_id": str(run_id), "artifact_root": artifact_root}
