@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "utilities"))
 import herdr_integration as herdr  # noqa: E402
 import fixture_env  # noqa: E402
 import projector  # noqa: E402
+import runtime_activation as activation  # noqa: E402
 
 
 class PinnedSourceTest(unittest.TestCase):
@@ -42,6 +43,83 @@ class PinnedSourceTest(unittest.TestCase):
         self.assertEqual(len(matching), 1, matching)
         self.assertEqual(matching[0]["action"], "copy_managed")
         self.assertEqual(matching[0]["integration_id"], "claude")
+
+    def test_claude_template_command_tracks_the_owned_herdr_command(self):
+        settings = json.loads((ROOT / "adapters/claude/settings.json").read_text(encoding="utf-8"))
+        commands = [hook.get("command") for groups in settings["hooks"].values()
+                    for group in groups for hook in group.get("hooks", [])]
+        self.assertIn(herdr.CLAUDE_SESSION_COMMAND, commands)
+        self.assertTrue(herdr._owned_state_hook(
+            herdr.CLAUDE_SESSION_COMMAND.replace(
+                "${CLAUDE_CONFIG_DIR:-$HOME/.claude}", "$HOME/.claude"
+            )
+        ))
+        self.assertTrue(herdr._owned_state_hook(herdr.CLAUDE_SESSION_COMMAND))
+
+    def test_activation_respells_tuned_herdr_and_migrates_old_and_new_wrappers(self):
+        old_root = "$HOME/.claude"
+        new_root = "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+        old_direct = herdr.CLAUDE_SESSION_COMMAND.replace(new_root, old_root)
+        old_wrapper = f'sh "{old_root}/hooks/run-hook.sh" bash herdr-agent-state.sh working'
+        new_wrapper = f'sh "{new_root}/hooks/run-hook.sh" bash herdr-agent-state.sh idle'
+        foreign = {"type": "command", "command": "/home/user/hooks/herdr-agent-state.sh working"}
+        with tempfile.TemporaryDirectory(prefix="herdr-claude-alias-") as temporary:
+            root = Path(temporary)
+            active_root = root / "release"
+            source_path = active_root / "adapters/claude/settings.json"
+            source_path.parent.mkdir(parents=True)
+            marker = active_root / "hooks/herdr-agent-state.sh"
+            marker.parent.mkdir(parents=True)
+            marker.write_text(
+                "# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION=11\n",
+                encoding="utf-8",
+            )
+            source = {
+                "hooks": {"SessionStart": [{"matcher": "*", "hooks": [
+                    {"type": "command", "command": herdr.CLAUDE_SESSION_COMMAND, "timeout": 10},
+                ]}]},
+                "statusLine": {"type": "command", "command": activation.CLAUDE_STATUSLINE_COMMAND},
+                "autoMemoryEnabled": False,
+                "env": {key: "" for key in activation.CLAUDE_MANAGED_ENV_KEYS},
+            }
+            source_path.write_text(json.dumps(source), encoding="utf-8")
+            settings_path = root / "custom config" / "settings.json"
+            settings_path.parent.mkdir(parents=True)
+            tuned = {"type": "command", "command": old_direct, "timeout": 123, "async": True}
+            original_settings = {
+                **source,
+                "hooks": {
+                    "SessionStart": [{"matcher": "*", "hooks": [
+                        tuned, {"type": "command", "command": "user-start"},
+                    ]}],
+                    "UserPromptSubmit": [{"matcher": "*", "hooks": [
+                        {"type": "command", "command": old_wrapper},
+                        {"type": "command", "command": new_wrapper},
+                        foreign,
+                    ]}],
+                },
+            }
+            settings_path.write_text(json.dumps(original_settings), encoding="utf-8")
+            with mock.patch.object(activation, "_config_path", return_value=settings_path):
+                activation._merge_claude_settings(active_root, None)
+            merged = json.loads(settings_path.read_text(encoding="utf-8"))
+            start = merged["hooks"]["SessionStart"]
+            self.assertEqual(start, [{"matcher": "*", "hooks": [
+                {**tuned, "command": herdr.CLAUDE_SESSION_COMMAND},
+                {"type": "command", "command": "user-start"},
+            ]}])
+            self.assertEqual(merged["hooks"]["UserPromptSubmit"], [{
+                "matcher": "*", "hooks": [foreign]
+            }])
+            owned = [(event, hook["command"])
+                     for event, groups in merged["hooks"].items()
+                     for group in groups for hook in group.get("hooks", [])
+                     if herdr._owned_state_hook(hook.get("command"))]
+            self.assertEqual(owned, [("SessionStart", herdr.CLAUDE_SESSION_COMMAND)])
+            after_first = settings_path.read_bytes()
+            with mock.patch.object(activation, "_config_path", return_value=settings_path):
+                activation._merge_claude_settings(active_root, None)
+            self.assertEqual(settings_path.read_bytes(), after_first)
 
     def test_codex_uses_the_herdr_home_asset_for_callback_and_manifest(self):
         self.assertEqual(
