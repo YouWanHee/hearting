@@ -152,7 +152,8 @@ class InheritedCanonicalOwnerRouteTest(unittest.TestCase):
                     self.route_file, self.route_id, self.route_hash = route_file, route_id, route_hash
             class OwnerRouteState:
                 OwnerRouteBinding = Binding
-                def resolve_owner_route_lifecycle(self, path, *, owner_attempt_id, sealed_binding=None):
+                def resolve_owner_route_lifecycle(self, path, *, owner_attempt_id,
+                                                  sealed_binding=None):
                     self.asserted_path = str(path)
                     if Path(path).read_text(encoding="utf-8") == "":
                         raise AssertionError("canonical registry was not read")
@@ -3184,6 +3185,48 @@ class FastFirstPublicationTest(unittest.TestCase):
              mock.patch("fleet.collectors.procscan.scan", return_value=[]):
             fleet_collectors.collect_all()
             self.assertNotIn("fast_first", dispatch.collect.call_args.kwargs)
+
+
+class AttemptStallProjectionTest(unittest.TestCase):
+    def test_current_stall_advisory_overlays_working_without_changing_liveness(self):
+        observation = {"state": "stalled", "reason": "no-comparable-progress",
+                       "attempt_id": "att-stall", "route_id": "rt-stall",
+                       "route_node": "execute", "observed_at": 700.0,
+                       "last_progress_at": 100.0, "quiet_windows": 2}
+        job = DispatchJob(key="code", route_id="rt-stall", route_node="execute",
+                          attempt_id="att-stall", status="running", liveness="working",
+                          elapsed_min=12, stall_observation=observation)
+        node = route._node_state("execute", [job], {}, now=700.0)
+        self.assertEqual(node["state"], "attention")
+        self.assertIsNone(node["pid"])
+        self.assertEqual(job.liveness, "working")
+        for width in (100, 140, 168):
+            text, color, _mark = render._route_node_text({"id": "execute", **node})
+            with self.subTest(width=width):
+                self.assertIn("! stalled 10m", text)
+                self.assertLessEqual(render._dw(text), width)
+                self.assertEqual(color, "lvl_y")
+        job.stall_observation["state"] = "unknown"
+        node = route._node_state("execute", [job], {}, now=700.0)
+        text, _color, _mark = render._route_node_text({"id": "execute", **node})
+        self.assertIn("! check 10m", text)
+        job.stall_observation = None
+        self.assertEqual(route._node_state("execute", [job], {}, now=700.0)["state"], "active")
+
+    def test_reconciling_gate_and_current_marker_keep_their_existing_precedence(self):
+        stall = {"state": "stalled", "attempt_id": "att-stall", "route_id": "rt-stall",
+                 "route_node": "execute", "observed_at": 700.0, "last_progress_at": 100.0}
+        reconciling = DispatchJob(key="code", route_id="rt-stall", route_node="execute",
+            attempt_id="att-stall", status="open", liveness="stale", stall_observation=stall,
+            state_evidence={"attempt": {"state": "stale", "source": "shared-observer",
+                "rule": "terminal-observed/reconcile-needed", "attempt_id": "att-stall",
+                "route_id": "rt-stall", "route_node": "execute",
+                "observed_liveness": {"state": "reconcile-needed"}}})
+        self.assertEqual(route._node_state("execute", [reconciling], {}, now=700.0)["state"],
+                         "reconciling")
+        marked = route._node_state("execute", [reconciling], {}, now=700.0,
+                                   completion_marked=True)
+        self.assertEqual(marked["state"], "done")
 
 
 if __name__ == "__main__":

@@ -40,6 +40,11 @@ class NavState:
 VIEWS = ("OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "COMPUTE", "MEMORY", "MODELS", "SYSTEM")
 
 
+def _scroll_region(frame, name):
+    region = getattr(frame, name, ()) if frame is not None else ()
+    return tuple(region) if isinstance(region, (list, tuple)) else ()
+
+
 def reduce(state, event, frame=None):
     """Apply one normalized input or hit-map action and preserve its order."""
     before = NavState.from_value(state)
@@ -112,14 +117,24 @@ def _reduce(state, event, frame=None):
             x, y = int(event.get("x", -1)), int(event.get("y", -1))
             hit = next((item for item in getattr(frame, "hits", ())
                         if item.y == y and item.x0 <= x < item.x1 and item.action[:1] == ("scroll",)), None)
-            if hit is None:
-                return state, ()
-            _name, slot, maximum, *sign = hit.action
-            direction = int(event.get("direction", 0))
-            amount = 3 * direction * (int(sign[0]) if sign else 1)
             offsets = dict(state.scroll)
-            offsets[slot] = max(0, min(int(maximum), int(offsets.get(slot, 0)) + amount))
-            return replace(state, scroll=tuple(sorted(offsets.items()))), ()
+            if hit is not None:
+                _name, slot, maximum, *sign = hit.action
+                direction = int(event.get("direction", 0))
+                amount = 3 * direction * (int(sign[0]) if sign else 1)
+                offsets[slot] = max(0, min(int(maximum), int(offsets.get(slot, 0)) + amount))
+                return replace(state, scroll=tuple(sorted(offsets.items()))), ()
+            direction = int(event.get("direction", 0))
+            for slot, name in (("tree", "tree_scroll"), ("pane", "pane_scroll")):
+                region = _scroll_region(frame, name)
+                if len(region) < 7:
+                    continue
+                x0, y0, x1, y1, painted, maximum, page = map(int, region[:7])
+                if x0 <= x < x1 and y0 <= y < y1:
+                    current = int(offsets.get(slot, painted))
+                    offsets[slot] = max(0, min(maximum, current - 3 * direction))
+                    return replace(state, scroll=tuple(sorted(offsets.items()))), ()
+            return state, ()
         if kind == "mouse":
             phase = event.get("phase")
             x, y = int(event.get("x", -1)), int(event.get("y", -1))
@@ -158,6 +173,12 @@ def _reduce(state, event, frame=None):
                     action = hit.action if hit is not None else ()
                     target_kind, target = None, None
                     valid = False
+                    tree = _scroll_region(frame, "tree_scroll")
+                    tree_end_visible = (len(tree) >= 8 and
+                                        int(tree[4]) + int(tree[7]) >= int(tree[6]))
+                    in_tree = (not tree or (len(tree) >= 4 and
+                                            int(tree[0]) <= x < int(tree[2]) and
+                                            int(tree[1]) <= y < int(tree[3])))
                     if action[:1] == ("scope",) and len(action) > 1:
                         value = str(action[1])
                         if value.startswith("repo:"):
@@ -166,7 +187,7 @@ def _reduce(state, event, frame=None):
                             target_kind, target = "session", value
                     elif action[:1] == ("order-end",):
                         target, valid = "end", True
-                    elif (hit is None and x < 32 and
+                    elif (hit is None and in_tree and (not tree or tree_end_visible) and x < 32 and
                           y > max((item.y for item in getattr(frame, "hits", ())
                                    if item.action[:1] == ("scope",) and len(item.action) > 1 and
                                    (str(item.action[1]).startswith("repo:") or
@@ -240,6 +261,23 @@ def _reduce(state, event, frame=None):
         return state, ()
     if key in ("backspace", "delete"):
         return reduce(state, {"type": "key", "key": "escape"}, frame)
+    if key in ("pageup", "pagedown", "home", "end"):
+        region = _scroll_region(frame, "pane_scroll")
+        if len(region) < 7:
+            return state, ()
+        _x0, _y0, _x1, _y1, painted, maximum, page = map(int, region[:7])
+        offsets = dict(state.scroll)
+        current = int(offsets.get("pane", painted))
+        if key == "home":
+            current = 0
+        elif key == "end":
+            current = int(event.get("max_scroll", maximum))
+        elif key == "pageup":
+            current = max(0, current - max(1, page))
+        else:
+            current = min(maximum, current + max(1, page))
+        offsets["pane"] = current
+        return replace(state, scroll=tuple(sorted(offsets.items()))), ()
     if key in ("up", "down"):
         order = tuple(str(item) for item in event.get("order", ()))
         if not order:
@@ -247,7 +285,25 @@ def _reduce(state, event, frame=None):
         step = -1 if key == "up" else 1
         index = order.index(state.scope) + step if state.scope in order else (0 if step > 0 else -1)
         scope = order[index % len(order)]
-        return replace(state, scope=scope, opened="", title=scope.partition(":")[2] or scope), ()
+        offsets = dict(state.scroll)
+        tree = _scroll_region(frame, "tree_scroll")
+        if len(tree) >= 9 and isinstance(tree[8], Mapping):
+            row_index = tree[8].get(scope)
+            if row_index is None and ":" not in scope:
+                row_index = tree[8].get("session:" + scope)
+            if row_index is not None:
+                _x0, top, _x1, _bottom, painted, maximum, total, visible = map(int, tree[:8])
+                offset = int(offsets.get("tree", painted))
+                row_index = int(row_index)
+                if row_index < offset:
+                    offset = row_index
+                elif visible and row_index >= offset + visible:
+                    offset = row_index - visible + 1
+                offset = max(0, min(maximum, offset))
+                if offset or "tree" in offsets:
+                    offsets["tree"] = offset
+        return replace(state, scope=scope, opened="", title=scope.partition(":")[2] or scope,
+                       scroll=tuple(sorted(offsets.items()))), ()
     if key in ("u", "usage"):
         return replace(state, usage_open=not state.usage_open), ()
     if key in ("/", "F"):

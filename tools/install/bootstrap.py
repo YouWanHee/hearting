@@ -4,7 +4,7 @@
 first install, creates the empty default store (and drops the retired
 distiller's leftover state files from the store, see ``retired_memory_state``).
 ``install_launchers`` creates guarded
-``~/.local/bin/{hearting,harness,fleet,mem,compute-hosts}`` symlinks.
+``~/.local/bin/{hearting,harness,fleet,fleet-monitor,fleet2,mem,compute-hosts}`` symlinks.
 The helpers remain usable independently of installer command wiring.
 """
 
@@ -122,6 +122,7 @@ LAUNCHERS = (
     ("hearting", "tools/install/harness.sh"),
     ("harness", "tools/install/harness.sh"),
     ("fleet", "tools/fleet/fleet.sh"),
+    ("fleet-monitor", "tools/fleet/fleet-monitor.sh"),
     ("fleet2", "tools/fleet/fleet2.sh"),
     ("mem", "tools/memory/mem.py"),
     ("compute-hosts", "utilities/compute-hosts"),
@@ -429,3 +430,45 @@ def uninstall_compute_hosts(home=None, dry_run=False):
     else:
         report["status"] = "preserved-foreign"
     return report
+
+
+def uninstall_fleet_launchers(home=None, dry_run=False):
+    """Remove exact installer-owned Fleet command links on a full uninstall.
+
+    User files and symlinks outside the known Hearting source trees are kept.
+    """
+    home = Path(home) if home is not None else Path.home()
+    results = []
+    for name, rel_source in LAUNCHERS:
+        if name not in {"fleet", "fleet-monitor", "fleet2"}:
+            continue
+        target = home / ".local" / "bin" / name
+        source = paths.resolve_launcher_source(rel_source)
+        if not target.exists() and not target.is_symlink():
+            status = "not-installed"
+        elif not (_is_our_symlink(target, source)
+                  or _is_prior_linked_launcher(target, home, rel_source)):
+            status = "preserved-foreign"
+        elif dry_run:
+            status = "planned-remove"
+        else:
+            try:
+                current = safe_fs.capture_state(target)
+                if current.kind != "symlink" or not (
+                    _is_our_symlink(target, source)
+                    or _is_prior_linked_launcher(target, home, rel_source)
+                ):
+                    status = "preserved-foreign"
+                else:
+                    auth = safe_fs.authority(
+                        target,
+                        owner=f"bootstrap:owned-{name}-launcher",
+                        allowed_paths=(target,),
+                        expected=current,
+                    )
+                    safe_fs.remove_exact(auth)
+                    status = "removed"
+            except safe_fs.SafetyError:
+                status = "preserved-foreign"
+        results.append({"name": name, "target": str(target), "source": str(source), "status": status})
+    return results

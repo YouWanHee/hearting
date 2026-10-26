@@ -3573,13 +3573,16 @@ def _compose_readiness(cwd, jobs, parent_harness, children, *, gpu_route=None,
         "hearting_dispatch_readiness", ROOT / "utilities" / "dispatch-readiness.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # Compose drafts have no historical seal; pin probes pass the existing
+    # route, whose owner selection survives completed compute-node omission.
+    selection = GPU_SANDBOX.select(gpu_route) if gpu_route else None
     try:
         return module.generate(
             worktree=Path(cwd), jobs=Path(jobs),
             owner_harnesses=list(owner_harnesses) if owner_harnesses is not None else [parent_harness],
             child_harnesses=list(children),
-            **({"codex_execution_selection": GPU_SANDBOX.select_fresh(gpu_route)}
-               if gpu_route and GPU_SANDBOX.fresh_gpu_resource_nodes(gpu_route) else {}),
+            **({"codex_execution_selection": selection}
+               if selection and selection["gpu_scope"] else {}),
         )
     except module.ReadinessError as exc:
         raise ValueError(f"compose-readiness-unavailable:{exc}") from exc
@@ -8309,6 +8312,14 @@ def _registered_marker_fence(route, node, marker, lines):
             continue
         if identity == expected:
             latest = metadata.get("attempt_id")
+    if latest != attempt_id and "retained_review" in marker:
+        try:
+            from retained_review_completion import verify_marker
+            verify_marker(route, node, marker, completion_dir(route["route_id"]) / f"{node['id']}.json")
+            if latest == marker["retained_review"]["rejected_attempt_id"]:
+                return None
+        except (KeyError, OSError, TypeError, ValueError):
+            pass
     if latest != attempt_id:
         return "completion-attempt-not-current"
     return None
@@ -9277,6 +9288,10 @@ def _publish_completion_locked(
     expected_evidence_sha256=None,
 ):
     """Publish marker history, exact-attempt link, and canonical marker under one node lock."""
+
+    from codex_dispatch_terminal import artifact_declared_verdict
+    if not owner_override and artifact_declared_verdict(Path(evidence)) in {"FAIL", "BLOCKED"}:
+        raise ValueError("completion-evidence-verdict-not-pass")
 
     # The same producer binding owns write admission and completion evidence.
     # An open neighbouring cycle cannot certify this route's completed work.

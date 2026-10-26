@@ -520,6 +520,14 @@ def ensure_observers(jobs: str | Path | None = None, *, service_current=None,
     script, child_env, binding = peer_obligations.service_script(
         "utilities/codex-managed-completion.py", service_current)
     jobs_paths = _jobs_paths(jobs)
+    # Open attempts without a batch sidecar still use this existing bounded
+    # lifecycle pass for observation and exact parent notice retention.
+    if jobs_paths:
+        try:
+            import dispatch_supervision
+            dispatch_supervision.update_open_attempt_stall_observations(jobs_paths[0])
+        except (OSError, ValueError, RuntimeError):
+            pass
     settlement_signatures = []
     # Discovery returns the canonical writer first, followed by compatibility
     # roots that are read-only under dispatch_state_roots(). Owner settlement
@@ -1405,7 +1413,14 @@ def _resume_owner_settlements(jobs: Path, *, context=None) -> None:
 
 def has_unowned_work(jobs: str | Path | None = None) -> bool:
     """Read-only check for batch or owner settlement work without a live owner."""
-    for jobs_path in _jobs_paths(jobs, strict=False):
+    for index, jobs_path in enumerate(_jobs_paths(jobs, strict=False)):
+        if index == 0:
+            try:
+                import dispatch_supervision
+                if dispatch_supervision.has_unowned_stall_observation(jobs_path):
+                    return True
+            except (OSError, ValueError, RuntimeError):
+                return True
         try:
             owner_settlements = _pending_owner_settlements(jobs_path)
         except (OSError, UnicodeError):
@@ -1445,7 +1460,7 @@ def pending_observer_snapshot(jobs: str | Path | None = None, *,
     roots_by_jobs = {}
     root_stamps = {}
     cacheable = True
-    for jobs_path in _jobs_paths(jobs, strict=False):
+    for index, jobs_path in enumerate(_jobs_paths(jobs, strict=False)):
         key = str(jobs_path.resolve(strict=False))
         root_path = jobs_path.resolve(strict=False).parent / "supervisor-state" / "obligations"
         roots_by_jobs[key] = root_path
@@ -1496,6 +1511,15 @@ def pending_observer_snapshot(jobs: str | Path | None = None, *,
                 record.get("delivery"),
             ))
         paths_by_jobs[key] = tuple(pending_paths)
+        if index == 0:
+            try:
+                import dispatch_supervision
+                stall_rows = dispatch_supervision.stall_observer_signature(jobs_path)
+            except (OSError, ValueError, RuntimeError):
+                stall_rows = (("attempt-stall-observation-unavailable",),)
+                cacheable = False
+            signature.extend((str(jobs_path), "attempt-stall", *item)
+                             for item in stall_rows)
     return {
         "signature": tuple(sorted(signature)), "paths_by_jobs": paths_by_jobs,
         "roots_by_jobs": roots_by_jobs, "root_stamps": root_stamps,

@@ -600,7 +600,7 @@ def draw_routes(grid, vm, state, x=34, y=3):
     headers += [(cols["prog"], "PROGRESS"), (use - 2, "AGE")]
     for col, name in headers:
         # a label that would run into the AGE label is left out, never overlapped
-        edge = right if name == "AGE" else x + use - 2 - 1
+        edge = right if name == "AGE" else x + use - 2
         grid.put(x + col, y, name, "head", tint=234, limit=edge)
     y += 1
     repos = [r.get("id", r.get("name", "")) for r in vm.repos]
@@ -655,7 +655,7 @@ def draw_routes(grid, vm, state, x=34, y=3):
             if suffix:
                 kind_parts.append(("(" + suffix + ")", "dim"))
             cursor = x + cols["kind"]
-            age_edge = x + use - len(str(route.get("age") or "")) - 1       # nothing runs into AGE
+            age_edge = x + use - len(str(route.get("age") or ""))           # content stops where AGE starts
             for text, style in kind_parts:
                 cursor = grid.put(cursor, y, text, style, limit=min(x + cols["own"] - GAP, age_edge))
             _draw_owner(grid, x + cols["own"], y, route, cols["narrow"], slim,

@@ -7475,4 +7475,47 @@ class GitOptionalLocksEnvironmentTest(unittest.TestCase):
      self.assertEqual(D.git_optional_locks_env(), {"GIT_OPTIONAL_LOCKS":"0"})
      self.assertEqual(dict(os.environ), before)
 
+class AttemptExecutionObservationTest(unittest.TestCase):
+ def _observe(self, command, *, start="11", actual_start="11", comm="python3"):
+  metadata={"attempt_id":"att-observe","harness":"codex",
+            "pid_observer_ns":D.process_namespace_identity(),
+            "pid_ns":D.process_namespace_identity()}
+  member=D.ProcessGroupObservation("populated",((101,start,"S"),))
+  def read_bytes(path):
+   if str(path)=="/proc/101/cmdline": return command
+   raise FileNotFoundError(path)
+  def read_text(path,encoding=None):
+   if str(path)=="/proc/101/comm": return comm+"\n"
+   raise FileNotFoundError(path)
+  with mock.patch.object(D,"attempt_tagged_descendants",return_value=member), \
+       mock.patch.object(D,"process_start_ticks",return_value=actual_start), \
+       mock.patch.object(D.Path,"read_bytes",read_bytes), \
+       mock.patch.object(D.Path,"read_text",read_text):
+   return D.attempt_execution_observation(metadata)
+
+ def test_exact_runtime_command_is_active_and_registered_carrier_is_absent(self):
+  active=self._observe(b"/usr/bin/codex"+bytes([0])+b"exec"+bytes([0]),comm="codex")
+  self.assertEqual(active.state,"active")
+  self.assertEqual(active.reason,"runtime-command-live")
+  carrier=self._observe(b"/usr/bin/python3"+bytes([0])+b"/tmp/peer-steward.py"+bytes([0]),comm="python3")
+  self.assertEqual((carrier.state,carrier.reason),("absent","carrier-only"))
+  self.assertEqual(carrier.identities,((101,"11","peer-steward.py"),))
+
+ def test_unclassified_role_pid_reuse_and_incomplete_scan_remain_unknown(self):
+  role=self._observe(b"/usr/bin/sleep"+bytes([0]),comm="sleep")
+  self.assertEqual((role.state,role.reason),("unknown","attempt-process-role-unclassified"))
+  reused=self._observe(b"/usr/bin/codex"+bytes([0]),actual_start="12",comm="codex")
+  self.assertEqual((reused.state,reused.reason),("unknown","attempt-process-identity-changed"))
+  with mock.patch.object(D,"attempt_tagged_descendants",
+       return_value=D.ProcessGroupObservation("unverifiable",reason="observer-namespace-mismatch")):
+   self.assertEqual(D.attempt_execution_observation({"attempt_id":"att-observe",
+       "harness":"codex"}).state,"unknown")
+
+ def test_empty_complete_tag_census_is_absent(self):
+  with mock.patch.object(D,"attempt_tagged_descendants",
+       return_value=D.ProcessGroupObservation("empty")):
+   result=D.attempt_execution_observation({"attempt_id":"att-observe","harness":"codex"})
+  self.assertEqual((result.state,result.reason),("absent","attempt-tag-census-empty"))
+
+
 if __name__=="__main__": unittest.main()

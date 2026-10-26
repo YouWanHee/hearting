@@ -653,6 +653,27 @@ class TestRunner(unittest.TestCase):
                 self.assertEqual(json.loads(result_path.read_text()),
                                  {"args": ["payload-arg"], "stdin": "", "bash_env": str(startup)})
 
+    def test_cleanup_stops_only_its_exact_supervisor(self):
+        watch = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"], env=CLEAN_ENV)
+        try:
+            supervision = R.launched_identity(watch)
+            self.assertIsNotNone(supervision)
+            run = {"supervision": {**supervision, "starttime": "0"}}
+            self.registry.write_text(json.dumps({"runs": {"observer": run}}))
+            self._stop_started_runs()
+            self.assertIsNone(watch.poll(), "cleanup stopped a mismatched process identity")
+
+            run["supervision"] = supervision
+            self.registry.write_text(json.dumps({"runs": {"observer": run}}))
+            self._stop_started_runs()
+            self.assertEqual(watch.poll(), -signal.SIGTERM,
+                             "cleanup returned before its observer exited")
+        finally:
+            if watch.poll() is None:
+                watch.terminate()
+            watch.wait(timeout=3)
+
     def test_resource_run_probe_attributes_both_gpu_spawn_paths_to_route_parent(self):
         harness = textwrap.dedent(r"""
             import contextlib, hashlib, importlib.util, io, json, os, signal, subprocess, sys, time
@@ -1345,8 +1366,8 @@ class TestRunner(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        # Runs after (LIFO) nothing else and before the directory removal: a
-        # started run still writing its log made that removal fail in CI.
+        # Stop payloads and their separate workflow observers before removing
+        # the directory: either can still be writing after the payload exits.
         self.addCleanup(self._stop_started_runs)
         self.base = Path(self.temp.name)
         self.repo = self.base / "repo"
@@ -1451,6 +1472,22 @@ class TestRunner(unittest.TestCase):
                 except OSError:
                     break
                 time.sleep(0.02)
+        for run in runs.values():
+            supervision = run.get("supervision") if isinstance(run, dict) else None
+            if not R.RESOURCE_RESUME.supervisor_alive(supervision):
+                continue
+            pid = int(supervision["pid"])
+            if pid <= 1 or pid == os.getpid():
+                continue  # fixtures may deliberately record this test process
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            deadline = time.monotonic() + 3
+            while R.RESOURCE_RESUME.supervisor_alive(supervision) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(R.RESOURCE_RESUME.supervisor_alive(supervision),
+                             f"fixture workflow observer {pid} did not stop")
 
     def cli(self, *args, cwd=None, pass_fds=(), input=None, extra_env=None):
         return subprocess.run([
