@@ -2348,6 +2348,39 @@ class NativeQueueSiblingBatchTest(unittest.TestCase):
         self._run(members)
         self.assertEqual(len(self.sent), 1)
 
+    def test_all_acked_courier_dedupe_attempts_retirement_and_keeps_accepted_envelope(self):
+        members = [self._create(index) for index in range(2)]
+        first = self._run(members)
+        self.assertTrue(all(isinstance(result, dict) and result["status"] == "accepted"
+                            for result in first), first)
+        with mock.patch.object(
+                self.module.codex_queue_delivery, "retire_acked_completion",
+                side_effect=self.module.codex_queue_delivery.QueueDeliveryError("unavailable")) as retire:
+            results = self._run(members)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result["status"] == "accepted"
+                            and result["deduplicated_by"] == "pending-delivery-ledger"
+                            for result in results), results)
+        self.assertEqual(retire.call_count, 2)
+        by_client = {call.kwargs["expected_client_id"]: call for call in retire.call_args_list}
+        self.assertEqual({result["client_user_message_id"] for result in results}, set(by_client))
+        for result in results:
+            call = by_client[result["client_user_message_id"]]
+            self.assertEqual(call.args[2], SESSION)
+            self.assertEqual(len(call.kwargs["expected_body"]), 1)
+            records = call.args[3]
+            storage = call.args[4]
+            receipt = records[0]["receipt"]
+            expected_id = self.module.codex_queue_delivery.native_client_message_id(
+                storage, [records[0]["delivery_id"]])
+            followup = self.module.completion_followup_text(
+                receipt, jobs=str(self.jobs),
+                surface=str(ROOT / "adapters" / "codex" / "bin" / "preflight.sh"))
+            expected_body = self.module.codex_queue_delivery.native_completion_body(
+                storage, records, receipt, followup)
+            self.assertEqual(result["client_user_message_id"], expected_id)
+            self.assertEqual(call.kwargs["expected_body"], [expected_body])
+
     def test_only_a_single_sibling_that_was_already_received_queues_nothing(self):
         member = self._create(0)
         results = self._run([member], current=lambda record, jobs=None: False)

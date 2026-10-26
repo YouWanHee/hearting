@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import sqlite3
@@ -433,6 +434,14 @@ def native_completion_body(storage_key: str, records: list[dict], receipt: dict,
     return envelope + followup + markers
 
 
+def native_batch_unit_body(root: Path, storage_key: str, records: list[dict]) -> str:
+    """Render one producer-identical sibling batch unit."""
+    import dispatch_session_sweep as sweep
+    members = sorted(records, key=lambda record: record["delivery_id"])
+    return sweep.delivery_context([(root, [
+        {**record, "attempts": 0, sweep.STORAGE_KEY: storage_key} for record in members])])
+
+
 def prior_followup_text(current: str) -> str | None:
     """The one exact historical completion wording retained for recovery."""
     head, newline, rest = current.partition("\n")
@@ -455,7 +464,7 @@ def retire_acked_completion(root: Path, path: Path, thread_id: str, seed: dict |
     """
     import dispatch_pending_delivery as pending
     from dispatch_completion_join import completion_followup_text
-    from dispatch_recipient_receipt import IDENTITY_KEY
+    from dispatch_recipient_receipt import IDENTITY_KEY, MARKER_RE, identity_binding
 
     seeds = seed if isinstance(seed, list) else [seed]
     if (not seeds or any(not isinstance(row, dict)
@@ -503,6 +512,57 @@ def retire_acked_completion(root: Path, path: Path, thread_id: str, seed: dict |
         end = deadline if deadline is not None else time.monotonic() + 1.5
         queue = list_queue(path, thread_id, timeout=_rpc_timeout(timeout, end),
                            session=session, deadline=end)
+        # Batch-v1 has no saved aggregate receipt, so reconstruct only from the
+        # exact marker set on a listed item. Multi-member own-set v1 stays
+        # courier-only because its original receipt cannot be recovered here.
+        seed_ids = {row["delivery_id"] for row in fresh_records}
+        for item in queue:
+            content = item.get("input") if isinstance(item, dict) else None
+            if (not isinstance(content, list) or len(content) != 1
+                    or not isinstance(content[0], dict) or content[0].get("type") != "text"
+                    or set(content[0]) - {"type", "text", "text_elements"}
+                    or content[0].get("text_elements", []) != []
+                    or not isinstance(content[0].get("text"), str)):
+                continue
+            input_text = content[0]["text"]
+            marker_lines = [line for line in input_text.splitlines() if "HEARTING_RECEIPT_V1" in line]
+            if not marker_lines or any(not re.fullmatch(
+                    r"HEARTING_RECEIPT_V1 delivery-[A-Za-z0-9._-]{1,128} [0-9a-f]{64}", line)
+                    for line in marker_lines):
+                continue
+            parsed = [MARKER_RE.fullmatch(line) for line in marker_lines]
+            if any(match is None for match in parsed):
+                continue
+            marker_ids = [match.group(1) for match in parsed]
+            if len(set(marker_ids)) != len(marker_ids) or not seed_ids.intersection(marker_ids):
+                continue
+            client_id = native_client_message_id(storage_key, marker_ids, batch=True)
+            if item.get("clientUserMessageId") != client_id:
+                continue
+            members = []
+            valid = True
+            for marker_id, match in zip(marker_ids, parsed):
+                member = pending.read(root, storage_key, marker_id)
+                try:
+                    if (not isinstance(member, dict) or member.get("state") != "acked"
+                            or member.get("recipient_kind") != "codex-native-queue"
+                            or identity_binding(pending.received_ack_identity(
+                                member, storage_key, marker_id)) != match.group(2)):
+                        valid = False
+                        break
+                except Exception:
+                    valid = False
+                    break
+                members.append(member)
+            if not valid:
+                continue
+            try:
+                rendered = native_batch_unit_body(root, storage_key, members)
+            except Exception:
+                continue
+            if not _peer_text_input(item.get("input"), rendered):
+                continue
+            candidates.append((members, client_id, [rendered]))
         deleted = 0
         for member_records, client_id, candidate_bodies in candidates:
             if deleted >= MAX_QUEUE_RETIREMENTS:
@@ -518,6 +578,7 @@ def retire_acked_completion(root: Path, path: Path, thread_id: str, seed: dict |
             for fresh in member_records:
                 latest = pending.read(root, storage_key, fresh["delivery_id"])
                 if (not isinstance(latest, dict) or latest.get("state") != "acked"
+                        or latest.get("recipient_kind") != "codex-native-queue"
                         or pending.received_ack_identity(latest, storage_key, fresh["delivery_id"])
                         != pending.received_ack_identity(fresh, storage_key, fresh["delivery_id"])):
                     exact = False

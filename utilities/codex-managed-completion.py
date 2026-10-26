@@ -982,10 +982,8 @@ def _batch_units(root: Path, thread_id: str, members: list[dict]) -> list[tuple[
     """Render a claimed sibling batch as one shared-header body, halving it only when it
     cannot fit one queue message. The attempts counter is pinned so every sibling sidecar
     and every pass renders the same bytes for the same members."""
-    import dispatch_session_sweep as sweep
     members = sorted(members, key=lambda record: record["delivery_id"])
-    body = sweep.delivery_context([(root, [
-        {**record, "attempts": 0, sweep.STORAGE_KEY: thread_id} for record in members])])
+    body = codex_queue_delivery.native_batch_unit_body(root, thread_id, members)
     if len(body.encode("utf-8")) <= QUEUE_BODY_LIMIT or len(members) == 1:
         return [(members, body)]
     middle = len(members) // 2
