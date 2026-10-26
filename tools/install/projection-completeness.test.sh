@@ -186,7 +186,9 @@ PY
   test -L "$HOME/.claude/statusline.sh" || fail "$mode lost Claude statusline"
   test -x "$HOME/.claude/statusline.sh" || fail "$mode Claude statusline is not executable"
   test -L "$HOME/.config/opencode/plugins/hearting-guards.js" || fail "$mode lost OpenCode kernel guard plugin"
-test -L "$HOME/.config/opencode/plugins/hearting-guards/index.ts" || fail "$mode lost OpenCode V2 guard package entrypoint"
+  { test -f "$HOME/.config/opencode/plugins/hearting-guards/index.ts" \
+    && test ! -L "$HOME/.config/opencode/plugins/hearting-guards/index.ts"; } \
+    || fail "$mode lost OpenCode V2 guard package entrypoint (must be a regular file inside the package)"
 
   python3 - "$HOME/.claude/settings.json" <<'PY'
 import json, sys
