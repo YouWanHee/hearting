@@ -68,6 +68,7 @@ shared-utility-deferred	recovery_history.py
 shared-utility-deferred	report_verification_projection.py
 shared-utility-deferred	resource_resume.py
 shared-utility-deferred	review_input.py
+shared-utility-deferred	retained_review_completion.py
 shared-utility-deferred	review_watchdog.py
 shared-utility-deferred	session_tidy_idle.py
 shared-utility-deferred	session_tidy_policy.py
@@ -392,3 +393,4 @@ tool-deferred	test-isolation.tsv
 tool-deferred	web-bundle
 utility-deferred	artifact_directory_bundle.py
 utility-deferred	codex_shared_daemon_live_driver.py
+utility-deferred	retained_review_completion.test.py

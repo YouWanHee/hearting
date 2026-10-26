@@ -18,6 +18,7 @@ OPEN_STATES = frozenset({"open", "running"})
 TERMINAL_STATES = frozenset({"done", "killed", "cancelled"})
 SUBSESSION_NOTE = "completed-subsession"
 REVIEW_BLOCKING_NOTE = "completed-review-blocking"
+RETAINED_REVIEW_RESOLUTION = "retained-independent-review-v1"
 SUCCESS_NOTES = frozenset({"completed-marker", "completed-supervisor", SUBSESSION_NOTE})
 
 # A completion-budget row closed typed-deferred (not `dead-*`, not a plain
@@ -63,14 +64,23 @@ def terminal_conflicts(metadata: Mapping[str, str]) -> dict:
     return {}
 
 
+def _conflict_reviewed(entry: Mapping[str, str]) -> bool:
+    # Legacy readers only know review_sha256. Keep it absent for a new
+    # semantic recovery so those readers retain the hold instead of PASS.
+    return bool(entry.get("review_sha256") or (
+        entry.get("resolution") == RETAINED_REVIEW_RESOLUTION
+        and entry.get("resolved_failure_class") == "blocked"
+        and entry.get("resolution_review_sha256") and entry.get("recovery_marker_sha256")))
+
+
 def terminal_conflict_digest(metadata: Mapping[str, str]) -> str:
     pending = sorted(key for key, entry in terminal_conflicts(metadata).items()
-                     if not entry.get("review_sha256"))
+                     if not _conflict_reviewed(entry))
     return hashlib.sha256(json.dumps(pending).encode()).hexdigest()
 
 
 def terminal_conflict_pending(metadata: Mapping[str, str]) -> bool:
-    return any(not entry.get("review_sha256") for entry in terminal_conflicts(metadata).values())
+    return any(not _conflict_reviewed(entry) for entry in terminal_conflicts(metadata).values())
 
 
 def deferred_completion(metadata: Mapping[str, str]) -> str:
@@ -89,8 +99,17 @@ def deferred_completion(metadata: Mapping[str, str]) -> str:
     return "completed" if metadata.get("completion_marker") else "pending"
 
 
+def reviewed_blocked_completion(metadata: Mapping[str, str]) -> bool:
+    """A reviewed bad success retains its historical row but never grants PASS."""
+    return any(entry.get("resolution") == RETAINED_REVIEW_RESOLUTION
+               and _conflict_reviewed(entry) and entry.get("resolved_failure_class") == "blocked"
+               for entry in terminal_conflicts(metadata).values())
+
+
 def verdict_pass(metadata: Mapping[str, str]) -> bool:
     """The one place a caller asks "did this attempt succeed"."""
+    if reviewed_blocked_completion(metadata):
+        return False
     state = deferred_completion(metadata)
     if state:
         return state == "completed"
@@ -106,6 +125,8 @@ def readable_result(metadata: Mapping[str, str]) -> str:
     `completed-review-blocking` (its readable review artifact); a bare
     `dead-worker-fail` on a review row stays a death, as the round census reads it.
     """
+    if reviewed_blocked_completion(metadata):
+        return "BLOCKED"
     note, failure_class = metadata.get("note", ""), metadata.get("failure_class")
     if note == "dead-worker-fail" and failure_class == "fail" and metadata.get("worker_type") != "review":
         return "FAIL"
@@ -116,6 +137,8 @@ def readable_result(metadata: Mapping[str, str]) -> str:
 
 def success_note(metadata: Mapping[str, str]) -> bool:
     """The one place a caller asks "does this row's note read as success"."""
+    if reviewed_blocked_completion(metadata):
+        return False
     state = deferred_completion(metadata)
     if state:
         return state == "completed"
@@ -128,6 +151,8 @@ def committed_outcome(status: str, metadata: Mapping[str, str]) -> str:
         return "pending"
     if status not in TERMINAL_STATES:
         return "unknown"
+    if reviewed_blocked_completion(metadata):
+        return "failed"
     note = metadata.get("note", "")
     if note in {"cancelled-by-parent", "fleet-kill"} and metadata.get("failure_class") == "cancelled":
         return "cancelled"

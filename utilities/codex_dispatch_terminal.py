@@ -1034,7 +1034,7 @@ _ARTIFACT_VERDICT_HEAD_BYTES = 4096
 
 
 def artifact_declared_verdict(path: Path) -> str:
-    """The verdict a review artifact declares in its own opening heading.
+    """The verdict declared by structured evidence or a report opening heading.
 
     Returns `PASS`/`FAIL`/`BLOCKED`, `unstated` when the artifact declares no
     such heading, or `unreadable` when the head cannot be read.
@@ -1045,6 +1045,19 @@ def artifact_declared_verdict(path: Path) -> str:
             head = handle.read(_ARTIFACT_VERDICT_HEAD_BYTES)
     except OSError:
         return "unreadable"
+    if path.suffix.lower() == ".json":
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            return "unreadable"
+        if isinstance(value, dict):
+            declarations = [value, value.get("io"), value.get("typed_handoff")]
+            verdicts = {str(item.get("verdict", "")).upper()
+                        for item in declarations if isinstance(item, dict)}
+            # Contradictory structured declarations never manufacture PASS.
+            for verdict in ("BLOCKED", "FAIL", "PASS"):
+                if verdict in verdicts:
+                    return verdict
     match = _ARTIFACT_VERDICT_RE.search(head)
     return match.group(1).upper() if match else "unstated"
 

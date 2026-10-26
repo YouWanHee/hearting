@@ -872,6 +872,24 @@ the exact row and prints its `apply_command`, which carries that row's digest
 releases consumption.
 A different conflict invalidates that disposition; classifier ranks grant no override.
 
+An explicit FAIL or BLOCKED in bound completion evidence cannot publish a
+normal success marker. Structured verdict evidence and a review report's declared
+result share this rule; an evidence-bound owner closure keeps its separate,
+reduced-independence meaning. A legacy marker that committed BLOCKED evidence
+does not make that review a PASS. The existing terminal-conflict review may
+retain a previous independent PASS only after proving exact history, preserved
+evidence, unchanged reviewed inputs, settled attempts and current owner/parent
+authority, together with the later attempt’s retained PASS and explicit record
+of no scientific review or input change. Runtime appends the verified
+judgment's provenance, preserves the later BLOCKED result, original marker
+history, canonical verdict bytes and round census, and records the rejected
+correction as BLOCKED rather than independent PASS. Missing or contradictory
+proof leaves the conflict pending. This reuses an existing judgment without a
+reviewer launch, new round or budget reset.
+Older readers retain their unreviewed hold for this semantic recovery; only a
+capable installed reader consumes it. No legacy success receipt is reclassified
+as a new independent PASS.
+
 `dispatch_supervision.wait_for_batch` owns repeated join checkpoints across
 session supervisors, serial chains, and the managed completion carrier. It
 keeps execution alive, schedules exact recovery, and uses the existing
