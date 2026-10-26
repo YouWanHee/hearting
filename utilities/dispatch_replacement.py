@@ -1956,7 +1956,7 @@ def admission(jobs, lines, metadata):
         # Legacy pre-registered candidates converge at their first launch claim;
         # the shared admission under this same jobs lock rejects a committed
         # sibling without letting unclaimed candidates deadlock one another.
-        DC._automatic_retry_admission(peers, metadata)
+        DC._automatic_retry_admission(peers, metadata, jobs=jobs)
         if source.get('replacement_original_attempt_id'):
             # A completed content result or frame's already-applied profile
             # descent cannot become transport failure merely by retry labeling.
