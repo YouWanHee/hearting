@@ -414,10 +414,10 @@ class BacklogAndCurrentTaskProjection(unittest.TestCase):
         self.assertIn("last good task", stale_text)
 
     def test_peer_count_stays_unknown_or_marks_last_good_after_empty_unhealthy_source(self):
-        from fleet.explorer.frame import draw
-        from fleet.explorer.live import build_view_model
-        from fleet.explorer.state import NavState, reduce
-        from fleet.explorer.view_model import ExplorerViewModel
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.live import build_view_model
+        from tools.fleet.explorer.state import NavState, reduce
+        from tools.fleet.explorer.view_model import ExplorerViewModel
 
         unknown = build_view_model({"sessions": [], "resources": [],
                                     "observations": {"optional:peers": {"state": "unknown"}}})
