@@ -616,15 +616,18 @@ def current_capability(chain, marker_fields, *, session_start, slack):
     return marker_fields
 
 
-def enrich(sessions, jobs=(), node_evidence=None, now=None, fast_first=False):
+def enrich(sessions, jobs=(), node_evidence=None, now=None, fast_first=False,
+           only_sessions=None):
     """Attach `session.route_chain` to every eligible session (env-writer harness, not a
-    dispatch child, not an app-server row, with a session id). Exceptions are per-session."""
+    dispatch child, not an app-server row, with a session id). `only_sessions` limits writes
+    while all eligible sessions remain available as handoff context. Exceptions are per-session."""
     if fast_first:
         return  # route/outcome and ledger reads belong to the next detail tick
     from . import route as _route
 
     node_evidence = node_evidence or {}
     jobs = jobs or ()
+    update_ids = None if only_sessions is None else {id(sess) for sess in only_sessions}
     eligible = []
     for sess in sessions or ():
         try:
@@ -684,6 +687,8 @@ def enrich(sessions, jobs=(), node_evidence=None, now=None, fast_first=False):
         handoffs[rid] = {"origin": _identity(origin_sess), "receiver": _identity(receiver_sess)}
 
     for sess in eligible:
+        if update_ids is not None and id(sess) not in update_ids:
+            continue
         try:
             chain = assemble(
                 per_session_lines.get(id(sess), []), load_record=_route.load,

@@ -894,6 +894,24 @@ the exact row and prints its `apply_command`, which carries that row's digest
 releases consumption.
 A different conflict invalidates that disposition; classifier ranks grant no override.
 
+An explicit FAIL or BLOCKED in bound completion evidence cannot publish a
+normal success marker. Structured verdict evidence and a review report's declared
+result share this rule; an evidence-bound owner closure keeps its separate,
+reduced-independence meaning. A legacy marker that committed BLOCKED evidence
+does not make that review a PASS. The existing terminal-conflict review may
+retain a previous independent PASS only after proving exact history, preserved
+evidence, unchanged reviewed inputs, settled attempts and current owner/parent
+authority, together with the later attempt’s retained PASS and explicit record
+of no scientific review or input change. Runtime appends the verified
+judgment's provenance, preserves the later BLOCKED result, original marker
+history, canonical verdict bytes and round census, and records the rejected
+correction as BLOCKED rather than independent PASS. Missing or contradictory
+proof leaves the conflict pending. This reuses an existing judgment without a
+reviewer launch, new round or budget reset.
+Older readers retain their unreviewed hold for this semantic recovery; only a
+capable installed reader consumes it. No legacy success receipt is reclassified
+as a new independent PASS.
+
 `dispatch_supervision.wait_for_batch` owns repeated join checkpoints across
 session supervisors, serial chains, and the managed completion carrier. It
 keeps execution alive, schedules exact recovery, and uses the existing
@@ -2374,14 +2392,19 @@ Resumed retirement determines self-target from its recorded requester's session
 and pane identity. A cancelled request is terminal history:
 a new explicit request for the same lifetime accepts a fresh duty while retaining
 the cancelled record; repeated active or completed requests share that fresh duty.
-When the retire succeeds from the pane started beside the predecessor, the
-predecessor's open depth-1 routes pass to the successor, on any harness: it may
-`start` and `correct` them, and their stored completion records reach it
-(`retire ... handover=<n>`). Registry rows, their registered parent and worker
-identities stay as they are; cards and notices are not moved.
-Deferred retirement resolves succession from the recorded requester session and
-pane, with the original successor mark predating acceptance and matching both
-requester and predecessor. Proven loss of the booked predecessor
+An explicitly accepted typed cross-seat handoff records the predecessor's
+open depth-1 routes to the exact successor through the common seat ledger,
+before reply delivery or physical retirement settles. The successor may then
+`start` and `correct` them, and their stored completion records reach it. The
+registered parent, worker, receipt, claim, and ACK identities stay anchored to
+their original storage; cards and notices are not moved. Physical retirement
+remains a separate retained duty and still observes the original process
+birth, executor work, busy state, drafts, and forms. A later retire replay
+reuses the same ledger row rather than creating another transfer.
+Deferred retirement uses the same early cutover when the original successor
+mark predates acceptance and its current native process proves the recorded
+requester. The mark stays available while exit waits. Past parent delivery
+uncertainty is separate from actual executor liveness. Proven loss of the booked predecessor
 lifetime can finish this same handover even when its pane has disappeared; it
 grants nothing to a later occupant. A completed retirement whose handover was
 missed is consumed by the ordinary lifecycle callback or the same
@@ -2867,9 +2890,12 @@ handoff supplies the existing `session_tidy.py handoff accept <ref>` command.
 After reading the card and referenced documents, the receiver uses that exact
 command; it binds the current receiver and transfer ref. Ordinary messages and
 cards have no accept command or successor authority. A confirmed same-seat clear
-uses the existing seat handover automatically. Explicit acceptance schedules the
-retained reply and normal predecessor retire reservation using the original exact
-identities. Delivery is receipt, not acceptance.
+uses the existing seat handover automatically. Explicit acceptance records the
+current parent and completion recipient in the common seat ledger, then schedules
+the retained reply and normal predecessor retire reservation with the original
+exact identities. Reply delivery and physical retire remain separate retained
+duties; an unknown reply does not delay the accepted authority transfer. Delivery
+is receipt, not acceptance.
 For an actionable peer request that can be completed now, reply once with the
 result. For work that will wait or take sustained effort, send one short receipt and
 continue through the existing registered continuation. Informational/no-reply

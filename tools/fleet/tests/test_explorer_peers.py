@@ -60,6 +60,20 @@ class PeerPaneReference(unittest.TestCase):
             self.assertLessEqual(hit.x1, 80)
             self.assertLess(hit.x0, hit.x1)
 
+    def test_empty_narrow_links_keep_the_reference_heading_and_columns(self):
+        from tools.fleet.explorer.view_model import ExplorerViewModel
+
+        values = load_fixture(FIXTURES / "view_model.json").to_mapping()
+        values["peer_nodes"] = []
+        values["peer_edges"] = {"links": [], "cross": [], "side_lanes": [], "cards": {}, "watches": []}
+        vm = ExplorerViewModel.from_mapping(values)
+        for cols in (80, 100):
+            with self.subTest(cols=cols):
+                text = "\n".join(draw(vm, NavState(view="PEERS", title="PEERS"), cols, 45).text_rows())
+                self.assertIn("LINKS  communication", text)
+                self.assertIn("FROM", text)
+                self.assertIn("KIND", text)
+
     def test_cards_use_each_harness_palette(self):
         base = load_fixture(FIXTURES / "view_model.json").to_mapping()
         base["sessions"] = [
@@ -146,6 +160,15 @@ class PeerDerivedElements(unittest.TestCase):
             text = "\n".join(frame.text_rows())
             self.assertIn("[a3]→[f5] steer 3h 17m", text)
             self.assertIn("→[f5] steer 3h 22m", text)
+
+    def test_empty_narrow_links_keep_the_reference_heading_and_columns(self):
+        vm = _variant(peer_nodes=[], peer_edges={"links": [], "cross": [], "side_lanes": [], "cards": {}, "watches": []})
+        for cols in (80, 100):
+            with self.subTest(cols=cols):
+                text = "\n".join(draw(vm, NavState(view="PEERS", title="PEERS"), cols, 45).text_rows())
+                self.assertIn("LINKS  communication", text)
+                self.assertIn("FROM", text)
+                self.assertIn("KIND", text)
 
     def test_cards_never_overlap_and_hits_stay_in_the_pane(self):
         base = load_fixture(FIXTURES / "view_model.json").to_mapping()

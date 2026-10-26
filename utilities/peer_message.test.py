@@ -2372,8 +2372,25 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
             "requester": {"harness": "codex", "session_id": "successor", "pane": "p2", "server": "default"}}
         peer_message._save_pending(row)
         self.store = self.steward.peer_obligations.ObligationStore(self.jobs_path.parent)
+        def current_candidate(pane, *, expected_harness=None, expected_sid=None,
+                             require_process_session=False, target_observation=None,
+                             pane_info=None, **_kwargs):
+            state, ident, _code, reason = target_observation
+            session_id = peer_message.usable_session_id(ident.get("session_id"))
+            if (reason or ident.get("pane") != pane
+                    or expected_harness and ident.get("harness") != expected_harness
+                    or expected_sid and session_id != expected_sid
+                    or require_process_session and not session_id):
+                return None, reason or "target-identity-unverified"
+            info = pane_info or {"pane_id": pane, "foreground_processes": [{"pid": 22}]}
+            identity = dict(ident, session_id=session_id, server="default")
+            return {"state": state, "harness": ident.get("harness"),
+                    "session_id": session_id, "pane": pane, "name": ident.get("name"),
+                    "_identity": identity, "_pane_info": info,
+                    "_native_session_id": session_id}, None
         patches = [mock.patch.object(runner, "_handoff_steward", return_value=self.steward),
             mock.patch.object(self.steward, "_retire_target", return_value=("idle", {k:v for k,v in self.successor.items() if k not in {"foreground", "server"}}, None, None)),
+            mock.patch.object(self.steward, "_prompt_current_candidate", side_effect=current_candidate),
             mock.patch.object(self.steward, "_retire_foreground", return_value=self.successor["foreground"]),
             mock.patch.object(self.steward, "_pid_identity_ok", return_value=True),
             mock.patch.object(self.steward.peer_obligations, "ObligationStore", return_value=self.store),
@@ -2547,6 +2564,314 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(self.store.get(first["retire_id"])["intent"]["requester"]["session_id"], "successor")
         self.assertEqual(peer_message._read_pending(first["reply_ref"])["state"], "received")
 
+    def test_typed_acceptance_cuts_over_through_the_shared_writer_in_all_six_directions(self):
+        import session_tidy
+        import dispatch_seat_handover as handover
+        original_jobs = self.jobs_path.read_bytes()
+        cases = (("claude", "codex"), ("claude", "opencode"),
+                 ("codex", "claude"), ("codex", "opencode"),
+                 ("opencode", "claude"), ("opencode", "codex"))
+        for index, (predecessor_harness, successor_harness) in enumerate(cases):
+            with self.subTest(predecessor=predecessor_harness, successor=successor_harness):
+                predecessor_sid = f"parent-{index}"
+                successor_sid = f"successor-{index}"
+                predecessor_pane = f"w1:pOld{index}"
+                successor_pane = f"w1:pNew{index}"
+                predecessor = {"harness": predecessor_harness, "session_id": predecessor_sid,
+                    "name": "old", "pane": predecessor_pane, "server": "default",
+                    "foreground": {"pid": 1100 + index, "start": str(10100 + index)}}
+                successor = {"harness": successor_harness, "session_id": successor_sid,
+                    "name": "new", "pane": successor_pane, "server": "default",
+                    "foreground": {"pid": 2200 + index, "start": str(20200 + index)}}
+                requester = {"harness": successor_harness, "session_id": successor_sid,
+                    "pane": successor_pane, "server": "default"}
+                attempt = f"att-handoff-{index}"
+                meta = {"attempt_id": attempt, "dispatch_depth": "1", "worker_type": "owner",
+                    "parent_sid": predecessor_sid, "parent_harness": predecessor_harness,
+                    "route_id": f"rt-handoff-{index}", "route_hash": f"sha256:handoff-{index}",
+                    "route_node": "owner"}
+                original_jobs = ("now\trunning\t0\tjob\tlog\t" +
+                    ",".join(f"{key}={value}" for key, value in meta.items()) + "\n").encode()
+                self.jobs_path.write_bytes(original_jobs)
+                sender = {key: predecessor[key] for key in ("harness", "session_id", "name")}
+                recipient = {key: successor[key] for key in ("harness", "session_id", "name")}
+                body = f"[handoff] card {index}"
+                text, ref = peer_message.prepare_peer_message(body, sender, recipient, defer=True)
+                row = peer_message._read_pending(ref)
+                row.update(state="unverified", receipt="target-identity-unverified")
+                row["handoff"] = {"card_id": f"card-{index}", "target": predecessor_pane,
+                    "predecessor": predecessor, "successor": successor, "requester": requester}
+                peer_message._save_pending(row)
+
+                self.steward._retire_target.return_value = (
+                    "idle", {key: successor[key] for key in ("harness", "session_id", "name", "pane")}, None, None)
+                self.steward._retire_foreground.return_value = successor["foreground"]
+                caller = (session_tidy.Seat("pane", "successor-seat", successor_pane),
+                          successor_harness, successor_sid)
+                self.runner.accept_handoff(ref, caller)
+                self.assertEqual(handover.effective_parent(meta, self.jobs_path), successor_sid)
+                self.assertTrue(handover.owns(meta, successor_sid, self.jobs_path))
+                self.assertFalse(handover.owns(meta, predecessor_sid, self.jobs_path))
+                self.assertEqual(self.jobs_path.read_bytes(), original_jobs)
+                after = peer_message._read_pending(ref)
+                self.assertEqual((after["state"], after["receipt"]),
+                                 ("unverified", "target-identity-unverified"))
+                self.assertTrue(after["acceptance"]["settled"])
+                self.assertEqual((after["from"]["harness"], after["from"]["session_id"]),
+                                 (predecessor_harness, predecessor_sid))
+                self.assertEqual((after["to"]["harness"], after["to"]["session_id"]),
+                                 (successor_harness, successor_sid))
+                if index == 0:
+                    import dispatch_pending_delivery as pending
+                    delivery_root = self.tmp_root / "dispatch-delivery"
+                    delivery_id = "delivery-" + "c" * 32
+                    receipt = {"schema_version": 2, "state": "delivered",
+                        "parent_attempt_id": attempt, "job_registry": str(self.jobs_path),
+                        "delivery_classification": "attention",
+                        "children": [{"attempt_id": attempt, "status": "done",
+                            "readiness": "ready", "reason": "terminal-failure-or-unclosed",
+                            "required_action": "inspect-done-failure", "harness": predecessor_harness,
+                            "delivery_classification": "attention"}]}
+                    pending.create(delivery_root, recipient_kind="codex-native-queue",
+                        recipient_key=predecessor_sid, delivery_id=delivery_id,
+                        session_generation="", session_generation_supported="0",
+                        attempt_ids=[attempt], parent_attempt_id=attempt, route_id=meta["route_id"],
+                        route_node="owner", receipt=receipt,
+                        receipt_digest=pending._canonical_receipt_digest(receipt),
+                        row_revisions={attempt: "original-revision"})
+                    pending.claim(delivery_root, predecessor_sid, delivery_id,
+                                  claim_owner="fixture-carrier", lease_seconds=30)
+                    ambiguous = pending.mark_sent_ambiguous(
+                        delivery_root, predecessor_sid, delivery_id,
+                        claim_owner="fixture-carrier")
+                    successor_seat = session_tidy._pane_seat_of(successor_pane)
+                    with mock.patch.object(handover, "pane_seat", return_value=successor_seat):
+                        recipients = dict(handover.storage_recipients(
+                            successor_sid, {}, successor_harness))
+                    allowed = recipients[predecessor_sid]
+                    self.assertEqual(allowed, frozenset({attempt}))
+                    self.assertTrue(handover.record_for_session(ambiguous, allowed))
+                    current_delivery = pending.read(delivery_root, predecessor_sid, delivery_id)
+                    for key in ("delivery_id", "recipient_digest", "receipt_digest",
+                                "claim_token", "claim_owner", "lease_until_ns", "state", "acked_by"):
+                        self.assertEqual(current_delivery.get(key), ambiguous.get(key))
+                    self.assertEqual(current_delivery["state"], "sent-ambiguous")
+                    self.assertIsNone(current_delivery.get("acked_at_ns"))
+
+    def test_registered_parent_same_seat_holder_then_codex_acceptance_keeps_original_storage(self):
+        import session_tidy
+        import dispatch_seat_handover as handover
+        registered = "92144f29-855c-45ec-9256-d303a1943d04"
+        intermediate = "e3250355-411d-410f-9f19-cbd3e4b5077c"
+        successor_sid = "01a17511-79d4-7ef0-ab19-12e4163d9d6c"
+        parent_pane, successor_pane = "wX:pA", "wX:pB"
+        meta = {"attempt_id": "att-sr-lineage", "dispatch_depth": "1", "worker_type": "owner",
+                "parent_sid": registered, "parent_harness": "claude",
+                "route_id": "rt-sr-lineage", "route_hash": "sha256:sr-lineage",
+                "route_node": "owner"}
+        original_jobs = ("now\trunning\t0\tjob\tlog\t" +
+            ",".join(f"{key}={value}" for key, value in meta.items()) + "\n").encode()
+        self.jobs_path.write_bytes(original_jobs)
+        intermediate_seat = session_tidy._pane_seat_of(parent_pane)
+        same_seat_row = handover.record_retire_handover(
+            registered, "claude", intermediate, "claude", jobs=self.jobs_path,
+            successor_seat=intermediate_seat)
+        self.assertIsNotNone(same_seat_row)
+        self.assertEqual(handover.effective_parent(meta, self.jobs_path), intermediate)
+
+        sender = {"harness": "claude", "session_id": intermediate, "name": "sr-supervisor"}
+        recipient = {"harness": "codex", "session_id": successor_sid, "name": "sr-successor"}
+        predecessor = {**sender, "pane": parent_pane, "server": "default",
+                       "foreground": {"pid": 92144, "start": "192144"}}
+        successor = {**recipient, "pane": successor_pane, "server": "default",
+                     "foreground": {"pid": 101175, "start": "101175"}}
+        requester = {"harness": "codex", "session_id": successor_sid,
+                     "pane": successor_pane, "server": "default"}
+        text, ref = peer_message.prepare_peer_message(
+            "[handoff] registered parent lineage", sender, recipient, defer=True)
+        row = peer_message._read_pending(ref)
+        row["handoff"] = {"card_id": "sr-card", "target": parent_pane,
+            "predecessor": predecessor, "successor": successor, "requester": requester}
+        row.update(state="unverified", receipt="target-identity-unverified")
+        peer_message._save_pending(row)
+        self.steward._retire_target.return_value = (
+            "idle", {key: successor[key] for key in ("harness", "session_id", "name", "pane")}, None, None)
+        self.steward._retire_foreground.return_value = successor["foreground"]
+        caller = (session_tidy.Seat("pane", "sr-successor-seat", successor_pane),
+                  "codex", successor_sid)
+        _message, code = self.runner.accept_handoff(ref, caller)
+        self.assertEqual(code, 0)
+        self.assertEqual(handover.effective_parent(meta, self.jobs_path), successor_sid)
+        self.assertFalse(handover.owns(meta, registered, self.jobs_path))
+        self.assertFalse(handover.owns(meta, intermediate, self.jobs_path))
+        self.assertTrue(handover.owns(meta, successor_sid, self.jobs_path))
+        self.assertEqual(self.jobs_path.read_bytes(), original_jobs)
+        current = peer_message._read_pending(ref)
+        self.assertEqual((current["from"]["session_id"], current["to"]["session_id"]),
+                         (intermediate, successor_sid))
+        self.assertEqual(current["state"], "unverified")
+        successor_seat = session_tidy._pane_seat_of(successor_pane)
+        with mock.patch.object(handover, "pane_seat", return_value=successor_seat):
+            storage = dict(handover.storage_recipients(successor_sid, {}, "codex"))
+        self.assertEqual(storage[registered], frozenset({meta["attempt_id"]}))
+
+    def test_acceptance_crash_and_legacy_settled_row_replay_the_same_cutover(self):
+        import dispatch_seat_handover as handover
+        meta = {"attempt_id": "att-accepted-crash", "dispatch_depth": "1", "worker_type": "owner",
+                "parent_sid": "predecessor", "parent_harness": "claude",
+                "route_id": "rt-accepted-crash", "route_hash": "sha256:accepted-crash",
+                "route_node": "owner"}
+        original_jobs = ("now\trunning\t0\tjob\tlog\t" +
+            ",".join(f"{key}={value}" for key, value in meta.items()) + "\n").encode()
+        self.jobs_path.write_bytes(original_jobs)
+        writer = handover.record_retire_handover
+        with mock.patch.object(handover, "record_retire_handover",
+                               side_effect=OSError("ledger write interrupted")):
+            with self.assertRaises(OSError):
+                self.runner.accept_handoff(self.ref, self.caller)
+        accepted = peer_message._read_pending(self.ref)
+        self.assertTrue(accepted["acceptance"]["read_and_accepted"])
+        self.assertFalse(accepted["acceptance"].get("settled", False))
+        self.assertEqual(handover.effective_parent(meta, self.jobs_path), "predecessor")
+
+        # A release that marked the old typed acceptance settled before its
+        # ledger write is repaired by the same retained acceptance duty.
+        accepted["acceptance"]["settled"] = True
+        peer_message._save_pending(accepted)
+        duty = next(item for item in self.store.list()
+                    if item["intent"].get("handoff_acceptance"))
+        self.steward._resume_message_obligation(duty, self.store)
+        self.assertEqual(handover.effective_parent(meta, self.jobs_path), "successor")
+        self.assertEqual(handover.record_retire_handover, writer)
+        self.assertEqual(self.jobs_path.read_bytes(), original_jobs)
+
+    def test_completed_legacy_acceptance_is_found_by_the_normal_retire_runner(self):
+        import dispatch_seat_handover as handover
+        meta = {"attempt_id": "att-terminal-accepted", "dispatch_depth": "1", "worker_type": "owner",
+                "parent_sid": "predecessor", "parent_harness": "claude",
+                "route_id": "rt-terminal-accepted", "route_hash": "sha256:terminal-accepted",
+                "route_node": "owner"}
+        original_jobs = ("now\trunning\t0\tjob\tlog\t" +
+            ",".join(f"{key}={value}" for key, value in meta.items()) + "\n").encode()
+        self.jobs_path.write_bytes(original_jobs)
+        with mock.patch.object(handover, "record_retire_handover", return_value=None):
+            self.runner.accept_handoff(self.ref, self.caller)
+        accepted = peer_message._read_pending(self.ref)["acceptance"]
+        self.assertTrue(accepted["settled"])
+        self.assertEqual(handover.effective_parent(meta, self.jobs_path), "predecessor")
+        acceptance_duty = next(item for item in self.store.list()
+                               if item["intent"].get("handoff_acceptance"))
+        self.assertTrue(any(item["id"] == accepted["retire_id"]
+                            and item["state"] in {"pending", "unknown"}
+                            for item in self.store.list()))
+        acceptance_duty = self.store.update(
+            acceptance_duty["id"], state="complete", result="accepted",
+            delivery="scheduled", cleanup="complete")
+
+        terminal_duties = self.steward._settled_handoff_acceptance_duties(self.store)
+        replay = next((item for item in terminal_duties
+                       if item["id"] == acceptance_duty["id"]), None)
+        self.assertIsNotNone(replay)
+        with mock.patch.object(handover, "record_retire_handover",
+                               side_effect=OSError("legacy ledger retry")):
+            self.steward._resume_message_obligation(replay, self.store)
+        self.assertEqual(self.store.get(acceptance_duty["id"])["state"], "complete")
+        self.steward._resume_message_obligation(
+            self.store.get(acceptance_duty["id"]), self.store)
+        self.assertEqual(handover.effective_parent(meta, self.jobs_path), "successor")
+        self.assertEqual(self.store.get(acceptance_duty["id"])["state"], "complete")
+        self.assertEqual(self.jobs_path.read_bytes(), original_jobs)
+
+    def test_sidless_first_input_binds_the_same_handoff_ref_before_acceptance(self):
+        import session_tidy
+        recipient = {"harness": "codex", "session_id": None,
+                     "pane_id": "p2", "name": "new"}
+        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                 "pane_id": "p2", "pid": 22, "start": "202",
+                 "pid_namespace": "pid:[4026531836]"}
+        text, ref = peer_message.prepare_peer_message(
+            "[handoff] first turn card", self.sender, recipient, defer=True,
+            first_input_process=proof)
+        row = peer_message._read_pending(ref)
+        successor = dict(self.successor, session_id=None)
+        requester = {"harness": "codex", "session_id": None,
+                     "pane": "p2", "server": "default"}
+        row["handoff"] = {"card_id": "sidless-card", "target": "p1",
+            "predecessor": self.predecessor, "successor": successor,
+            "requester": requester}
+        peer_message._save_pending(row)
+        before_transfer = peer_message._transfer_path(ref).read_bytes()
+        with self.assertRaisesRegex(ValueError, "handoff-context-invalid"):
+            self.runner.accept_handoff(ref, self.caller)
+        with mock.patch.object(peer_message, "_first_input_process_is_current", return_value=True):
+            bound = peer_message.bind_pending_recipient(
+                ref, {"harness": "codex", "session_id": "first-session", "pane_id": "p2"},
+                process_proof=proof)
+            self.assertIsNotNone(bound)
+            self.assertIsNone(peer_message.bind_pending_recipient(
+                ref, {"harness": "codex", "session_id": "replacement", "pane_id": "p2"},
+                process_proof=proof))
+            self.assertEqual(peer_message._transfer_path(ref).read_bytes(), before_transfer)
+            self.assertEqual(bound["to"]["session_id"], None)
+            self.assertEqual(bound["bound_to"], {
+                "harness": "codex", "session_id": "first-session", "pane_id": "p2"})
+            self.assertEqual(bound["handoff"]["successor"]["session_id"], "first-session")
+            self.assertEqual(bound["handoff"]["requester"]["session_id"], "first-session")
+            self.assertNotIn("acceptance", bound)
+            caller = (session_tidy.Seat("pane", "sidless-seat", "p2"),
+                      "codex", "first-session")
+            self.steward._retire_target.return_value = (
+                "idle", {"harness": "codex", "session_id": "first-session",
+                         "name": "new", "pane": "p2"}, None, None)
+            accepted, code = self.runner.accept_handoff(ref, caller)
+        self.assertEqual(code, 0, accepted)
+        self.assertTrue(peer_message._read_pending(ref)["acceptance"]["settled"])
+        self.assertEqual(peer_message.pending_delivery_recipient(
+            peer_message._read_pending(ref))["session_id"], "first-session")
+
+    def test_owner_peer_report_and_completion_carrier_share_the_exact_native_gate(self):
+        producer = {
+            "schema": peer_message._RUNTIME_PRODUCER_SCHEMA,
+            "duty_id": "registered-batch-" + "a" * 32,
+            "jobs": str(self.jobs_path), "attempt_id": "att-native-gate",
+            "carrier": "codex-async-rewake", "delivery_id": "delivery-native-gate",
+            "receipt_digest": "b" * 64,
+            "recipient": {"harness": "codex", "session_id": "successor"},
+            "route_id": "rt-native-gate", "route_node": "execute",
+        }
+        args = self.steward.build_parser().parse_args(["prompt", "w1:p2", "owner report body"])
+        outputs = []
+        # This case exercises native identity rejection after the executable
+        # prerequisite; it must not depend on Herdr being installed on CI.
+        with mock.patch.object(self.steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(self.steward, "_prompt_current_candidate",
+                               return_value=(None, "target-identity-unverified")), \
+             mock.patch.object(self.steward, "_herdr_prompt") as send, \
+             mock.patch("builtins.print", side_effect=lambda *a, **_k: outputs.append(" ".join(map(str, a)))):
+            ordinary_rc = self.steward.cmd_prompt(args)
+            completion_rc = self.steward.cmd_prompt(args, producer_binding=producer)
+        self.assertEqual((ordinary_rc, completion_rc), (5, 5))
+        self.assertEqual(outputs, [
+            'prompted=false reason=target-identity-unverified target="w1:p2" candidate_panes=["w1:p2"]',
+            'prompted=false reason=target-identity-unverified target="w1:p2" candidate_panes=["w1:p2"]',
+        ])
+        send.assert_not_called()
+
+    def test_owner_peer_and_completion_without_herdr_remain_unavailable(self):
+        args = self.steward.build_parser().parse_args(["prompt", "w1:p2", "owner report body"])
+        outputs = []
+        with mock.patch.object(self.steward, "_herdr_missing", return_value=True), \
+             mock.patch.object(self.steward, "_prompt_current_candidate") as identity, \
+             mock.patch.object(self.steward, "_herdr_prompt") as send, \
+             mock.patch("builtins.print", side_effect=lambda *a, **_k: outputs.append(" ".join(map(str, a)))):
+            self.assertEqual(self.steward.cmd_prompt(args), 4)
+            self.assertEqual(self.steward.cmd_prompt(args, producer_binding={}), 4)
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(all(line.startswith("herdr-unavailable reason=herdr-not-found ")
+                            for line in outputs))
+        identity.assert_not_called()
+        send.assert_not_called()
+
     def test_crash_after_reply_and_after_reservation_reuses_both(self):
         reserve = self.steward.reserve_handoff_retire
         for after in (False, True):
@@ -2607,6 +2932,76 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
         self.assertIn(f"prompted={outcome}", line)
         marked.assert_called_once()
         self.assertEqual(self.store.list(), [])
+
+    def test_new_codex_placeholder_and_sidless_handoff_keep_one_native_identity_path(self):
+        import session_tidy as tidy
+        cases = (("successor", True), (None, False))
+        for sid, process_proven in cases:
+            with self.subTest(sid=sid):
+                expected_observed = []
+                prepared = []
+                def target(pane):
+                    if pane == "p1":
+                        return "idle", {key: value for key, value in self.predecessor.items()
+                                         if key not in {"foreground", "server"}}, None, None
+                    raw = dict(self.successor, session_id="-")
+                    return "idle", {key: value for key, value in raw.items()
+                                     if key not in {"foreground", "server"}}, None, None
+                def candidate(pane, *, expected_harness=None, expected_sid=None,
+                              target_observation=None, **_kwargs):
+                    state, ident, _code, reason = target_observation
+                    if reason:
+                        return None, reason
+                    native_sid = sid
+                    identity = dict(ident, session_id=native_sid, server="default")
+                    return {"state": state, "harness": "codex", "session_id": native_sid,
+                            "pane": pane, "name": "new", "_identity": identity,
+                            "_pane_info": {"pane_id": pane,
+                                "foreground_processes": [{"pid": 22}]},
+                            "_native_session_id": native_sid}, None
+                def send(args, *, expected_recipient, on_prepared):
+                    expected_observed.append(expected_recipient)
+                    if sid is None:
+                        recipient = {"harness": "codex", "session_id": None,
+                                     "pane_id": "p2", "name": "new"}
+                        proof = {"schema": "peer-first-input-process-v1", "harness": "codex",
+                                 "pane_id": "p2", "pid": 22, "start": "202",
+                                 "pid_namespace": "pid:[4026531836]"}
+                    else:
+                        recipient = dict(self.recipient)
+                        proof = None
+                    body = Path(args.body_file).read_text()
+                    _text, ref = peer_message.prepare_peer_message(
+                        body, self.sender, recipient, defer=True, first_input_process=proof)
+                    on_prepared(ref)
+                    prepared.append(peer_message._read_pending(ref))
+                    print("prompted=true reason=exact-peer-ref")
+                    return 0
+                with mock.patch.object(tidy, "read_latest_card",
+                                       return_value={"id": "card-startup", "body": "exact card"}), \
+                     mock.patch.object(tidy, "state_root", return_value=self.tmp_root), \
+                     mock.patch.object(tidy, "mark_card_handed_off"), \
+                     mock.patch.object(self.runner, "injected_executable", return_value=None), \
+                     mock.patch.object(self.steward, "_retire_target", side_effect=target), \
+                     mock.patch.object(self.steward, "_prompt_current_candidate", side_effect=candidate), \
+                     mock.patch.object(self.steward, "_retire_foreground",
+                                       return_value=self.successor["foreground"]), \
+                     mock.patch.object(self.steward, "_current_session_identity",
+                                       return_value=("predecessor", "claude")), \
+                     mock.patch.object(self.steward, "cmd_prompt", side_effect=send):
+                    line, code = self.runner.handoff(tidy.Seat("pane", "old-seat", "p1"), "p2")
+                self.assertEqual((code, expected_observed), (0, [("codex", sid)]))
+                self.assertIn("prompted=true", line)
+                row = prepared[0]
+                self.assertEqual(row["handoff"]["successor"]["session_id"], sid)
+                if process_proven:
+                    self.assertEqual(row["to"]["session_id"], "successor")
+                    self.assertNotIn("first_input_process", row)
+                else:
+                    self.assertIsNone(row["to"]["session_id"])
+                    self.assertEqual(row["to"]["pane_id"], "p2")
+                    self.assertEqual(row["first_input_process"]["pid"], 22)
+                    self.assertIsNone(row["handoff"]["requester"]["session_id"])
 
     def test_unverified_send_keeps_exact_retained_handoff(self):
         self.handoff_outcome = ("unverified", 5)

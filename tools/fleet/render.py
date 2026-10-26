@@ -6705,6 +6705,10 @@ _EXPLORER_RUNTIME = None
 _EXPLORER_GENERATION = 0
 _EXPLORER_READINESS = {"ready": True}
 _EXPLORER_SHOWN = False      # a complete frame was drawn: later pending sources never blank the screen again
+_EXPLORER_PUBLISHED_MODEL = None
+_EXPLORER_REPLAY_ACTIVE = False
+_EXPLORER_DETAIL_CONTINUATION = None
+_EXPLORER_REMOTE_OBSERVATION = None
 
 
 def set_explorer_mode(enabled=True):
@@ -6767,11 +6771,53 @@ def _explorer_runtime():
     return _EXPLORER_RUNTIME
 
 
+def _explorer_remote_host_observation(value):
+    """Translate one completed compute-host pump result into readiness evidence."""
+    if not isinstance(value, Mapping):
+        return {"state": "failed", "attempted": True, "reason": "invalid-host-observation",
+                "observed_at": time.time()}
+    stamp = value.get("observed_at")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+        stamp = time.time()
+    if value.get("error"):
+        return {"state": "failed", "attempted": True,
+                "reason": "remote-host-probe-failed", "observed_at": stamp}
+    if value.get("configured") is False:
+        return {"state": "absent", "attempted": True,
+                "reason": "remote-hosts-not-configured", "observed_at": stamp}
+    hosts = value.get("hosts")
+    if not isinstance(hosts, (list, tuple)):
+        return {"state": "failed", "attempted": True,
+                "reason": "invalid-host-list", "observed_at": stamp}
+    if any(not isinstance(host, Mapping) for host in hosts):
+        return {"state": "failed", "attempted": True,
+                "reason": "invalid-host-row", "observed_at": stamp}
+    remote = [host for host in hosts if isinstance(host, Mapping) and host.get("self") is not True]
+    if not remote:
+        return {"state": "absent", "attempted": True,
+                "reason": "no-remote-hosts-configured", "observed_at": stamp}
+    if all(host.get("reachable") is True for host in remote):
+        return {"state": "success", "attempted": True, "observed_at": stamp}
+    return {"state": "failed", "attempted": True,
+            "reason": "remote-host-unreachable", "observed_at": stamp}
+
+
+def _explorer_attach_remote_observation(snapshot, observation):
+    if snapshot is None or observation is None:
+        return snapshot
+    from dataclasses import replace as _replace_snapshot
+    observations = dict(getattr(snapshot, "observations", None) or {})
+    observations["remote-host"] = dict(observation)
+    return _replace_snapshot(snapshot, observations=observations)
+
+
 def _explorer_targets(nav_rows):
     """The s/x target map: the navigation's session and worker rows, through the existing entry
     builders (``_selectable_session`` / ``_select_entry`` / ``_select_entry_job``). Requests, steps,
     ledger, output, relations, duties, events and the system section never get one, and a row whose
     process cannot be read is not a target (fail closed)."""
+    if _EXPLORER_REPLAY_ACTIVE:
+        return []
     targets = []
     for index, row in enumerate(nav_rows):
         target = row.target_ref
@@ -7004,6 +7050,21 @@ def _explorer_compose(snapshot, cols, rows, state=None, focus_result=None, last_
     return frame
 
 
+def _explorer_frame_from_model(model, state, cols, rows, *, beat=1):
+    """Redraw a frozen VM at current geometry with this process's validated install identity."""
+    from .explorer import frame as explorer_frame
+    from dataclasses import replace as _replace_model
+    install = _HEARTING if isinstance(_HEARTING, dict) else {}
+    identity = {
+        "version": install.get("version") if isinstance(install.get("version"), str)
+        and install.get("version") else "unknown",
+        "install_method": install.get("install_method") if isinstance(install.get("install_method"), str)
+        and install.get("install_method") else "unmanaged",
+    }
+    model = _replace_model(model, hearting=identity)
+    return explorer_frame.draw(model, _explorer_state_for(state, cols), cols, rows, beat=beat)
+
+
 def _explorer_key_name(ch, searching=False):
     """The reducer key a curses code stands for; ``None`` when the explorer does not use it.
     While the ``/`` search is open, printable characters are text, never commands."""
@@ -7097,13 +7158,13 @@ def _draw_explorer(stdscr, snapshot, frame=None):
     _EXPLORER_SIZE = (h, w)
     if frame is None:
         frame = _explorer_compose(snapshot, w, h, state, _EXPLORER_RESULT)
-    _draw_explorer_frame(stdscr, frame, snapshot)
+    _draw_explorer_frame(stdscr, frame, snapshot, stale=_EXPLORER_REPLAY_ACTIVE)
 
 
 _EXPLORER_SPIN_KEYS = frozenset(("spin", "g_spin", "g_spin_dim"))
 
 
-def _draw_explorer_frame(stdscr, frame, snapshot):
+def _draw_explorer_frame(stdscr, frame, snapshot, *, stale=False):
     global _EXPLORER_FRAME
     _EXPLORER_FRAME = frame
     h, w = stdscr.getmaxyx()
@@ -7116,10 +7177,13 @@ def _draw_explorer_frame(stdscr, frame, snapshot):
                 glyph, colour_key, tint = cell
                 if glyph == "":
                     continue
-                if glyph == "⠏" and colour_key in _EXPLORER_SPIN_KEYS:
+                if not stale and glyph == "⠏" and colour_key in _EXPLORER_SPIN_KEYS:
                     glyph = spin
                 try:
-                    stdscr.addstr(y, x, glyph, _key_attr(colour_key, tint))
+                    attr = _key_attr(colour_key, tint)
+                    if stale:
+                        attr |= getattr(curses, "A_DIM", 0)
+                    stdscr.addstr(y, x, glyph, attr)
                 except Exception:
                     pass
     else:
@@ -10721,7 +10785,12 @@ def reset_scroll():
     _RELOAD_LAYOUT = None
     _SHELL_TTY_MODE = None
     global _EXPLORER_STATE, _EXPLORER_RESULT, _EXPLORER_FRAME, _EXPLORER_SIZE
+    global _EXPLORER_PUBLISHED_MODEL, _EXPLORER_REPLAY_ACTIVE, _EXPLORER_DETAIL_CONTINUATION
+    global _EXPLORER_REMOTE_OBSERVATION
     _EXPLORER_STATE = _EXPLORER_RESULT = _EXPLORER_FRAME = _EXPLORER_SIZE = None
+    _EXPLORER_PUBLISHED_MODEL = _EXPLORER_DETAIL_CONTINUATION = None
+    _EXPLORER_REPLAY_ACTIVE = False
+    _EXPLORER_REMOTE_OBSERVATION = None
 
 
 def viewer_state(live_order):
@@ -10802,6 +10871,8 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
     global _RELOAD_FRAME_AT, _RELOAD_FRAME_COMPUTE_AT, _HIT_VALID, _HIT_SIZE
     global _HIT_SNAPSHOT_ID, _CURRENT_BODY_H, _CURRENT_BODY_TOP, _CURRENT_BODY_COUNT
     global _LAYOUT_META, _EXPLORER_SHOWN
+    global _EXPLORER_MODEL, _EXPLORER_PUBLISHED_MODEL, _EXPLORER_REPLAY_ACTIVE
+    global _EXPLORER_DETAIL_CONTINUATION, _EXPLORER_STATE
 
     _TOGGLE_ROWS, _TOGGLE_SPANS = {}, {}
     _CLICK_ROWS, _CLICK_SPANS = {}, {}
@@ -10815,19 +10886,45 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
     if _EXPLORER_ENABLED:
         current = snapshot or LiveSnapshot(sessions=sessions, jobs=jobs)
         state = _explorer_state_for(_EXPLORER_STATE, w)
-        frame = _explorer_compose(current, w, h, state, _EXPLORER_RESULT)
-        readiness = _EXPLORER_READINESS
-        ready = (readiness.get("ready", True) if isinstance(readiness, Mapping)
-                 else getattr(readiness, "ready", True))
-        # ``loading`` is the caller's "no collection yet": the placeholder snapshot is empty,
-        # not a fleet with zero sessions. Once a complete frame is up, a source that is
-        # pending again (a usage refresh in flight) keeps the last frame instead.
-        if not _EXPLORER_SHOWN and (loading or not ready):
-            placeholder = _explorer_runtime().loading_frame(w, h)
-            if placeholder is not None:
-                frame = placeholder
-        elif not loading:
+        _EXPLORER_STATE = state
+        runtime = _explorer_runtime()
+        # Generation zero has no live rows to compose. Paint a persisted VM (or
+        # the loading frame) directly; later generations still compose first so
+        # their readiness evidence is current before a publication decision.
+        if loading and _EXPLORER_PUBLISHED_MODEL is not None:
+            _EXPLORER_MODEL = _EXPLORER_PUBLISHED_MODEL
+            frame = _explorer_frame_from_model(_EXPLORER_MODEL, state, w, h, beat=1)
             _EXPLORER_SHOWN = True
+        elif loading:
+            frame = runtime.loading_frame(w, h)
+        else:
+            candidate_frame = _explorer_compose(current, w, h, state, _EXPLORER_RESULT)
+            candidate_model = _EXPLORER_MODEL
+            readiness = _EXPLORER_READINESS
+            complete = runtime.publication_ready(readiness)
+            # A partial basic/detail generation never replaces the last complete screen.
+            if complete:
+                _EXPLORER_REPLAY_ACTIVE = False
+                _EXPLORER_PUBLISHED_MODEL = candidate_model
+                _EXPLORER_MODEL = candidate_model
+                _EXPLORER_SHOWN = True
+                runtime.mark_published(readiness)
+                frame = candidate_frame
+                if runtime.all_new(readiness):
+                    runtime.persist_complete_async(candidate_model, readiness,
+                                                   _EXPLORER_DETAIL_CONTINUATION)
+            elif _EXPLORER_PUBLISHED_MODEL is not None:
+                _EXPLORER_MODEL = _EXPLORER_PUBLISHED_MODEL
+                if _EXPLORER_REPLAY_ACTIVE:
+                    frame = _explorer_frame_from_model(_EXPLORER_MODEL, state, w, h, beat=1)
+                else:
+                    from dataclasses import replace as _replace_model
+                    live_model = _replace_model(_EXPLORER_MODEL, clock=time.time())
+                    frame = _explorer_frame_from_model(live_model, state, w, h,
+                                                       beat=int(_BLINK_ON))
+                _EXPLORER_SHOWN = True
+            else:
+                frame = runtime.loading_frame(w, h)
         _draw_explorer(stdscr, current, frame=frame)
         return
     stdscr.erase()
@@ -11107,11 +11204,63 @@ def _explorer_note_earlier(before, key):
         _EXPLORER_EARLIER = True
 
 
+def _explorer_detail_callback(collector, *, optional=False):
+    """Choose the required fast pass before the first complete screen."""
+    if not optional:
+        callback = getattr(collector, "required_detail_refresh", None)
+        if callable(callback):
+            return callback, True
+    callback = getattr(collector, "detail_refresh", None)
+    return (callback, False) if callable(callback) else (None, False)
+
+
+def _explorer_resume_continuation(collector, source, payload, details):
+    """Resume valid rows and refresh misses with the full current snapshot as context."""
+    restore = getattr(details, "restore_continuation", None)
+    merge = getattr(details, "merge_continuation", None)
+    if not callable(restore) or not callable(merge):
+        return None
+    continued = merge(source, restore(payload))
+    if isinstance(continued, tuple) and continued:
+        continued = continued[0]
+    if not hasattr(continued, "snapshot"):
+        return None
+    if getattr(continued, "continuation_complete", False):
+        return continued
+    if not getattr(continued, "continued_count", 0):
+        return None
+    # The callback retains neighbourhood and association evidence from all rows;
+    # continuation markers limit required-detail writes to the unvalidated rows.
+    callback, _required_only = _explorer_detail_callback(collector, optional=False)
+    if callable(callback):
+        try:
+            refreshed = callback(continued.snapshot)
+        except Exception:
+            refreshed = None
+        if refreshed is not None:
+            return refreshed
+    return continued
+
+
 def _loop(stdscr, collect_all, hfilter, section, interval):
     global _OFFSET, _BLINK_ON, _RESUME_ORDER, _RELOAD_FRAME, _HIT_VALID, _EXPLORER_RESULT, _EXPLORER_EARLIER
-    global _EXPLORER_GENERATION
+    global _EXPLORER_GENERATION, _EXPLORER_MODEL, _EXPLORER_PUBLISHED_MODEL
+    global _EXPLORER_REPLAY_ACTIVE, _EXPLORER_SHOWN, _EXPLORER_DETAIL_CONTINUATION
+    global _EXPLORER_READINESS, _EXPLORER_REMOTE_OBSERVATION
     curses.curs_set(0)
     _init_colors()
+    if _EXPLORER_ENABLED:
+        _EXPLORER_REMOTE_OBSERVATION = None
+        runtime = _explorer_runtime()
+        runtime.configure_persistence(hfilter, strict_readiness=not bool(os.environ.get("FLEET_DEMO")))
+        _EXPLORER_GENERATION = 0
+        _EXPLORER_SHOWN = False
+        _EXPLORER_PUBLISHED_MODEL = runtime.load_last_complete(hfilter)
+        _EXPLORER_MODEL = _EXPLORER_PUBLISHED_MODEL
+        _EXPLORER_REPLAY_ACTIVE = _EXPLORER_PUBLISHED_MODEL is not None
+        _EXPLORER_DETAIL_CONTINUATION = runtime.cached_continuation
+        _EXPLORER_READINESS = {"ready": False, "fully_fresh": False,
+                               "all_new": False, "pending": ("basic",)}
     live_order = _RESUME_ORDER or _LiveOrderState()
     _RESUME_ORDER = None
     mouse_enabled = "FLEET_MOUSE" not in os.environ or os.environ.get("FLEET_MOUSE") == "1"
@@ -11126,15 +11275,21 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
 
     from . import details
     latest_basic = [None]
+    optional_detail_source = [None]
+    optional_detail_identity = [None]
     detail_generation = 0
 
     def collect_snapshot():
         options = {"harness_filter": hfilter}
         if _EXPLORER_ENABLED:
-            options.update(_explorer_runtime().collection_options(first_complete=(generation == 0)))
+            runtime = _explorer_runtime()
+            options.update(runtime.collection_options(first_complete=not runtime.has_complete))
         else:
             options["fast_first"] = True
         snapshot = as_snapshot(collect_all(**options))
+        if _EXPLORER_ENABLED:
+            snapshot = _explorer_attach_remote_observation(
+                snapshot, _EXPLORER_REMOTE_OBSERVATION)
         snapshot.hearting = dict(_HEARTING) if isinstance(_HEARTING, dict) else None
         # Publication makes these rows immutable to the detail worker. Every
         # basic tick stays cheap even while that worker is delayed on NAS.
@@ -11142,29 +11297,73 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         return snapshot
 
     def collect_details():
-        source = latest_basic[0]
-        governor = _collect_governor()
+        optional_source = optional_detail_source[0]
+        optional_detail_source[0] = None
+        optional_pass = optional_source is not None
+        source = optional_source if optional_pass else latest_basic[0]
+        if source is None:
+            return (None, None) if _EXPLORER_ENABLED else None
         detail_refresh = getattr(collect_all, "detail_refresh", None)
-        if callable(detail_refresh):
-            result = detail_refresh(source)
-            value = result.snapshot
+        result = None
+        continuation = None
+        required_only_pass = False
+        if _EXPLORER_ENABLED:
+            runtime = _explorer_runtime()
+            if not optional_pass:
+                payload = runtime.clear_cached_continuation()
+                restore_continuation = getattr(details, "restore_continuation", None)
+                merge_continuation = getattr(details, "merge_continuation", None)
+                if payload is not None and callable(restore_continuation) and callable(merge_continuation):
+                    try:
+                        resumed = _explorer_resume_continuation(
+                            collect_all, source, payload, details)
+                        if resumed is not None:
+                            result = resumed
+                            required_only_pass = True
+                    except Exception:
+                        result = None
+            if result is None:
+                callback, required_only_pass = _explorer_detail_callback(
+                    collect_all, optional=optional_pass)
+                if callable(callback):
+                    result = callback(source)
+        else:
+            if callable(detail_refresh):
+                result = detail_refresh(source)
+        if result is not None:
+            value = result.snapshot if hasattr(result, "snapshot") else source
+        elif callable(detail_refresh):
+            value = source
+            required_only_pass = False
+            if optional_pass:
+                result = details.DetailSnapshot(details.state_key(source), value)
         else:
             import copy
             value = copy.deepcopy(source)
             result = details.DetailSnapshot(details.state_key(source), value)
-        gitinfo.enrich_entities(value.sessions + value.jobs, schedule_ahead=True)
-        value.memory, value.governor = _collect_memory(), governor
-        try:
-            from .display_snapshot import extend
-            value.display_snapshot = extend(value.display_snapshot, memory=value.memory)
-        except Exception:
-            pass
-        hearting_refresh = getattr(collect_all, "hearting_refresh", None)
-        if callable(hearting_refresh):
+        if not required_only_pass:
+            governor = _collect_governor()
+            gitinfo.enrich_entities(value.sessions + value.jobs, schedule_ahead=True)
+            value.memory, value.governor = _collect_memory(), governor
             try:
-                value.hearting = hearting_refresh()
+                from .display_snapshot import extend
+                value.display_snapshot = extend(value.display_snapshot, memory=value.memory)
             except Exception:
                 pass
+            hearting_refresh = getattr(collect_all, "hearting_refresh", None)
+            if callable(hearting_refresh):
+                try:
+                    value.hearting = hearting_refresh()
+                except Exception:
+                    pass
+        if _EXPLORER_ENABLED:
+            export_continuation = getattr(details, "export_continuation", None)
+            if not optional_pass and callable(export_continuation):
+                try:
+                    continuation = export_continuation(result)
+                except Exception:
+                    continuation = None
+            return result, continuation
         return result
 
     # Draw a loading frame until the first complete snapshot is adopted. Empty
@@ -11172,12 +11371,9 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     snapshot = LiveSnapshot(hearting=dict(_HEARTING) if isinstance(_HEARTING, dict) else None)
     generation = 0
     pump = RefreshPump(collect_snapshot, interval, adaptive_cadence=_EXPLORER_ENABLED)
-    pump.start()
     follower = getattr(collect_all, "install_follower", None)
     install_pump = RefreshPump(follower.target, interval, name="fleet-install-refresh") if follower else None
     install_generation, install_target = 0, None
-    if install_pump is not None:
-        install_pump.start()
     # Existing coalescing/last-good semantics, independent of basic refresh.
     detail_pump = RefreshPump(collect_details, interval, name="fleet-detail-refresh")
     basic_snapshot = snapshot
@@ -11194,14 +11390,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             compute_host_interval = _COMPUTE_HOST_INTERVAL
         compute_host_pump = RefreshPump(
             compute_host_refresh, compute_host_interval, name="fleet-gpu-refresh")
-        compute_host_pump.start()
     latest_view = [snapshot]
     selection_feed = None
-    if _EXPLORER_ENABLED:
-        from .explorer.focus import FocusReader
-        selection_feed = _ExplorerFeed(
-            FocusReader(live_jobs=lambda: list(getattr(latest_view[0], "jobs", ()) or ()),
-                        snapshot=lambda: latest_view[0], output_reader=_explorer_output_reader()), interval)
     sessions, jobs = snapshot.sessions, snapshot.jobs
     resources = snapshot.resources
     usage_snapshots = snapshot.usage_snapshots
@@ -11213,10 +11403,62 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         details=detail_pump.health(time.monotonic()),
         compute_hosts=(compute_host_pump.health(time.monotonic())
                        if compute_host_pump is not None else None))
+
+    background_started = False
+
+    def start_background_pumps():
+        nonlocal background_started
+        if background_started:
+            return
+        for background in (pump, install_pump, compute_host_pump):
+            if (background is not None and background.generation == 0
+                    and not background.running):
+                background.start()
+        background_started = True
+
+    def ensure_selection_feed():
+        nonlocal selection_feed
+        if _EXPLORER_ENABLED and selection_feed is None:
+            from .explorer.focus import FocusReader
+            selection_feed = _ExplorerFeed(
+                FocusReader(live_jobs=lambda: list(getattr(latest_view[0], "jobs", ()) or ()),
+                            snapshot=lambda: latest_view[0],
+                            output_reader=_explorer_output_reader()), interval)
+
     stdscr.timeout(200)                     # getch blocks ≤200ms → responsive keys
     _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
           live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
           governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
+    # The first input read gets an uncontended opportunity after a cached paint.
+    # With no input, the normal 100 ms wake starts background collection below.
+    if not _EXPLORER_ENABLED:
+        start_background_pumps()
+
+    def queue_optional_details():
+        if not _EXPLORER_ENABLED or optional_detail_source[0] is not None:
+            return
+        if not (callable(getattr(collect_all, "required_detail_refresh", None))
+                and callable(getattr(collect_all, "detail_refresh", None))):
+            return
+        runtime = _explorer_runtime()
+        readiness = _EXPLORER_READINESS
+        if not runtime.publication_ready(readiness):
+            return
+        identity = readiness.get("generation_identity") if isinstance(readiness, Mapping) else None
+        source = latest_view[0]
+        if identity is None or identity == optional_detail_identity[0] or source is None:
+            return
+        observations = getattr(source, "observations", None)
+        basic = observations.get("basic") if isinstance(observations, Mapping) else None
+        detail = observations.get("required-details") if isinstance(observations, Mapping) else None
+        if (not isinstance(basic, Mapping) or not isinstance(detail, Mapping)
+                or basic.get("generation_identity", basic.get("identity")) != identity
+                or detail.get("generation_identity", detail.get("identity")) != identity):
+            return
+        optional_detail_identity[0] = identity
+        optional_detail_source[0] = source
+        detail_pump.request(force=True)
+
     if _EXPLORER_ENABLED:
         try:
             os.write(sys.stdout.fileno(), b"\x1b[?1002h\x1b[?1006h")
@@ -11235,15 +11477,16 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 ch, mouse_event = stdscr.getch(), None
             now = time.time()
             now_mono = time.monotonic()
-            pump.request_due(now=now_mono)
-            if install_pump is not None:
+            if background_started:
+                pump.request_due(now=now_mono)
+            if install_pump is not None and background_started:
                 install_pump.request_due(now=now_mono)
                 install_update = install_pump.poll(install_generation)
                 if install_update is not None:
                     install_generation, install_target = install_update
-            if latest_basic[0] is not None:
+            if latest_basic[0] is not None and not _EXPLORER_ENABLED:
                 detail_pump.request_due(now=now_mono)
-            if compute_host_pump is not None:
+            if compute_host_pump is not None and background_started:
                 compute_host_pump.request_due(now=now_mono)
             set_refresh_health(
                 snapshot=pump.health(now_mono),
@@ -11253,11 +11496,14 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             update = pump.poll(generation)
             if update is not None:
                 generation, basic_snapshot = update
-                if generation == 1:
+                if _EXPLORER_ENABLED:
                     detail_pump.request(force=True)
             detail_update = detail_pump.poll(detail_generation)
             if detail_update is not None:
                 detail_generation, latest_detail = detail_update
+                if (_EXPLORER_ENABLED and isinstance(latest_detail, tuple)
+                        and len(latest_detail) == 2):
+                    latest_detail, _EXPLORER_DETAIL_CONTINUATION = latest_detail
             _EXPLORER_GENERATION = generation
             if update is not None or detail_update is not None:
                 snapshot = details.merge(basic_snapshot, latest_detail)
@@ -11277,6 +11523,16 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     compute_host_generation, compute_host_snapshot = compute_host_update
                     set_compute_hosts(compute_host_snapshot)
                     _HIT_VALID = False
+                    if _EXPLORER_ENABLED:
+                        _EXPLORER_REMOTE_OBSERVATION = _explorer_remote_host_observation(
+                            compute_host_snapshot)
+                        latest_basic[0] = _explorer_attach_remote_observation(
+                            latest_basic[0], _EXPLORER_REMOTE_OBSERVATION)
+                        basic_snapshot = _explorer_attach_remote_observation(
+                            basic_snapshot, _EXPLORER_REMOTE_OBSERVATION)
+                        snapshot = _explorer_attach_remote_observation(
+                            snapshot, _EXPLORER_REMOTE_OBSERVATION)
+                        latest_view[0] = snapshot
             _BLINK_ON = _blink_phase(now)
             if selection_feed is not None:
                 focus_result, focus_changed = selection_feed.update(
@@ -11291,6 +11547,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             if (install_target is not None and ch == curses.ERR
                     and not input_reader.has_buffered_input()
                     and _PROMPT is None and _PENDING_KILL is None):
+                if _EXPLORER_ENABLED:
+                    _explorer_runtime().wait_for_writes(timeout=0.25)
                 follower.restart(install_target, getattr(collect_all, "restart_argv", []),
                                  viewer_state(live_order),
                                  stderr_fd=getattr(collect_all, "restart_stderr_fd", None))
@@ -11319,6 +11577,10 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                       live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
                       governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
+                start_background_pumps()
+                if generation > 0:
+                    ensure_selection_feed()
+                queue_optional_details()
                 continue
             if _EXPLORER_ENABLED:
                 _explorer_handle(ch, mouse_event, (h, w), snapshot)
@@ -11328,7 +11590,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                         selection_feed.pump.load_earlier()
                 if ch in (ord("r"), ord("R")) and not _explorer_searching():
                     pump.request(force=True)
-                    detail_pump.request(force=True)
+                    if latest_basic[0] is not None:
+                        detail_pump.request(force=True)
                     if compute_host_pump is not None:
                         compute_host_pump.request(force=True)
                     if selection_feed is not None:
@@ -11338,6 +11601,10 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                       live_order=live_order, resources=resources,
                       usage_snapshots=usage_snapshots, governor=governor_snapshot,
                       loading=(generation == 0), snapshot=snapshot)
+                start_background_pumps()
+                if generation > 0:
+                    ensure_selection_feed()
+                queue_optional_details()
                 continue
             if _SELECT_MODE:
                 if _handle_select_key(ch):
@@ -11372,7 +11639,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
 
             if ch in (ord("r"), ord("R")):
                 pump.request(force=True)
-                detail_pump.request(force=True)
+                if latest_basic[0] is not None:
+                    detail_pump.request(force=True)
                 if compute_host_pump is not None:
                     compute_host_pump.request(force=True)
             _poll_pending_kill()     # F-27 grace window — non-blocking; may raise a re-prompt

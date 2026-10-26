@@ -953,6 +953,15 @@ def scan(harness_filter=None):
                                    attempt_id=env.get("AGENT_DISPATCH_ATTEMPT_ID") or None)
                         if proc_start is not None else None),
         )
+        # A registered owner has a route binding, but no stage node. Preserve
+        # the wrapper's complete/partial tuple for the existing fail-closed
+        # owner resolver, including when its runtime session id is unobserved.
+        # These observation-only attributes do not extend Session's JSON shape.
+        for field in ("owner_route_file", "owner_route_id", "owner_route_hash"):
+            value = env.get("AGENT_" + field.upper())
+            if value:
+                setattr(sess, field, value)
+        sess._dispatch_depth = env.get("AGENT_DISPATCH_DEPTH")
         # Shared process snapshot for targeted output-writer correlation. These
         # private references are excluded from public dataclass serialization.
         sess._proc_tree = tree

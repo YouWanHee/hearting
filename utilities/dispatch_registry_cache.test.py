@@ -16,6 +16,21 @@ import dispatch_registry_cache as CACHE  # noqa: E402
 
 
 class RegistryLinesCacheTest(unittest.TestCase):
+    def test_canonical_completion_and_handover_share_one_metadata_parse(self):
+        raw = "attempt_id=att-owner,parent=parent,model_role=deep maker"
+        self.jobs.write_text("t\topen\t/repo\t/wt\towner\t" + raw + "\n")
+        with mock.patch.object(CACHE, "_handover_metadata", side_effect=AssertionError("reparsed")):
+            row = CACHE.registry_view(self.jobs).records[0]
+            self.assertEqual(row.handover_metadata(), row.completion_metadata())
+
+    def test_noncanonical_key_collisions_keep_handover_ordering(self):
+        examples = [" a=1,a=2, a=3", "=empty,parent=p", " a=one, a=two,a=three"]
+        self.jobs.write_text("".join("t\topen\t/repo\t/wt\towner\t" + raw + "\n"
+                                     for raw in examples))
+        rows = CACHE.registry_view(self.jobs).records
+        self.assertEqual([row.handover_metadata() for row in rows],
+                         [dict(CACHE._handover_metadata(raw)) for raw in examples])
+
     def test_utf8_status_accepts_literal_replacement_and_malformed_historical_rows(self):
         self.jobs.write_bytes(
             b"t\topen\t/repo\t/wt\towner\tnote=" + "\ufffd".encode("utf-8")

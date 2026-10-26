@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from unittest import mock
+from tools.fleet.model import DispatchJob
 
 from tools.fleet.collectors import dispatch
 
@@ -19,6 +20,36 @@ _ROW = ("2026-07-19T00:00:00Z\tdone\t/r\t/w\t{slug}\t"
 
 
 class DeadTerminalOwnerTest(unittest.TestCase):
+    def test_repeated_lineage_sources_are_memoized_within_one_retention_pass(self):
+        path = "/dispatch/jobs.log"
+        route_file = "/routes/shared.json"
+        def owner_row(order, attempt):
+            return {"order": order, "worktree": "/work", "meta": {
+                "owner_route_id": "rt-shared", "owner_route_file": route_file,
+                "route_id": "rt-shared", "route_file": route_file,
+                "capability": "autopilot-code", "worker_type": "owner",
+                "attempt_id": attempt,
+            }}
+
+        rows = [owner_row(0, "dead-a"), owner_row(1, "dead-b"),
+                owner_row(2, "newer")]
+        jobs = []
+        for attempt in ("dead-a", "dead-b"):
+            job = DispatchJob(key="owner", slug=attempt, attempt_id=attempt,
+                              elapsed_min=1, liveness="dead")
+            job._dead_terminal_owner = True
+            job._registry_path = path
+            jobs.append(job)
+
+        with mock.patch.object(dispatch, "_orphan_registry_module", return_value=object()), \
+                mock.patch.object(dispatch, "_orphan_registry_rows_for_pass", return_value=rows), \
+                mock.patch.object(dispatch, "_route_lineage", return_value={"rt-shared"}) as lineage:
+            retained = dispatch._retain_dead_terminal_owners(
+                jobs, now=0, jobs_path=path)
+
+        self.assertEqual(retained, [])
+        self.assertEqual(lineage.call_count, 1)
+
     def _route(self, td, rid):
         record = {"route_id": rid, "nodes": [
             {"id": "plan", "depends_on": []}, {"id": "execute", "depends_on": ["plan"]},
