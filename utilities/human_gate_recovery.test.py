@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """M1–M4 behavioral checks against the same archived or working source.
 
-Only time/wait and transport are controlled; authority checks remain real.
+Time/wait, transport and the enforcement unit's gate policy are controlled;
+authority checks remain real.
 HEARTING_TEST_SOURCE_ROOT selects a read-only git archive for RED runs.
 """
 import contextlib
@@ -44,6 +45,11 @@ class M1Decision(unittest.TestCase):
         self.fixture = SF.TestGateRelease()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        # These cases exercise proof enforcement, independently of the user's
+        # default-off policy. No live setting or controller is changed.
+        policy = mock.patch.object(SF.ROUTE, "gates_on", return_value=True)
+        policy.start()
+        self.addCleanup(policy.stop)
         with contextlib.redirect_stdout(io.StringIO()):
             self.source, self.route_file = self.fixture._blocked()
         self.source["launch_compatibility_tuple"] = {"jobs_path": {"path": str(self.fixture.jobs)}}
@@ -104,6 +110,12 @@ class M1Decision(unittest.TestCase):
 
     def test_latest_reraise_invalidates_prior_proof(self):
         self.assert_prior_invalid(self.prior_proof())
+
+    def test_disabled_gate_policy_accepts_same_work_drift(self):
+        proof = self.prior_proof()
+        with mock.patch.object(SF.ROUTE, "gates_on", return_value=False):
+            self.assertEqual(SF.ROUTE._verify_continuation_gate_release_proofs(
+                self.suffix(proof)), [proof])
 
     def test_latest_stop_invalidates_prior_proof(self):
         proof = self.prior_proof()

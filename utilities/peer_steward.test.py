@@ -12177,37 +12177,72 @@ class RegisteredUnknownRetryTest(_TmpRootMixin, unittest.TestCase):
         import session_notice
         import session_tidy as tidy
 
-        for harness in ("claude", "codex", "opencode"):
-            with self.subTest(harness=harness):
-                storage_sid = harness + "-notice-storage"
-                successor_sid = harness + "-notice-successor"
+        cases = ((harness, producer_name, notify, kind, storage_field)
+                 for harness in ("claude", "codex", "opencode")
+                 for producer_name, notify, kind, storage_field in (
+                     ("canonical", session_notice.notify, "run-notice", "storage_recipient"),
+                     ("legacy", _legacy_notice, "session-notice", "storage_sid")))
+        for harness, producer_name, notify, kind, storage_field in cases:
+            with self.subTest(harness=harness, producer=producer_name):
+                storage_sid = harness + "-" + producer_name + "-notice-storage"
+                successor_sid = harness + "-" + producer_name + "-notice-successor"
                 with mock.patch.object(peer_steward.peer_obligations,
-                                       "ensure_normal_runner", return_value=False):
-                    notice = session_notice.notify(
-                        harness, storage_sid, key="unknown-lineage-" + harness,
+                                       "ensure_normal_runner", return_value=False), \
+                        mock.patch.object(peer_steward.peer_obligations,
+                                          "request_dispatch_reconciliation", return_value=False):
+                    notice = notify(
+                        harness, storage_sid, key="unknown-lineage-" + harness + "-" + producer_name,
                         subject="run finished", text="keep the original storage key",
                         jobs=self.jobs_path)
                 store = peer_steward.peer_obligations.ObligationStore(self.tmp_root)
-                duty = next(row for row in store.list(kinds={"session-notice"})
-                            if row["intent"]["identity"]["storage_sid"] == storage_sid)
+                duty = next(row for row in store.list(kinds={kind})
+                            if row["intent"]["identity"][storage_field] == storage_sid)
+                self.assertEqual(duty["intent"]["kind"], kind)
+                self.assertEqual(peer_steward.peer_obligations._notice_duty_source(
+                    duty, self.tmp_root), (harness, storage_sid, notice["delivery_id"], self.jobs_path))
                 duty = store.update(duty["id"], observer_error="recipient-unavailable")
-                seat = tidy.Seat("pane", "unknown-notice-" + harness,
+                seat = tidy.Seat("pane", "unknown-notice-" + harness + "-" + producer_name,
                                  pane="w1:p-" + harness, harness=harness)
                 inventory = {"result": {"agents": []}}
                 deliveries = []
 
+                real_courier = peer_steward.cmd_prompt
+
                 def courier(args, *, expected_recipient, on_prepared, producer_binding):
                     deliveries.append((expected_recipient, producer_binding,
                                        Path(args.body_file).read_text()))
-                    on_prepared("transfer-" + harness)
-                    return 0
+                    return real_courier(args, expected_recipient=expected_recipient,
+                        on_prepared=on_prepared, producer_binding=producer_binding)
 
+                def native_observation(argv, **kwargs):
+                    if argv[-2:] == ["agent", "list"]:
+                        payload = inventory
+                    elif argv[-3:] == ["agent", "get", seat.pane]:
+                        payload = {"result": {"agent": inventory["result"]["agents"][0]}}
+                    else:
+                        raise AssertionError("unprovided native observation: " + repr(argv))
+                    return SimpleNamespace(stdout=json.dumps(payload), stderr="", returncode=0)
+
+                def native_session(pane, observed_harness, info):
+                    self.assertEqual((pane, observed_harness), (seat.pane, harness))
+                    self.assertEqual(info["pane_id"], seat.pane)
+                    return successor_sid, None
+
+                # Keep both resolvers and the courier real. A native session
+                # observation without an input-ready process leaves its real
+                # prepared transfer queued; it cannot authorize a native write.
                 retry_state = {}
                 with mock.patch.object(peer_steward.time, "monotonic", return_value=100.0), \
-                        mock.patch.object(peer_steward.subprocess, "run", side_effect=lambda *a, **kw:
-                            SimpleNamespace(stdout=json.dumps(inventory), returncode=0)), \
-                        mock.patch.object(peer_steward, "_resolve_target", return_value=(
-                            harness, successor_sid, "fixture")), \
+                        mock.patch.object(peer_steward.subprocess, "run", side_effect=native_observation), \
+                        mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+                        mock.patch.object(peer_steward, "_retire_pane_info", return_value={
+                            "pane_id": seat.pane, "foreground_processes": []}), \
+                        mock.patch.object(peer_steward, "_prompt_process_session",
+                                          side_effect=native_session), \
+                        mock.patch.object(peer_steward, "_herdr_prompt",
+                                          side_effect=AssertionError("native write must stay queued")), \
+                        mock.patch.object(peer_steward.peer_obligations,
+                                          "request_dispatch_reconciliation", return_value=False), \
                         mock.patch.object(peer_steward, "cmd_prompt", side_effect=courier):
                     peer_steward._reconcile_obligations(store, [duty], retry_state=retry_state)
                     self.assertEqual(deliveries, [])
@@ -12224,7 +12259,7 @@ class RegisteredUnknownRetryTest(_TmpRootMixin, unittest.TestCase):
                     })
                     inventory["result"]["agents"] = [{
                         "agent": harness, "agent_session": {"value": successor_sid},
-                        "pane_id": seat.pane,
+                        "pane_id": seat.pane, "agent_status": "working", "name": "fixture",
                     }]
                     self.assertEqual(store.get(duty["id"]), duty_before)
                     self.assertEqual(peer_steward._obligation_retry_fingerprint(
