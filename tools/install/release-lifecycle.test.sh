@@ -80,6 +80,7 @@ required = {
     "hearting/utilities/compute-hosts": "#!/bin/sh\n",
     "hearting/utilities/compute-hosts.py": "#!/usr/bin/env python3\n",
     "hearting/tools/fleet/fleet.sh": "#!/bin/sh\n",
+    "hearting/tools/fleet/fleet-monitor.sh": "#!/bin/sh\n",
     "hearting/tools/fleet/fleet2.sh": "#!/bin/sh\n",
     "hearting/tools/memory/mem.py": "#!/usr/bin/env python3\n",
     "hearting/tools/memory/protocol_v2.py": "#!/usr/bin/env python3\n",
@@ -294,6 +295,17 @@ assert same["status"] == "up-to-date"
 assert len(activation_calls) == 1
 
 fleet_launcher = d.bin_dir() / "fleet"
+fleet_monitor_launcher = d.bin_dir() / "fleet-monitor"
+fleet2_launcher = d.bin_dir() / "fleet2"
+fleet_launcher_names = {
+    "fleet": "tools/fleet/fleet.sh",
+    "fleet-monitor": "tools/fleet/fleet-monitor.sh",
+    "fleet2": "tools/fleet/fleet2.sh",
+}
+for name, relative in fleet_launcher_names.items():
+    path = d.bin_dir() / name
+    assert path.is_symlink()
+    assert Path(os.readlink(path)) == d.current_path() / relative
 prior_bundle = Path(os.environ["CODEX_HOME"]) / ".harness/bundles/prior/source"
 prior_fleet = prior_bundle / "tools/fleet/fleet.sh"
 prior_fleet.parent.mkdir(parents=True)
@@ -306,17 +318,20 @@ assert Path(os.readlink(fleet_launcher)) == (
     d.current_path() / "tools/fleet/fleet.sh"
 )
 
-fleet_launcher.unlink()
-fleet_launcher.symlink_to(tmp / "foreign/fleet")
-try:
-    d.update()
-except d.DistributionError:
-    pass
-else:
-    raise AssertionError("foreign Fleet launcher was overwritten")
-assert Path(os.readlink(fleet_launcher)) == tmp / "foreign/fleet"
-fleet_launcher.unlink()
-fleet_launcher.symlink_to(d.current_path() / "tools/fleet/fleet.sh")
+for name, relative in fleet_launcher_names.items():
+    launcher = d.bin_dir() / name
+    launcher.unlink()
+    foreign = tmp / "foreign" / name
+    launcher.symlink_to(foreign)
+    try:
+        d.update()
+    except d.DistributionError:
+        pass
+    else:
+        raise AssertionError(f"foreign {name} launcher was overwritten")
+    assert Path(os.readlink(launcher)) == foreign
+    launcher.unlink()
+    launcher.symlink_to(d.current_path() / relative)
 
 old_root = Path(installed["release_root"])
 linked = tmp / "linked-checkout"
@@ -348,6 +363,10 @@ assert d.current_path().resolve().name == "v1.1.0"
 assert Path(os.readlink(d.bin_dir() / "fleet")) == (
     d.current_path() / "tools/fleet/fleet.sh"
 )
+assert Path(os.readlink(fleet_monitor_launcher)) == (
+    d.current_path() / "tools/fleet/fleet-monitor.sh"
+)
+assert Path(os.readlink(fleet2_launcher)) == d.current_path() / "tools/fleet/fleet2.sh"
 for runtime in ("codex", "opencode"):
     path = runtime_homes[runtime] / ".harness/activation.json"
     path.write_text(
@@ -377,6 +396,10 @@ assert activation_calls[-1][0] == "v1.1.0"
 assert Path(os.readlink(d.bin_dir() / "fleet")) == (
     d.current_path() / "tools/fleet/fleet.sh"
 )
+assert Path(os.readlink(fleet_monitor_launcher)) == (
+    d.current_path() / "tools/fleet/fleet-monitor.sh"
+)
+assert Path(os.readlink(fleet2_launcher)) == d.current_path() / "tools/fleet/fleet2.sh"
 
 for version, attack, wrong in [
     ("v1.2.1", None, True),

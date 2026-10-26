@@ -1,4 +1,4 @@
-"""fleet.sh --window opens through utilities/pane.py and otherwise runs in place.
+"""The Fleet launchers preserve --window behavior and screen selection.
 
 The interpreter is a recording stand-in: it answers for pane.py from the test's
 JSON and exit status, logs a direct fleet.py run, and executes `-c` snippets for
@@ -16,7 +16,9 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[3]
-SCRIPT = ROOT / "tools/fleet/fleet.sh"
+SCRIPT = ROOT / "tools/fleet/fleet-monitor.sh"
+PUBLIC_SCRIPT = ROOT / "tools/fleet/fleet.sh"
+COMPAT_SCRIPT = ROOT / "tools/fleet/fleet2.sh"
 _SURFACE_ENV = ("HERDR_PANE_ID", "HERDR_SOCKET_PATH", "TMUX", "TMUX_PANE")
 
 _PYTHON = """#!{python}
@@ -44,10 +46,13 @@ class FleetWindowTest(unittest.TestCase):
         self.python.chmod(0o700)
 
     def run_case(self, payload, *args, code=0):
+        return self.run_script_case(SCRIPT, payload, *args, code=code)
+
+    def run_script_case(self, script, payload, *args, code=0):
         env = {key: value for key, value in os.environ.items() if key not in _SURFACE_ENV}
         env.update(FLEET_PYTHON=str(self.python), CALL_LOG=str(self.log), PANE_JSON=json.dumps(payload),
                    PANE_EXIT=str(code), PYTHONDONTWRITEBYTECODE="1")
-        return subprocess.run(["bash", str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=60)
+        return subprocess.run(["bash", str(script), *args], env=env, capture_output=True, text=True, timeout=60)
 
     def calls(self):
         if not self.log.exists():
@@ -94,6 +99,26 @@ class FleetWindowTest(unittest.TestCase):
                 result = self.run_case({}, "--window", flag)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.calls(), [[str(ROOT / "tools/fleet/fleet.py"), flag]])
+
+    def test_public_fleet_and_fleet2_select_explorer_and_forward_machine_flags(self):
+        for script in (PUBLIC_SCRIPT, COMPAT_SCRIPT):
+            with self.subTest(script=script.name):
+                self.log.unlink(missing_ok=True)
+                result = self.run_script_case(
+                    script, {}, "--once", "--json", "--no-tmux", "--interval", "3"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.calls(), [[
+                    str(ROOT / "tools/fleet/fleet.py"), "--explorer", "--once",
+                    "--json", "--no-tmux", "--interval", "3",
+                ]])
+
+    def test_monitor_launcher_keeps_the_group_process_default(self):
+        result = self.run_case({}, "--once", "--json", "--no-tmux")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [[
+            str(ROOT / "tools/fleet/fleet.py"), "--once", "--json", "--no-tmux",
+        ]])
 
 
 if __name__ == "__main__":
