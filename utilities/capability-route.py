@@ -5063,6 +5063,12 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
     if plan:
         suffix = " (상속)" if plan_source == "inherited" else ""
         card += f"\n  계획 {' › '.join(plan)}{suffix}"
+    leg_plan = ROUTE_PLAN.leg_plan(route)
+    parallel = (leg_plan or {}).get("leg", {}).get("parallel") or []
+    if parallel:
+        card += "\n  승인된 분할: " + " · ".join(parallel[:3])
+        if len(parallel) > 3:
+            card += f"; 외 {len(parallel) - 3}개(route·owner 지시문에 전부)"
     if route_plan_unreadable:
         card += "\n  경로 계획을 읽지 못함"
     notice = _compose_spec_read_notice(route)
@@ -12717,6 +12723,7 @@ def main():
                                        for n in route["nodes"]],
                               "human_gates":route.get("human_gates"),"parallel_groups":route.get("parallel_groups"),
                               "campaign":_campaign_for_card,
+                              **({"route_plan":route["route_plan"]} if route.get("route_plan") else {}),
                               "advisories":OWNER_WRITE_ADVISORY.advisories(route, owner_harness=owner_pin),
                               "tracked_gate_evidence":route.get("tracked_gate_evidence"),
                               **compose_observations(route)},sort_keys=True))
