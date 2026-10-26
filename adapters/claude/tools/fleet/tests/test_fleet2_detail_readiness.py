@@ -1,0 +1,1 @@
+../../../../../tools/fleet/tests/test_fleet2_detail_readiness.py

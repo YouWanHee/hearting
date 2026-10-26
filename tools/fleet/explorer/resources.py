@@ -108,7 +108,11 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
                 if str(process.get("host") or "") != str(host) or \
                         str(process.get("gpu") if process.get("gpu") is not None else "") != str(idx):
                     continue
-                sid = str(process.get("session_id") or process.get("session") or "")
+                # New records keep the exact source ID separately from the display tag.
+                # Older fixtures already put the short tag in session_id.
+                sid_value = (process.get("session_tag") if "session_tag" in process else
+                             process.get("session_id") or process.get("session"))
+                sid = str(sid_value or "")
                 cwd = str(process.get("cwd") or "")
                 repo = cwd.rstrip("/").rsplit("/", 1)[-1] if cwd else "·"
                 command = short_cmd(str(process.get("command") or "")) or "·"

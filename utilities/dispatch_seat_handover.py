@@ -151,8 +151,10 @@ def _all_snapshots_uncached() -> list[dict]:
 def handover_rows(seat, *, read_context=None) -> list[dict]:
     """The seat ledger's handover rows, oldest first."""
     def load():
-        return [e for e in _st()._read_ledger_lines(seat)
-                if e.get("event") == ROW_EVENT and e.get("from")]
+        st = _st()
+        with st.seat_ledger_readonly_scope():
+            return [e for e in st._read_ledger_lines(seat)
+                    if e.get("event") == ROW_EVENT and e.get("from")]
 
     rows = (read_context.handover_rows(seat, load) if read_context is not None else load())
     return sorted(rows, key=lambda r: float(r.get("ts", 0) or 0))
@@ -183,9 +185,10 @@ def _transition_rows(seat_key: Optional[str] = None) -> list[tuple[str, dict]]:
         if path.is_symlink():
             continue
         key = path.stem
-        for row in st._read_ledger_lines(st.Seat("pane", key)):
-            if row.get("event") in {ROW_EVENT, "steward-release"}:
-                out.append((key, row))
+        with st.seat_ledger_readonly_scope():
+            for row in st._read_ledger_lines(st.Seat("pane", key)):
+                if row.get("event") in {ROW_EVENT, "steward-release"}:
+                    out.append((key, row))
     return out
 
 

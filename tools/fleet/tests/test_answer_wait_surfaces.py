@@ -79,6 +79,12 @@ class AnswerWaitSurfaceTests(unittest.TestCase):
             {"id": "s3", "source": "S3", "kind": "decision", "since": 100,
              "attempt_id": "att", "owner": {"harness": "claude", "session_id": "b"},
              "question": "PRIVATE-BLOCKER", "stale": True},
+            {"id": "s3-old", "source": "S3", "kind": "decision", "since": 90,
+             "attempt_id": "older", "owner": {"harness": None, "session_id": None},
+             "question": "PRIVATE-OLD-S3", "stale": True},
+            {"id": "s4", "source": "S4", "kind": "decision", "since": 100,
+             "owner": {"harness": "claude", "session_id": "c"},
+             "question": "PRIVATE-QUESTION", "stale": False},
         ], "complete": True, "observed_at": 101}
         self.assertTrue(human_wait_state.publish_cache(result))
         payload = human_wait_state._fleet_cache_path().read_bytes()
@@ -87,15 +93,21 @@ class AnswerWaitSurfaceTests(unittest.TestCase):
         self.assertNotIn(b'"recommendation"', payload)
         self.assertNotIn(b'"seat_key"', payload)
         for sentinel in (b"PRIVATE-QUESTION", b"PRIVATE-CHOICE", b"PRIVATE-REC",
-                         b"PRIVATE-SEAT", b"PRIVATE-BLOCKER"):
+                         b"PRIVATE-SEAT", b"PRIVATE-BLOCKER", b"PRIVATE-OLD-S3"):
             self.assertNotIn(sentinel, payload)
         view = human_wait_state.cached_fleet_view(now=101, request=False)
         self.assertEqual([item["source"] for item in view["items"]],
-                         ["S1-approval", "S1-question", "S2", "S3"])
+                         ["S1-approval", "S1-question", "S2", "S3", "S3", "S4"])
         self.assertEqual([item["kind"] for item in view["items"]],
-                         ["approval", "decision", "human gate", "blocked owner"])
+                         ["approval", "decision", "human gate", "blocked owner",
+                          "blocked owner", "marker"])
         self.assertEqual([item["stale"] for item in view["items"]],
-                         ["current", "current", "current", "older"])
+                         ["current", "current", "current", "older", "older", "current"])
+        self.assertEqual([item.get("pane_id") for item in view["items"]],
+                         [None, None, None, None, None, None])
+        self.assertEqual(view["total"], 4)
+        self.assertEqual(view["older"], 2)
+        self.assertEqual(view["unattributed"], ["s2", "s3-old"])
         ids_before = [item["id"] for item in view["items"]]
         self.assertTrue(human_wait_state.publish_cache(result))
         second = human_wait_state.cached_fleet_view(now=101, request=False)
@@ -104,7 +116,56 @@ class AnswerWaitSurfaceTests(unittest.TestCase):
                                    compute_hosts=None)
         summary = job_summary(snapshot)
         self.assertIn("◑답 대기 1", summary)
-        self.assertIn("답변 필요 2", summary)
+        self.assertIn("답변 필요 3", summary)
+
+    def test_fleet_reader_does_not_fall_back_to_private_projection_cache(self):
+        private_path = human_wait_state._cache_path()
+        private_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        private_path.parent.chmod(0o700)
+        private_path.write_text(
+            '{"schema_version":1,"observed_at":101,"complete":true,'
+            '"items":[{"id":"private","question":"PRIVATE-QUESTION-SENTINEL"}]}',
+            encoding="utf-8")
+        private_path.chmod(0o600)
+
+        self.assertEqual(human_wait_state._fleet_cache_path().name, "fleet.json")
+        with mock.patch.object(
+                human_wait_state, "_read_cache",
+                side_effect=AssertionError("Fleet must not read projection.json")) as reader:
+            self.assertIsNone(human_wait_state.cached_fleet_view(now=101, request=False))
+        reader.assert_not_called()
+
+    def test_expired_and_malformed_fleet_cache_are_unknown(self):
+        path = human_wait_state._fleet_cache_path()
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
+        path.write_text(
+            '{"schema_version":1,"observed_at":101,"complete":true,'
+            '"total":1,"items":[],"unattributed":[]}', encoding="utf-8")
+        path.chmod(0o600)
+
+        self.assertIsNone(human_wait_state.cached_fleet_view(
+            now=101 + human_wait_state._DISPLAY_TTL + 1, request=False))
+        path.write_text("{malformed", encoding="utf-8")
+        self.assertIsNone(human_wait_state.cached_fleet_view(now=101, request=False))
+
+    def test_incomplete_fleet_cache_keeps_global_count_unknown_on_every_surface(self):
+        partial = self.result()
+        partial["complete"] = False
+        self.assertTrue(human_wait_state.publish_cache(partial))
+
+        cached = human_wait_state.cached_fleet_view(now=101, request=False)
+        view = fleet_answer_wait_view(cached)
+        snapshot = SimpleNamespace(jobs=[], sessions=[], answer_waits=view,
+                                   compute_hosts=None)
+
+        self.assertEqual(human_wait_state.cached_count("claude", "sid-a", now=101),
+                         (-1, 1))
+        self.assertIn("◑답 대기 ?", job_summary(snapshot))
+        self.assertNotIn("◑답 대기 0", job_summary(snapshot))
+        lines = system_lines(snapshot)
+        self.assertIn("답 대기 ? · 관측 미완료", lines)
+        self.assertNotIn("답 대기 0", lines)
 
     def test_dispatch_owner_row_uses_the_shared_wait_item_chip(self):
         job = SimpleNamespace(interaction_observations=[{"kind": "decision", "item_id": "S3:a"}])

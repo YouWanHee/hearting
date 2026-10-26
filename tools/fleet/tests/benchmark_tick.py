@@ -29,7 +29,7 @@ from fleet.collectors import codex, dispatch, liveness, procscan, usage_api  # n
 from fleet.model import Session  # noqa: E402
 
 
-BENCHMARK_SCHEMA = "fleet-tick-benchmark-v2"
+BENCHMARK_SCHEMA = "fleet-tick-benchmark-v3"
 FIXTURE_SCHEMA = "fleet-tick-fixture-v1"
 SESSION_FIELDS = (
     "harness", "pid", "proc_start", "cwd", "elapsed_min", "session_id", "title",
@@ -255,9 +255,15 @@ class _Counters:
     def __init__(self, fixture_root):
         self.fixture_root = fixture_root
         self.current = {}
-        self.reset()
+        self._unique = {}
+        self._seen_registry_objects = set()
+        self.tcp_scan_phases = {}
+        self.tcp_phase = "uncached"
+        self.reset("unspecified")
 
-    def reset(self):
+    def reset(self, phase="unspecified"):
+        self.phase = phase
+        self.tcp_scan_phases.clear()
         self.current = {
             "lifecycle_calls": 0,
             "lifecycle_cursor_initializations": 0,
@@ -267,10 +273,38 @@ class _Counters:
             "roots_visited": 0,
             "files_visited": 0,
             "cache_evictions": 0,
+            "phase": phase,
+            "five_paths": {
+                name: {"helper_calls": 0, "costly_evaluations": 0,
+                      "physical_reads": 0, "rows_parsed": 0,
+                      "file_touches": 0, "by_phase": {}}
+                for name in ("registry", "tcp", "seat-ledger", "route-gate",
+                             "owner-lifecycle")
+            },
         }
+        self._unique = {name: set() for name in self.current["five_paths"]}
+
+    def record(self, name, field, *, key=None, amount=1):
+        row = self.current["five_paths"][name]
+        row[field] += amount
+        if key is not None:
+            self._unique[name].add(json.dumps(key, sort_keys=True, default=str))
+            if name == "tcp" and isinstance(key, (tuple, list)) and key:
+                phase_row = row["by_phase"].setdefault(
+                    str(key[0]), {"helper_calls": 0, "costly_evaluations": 0,
+                                  "physical_reads": 0, "ports": set()})
+                if field in phase_row:
+                    phase_row[field] += amount
+                if field == "helper_calls" and len(key) > 1:
+                    phase_row["ports"].add(str(key[1]))
 
     def snapshot(self):
-        return json.loads(json.dumps(self.current, sort_keys=True))
+        result = json.loads(json.dumps(self.current, sort_keys=True, default=list))
+        for name, keys in self._unique.items():
+            result["five_paths"][name]["unique_keys"] = len(keys)
+        for phase_row in result["five_paths"]["tcp"]["by_phase"].values():
+            phase_row["distinct_ports"] = len(phase_row.pop("ports"))
+        return result
 
 
 @contextlib.contextmanager
@@ -281,6 +315,23 @@ def _instrument(counters):
     raw_edges = codex._build_thread_subagents
     transcript_cwd = dispatch._codex_transcript_cwd
     real_walk = os.walk
+    import builtins
+    from fleet import projection, route
+
+    utility_root = Path(__file__).resolve().parents[3] / "utilities"
+    if str(utility_root) not in sys.path:
+        sys.path.insert(0, str(utility_root))
+    import session_tidy
+    owner_binding = projection._owner_route_binding_module()
+    parsed_registry = dispatch.parsed_registry_rows
+    tcp_snapshot = codex._tcp_listener_snapshot
+    resolve_gate_marks = route.resolve_gate_marks
+    gate_mark = route.gate_mark
+    owner_binding_call = projection._owner_route_advance_binding
+    resolve_owner_lifecycle = owner_binding.resolve_owner_route_lifecycle
+    read_ledger = session_tidy._read_ledger_lines
+    read_bytes = session_tidy.read_bytes
+    real_open = builtins.open
 
     exact_depth = 0
 
@@ -318,6 +369,123 @@ def _instrument(counters):
             counters.current["files_visited"] += len(names)
             yield root, dirs, names
 
+    def counted_registry(path):
+        normalized = os.path.abspath(os.fspath(path))
+        key = (normalized,)
+        counters.record("registry", "helper_calls", key=key)
+        value = parsed_registry(path)
+        if value and id(value) not in counters._seen_registry_objects:
+            counters._seen_registry_objects.add(id(value))
+            counters.record("registry", "costly_evaluations", key=key)
+            counters.record("registry", "rows_parsed", key=key, amount=len(value))
+        return value
+
+    def counted_tcp(port, scan=None):
+        phase = counters.tcp_scan_phases.get(id(scan), "uncached") if scan is not None else "uncached"
+        counters.tcp_phase = phase
+        counters.record("tcp", "helper_calls", key=(phase, str(port)))
+        cached = scan is not None and port in scan
+        if not cached:
+            counters.record("tcp", "costly_evaluations", key=(phase, str(port)))
+        try:
+            return tcp_snapshot(port, scan)
+        finally:
+            counters.tcp_phase = "uncached"
+
+    def counted_open(file, *args, **kwargs):
+        path = os.fspath(file) if isinstance(file, (str, bytes, os.PathLike)) else ""
+        if path in ("/proc/net/tcp", "/proc/net/tcp6"):
+            counters.record("tcp", "physical_reads",
+                            key=(counters.tcp_phase, path.rsplit("/", 1)[-1]))
+        if owner_depth:
+            counters.record("owner-lifecycle", "physical_reads", key=(path,))
+        return real_open(file, *args, **kwargs)
+
+    def counted_observation_init(observation, *args, **kwargs):
+        original_observation_init(observation, *args, **kwargs)
+        counters.tcp_scan_phases[id(observation.initial_scan)] = "initial"
+        counters.tcp_scan_phases[id(observation.recheck_scan)] = "recheck"
+
+    original_observation_init = codex.DaemonIdentityObservation.__init__
+
+    def counted_resolve_gate_marks(*args, **kwargs):
+        records = args[0] if args else kwargs.get("records")
+        counters.record("route-gate", "helper_calls",
+                        key=tuple(sorted((records or {}).keys())))
+        return resolve_gate_marks(*args, **kwargs)
+
+    def counted_gate_mark(record, node_id, home=None, state_roots=None):
+        rid = record.get("route_id") if isinstance(record, dict) else None
+        roots = tuple(os.fspath(item) for item in (state_roots or ()))
+        counters.record("route-gate", "costly_evaluations",
+                        key=(rid, str(node_id), home, roots))
+        return gate_mark(record, node_id, home=home, state_roots=state_roots)
+
+    def counted_owner_binding(entity, owner_binding_value=None):
+        key = (getattr(entity, "owner_attempt_id", None),
+               getattr(entity, "owner_route_file", None),
+               getattr(entity, "route_id", None))
+        counters.record("owner-lifecycle", "helper_calls", key=key)
+        return owner_binding_call(entity, owner_binding_value)
+
+    owner_depth = 0
+
+    def counted_owner_lifecycle(*args, **kwargs):
+        nonlocal owner_depth
+        key = (os.fspath(args[0]) if args else os.fspath(kwargs.get("jobs", "")),
+               kwargs.get("owner_attempt_id", ""))
+        counters.record("owner-lifecycle", "costly_evaluations", key=key)
+        owner_depth += 1
+        try:
+            return resolve_owner_lifecycle(*args, **kwargs)
+        finally:
+            owner_depth -= 1
+
+    def counted_read_ledger(seat):
+        path = os.fspath(session_tidy._ledger_path(seat))
+        counters.record("seat-ledger", "helper_calls", key=(path,))
+        return read_ledger(seat)
+
+    def counted_read_bytes(path):
+        normalized = os.fspath(path)
+        if "/sessions/" in normalized and normalized.endswith(".jsonl"):
+            counters.record("seat-ledger", "physical_reads", key=(normalized,))
+        return read_bytes(path)
+
+    def counted_owner_file_read(kind, path):
+        # Owner lifecycle's file observer reports the exact files it evaluates.
+        if kind == "file":
+            counters.record("owner-lifecycle", "file_touches",
+                            key=(os.fspath(path),))
+
+    original_read_text = Path.read_text
+    original_read_bytes = Path.read_bytes
+
+    def counted_read_text(path, *args, **kwargs):
+        value = os.fspath(path)
+        if "/.dispatch/jobs.log" in value or value.endswith("/jobs.log"):
+            counters.record("registry", "physical_reads", key=(value,))
+        if owner_depth:
+            counters.record("owner-lifecycle", "physical_reads", key=(value,))
+        return original_read_text(path, *args, **kwargs)
+
+    def counted_path_read_bytes(path, *args, **kwargs):
+        value = os.fspath(path)
+        if owner_depth:
+            counters.record("owner-lifecycle", "physical_reads", key=(value,))
+        return original_read_bytes(path, *args, **kwargs)
+
+    def counted_owner_lifecycle_with_observer(*args, **kwargs):
+        observer = kwargs.get("observer")
+        if observer is None:
+            kwargs["observer"] = counted_owner_file_read
+        else:
+            def observe(kind, path):
+                counted_owner_file_read(path)
+                return observer(kind, path)
+            kwargs["observer"] = observe
+        return counted_owner_lifecycle(*args, **kwargs)
+
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.object(
             codex, "_initialize_lifecycle_cursor",
@@ -335,12 +503,45 @@ def _instrument(counters):
         stack.enter_context(mock.patch.object(
             dispatch, "_codex_transcript_cwd", side_effect=counted_cwd
         ))
+        stack.enter_context(mock.patch.object(
+            dispatch, "parsed_registry_rows", side_effect=counted_registry
+        ))
+        stack.enter_context(mock.patch.object(
+            codex, "_tcp_listener_snapshot", side_effect=counted_tcp
+        ))
+        stack.enter_context(mock.patch.object(
+            builtins, "open", side_effect=counted_open
+        ))
+        stack.enter_context(mock.patch.object(
+            codex.DaemonIdentityObservation, "__init__", new=counted_observation_init
+        ))
+        stack.enter_context(mock.patch.object(
+            route, "resolve_gate_marks", side_effect=counted_resolve_gate_marks
+        ))
+        stack.enter_context(mock.patch.object(
+            route, "gate_mark", side_effect=counted_gate_mark
+        ))
+        stack.enter_context(mock.patch.object(
+            projection, "_owner_route_advance_binding", side_effect=counted_owner_binding
+        ))
+        stack.enter_context(mock.patch.object(
+            owner_binding, "resolve_owner_route_lifecycle",
+            side_effect=counted_owner_lifecycle_with_observer
+        ))
+        stack.enter_context(mock.patch.object(
+            session_tidy, "_read_ledger_lines", side_effect=counted_read_ledger
+        ))
+        stack.enter_context(mock.patch.object(
+            session_tidy, "read_bytes", side_effect=counted_read_bytes
+        ))
+        stack.enter_context(mock.patch.object(Path, "read_text", new=counted_read_text))
+        stack.enter_context(mock.patch.object(Path, "read_bytes", new=counted_path_read_bytes))
         stack.enter_context(mock.patch.object(dispatch.os, "walk", side_effect=counted_walk))
         yield
 
 
-def _run_tick(jobs_path, fixture_root, counters):
-    counters.reset()
+def _run_tick(jobs_path, fixture_root, counters, phase="unchanged-warm"):
+    counters.reset(phase)
     evictions_before = getattr(codex, "_LIFECYCLE_CACHE_EVICTIONS", 0)
     wall_start = time.perf_counter_ns()
     cpu_start = time.process_time_ns()
@@ -382,6 +583,9 @@ def _hermetic_result(raw_fixture, fixture_hash, fixture_root, iterations):
         return proc_rollouts.get(pid)
 
     with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.dict(os.environ, {
+            "XDG_STATE_HOME": os.path.join(fixture_root, "xdg-state"),
+        }))
         stack.enter_context(_instrument(counters))
         stack.enter_context(mock.patch.object(
             procscan, "scan", side_effect=lambda **_kwargs: _fresh_sessions(fixture)
@@ -420,14 +624,24 @@ def _hermetic_result(raw_fixture, fixture_hash, fixture_root, iterations):
         stack.enter_context(mock.patch.object(titles, "fresh_summary", return_value=None))
         stack.enter_context(mock.patch("time.time", return_value=fixture["fixed_now"]))
 
-        cold, cold_payload = _run_tick(jobs_path, fixture_root, counters)
+        cold, cold_payload = _run_tick(jobs_path, fixture_root, counters, phase="cold")
         warm = []
         payload = cold_payload
         for _index in range(iterations):
-            sample, candidate = _run_tick(jobs_path, fixture_root, counters)
+            sample, candidate = _run_tick(
+                jobs_path, fixture_root, counters, phase="unchanged-warm")
             if candidate != payload:
                 raise RuntimeError("semantic payload changed between hermetic ticks")
             warm.append(sample)
+        registry_path = Path(jobs_path)
+        original_registry = registry_path.read_bytes()
+        last_row = original_registry.splitlines(keepends=True)[-1]
+        try:
+            registry_path.write_bytes(original_registry + last_row)
+            append_warm, _append_payload = _run_tick(
+                jobs_path, fixture_root, counters, phase="append-warm")
+        finally:
+            registry_path.write_bytes(original_registry)
 
     payload_bytes = _canonical_bytes(payload)
     return {
@@ -443,6 +657,7 @@ def _hermetic_result(raw_fixture, fixture_hash, fixture_root, iterations):
         "iterations": iterations,
         "cold_sample": cold,
         "warm_samples": warm,
+        "append_warm_sample": append_warm,
         "warm_summary": _summary(warm),
         "normalized_payload": payload,
         "semantic_digest": hashlib.sha256(payload_bytes).hexdigest(),
@@ -464,11 +679,24 @@ def _validate_result(result):
         "raw_edge_builds_by_home", "cwd_parses", "cache_evictions",
         "roots_visited", "files_visited",
     }
-    for sample in [result.get("cold_sample")] + result.get("warm_samples", []):
+    samples = ([result.get("cold_sample")] + result.get("warm_samples", [])
+               + [result.get("append_warm_sample")])
+    required_paths = {"registry", "tcp", "seat-ledger", "route-gate", "owner-lifecycle"}
+    for sample in samples:
         if not isinstance(sample, dict) or not required_counters.issubset(
             (sample.get("counters") or {}).keys()
         ):
             raise ValueError("sample missing required counters")
+        counters = sample["counters"]
+        if counters.get("phase") not in {"cold", "unchanged-warm", "append-warm"}:
+            raise ValueError("sample missing phase label")
+        paths = counters.get("five_paths")
+        if not isinstance(paths, dict) or set(paths) != required_paths:
+            raise ValueError("sample missing five-path counters")
+        for path_counts in paths.values():
+            for field in ("helper_calls", "costly_evaluations", "physical_reads", "unique_keys"):
+                if not isinstance(path_counts.get(field), int) or path_counts[field] < 0:
+                    raise ValueError("invalid five-path counter")
     if not isinstance(result.get("normalized_payload"), dict):
         raise ValueError("normalized payload missing")
     digest = hashlib.sha256(
@@ -502,12 +730,25 @@ def _comparison(baseline, current):
     cwd_scaled = all(
         sample["counters"]["cwd_parses"] == expected_cwd for sample in all_samples
     )
+    five_path_costs_bounded = all(
+        path["costly_evaluations"] <= path["unique_keys"]
+        for sample in ([current["cold_sample"]] + warm
+                       + [current["append_warm_sample"]])
+        for path in sample["counters"]["five_paths"].values()
+    )
+    phases_recorded = (
+        current["cold_sample"]["counters"]["phase"] == "cold"
+        and all(sample["counters"]["phase"] == "unchanged-warm" for sample in warm)
+        and current["append_warm_sample"]["counters"]["phase"] == "append-warm"
+    )
     checks.update({
         "edge_builds_at_most_one_per_home": edge_bound,
         "unchanged_warm_lifecycle_cursor_initializations_zero": (
             zero_warm_cursor_initializations
         ),
         "cwd_parses_equal_unique_rollouts": cwd_scaled,
+        "five_path_costs_do_not_exceed_unique_keys": five_path_costs_bounded,
+        "cold_unchanged_append_phases_recorded": phases_recorded,
     })
     baseline_lifecycle_cursor_initializations = [
         item["counters"]["lifecycle_cursor_initializations"]

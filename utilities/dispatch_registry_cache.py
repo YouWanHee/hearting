@@ -90,6 +90,8 @@ def _handover_metadata(raw: str) -> tuple[tuple[str, str], ...]:
 class RegistryRecord:
     order: int
     fields: tuple[str, ...]
+    _completion_pairs: tuple[tuple[str, str], ...] = ()
+    _handover_pairs: tuple[tuple[str, str], ...] = ()
 
     @property
     def raw(self) -> str:
@@ -105,10 +107,10 @@ class RegistryRecord:
         return self.fields[4]
 
     def completion_metadata(self) -> dict[str, str]:
-        return dict(_completion_metadata(self.fields[5]))
+        return dict(self._completion_pairs or _completion_metadata(self.fields[5]))
 
     def handover_metadata(self) -> dict[str, str]:
-        return dict(_handover_metadata(self.fields[5]))
+        return dict(self._handover_pairs or _handover_metadata(self.fields[5]))
 
 
 class _RegistrySegment:
@@ -146,10 +148,15 @@ class _RegistrySegment:
                 self.malformed_rows += 1
                 malformed_lines.append((order_base + relative_order, line))
                 continue
-            record = RegistryRecord(order_base + relative_order, fields)
+            completion_pairs = _completion_metadata(fields[5])
+            canonical_keys = all(key and key == key.strip() for key, _value in completion_pairs)
+            handover_pairs = (completion_pairs if canonical_keys
+                              else _handover_metadata(fields[5]))
+            record = RegistryRecord(order_base + relative_order, fields,
+                                    completion_pairs, handover_pairs)
             records.append(record)
-            completion_meta = dict(_completion_metadata(fields[5]))
-            handover_meta = dict(_handover_metadata(fields[5]))
+            completion_meta = dict(completion_pairs)
+            handover_meta = completion_meta if canonical_keys else dict(handover_pairs)
             parent = completion_meta.get("parent")
             attempt_id = completion_meta.get("attempt_id")
             if parent:

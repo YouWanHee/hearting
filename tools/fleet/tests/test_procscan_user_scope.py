@@ -11,9 +11,55 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from fleet.collectors import dispatch, procscan  # noqa: E402
+from fleet import projection  # noqa: E402
 
 
 class CurrentUserProcessScopeTest(unittest.TestCase):
+    def _scan_owner(self, **overrides):
+        env = {"AGENT_DISPATCH_WORKER_TYPE": "owner", "AGENT_DISPATCH_DEPTH": "1",
+               "AGENT_DISPATCH_ATTEMPT_ID": "exact-owner-attempt",
+               "AGENT_ROUTE_FILE": "/route.json", "AGENT_ROUTE_ID": "rt-owner",
+               "AGENT_OWNER_ROUTE_FILE": "/route.json",
+               "AGENT_OWNER_ROUTE_ID": "rt-owner",
+               "AGENT_OWNER_ROUTE_HASH": "sha256:owner"}
+        env.update(overrides)
+        with mock.patch.object(procscan, "_ps_lines", return_value=["101 codex 00:01 codex"]), \
+             mock.patch.object(procscan, "_pid_ttys", return_value={}), \
+             mock.patch.object(procscan, "_detached_ttys", return_value=set()), \
+             mock.patch.object(procscan, "proc_tree", return_value={}), \
+             mock.patch.object(procscan, "is_terminal_state", return_value=False), \
+             mock.patch.object(procscan, "_read_cwd", return_value=("/work", False)), \
+             mock.patch.object(procscan, "_read_argv", return_value=["codex"]), \
+             mock.patch.object(procscan, "read_environ", return_value=env), \
+             mock.patch.object(procscan, "read_proc_start", return_value="start-101"), \
+             mock.patch.object(procscan, "exec_child", return_value=None):
+            return procscan.scan()[0]
+
+    def test_node_less_owner_preserves_explicit_binding_without_guessing_session_id(self):
+        row = self._scan_owner()
+        self.assertIsNone(row.session_id)
+        self.assertIsNone(row.route_node)
+        binding, error = projection._owner_route_binding(row)
+        self.assertIsNone(error)
+        self.assertEqual(binding, {"route_file": "/route.json", "route_id": "rt-owner",
+                                   "route_hash": "sha256:owner"})
+        sentinel = object()
+        with mock.patch.object(projection, "_owner_route_advance_for_pass", return_value=(None, "none")), \
+             mock.patch.object(projection, "_projection_from_record", return_value=sentinel) as resolve:
+            result = projection.resolve_work_projection(row, route_records={
+                "rt-owner": {"route_id": "rt-owner", "route_hash": "sha256:owner"}})
+        self.assertIs(result, sentinel)
+        self.assertTrue(resolve.call_args.kwargs["owner"])
+
+    def test_owner_environment_does_not_relax_depth_role_or_partial_binding(self):
+        for changes in ({"AGENT_DISPATCH_DEPTH": "2"},
+                        {"AGENT_DISPATCH_WORKER_TYPE": "stage"},
+                        {"AGENT_OWNER_ROUTE_HASH": ""}):
+            with self.subTest(changes=changes):
+                binding, error = projection._owner_route_binding(self._scan_owner(**changes))
+                self.assertIsNone(binding)
+                self.assertEqual(error, "owner-route-binding-invalid")
+
     def test_all_ps_surfaces_select_current_effective_uid(self):
         outputs = [
             "101 codex 00:01 codex --yolo\n",
