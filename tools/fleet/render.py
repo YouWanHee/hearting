@@ -7311,10 +7311,10 @@ def _explorer_apply_effects(effects, vm):
     for effect in question_effects:
         _explorer_queue_question_effect(effect)
     model_actions = tuple(effect for effect in effects
-                          if effect and effect[0] == "models.apply")
+                          if effect and effect[0] in ("models.apply", "alloc.apply"))
     if _EXPLORER_REPLAY_ACTIVE:
         effects = tuple(effect for effect in effects
-                        if not effect or effect[0] != "models.apply")
+                        if not effect or effect[0] not in ("models.apply", "alloc.apply"))
         result = None
         if effects:
             result = _explorer_runtime().apply_effects(effects, vm)

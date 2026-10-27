@@ -251,6 +251,125 @@ def _draw_context(grid, data, state, x, y, width):
         y += 1
 
 
+_EDITED_FIELDS = ("strategy:", "weights:", "affinity:")   # read-only lines the editor replaces
+_STRATEGY_NOTES = {
+    "balanced": "remaining usage sets each harness's share; recent attempts fill it",
+    "capacity-aware": "most remaining usage first; unknown usage is skipped",
+    "least-recent-attempts": "plain rotation by recent attempts",
+}
+_ALLOC_CHOICES = {
+    "window": (10, 20, 30, 60, 100),
+    "usage_gate_used_percent": (70, 80, 85, 90, 95, 100),
+    "usage_headroom_exponent": (1, 2, 3, 4),
+    "depth_affinity_weight": (0.5, 0.65, 0.85, 1.0),
+    "harness_weights": (0.2, 0.3, 0.5, 0.7, 1.0),
+}
+
+
+def _alloc_label(name):
+    parent, _dot, child = name.partition(".")
+    return {"strategy": "strategy", "usage_gate_used_percent": "usage gate %",
+            "usage_headroom_exponent": "usage effect", "window": "window",
+            "depth_affinity_weight": "prefer strength", "harness_weights": "share " + child,
+            "depth_affinity": child + " prefers"}.get(parent, name)
+
+
+def _num(value):
+    if isinstance(value, float):
+        text = f"{value:g}"
+        return text if "." in text or "e" in text else text + ".0"
+    return str(value)
+
+
+def _alloc_options(name, current):
+    options = list(_ALLOC_CHOICES[name.partition(".")[0]])
+    if isinstance(current, (int, float)) and not isinstance(current, bool) and current not in options:
+        options.append(current)
+    return tuple(_num(item) for item in sorted(options))
+
+
+def allocation_changes(allocation, folds):
+    """``((key, old text, new text), ...)`` the pending chips differ from the current file on."""
+    values = _dict(allocation.get("values"))
+    current = {name: _num(values.get(name)) for name in
+               ("strategy", "window", "usage_gate_used_percent", "usage_headroom_exponent",
+                "depth_affinity_weight")}
+    for role in ("owner", "worker"):
+        current["depth_affinity." + role] = str(_dict(values.get("depth_affinity")).get(role) or "none")
+    for harness in allocation.get("harnesses") or ():
+        current["harness_weights." + harness] = _num(float(_dict(values.get("harness_weights")).get(harness, 1.0)))
+    changes = []
+    for name, old in current.items():
+        new = folds.get("ui:alloc:" + name)
+        if new is not None and new != old:
+            changes.append((name, old, new))
+    return tuple(changes)
+
+
+def _alloc_row(grid, x, y, right, label, name, options, current, folds, note="", inert=""):
+    grid.put(x + 3, y, label, "label", limit=right)
+    cursor = _chips(grid, x + 20, y, options, current, folds.get("ui:alloc:" + name), "alloc:" + name, right)
+    if inert:
+        grid.put(cursor + 1, y, "· " + inert, "lvl_y", limit=right)
+    elif note:
+        grid.put(cursor + 1, y, note, "dim", limit=right)
+    return y + 1
+
+
+def _draw_allocation_editor(grid, allocation, state, x, y, right):
+    """Every existing allocation key as choices, with what the chosen strategy ignores, a preview and Apply."""
+    folds = state.fold_map()
+    values = _dict(allocation.get("values"))
+    strategy = folds.get("ui:alloc:strategy") or str(values.get("strategy"))
+    inert = _dict(_dict(allocation.get("inert")).get(strategy))
+    y = _alloc_row(grid, x, y, right, "strategy", "strategy", tuple(allocation.get("strategies") or ()),
+                   str(values.get("strategy")), folds, _STRATEGY_NOTES.get(strategy, ""))
+    rows = (("usage gate %", "usage_gate_used_percent",
+             "skip a harness past this used share while another is under it"),
+            ("usage effect", "usage_headroom_exponent", "how strongly remaining usage shapes the share"),
+            ("window", "window", "recent attempts counted"))
+    for label, name, note in rows:
+        y = _alloc_row(grid, x, y, right, label, name, _alloc_options(name, values.get(name)),
+                       _num(values.get(name)), folds, note, inert.get(name, ""))
+    weights = _dict(values.get("harness_weights"))
+    for harness in allocation.get("harnesses") or ():
+        current = float(weights.get(harness, 1.0))
+        y = _alloc_row(grid, x, y, right, "share " + harness, "harness_weights." + harness,
+                       _alloc_options("harness_weights", current), _num(current), folds,
+                       "1.0 = full share; lower takes fewer new placements", inert.get("harness_weights", ""))
+    affinity = _dict(values.get("depth_affinity"))
+    choices = tuple(allocation.get("harnesses") or ()) + ("none",)
+    for role in ("worker", "owner"):
+        y = _alloc_row(grid, x, y, right, role + " prefers", "depth_affinity." + role, choices,
+                       str(affinity.get(role) or "none"), folds, "", inert.get("depth_affinity", ""))
+    y = _alloc_row(grid, x, y, right, "prefer strength", "depth_affinity_weight",
+                   _alloc_options("depth_affinity_weight", values.get("depth_affinity_weight")),
+                   _num(values.get("depth_affinity_weight")), folds, "0.5 = no lean",
+                   inert.get("depth_affinity_weight", ""))
+    changes = allocation_changes(allocation, folds)
+    if changes:
+        preview = "  ·  ".join(f"{_alloc_label(name)} {old} → {new}" for name, old, new in changes)
+        grid.put(x + 3, y, "change", "label", limit=right)
+        dry_x = min(x + 20 + cell_width(preview) + 3, right - 25)
+        grid.put(x + 20, y, preview, "soft", limit=dry_x - 2)
+        payload = tuple((name, new) for name, _old, new in changes)
+        grid.put(dry_x, y, "[ dry-run ]", "title_dim", limit=right)
+        grid.add_hit(y, dry_x, dry_x + 11, ("alloc.apply", payload, True))
+        grid.put(dry_x + 13, y, "[ apply ]", "chip_on", limit=right)
+        grid.add_hit(y, dry_x + 13, dry_x + 22, ("alloc.apply", payload, False))
+        y += 1
+    status = str(state.status or "")
+    if status.startswith("allocation"):
+        failed = "failed" in status or "invalid" in status
+        grid.put(x + 3, y, status, "g_blocked" if failed else "soft", limit=right)
+        y += 1
+    if not allocation.get("user_file"):
+        grid.put(x + 3, y, "no user policy file yet: Apply creates it from the shipped defaults", "dim",
+                 limit=right)
+        y += 1
+    return y
+
+
 def draw_models(grid: CellGrid, vm, state, x=X, y=3):
     data = _dict(vm.models)
     if not data:
@@ -431,6 +550,9 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
     _section(grid, x, left, y, "DISPATCH ALLOCATION", "~/.config/hearting/dispatch-defaults.yaml")
     y += 1
     fields = allocation.get("fields", ())
+    if isinstance(allocation.get("values"), Mapping):
+        y = _draw_allocation_editor(grid, allocation, state, x, y, right)
+        fields = [field for field in fields if field[0] not in _EDITED_FIELDS]
     for label, fragments in fields:
         grid.put(x + 3, y, label, "dim")
         cursor = x + 20

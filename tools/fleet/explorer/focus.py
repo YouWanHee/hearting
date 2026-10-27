@@ -809,6 +809,31 @@ def _allocation_fields(policy):
     return fields
 
 
+_ALLOCATION_OPTIONAL = ("usage_gate_used_percent", "depth_affinity", "depth_affinity_weight",
+                        "usage_headroom_exponent", "harness_weights")
+
+
+def _allocation_editable(module, policy):
+    """Current allocation values and, per strategy, the keys it leaves without effect (and why)."""
+    values = module.query_allocation(policy)
+    if not values:
+        return {}
+    strategies = sorted(module.ALLOCATION_STRATEGIES)
+    probe = {key: None for key in _ALLOCATION_OPTIONAL}
+    inert = {name: dict(module.inert_allocation_keys(dict(probe, strategy=name))) for name in strategies}
+    enabled = [name for name in ("claude", "codex", "opencode")
+               if name in ((policy.get("harnesses") or {}).get("enabled") or ("claude", "codex", "opencode"))]
+    path = module.default_config_path()
+    return {"values": {"strategy": values.get("strategy"), "window": values.get("window"),
+                       "usage_gate_used_percent": values.get("usage_gate_used_percent"),
+                       "usage_headroom_exponent": values.get("usage_headroom_exponent"),
+                       "depth_affinity_weight": values.get("depth_affinity_weight"),
+                       "depth_affinity": dict(values.get("depth_affinity") or {}),
+                       "harness_weights": dict(values.get("harness_weights") or {})},
+            "strategies": strategies, "inert": inert, "harnesses": enabled,
+            "user_file": os.path.realpath(path) != os.path.realpath(module.SHIPPED_CONFIG_PATH)}
+
+
 def _read_tidy_points():
     """Read the context alert thresholds; unavailable or malformed source stays unknown."""
     try:
@@ -872,7 +897,8 @@ def read_model_config():
             pools[profile] = [[list(bands.get("primary") or ())], note]
         pools.setdefault("top", None)
         allocation = {"fields": _allocation_fields(policy),
-                      "note": "these keys have no setter command yet — Fleet would edit the YAML and run its validator"}
+                      "note": "new dispatch decisions only · running and sealed routes keep their choice"}
+        allocation.update(_allocation_editable(module, policy))
     except Exception:
         pools, allocation = {}, {}
     try:
