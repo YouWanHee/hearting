@@ -2363,10 +2363,16 @@ Periodic steward check. Each role-holding session carries one `steward-check` du
 the existing obligation store, advanced by the existing obligation runner; there is no
 new hook event, per-session process, cron or ledger. It is registered by the shared
 grant, by the holder's own role comparison in `__ensure-obligations` (which all three
-lifecycle bridges already call), and once when the runner starts. When the configured
+lifecycle bridges already call), and once when the runner starts. `steward on` also
+starts the shared runner at once; other grants reach it through the same bridges (for
+Claude, the Stop at the end of the granting turn) or a watcher's completion, so with no
+runner running a Codex or OpenCode watch/start grant can wait for the next lifecycle
+event. When the configured
 interval (`steward.check_interval_seconds`, default 7200, range 600..86400) has
 elapsed since the last check or delivery, the runner sends one request through the
-`session_notice` carrier without waiting for input or a Stop event. While that request
+`session_notice` carrier without waiting for input or a Stop event. Only a session that
+Fleet flags as steward (`role_flag`) receives it; marker evidence for a target in another
+repository is communication and yields no request. While that request
 is undelivered no second one is made, a long gap still yields one request and no
 catch-up, and a visible human-answer wait defers it. The carrier's screen check keeps
 drafts, open questions and approval forms untouched, and a steward stopped with Esc
@@ -2394,7 +2400,10 @@ limit (`steward.max_supervisors_per_repo`, default 2, range 1..8). The decision 
 under one grant lock held inside the seat lock, so concurrent grants cannot pass the
 limit. The repository is the git common dir (a linked worktree folds into its primary),
 the same key as the Fleet ⚑, and `tools/fleet/collectors/steward.py` `repo_supervision`
-is the single count both the grant and the Fleet display read. A session counts once
+is the single count both the grant and the Fleet display read. A watch or start whose
+target sits in another repository is communication (F-100c-2) and is neither counted nor
+limited. A grant whose own session row is not yet visible is admitted without a
+repository and counts once its row appears; the process cwd is not used to guess it. A session counts once
 however many generations it holds. A same-session re-grant, restart, resume or a
 confirmed successor takes no further slot; a session whose end Hearting proved leaves
 its slot while its mark remains and reclaims the role when it revives (a resulting

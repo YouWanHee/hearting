@@ -169,6 +169,19 @@ def _role_held(harness: str, session_id: str) -> dict:
     return {"held": False, "reason": "role-released", "successor": None}
 
 
+def _role_flagged(harness: str, session_id: str) -> bool:
+    """The Fleet steward flag (`role_flag`): explicit self role or a same-repository
+    target. Marker evidence alone (a foreign-repository watch) is communication."""
+    collector = _collector()
+    function = getattr(collector, "role_flag", None)
+    if function is None:
+        return True  # no collector: keep the existing check rather than go silent
+    try:
+        return bool(function(harness, session_id))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _agents():
     try:
         tools = _UTILITIES.parent / "tools"
@@ -486,6 +499,13 @@ def _due(duty, store, observation, harness, session_id, now) -> None:
             store.update(duty["id"], observation={**observation, "reason": "human-wait-deferred"})
         return
     _THROTTLE.pop((duty["id"], "deferred"), None)
+    if not _role_flagged(harness, session_id):
+        # Evidence without the steward flag (only a foreign-repository target):
+        # no notice and no model turn; the duty waits for a role or a release.
+        store.update(duty["id"], observation={
+            **observation, "anchor": now, "skipped": int(observation.get("skipped") or 0) + 1,
+            "reason": "no-steward-flag"})
+        return
     seen = _observe_role(harness, session_id)
     action = _classify(seen)
     signature = _signature(action, seen)

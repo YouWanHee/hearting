@@ -30,6 +30,7 @@ import steward_check as SC  # noqa: E402
 REAL_OBSERVE = SC._observe_role
 REAL_ROLE_HELD = SC._role_held
 REAL_HUMAN_WAIT = SC._human_wait_open
+REAL_ROLE_FLAGGED = SC._role_flagged
 T0 = 1_000_000.0
 INTERVAL = 7200
 HARNESS = "claude"
@@ -61,8 +62,10 @@ class CheckBase(unittest.TestCase):
         self.seen = {"targets": [target()], "pending_messages": 0}
         self.liveness = "live"
         self.human_wait = False
+        self.flagged = True
         for name, replacement in (
                 ("_role_held", lambda h, s: dict(self.role)),
+                ("_role_flagged", lambda h, s: self.flagged),
                 ("_observe_role", lambda h, s: {"targets": list(self.seen["targets"]),
                                                 "pending_messages": self.seen["pending_messages"]}),
                 ("_session_liveness", lambda h, s, agents=None: self.liveness),
@@ -629,6 +632,40 @@ class StewardCheckEscTest(CheckBase):
             signals.append({"harness": "claude", "session_id": SID, "stale": False})
             self.assertTrue(REAL_HUMAN_WAIT(HARNESS, SID, T0))
 
+
+
+class StewardCheckRoleFlagTest(CheckBase):
+    """Only a session Fleet flags as steward receives the periodic request."""
+
+    def test_foreign_repository_evidence_sends_nothing_and_keeps_the_duty(self):
+        self.register()
+        self.flagged = False
+        duty = self.step(T0 + INTERVAL)
+        self.assertEqual(self.notify.call_count, 0)
+        self.assertEqual(duty["observation"]["reason"], "no-steward-flag")
+        self.assertEqual(duty["observation"]["anchor"], T0 + INTERVAL)
+        self.assertIsNone(duty["observation"]["last_checked"])
+        self.assertTrue(SC._active(duty))
+        self.step(T0 + INTERVAL * 4)
+        self.assertEqual(self.notify.call_count, 0)
+
+    def test_flag_raised_later_gets_one_request_at_the_next_due(self):
+        self.register()
+        self.flagged = False
+        self.step(T0 + INTERVAL)
+        self.flagged = True
+        self.step(T0 + INTERVAL * 2 - 1)
+        self.assertEqual(self.notify.call_count, 0)
+        self.step(T0 + INTERVAL * 2)
+        self.assertEqual(self.notify.call_count, 1)
+
+    def test_real_flag_seam_reads_the_fleet_role_flag(self):
+        collector = SimpleNamespace(role_flag=mock.Mock(return_value=False))
+        with mock.patch.object(SC, "_collector", return_value=collector):
+            self.assertFalse(REAL_ROLE_FLAGGED(HARNESS, SID))
+        collector.role_flag.assert_called_once_with(HARNESS, SID)
+        with mock.patch.object(SC, "_collector", return_value=None):
+            self.assertTrue(REAL_ROLE_FLAGGED(HARNESS, SID))
 
 
 def _load_peer_steward():
