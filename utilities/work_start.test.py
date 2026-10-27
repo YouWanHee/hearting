@@ -1769,23 +1769,41 @@ class WorkStartTest(unittest.TestCase):
 
         route = {**self.route, "artifact_root": str(self.tmp.name),
                  "nodes": [*self.route["nodes"], {"id": "cpu", "kind": "resource-runner"}]}
+        self.path.write_text(json.dumps(route))
         watcher = SimpleNamespace(recover_resource_watches=mock.Mock(return_value=[{"state": "watching"}]))
-        for recovery, expected_field in (({"consumer_recovery": "respawned", "pid": "42"}, "respawned"),
-                                         ({"consumer_recovery": "not-started:no-queued-correction"}, None)):
-            with self.subTest(recovery=recovery), \
-                 mock.patch.object(W, "continuation_work_request", return_value={}), \
-                 mock.patch.object(W, "resume_command", return_value="resume"), \
-                 mock.patch.object(inline_finish, "pending_state", return_value=None), \
-                 mock.patch.object(dispatch_notice_state, "closed_outcome", return_value=None), \
-                 mock.patch.object(W, "_harvest_unread_blocked_owner", return_value=None), \
-                 mock.patch.object(W, "_owner_pin_handoff", return_value=None), \
-                 mock.patch.object(dispatch_resource_wait, "supervisor", return_value=watcher), \
-                 mock.patch.object(dispatch_owner_input, "recover_consumer", return_value=recovery) as recover:
-                result = W._advance(route, self.path, self.jobs,
-                                    {"owner_attempt_id": "att-owner"})
-            recover.assert_called_once_with(self.jobs.resolve(), "att-owner")
-            self.assertEqual(result["state"], "resource-watching")
-            self.assertEqual(result.get("consumer_recovery"), expected_field)
+        module = SimpleNamespace(restore_consumed_tombstones=lambda *args, **kwargs:
+                                 {"restored": [], "errors": []})
+        owner_meta = (f"worker_type=owner,owner_route_id={route['route_id']},"
+                      f"owner_route_hash={route['route_hash']},parent_sid=parent,harness=codex,"
+                      "launch_claimed=1,launch_started=1")
+        for replaced in (False, True):
+            previous = (f"0\tdone\told-owner\t{self.tmp.name}\t0\t"
+                        f"attempt_id=att-original,{owner_meta}\n") if replaced else ""
+            lineage = ",replacement_original_attempt_id=att-original" if replaced else ""
+            self.jobs.write_text(previous + f"1\topen\towner\t{self.tmp.name}\t0\t"
+                                 f"attempt_id=att-owner,{owner_meta}{lineage}\n")
+            for recovery, expected_field in (({"consumer_recovery": "respawned", "pid": "42"}, "respawned"),
+                                             ({"consumer_recovery": "not-started:no-queued-correction"}, None)):
+                with self.subTest(replaced=replaced, recovery=recovery), \
+                     mock.patch("route_parent_close.intent", return_value=None), \
+                     mock.patch.object(W, "_route_module", return_value=module), \
+                     mock.patch.object(W, "continuation_work_request", return_value={}), \
+                     mock.patch.object(W, "resume_command", return_value="resume"), \
+                     mock.patch.object(inline_finish, "pending_state", return_value=None), \
+                     mock.patch.object(dispatch_notice_state, "closed_outcome", return_value=None), \
+                     mock.patch.object(W, "_harvest_unread_blocked_owner", return_value=None), \
+                     mock.patch.object(dispatch_resource_wait, "supervisor", return_value=watcher), \
+                     mock.patch("start_receipt.save", side_effect=lambda result, _jobs: result), \
+                     mock.patch.object(dispatch_owner_input, "recover_consumer", return_value=recovery) as recover:
+                    # Use the actual public initializer and registered owner lookup;
+                    # no owner id is injected into an intermediate receipt.
+                    result = W.start_work(route, self.path, self.jobs)
+                recover.assert_called_once_with(self.jobs.resolve(), "att-owner")
+                self.assertEqual(result["owner_attempt_id"], "att-owner")
+                self.assertEqual(result["state"], "resource-watching")
+                self.assertEqual(result.get("consumer_recovery"), expected_field)
+                self.assertFalse(result["owner_started"])
+                self.assertEqual(result["launches"], [])
 
 
 WF = load("work_start_workflow_fixture", W.ROOT / "utilities/workflow_supervisor.test.py")
