@@ -825,7 +825,7 @@ class PartCatalogTest(unittest.TestCase):
         optional = {part for part, row in self.parts.items() if "optional" in row}
         self.assertEqual(set(self.parts), stages | optional)
         self.assertEqual(optional, {"autopilot-lab:diagnose", "autopilot-lab:eval-spec", "autopilot-lab:eval-smoke",
-                                    "autopilot-lab:resume-run"})
+                                    "autopilot-lab:resume-run", "autopilot-lab:host-run"})
         self.invalid(lambda c, r: c["parts"].pop("audit:inspect"), "lacks a row for recipe stages")
         self.invalid(lambda c, r: c["parts"]["audit:inspect"].update(summary=""), "one-line summary")
         self.invalid(lambda c, r: c["parts"]["audit:inspect"].update(gate="x"), "unknown catalog fields")
@@ -864,15 +864,38 @@ class PartCatalogTest(unittest.TestCase):
         def renamed(c, r): c["parts"]["autopilot-lab:diagnose"]["optional"]["node"]["id"] = "other"
         self.invalid(renamed, "node id must equal the stage id")
         self.assertEqual([stage for stage, _row in T.recipe_optional_parts(
-            self.r, T.resolve_recipe(self.r, "autopilot-lab", "eval"))], ["diagnose", "eval-spec", "eval-smoke"])
+            self.r, T.resolve_recipe(self.r, "autopilot-lab", "eval"))],
+            ["diagnose", "eval-spec", "eval-smoke", "host-run"])
         self.assertEqual([stage for stage, _row in T.recipe_optional_parts(
-            self.r, T.resolve_recipe(self.r, "autopilot-lab", "setup"))], ["resume-run"])
+            self.r, T.resolve_recipe(self.r, "autopilot-lab", "setup"))], ["resume-run", "host-run"])
         def unsafe_resource(c, r):
             c["parts"]["autopilot-lab:resume-run"]["optional"]["node"]["continuation"] = {"kind": "inline-next"}
         self.invalid(unsafe_resource, "optional part must be")
-        def unverified_resource(c, r):
-            c["parts"]["autopilot-lab:resume-run"]["optional"]["node"]["resource_policy"] = "new-code"
-        self.invalid(unverified_resource, "optional part must be")
+        def undetached_resource(c, r):
+            c["parts"]["autopilot-lab:host-run"]["optional"]["node"]["resource_transport"] = "inline"
+        self.invalid(undetached_resource, "optional part must be")
+        def unsupervised_host(c, r):
+            c["parts"]["autopilot-lab:host-run"]["optional"]["node"]["continuation"] = {"kind": "inline-next"}
+        self.invalid(unsupervised_host, "optional part must be")
+        def unknown_need(c, r):
+            c["parts"]["autopilot-lab:host-run"]["execution_needs"] = ["host-process", "root"]
+        self.invalid(unknown_need, "invalid execution_needs")
+    def test_supervised_resource_parts_declare_their_own_policy_and_needs(self):
+        resume = self.parts["autopilot-lab:resume-run"]
+        self.assertEqual(resume["optional"]["node"]["resource_policy"], "verified-resume")
+        self.assertEqual(resume["execution_needs"], ["compute-hosts"])
+        host = self.parts["autopilot-lab:host-run"]
+        node = host["optional"]["node"]
+        self.assertEqual(host["execution_needs"], ["host-process"])
+        self.assertEqual((node["kind"], node["resource_transport"], node["continuation"]),
+                         ("resource-runner", "detached-process", {"kind": "supervised"}))
+        self.assertNotIn("resource_policy", node)
+        self.assertNotIn("start_approval", host)
+        self.assertEqual(host["hosts"], ["autopilot-code", "autopilot-lab"])
+        # The probe follows the recipe's own check: a terminal-only resource stays invalid.
+        for mode in ("setup", "eval"):
+            recipe = T.resolve_recipe(self.r, "autopilot-lab", mode)
+            self.assertIn("host-run", [stage for stage, _row in T.recipe_optional_parts(self.r, recipe)])
     def test_unit_io_gate_accepts_a_declared_choice_only(self):
         r = copy.deepcopy(self.r)
         lab = T.resolve_recipe(r, "autopilot-lab", "setup")
