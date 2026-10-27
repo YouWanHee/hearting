@@ -643,8 +643,13 @@ def join_process_error(returncode: int, receipt: object, parent_attempt_id: str)
     return f"join-process-contract-failed:exit={returncode}:reason={reason}"
 
 
-def _rows(jobs: Path, attempts: Iterable[str] | None = None) -> dict:
+def _rows(jobs: Path, attempts: Iterable[str] | None = None, *,
+          require_unique: bool = False) -> dict:
     view = registry_view(Path(jobs))
+    if require_unique and view.has_duplicate_attempts:
+        # The registry-wide duplicate refusal of an unfiltered read, kept for
+        # callers that now look up only the attempts they own.
+        raise SupervisionError("supervision-attempt-ambiguous")
     rows = {}
     if attempts is None:
         selected = ((record, record.completion_metadata()) for record in view.records)
@@ -678,6 +683,15 @@ def _rows(jobs: Path, attempts: Iterable[str] | None = None) -> dict:
                 raise SupervisionError("supervision-attempt-ambiguous")
             rows[aid] = (record.status, meta)
     return rows
+
+
+def _owned_rows(jobs: Path, attempt_id: str) -> dict:
+    """Rows of one owner and its direct children, without parsing the registry."""
+    view = registry_view(Path(jobs))
+    ids = {attempt_id} | {meta.get("attempt_id") for meta in
+                          (record.completion_metadata() for record in view.completion_children(attempt_id))
+                          if meta.get("attempt_id")}
+    return _rows(jobs, ids, require_unique=True)
 
 
 def _root(rows: dict, attempt: str) -> str:
@@ -743,6 +757,17 @@ def _attempt_stall_superseded(jobs: Path, aid: str, metadata: dict) -> bool:
     return False
 
 
+def _settlement_decision(status: str, meta: dict):
+    from dispatch_contract import observed_attempt_liveness
+    from codex_dispatch_terminal import terminal_envelope_observed
+    proof = observed_attempt_liveness(status, meta,
+        terminal_envelope=terminal_envelope_observed(meta.get("log_file")),
+        terminal_receipt_gate=True)
+    decision = decide_attempt(status, meta, process_state=proof.process_state,
+                              process_reason=proof.process_reason)
+    return proof, decision
+
+
 def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
     import route_parent_close
     attempts = [aid for aid in attempts if aid not in rows or not route_parent_close.row_requested(rows[aid][1], jobs)]
@@ -771,8 +796,6 @@ def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
             if parent_resume_obligation(jobs, aid, route_id=route_id) is not None:
                 return True
         return False
-    from dispatch_contract import observed_attempt_liveness
-    from codex_dispatch_terminal import terminal_envelope_observed
     for aid in attempts:
         if aid not in rows:
             raise SupervisionError("supervision-attempt-missing")
@@ -782,13 +805,7 @@ def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
         # unknown, or conflicting execution.
         from dispatch_notice_state import route_obligation_closed
         route_closed = reason == "supervisor-exited" and route_obligation_closed(meta, jobs)
-        from dispatch_contract import observed_attempt_liveness
-        from codex_dispatch_terminal import terminal_envelope_observed
-        proof = observed_attempt_liveness(status, meta,
-            terminal_envelope=terminal_envelope_observed(meta.get("log_file")),
-            terminal_receipt_gate=True)
-        decision = decide_attempt(status, meta, process_state=proof.process_state,
-                                  process_reason=proof.process_reason)
+        _proof, decision = _settlement_decision(status, meta)
         if decision.action in {"wait", "recover", "reconcile", "inspect-conflict"}:
             return True
         # A supervisor-exited notice may be only a lagging route-settlement
@@ -1546,5 +1563,30 @@ def wait_for_child_settlement(*, jobs: Path, attempts: set[str],
             time.sleep(1.0)
         return {"state": "timeout"}
 
+    def held_by_conflict() -> str:
+        """End the wait only when every remaining child is a settled, unreviewed conflict.
+
+        Open, live, or recoverable work keeps the wait; a closed and quiescent
+        child that only a person's review can change would otherwise hold this
+        supervisor, and its watchers, forever.
+        """
+        from dispatch_contract import PARENT_EXTINCTION_TERMINAL_STATUSES
+        rows = _rows(jobs, attempts)
+        held = False
+        for aid in sorted(attempts):
+            if aid not in rows:
+                return ""
+            if not _pending({aid: rows[aid]}, [aid], jobs):
+                continue
+            status, meta = rows[aid]
+            proof, decision = _settlement_decision(status, meta)
+            if (decision.action != "inspect-conflict"
+                    or status not in PARENT_EXTINCTION_TERMINAL_STATUSES
+                    or proof.process_state != "quiescent"):
+                return ""
+            held = True
+        return "terminal-evidence-conflict" if held else ""
+
     wait_for_batch(join=observe, attempts=attempts, jobs=jobs,
-                   parent_attempt_id=parent_attempt_id, emit=emit)
+                   parent_attempt_id=parent_attempt_id, emit=emit,
+                   stop_check=held_by_conflict)
