@@ -481,7 +481,7 @@ class PaneOwnershipTest(unittest.TestCase):
 
         def pane_info(pane, **_kwargs):
             pid = int(pane.removeprefix("pane-"))
-            return {"foreground_process_group_id": 77,
+            return {"pane_id": pane, "foreground_process_group_id": 77,
                     "foreground_processes": [{"pid": pid}]}
 
         with mock.patch.object(po.os, "listdir", return_value=[str(pid) for pid in pids]), \
