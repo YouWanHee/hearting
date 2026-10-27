@@ -25,6 +25,29 @@ import os
 import sys
 from dataclasses import replace
 
+
+def _cap_malloc_arenas(environ=os.environ, platform=sys.platform):
+    """Keep glibc from giving every concurrent reader thread its own heap arena.
+
+    Fleet starts a fresh worker thread for each pass and a burst of short pane-read
+    threads. With one arena per concurrent thread, each large collector pass lands in
+    a different arena and the memory it frees stays mapped there, so RSS climbs pass
+    after pass (measured: 0.6GB to 1.9GB in 20 rewrites of a 45MB registry, flat at
+    0.9GB with two arenas). Set once, before any thread exists. An operator's own
+    MALLOC_ARENA_MAX wins; other platforms and C libraries are left alone.
+    """
+    if not platform.startswith("linux") or environ.get("MALLOC_ARENA_MAX"):
+        return False
+    try:
+        import ctypes
+        mallopt = getattr(ctypes.CDLL(None), "mallopt", None)
+        return bool(mallopt is not None and mallopt(-8, 2))   # M_ARENA_MAX
+    except (OSError, AttributeError, TypeError, ValueError):
+        return False
+
+
+_cap_malloc_arenas()
+
 # Support both `python3 fleet.py` (script) and `python3 -m fleet.fleet` (module).
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
