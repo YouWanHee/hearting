@@ -298,6 +298,19 @@ def _key_attr(key, tint=None):
 
 
 # ---------- color ----------
+# curses pair numbers. Model families take 10-17 (eight families since Sol/Astra/Luna
+# split), so the structural bars must sit above the steward badge, not inside the family
+# block: when the bars reused 15-17, `fam_astra/luna/gpt` text inherited the header's
+# chrome background (user 2026-10-27: "astra 모델 컬러가 왜이래.. 왜 틴트가 있어").
+# Keep everything except the 256-color tints below 64 so 8-color terminals still get bars.
+_FAMILY_PAIR_START = 10
+_STEWARD_PAIR = 18
+_HDR_BAR_PAIR = 19
+_HDR_WARN_PAIR = 20
+_HDR_BLK_PAIR = 21
+_TINT_PAIR_START = 22
+
+
 def _init_colors():
     _COLOR.clear()
     try:
@@ -391,7 +404,7 @@ def _init_colors():
             "astra": _palette_fg("orange", curses.COLOR_YELLOW),
             "luna": _palette_fg("soft", curses.COLOR_WHITE),
             "gpt": _palette_fg("yellow", curses.COLOR_YELLOW)}
-    n_pair = 10                                     # pairs 1-9 reserved above; families from 10
+    n_pair = _FAMILY_PAIR_START                     # pairs 1-9 reserved above; families from 10
     for fam, fg in _fam.items():
         try:
             curses.init_pair(n_pair, fg, bg)
@@ -427,8 +440,8 @@ def _init_colors():
     _COLOR["tag"] = _COLOR.get("soft", 0)
     _COLOR["tag_dim"] = curses.A_DIM
     try:
-        curses.init_pair(18, _palette_fg("steward_pink", curses.COLOR_MAGENTA), bg)
-        _COLOR["tag_steward"] = curses.color_pair(18) | curses.A_BOLD
+        curses.init_pair(_STEWARD_PAIR, _palette_fg("steward_pink", curses.COLOR_MAGENTA), bg)
+        _COLOR["tag_steward"] = curses.color_pair(_STEWARD_PAIR) | curses.A_BOLD
     except Exception:
         _COLOR["tag_steward"] = (_COLOR.get("h_codex", 0) & ~curses.A_DIM) | curses.A_BOLD
     _COLOR["herdr_on"] = _COLOR.get("soft", 0)
@@ -479,9 +492,9 @@ def _init_colors():
     # Structural, one-shot — NOT a per-item classification color, so the fg color-axis budget
     # The no-rainbow-noise rule remains; keycaps use bold because dim vanishes on the bar.
     try:
-        curses.init_pair(15, curses.COLOR_BLACK,
+        curses.init_pair(_HDR_BAR_PAIR, curses.COLOR_BLACK,
                          _palette_fg("chrome", curses.COLOR_WHITE))
-        _COLOR["hdr_bar"] = curses.color_pair(15)
+        _COLOR["hdr_bar"] = curses.color_pair(_HDR_BAR_PAIR)
     except Exception:
         _COLOR["hdr_bar"] = curses.A_REVERSE
     _COLOR["hdr_key"] = _COLOR["hdr_bar"] | curses.A_BOLD
@@ -492,21 +505,21 @@ def _init_colors():
     # inverts the hierarchy the double-confirm ladder depends on: the live-session prompt must
     # read as MORE serious, not like a render glitch.
     try:
-        curses.init_pair(17, _palette_fg("soft", curses.COLOR_WHITE),
+        curses.init_pair(_HDR_WARN_PAIR, _palette_fg("soft", curses.COLOR_WHITE),
                          _palette_fg("warning", curses.COLOR_RED))
-        _COLOR["hdr_warn"] = curses.color_pair(17) | curses.A_BOLD
+        _COLOR["hdr_warn"] = curses.color_pair(_HDR_WARN_PAIR) | curses.A_BOLD
     except Exception:
         _COLOR["hdr_warn"] = curses.A_REVERSE | curses.A_BOLD
     # The one key the user must press, advertised on top of the red bar.
     _COLOR["hdr_warn_key"] = _COLOR["hdr_warn"] | curses.A_REVERSE
-    # bar BLANKS are drawn as muted-neutral █ blocks on the DEFAULT bg (pair 16), not as bg-colored
+    # bar BLANKS are drawn as muted-neutral █ blocks on the DEFAULT bg (hdr_blk), not as bg-colored
     # spaces: ncurses collapses blank runs into ECH/EL erase sequences, and on terminals without
     # working BCE the erased cells come out BLACK — the bar broke between words and after the
     # text. A block glyph is a real character, so it is
     # physically written every time and matches the muted bar background cell.
     try:
-        curses.init_pair(16, _palette_fg("chrome", curses.COLOR_WHITE), bg)
-        _COLOR["hdr_blk"] = curses.color_pair(16)
+        curses.init_pair(_HDR_BLK_PAIR, _palette_fg("chrome", curses.COLOR_WHITE), bg)
+        _COLOR["hdr_blk"] = curses.color_pair(_HDR_BLK_PAIR)
     except Exception:
         _COLOR["hdr_blk"] = 0
     # Subtle panel tints in 256-color mode: seven hues by tint level.
@@ -527,7 +540,7 @@ def _init_colors():
                     "o": _palette_fg("orange", curses.COLOR_YELLOW),
                     "p": _palette_fg("steward_pink", curses.COLOR_MAGENTA),
                     "l": _palette_fg("blue", curses.COLOR_BLUE)}
-            n_pair = 20
+            n_pair = _TINT_PAIR_START
             for tch, lvl in _TINT_LVL.items():
                 for hch, fg in hues.items():
                     curses.init_pair(n_pair, fg, lvl)
