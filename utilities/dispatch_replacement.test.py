@@ -3225,6 +3225,14 @@ class ReplacementTest(unittest.TestCase):
                 R._check_tuple({**newer,'resolved':{'model':'m2','permission_mode':'config'}},old)
         same_release=dict(old,resolved={'model':'m3','permission_mode':'default'})
         with self.assertRaises(D.DispatchContractError):R._check_tuple(same_release,old)
+        # A key the older release never sealed (runtime_dir, added later) follows the
+        # current release; a key the older release did seal still has to match.
+        added={**newer,'resolved':{**newer['resolved'],'runtime_dir':'/checkout/.agent_runtime'}}
+        R._check_tuple(added,old)
+        with self.assertRaises(D.DispatchContractError):
+            R._check_tuple(added,dict(old,resolved={**old['resolved'],'runtime_dir':None}))
+        with self.assertRaises(D.DispatchContractError):
+            R._check_tuple(dict(old,resolved={**old['resolved'],'runtime_dir':'/checkout/.agent_runtime'}),old)
 
     def test_permission_widening_and_narrowing_are_refused_with_axis_values(self):
         base = {
