@@ -2,7 +2,7 @@
 """Compile, verify, and complete immutable capability routes."""
 from __future__ import annotations
 
-import argparse, base64, contextlib, fcntl, functools, hashlib, importlib.util, json, locale, os, re, shlex, shutil, stat, subprocess, sys, tempfile, uuid
+import argparse, base64, contextlib, copy, fcntl, functools, hashlib, importlib.util, json, locale, os, re, shlex, shutil, stat, subprocess, sys, tempfile, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -2751,13 +2751,59 @@ def _validation_basis():
 
 def unit_catalog_digest(units_root=None):
     """Digest of unit frontmatter blocks (machine contracts); unit BODY prose stays un-hashed."""
+    return _unit_blocks_digest(_capture_unit_frontmatter(units_root))
+
+
+def _capture_unit_frontmatter(units_root=None):
+    """Capture the exact hashed blocks, retaining malformed files as None."""
     units_root=Path(units_root) if units_root else ROOT/"roles"/"units"
-    blocks=[]
+    captured={}
     for path in sorted(units_root.glob("*/*.md")):
         if path.name.startswith("_"): continue
         match=re.match(r"\A---\n.*?\n---\n", path.read_text(encoding="utf-8"), re.DOTALL)
-        if match: blocks.append(f"{path.relative_to(units_root)}\n{match.group(0)}")
+        captured[path.relative_to(units_root).as_posix()] = match.group(0) if match else None
+    return captured
+
+
+def _unit_blocks_digest(captured):
+    blocks=[f"{path}\n{block}" for path,block in sorted(captured.items()) if block is not None]
     return "sha256:"+hashlib.sha256("\n".join(blocks).encode()).hexdigest()
+
+
+SD160_REGISTRY_DIGEST = "sha256:4260c26aebc1ab2f5bbb722d1b77a0d3fe555504a4122ec5dd3c891dd8071f10"
+SD160_UNIT_CATALOG_DIGEST = "sha256:a565c51b6d07e301836027295e3e49d01dcb2b2bdacb98845441711c73188314"
+SD160_SNAPSHOT_DIR = ROOT / "utilities" / "legacy-route-snapshots"
+
+
+def _sd160_snapshot_path(digest):
+    """Map a sealed sha256 digest to its Windows-safe snapshot filename."""
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise ValueError("invalid SD-160 snapshot digest")
+    return SD160_SNAPSHOT_DIR / f"sha256-{digest.split(':', 1)[1]}.json"
+
+
+def _load_sd160_snapshots():
+    """Load the immutable registry and parsed unit contracts for sealed SD-160 routes."""
+    try:
+        registry_path = _sd160_snapshot_path(SD160_REGISTRY_DIGEST)
+        units_path = _sd160_snapshot_path(SD160_UNIT_CATALOG_DIGEST)
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        blocks = json.loads(units_path.read_text(encoding="utf-8"))
+        registry_digest = TOPO.registry_digest(registry)
+        units_digest = _unit_blocks_digest(blocks)
+        registry_filename_digest = "sha256:" + registry_path.stem.removeprefix("sha256-")
+        units_filename_digest = "sha256:" + units_path.stem.removeprefix("sha256-")
+        if registry_digest != registry_filename_digest or units_digest != units_filename_digest:
+            return None
+        if registry_digest != SD160_REGISTRY_DIGEST or units_digest != SD160_UNIT_CATALOG_DIGEST:
+            return None
+        fields = {}
+        for path, block in blocks.items():
+            unit = path[:-3]
+            fields[unit] = TOPO._parse_unit_frontmatter(unit, block)
+        return registry, registry_digest, units_digest, fields
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
 
 def compile_route(capability, capability_mode, requested_intensity, cwd, artifact_root,
                   predicates=(), signals=(), transport=None,
@@ -5497,24 +5543,6 @@ def _validate_campaign_selection(key, value):
         raise ValueError(f"route-{key.replace('_', '-')}-invalid")
 
 
-def _sd160_legacy_registry(registry):
-    """Reconstruct only the immediately preceding cross-harness declaration.
-
-    This is an exact digest bridge, never a general stale-registry exemption.
-    Any changed node, width, budget, role or other registry byte changes its
-    digest and remains refused. Old sealed documents themselves are untouched.
-    """
-    legacy = json.loads(json.dumps(registry))
-    changed = False
-    for recipe in legacy["recipes"]:
-        for graph in (v for v in recipe.values() if isinstance(v, dict)):
-            for group in graph.get("parallel_groups", []):
-                if group.get("independence_axes") == ["model-profile", "perspective"]:
-                    group["independence_axes"] = ["cross-harness", "model-profile", "perspective"]
-                    changed = True
-    return legacy if changed else None
-
-
 def _entry_scope_legacy_registry(registry):
     """Reconstruct only the catalog immediately before the refine preview mark."""
     legacy = json.loads(json.dumps(registry))
@@ -5710,34 +5738,30 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         # An unsupported basis_version is a legitimate newer harness's route;
         # closure records it honestly as unproven rather than stranding it.
         return dict(route, _registry_current=False)
-    registry=TOPO.load_registry()
+    persona_version = route.get("persona_independence_contract_version")
+    if persona_version is not None and (type(persona_version) is not int or persona_version != 1):
+        raise ValueError("unsupported-persona-independence-contract-version")
+    legacy_unit_view=None
+    snapshot_pair=(persona_version is None
+                   and route.get("registry_digest")==SD160_REGISTRY_DIGEST
+                   and route.get("unit_catalog_digest")==SD160_UNIT_CATALOG_DIGEST)
+    snapshots=_load_sd160_snapshots() if snapshot_pair else None
+    if snapshots is not None:
+        registry, registry_digest_now, current_units_digest, legacy_unit_view = snapshots
+    else:
+        registry=TOPO.load_registry()
+        registry_digest_now=TOPO.registry_digest(registry)
+        current_units_digest=unit_catalog_digest()
     capability_digest_now=None
     if isinstance(route.get("capability_registry_digest"), str) and isinstance(route.get("capability"), str):
         extra=[route["composed_recipe"]] if route.get("composed") and isinstance(route.get("composed_recipe"), dict) else ()
         capability_digest_now=TOPO.capability_registry_digest(registry, route["capability"], extra)
     classification=classify_validation_basis(
-        route, registry_digest_now=TOPO.registry_digest(registry),
-        units_digest_now=unit_catalog_digest(),
+        route, registry_digest_now=registry_digest_now,
+        units_digest_now=current_units_digest,
         registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
         capability_digest_now=capability_digest_now,
     )
-    persona_version = route.get("persona_independence_contract_version")
-    if persona_version is not None and (type(persona_version) is not int or persona_version != 1):
-        raise ValueError("unsupported-persona-independence-contract-version")
-    if (classification["registry"]["verdict"] != "current"
-            and classification["unit_catalog"]["verdict"] == "current"
-            and persona_version is None):
-        legacy_registry = _sd160_legacy_registry(registry)
-        if (legacy_registry is not None
-                and route.get("registry_digest") == TOPO.registry_digest(legacy_registry)):
-            # Reconstruct the old graph under its exact authenticated declaration;
-            # launch/receipt consumers apply SD-160's effective persona policy.
-            registry = legacy_registry
-            classification = classify_validation_basis(
-                route, registry_digest_now=TOPO.registry_digest(registry),
-                units_digest_now=unit_catalog_digest(),
-                registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
-            )
     if (classification["registry"]["verdict"] != "current"
             and classification["unit_catalog"]["verdict"] == "current"):
         legacy_registry = _entry_scope_legacy_registry(registry)
@@ -5787,10 +5811,12 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         composed_recipe=route.get("composed_recipe")
         if not isinstance(composed_recipe, dict):
             raise ValueError("composed route lacks embedded composed_recipe")
-        TOPO._validate_recipe(
-            composed_recipe, registry,
-            registry["owner_profile_by_intensity"]["standard"],
-        )
+        with (TOPO._unit_contract_view(legacy_unit_view)
+              if legacy_unit_view is not None else contextlib.nullcontext()):
+            TOPO._validate_recipe(
+                composed_recipe, registry,
+                registry["owner_profile_by_intensity"]["standard"],
+            )
         _validate_compose_owner_close(registry, composed_recipe, route["effective_intensity"])
         if resume_recipe and not _versioned_subgraph(registry, composed_recipe):
             raise ValueError("resume recipe differs from the declared catalog")

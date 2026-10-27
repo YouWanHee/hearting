@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import contextvars
 import hashlib
 import json
 import re
@@ -45,6 +47,8 @@ _BLOCKING_VERDICT_TOKENS = frozenset({
     "failed", "FAILED", "needs_work", "killed", "conflicts-found",
 })
 _UNIT_CACHE: dict = {}
+_UNIT_CONTRACT_VIEW: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "unit_contract_view", default=None)
 
 
 class TopologyError(ValueError):
@@ -468,6 +472,9 @@ def _validate_model_profile(registry, profile, context, *, registered=True):
 
 def _unit_frontmatter(unit):
     """Read the few scalars the validator needs from a unit file (stdlib regex only)."""
+    view = _UNIT_CONTRACT_VIEW.get()
+    if view is not None and unit in view:
+        return dict(view[unit])
     key = (str(UNITS), unit)
     if key in _UNIT_CACHE:
         return _UNIT_CACHE[key]
@@ -476,6 +483,13 @@ def _unit_frontmatter(unit):
         text = path.read_text(encoding="utf-8")
     except OSError:
         raise TopologyError(f"unknown unit: {unit} (no roles/units/{unit}.md)")
+    fields = _parse_unit_frontmatter(unit, text)
+    _UNIT_CACHE[key] = fields
+    return fields
+
+
+def _parse_unit_frontmatter(unit, text):
+    """Parse unit contract fields from the same sealed frontmatter text used on disk."""
     match = re.match(r"\A---\n(.*?\n)---\n", text, re.DOTALL)
     if not match:
         raise TopologyError(f"unit {unit}: missing frontmatter block")
@@ -500,8 +514,18 @@ def _unit_frontmatter(unit):
         if verdict
         else []
     )
-    _UNIT_CACHE[key] = fields
     return fields
+
+
+@contextlib.contextmanager
+def _unit_contract_view(fields_by_unit):
+    """Temporarily expose authenticated historical fields without touching the cache."""
+    copied={unit:dict(fields) for unit,fields in fields_by_unit.items()}
+    token=_UNIT_CONTRACT_VIEW.set(copied)
+    try:
+        yield
+    finally:
+        _UNIT_CONTRACT_VIEW.reset(token)
 
 
 def _validate_unit_ref(recipe, node, registry):
