@@ -523,6 +523,14 @@ def append_job(jobs: Path, args: argparse.Namespace, *, harness: str, runtime_sa
     sandbox and effort, any fields only it records, and -- looked up in its
     own module at call time -- the claim and completion-gate functions.
     """
+    settings = args.resolved_model_settings
+    selection_receipt = getattr(args, "profile_selection_receipt", {})
+    if ("model_source" in selection_receipt
+            and selection_receipt["model_source"] != settings["source"]):
+        raise DispatchContractError(
+            "model-selection-source-mismatch",
+            "model_source differs between selection receipt and resolved settings",
+        )
     if args.action in {"register", "start"}:
         # Validate the complete shared projection before sealing permissions or
         # mutating the registry. Adapter settings and this row were rendered
@@ -627,9 +635,11 @@ def append_job(jobs: Path, args: argparse.Namespace, *, harness: str, runtime_sa
             f",owner_route_hash={args.owner_route_binding.route_hash}"
         )
     pipe += workflow_completion_receipt(args)
-    settings = args.resolved_model_settings
-    for key, value in sorted(getattr(args, "profile_selection_receipt", {}).items()):
-        pipe += f",{key}={value}"
+    for key, value in sorted(selection_receipt.items()):
+        # Rotated selection receipts repeat the resolved source for diagnostics;
+        # registry identity fields must have exactly one serialized occurrence.
+        if key != "model_source":
+            pipe += f",{key}={value}"
     pipe += (
         f",model_source={settings['source']},model_role={settings['role']}"
         f",model_profile={settings['profile']},model_tier={settings['tier']}"

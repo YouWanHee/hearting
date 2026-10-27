@@ -297,6 +297,19 @@ completion is `exited`, not workflow success; missing evidence is unknown.
 Large snapshots name their sampled scope, so a bounded display never implies
 that omitted jobs have ended.
 
+Attempt metadata serializes each immutable key once. Model-selection diagnostic
+receipts may repeat a resolved value in memory, but the shared launch writer
+checks agreement and emits one registry field. Ordinary mutation still refuses
+duplicate immutable keys. Terminal settlement alone may normalize the known
+schema-v2 registered depth-one `frame-alternative` defect: exactly two identical
+`model_source=profile+diversity` fields on a rotated model-selection row with
+bound route and attempt identities, and no other immutable duplicate. It removes
+only the repeated identical field under the existing registry lock and preserves
+the immutable identity. Conflicting values, additional copies, other duplicate
+keys and ordinary updates remain refused. Existing exact process-death,
+cleanup, terminal-result and replacement checks continue to decide the outcome;
+normalization grants neither success nor a new launch.
+
 Dispatch same-work identity gates are opt-in: only `HEARTING_GATES=on`
 enforces sealed-versus-current route, parent, lineage, runtime and review
 bindings. Otherwise `utilities/hearting_gates.py` emits `hearting: gate-off`

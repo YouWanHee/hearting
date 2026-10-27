@@ -11231,12 +11231,35 @@ def _updated_attempt_metadata(
         key for key in keys
         if keys.count(key) > 1 and key not in ATTEMPT_MUTABLE_METADATA
     }
-    if immutable_duplicates:
+    metadata = parse_registry_metadata(pipe)
+    # Historical rotated frame launches wrote this same diagnostic twice.
+    # Normalize only their exact terminal path; ordinary mutation and every
+    # conflicting or otherwise duplicated immutable identity remain refused.
+    historical_frame_source = (
+        terminal
+        and immutable_duplicates == {"model_source"}
+        and [part for part in raw_parts if part.split("=", 1)[0] == "model_source"]
+        == ["model_source=profile+diversity"] * 2
+        and all(metadata.get(key) == value for key, value in {
+            "attempt_schema_version": "2",
+            "dispatch_depth": "1",
+            "transport": "headless",
+            "execution_surface": "registered-headless",
+            "registered_worker": "1",
+            "worker_type": "frame",
+            "route_node": "frame-alternative",
+            "model_diversity": "rotated",
+        }.items())
+        and all(metadata.get(key) for key in ("attempt_id", "route_id", "route_hash"))
+    )
+    if historical_frame_source:
+        first_source = keys.index("model_source")
+        del raw_parts[keys.index("model_source", first_source + 1)]
+    elif immutable_duplicates:
         raise DispatchContractError(
             "attempt-immutable-metadata-duplicate",
             ",".join(sorted(immutable_duplicates)),
         )
-    metadata = parse_registry_metadata(pipe)
     allowed_new = ATTEMPT_TERMINAL_EVIDENCE_KEYS if terminal else set()
     replace: dict[str, str] = {}
     for key, raw_value in values.items():

@@ -1122,7 +1122,7 @@ class SameRowTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.tmp = self._tmp.name
 
-    def row(self, harness, repository_kind=None, **kwargs):
+    def row(self, harness, repository_kind=None, *, args_updates=None, raw=False, **kwargs):
         from unittest import mock
         claimed = []
         tmp = self.tmp
@@ -1137,6 +1137,8 @@ class SameRowTest(unittest.TestCase):
              mock.patch("dispatch_replacement.seal_launch_input", return_value=""):
             secrets_.token_hex.return_value = "nonce"
             args = self.args(Path(tmp))
+            for name, value in (args_updates or {}).items():
+                setattr(args, name, value)
             if repository_kind is not None:
                 args.repository_kind = repository_kind
             C.append_job(Path(tmp) / "jobs.log", args, harness=harness,
@@ -1144,8 +1146,57 @@ class SameRowTest(unittest.TestCase):
                          marker_gate=None, **kwargs)
         row, kw = claimed[0]
         self.assertIn("mutation_precheck", kw)
+        if raw:
+            return row
         fields = dict(part.split("=", 1) for part in row.split("\t")[5].split(","))
         return fields
+
+    def test_model_source_is_serialized_once_for_normal_and_rotated_selection(self):
+        for harness, effort_key in (("claude", "effort"), ("codex", "reasoning"),
+                                    ("opencode", "variant")):
+            for rotated in (False, True):
+                with self.subTest(harness=harness, rotated=rotated):
+                    source = "profile+diversity" if rotated else "profile"
+                    settings = {**self.args(Path(self.tmp)).resolved_model_settings,
+                                "source": source, "profile": "balanced"}
+                    receipt = {"profile_selection_source": "legacy",
+                               "profile_resolver_version": "profile-demand/v1"}
+                    if rotated:
+                        receipt.update(model_source=source, model_diversity="rotated",
+                                       model_diversity_from="top/sibling-model")
+                    row = self.row(
+                        harness, runtime_sandbox="workspace-write", effort_key=effort_key,
+                        args_updates={"resolved_model_settings": settings,
+                                      "profile_selection_receipt": receipt,
+                                      "worker_type": "frame",
+                                      "route_node": "frame-alternative"}, raw=True,
+                    )
+                    metadata = row.split("\t")[5].split(",")
+                    self.assertEqual([part for part in metadata
+                                      if part.startswith("model_source=")],
+                                     ["model_source=" + source])
+                    self.assertIn("profile_selection_source=legacy", metadata)
+                    self.assertIn("model_profile=balanced", metadata)
+                    if rotated:
+                        self.assertIn("model_diversity=rotated", metadata)
+                        self.assertIn("model_diversity_from=top/sibling-model", metadata)
+
+    def test_conflicting_model_source_is_refused_before_registration_side_effects(self):
+        for action in ("register", "start"):
+            with self.subTest(action=action):
+                args = self.args(Path(self.tmp))
+                args.action = action
+                args.profile_selection_receipt = {"model_source": "profile+diversity"}
+                jobs = Path(self.tmp) / action / "jobs.log"
+                claim = mock.Mock()
+                with mock.patch.object(C.commit_policy, "assert_launch_permission_projection") as projection, \
+                     self.assertRaises(C.DispatchContractError) as refused:
+                    C.append_job(jobs, args, harness="codex", runtime_sandbox="workspace-write",
+                                 effort_key="reasoning", claim=claim, marker_gate=None)
+                self.assertEqual(refused.exception.reason, "model-selection-source-mismatch")
+                claim.assert_not_called()
+                projection.assert_not_called()
+                self.assertFalse(jobs.parent.exists())
 
     def test_repository_marker_is_only_added_for_non_git_rows(self):
         non_git_fields = self.row("codex", repository_kind="non-git",
