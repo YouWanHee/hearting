@@ -4,6 +4,7 @@ import os
 import json
 from pathlib import Path
 import sys
+import stat
 import tempfile
 import unittest
 from dataclasses import replace
@@ -1364,10 +1365,34 @@ class FleetWorkflowQuestionIntegrationTests(unittest.TestCase):
 
         self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
+        self.agent_home = self.root / "agent-home"
+        (self.agent_home / "core").mkdir(parents=True)
+        (self.agent_home / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
         self.env = mock.patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root / "xdg"),
             "HOME": str(self.root),
             "PYTHONDONTWRITEBYTECODE": "1",
+            "AGENT_HOME": str(self.agent_home),
+            "AGENT_WORKFLOW_ROOT": str(self.root / "workflow"),
+            "AGENT_ARTIFACT_CHECKPOINT": "off",
+            "AGENT_ARTIFACT_CAMPAIGN_ID": "",
+            "AGENT_ARTIFACT_CYCLE_ID": "",
+            "AGENT_ARTIFACT_PRODUCER_ID": "",
+            "AGENT_ARTIFACT_CYCLE_DIR": "",
+            "AGENT_ARTIFACT_OUTPUT_DIR": "",
+            "AGENT_DISPATCH_CALLER_HARNESS": "codex",
+            "AGENT_DISPATCH_REGISTERED_WORKER": "",
+            "AGENT_DISPATCH_CHILD": "",
+            "AGENT_DISPATCH_DEPTH": "0",
+            "AGENT_DISPATCH_ATTEMPT_ID": "",
+            "AGENT_OWNER_ROUTE_FILE": "",
+            "AGENT_OWNER_ROUTE_ID": "",
+            "AGENT_OWNER_ROUTE_HASH": "",
+            "CODEX_THREAD_ID": "parent-session",
+            "CODEX_SESSION_ID": "",
+            "CLAUDE_CODE_SESSION_ID": "",
+            "CLAUDE_SESSION_ID": "",
+            "OPENCODE_SESSION_ID": "",
         })
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -1384,6 +1409,7 @@ class FleetWorkflowQuestionIntegrationTests(unittest.TestCase):
         self.dispatch = dispatch
         self.jobs = self.root / "jobs.log"
         self.jobs.write_text("", encoding="utf-8")
+        os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
         registries = mock.patch.object(dispatch, "human_gate_registry_paths",
                                        return_value=(self.jobs,))
         registries.start()
@@ -1674,22 +1700,28 @@ class FleetWorkflowQuestionIntegrationTests(unittest.TestCase):
         from fleet.explorer.state import reduce
 
         metadata = self._metadata
-        with mock.patch.object(self, "_metadata", side_effect=lambda *args, **kwargs:
-                               metadata(*args, **kwargs).replace(
-                                   "parent_harness=codex", "parent_harness=" + harness)):
-            source = self._blocked_owner_wait()
-        row = self._row(self._view_model(self.latest_result), "S3")
-        state, envelope, _ = self._read_in_ui(row)
-        self.assertEqual(envelope["harness"], harness)
-        self.assertEqual(envelope["native_ref"]["transport"], "hearting-owner-input")
-        state, saved = self._save_typed_draft(state, "Continue this exact owner")
-        state = self._adopt_result(state, saved)
-        state, effects = reduce(state, {"type": "click", "action": ("question.submit",)})
-        self.assertEqual(len(effects), 1)
-        receipt = ExplorerRuntime.execute_question_action(effects[0])
-        self.assertEqual(receipt["state"], "received")
-        self.assertEqual(len(dispatch_owner_input.inspect(
-            self.jobs, source["attempt_id"])["requests"]), 1)
+        identity = {"AGENT_DISPATCH_CALLER_HARNESS": harness,
+                    "CODEX_THREAD_ID": "" if harness != "codex" else "parent-session",
+                    "CLAUDE_CODE_SESSION_ID": "parent-session" if harness == "claude" else "",
+                    "CLAUDE_SESSION_ID": "",
+                    "OPENCODE_SESSION_ID": "parent-session" if harness == "opencode" else ""}
+        with mock.patch.dict(os.environ, identity):
+            with mock.patch.object(self, "_metadata", side_effect=lambda *args, **kwargs:
+                    metadata(*args, **kwargs).replace(
+                        "parent_harness=codex", "parent_harness=" + harness)):
+                source = self._blocked_owner_wait()
+            row = self._row(self._view_model(self.latest_result), "S3")
+            state, envelope, _ = self._read_in_ui(row)
+            self.assertEqual(envelope["harness"], harness)
+            self.assertEqual(envelope["native_ref"]["transport"], "hearting-owner-input")
+            state, saved = self._save_typed_draft(state, "Continue this exact owner")
+            state = self._adopt_result(state, saved)
+            state, effects = reduce(state, {"type": "click", "action": ("question.submit",)})
+            self.assertEqual(len(effects), 1)
+            receipt = ExplorerRuntime.execute_question_action(effects[0])
+            self.assertEqual(receipt["state"], "received")
+            self.assertEqual(len(dispatch_owner_input.inspect(
+                self.jobs, source["attempt_id"])["requests"]), 1)
 
     def test_workflow_free_text_does_not_widen_native_explicit_choices(self):
         from fleet.explorer.state import question_free_text_supported, question_values_valid
@@ -1847,6 +1879,181 @@ class FleetWorkflowQuestionIntegrationTests(unittest.TestCase):
         import dispatch_owner_input
 
         return dispatch_owner_input.inspect(self.jobs, attempt)["requests"]
+
+
+class FleetS3OwnerContinuationTests(unittest.TestCase):
+    """Exercise selected S3 answers through the public correction continuation."""
+
+    _seal_route = FleetWorkflowQuestionIntegrationTests._seal_route
+    _metadata = FleetWorkflowQuestionIntegrationTests._metadata
+    _write_owner = FleetWorkflowQuestionIntegrationTests._write_owner
+    _observe = FleetWorkflowQuestionIntegrationTests._observe
+    _blocked_owner_wait = FleetWorkflowQuestionIntegrationTests._blocked_owner_wait
+
+    def setUp(self):
+        FleetWorkflowQuestionIntegrationTests.setUp(self)
+        import work_start
+
+        project_root = Path(__file__).resolve().parents[3]
+        router = work_start._route_module()
+        gate = {"spec_read": {"satisfied": True, "source": "canonical-prd-sha256"},
+                "drift_verdict": "within-spec", "workflow_mode": "tracked",
+                "artifact_guard": {"satisfied": True, "source": "conductor-prechecked"}}
+        route = router.compile_route(
+            "autopilot-code", "dev", "direct", str(project_root), str(self.artifacts),
+            predicates=["atomic-outcome", "known-scope", "no-shared-contract",
+                        "no-resource-run", "no-artifact-handoff", "no-independent-verifier",
+                        "focused-verification"],
+            signals=[], transport=None, inline_reason="atomic-direct", tracking="tracked",
+            tracked_gate_evidence=gate)
+        route["work_request"] = {"text": "Continue the selected owner's approved route.",
+                                 "owner_harness": "codex"}
+        self.route = route
+        self._seal_route()
+        router.verify_route(self.route, str(project_root))
+        self.public_correct_commands = []
+
+    def _public_correct_runner(self, *, lose_reply=False):
+        import subprocess
+
+        real_run = subprocess.run
+        calls = []
+        files = []
+
+        def run(command, *args, **kwargs):
+            if (not isinstance(command, (list, tuple)) or len(command) < 3
+                    or Path(str(command[1])).name != "capability-route.py"
+                    or command[2] != "correct"):
+                return real_run(command, *args, **kwargs)
+            command = list(command)
+            calls.append(command)
+            message_path = Path(command[command.index("--message-file") + 1])
+            self.assertTrue(message_path.is_file())
+            self.assertEqual(stat.S_IMODE(message_path.stat().st_mode), 0o600)
+            files.append(message_path)
+            completed = real_run(command, *args, **kwargs)
+            if lose_reply:
+                raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 30))
+            return completed
+
+        return run, calls, files
+
+    def _selected_owner(self):
+        item = self._blocked_owner_wait()
+        selected = human_wait_state.read_selected_request({"id": item["id"]})
+        self.assertEqual(selected["state"], "open")
+        self.assertTrue(selected["support"]["supported"], selected)
+        self.assertEqual(selected["native_ref"]["attempt_id"], item["attempt_id"])
+        return item, selected
+
+    def test_public_correct_continues_once_and_refreshes_the_private_receipt(self):
+        import dispatch_owner_input
+
+        item, selected = self._selected_owner()
+        answer = "private continuation answer"
+        drafted = human_wait_state.write_selected_draft(selected, answer)
+        runner, calls, files = self._public_correct_runner()
+        with mock.patch.object(human_wait_state.subprocess, "run", side_effect=runner):
+            result = human_wait_state.submit_selected_response(
+                drafted, {"answers": {"owner-correction": [answer]}},
+                action_id="s3-public-correct-once")
+
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertEqual(argv[argv.index("--attempt-id") + 1], item["attempt_id"])
+        self.assertEqual(argv[argv.index("--request-id") + 1], "s3-public-correct-once")
+        self.assertNotIn(answer, " ".join(argv))
+        self.assertEqual(len(files), 1)
+        self.assertFalse(files[0].exists())
+        self.assertEqual(result["state"], "received", result)
+        self.assertEqual(result["result"]["status"], "retained", result)
+        self.assertEqual(result["result"]["target_attempt_id"], item["attempt_id"])
+        self.assertEqual(result["result"]["continuation"]["state"], "inline")
+        receipt = dispatch_owner_input.inspect(self.jobs, item["attempt_id"])
+        self.assertEqual([row["id"] for row in receipt["requests"]], ["s3-public-correct-once"])
+        self.assertEqual(receipt["requests"][0]["state"], "retained")
+        self.assertNotIn(answer, self.jobs.read_text(encoding="utf-8"))
+        self.assertNotIn(answer, human_wait_state._fleet_cache_path().read_text(encoding="utf-8"))
+
+        empty = dict(self.latest_result, items=[], total=0, older=0, unattributed=[])
+        self.assertTrue(human_wait_state.publish_cache(empty))
+        refreshed = human_wait_state.read_selected_request(selected)
+        self.assertEqual(refreshed["state"], "received", refreshed)
+        self.assertEqual(refreshed["result"]["status"], "retained", refreshed)
+        self.assertEqual(refreshed["result"]["target_attempt_id"], item["attempt_id"])
+        self.assertEqual(refreshed["result"]["continuation"]["state"], "inline")
+        self.assertNotIn(answer, human_wait_state._fleet_cache_path().read_text(encoding="utf-8"))
+
+    def test_lost_correct_reply_is_not_replayed_and_exact_receipt_recovers(self):
+        import dispatch_owner_input
+
+        item, selected = self._selected_owner()
+        answer = "private answer with a lost command reply"
+        drafted = human_wait_state.write_selected_draft(selected, answer)
+        runner, calls, files = self._public_correct_runner(lose_reply=True)
+        with mock.patch.object(human_wait_state.subprocess, "run", side_effect=runner):
+            ambiguous = human_wait_state.submit_selected_response(
+                drafted, {"answers": {"owner-correction": [answer]}},
+                action_id="s3-lost-correct-reply")
+            recovered = human_wait_state.submit_selected_response(
+                drafted, {"answers": {"owner-correction": [answer]}},
+                action_id="s3-lost-correct-reply")
+
+        self.assertEqual(ambiguous["state"], "unknown", ambiguous)
+        self.assertEqual(recovered["state"], "received", recovered)
+        self.assertEqual(recovered["result"]["status"], "retained")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(files), 1)
+        self.assertFalse(files[0].exists())
+        receipt = dispatch_owner_input.inspect(self.jobs, item["attempt_id"])
+        self.assertEqual([row["id"] for row in receipt["requests"]], ["s3-lost-correct-reply"])
+
+    def test_registered_worker_and_foreign_parent_cannot_submit(self):
+        _item, selected = self._selected_owner()
+        for context in ({"AGENT_DISPATCH_REGISTERED_WORKER": "1"},
+                        {"CODEX_THREAD_ID": "foreign-parent"}):
+            with self.subTest(context=context), \
+                 mock.patch.dict(os.environ, context), \
+                 mock.patch.object(human_wait_state.subprocess, "run",
+                                   side_effect=AssertionError("public correct must not run")) as run:
+                refused = human_wait_state.submit_selected_response(
+                    selected, {"answers": {"owner-correction": ["must stay local"]}},
+                    action_id="s3-refused-context")
+                self.assertFalse(refused["support"]["supported"])
+                self.assertEqual(refused["reason"],
+                                 "owner-correction-native-parent-context-required")
+                run.assert_not_called()
+
+    def test_changed_parent_route_target_or_lineage_refuses_before_public_correct(self):
+        cases = ("parent", "route", "target", "lineage")
+        for change in cases:
+            with self.subTest(change=change):
+                item, selected = self._selected_owner()
+                drafted = human_wait_state.write_selected_draft(selected, "keep this selected answer")
+                if change == "parent":
+                    self.jobs.write_text(self.jobs.read_text(encoding="utf-8").replace(
+                        "parent_sid=parent-session", "parent_sid=replacement-session"),
+                        encoding="utf-8")
+                elif change == "route":
+                    self.route["changed_after_selection"] = True
+                    self._seal_route()
+                elif change == "target":
+                    drafted = dict(drafted)
+                    drafted["native_ref"] = {**drafted["native_ref"],
+                                             "attempt_id": "att-different-selected-target"}
+                else:
+                    fields = self.jobs.read_text(encoding="utf-8").rstrip("\n").split("\t")
+                    fields[5] += (",replacement_family_id=unrecorded-family"
+                                  ",replacement_attempt_id=att-unrecorded"
+                                  ",replacement_claim_digest=" + "a" * 64)
+                    self.jobs.write_text("\t".join(fields) + "\n", encoding="utf-8")
+                with mock.patch.object(human_wait_state.subprocess, "run",
+                                       side_effect=AssertionError("changed selection must not submit")) as run:
+                    refused = human_wait_state.submit_selected_response(
+                        drafted, {"answers": {"owner-correction": ["keep this selected answer"]}},
+                        action_id="s3-changed-selection")
+                self.assertIn(refused["state"], {"unknown", "open"}, refused)
+                run.assert_not_called()
 
 
 class FleetS2WorkflowResponseTests(unittest.TestCase):
