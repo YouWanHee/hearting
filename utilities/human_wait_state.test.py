@@ -1367,5 +1367,254 @@ print(json.dumps({"state": value.get("state"), "draft": value.get("draft")}))
         self.assertEqual(expired["support"]["reason"], "codex-native-request-expired")
 
 
+class WorkflowSelectedResponseTest(unittest.TestCase):
+    """Exercise selected S2/S3/S4 records against isolated workflow sources."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.env = mock.patch.dict(os.environ, {
+            "XDG_STATE_HOME": str(self.root / "xdg"),
+            "HOME": str(self.root),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }, clear=False)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        demand = mock.patch.object(state, "_request_producer")
+        demand.start()
+        self.addCleanup(demand.stop)
+
+        project_root = str(Path(__file__).resolve().parents[1])
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from tools.fleet.collectors import dispatch
+        self.dispatch = dispatch
+        self.jobs = self.root / "jobs.log"
+        self.jobs.write_text("", encoding="utf-8")
+        registries = mock.patch.object(dispatch, "human_gate_registry_paths",
+                                       return_value=(self.jobs,))
+        registries.start()
+        self.addCleanup(registries.stop)
+        self.artifacts = self.root / "artifacts"
+        self.artifacts.mkdir()
+        self.route_file = self.root / "owner.route.json"
+        self.route = {"artifact_root": str(self.artifacts), "nodes": []}
+        self._seal_route()
+
+    def _seal_route(self):
+        from route_identity import route_hash, route_id_from_hash
+        self.route.pop("route_hash", None)
+        self.route.pop("route_id", None)
+        self.route["route_hash"] = route_hash(self.route)
+        self.route["route_id"] = route_id_from_hash(self.route["route_hash"])
+        self.route_file.write_text(json.dumps(self.route), encoding="utf-8")
+
+    def _metadata(self, attempt="att-workflow-owner"):
+        from dispatch_contract import supervisor_lease_path
+        lease = supervisor_lease_path(self.jobs, attempt)
+        return ",".join((
+            "attempt_schema_version=2", "dispatch_depth=1", "worker_type=owner",
+            "transport=headless", "execution_surface=registered-headless",
+            "registered_worker=1", "completion_delivery=app-server-supervised",
+            "harness=codex", "attempt_id=" + attempt,
+            "supervisor_lease=flock-v1", "supervisor_lease_nonce=" + "d" * 64,
+            "supervisor_lease_file=" + str(lease), "parent_sid=parent-session",
+            "parent_harness=codex", "route_id=" + self.route["route_id"],
+            "route_hash=" + self.route["route_hash"], "route_file=" + str(self.route_file),
+            "owner_route_id=" + self.route["route_id"],
+            "owner_route_hash=" + self.route["route_hash"],
+            "owner_route_file=" + str(self.route_file),
+        ))
+
+    def _write_owner(self, status, *, attempt="att-workflow-owner", suffix=""):
+        row = (f"{time.time():.6f}\t{status}\t/repo\t/wt\towner\t"
+               + self._metadata(attempt) + suffix + "\n")
+        self.jobs.write_text(row, encoding="utf-8")
+
+    def _observe(self):
+        import human_gate_observation
+        result = human_gate_observation.read_answer_waits(jobs_paths=(self.jobs,))
+        self.assertTrue(result["complete"], result["health"])
+        self.assertTrue(state.publish_cache(result))
+        return result
+
+    def _blocked_owner_wait(self):
+        import dispatch_owner_input
+        attempt = "att-workflow-owner"
+        self._write_owner("open", attempt=attempt)
+        dispatch_owner_input.initialize_owner_input(self.jobs, attempt, "codex-next-turn")
+        suffix = (",note=dead-worker-blocked,failure_class=blocked")
+        self._write_owner("done", attempt=attempt, suffix=suffix)
+        result = self._observe()
+        item = next(row for row in result["items"] if row["source"] == "S3")
+        return item
+
+    def _human_gate_wait(self):
+        self.route["human_gate_bindings"] = [{"gate": "frame-review", "node": "owner"}]
+        self._seal_route()
+        self._write_owner("open", suffix="")
+        import workflow_state
+        ledger = workflow_state.WorkflowLedger(self.route["route_id"],
+                                                self.route["route_hash"], jobs=self.jobs)
+        ledger.root.mkdir(parents=True, exist_ok=True)
+        ledger.journal_path.write_text(json.dumps({
+            "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "route_id": self.route["route_id"],
+            "route_hash": self.route["route_hash"],
+            "workflow_state": "BLOCKED_HUMAN_GATE",
+            "evidence": {"gate": "frame-review"},
+        }) + "\n", encoding="utf-8")
+        result = self._observe()
+        item = next(row for row in result["items"] if row["source"] == "S2")
+        return item, ledger.journal_path
+
+    def test_s3_explicit_correction_uses_public_owner_input_once(self):
+        import dispatch_owner_input
+        item = self._blocked_owner_wait()
+        selected = state.read_selected_request({"id": item["id"]})
+        self.assertEqual(selected["state"], "open")
+        self.assertTrue(selected["support"]["supported"])
+        self.assertEqual(selected["native_ref"]["transport"], "hearting-owner-input")
+        self.assertIsNone(selected["turn_id"])
+        self.assertEqual(selected["item_id"], "att-workflow-owner")
+        self.assertEqual(selected["route_id"], self.route["route_id"])
+        self.assertEqual(state._read_cache()["items"][0]["route_hash"],
+                         self.route["route_hash"])
+
+        drafted = state.write_selected_draft(selected, "preserve the approved route and retry")
+        self.assertEqual(drafted["draft"], "preserve the approved route and retry")
+        empty = state.submit_selected_response(
+            drafted, {"answers": {"owner-correction": [""]}}, action_id="empty-correction")
+        self.assertEqual(empty["state"], "open")
+        self.assertEqual(dispatch_owner_input.inspect(
+            self.jobs, "att-workflow-owner")["requests"], [])
+
+        original = state._claim_selected_action
+        barrier = threading.Barrier(2)
+
+        def simultaneous_claim(*args):
+            barrier.wait(timeout=5)
+            return original(*args)
+
+        with mock.patch.object(state, "_claim_selected_action", side_effect=simultaneous_claim), \
+             mock.patch.object(dispatch_owner_input, "submit",
+                               wraps=dispatch_owner_input.submit) as submit:
+            results = []
+            failures = []
+
+            def send(action_id):
+                try:
+                    results.append(state.submit_selected_response(
+                        drafted, {"answers": {"owner-correction": [drafted["draft"]]}},
+                        action_id=action_id))
+                except Exception as exc:
+                    failures.append(exc)
+
+            callers = [threading.Thread(target=send, args=(action,))
+                       for action in ("owner-action-a", "owner-action-b")]
+            for caller in callers:
+                caller.start()
+            for caller in callers:
+                caller.join(timeout=20)
+            self.assertTrue(all(not caller.is_alive() for caller in callers))
+            self.assertEqual(failures, [])
+            self.assertEqual(submit.call_count, 1)
+
+        receipt = dispatch_owner_input.inspect(self.jobs, "att-workflow-owner")
+        self.assertEqual(len(receipt["requests"]), 1)
+        request = receipt["requests"][0]
+        self.assertEqual(request["state"], "retained")
+        self.assertNotIn(drafted["draft"], json.dumps(receipt))
+        self.assertEqual(dispatch_owner_input.retained(self.jobs, "att-workflow-owner")[0]["text"],
+                         drafted["draft"])
+        current = state.read_selected_request(selected)
+        self.assertEqual(current["state"], "received")
+        self.assertEqual(current["result"]["status"], "retained")
+        self.assertEqual(self._observe()["total"], 0)
+        self.assertNotIn(drafted["draft"], state._fleet_cache_path().read_text(encoding="utf-8"))
+
+    def test_s3_consumed_receipt_preserves_its_actual_source_and_request(self):
+        import dispatch_owner_input
+
+        item = self._blocked_owner_wait()
+        selected = state.read_selected_request({"id": item["id"]})
+        received = state.submit_selected_response(
+            selected, {"answers": {"owner-correction": ["continue the approved work"]}},
+            action_id="owner-consumed")
+        self.assertEqual(received["state"], "received")
+        with mock.patch.object(dispatch_owner_input.OwnerInput, "notify_unresolved"):
+            consumer = dispatch_owner_input.OwnerInput(
+                self.jobs, item["attempt_id"], "actual-owner-thread", "codex-next-turn", lambda _: None)
+        consumer.record(["owner-consumed"], "accepted", turn_id="actual-owner-turn")
+        consumer.completed("actual-owner-turn")
+        applied = state.read_selected_request(selected)
+        self.assertEqual(applied["state"], "applied")
+        self.assertEqual(applied["result"], {
+            "source": "hearting-owner-input", "status": "turn-completed",
+            "request_id": "owner-consumed", "delivery_observation": "turn-completed"})
+        self.assertEqual(applied["draft"], "")
+
+    def test_s3_replaced_owner_route_or_parent_cannot_receive_old_answer(self):
+        import dispatch_owner_input
+        item = self._blocked_owner_wait()
+        selected = state.read_selected_request({"id": item["id"]})
+        drafted = state.write_selected_draft(selected, "do not retarget this correction")
+        changed = self.jobs.read_text(encoding="utf-8").replace(
+            "parent_sid=parent-session", "parent_sid=replacement-session")
+        self.jobs.write_text(changed, encoding="utf-8")
+        refused = state.submit_selected_response(
+            drafted, {"answers": {"owner-correction": [drafted["draft"]]}},
+            action_id="stale-owner-action")
+        self.assertFalse(refused["support"]["supported"])
+        self.assertEqual(refused["state"], "unknown")
+        with self.assertRaisesRegex(dispatch_owner_input.InputError, "target-changed"):
+            dispatch_owner_input.inspect(self.jobs, "att-workflow-owner")
+        value = json.loads(dispatch_owner_input._path(
+            self.jobs, "att-workflow-owner").read_text(encoding="utf-8"))
+        self.assertEqual(value["requests"], [])
+
+    def test_s2_detail_is_exact_and_release_stays_disabled_without_raise_binding(self):
+        item, journal = self._human_gate_wait()
+        before = journal.read_bytes()
+        selected = state.read_selected_request({"id": item["id"]})
+        self.assertEqual(selected["route_id"], self.route["route_id"])
+        self.assertEqual(selected["native_ref"]["transport"], "hearting-human-gate")
+        self.assertIsNone(selected["turn_id"])
+        self.assertFalse(selected["support"]["supported"])
+        self.assertEqual(selected["support"]["reason"],
+                         "workflow-gate-artifact-unavailable")
+        refused = state.submit_selected_response(
+            selected, {"answers": {"frame-review": ["proceed"]}},
+            action_id="must-not-release")
+        self.assertFalse(refused["support"]["supported"])
+        self.assertEqual(journal.read_bytes(), before)
+
+    def test_s4_marker_detail_and_draft_never_fabricate_a_reply(self):
+        import human_gate_observation
+        text = "[답변 필요] select the next step"
+        self.assertTrue(state.open_signal("codex", "marker-session", "marker-seat", text,
+                                           sequence=7))
+        result = human_gate_observation.read_answer_waits(jobs_paths=(self.jobs,))
+        self.assertTrue(state.publish_cache(result))
+        item = next(row for row in result["items"] if row["source"] == "S4")
+        selected = state.read_selected_request({"id": item["id"]})
+        self.assertEqual(selected["detail"]["question"], "select the next step")
+        self.assertIsNone(selected["turn_id"])
+        self.assertFalse(selected["support"]["supported"])
+        self.assertEqual(selected["support"]["reason"],
+                         "marker-has-no-bound-native-response-surface")
+        drafted = state.write_selected_draft(selected, "keep this private for a native reply")
+        refused = state.submit_selected_response(
+            drafted, {"answers": {"marker-response": [drafted["draft"]]}},
+            action_id="marker-reply")
+        self.assertFalse(refused["support"]["supported"])
+        self.assertTrue(state.signal_is_current({"id": item["id"], "seat_key": "marker-seat"}))
+        self.assertNotIn("select the next step",
+                         state._cache_path().read_text(encoding="utf-8"))
+        self.assertNotIn("select the next step",
+                         state._fleet_cache_path().read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
