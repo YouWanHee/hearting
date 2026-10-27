@@ -912,7 +912,7 @@ def draw_questions(grid, vm, state, x=34, y=3):
         y += 1
         grid.put(x + 10, y, "answer:", "label")
         grid.put(x + 20, y, "⏎", "hearting")
-        guide = (" select to answer here · open ▸ native fallback" if can_select
+        guide = (" select to view and answer · native fallback if unsupported" if can_select
                  else " go to its pane and answer there")
         grid.put(x + 21, y, guide, "dim", limit=x + use)
         y += 1
@@ -966,6 +966,10 @@ def draw_questions(grid, vm, state, x=34, y=3):
                     grid.put(content_x, y, wrapped, "soft", limit=right)
                     y += 1
             status = str(private.get("status") or private.get("state") or "")
+            support = envelope.get("support")
+            if (support is False or
+                    isinstance(support, Mapping) and support.get("supported") is False):
+                status = "No verified direct response; check the native prompt."
             if status and y < bottom:
                 if narrow:
                     grid.put(x + 10, y, _clip("status: " + status, max(1, right - x - 10)),
@@ -980,6 +984,7 @@ def draw_questions(grid, vm, state, x=34, y=3):
             request_state = str(private.get("state") or envelope.get("state") or "unknown")
             request_state = (request_state if envelope.get("state") == request_state else "unknown")
             from .state import (question_action_supported, question_answer_supported,
+                                question_draft_supported,
                                 question_choice_click_allowed, question_decisions,
                                 question_free_text_available, question_multiple_select,
                                 question_values_valid)
@@ -999,14 +1004,18 @@ def draw_questions(grid, vm, state, x=34, y=3):
                 draft = private.get("draft")
                 answers = draft.get("answers", {}) if hasattr(draft, "get") else {}
                 can_answer = question_answer_supported(envelope)
+                can_draft = question_draft_supported(envelope)
                 complete = True
                 for index, question_spec in enumerate(question_specs, 1):
                     qid = question_spec["id"]
                     prompt = (question_spec.get("question") or question_spec.get("prompt")
                               or question_spec.get("header") or question_spec.get("title")
-                              or question_spec.get("text") or "Question")
+                              or question_spec.get("text") or envelope.get("question_id")
+                              or "Question")
                     if hasattr(prompt, "get"):
-                        prompt = prompt.get("text") or prompt.get("question") or "Question"
+                        prompt = (prompt.get("text") or prompt.get("question")
+                                  or prompt.get("gate") or envelope.get("question_id")
+                                  or "Question")
                     prompt_lines = _wrap(str(prompt), max(1, right - (x + 20)))
                     if y < bottom:
                         grid.put(x + 10, y, f"Q{index}:", "label")
@@ -1042,7 +1051,7 @@ def draw_questions(grid, vm, state, x=34, y=3):
                                  + str(label if isinstance(label, str) else value)
                                  if multi_select else
                                  "[ " + str(label if isinstance(label, str) else value) + " ]")
-                        selectable = (can_answer and request_state == "open"
+                        selectable = (can_draft and request_state == "open"
                                       and question_choice_click_allowed(
                                           envelope, qid, value, values))
                         end = grid.put(cursor, y, shown,
@@ -1064,7 +1073,7 @@ def draw_questions(grid, vm, state, x=34, y=3):
                         label = "answer: " + (answer_text or "press e or click to type")
                         end = grid.put(x + 10, y, _clip(label, max(0, right - x - 10)),
                                        "soft", limit=right)
-                        if can_answer and request_state == "open":
+                        if can_draft and request_state == "open":
                             grid.add_hit(y, x + 10, max(x + 11, end),
                                          ("question.edit", qid))
                         y += 1
@@ -1077,7 +1086,7 @@ def draw_questions(grid, vm, state, x=34, y=3):
                         answers.get(item["id"], ()) if hasattr(answers, "get") else ())
                     and not (item.get("choices", item.get("options")))
                     for item in question_specs)
-                if (not can_answer or no_native_input) and y < bottom:
+                if no_native_input and y < bottom:
                     fallback = ("Multiple question response is unavailable; use the native prompt."
                                 if len(question_specs) > 1 else
                                 "No native answer input is available; use the native prompt.")

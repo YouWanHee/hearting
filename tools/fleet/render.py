@@ -7330,6 +7330,41 @@ def _explorer_question_ref_current(ref):
     return True
 
 
+def _explorer_question_has_workflow_binding(ref, envelope):
+    """Workflow requests have their own exact identity, rather than a native turn."""
+    native = envelope.get("native_ref")
+    selected = envelope.get("selected_id")
+    if ("turn_id" not in envelope or envelope["turn_id"] is not None
+            or not isinstance(native, Mapping) or not isinstance(selected, str)
+            or selected != ref.get("id") or envelope.get("request_id") != selected):
+        return False
+    transport = native.get("transport")
+    if transport == "hearting-answer-marker":
+        return (selected.startswith("S4:") and native.get("signal_id") == selected
+                and bool(native.get("seat_key"))
+                and envelope.get("question_id") == "marker-response")
+    if (native.get("source_id") != selected or not native.get("jobs_path")
+            or native.get("route_id") != envelope.get("route_id")
+            or not envelope.get("route_id")
+            or not isinstance(native.get("route_hash"), str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", native["route_hash"])
+            or not native.get("attempt_id")):
+        return False
+    if transport == "hearting-owner-input":
+        return (selected.startswith("S3:")
+                and native["attempt_id"] == envelope.get("item_id")
+                and isinstance(native.get("owner_binding"), Mapping)
+                and native["owner_binding"].get("attempt_id") == native["attempt_id"]
+                and envelope.get("question_id") == "owner-correction")
+    if transport == "hearting-human-gate":
+        raised = native.get("raised_at")
+        return (selected.startswith("S2:")
+                and native.get("gate_id") == envelope.get("question_id")
+                and bool(native.get("gate_id"))
+                and type(raised) in (int, float) and math.isfinite(raised))
+    return False
+
+
 def _explorer_question_envelope(ref, value):
     if not isinstance(value, Mapping):
         return None
@@ -7358,12 +7393,14 @@ def _explorer_question_envelope(ref, value):
         if state != "unknown" and expected_value is not None and actual_value != expected_value:
             return None
     if state != "unknown":
+        workflow = isinstance(ref.get("id"), str) and ref["id"].startswith(("S2:", "S3:", "S4:"))
+        turn_bound = (_explorer_question_has_workflow_binding(ref, envelope) if workflow else
+                      isinstance(envelope.get("turn_id"), str) and bool(envelope["turn_id"]))
         if (envelope.get("v") != 1 or envelope.get("harness") != ref.get("harness")
                 or envelope.get("session_id") != ref.get("session_id")
                 or type(envelope.get("request_id")) not in (str, int)
                 or envelope.get("request_id") == ""
-                or not isinstance(envelope.get("turn_id"), str)
-                or not envelope.get("turn_id")
+                or not turn_bound
                 or not envelope.get("kind") or "detail" not in envelope):
             return None
     return dict(envelope)

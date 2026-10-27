@@ -27,6 +27,7 @@ _MARKER = re.compile(r"^\s*\[(?:답변 필요|결정 필요)\]\s*(.*)$")
 _MAX_QUESTION = 160
 _SAFE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9._:@/+\-=]{1,256}$")
+_SAFE_ROUTE_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CACHE_MAX_BYTES = 2 * 1024 * 1024
 _DISPLAY_TTL = 180.0
 _REQUEST_TTL = 60.0
@@ -317,8 +318,9 @@ def publish_cache(result: dict) -> bool:
         harness, sid = owner.get("harness"), owner.get("session_id")
         row = {key: item.get(key) for key in ("id", "source", "kind", "since", "route_id",
                "attempt_id", "gate_id", "attribution", "stale")}
-        row["question"] = _clean(item.get("question") or "") or None
-        row["seat_key"] = owner.get("seat_key")
+        route_hash = item.get("route_hash")
+        if isinstance(route_hash, str) and _SAFE_ROUTE_HASH.fullmatch(route_hash):
+            row["route_hash"] = route_hash
         row["owner"] = {"harness": harness, "session_id": sid}
         if item.get("source") == "S1":
             for key in ("request_id", "turn_id", "item_id"):
@@ -412,6 +414,10 @@ def _read_cache(*, now=None, max_age=_DISPLAY_TTL):
                 or not isinstance(item.get("since"), (int, float))
                 or isinstance(item.get("since"), bool) or not math.isfinite(float(item["since"]))
                 or not isinstance(item.get("owner"), dict)):
+            return None
+        if ("route_hash" in item and
+                (not isinstance(item["route_hash"], str)
+                 or not _SAFE_ROUTE_HASH.fullmatch(item["route_hash"]))):
             return None
         if (("request_id" in item and _safe_request_id(item["request_id"]) != item["request_id"])
                 or any(_safe_native_ref(item[key]) != item[key]
@@ -1305,11 +1311,201 @@ def _codex_current_selected(base, *, requested_id=None):
             "gateway": control}
 
 
+_OWNER_INPUT_BINDING_KEYS = ("attempt_id", "harness", "owner_route_id", "owner_route_hash",
+                             "route_id", "route_hash", "parent_sid", "supervisor_lease_nonce",
+                             "parent_harness", "owner_route_file", "route_file")
+
+
+def _workflow_registry_paths():
+    try:
+        project_root = str(Path(__file__).resolve().parents[1])
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from tools.fleet.collectors import dispatch
+        return tuple(Path(path).expanduser().resolve(strict=True)
+                     for path in dispatch.human_gate_registry_paths())
+    except (OSError, ValueError, TypeError, ImportError):
+        return ()
+
+
+def _workflow_current_item(item_id, source):
+    """Re-read the exact S2/S3 wait from its registry source before showing detail."""
+    try:
+        import human_gate_observation
+    except ImportError:
+        return None, "workflow-wait-observer-unavailable"
+    paths = _workflow_registry_paths()
+    if not paths:
+        return None, "workflow-registry-unavailable"
+    matches = []
+    for path in paths:
+        try:
+            result = human_gate_observation.read_answer_waits(jobs_paths=(path,))
+        except Exception:
+            return None, "workflow-wait-source-unknown"
+        if result.get("complete") is not True:
+            return None, "workflow-wait-source-incomplete"
+        matches.extend((path, item) for item in result.get("items", ())
+                       if isinstance(item, dict) and item.get("id") == item_id
+                       and item.get("source") == source)
+    if len(matches) != 1:
+        return None, ("workflow-wait-source-ambiguous" if matches else
+                      "workflow-wait-no-longer-current")
+    return matches[0], None
+
+
+def _workflow_item_matches(base, item):
+    for key in ("id", "source", "route_id", "attempt_id", "gate_id"):
+        if base.get(key) != item.get(key):
+            return False
+    try:
+        if abs(float(base.get("since")) - float(item.get("since"))) >= 0.001:
+            return False
+    except (TypeError, ValueError, OverflowError):
+        return False
+    old_hash = base.get("route_hash")
+    if old_hash is not None and old_hash != item.get("route_hash"):
+        return False
+    old_owner, owner = base.get("owner") or {}, item.get("owner") or {}
+    return (old_owner.get("harness") == owner.get("harness")
+            and old_owner.get("session_id") == owner.get("session_id"))
+
+
+def _owner_binding(metadata):
+    return {key: str(metadata.get(key) or "") for key in _OWNER_INPUT_BINDING_KEYS}
+
+
+def _workflow_owner_snapshot(base, *, expected_native_ref=None):
+    """Resolve a current S3 owner row and its existing public input surface."""
+    match, error = _workflow_current_item(base.get("id"), "S3")
+    if match is None:
+        return None, error
+    jobs, item = match
+    if not _workflow_item_matches(base, item):
+        return None, "workflow-owner-request-binding-changed"
+    try:
+        import dispatch_completion_join
+        import dispatch_owner_input
+        import route_authority
+        row = dispatch_completion_join.exact_attempt_row(jobs, item["attempt_id"])
+        metadata = row.metadata
+        route_id = metadata.get("owner_route_id") or metadata.get("route_id")
+        route_hash = metadata.get("owner_route_hash") or metadata.get("route_hash")
+        if (metadata.get("worker_type") != "owner"
+                or str(metadata.get("dispatch_depth")) != "1"
+                or row.status != "done"
+                or route_authority.answerable_owner_end(row.status, metadata) not in {"BLOCKED", "FAIL"}
+                or route_id != item.get("route_id") or route_hash != item.get("route_hash")):
+            return None, "workflow-owner-target-not-answerable"
+        binding = _owner_binding(metadata)
+        native_ref = {"transport": "hearting-owner-input", "jobs_path": str(jobs),
+                      "source_id": item["id"], "attempt_id": item["attempt_id"],
+                      "route_id": route_id, "route_hash": route_hash,
+                      "owner_binding": binding}
+        if expected_native_ref is not None and expected_native_ref != native_ref:
+            return None, "workflow-owner-binding-changed"
+        try:
+            observed = dispatch_owner_input.inspect(jobs, item["attempt_id"])
+        except Exception as exc:
+            return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                    "observed": None, "support": False,
+                    "reason": "owner-correction-surface-unavailable:" + type(exc).__name__}, None
+        unsettled = {"retained", "queued", "undelivered", "sending", "delivery-unknown"}
+        if any((request.get("state") in unsettled
+                or request.get("delivery_observation") in unsettled)
+               for request in observed.get("requests", ()) if isinstance(request, dict)):
+            return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                    "observed": observed, "support": False,
+                    "reason": "owner-correction-already-pending"}, None
+        return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                "observed": observed, "support": True}, None
+    except Exception as exc:
+        return None, "owner-correction-target-unavailable:" + type(exc).__name__
+
+
+def _workflow_owner_receipt(base, entry):
+    """Read an already-claimed S3 correction receipt; never retry its delivery."""
+    native_ref = base.get("native_ref")
+    if (not isinstance(native_ref, dict)
+            or native_ref.get("transport") != "hearting-owner-input"
+            or not isinstance(entry, dict) or not entry.get("action_id")):
+        return {"state": "unknown", "reason": "owner-correction-receipt-binding-missing"}
+    try:
+        paths = _workflow_registry_paths()
+        jobs = Path(native_ref["jobs_path"]).resolve(strict=True)
+        if jobs not in paths:
+            return {"state": "unknown", "reason": "owner-correction-registry-changed"}
+        import dispatch_completion_join
+        import dispatch_owner_input
+        row = dispatch_completion_join.exact_attempt_row(jobs, native_ref["attempt_id"])
+        metadata = row.metadata
+        route_id = metadata.get("owner_route_id") or metadata.get("route_id")
+        route_hash = metadata.get("owner_route_hash") or metadata.get("route_hash")
+        if (_owner_binding(metadata) != native_ref.get("owner_binding")
+                or route_id != native_ref.get("route_id")
+                or route_hash != native_ref.get("route_hash")):
+            return {"state": "unknown", "reason": "owner-correction-target-replaced"}
+        observed = dispatch_owner_input.inspect(jobs, native_ref["attempt_id"])
+        request = next((request for request in observed.get("requests", ())
+                        if isinstance(request, dict)
+                        and request.get("id") == entry.get("action_id")), None)
+        if request is None:
+            return {"state": "unknown", "reason": "owner-correction-receipt-unavailable"}
+        request_state = request.get("state")
+        if request_state == "turn-completed":
+            state = "applied"
+        elif request_state in {"retained", "queued", "accepted"}:
+            state = "received"
+        else:
+            state = "unknown"
+        result = {"status": request_state, "request_id": entry.get("action_id")}
+        if request.get("delivery_observation"):
+            result["delivery_observation"] = request["delivery_observation"]
+        return {"state": state, "result": result}
+    except Exception as exc:
+        return {"state": "unknown", "reason": "owner-correction-receipt-unavailable:" +
+                type(exc).__name__}
+
+
+def _stored_workflow_action(ref):
+    """Recover a selected workflow receipt after its source wait leaves the projection."""
+    if not isinstance(ref, dict):
+        return None
+    native_ref = ref.get("native_ref")
+    if not isinstance(native_ref, dict) or native_ref.get("transport") != "hearting-owner-input":
+        return None
+    entry = _selected_entry(ref)
+    if not entry or not entry.get("action_id"):
+        return None
+    identity = _selected_identity(ref)
+    if identity is None:
+        return None
+    return {**identity, "id": ref.get("selected_id") or ref.get("id"),
+            "selected_id": ref.get("selected_id") or ref.get("id"),
+            "item_id": identity.get("item_id"), "source": "S3",
+            "attempt_id": native_ref.get("attempt_id"), "since": ref.get("since"),
+            "detail": ref.get("detail"),
+            "native_ref": native_ref}
+
+
+def _selected_hints_match(values, base):
+    for key in ("request_id", "turn_id", "item_id", "question_id"):
+        supplied = values.get(key)
+        actual = base.get(key)
+        if supplied is None:
+            continue
+        safe = _safe_request_id(supplied) if key == "request_id" else _safe_native_ref(supplied)
+        if safe is None or (not _same_request_id(safe, actual) if key == "request_id"
+                            else safe != actual):
+            return False
+    for key in ("source", "attempt_id", "gate_id"):
+        if values.get(key) is not None and values.get(key) != base.get(key):
+            return False
+    return True
+
+
 def _selected_base(ref):
     cache = _read_cache()
-    if cache is None:
-        _request_producer()
-        return None, "selected-wait-cache-unknown"
     if isinstance(ref, str):
         values = {"id": ref}
     elif isinstance(ref, dict):
@@ -1321,8 +1517,17 @@ def _selected_base(ref):
     item_id = values.get("id") or values.get("selected_id")
     if not isinstance(item_id, str):
         return None, "selected-wait-reference-invalid"
+    if cache is None:
+        stored = _stored_workflow_action(ref)
+        if stored is not None:
+            return stored, None
+        _request_producer()
+        return None, "selected-wait-cache-unknown"
     item = next((row for row in cache["items"] if row.get("id") == item_id), None)
-    if not isinstance(item, dict) or item.get("source") != "S1":
+    if not isinstance(item, dict):
+        stored = _stored_workflow_action(ref)
+        if stored is not None:
+            return stored, None
         return None, "selected-item-not-current"
     owner = item.get("owner") or {}
     harness, session_id = owner.get("harness"), owner.get("session_id")
@@ -1336,24 +1541,91 @@ def _selected_base(ref):
     supplied_route = values.get("route_id")
     if route_id is not None and supplied_route not in (None, route_id):
         return None, "selected-route-changed"
-    hints = {}
-    for key in ("request_id", "turn_id", "item_id", "question_id"):
-        safe_ref = _safe_request_id if key == "request_id" else _safe_native_ref
-        actual = safe_ref(item.get(key))
-        supplied = safe_ref(values.get(key))
-        if item.get(key) is not None and actual is None:
-            return None, "selected-native-reference-invalid"
-        if (actual is not None and supplied is not None
-                and (not _same_request_id(actual, supplied) if key == "request_id"
-                     else actual != supplied)):
-            return None, "selected-native-reference-changed"
-        hints[key] = actual if actual is not None else supplied
-    raw_kind = item.get("kind")
-    if raw_kind not in {"decision", "approval", "permission", "elicitation"}:
-        return None, "selected-kind-unsupported"
-    return {"id": item_id, "harness": harness, "session_id": session_id,
-            "route_id": route_id, "kind": raw_kind, **hints,
-            "native_ref": ref.get("native_ref") if isinstance(ref, dict) else None}, None
+    source = item.get("source")
+    if source == "S1":
+        hints = {}
+        for key in ("request_id", "turn_id", "item_id", "question_id"):
+            safe_ref = _safe_request_id if key == "request_id" else _safe_native_ref
+            actual = safe_ref(item.get(key))
+            supplied = safe_ref(values.get(key))
+            if item.get(key) is not None and actual is None:
+                return None, "selected-native-reference-invalid"
+            if (actual is not None and supplied is not None
+                    and (not _same_request_id(actual, supplied) if key == "request_id"
+                         else actual != supplied)):
+                return None, "selected-native-reference-changed"
+            hints[key] = actual if actual is not None else supplied
+        raw_kind = item.get("kind")
+        if raw_kind not in {"decision", "approval", "permission", "elicitation"}:
+            return None, "selected-kind-unsupported"
+        return {"id": item_id, "source": source, "harness": harness,
+                "session_id": session_id, "route_id": route_id, "kind": raw_kind,
+                "since": item.get("since"), **hints,
+                "native_ref": ref.get("native_ref") if isinstance(ref, dict) else None}, None
+
+    if source == "S4":
+        signal = next((value for value in read_signals()
+                       if value.get("id") == item_id), None)
+        if (signal is None or signal.get("harness") != harness
+                or signal.get("session_id") != session_id):
+            return None, "selected-marker-no-longer-current"
+        native_ref = {"transport": "hearting-answer-marker", "signal_id": item_id,
+                      "seat_key": signal["seat_key"], "sequence": signal.get("sequence")}
+        supplied = ref.get("native_ref") if isinstance(ref, dict) else None
+        if supplied is not None and supplied != native_ref:
+            return None, "selected-marker-binding-changed"
+        base = {"id": item_id, "source": source, "harness": harness,
+                "session_id": session_id, "route_id": None, "kind": "decision",
+                "request_id": item_id, "turn_id": None, "question_id": "marker-response",
+                "since": item.get("since"), "question": signal.get("question"),
+                "native_ref": native_ref}
+        if not _selected_hints_match(values, base):
+            return None, "selected-marker-reference-changed"
+        return base, None
+
+    if source not in {"S2", "S3"}:
+        return None, "selected-item-source-unsupported"
+    base = {"id": item_id, "source": source, "harness": harness,
+            "session_id": session_id, "route_id": route_id, "route_hash": item.get("route_hash"),
+            "attempt_id": item.get("attempt_id"), "gate_id": item.get("gate_id"),
+            "kind": "decision", "since": item.get("since"), "owner": owner,
+            "question": item.get("question"), "choices": item.get("choices") or []}
+    if source == "S2":
+        base.update({"request_id": item_id,
+                     "turn_id": None,
+                     "question_id": item.get("gate_id"),
+                     "item_id": item.get("attempt_id")
+                     if _safe_native_ref(item.get("attempt_id")) else None})
+        match, error = _workflow_current_item(item_id, source)
+        if match is None:
+            return None, error
+        jobs, current = match
+        if not _workflow_item_matches(base, current):
+            return None, "workflow-gate-binding-changed"
+        native_ref = {"transport": "hearting-human-gate", "jobs_path": str(jobs),
+                      "source_id": item_id, "route_id": current.get("route_id"),
+                      "route_hash": current.get("route_hash"), "gate_id": current.get("gate_id"),
+                      "attempt_id": current.get("attempt_id"), "raised_at": current.get("since")}
+    else:
+        attempt_id = item.get("attempt_id")
+        if not _safe_native_ref(attempt_id):
+            return None, "workflow-owner-attempt-unknown"
+        base.update({"request_id": item_id, "turn_id": None,
+                     "question_id": "owner-correction", "item_id": attempt_id})
+        snapshot, error = _workflow_owner_snapshot(base)
+        if snapshot is None:
+            stored = _stored_workflow_action(ref)
+            if stored is not None:
+                return stored, None
+            return None, error
+        native_ref = snapshot["native_ref"]
+    if not _selected_hints_match(values, base):
+        return None, "selected-workflow-reference-changed"
+    supplied = ref.get("native_ref") if isinstance(ref, dict) else None
+    if supplied is not None and supplied != native_ref:
+        return None, "workflow-selected-binding-changed"
+    base["native_ref"] = native_ref
+    return base, None
 
 
 def _selected_fallback(base, reason, *, state="unknown"):
@@ -1433,6 +1705,9 @@ def _selected_envelope(base, resolved):
     question_id = _safe_native_ref(resolved.get("question_id")) or base.get("question_id")
     if question_id is not None:
         envelope["question_id"] = question_id
+    item_id = _safe_native_ref(resolved.get("item_id")) or base.get("item_id")
+    if item_id is not None:
+        envelope["item_id"] = item_id
     choices = resolved.get("choices")
     if isinstance(choices, list):
         envelope["choices"] = choices
@@ -1466,6 +1741,8 @@ def _selected_envelope(base, resolved):
 
 def _selected_transport(base, requested_id=None):
     try:
+        if base.get("source") in {"S2", "S3", "S4"}:
+            return _workflow_selected_transport(base)
         if base["harness"] == "codex":
             return _codex_current_selected(base, requested_id=requested_id)
         if base["harness"] == "opencode":
@@ -1473,6 +1750,71 @@ def _selected_transport(base, requested_id=None):
         return {"state": "unknown", "reason": "claude-native-response-surface-unavailable"}
     except Exception:
         return {"state": "unknown", "reason": "native-request-observation-failed"}
+
+
+def _workflow_selected_transport(base):
+    source = base.get("source")
+    if source == "S4":
+        signal = next((value for value in read_signals()
+                       if value.get("id") == base.get("id")), None)
+        if (signal is None or signal.get("harness") != base.get("harness")
+                or signal.get("session_id") != base.get("session_id")):
+            return {"state": "unknown", "reason": "selected-marker-no-longer-current"}
+        native_ref = {"transport": "hearting-answer-marker", "signal_id": signal["id"],
+                      "seat_key": signal["seat_key"], "sequence": signal.get("sequence")}
+        if base.get("native_ref") != native_ref:
+            return {"state": "unknown", "reason": "selected-marker-binding-changed"}
+        return {"state": "open", "kind": "question", "request_id": base["request_id"],
+                "turn_id": None, "question_id": base["question_id"],
+                "detail": {"question": signal.get("question"), "choices": []},
+                "choices": [], "support": False,
+                "reason": "marker-has-no-bound-native-response-surface",
+                "native_ref": native_ref}
+
+    entry = _selected_entry(base)
+    if source == "S3" and entry and entry.get("action_id"):
+        receipt = _workflow_owner_receipt(base, entry)
+        return {"state": receipt["state"], "kind": "question",
+                "request_id": base["request_id"], "turn_id": base["turn_id"],
+                "route_id": base.get("route_id"), "question_id": base.get("question_id"),
+                "item_id": base.get("item_id"),
+                "detail": base.get("detail") or {"question": base.get("question"), "choices": []},
+                "choices": [], "support": True, "reason": receipt.get("reason"),
+                "result": receipt.get("result"), "native_ref": base.get("native_ref")}
+
+    match, error = _workflow_current_item(base.get("id"), source)
+    if match is None:
+        return {"state": "unknown", "reason": error}
+    jobs, item = match
+    if not _workflow_item_matches(base, item):
+        return {"state": "unknown", "reason": "workflow-selected-binding-changed"}
+    if source == "S2":
+        native_ref = {"transport": "hearting-human-gate", "jobs_path": str(jobs),
+                      "source_id": item["id"], "route_id": item.get("route_id"),
+                      "route_hash": item.get("route_hash"), "gate_id": item.get("gate_id"),
+                      "attempt_id": item.get("attempt_id"), "raised_at": item.get("since")}
+        if base.get("native_ref") != native_ref:
+            return {"state": "unknown", "reason": "workflow-gate-binding-changed"}
+        return {"state": "open", "kind": "question", "request_id": base["request_id"],
+                "turn_id": base.get("turn_id"), "route_id": item.get("route_id"),
+                "question_id": item.get("gate_id"), "detail": {
+                    "gate": item.get("gate_id"), "question": item.get("question"),
+                    "choices": item.get("choices") or []},
+                "choices": item.get("choices") or [], "support": False,
+                "reason": "workflow-release-missing-expected-raise-binding",
+                "native_ref": native_ref}
+
+    snapshot, error = _workflow_owner_snapshot(base, expected_native_ref=base.get("native_ref"))
+    if snapshot is None:
+        return {"state": "unknown", "reason": error}
+    support = bool(snapshot.get("support"))
+    return {"state": "open", "kind": "question", "request_id": base["request_id"],
+            "turn_id": base["turn_id"], "route_id": item.get("route_id"),
+            "question_id": "owner-correction", "item_id": item.get("attempt_id"),
+            "detail": {"question": item.get("question"), "choices": []}, "choices": [],
+            "support": support,
+            "reason": snapshot.get("reason") or (None if support else "owner-correction-surface-unavailable"),
+            "native_ref": snapshot["native_ref"]}
 
 
 def read_selected_request(ref):
@@ -1513,8 +1855,11 @@ def read_selected_request(ref):
                 previous["state"] = envelope["state"]
                 if envelope["state"] == "applied":
                     previous["draft"] = ""
-                previous["result"] = {"source": "codex-managed-gateway",
-                                       "status": envelope["state"]}
+                receipt = resolved.get("result")
+                previous["result"] = ({"source": "hearting-owner-input", **receipt}
+                                      if base.get("source") == "S3" and isinstance(receipt, dict)
+                                      else {"source": "codex-managed-gateway",
+                                            "status": envelope["state"]})
                 if _store_selected_entry(envelope, previous):
                     stored = _selected_entry(envelope)
                     if stored:
@@ -1595,6 +1940,11 @@ def _native_response_error(envelope, portable):
     """Check a portable response against the exact selected native request shape."""
     native_ref = envelope.get("native_ref")
     detail = envelope.get("detail")
+    if isinstance(native_ref, dict) and native_ref.get("transport") == "hearting-owner-input":
+        return None
+    if isinstance(native_ref, dict) and native_ref.get("transport") in {
+            "hearting-human-gate", "hearting-answer-marker"}:
+        return "workflow-response-surface-unavailable"
     if envelope.get("kind") == "approval":
         decision = portable.get("decision")
         if decision == "defer":
@@ -1657,6 +2007,48 @@ def _native_response_error(envelope, portable):
                     } for value in values)):
                 return "codex-answer-not-in-current-options"
     return None
+
+
+def _workflow_owner_submit(envelope, portable, action_id):
+    """Use the existing durable blocked-owner correction API exactly once."""
+    base, error = _selected_base(envelope)
+    if base is None:
+        return "unknown", {"reason": error}
+    snapshot, error = _workflow_owner_snapshot(
+        base, expected_native_ref=envelope.get("native_ref"))
+    if snapshot is None:
+        return "unknown", {"reason": error}
+    if not snapshot.get("support"):
+        return "unknown", {"reason": snapshot.get("reason") or "owner-correction-unavailable"}
+    answers = portable.get("answers") if isinstance(portable, dict) else None
+    values = answers.get("owner-correction") if isinstance(answers, dict) else None
+    if not isinstance(values, list) or len(values) != 1:
+        return "unknown", {"reason": "owner-correction-answer-shape-invalid"}
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", action_id):
+        return "unknown", {"reason": "owner-correction-action-id-invalid"}
+    try:
+        import dispatch_owner_input
+        receipt = dispatch_owner_input.submit(
+            snapshot["jobs"], envelope["native_ref"]["attempt_id"], values[0],
+            request_id=action_id)
+        request = next((row for row in receipt.get("requests", ())
+                        if isinstance(row, dict) and row.get("id") == action_id), None)
+        if request is None:
+            return "unknown", {"reason": "owner-correction-receipt-missing"}
+        request_state = request.get("state")
+        if request_state == "turn-completed":
+            state = "applied"
+        elif request_state in {"retained", "queued", "accepted"}:
+            state = "received"
+        else:
+            state = "unknown"
+        result = {"status": request_state, "request_id": action_id,
+                  "duplicate": bool(receipt.get("duplicate"))}
+        if request.get("delivery_observation"):
+            result["delivery_observation"] = request["delivery_observation"]
+        return state, result
+    except Exception as exc:
+        return "unknown", {"reason": "owner-correction-submit-ambiguous:" + type(exc).__name__}
 
 
 def _selected_invalid_response(envelope, reason):
@@ -1783,8 +2175,7 @@ def submit_selected_response(ref, response, *, action_id=None):
     identity = _selected_identity(ref) if isinstance(ref, dict) else None
     if (identity is None or identity.get("harness") != base["harness"]
             or identity.get("session_id") != base["session_id"]
-            or identity.get("route_id") != base.get("route_id")
-            or identity.get("turn_id") is None):
+            or identity.get("route_id") != base.get("route_id")):
         return _selected_fallback(base, "exact-request-turn-binding-required")
     current = read_selected_request(ref)
     current_identity = _selected_identity(current)
@@ -1792,6 +2183,15 @@ def submit_selected_response(ref, response, *, action_id=None):
             or current_identity != identity
             or current.get("native_ref") != ref.get("native_ref")):
         return current
+    native_ref = current.get("native_ref")
+    workflow_owner_request = (
+        isinstance(native_ref, dict)
+        and native_ref.get("transport") == "hearting-owner-input"
+        and identity.get("turn_id") is None
+        and identity.get("item_id") == native_ref.get("attempt_id")
+        and identity.get("route_id") == native_ref.get("route_id"))
+    if identity.get("turn_id") is None and not workflow_owner_request:
+        return _selected_fallback(base, "exact-request-turn-binding-required")
     portable, response_error = _portable_response(current, response)
     if portable is None:
         return _selected_invalid_response(current, response_error)
@@ -1811,13 +2211,21 @@ def submit_selected_response(ref, response, *, action_id=None):
         action_id = uuid.uuid4().hex
     if not isinstance(action_id, str) or not _SAFE.fullmatch(action_id):
         return _selected_invalid_response(current, "action-id-invalid")
+    native_ref = current.get("native_ref")
+    if (isinstance(native_ref, dict)
+            and native_ref.get("transport") == "hearting-owner-input"
+            and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", action_id)):
+        return _selected_invalid_response(current, "owner-correction-action-id-invalid")
     response_error = _native_response_error(current, portable)
     if response_error:
         return _selected_invalid_response(current, response_error)
     claimed, entry = _claim_selected_action(current, action_id, portable)
     if not claimed:
         return read_selected_request(current)
-    if current["harness"] == "opencode":
+    if (isinstance(native_ref, dict)
+            and native_ref.get("transport") == "hearting-owner-input"):
+        state, result = _workflow_owner_submit(current, portable, action_id)
+    elif current["harness"] == "opencode":
         state, result = _opencode_submit(current, portable)
     elif current["harness"] == "codex":
         state, result = _codex_submit(current, portable, action_id)
