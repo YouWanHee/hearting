@@ -544,7 +544,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
     def authorized_bridge_body(self, route, path, jobs, registry, owner_attempt,
                                owner_input, name, output, *, approved_text=None,
                                payload_path=None, payload_result='cpu-bridge-payload-complete\n',
-                               artifact_output_path=None, artifact_output_result=None):
+                               artifact_output_path=None, artifact_output_result=None,
+                               fixed_resume=False):
         """Build the recorded local-bridge / remote-compute-hosts request shape."""
         import dispatch_owner_input as INPUT
         import shlex
@@ -588,6 +589,14 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         remote_payload = ['env', 'REMOTE_TRAINING_ENV=approved', sys.executable,
                           '-c', payload_script, '--config', str(config),
                           '--data-lock', str(data_lock), '--smoke', str(smoke)]
+        if fixed_resume:
+            checkpoint = self.base / f'{name}-last.pt'
+            checkpoint.write_bytes(b'fixture checkpoint: epoch 4 / 80000 updates\n')
+            checkpoint_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+            remote_payload.extend(['--resume', str(checkpoint)])
+            provenance.update(source_bridge_sha256='a' * 64,
+                              cache_preflight_sha256='b' * 64,
+                              resume_checkpoint_sha256=checkpoint_hash)
         remote_argv = [str(ROOT / 'utilities' / 'compute-hosts'), 'run', 'gpu-fixture',
                        '--cwd', str(self.base.resolve()), '--env', 'fixture-env',
                        '--gpus', '0', '--name', name, '--', 'bash', '-c',
@@ -601,6 +610,17 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             'Dev_admission_evidence': str(admission_dir / 'admission-evidence.json'),
             'provenance': provenance,
         }
+        if fixed_resume:
+            request.pop('Dev_admission_evidence')
+            preflight = admission_dir / 'cpu-preflight-receipt.json'
+            destination = admission_dir / 'destination-data-evidence.json'
+            preflight.write_text('{"cpu_preflight": "passed"}\n')
+            destination.write_text('{"destination": "fixture"}\n')
+            request.update(preflight_receipt=str(preflight),
+                           destination_data_evidence=str(destination),
+                           resume_checkpoint=str(checkpoint),
+                           resume_checkpoint_sha256=checkpoint_hash,
+                           requested_scope='resume the fixed model and preserve the live variable model')
         request_bytes = json.dumps(request, sort_keys=True).encode()
         request_path.write_bytes(request_bytes)
         body['command'] = command
@@ -613,7 +633,9 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         record_path = admission_dir / f'{name}-resource-start-command.json'
         record_path.write_text(json.dumps({'argv': argv, 'request_path': str(request_path),
             'request_sha256': hashlib.sha256(request_bytes).hexdigest()}, sort_keys=True))
-        approved_text = approved_text or 'Run the variable model while preserving the fixed model.'
+        approved_text = approved_text or (
+            'Resume the fixed model from its checkpoint and preserve the live variable model.'
+            if fixed_resume else 'Run the variable model while preserving the fixed model.')
         with mock.patch.object(RA, 'correction_source_session', return_value='fixture-user-session'):
             INPUT.submit(jobs, owner_attempt, approved_text, request_id=f'input-{name}')
             owner_input.prepare('continue the approved work')
@@ -627,6 +649,221 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         body['resource_operation'] = operation
         body['launch_state'] = 'queued'
         return body
+
+    def test_fixed_resume_public_start_restores_same_never_started_id_beside_live_legacy_var(self):
+        """No Dev locator; restore the original unarmed __a1, not a new run id."""
+        import artifact_producer
+        import resource_run_registry as RR
+        import session_identity
+
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        state_path = DC.dispatch_state_root(jobs) / 'supervisor-state' / f'{owner_attempt}.json'
+        WAIT.JOIN.write_supervisor_state(state_path, owner_attempt, set(), phase='running-turn')
+        environment = dict(os.environ)
+        for key in ('AGENT_DISPATCH_WORKER_TYPE', 'AGENT_DISPATCH_DEPTH',
+                    'AGENT_DISPATCH_ATTEMPT_SCHEMA_VERSION', 'AGENT_DISPATCH_EXECUTION_SURFACE',
+                    'AGENT_DISPATCH_REGISTERED_WORKER'):
+            environment.pop(key, None)
+        environment.update(CUDA_VISIBLE_DEVICES='', AGENT_DISPATCH_COMPLETION_MODE='supervised',
+            AGENT_DISPATCH_ATTEMPT_ID=owner_attempt, AGENT_OWNER_ROUTE_FILE=str(path),
+            AGENT_DISPATCH_JOBS=str(jobs), AGENT_DISPATCH_COMPLETION_STATE_FILE=str(state_path))
+        var = self.authorized_bridge_body(route, path, jobs, registry, owner_attempt,
+                                         owner_input, 'legacy-var', output)
+        run_id = 'fixed-resume__a1'
+        result_path = self.base / 'fixed-resume-result.txt'
+        body = self.authorized_bridge_body(route, path, jobs, registry, owner_attempt,
+            owner_input, run_id, output, fixed_resume=True, payload_path=result_path)
+        request_path = Path(body['command'][-1])
+        request = json.loads(request_path.read_text())
+        self.assertNotIn('Dev_admission_evidence', request)
+        self.assertTrue(Path(request['preflight_receipt']).is_file())
+        self.assertTrue(Path(request['destination_data_evidence']).is_file())
+        checkpoint = Path(request['resume_checkpoint'])
+        checkpoint_bytes = checkpoint.read_bytes()
+        self.assertEqual(hashlib.sha256(checkpoint_bytes).hexdigest(),
+                         request['resume_checkpoint_sha256'])
+
+        smoke = self.base / 'fixed-public-smoke.json'
+        smoke.write_text('{"fixture": true}\n')
+        smoke_hash = hashlib.sha256(smoke.read_bytes()).hexdigest()
+        request.update(smoke_attestation=str(smoke), smoke_attestation_sha256=smoke_hash)
+        request['provenance']['smoke_attestation_sha256'] = smoke_hash
+        request_bytes = json.dumps(request, sort_keys=True).encode()
+        request_path.write_bytes(request_bytes)
+        record_path = Path(request['preflight_receipt']).parent / f'{run_id}-resource-start-command.json'
+        command_record = json.loads(record_path.read_text())
+        command_record['request_sha256'] = hashlib.sha256(request_bytes).hexdigest()
+        divider = command_record['argv'].index('--')
+        command_record['argv'][divider:divider] = ['--smoke-attestation', str(smoke)]
+        record_path.write_text(json.dumps(command_record, sort_keys=True))
+        runner = SUP.runner()
+        cli = command_record['argv'][2:]
+        binding_args = SimpleNamespace(jobs=str(jobs), parent_attempt_id=owner_attempt)
+        with mock.patch.dict(os.environ, environment, clear=True):
+            owner_wait = WAIT.start_binding(route, path, binding_args, os.environ)
+        body['owner_wait'] = owner_wait
+        body['launch_request'] = runner.launch_request(SimpleNamespace(
+            smoke_attestation=str(smoke), config_manifest=None))
+        operation = runner.resource_operation_binding(route, path, body['node'], run_id,
+            body['command'], body['cwd'], body['launch_request'], owner_wait,
+            registry_path=registry, log_path=body['log'])
+        self.assertIsNotNone(operation, 'the existing preflight/destination record must bind the resume')
+        self.assertEqual(operation['payload']['input_hashes']['resume_checkpoint_sha256'],
+                         request['resume_checkpoint_sha256'])
+        body['resource_operation'] = operation
+
+        # Private live-process stand-in for the protected legacy variable run.
+        var_ready = self.base / 'private-var-ready'
+        var_process = subprocess.Popen([sys.executable, '-c',
+            'import sys,time; from pathlib import Path; Path(sys.argv[1]).write_text("ready"); time.sleep(120)',
+            str(var_ready)], start_new_session=True)
+        def stop_fixture_var():
+            if var_process.poll() is None:
+                var_process.terminate()
+            var_process.wait(timeout=5)
+        self.addCleanup(stop_fixture_var)
+        deadline = time.monotonic() + 5
+        while not var_ready.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertTrue(var_ready.exists())
+        var_identity = RR.proc_identity(var_process.pid)
+        self.assertIsNotNone(var_identity)
+        var.update(owner_wait=owner_wait, route_id=route['route_id'], status='running', launch_state='started',
+                   workflow_state='RUNNING', process_group=var_process.pid,
+                   pid_namespace=os.readlink('/proc/self/ns/pid'), **var_identity)
+        var.pop('resource_operation', None)
+        seed = json.loads((ledger.root / 'armed/full-run.json').read_bytes())
+        seed.update(predecessor_id=var['run_id'], resource_binding=WAIT.resource_legacy_body_digest(var))
+        seed.pop('resource_current_binding', None)
+        seed.pop('resource_operation', None)
+        primary = ledger.root / 'armed/full-run.json'
+        primary.write_text(json.dumps(seed))
+        var_watch_bytes = primary.read_bytes()
+        var_snapshot = copy.deepcopy(var)
+        failed = {**body, 'status': 'failed', 'workflow_state': 'FAILED_RETRYABLE',
+                  'route_id': route['route_id'],
+                  'launch_state': 'not-started', 'failure_class': 'resource-launch-incomplete',
+                  'ended_at': time.time(), 'launch_error': {'message': 'resource-watch-binding-conflict'}}
+        launcher = session_identity.identity(environment)
+        failed['session'] = ({'harness': launcher.harness, 'id': launcher.session_id}
+                             if launcher.known and launcher.session_id else None)
+        failed.pop('resource_operation')
+        registry.write_text(json.dumps({'schema_version': 1,
+            'runs': {var['run_id']: var, run_id: failed}}))
+        self.assertTrue(RR.resource_never_started(failed))
+        self.assertNotIn('payload_spawned', failed)  # Old runner persisted no such field.
+        self.assertFalse(Path(failed['sentinel']).exists())
+        self.assertEqual(SUP.resource_watch_for_run(ledger, body['node'], registry, run_id), None)
+
+        payloads = []
+        launch_failures = []
+        actual_launch_error = runner.launch_error
+        def describe_launch_error(error):
+            import traceback
+            launch_failures.append(''.join(traceback.format_exception(
+                type(error), error, error.__traceback__)))
+            return actual_launch_error(error)
+        real_run, real_popen = runner.subprocess.run, subprocess.Popen
+        def arm_transport(argv, *args, **kwargs):
+            if (isinstance(argv, list) and len(argv) > 2
+                    and Path(argv[1]).name == 'workflow-supervisor.py' and argv[2] == 'arm'):
+                # In-process transport stand-in still executes the real arm operation.
+                code = SUP.main(argv[2:])
+                if kwargs.get('check') and code:
+                    raise subprocess.CalledProcessError(code, argv)
+                return subprocess.CompletedProcess(argv, code)
+            return real_run(argv, *args, **kwargs)
+        def capture_payload(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            if args and isinstance(args[0], list) and args[0][:2] == ['/bin/bash', '-p']:
+                payloads.append(proc)
+            return proc
+        def public_start():
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                 contextlib.redirect_stdout(out):
+                runner.main(cli)
+            return json.loads(out.getvalue().splitlines()[-1])
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(WAIT, 'supervisor', return_value=SUP))
+            # Source/smoke verifier and artifact environment are existing fixture boundaries.
+            stack.enter_context(mock.patch.object(runner, 'verify_launch_input'))
+            stack.enter_context(mock.patch.object(artifact_producer, 'prepare_route_artifact_env',
+                return_value={'AGENT_ARTIFACT_OUTPUT_DIR': str(output)}))
+            stack.enter_context(mock.patch.object(runner, 'register_registry'))
+            stack.enter_context(mock.patch.object(runner, 'start_watch', return_value=(
+                mock.Mock(poll=lambda: None), RR.proc_identity(os.getpid()))))
+            stack.enter_context(mock.patch.object(runner.gpu_leases, 'resource_admission',
+                return_value=(None, None, {})))
+            stack.enter_context(mock.patch.object(runner.subprocess, 'run', side_effect=arm_transport))
+            stack.enter_context(mock.patch.object(runner.subprocess, 'Popen', side_effect=capture_payload))
+            stack.enter_context(mock.patch.object(runner, 'launch_error', side_effect=describe_launch_error))
+            initial_registry = registry.read_bytes()
+            initial_journal = ledger.journal_path.read_bytes()
+            for invalid, changes in (
+                    ('changed-command', {'command': [*body['command'], '--changed']}),
+                    ('changed-launch-input', {'launch_request': {
+                        **body['launch_request'], 'smoke_attestation_sha256': 'c' * 64}}),
+                    ('claimed', {'launch_state': 'claimed', 'launch_controller': {
+                        'pid': 4_000_000_000, 'starttime': '1'}}),
+                    ('unknown-process', {'pid': 4_000_000_000, 'starttime': '1',
+                                         'command_hash': 'c' * 64}),
+                    ('sentinel', {}), ('already-armed', {})):
+                with self.subTest(restore_refusal=invalid):
+                    unsafe = {**failed, **changes}
+                    registry.write_text(json.dumps({'schema_version': 1,
+                        'runs': {var['run_id']: var, run_id: unsafe}}))
+                    if invalid == 'sentinel':
+                        Path(unsafe['sentinel']).write_text('0\n')
+                    if invalid == 'already-armed':
+                        self_watch = {**seed, 'predecessor_id': run_id,
+                                      'resource_binding': WAIT.resource_legacy_body_digest(unsafe)}
+                        primary.write_text(json.dumps(self_watch))
+                    before = registry.read_bytes(), primary.read_bytes()
+                    try:
+                        with self.assertRaises((ValueError, SystemExit)):
+                            public_start()
+                        self.assertEqual((registry.read_bytes(), primary.read_bytes()), before)
+                        self.assertEqual(ledger.journal_path.read_bytes(), initial_journal)
+                        self.assertEqual(payloads, [])
+                    finally:
+                        if invalid == 'sentinel':
+                            Path(unsafe['sentinel']).unlink()
+                        primary.write_bytes(var_watch_bytes)
+                        registry.write_bytes(initial_registry)
+            queued = public_start()
+            self.assertEqual(queued['run_id'], run_id)
+            self.assertEqual(queued['launch_state'], 'queued')
+            self.assertEqual(queued['resource_operation'], operation)
+            self.assertFalse(queued['payload_spawned'])
+            self.assertEqual(payloads, [])
+            self.assertEqual(json.loads(registry.read_text())['runs'][var['run_id']], var_snapshot)
+            self.assertEqual(SUP.resource_watch_storage_path(ledger, seed).read_bytes(), var_watch_bytes)
+            self.assertTrue(any((entry.get('evidence') or {}).get('previous_resource') == failed
+                                for entry in ledger.journal()))
+            args = SimpleNamespace(parent_attempt_id=owner_attempt, route_file=str(path),
+                route_id=route['route_id'], route_hash=route['route_hash'], jobs=str(jobs),
+                resource_launch_command=lambda row: (row['command'], 'fixture-local-cpu'))
+            control = SimpleNamespace(thread_id='same-native', pending=lambda: False)
+            found = WAIT.context(args, control)
+            candidates = [pair for pair in found[3] if WAIT.controller_intent(pair[1])]
+            self.assertEqual([row['run_id'] for _, row in candidates], [run_id])
+            armed, row = candidates[0]
+            WAIT.admit_controller_launch(args, control, armed, row, [])
+            self.assertEqual(len(payloads), 1, launch_failures or
+                             json.loads(registry.read_text())['runs'][run_id])
+            self.assertEqual(payloads[0].wait(timeout=10), 0)
+            self.assertEqual(result_path.read_text(), 'cpu-bridge-payload-complete\n')
+            replay = public_start()
+            self.assertTrue(replay['replayed'])
+            self.assertFalse(replay['payload_spawned'])
+            self.assertEqual(len(payloads), 1)
+        self.assertEqual(json.loads(registry.read_text())['runs'][var['run_id']], var_snapshot)
+        self.assertEqual(SUP.resource_watch_storage_path(ledger, seed).read_bytes(), var_watch_bytes)
+        self.assertEqual(checkpoint.read_bytes(), checkpoint_bytes)
+        self.assertIsNone(var_process.poll())
 
     def _queue_current_legacy_bridge_operation(self, route, path, jobs, registry,
                                                owner_attempt, body, output):
