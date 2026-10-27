@@ -603,7 +603,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         request_bytes = json.dumps(request, sort_keys=True).encode()
         request_path.write_bytes(request_bytes)
         body['command'] = command
-        runner_path = Path('/home/Uihyeop/.local/share/hearting/releases/v3.53.2/utilities/resource-runner.py')
+        runner_path = HERE / 'fixtures' / 'resource-v3532' / 'resource-runner.py'
         argv = ['python3', str(runner_path), '--registry', str(Path(registry).resolve()),
             'start', '--run-id', name, '--cwd', str(Path(body['cwd']).resolve()),
             '--log', str(Path(body['log']).resolve()), '--route', str(Path(path).resolve()),
@@ -2194,10 +2194,23 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertEqual({row['predecessor_id'] for row in SUP.read_resource_watches(
             ledger, 'full-run')}, {'fixture-run', body_a['run_id']})
 
-        old_path = Path('/home/Uihyeop/.local/share/hearting/releases/v3.53.2/utilities/dispatch_resource_wait.py')
+        fixture_dir = HERE / 'fixtures' / 'resource-v3532'
+        old_path = fixture_dir / 'dispatch_resource_wait.py'
         legacy_spec = importlib.util.spec_from_file_location('legacy_v3532_resource_wait_fixture', old_path)
         legacy_wait = importlib.util.module_from_spec(legacy_spec)
         legacy_spec.loader.exec_module(legacy_wait)
+        legacy_wait.__getattr__ = lambda name: getattr(WAIT, name)
+        legacy_supervisor = legacy_wait.supervisor()
+        legacy_supervisor.bind_runtime_support(SUP)
+        legacy_runner = legacy_supervisor.runner()
+        # Match the old install layout for its relative utility/tool lookups.
+        legacy_runner.__file__ = str(HERE / 'resource-runner.py')
+        self.assertEqual(hashlib.sha256(V3532_READ_ARMED_SOURCE.encode()).hexdigest(),
+                         V3532_READ_ARMED_SHA256)
+        legacy_read_armed = {}
+        exec(compile(V3532_READ_ARMED_SOURCE, 'v3.53.2-workflow-supervisor.py', 'exec'),
+             {'json': json, 'armed_dir': legacy_supervisor.armed_dir}, legacy_read_armed)
+        legacy_supervisor.read_armed = legacy_read_armed['read_armed']
         phase = self.base / 'legacy-owner-phase.json'
         control = SimpleNamespace(thread_id='same-native', pending=lambda: False)
         events = []
@@ -2215,15 +2228,14 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                 self.assertEqual(old_route['route_id'], route['route_id'])
                 self.assertEqual([row['run_id'] for _, row in found], [body['run_id']])
                 armed, queued = found[0]
-                old_runner = legacy_wait.supervisor().runner()
                 observer = mock.Mock()
                 observer.poll.return_value = None
                 import artifact_producer
                 with mock.patch.object(artifact_producer, 'prepare_route_artifact_env',
                                        return_value={'AGENT_ARTIFACT_OUTPUT_DIR': str(output)}), \
-                     mock.patch.object(old_runner.gpu_leases, 'resource_admission',
+                     mock.patch.object(legacy_runner.gpu_leases, 'resource_admission',
                                        return_value=(None, None, {})), \
-                     mock.patch.object(old_runner, 'start_watch', return_value=(
+                     mock.patch.object(legacy_runner, 'start_watch', return_value=(
                         observer, SUP.RR.proc_identity(os.getpid()))):
                     legacy_wait.admit_controller_launch(args, control, armed, queued, [])
                 launched = json.loads(registry.read_text())['runs'][body['run_id']]
