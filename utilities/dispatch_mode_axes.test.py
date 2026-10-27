@@ -33,6 +33,11 @@ class DispatchModeAxesWrapperTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_wrapper(self, harness, *axes):
+        # The claude wrapper probes `claude --help` for a standard+ owner and
+        # refuses when the binary is absent. This suite covers mode axes, not
+        # completion delivery, so ask for the explicit poll fallback instead of
+        # depending on the host CLI. `opencode` has no such option.
+        completion = ["--completion-delivery", "poll"] if harness != "opencode" else []
         command = [
             sys.executable,
             str(ROOT / f"adapters/{harness}/bin/dispatch-headless.py"),
@@ -42,12 +47,17 @@ class DispatchModeAxesWrapperTest(unittest.TestCase):
             "--capability", "autopilot-code",
             "--intensity", "standard",
             *axes,
+            *completion,
             *ADAPTERS[harness],
         ]
         env = {
             **os.environ,
             "AGENT_HOME": str(ROOT),
             "AGENT_ARTIFACT_ROOT": str(self.artifact_root),
+            # Codex projects the canonical registry root into the owner only
+            # when it already exists. Keep the dry-run registry inside this
+            # fixture instead of inheriting the caller's XDG state root.
+            "AGENT_DISPATCH_JOBS": str(self.base / "jobs.log"),
             "OPENCODE_CONFIG_CONTENT": "{}",
         }
         return subprocess.run(command, text=True, capture_output=True, env=env)
