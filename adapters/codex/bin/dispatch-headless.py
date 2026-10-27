@@ -1397,6 +1397,30 @@ def _resolve_recorded_supervisor_values(record: dict, fields: list[str],
         if normal_runtime is not None:
             normal_runtime = normal_runtime.resolve(strict=False)
 
+        # Additional request roots were outside the launcher's default roots,
+        # which already included its runtime. They remain writable but are not
+        # evidence for a different runtime. Use only the same bound request.
+        additional_roots = set()
+        access = applied.get("execution_access")
+        if isinstance(access, dict) and access.get("additional_writable_roots"):
+            additional = access["additional_writable_roots"]
+            requested = access.get("writable_roots")
+            if (not isinstance(additional, list)
+                    or any(not isinstance(root, str) for root in additional)
+                    or not isinstance(requested, list)
+                    or any(not isinstance(root, str) for root in requested)
+                    or not access.get("source_path")
+                    or access["source_path"] != effective.get("request_path")
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(access.get("request_sha256", "")))
+                    or access["request_sha256"] != effective.get("request_sha256")):
+                raise DispatchContractError("consumer-respawn-launch-record-unavailable",
+                                            "execution_access_request")
+            additional_roots = {Path(root) for root in additional}
+            if (not additional_roots.issubset(roots)
+                    or not additional_roots.issubset({Path(root) for root in requested})):
+                raise DispatchContractError("consumer-respawn-launch-record-unavailable",
+                                            "execution_access_request")
+
         git_roots = set(worktree_git_dirs or ())
         git_roots.update(commit_policy.commit_git_metadata_dirs(SimpleNamespace(
             worktree=str(worktree), worker_type="owner", dispatch_depth=1,
@@ -1405,9 +1429,10 @@ def _resolve_recorded_supervisor_values(record: dict, fields: list[str],
         dispatch_root = dispatch_state_root(jobs).resolve(strict=False)
         recorded_home_path = Path(recorded_home).resolve(strict=False) if recorded_home else None
         candidates = set()
-        if normal_runtime is not None and normal_runtime in runtime_roots:
+        if (normal_runtime is not None and normal_runtime in runtime_roots
+                and normal_runtime not in additional_roots):
             candidates.add(normal_runtime)
-        for candidate in runtime_roots:
+        for candidate in runtime_roots - additional_roots:
             if candidate == normal_runtime:
                 continue
             if (candidate == Path("/") or candidate in git_roots

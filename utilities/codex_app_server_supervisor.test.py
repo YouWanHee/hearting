@@ -1059,7 +1059,10 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
     def test_legacy_v3532_public_correct_respawns_from_bound_provenance(self):
         self._public_correct_respawn_fixture(legacy_record=True)
 
-    def _public_correct_respawn_fixture(self, *, legacy_record):
+    def test_legacy_public_correct_preserves_runtime_with_additional_writable_grant(self):
+        self._public_correct_respawn_fixture(legacy_record=True, additional_grant=True)
+
+    def _public_correct_respawn_fixture(self, *, legacy_record, additional_grant=False):
         import contextlib
         import dispatch_completion_join as join
         import dispatch_budget_record as budget_record
@@ -1080,6 +1083,13 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         artifact_root.mkdir(exist_ok=True)
         runtime_dir = base / ".agent_runtime"
         runtime_dir.mkdir(exist_ok=True)
+        compute_root = None
+        if additional_grant:
+            compute_scratch = tempfile.TemporaryDirectory(prefix="hearting-compute-grant-")
+            self.addCleanup(compute_scratch.cleanup)
+            compute_root = Path(compute_scratch.name) / "opaque-output"
+            compute_root.mkdir()
+            self.assertFalse(compute_root.is_relative_to(base))
         home = base / "home"
         home.mkdir(exist_ok=True)
         xdg_state = base / "xdg-state"
@@ -1191,9 +1201,33 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                               "tier": "balanced", "granularity": "model"}
             binding = SimpleNamespace(route_file=str(route_path), route_id=route["route_id"],
                                       route_hash=route["route_hash"])
+            default_writable_roots = (artifact_root, runtime_dir, jobs.parent)
+            access_grant = None
+            access_argv = []
+            if additional_grant:
+                access_file = base / "execution-access-request.json"
+                access_file.write_text(json.dumps({
+                    "schema_version": 1, "writable_roots": [str(compute_root)],
+                    "read_roots": [],
+                    "network": {"required": False, "reason": "", "hosts": []},
+                    "enforcement_required": "os-sandbox",
+                    "justification": {str(compute_root): "fixture compute output"},
+                }), encoding="utf-8")
+                access_context = execution_access.AccessContext.build(
+                    worktree=base, artifact_root=artifact_root, dispatch_state_root=jobs.parent,
+                    agent_home=ROOT, environ=env)
+                access_request = execution_access.load_request(access_file, context=access_context)
+                access_grant = execution_access.build_grant(
+                    access_request, runtime="codex-app-server",
+                    default_writable_roots=default_writable_roots,
+                    effective_sandbox="workspace-write")
+                self.assertEqual(access_grant.additional_writable_roots, (compute_root,))
+                self.assertEqual(access_grant.absorbed_writable_roots, ())
+                access_argv = ["--execution-access-file", str(access_file)]
             launch_args = SimpleNamespace(
                 attempt_id=attempt, jobs_path=jobs, worktree=str(base), replacement_input_argv=[
-                    "--approval", "never", "--sandbox", "workspace-write", "--max-continuations", "20"],
+                    "--approval", "never", "--sandbox", "workspace-write", "--max-continuations", "20",
+                    *access_argv],
                 capability="autopilot-code", capability_mode="dev", unit="", worker_type="owner",
                 worker_mode="", assigned_contract="capability-owner", dispatch_depth=1,
                 intensity="standard", qa="standard", sandbox="workspace-write", permission_mode="sandboxed",
@@ -1207,13 +1241,18 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                 launch_lifecycle="detached", nested_headless_network=False, profile=None,
                 owner_route_binding=binding, route_id=route["route_id"], route_node="",
                 route_file=str(route_path), route_hash=route["route_hash"], artifact_root=str(artifact_root),
-                replacement_retry_brief="", execution_access_grant=None,
+                replacement_retry_brief="", execution_access_grant=access_grant,
             )
             input_fragment = dispatch_replacement.seal_launch_input(
                 launch_args, "codex", "ORIGINAL_TASK_SENTINEL must not be replayed")
             launch_input_path = (dispatch_replacement._directory(jobs) / "inputs"
                                  / f"{attempt}.json")
             sealed_launch = json.loads(launch_input_path.read_text(encoding="utf-8"))
+            if additional_grant:
+                recorded_access = sealed_launch["applied_permissions"]["execution_access"]
+                self.assertEqual(recorded_access["additional_writable_roots"], [str(compute_root)])
+                self.assertEqual(recorded_access["request_sha256"], access_request.request_sha256)
+                self.assertEqual(recorded_access["source_path"], str(access_file))
             if legacy_record:
                 sealed_launch["resolved"].pop("runtime_dir")
                 sealed_launch["applied_permissions"].pop("approval", None)
@@ -1225,10 +1264,16 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             effective_path, effective_digest = execution_access.publish_effective_grant(
                 jobs=jobs, attempt_id=attempt, route_id=route["route_id"],
                 route_hash=route["route_hash"], runtime="codex-app-server",
-                sandbox="workspace-write", grant=None,
-                default_writable_roots=(artifact_root, runtime_dir, jobs.parent),
+                sandbox="workspace-write", grant=access_grant,
+                default_writable_roots=default_writable_roots,
                 network_allowed=False,
             )
+            verified_effective = json.loads(effective_path.read_text(encoding="utf-8"))
+            if additional_grant:
+                self.assertEqual(verified_effective["request_sha256"], access_request.request_sha256)
+                self.assertEqual(verified_effective["request_path"], str(access_file))
+                self.assertEqual(set(verified_effective["writable_roots"]),
+                                 {str(root) for root in (*default_writable_roots, compute_root)})
             old_pid = "99999999"
             old_start = "100"
             metadata = {
@@ -1369,7 +1414,7 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                 owner_input.OwnerInput(jobs, attempt, "thread-1", "codex-active-turn", lambda _e: None)
             headless = load_local("respawn_legacy_dispatch_headless",
                                   ROOT / "adapters/codex/bin/dispatch-headless.py")
-            if legacy_record:
+            if legacy_record and not additional_grant:
                 effective = json.loads(effective_path.read_text(encoding="utf-8"))
                 row_fields = row_line.rstrip("\n").split("\t")
                 state_path = lease.with_suffix(".json")
@@ -1436,9 +1481,11 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             respawn_outcomes = []
             launch_environments = []
             prompt_temp_dirs = []
+            rendered_commands = []
             original_recover_consumer = owner_input.recover_consumer
             real_popen = subprocess.Popen
             real_temporary_file = tempfile.TemporaryFile
+            real_recorded_command = headless.recorded_supervisor_command
 
             def capture_recovery(jobs_arg, attempt_arg, *, session=None, spawn=None):
                 def capture_spawn(*spawn_args, **spawn_kwargs):
@@ -1460,6 +1507,11 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                     prompt_temp_dirs.append(str(file_kwargs["dir"]))
                 return real_temporary_file(*file_args, **file_kwargs)
 
+            def capture_recorded_command(*command_args, **command_kwargs):
+                rendered = real_recorded_command(*command_args, **command_kwargs)
+                rendered_commands.append(rendered)
+                return rendered
+
             with mock.patch.object(route_authority_module, "owns", return_value=True), \
                  mock.patch.object(contract, "attempt_governed_process_quiescence",
                                    return_value=contract.ProcessQuiescence("quiescent", "fixture")), \
@@ -1472,12 +1524,32 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                  mock.patch.object(owner_input, "recover_consumer", side_effect=capture_recovery), \
                  mock.patch.object(headless.subprocess, "Popen", side_effect=capture_popen), \
                  mock.patch.object(headless.tempfile, "TemporaryFile", side_effect=capture_temporary_file), \
+                 mock.patch.object(headless, "recorded_supervisor_command", side_effect=capture_recorded_command), \
                  contextlib.redirect_stdout(output), \
                  mock.patch.object(sys, "argv", [str(ROOT / "utilities/capability-route.py"),
                      "correct", "--attempt-id", attempt, "--jobs", str(jobs),
                      "--message-file", str(correction_path)]):
                 public_status = cap.main()
             receipt = json.loads(output.getvalue())
+            if additional_grant and receipt.get("consumer_recovery") != "respawned":
+                pending = owner_input.inspect(jobs, attempt)["requests"]
+                diagnostic = json.dumps({
+                    "receipt": receipt,
+                    "request_states": [item["state"] for item in pending],
+                    "consumer_launches": len(launch_environments),
+                    "rendered_commands": len(rendered_commands),
+                }, sort_keys=True)
+                self.assertEqual(len(pending), 1, diagnostic)
+                self.assertEqual(pending[0]["state"], "queued", diagnostic)
+                self.assertEqual(launch_environments, [], diagnostic)
+                self.assertFalse(self.trace.exists(), diagnostic)
+                self.assertIsNone(resource_process.poll(), diagnostic)
+                self.assertEqual(hashlib.sha256(resource_registry.read_bytes()).hexdigest(),
+                                 resource_registry_before, diagnostic)
+                self.assertEqual(hashlib.sha256(resource_results.read_bytes()).hexdigest(),
+                                 resource_results_before, diagnostic)
+                self.assertEqual(home_snapshot(), worker_home_before, diagnostic)
+                self.fail("public correction did not restore the recorded runtime: " + diagnostic)
 
             deadline = time.monotonic() + 15
             requests = []
@@ -1520,6 +1592,25 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertEqual(prompt_temp_dirs, [str(runtime_dir)])
         self.assertEqual(len(launch_environments), 1)
         self.assertEqual(launch_environments[0]["AGENT_RUNTIME_DIR"], str(runtime_dir))
+        if additional_grant:
+            self.assertEqual(len(rendered_commands), 1)
+            rendered = shlex.split(rendered_commands[0])
+            writable_roots = [rendered[index + 1] for index, part in enumerate(rendered)
+                              if part == "--writable-root"]
+            self.assertEqual(writable_roots, verified_effective["writable_roots"])
+            self.assertIn(str(runtime_dir), writable_roots)
+            self.assertIn(str(compute_root), writable_roots)
+            for key, value in (("request_sha256", "0" * 64),
+                               ("source_path", str(access_file) + ".other")):
+                with self.subTest(changed_access_binding=key):
+                    changed = json.loads(json.dumps(sealed_launch))
+                    changed["applied_permissions"]["execution_access"][key] = value
+                    with self.assertRaises(headless.DispatchContractError) as raised:
+                        real_recorded_command(
+                            changed, row_line.rstrip("\n").split("\t"), metadata, jobs,
+                            lease.with_suffix(".json"), lease, None, log_path,
+                            verified_effective, recorded_home=str(home))
+                    self.assertEqual(raised.exception.detail, "execution_access_request")
         self.assertFalse(receipt.get("duplicate"))
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0]["state"], "turn-completed")
