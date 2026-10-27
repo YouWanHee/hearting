@@ -324,10 +324,12 @@ def _delivery_panes(snapshot):
 def _session_records(snapshot, now, resolver):
     used, rows, by_key = set(), [], {}
     delivery_panes = _delivery_panes(snapshot)
-    for session in _records(_get(snapshot, "sessions", default=())):
-        if not _is_main(session):
-            continue
-        tag = _tag_for(session, used)
+    sessions = [session for session in _records(_get(snapshot, "sessions", default=())) if _is_main(session)]
+    # A collector tag is authoritative wherever its row sits: a tag minted for an earlier row must
+    # never take it, or the row that owns it is dropped as a duplicate below.
+    reserved = {tag for tag in (_text(_get(session, "session_tag", "tag")) for session in sessions) if tag}
+    for session in sessions:
+        tag = _tag_for(session, used | reserved)
         if tag is None or tag in used:
             continue
         used.add(tag)
@@ -944,7 +946,7 @@ def _question_records(snapshot, session_rows, session_index, now):
         stale = item.get("stale")
         older = stale == "older"
         source = _text(item.get("source"))
-        if stale not in (False, "current") and not (older and source.startswith("S1-")):
+        if stale not in (False, "current") and not older:
             continue
         ident = _text(item.get("id"))
         if ident and ident in seen:

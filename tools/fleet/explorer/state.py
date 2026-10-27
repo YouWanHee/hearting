@@ -139,6 +139,14 @@ def question_answer_supported(detail):
     return _question_supports_reply(detail) and bool(question_items(detail))
 
 
+def question_draft_supported(detail):
+    """Allow private drafts for an exact open question even without a reply transport."""
+    return (isinstance(detail, Mapping) and detail.get("kind") == "question"
+            and detail.get("state") == "open"
+            and isinstance(detail.get("native_ref"), Mapping)
+            and bool(question_items(detail)))
+
+
 def question_action_supported(detail):
     return (_question_supports_reply(detail)
             and (_question_is_approval(detail) or question_answer_supported(detail)))
@@ -170,12 +178,23 @@ def _question_choice_allowed(detail, question_id, answer):
     return any(_question_choice_value(choice) == answer for choice in choices)
 
 
+def _question_uses_workflow_transport(detail):
+    native = detail.get("native_ref")
+    return (isinstance(native, Mapping) and native.get("transport") in {
+        "hearting-owner-input", "hearting-human-gate", "hearting-answer-marker"})
+
+
 def question_free_text_supported(detail, question_id):
     question = next((item for item in question_items(detail) if item["id"] == question_id), None)
     if question is None:
         return False
+    native_ref = detail.get("native_ref")
+    if _question_uses_workflow_transport(detail):
+        choices = question.get("choices", question.get("options"))
+        return (question.get("is_other") is True
+                or choices is None
+                or isinstance(choices, (list, tuple)) and not choices)
     if detail.get("harness") == "opencode":
-        native_ref = detail.get("native_ref")
         field_type = (native_ref.get("field_type") if isinstance(native_ref, Mapping)
                       else question.get("field_type"))
         if field_type == "string":
@@ -209,7 +228,8 @@ def question_values_valid(detail, question_id, values):
     if (question is None or not isinstance(values, (list, tuple)) or not values
             or any(not isinstance(value, str) or not value.strip() for value in values)):
         return False
-    if detail.get("harness") == "opencode":
+    workflow = _question_uses_workflow_transport(detail)
+    if detail.get("harness") == "opencode" and not workflow:
         native_ref = detail.get("native_ref")
         if not isinstance(native_ref, Mapping):
             return False
@@ -231,7 +251,8 @@ def question_values_valid(detail, question_id, values):
         return (isinstance(allowed, list)
                 and (native_ref.get("custom") is True or all(value in allowed for value in values)))
     choices = question.get("choices", question.get("options"))
-    if isinstance(choices, (list, tuple)) and question.get("is_other") is not True:
+    if (isinstance(choices, (list, tuple)) and (choices or not workflow)
+            and question.get("is_other") is not True):
         allowed = {_question_choice_value(choice) for choice in choices}
         return all(value in allowed for value in values)
     return True
@@ -423,8 +444,10 @@ def _question_store_answers(state, question_id, values, *, editing=False):
                for key, value in answers.items()} if isinstance(answers, Mapping) else {}
     answers[question_id] = list(values)
     draft["answers"] = answers
+    supported = question_answer_supported(detail)
     overlay.update(draft=draft, editing=editing, editing_question_id=question_id,
-                   status="Draft updated; submit explicitly to send.")
+                   status=("Draft updated; submit explicitly to send." if supported else
+                           "Private draft saved; use the native prompt to respond."))
     ref = _question_action_ref(overlay)
     return replace(state, question_overlay=overlay), (("questions.draft", ref,
                                                         _question_draft_for_backend(draft, detail)),)
@@ -434,7 +457,7 @@ def _question_set_answer(state, question_id, answer):
     overlay = dict(_question_overlay(state))
     detail = overlay.get("detail")
     if (not isinstance(detail, Mapping) or overlay.get("state") != "open"
-            or detail.get("state") != "open" or not question_answer_supported(detail)):
+            or detail.get("state") != "open" or not question_draft_supported(detail)):
         return state, ()
     question_id = str(question_id or detail.get("question_id") or "")
     if (not question_id or question_id not in {item["id"] for item in question_items(detail)}
@@ -455,7 +478,7 @@ def _question_set_answer(state, question_id, answer):
             values.append(answer)
     else:
         values = [answer]
-    return _question_store_answers(state, question_id, values)
+    return _question_store_answers(state, question_id, values, editing=True)
 
 
 def _question_toggle_choice(state, question_id, answer):
@@ -550,7 +573,7 @@ def _reduce(state, event, frame=None):
             if (not isinstance(detail, Mapping) or detail.get("state") != "open"
                     or _question_overlay(state).get("state") != "open"
                     or _question_is_approval(detail)
-                    or not question_answer_supported(detail)
+                    or not question_draft_supported(detail)
                     or not _question_choice_allowed(detail, question_id, answer)
                     or not question_choice_click_allowed(detail, question_id, answer, answers)):
                 return state, ()
@@ -562,7 +585,7 @@ def _reduce(state, event, frame=None):
             detail = overlay.get("detail")
             if (isinstance(detail, Mapping) and overlay.get("state") == "open"
                     and detail.get("state") == "open"
-                    and question_answer_supported(detail)):
+                    and question_draft_supported(detail)):
                 questions = question_items(detail)
                 question_id = (str(action[1]) if len(action) > 1 else
                                (questions[0]["id"] if questions else ""))
@@ -786,7 +809,12 @@ def _reduce(state, event, frame=None):
             return state, ()
         if key in ("enter", "\n"):
             if overlay.get("editing"):
-                return _question_submit(state)
+                if question_answer_supported(overlay.get("detail")):
+                    return _question_submit(state)
+                overlay = dict(overlay)
+                overlay.update(editing=False,
+                               status="Private draft saved; use the native prompt to respond.")
+                return replace(state, question_overlay=overlay), ()
             if (_question_draft_response(overlay) is not None
                     and isinstance(overlay.get("detail"), Mapping)
                     and overlay["detail"].get("state") == "open"):
