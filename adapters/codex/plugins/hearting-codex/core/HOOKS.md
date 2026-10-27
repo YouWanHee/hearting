@@ -118,6 +118,16 @@ session still matches this current proof. Registered workers and shared services
 never gain pane ownership from an inherited pane label. When current selection
 cannot be proved, leave it unknown.
 
+The native harness and full session/thread ID identify the same conversation in
+Herdr, Fleet, and peer delivery. Short display numbers are aliases allocated by
+the shared session-tag policy; a pane, PID, or temporary display alias cannot
+become another session address or grant delivery authority. Current native
+selection evidence is consumed consistently even when process startup or rollout
+evidence is missing or names an earlier selection. Keep the physical ownership
+and fresh native-selection checks above; an unproved identity stays unknown.
+A clipped or unconfigured footer supplies no identity and does not invalidate
+independent process-native proof.
+
 Context pressure is display-only. Keep raw active usage and model capacity
 separate from configured requests, the runtime's applied compaction trigger,
 and any output reserve. Interpret the exact consumer for the resolved runtime
