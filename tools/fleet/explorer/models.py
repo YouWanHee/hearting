@@ -370,6 +370,106 @@ def _draw_allocation_editor(grid, allocation, state, x, y, right):
     return y
 
 
+_STEWARD_CHOICES = {"check_interval_seconds": (600, 1800, 3600, 7200, 21600, 86400),
+                    "max_supervisors_per_repo": (1, 2, 3, 4, 8)}
+_STEWARD_LABELS = {"check_interval_seconds": "check every", "max_supervisors_per_repo": "per repo"}
+
+
+def _interval(seconds):
+    """Seconds shown as minutes or hours; the file keeps seconds."""
+    seconds = int(seconds)
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 60}m" if seconds % 60 == 0 else f"{seconds}s"
+
+
+def _steward_shown(name, value):
+    return _interval(value) if name == "check_interval_seconds" else str(value)
+
+
+def steward_changes(steward, folds):
+    """``((key, old seconds/count, new), ...)`` the pending steward chips differ from the file on."""
+    values = _dict(steward.get("values"))
+    changes = []
+    for name in _STEWARD_CHOICES:
+        if values.get(name) is None:
+            continue
+        old, new = str(values[name]), folds.get("ui:steward:" + name)
+        if new is not None and new != old:
+            changes.append((name, old, new))
+    return tuple(changes)
+
+
+def _draw_supervisors(grid, census, limit, x, y, right):
+    """Current supervisors per repository as counted by the steward collector. The count is
+    that census, not the ⚑ marks: a fresh grant can count before its ⚑ appears."""
+    grid.put(x + 3, y, "supervising", "label", limit=right)
+    if not isinstance(census, (list, tuple)):
+        grid.put(x + 20, y, f"· / {limit} per repo (not counted yet)", "dim", limit=right)
+        return y + 1
+    if not census:
+        grid.put(x + 20, y, f"none · {limit} per repo allowed", "soft", limit=right)
+        return y + 1
+    for repo in census[:4]:
+        repo = _dict(repo)
+        shown = repo.get("limit") if repo.get("limit") is not None else limit
+        holders = [str(holder.get("name") or str(holder.get("session_id") or "?")[:8])
+                   + ("" if holder.get("counted", True) else " (ended)")
+                   for holder in repo.get("holders") or () if isinstance(holder, Mapping)]
+        text = (f"{repo.get('repository') or '?'} · {repo.get('counted', 0)} / {shown} supervising"
+                + (" · " + ", ".join(holders) if holders else ""))
+        over = bool(repo.get("over_limit"))
+        grid.put(x + 20, y, text + (" · over limit" if over else ""), "g_blocked" if over else "soft",
+                 limit=right)
+        y += 1
+    if len(census) > 4:
+        grid.put(x + 20, y, f"+{len(census) - 4} more repositories", "dim", limit=right)
+        y += 1
+    return y
+
+
+def _draw_steward_editor(grid, steward, state, x, y, right):
+    """Supervision check interval and per-repo supervisor limit, edited like the allocation keys."""
+    folds = state.fold_map()
+    values = _dict(steward.get("values"))
+    notes = {"check_interval_seconds": "a supervising session checks its targets this often without a notice",
+             "max_supervisors_per_repo": "sessions that may hold the supervisor flag in one repo"}
+    for name, choices in _STEWARD_CHOICES.items():
+        current = values.get(name)
+        if current is None:
+            continue
+        options = sorted(set(choices) | {int(current)})
+        labels = {str(item): _steward_shown(name, item) for item in options}
+        grid.put(x + 3, y, _STEWARD_LABELS[name], "label", limit=right)
+        cursor = _chips(grid, x + 20, y, tuple(str(item) for item in options), str(current),
+                        folds.get("ui:steward:" + name), "steward:" + name, right, labels)
+        grid.put(cursor + 1, y, notes[name], "dim", limit=right)
+        y += 1
+    y = _draw_supervisors(grid, steward.get("supervisors"), values.get("max_supervisors_per_repo"),
+                          x, y, right)
+    changes = steward_changes(steward, folds)
+    if changes:
+        preview = "  ·  ".join(f"{_STEWARD_LABELS[name]} {_steward_shown(name, old)} → {_steward_shown(name, new)}"
+                               for name, old, new in changes)
+        grid.put(x + 3, y, "change", "label", limit=right)
+        dry_x = min(x + 20 + cell_width(preview) + 3, right - 25)
+        grid.put(x + 20, y, preview, "soft", limit=dry_x - 2)
+        payload = tuple(("steward." + name, new) for name, _old, new in changes)
+        grid.put(dry_x, y, "[ dry-run ]", "title_dim", limit=right)
+        grid.add_hit(y, dry_x, dry_x + 11, ("alloc.apply", payload, True))
+        grid.put(dry_x + 13, y, "[ apply ]", "chip_on", limit=right)
+        grid.add_hit(y, dry_x + 13, dry_x + 22, ("alloc.apply", payload, False))
+        y += 1
+    status = str(state.status or "")
+    if status.startswith("steward"):
+        failed = "failed" in status or "invalid" in status
+        grid.put(x + 3, y, status, "g_blocked" if failed else "soft", limit=right)
+        y += 1
+    grid.put(x + 3, y, "affects new checks and new supervisor grants only",
+             "dim", limit=right + 1)
+    return y + 1
+
+
 def draw_models(grid: CellGrid, vm, state, x=X, y=3):
     data = _dict(vm.models)
     if not data:
@@ -562,5 +662,10 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
         y += 1
     if allocation:
         grid.put(x + 3, y, allocation.get("note", "·"), "dim", limit=right + 1)
+    steward = _dict(data.get("steward"))
+    if isinstance(steward.get("values"), Mapping):
+        y += 2
+        _section(grid, x, left, y, "SUPERVISION", "steward · same file")
+        y = _draw_steward_editor(grid, steward, state, x, y + 1, right) - 1
     if not beside:
         _draw_context(grid, data, state, x, y + 2, min(grid.cols - x - 2, 100))

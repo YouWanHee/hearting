@@ -795,17 +795,22 @@ class ExplorerRuntime:
                 "models": refreshed}
 
     def _apply_allocation_action(self, effect, vm):
-        """Validate one DISPATCH ALLOCATION hit and pass its typed values to the shared setter."""
+        """Validate one DISPATCH ALLOCATION or SUPERVISION hit and pass its typed values to the shared setter."""
         from . import focus
 
+        payload = effect[1] if isinstance(effect, (tuple, list)) and len(effect) > 1 else ()
+        steward = bool(payload) and isinstance(payload, (tuple, list)) and all(
+            isinstance(item, (tuple, list)) and str(item[0]).startswith("steward.") for item in payload)
+        section = "steward" if steward else "allocation"
+
         def failed(message, status="failed"):
-            text = f"allocation: {status}: {message}"[:240]
+            text = f"{section}: {status}: {message}"[:240]
             return {"model_action": True, "status": status, "message": text, "error": str(message)[:240],
                     "models": None}
 
         if os.environ.get("FLEET_DEMO"):
             return {"model_action": True, "status": "read-only",
-                    "message": "allocation: read-only in demo", "models": None}
+                    "message": f"{section}: read-only in demo", "models": None}
         kinds = {"strategy": str, "window": int, "usage_gate_used_percent": int,
                  "usage_headroom_exponent": int, "depth_affinity_weight": float}
         updates = {}
@@ -815,7 +820,11 @@ class ExplorerRuntime:
                 raise ValueError("invalid allocation action")
             for name, text in payload:
                 parent, _dot, child = str(name).partition(".")
-                if name in kinds:
+                if steward:
+                    if child not in ("check_interval_seconds", "max_supervisors_per_repo"):
+                        raise ValueError(f"steward.{child} is not editable here")
+                    updates[child] = int(text)
+                elif name in kinds:
                     updates[name] = kinds[name](text)
                 elif parent == "depth_affinity" and child in ("owner", "worker"):
                     updates[name] = None if text == "none" else str(text)
@@ -833,7 +842,7 @@ class ExplorerRuntime:
             if install_dir not in sys.path:
                 sys.path.insert(0, install_dir)
             settings = importlib.import_module("dispatch_settings")
-            result = settings.set_allocation(updates, dry_run=dry_run)
+            result = settings.set_allocation(updates, dry_run=dry_run, section=section)
         except Exception as exc:
             usage = settings is not None and isinstance(exc, settings.DispatchSettingsUsageError)
             return failed(exc, "invalid-arguments" if usage else "failed")
@@ -846,7 +855,7 @@ class ExplorerRuntime:
         else:
             note = ""
         lines = [str(line) for line in result.get("lines", ()) if line]
-        message = (lines[0] if lines else "allocation: " + str(result.get("status", "finished")))
+        message = (lines[0] if lines else f"{section}: " + str(result.get("status", "finished")))
         if result.get("warnings"):
             message += " · warning: " + "; ".join(result["warnings"])
         return {"model_action": True, "status": result.get("status", "failed"),

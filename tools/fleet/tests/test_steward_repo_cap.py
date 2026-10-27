@@ -137,6 +137,24 @@ class RepoSupervisionTest(_RepoFixture, unittest.TestCase):
                          {self.key: 2, steward._repository_key(str(self.other)): 1})
         self.assertEqual(board[self.key], self.census(rows, [_relation(s) for s in ("s1", "s2", "s3")]))
 
+    def test_enrich_keeps_one_board_census_for_the_models_view(self):
+        rows = [self.row("s1", self.primary), self.row("s3", self.other)]
+        relations = [_relation("s1"), _relation("s3")]
+        with mock.patch.object(steward, "_last_supervision", None), \
+                mock.patch.object(steward, "read_relations", return_value=relations) as read, \
+                mock.patch.object(steward, "_registry_sessions", return_value=[]), \
+                mock.patch.object(steward, "_steward_limit", return_value=2), \
+                mock.patch("fleet.collectors.herdr.list_agents", return_value=[]):
+            steward.enrich(rows, markers={})
+            census = steward.last_supervision()
+        read.assert_called_once()
+        self.assertEqual({key: value["counted"] for key, value in census.items()},
+                         {self.key: 1, steward._repository_key(str(self.other)): 1})
+        with mock.patch.object(steward, "_last_supervision", None), \
+                mock.patch.object(steward, "read_relations", return_value=[]):
+            steward.enrich(rows, markers={})
+            self.assertEqual(steward.last_supervision(), {})
+
 
 class SessionLivenessTest(_RepoFixture, unittest.TestCase):
     def test_herdr_row_means_live(self):

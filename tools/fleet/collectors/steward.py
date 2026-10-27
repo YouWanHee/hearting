@@ -592,6 +592,33 @@ def supervision_by_repository(sessions=None, *, limit=None, markers=None, relati
             for key in sorted(keys)}
 
 
+# The board-wide census from the last collection pass. The MODELS view reads this
+# instead of rereading markers, relations and the registry on every draw.
+_last_supervision = None
+
+
+def last_supervision():
+    """``supervision_by_repository`` from the last ``enrich`` pass; ``None`` before one ran."""
+    return _last_supervision
+
+
+def _record_supervision(context, markers, relations):
+    global _last_supervision
+    if not relations:
+        _last_supervision = {}
+        return
+    try:
+        from . import herdr
+        agents = herdr.list_agents()
+    except Exception:
+        agents = None
+    try:
+        _last_supervision = supervision_by_repository(
+            context, limit=_steward_limit(), markers=markers, relations=relations, agents=agents)
+    except Exception:
+        _last_supervision = None
+
+
 def enrich(sessions, markers=None):
     for s in sessions:
         s.steward = False
@@ -600,12 +627,14 @@ def enrich(sessions, markers=None):
         markers = read_markers()
     relations = read_relations()
     if not markers and not relations:
+        _record_supervision((), markers, relations)
         return
     # Reuse registry history for ended targets, but never overrule current rows.
     current_keys = {key for s in sessions for key in _session_keys(s)}
     context = list(sessions) + [s for s in _registry_sessions()
                                 if not current_keys.intersection(_session_keys(s))]
     context += _native_role_sessions(markers, context, relations)
+    _record_supervision(context, markers, relations)
     mod = _peer_message_module()
     evidence = getattr(mod, "steward_evidence_targets", None) if mod is not None else None
     if evidence is None:

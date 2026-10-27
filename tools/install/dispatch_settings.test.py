@@ -111,6 +111,36 @@ class DispatchSettingsTest(unittest.TestCase):
         self.assertIn("  window: 20\n", other.read_text())
         self.assertFalse(self.path.exists())
 
+    def test_steward_keys_change_their_lines_and_out_of_range_values_are_refused(self):
+        text = USER.replace("schema_version: 3", "schema_version: 4") + (
+            "steward:\n  child_permission_mode: bypass\n  check_interval_seconds: 3600   # hourly\n")
+        self.write(text)
+        result = settings.set_allocation({"check_interval_seconds": 1800, "max_supervisors_per_repo": 3},
+                                         section="steward")
+        self.assertEqual(result["status"], "changed")
+        self.assertEqual(result["lines"][0], "steward: set check_interval_seconds: 3600 -> 1800; "
+                                             "max_supervisors_per_repo: · -> 3")
+        changed = self.path.read_text()
+        self.assertIn("  check_interval_seconds: 1800   # hourly\n", changed)
+        self.assertIn("  max_supervisors_per_repo: 3\n", changed)
+        self.assertEqual(self.path.with_name(self.path.name + ".bak").read_text(), text)
+        for updates in ({"check_interval_seconds": 599}, {"check_interval_seconds": 86401},
+                        {"max_supervisors_per_repo": 0}, {"max_supervisors_per_repo": 9},
+                        {"child_permission_mode": "inherit"}, {"window": 60}):
+            with self.assertRaises(settings.DispatchSettingsUsageError):
+                settings.set_allocation(updates, section="steward")
+        self.assertEqual(self.path.read_text(), changed)
+
+    def test_steward_write_failure_leaves_the_file(self):
+        text = USER.replace("schema_version: 3", "schema_version: 4") + (
+            "steward:\n  child_permission_mode: bypass\n")
+        self.write(text)
+        self.path.parent.chmod(0o500)
+        self.addCleanup(self.path.parent.chmod, 0o700)
+        with self.assertRaises(Exception):
+            settings.set_allocation({"max_supervisors_per_repo": 1}, section="steward")
+        self.assertEqual(self.path.read_text(), text)
+
 
 if __name__ == "__main__":
     unittest.main()
