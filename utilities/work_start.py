@@ -1832,6 +1832,12 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     watches = (OWNER_RESOURCE.supervisor().recover_resource_watches(route, jobs)
                if any(n.get("kind") == "resource-runner" for n in route.get("nodes", [])) else [])
     if watches:
+        attempt = result.get("owner_attempt_id")
+        if attempt:
+            from dispatch_owner_input import recover_consumer
+            recovery = recover_consumer(jobs, attempt)
+            if recovery.get("consumer_recovery") != "not-started:no-queued-correction":
+                result = {**result, **recovery}
         return {**result, "state": "resource-watching", "required_action": "end-turn",
                 "resource_watches": watches, "parent_next": "end-turn",
                 "next_step": "The exact resource retains its watch and declared continuation; end this turn."}

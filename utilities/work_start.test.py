@@ -1761,6 +1761,32 @@ class WorkStartTest(unittest.TestCase):
                             return subprocess.CompletedProcess(command,0,"validated","")
                         W._start(route,self.path,self.jobs,node,harness,run)
 
+    def test_resource_watching_start_checks_the_same_attempt_consumer_before_return(self):
+        import dispatch_notice_state
+        import dispatch_owner_input
+        import dispatch_resource_wait
+        import inline_finish
+
+        route = {**self.route, "artifact_root": str(self.tmp.name),
+                 "nodes": [*self.route["nodes"], {"id": "cpu", "kind": "resource-runner"}]}
+        watcher = SimpleNamespace(recover_resource_watches=mock.Mock(return_value=[{"state": "watching"}]))
+        for recovery, expected_field in (({"consumer_recovery": "respawned", "pid": "42"}, "respawned"),
+                                         ({"consumer_recovery": "not-started:no-queued-correction"}, None)):
+            with self.subTest(recovery=recovery), \
+                 mock.patch.object(W, "continuation_work_request", return_value={}), \
+                 mock.patch.object(W, "resume_command", return_value="resume"), \
+                 mock.patch.object(inline_finish, "pending_state", return_value=None), \
+                 mock.patch.object(dispatch_notice_state, "closed_outcome", return_value=None), \
+                 mock.patch.object(W, "_harvest_unread_blocked_owner", return_value=None), \
+                 mock.patch.object(W, "_owner_pin_handoff", return_value=None), \
+                 mock.patch.object(dispatch_resource_wait, "supervisor", return_value=watcher), \
+                 mock.patch.object(dispatch_owner_input, "recover_consumer", return_value=recovery) as recover:
+                result = W._advance(route, self.path, self.jobs,
+                                    {"owner_attempt_id": "att-owner"})
+            recover.assert_called_once_with(self.jobs.resolve(), "att-owner")
+            self.assertEqual(result["state"], "resource-watching")
+            self.assertEqual(result.get("consumer_recovery"), expected_field)
+
 
 WF = load("work_start_workflow_fixture", W.ROOT / "utilities/workflow_supervisor.test.py")
 

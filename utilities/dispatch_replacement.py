@@ -163,7 +163,7 @@ RESOLVED_INPUT_KEYS = ('capability', 'capability_mode', 'unit', 'worker_type',
     'sandbox', 'permission_mode', 'parent_harness', 'parent_transport',
     'parent_sandbox', 'launch_authority', 'parent_session_id', 'parent_attempt_id',
     'execution_surface', 'registered_worker', 'fallback_hop', 'model_role',
-    'model_profile', 'model', 'reasoning', 'resolved_model_settings',
+    'model_profile', 'model', 'reasoning', 'resolved_model_settings', 'runtime_dir',
     'resolved_completion_delivery', 'parent_completion_delivery')
 
 
@@ -196,6 +196,11 @@ def _applied_permissions(args):
             }
     for key in ('launch_lifecycle','nested_headless_network'):
         if hasattr(args,key): result[key] = getattr(args,key)
+    if hasattr(args, 'approval'):
+        result['approval'] = args.approval
+    import commit_policy
+    projection = commit_policy.launch_permission_projection(args)
+    result['commit_policy'] = {'may_commit': bool(projection.get('may_commit'))}
     return result
 
 
