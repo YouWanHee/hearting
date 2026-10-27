@@ -1663,8 +1663,8 @@ def _owner_binding(metadata):
     return {key: str(metadata.get(key) or "") for key in _OWNER_INPUT_BINDING_KEYS}
 
 
-def _workflow_owner_person_context(base, metadata):
-    """Require the selected route's native parent session to submit its answer."""
+def _workflow_owner_person_context(base, metadata, jobs):
+    """Require the selected route's current effective native parent to answer."""
     env = os.environ
     if (env.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1"
             or env.get("AGENT_DISPATCH_CHILD") == "1"
@@ -1681,9 +1681,22 @@ def _workflow_owner_person_context(base, metadata):
     owner = base.get("owner") if isinstance(base.get("owner"), dict) else {}
     parent_harness = metadata.get("parent_harness")
     parent_session = metadata.get("parent_sid")
-    return bool(harness and session_id and parent_harness and parent_session
-                and harness == parent_harness == owner.get("harness")
-                and session_id == parent_session == owner.get("session_id"))
+    if not (harness and session_id and parent_harness and parent_session):
+        return False
+    try:
+        import dispatch_seat_handover
+        from peer_read_context import PeerReadContext
+
+        read_context = PeerReadContext()
+        effective_session = dispatch_seat_handover.effective_parent(
+            metadata, jobs, read_context=read_context)
+        effective_harness = dispatch_seat_handover.effective_parent_harness(
+            metadata, jobs, read_context=read_context)
+        owns = route_authority.owns(metadata, session_id, jobs, read_context=read_context)
+    except Exception:
+        return False
+    return bool(owns and harness == effective_harness == owner.get("harness")
+                and session_id == effective_session == owner.get("session_id"))
 
 
 def _workflow_owner_lineage(jobs, native_ref):
@@ -1772,7 +1785,7 @@ def _workflow_owner_snapshot(base, *, expected_native_ref=None):
                       "owner_binding": binding}
         if expected_native_ref is not None and expected_native_ref != native_ref:
             return None, "workflow-owner-binding-changed"
-        if not _workflow_owner_person_context(base, metadata):
+        if not _workflow_owner_person_context(base, metadata, jobs):
             return {"jobs": jobs, "item": item, "native_ref": native_ref,
                     "observed": None, "support": False,
                     "reason": "owner-correction-native-parent-context-required"}, None

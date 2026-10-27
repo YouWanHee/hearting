@@ -221,7 +221,7 @@ class SessionSummaryTriggerTest(unittest.TestCase):
              mock.patch.object(HOOK, "is_worker_session", return_value=False), \
              mock.patch.object(HOOK, "launch_trigger") as launch, \
              mock.patch.object(HOOK, "sd111_first_prompt_sweep"), \
-             mock.patch.object(HOOK, "candidate_context", return_value=""), \
+             mock.patch.object(HOOK, "candidate_context", return_value=("", None)), \
              mock.patch.object(HOOK, "run_preflight", return_value=""), \
              mock.patch.object(HOOK, "token_budget_context", return_value=""), \
              mock.patch.object(HOOK, "emit_context"), \

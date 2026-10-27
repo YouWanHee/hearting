@@ -344,8 +344,10 @@ class CodexFooterBindingTest(unittest.TestCase):
                                   + "\n  ? for shortcuts"] * 2
             self.assertEqual(pane_ownership.verified_pane(
                 pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), "")
+            # Full fresh native footer proof names the current selection even
+            # when the process source still names the prior conversation.
             self.assertEqual(pane_ownership.verified_pane(
-                pane, "codex", THREAD_B, pid=pid, executable="/fake/herdr"), "")
+                pane, "codex", THREAD_B, pid=pid, executable="/fake/herdr"), pane)
 
     def test_frontend_default_socket_does_not_inherit_service_socket(self):
         pid, pane = 42131, "wA:pdefault"
