@@ -13,6 +13,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import dispatch_settings as settings
+import fixture_env
 
 USER = """# my notes stay
 schema_version: 3
@@ -43,13 +44,13 @@ class DispatchSettingsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="dispatch-settings-test-")
         self.addCleanup(self.tmp.cleanup)
-        root = Path(self.tmp.name)
-        patch = mock.patch.dict(os.environ, {"HOME": str(root), "XDG_CONFIG_HOME": str(root / "config"),
-                                             "TMPDIR": str(root)})
+        env = fixture_env.build_environment(Path(self.tmp.name), ROOT)
+        env.pop("DISPATCH_DEFAULTS_CONFIG", None)
+        fixture_env.prepare_environment(env)
+        patch = mock.patch.dict(os.environ, env, clear=True)
         patch.start()
         self.addCleanup(patch.stop)
-        os.environ.pop("DISPATCH_DEFAULTS_CONFIG", None)
-        self.path = root / "config" / "hearting" / "dispatch-defaults.yaml"
+        self.path = Path(env["XDG_CONFIG_HOME"]) / "hearting" / "dispatch-defaults.yaml"
 
     def write(self, text=USER):
         self.path.parent.mkdir(parents=True, exist_ok=True)
