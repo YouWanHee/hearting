@@ -2775,16 +2775,25 @@ SD160_UNIT_CATALOG_DIGEST = "sha256:a565c51b6d07e301836027295e3e49d01dcb2b2bdacb
 SD160_SNAPSHOT_DIR = ROOT / "utilities" / "legacy-route-snapshots"
 
 
+def _sd160_snapshot_path(digest):
+    """Map a sealed sha256 digest to its Windows-safe snapshot filename."""
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise ValueError("invalid SD-160 snapshot digest")
+    return SD160_SNAPSHOT_DIR / f"sha256-{digest.split(':', 1)[1]}.json"
+
+
 def _load_sd160_snapshots():
     """Load the immutable registry and parsed unit contracts for sealed SD-160 routes."""
     try:
-        registry_path = SD160_SNAPSHOT_DIR / f"{SD160_REGISTRY_DIGEST}.json"
-        units_path = SD160_SNAPSHOT_DIR / f"{SD160_UNIT_CATALOG_DIGEST}.json"
+        registry_path = _sd160_snapshot_path(SD160_REGISTRY_DIGEST)
+        units_path = _sd160_snapshot_path(SD160_UNIT_CATALOG_DIGEST)
         registry = json.loads(registry_path.read_text(encoding="utf-8"))
         blocks = json.loads(units_path.read_text(encoding="utf-8"))
         registry_digest = TOPO.registry_digest(registry)
         units_digest = _unit_blocks_digest(blocks)
-        if registry_digest != registry_path.stem or units_digest != units_path.stem:
+        registry_filename_digest = "sha256:" + registry_path.stem.removeprefix("sha256-")
+        units_filename_digest = "sha256:" + units_path.stem.removeprefix("sha256-")
+        if registry_digest != registry_filename_digest or units_digest != units_filename_digest:
             return None
         if registry_digest != SD160_REGISTRY_DIGEST or units_digest != SD160_UNIT_CATALOG_DIGEST:
             return None

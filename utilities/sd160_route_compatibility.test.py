@@ -256,7 +256,7 @@ class LegacyRouteCompatibilityTest(unittest.TestCase):
 
     def test_snapshot_files_match_their_content_addressed_names(self):
         for digest in (R.SD160_REGISTRY_DIGEST, R.SD160_UNIT_CATALOG_DIGEST):
-            path=R.SD160_SNAPSHOT_DIR / f"{digest}.json"
+            path=R._sd160_snapshot_path(digest)
             self.assertTrue(path.is_file(), path)
             if digest == R.SD160_REGISTRY_DIGEST:
                 value=json.loads(path.read_text(encoding="utf-8"))
@@ -271,7 +271,7 @@ class LegacyRouteCompatibilityTest(unittest.TestCase):
             target=Path(td)
             for source in R.SD160_SNAPSHOT_DIR.glob("*.json"):
                 (target/source.name).write_bytes(source.read_bytes())
-            registry_path=target/f"{R.SD160_REGISTRY_DIGEST}.json"
+            registry_path=target/R._sd160_snapshot_path(R.SD160_REGISTRY_DIGEST).name
             registry=json.loads(registry_path.read_text(encoding="utf-8"))
             registry["corrupted_snapshot_value"]={"changed":True}
             registry_path.write_text(json.dumps(registry),encoding="utf-8")
