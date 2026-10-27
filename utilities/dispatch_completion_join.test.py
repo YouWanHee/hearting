@@ -1638,8 +1638,10 @@ class DispatchCompletionJoinTest(unittest.TestCase):
             if len(polls) == 3:
                 run.update(status="succeeded", exit_code=0)
                 stage.update(state="STAGE_SUCCEEDED", evidence={"resource_sha256":RESOURCE.RESUME.row_digest(run)})
-        sup = SimpleNamespace(poll_once=poll,
-            resource_evidence=lambda _: {"terminal":run["status"]=="succeeded", "succeeded":run["status"]=="succeeded",
+        sup = SimpleNamespace(poll_once=poll,read_resource_watches=lambda *_: [armed],
+            resource_evidence=lambda _: {"terminal":run["status"]=="succeeded",
+                                         "quiescent":run["status"]=="succeeded",
+                                         "succeeded":run["status"]=="succeeded",
                                          "liveness":"exited", "exit_code":0},
             artifact_evidence=lambda _: {"checked":True,"missing":[]},
             runner=lambda: SimpleNamespace(read_sentinel=lambda _:0))

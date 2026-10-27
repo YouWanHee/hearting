@@ -433,10 +433,12 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         run = {"run_id":"finished-resource","pid":555,"starttime":"201","command":["approved"],
                "node":"full-run","status":"succeeded","sentinel":"/fixture-exit"}
         stage = {"state":"STAGE_SUCCEEDED","evidence":{"resource_sha256":RESOURCE.RESUME.row_digest(run)}}
-        sup = SimpleNamespace(poll_once=mock.Mock(),resource_evidence=lambda _: {"terminal":True,"succeeded":True,"liveness":"exited","exit_code":0},
+        armed = {"node":"full-run","successors":["verify"]}
+        sup = SimpleNamespace(poll_once=mock.Mock(),read_resource_watches=lambda *_: [armed],
+            resource_evidence=lambda _: {"terminal":True,"quiescent":True,"succeeded":True,"liveness":"exited","exit_code":0},
             artifact_evidence=lambda _: {"checked":True,"missing":[]},runner=lambda:SimpleNamespace(read_sentinel=lambda _:0))
         ctx = (sup,route,SimpleNamespace(state=lambda:{"nodes":{"full-run":stage}}),
-               [({"node":"full-run","successors":["verify"]},run)])
+               [(armed,run)])
         args = SimpleNamespace(parent_attempt_id=PARENT,route_id=route["route_id"],route_hash=route["route_hash"],jobs=str(self.jobs))
         native = "mixed-native-session"
         turns = []
@@ -519,10 +521,12 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             events.append("runtime-poll")
             row.update(status="succeeded",exit_code=0)
             stage.update(state="STAGE_SUCCEEDED",evidence={"resource_sha256":RESOURCE.RESUME.row_digest(row)})
-        sup = SimpleNamespace(poll_once=poll,resource_evidence=lambda _: {"terminal":True,"succeeded":True,"liveness":"exited","exit_code":0},
+        armed = {"node":"full-run","successors":["verify"]}
+        sup = SimpleNamespace(poll_once=poll,read_resource_watches=lambda *_: [armed],
+            resource_evidence=lambda _: {"terminal":True,"quiescent":True,"succeeded":True,"liveness":"exited","exit_code":0},
             artifact_evidence=lambda _: {"checked":True,"missing":[]},runner=lambda:SimpleNamespace(read_sentinel=lambda _:0))
         ledger = SimpleNamespace(state=lambda:{"nodes":{"full-run":stage}})
-        ctx = (sup,route_value,ledger,[({"node":"full-run","successors":["verify"]},row)])
+        ctx = (sup,route_value,ledger,[(armed,row)])
         def turn(*a,**k):
             events.append("model-turn")
             prompt,session = k["prompt"],k["thread_id"]
@@ -769,8 +773,10 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             state=lambda: {"nodes": {"full-run": stage}})
         sup = SimpleNamespace(runner=lambda: runner, poll_once=mock.Mock(),
             load_route=lambda _: {}, ledger_for=lambda *_: ledger, read_armed=lambda _: {"full-run": armed},
+            read_resource_watches=lambda *_: [armed],
             resource_continuation_cancelled=lambda *_: False, _evaluate=mock.Mock(),
-            resource_evidence=lambda _: {"terminal": True, "succeeded": False, "liveness": "exited", "exit_code": None},
+            resource_evidence=lambda _: {"terminal": True, "quiescent": True, "succeeded": False,
+                                         "liveness": "exited", "exit_code": None},
             artifact_evidence=lambda _: {"missing": ["run.json"]})
         parent = SimpleNamespace(status="open", metadata={"harness": "codex", "pid": str(os.getpid()),
             "pid_start": starttime})
