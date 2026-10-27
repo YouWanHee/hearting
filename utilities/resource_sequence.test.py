@@ -542,7 +542,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
 
     def authorized_bridge_body(self, route, path, jobs, registry, owner_attempt,
                                owner_input, name, output, *, approved_text=None,
-                               payload_path=None):
+                               payload_path=None, payload_result='cpu-bridge-payload-complete\n',
+                               artifact_output_path=None, artifact_output_result=None):
         """Build the recorded local-bridge / remote-compute-hosts request shape."""
         import dispatch_owner_input as INPUT
         import shlex
@@ -575,10 +576,14 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                       for field, file in input_paths.items()}
         provenance['bridge_sha256'] = hashlib.sha256(bridge_path.read_bytes()).hexdigest()
         target = Path(payload_path or (self.base / f'{name}-payload-result.json')).resolve()
-        payload_script = (
-            'from pathlib import Path; '
-            f'Path({str(target)!r}).write_text("cpu-bridge-payload-complete\\n")'
-        )
+        payload_script = ('from pathlib import Path; '
+                          f'Path({str(target)!r}).write_text({payload_result!r})')
+        if artifact_output_path is not None:
+            artifact_output_path = Path(artifact_output_path).resolve()
+            if artifact_output_result is None:
+                artifact_output_result = payload_result
+            payload_script += (f'; Path({str(artifact_output_path)!r}).write_text('
+                               f'{artifact_output_result!r})')
         remote_payload = ['env', 'REMOTE_TRAINING_ENV=approved', sys.executable,
                           '-c', payload_script, '--config', str(config),
                           '--data-lock', str(data_lock), '--smoke', str(smoke)]
@@ -621,6 +626,61 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         body['resource_operation'] = operation
         body['launch_state'] = 'queued'
         return body
+
+    def _queue_current_legacy_bridge_operation(self, route, path, jobs, registry,
+                                               owner_attempt, body, output):
+        """Use the current normal owner start to publish one old-readable flat row."""
+        run_id = body['run_id']
+        attestation_path = self.base / f'{run_id}-smoke-attestation.json'
+        smoke_spec = importlib.util.spec_from_file_location(
+            f'legacy_fixture_smoke_attestation_{run_id}', ROOT / 'tools' / 'smoke-attestation.py')
+        smoke_tool = importlib.util.module_from_spec(smoke_spec)
+        smoke_spec.loader.exec_module(smoke_tool)
+        smoke_inputs = [self.base / f'{run_id}-config.yaml',
+                        self.base / f'{run_id}-data.lock',
+                        self.base / f'{run_id}-smoke.json']
+        attestation = smoke_tool.payload(smoke_inputs, body['command'], body['cwd'])
+        attestation.update(exit_code=0, status='passed')
+        attestation['attestation_hash'] = 'sha256:' + hashlib.sha256(json.dumps(
+            attestation, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        attestation_path.write_text(json.dumps(attestation, sort_keys=True))
+        request_path = Path(body['command'][-1])
+        request = json.loads(request_path.read_text())
+        attestation_hash = hashlib.sha256(attestation_path.read_bytes()).hexdigest()
+        request['smoke_attestation'] = str(attestation_path)
+        request['smoke_attestation_sha256'] = attestation_hash
+        request['provenance']['smoke_attestation_sha256'] = attestation_hash
+        request_bytes = json.dumps(request, sort_keys=True).encode()
+        request_path.write_bytes(request_bytes)
+        record_path = Path(request['Dev_admission_evidence']).parent / \
+            f'{run_id}-resource-start-command.json'
+        command_record = json.loads(record_path.read_text())
+        command_record['request_sha256'] = hashlib.sha256(request_bytes).hexdigest()
+        separator = command_record['argv'].index('--')
+        command_record['argv'][separator:separator] = ['--smoke-attestation', str(attestation_path)]
+        record_path.write_text(json.dumps(command_record, sort_keys=True))
+        body['launch_request'] = {
+            'smoke_attestation': str(attestation_path),
+            'smoke_attestation_sha256': attestation_hash,
+            'config_manifest': None, 'config_manifest_sha256': None,
+        }
+        body['resource_operation'] = SUP.runner().resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            dict(body['launch_request']), body['owner_wait'],
+            registry_path=registry, log_path=body['log'])
+        self.assertIsNotNone(body['resource_operation'])
+        body.pop('launch_state', None)
+        current_runner = SUP.runner()
+        current_args = SimpleNamespace(
+            jobs=str(jobs), run_id=body['run_id'], node=body['node'],
+            smoke_attestation=str(attestation_path), config_manifest=None)
+        import artifact_producer
+        with mock.patch.object(artifact_producer, 'prepare_route_artifact_env',
+                               return_value={'AGENT_ARTIFACT_OUTPUT_DIR': str(output)}), \
+             mock.patch.object(current_runner, 'register_registry'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            current_runner.start_verified(registry, current_args, route, path, dict(body))
+        return json.loads((SUP.ledger_for(route, jobs).root / 'armed' / 'full-run.json').read_bytes())
 
     def arm(self, path, registry, *, node='full-run', run_id='fixture-run', extra=()):
         argv = ['arm', '--route', str(path), '--node', node, '--predecessor-kind', 'resource',
@@ -2110,77 +2170,29 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
 
     def test_v3532_context_controller_launch_and_wait_consume_flat_queued_cpu_bridge(self):
         route, path, jobs, registry, output, ledger = self.fixture()
+        seed_armed = SUP.read_armed(ledger)['full-run']
+        seed_evidence = SUP.resource_evidence(seed_armed)
+        self.assertTrue(seed_evidence['terminal'])
+        self.assertTrue(seed_evidence['succeeded'])
+        self.assertEqual(seed_evidence['exit_code'], 0)
         owner_attempt, owner_input = self.live_owner(route, jobs, registry)
-        data = json.loads(registry.read_text())
-        old_fix = data['runs']['fixture-run']
-        old_fix.update(SUP.RR.proc_identity(os.getpid()), process_group=os.getpgrp(),
-                       pid_namespace=os.readlink('/proc/self/ns/pid'),
-                       status='running', exit_code=None)
-        Path(old_fix['sentinel']).unlink()
-        registry.write_text(json.dumps(data))
         primary_path = ledger.root / 'armed' / 'full-run.json'
         original_bytes = primary_path.read_bytes()
         original_armed = json.loads(original_bytes)
-        body = self.authorized_bridge_body(route, path, jobs, registry, owner_attempt,
-                                           owner_input, 'legacy-var', output)
-        attestation_path = self.base / 'legacy-var-smoke-attestation.json'
-        smoke_spec = importlib.util.spec_from_file_location(
-            'legacy_fixture_smoke_attestation', ROOT / 'tools' / 'smoke-attestation.py')
-        smoke_tool = importlib.util.module_from_spec(smoke_spec)
-        smoke_spec.loader.exec_module(smoke_tool)
-        smoke_inputs = [self.base / 'legacy-var-config.yaml',
-                        self.base / 'legacy-var-data.lock',
-                        self.base / 'legacy-var-smoke.json']
-        attestation = smoke_tool.payload(smoke_inputs, body['command'], body['cwd'])
-        attestation.update(exit_code=0, status='passed')
-        attestation['attestation_hash'] = 'sha256:' + hashlib.sha256(json.dumps(
-            attestation, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-        attestation_path.write_text(json.dumps(attestation, sort_keys=True))
-        request_path = Path(body['command'][-1])
-        request = json.loads(request_path.read_text())
-        attestation_hash = hashlib.sha256(attestation_path.read_bytes()).hexdigest()
-        request['smoke_attestation'] = str(attestation_path)
-        request['smoke_attestation_sha256'] = attestation_hash
-        request['provenance']['smoke_attestation_sha256'] = attestation_hash
-        request_bytes = json.dumps(request, sort_keys=True).encode()
-        request_path.write_bytes(request_bytes)
-        record_path = Path(request['Dev_admission_evidence']).parent / \
-            'legacy-var-resource-start-command.json'
-        command_record = json.loads(record_path.read_text())
-        command_record['request_sha256'] = hashlib.sha256(request_bytes).hexdigest()
-        separator = command_record['argv'].index('--')
-        command_record['argv'][separator:separator] = ['--smoke-attestation', str(attestation_path)]
-        record_path.write_text(json.dumps(command_record, sort_keys=True))
-        body['launch_request'] = {
-            'smoke_attestation': str(attestation_path),
-            'smoke_attestation_sha256': attestation_hash,
-            'config_manifest': None, 'config_manifest_sha256': None,
-        }
-        body['resource_operation'] = SUP.runner().resource_operation_binding(
-            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
-            dict(body['launch_request']), body['owner_wait'],
-            registry_path=registry, log_path=body['log'])
-        self.assertIsNotNone(body['resource_operation'])
-        body.pop('launch_state', None)
-        current_runner = SUP.runner()
-        current_args = SimpleNamespace(
-            jobs=str(jobs), run_id=body['run_id'], node=body['node'],
-            smoke_attestation=str(attestation_path), config_manifest=None)
-        import artifact_producer
-        with mock.patch.object(artifact_producer, 'prepare_route_artifact_env',
-                               return_value={'AGENT_ARTIFACT_OUTPUT_DIR': str(output)}), \
-             mock.patch.object(current_runner, 'register_registry'), \
-             contextlib.redirect_stdout(io.StringIO()):
-            current_runner.start_verified(registry, current_args, route, path, dict(body))
-
-        flat = json.loads(primary_path.read_text())
-        self.assertEqual(flat['predecessor_id'], body['run_id'])
-        self.assertEqual(flat['resource_binding'], WAIT.resource_legacy_body_digest(body))
-        self.assertEqual(flat['resource_current_binding'], WAIT.resource_body_digest(body))
-        archived = SUP.resource_watch_storage_path(ledger, original_armed)
-        self.assertEqual(archived.read_bytes(), original_bytes)
+        body_a = self.authorized_bridge_body(
+            route, path, jobs, registry, owner_attempt, owner_input, 'legacy-var', output,
+            payload_path=self.base / 'legacy-var-result.json',
+            payload_result='var-operation-result\n')
+        flat_a = self._queue_current_legacy_bridge_operation(
+            route, path, jobs, registry, owner_attempt, body_a, output)
+        flat_a_bytes = primary_path.read_bytes()
+        self.assertEqual(flat_a['predecessor_id'], body_a['run_id'])
+        self.assertEqual(flat_a['resource_binding'], WAIT.resource_legacy_body_digest(body_a))
+        self.assertEqual(flat_a['resource_current_binding'], WAIT.resource_body_digest(body_a))
+        self.assertEqual(SUP.resource_watch_storage_path(ledger, original_armed).read_bytes(),
+                         original_bytes)
         self.assertEqual({row['predecessor_id'] for row in SUP.read_resource_watches(
-            ledger, 'full-run')}, {'fixture-run', body['run_id']})
+            ledger, 'full-run')}, {'fixture-run', body_a['run_id']})
 
         old_path = Path('/home/Uihyeop/.local/share/hearting/releases/v3.53.2/utilities/dispatch_resource_wait.py')
         legacy_spec = importlib.util.spec_from_file_location('legacy_v3532_resource_wait_fixture', old_path)
@@ -2196,13 +2208,14 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             resource_launch_command=lambda row: (row['command'], 'fixture-local-cpu'),
         )
         children = []
-        try:
+
+        def deliver_from_old_consumer(body):
             with mock.patch.dict(sys.modules, {'dispatch_resource_wait': legacy_wait}):
-                sup, old_route, old_ledger, found = legacy_wait.context(args, control)
+                _old_supervisor, old_route, _old_ledger, found = legacy_wait.context(args, control)
                 self.assertEqual(old_route['route_id'], route['route_id'])
                 self.assertEqual([row['run_id'] for _, row in found], [body['run_id']])
                 armed, queued = found[0]
-                old_runner = sup.runner()
+                old_runner = legacy_wait.supervisor().runner()
                 observer = mock.Mock()
                 observer.poll.return_value = None
                 import artifact_producer
@@ -2214,36 +2227,144 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                         observer, SUP.RR.proc_identity(os.getpid()))):
                     legacy_wait.admit_controller_launch(args, control, armed, queued, [])
                 launched = json.loads(registry.read_text())['runs'][body['run_id']]
-                children = args.resource_children[legacy_wait.resource_key(launched)]
-                payload_proc, _observer = children
+                child = args.resource_children[legacy_wait.resource_key(launched)]
+                children.append(child)
+                payload_proc, _observer = child
                 self.assertEqual(payload_proc.wait(timeout=10), 0)
-                self.assertEqual(result_path.read_text(), 'cpu-bridge-payload-complete\n')
 
                 sleeps = [0]
                 def bounded_sleep(_seconds):
                     sleeps[0] += 1
                     if sleeps[0] > 80:
-                        raise TimeoutError('legacy resource receipt did not become ready')
+                        raise TimeoutError(f"legacy resource receipt did not become ready: {body['run_id']}")
                     time.sleep(0.01)
                 prompt = legacy_wait.wait(args, phase, control, set(), events.append,
                                           sleep=bounded_sleep)
                 state = legacy_wait.JOIN.read_supervisor_phase_state(phase, owner_attempt)
-                receipt = state.resource['outbox']['receipt']
+                receipt = copy.deepcopy(state.resource['outbox']['receipt'])
+                receipt_id = state.resource['outbox']['receipt_id']
                 self.assertIn(body['run_id'], prompt)
                 self.assertEqual(receipt['run_id'], body['run_id'])
                 self.assertFalse(receipt['verification_pass'])
-                self.assertTrue(legacy_wait.acknowledge(
-                    phase, owner_attempt, state.resource['outbox']['receipt_id']))
+                self.assertTrue(legacy_wait.acknowledge(phase, owner_attempt, receipt_id))
+            return receipt, receipt_id
+
+        successor_args = SimpleNamespace(
+            route_file=str(path), route_node='run-verify', attempt_id='att-verify',
+            jobs=str(jobs), agent_home=ROOT, worktree=str(self.base), dispatch_depth=2,
+            parent_slug='fixture-owner', parent_attempt_id=owner_attempt,
+            parent_harness='codex', parent_transport='headless',
+            parent_sandbox='workspace-write', subsession_id=None,
+        )
+
+        def current_successor_start():
+            with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
+                 mock.patch('subprocess.check_output', return_value=str(self.base)):
+                return RA.completion_gate(
+                    successor_args, 'start', ROOT, jobs, gate=DC.completion_marker_gate)
+
+        try:
+            receipt_a, receipt_id_a = deliver_from_old_consumer(body_a)
+            self.assertEqual((self.base / 'legacy-var-result.json').read_text(),
+                             'var-operation-result\n')
             current = SUP.read_resource_watches(ledger, 'full-run')
-            self.assertEqual({row['predecessor_id'] for row in current},
-                             {'fixture-run', body['run_id']})
-            with self.assertRaisesRegex(SUP.SupervisorError, 'resource-owner-operation-unsettled'):
-                SUP.admit_owner_successor_start(route, 'run-verify', jobs,
-                                                owner_attempt, 'same-native')
+            armed_a = next(row for row in current if row['predecessor_id'] == body_a['run_id'])
+            evidence_a = SUP.resource_evidence(armed_a)
+            self.assertTrue(evidence_a['terminal'])
+            self.assertTrue(evidence_a['succeeded'])
+            self.assertEqual(evidence_a['exit_code'], 0)
+            self.assertEqual(evidence_a['liveness'], 'exited')
+            self.assertTrue(evidence_a['quiescent'])
+
+            body_b = self.authorized_bridge_body(
+                route, path, jobs, registry, owner_attempt, owner_input, 'legacy-fix-resume', output,
+                payload_path=self.base / 'legacy-fix-result.json',
+                payload_result='fix-resume-result\n',
+                artifact_output_path=output / 'run.json',
+                artifact_output_result=json.dumps({'result': 'declared-output', 'run_id': 'legacy-fix-resume'}) + '\n')
+            flat_b = self._queue_current_legacy_bridge_operation(
+                route, path, jobs, registry, owner_attempt, body_b, output)
+            flat_b_bytes = primary_path.read_bytes()
+            self.assertEqual(flat_b['predecessor_id'], body_b['run_id'])
+            self.assertEqual(flat_b['resource_binding'], WAIT.resource_legacy_body_digest(body_b))
+            self.assertEqual(flat_b['resource_current_binding'], WAIT.resource_body_digest(body_b))
+            self.assertNotEqual(body_a['resource_operation']['operation_id'],
+                                body_b['resource_operation']['operation_id'])
+            self.assertEqual(primary_path.read_bytes(), flat_b_bytes)
+            self.assertEqual(SUP.resource_watch_storage_path(ledger, original_armed).read_bytes(),
+                             original_bytes)
+            self.assertEqual(SUP.resource_watch_storage_path(ledger, json.loads(flat_a_bytes)).read_bytes(),
+                             flat_a_bytes)
+            self.assertEqual({row['predecessor_id'] for row in SUP.read_resource_watches(
+                ledger, 'full-run')}, {'fixture-run', body_a['run_id'], body_b['run_id']})
+
+            blocked = current_successor_start()
+            self.assertIsNotNone(blocked)
+            self.assertEqual(blocked[0], 'resource-owner-stage-admission-blocked')
+            self.assertIn('resource-owner-operation-unsettled', blocked[2]['detail'])
             self.assertEqual(ledger.claims(), {})
+
+            receipt_b, receipt_id_b = deliver_from_old_consumer(body_b)
+            self.assertEqual((self.base / 'legacy-fix-result.json').read_text(),
+                             'fix-resume-result\n')
+            self.assertTrue((output / 'run.json').is_file())
+            self.assertEqual(receipt_a['run_id'], body_a['run_id'])
+            self.assertEqual(receipt_b['run_id'], body_b['run_id'])
+            self.assertNotEqual(receipt_id_a, receipt_id_b)
+
+            state = legacy_wait.JOIN.read_supervisor_phase_state(phase, owner_attempt)
+            self.assertIsNone(state.resource['outbox'])
+            self.assertEqual(len(state.resource['delivered']), 2)
+            self.assertEqual(len(set(state.resource['delivered'])), 2)
+            current = SUP.read_resource_watches(ledger, 'full-run')
+            evidence_by_run = {}
+            for run_id in (body_a['run_id'], body_b['run_id']):
+                armed = next(row for row in current if row['predecessor_id'] == run_id)
+                evidence = SUP.resource_evidence(armed)
+                self.assertTrue(evidence['terminal'], evidence)
+                self.assertTrue(evidence['succeeded'], evidence)
+                self.assertEqual(evidence['exit_code'], 0)
+                self.assertEqual(evidence['liveness'], 'exited')
+                self.assertTrue(evidence['quiescent'])
+                evidence_by_run[run_id] = evidence
+            self.assertNotEqual(evidence_by_run[body_a['run_id']]['identity'],
+                                evidence_by_run[body_b['run_id']]['identity'])
+            run_rows = json.loads(registry.read_text())['runs']
+            for body in (body_a, body_b):
+                row = run_rows[body['run_id']]
+                self.assertEqual(row['status'], 'succeeded')
+                self.assertEqual(row['exit_code'], 0)
+                self.assertTrue(row.get('pid'))
+                self.assertTrue(row.get('starttime'))
+                self.assertEqual(Path(row['sentinel']).read_text(), '0')
+
+            self.assertIsNone(current_successor_start())
+            stage = ledger.state()['nodes']['full-run']
+            operation_results = {row['run_id']: row for row in stage['evidence']['resource_operations']
+                                 if row['run_id'] in {body_a['run_id'], body_b['run_id']}}
+            self.assertEqual(set(operation_results), {body_a['run_id'], body_b['run_id']})
+            for body in (body_a, body_b):
+                result = operation_results[body['run_id']]
+                self.assertEqual(result['operation_id'], body['resource_operation']['operation_id'])
+                self.assertEqual(result['identity'], evidence_by_run[body['run_id']]['identity'])
+                self.assertEqual(result['exit_code'], 0)
+                self.assertEqual(result['request_sha256'], body['resource_operation']['request_sha256'])
+                self.assertEqual(len(result['resource_sha256']), 64)
+            self.assertEqual(stage['state'], 'STAGE_SUCCEEDED')
+            self.assertEqual(len(ledger.claims()), 1)
+            self.assertEqual(len(ledger.claim_history()), 1)
+            marker = jobs.parent / 'completion' / route['route_id'] / 'full-run.json'
+            marker_bytes = marker.read_bytes()
+            self.assertIsNone(current_successor_start())
+            self.assertEqual(marker.read_bytes(), marker_bytes)
+            self.assertEqual(len(ledger.claims()), 1)
+            self.assertEqual(len(ledger.claim_history()), 1)
+            self.assertEqual(SUP.resource_watch_storage_path(ledger, original_armed).read_bytes(),
+                             original_bytes)
+            self.assertEqual(SUP.resource_watch_storage_path(ledger, json.loads(flat_a_bytes)).read_bytes(),
+                             flat_a_bytes)
         finally:
-            if children:
-                process, _observer = children
+            for process, _observer in children:
                 if process.poll() is None:
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(process.pid, 15)
