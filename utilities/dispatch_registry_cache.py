@@ -693,8 +693,12 @@ def _stable_read(path: Path, path_identity: str):
             chunks = []
             size = 0
             _METRICS["content_reads"] += 1
+            # One read sized to the stat result lets join() return that buffer
+            # itself instead of copying a second full-size registry image.
+            request = max(_CHUNK_SIZE, before_signature[2] + 1)
             while True:
-                chunk = os.read(fd, _CHUNK_SIZE)
+                chunk = os.read(fd, request)
+                request = _CHUNK_SIZE
                 if not chunk:
                     break
                 chunks.append(chunk)
@@ -866,7 +870,9 @@ def _observe_generation(path: Path) -> tuple[RegistryView, tuple[str, ...]]:
                 and hashlib.sha256(memoryview(raw)[:cached.signature[2]]).digest()
                     == cached._raw_digest.digest()
                 and not any(separator in raw for separator in _NON_CANONICAL_LINE_SEPARATORS)
-                and not _utf8_status(raw)[0]
+                # The digest proves the eligible (valid UTF-8) prefix unchanged, so
+                # only its pending tail plus the appended bytes need decoding.
+                and not _utf8_status(cached._tail + raw[cached.signature[2]:])[0]
             )
             previous = cached if reusable else None
             suffix = raw[previous.signature[2]:] if previous is not None else raw
@@ -876,7 +882,7 @@ def _observe_generation(path: Path) -> tuple[RegistryView, tuple[str, ...]]:
             _METRICS["invalidations"] += 1
             view = RegistryView(identity, resolved, signature, suffix,
                                 previous=previous, fd=fd)
-            fd = None
+            fd = suffix = None
             if previous is not None:
                 _METRICS["append_reuses"] += 1
                 _METRICS["metadata_rows_parsed"] += view.record_count - previous.record_count
@@ -887,6 +893,11 @@ def _observe_generation(path: Path) -> tuple[RegistryView, tuple[str, ...]]:
             _remember(identity, view)
         if fd is not None:
             os.close(fd)
+    if view._prefix_reuse_eligible and not view.has_invalid_utf8:
+        # Valid LF-only text: the view's lines are exactly the splitlines() of
+        # these bytes, so skip a second full-size decode of the whole registry.
+        del raw
+        return view, view.lines
     return view, tuple(raw.decode("utf-8", errors="replace").splitlines())
 
 
