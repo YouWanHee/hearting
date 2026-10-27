@@ -15,6 +15,69 @@ import resource_progress as progress
 import resource_metric_sources as metric_sources
 
 
+def _cairn_problems(record_path):
+    """Python port of the Cairn run-discovery constraints (read-only reference:
+    cairn/lib/experiments/run-discovery.ts, file size :76/:275, schema_version :566,
+    output_dir :571-573, metrics :354-413, epoch-json-files folders :385-397)."""
+    import re
+    problems = []
+    raw = Path(record_path).read_bytes()
+    if len(raw) > 16 * 1024:
+        problems.append(f"size {len(raw)} > 16384")
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return problems + ["not-json"]
+    if record.get("schema_version") not in (None, 1):
+        problems.append("schema_version")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(record.get("run_id"))):
+        problems.append("run_id")
+    output_dir = record.get("output_dir")
+    if not (isinstance(output_dir, str) and os.path.isabs(output_dir) and os.path.isdir(output_dir)):
+        problems.append("output_dir")
+    metrics = record.get("metrics")
+    if not isinstance(metrics, list) or len(metrics) > 128:
+        return problems + ["metrics"]
+    merged, normalized = set(), 0
+    for item in metrics:
+        if item.get("format") not in {"epochs-jsonl", "epoch-json-files", "tfevents"}:
+            problems.append("format")
+        for key in item.get("keys") or []:
+            if not isinstance(key, str) or not 1 <= len(key) <= 128:
+                problems.append("key")
+        path = item.get("path")
+        if isinstance(path, list):
+            if len(path) > 1024:
+                problems.append("path-array")
+            merged.add((item.get("format"), output_dir))
+            continue
+        normalized += 1
+        if not isinstance(path, str) or not os.path.exists(path):
+            problems.append("path-missing:" + str(path))
+        elif item["format"] == "epoch-json-files":
+            if not os.path.isdir(path) or not any(
+                    re.fullmatch(r"(train|valid)-epoch-\d+\.json", name) for name in os.listdir(path)):
+                problems.append("epoch-folder:" + str(path))
+        elif item["format"] == "epochs-jsonl" and not os.path.isfile(path):
+            problems.append("jsonl-not-file")
+    if normalized + len(merged) > 16:
+        problems.append("normalized>16")
+    return problems
+
+
+def _legacy_epoch_run(base, name_pad=100):
+    """A run folder with 170 epoch files and a tensorboard folder."""
+    run = Path(base) / ("run-" + "x" * name_pad)
+    (run / "tensorboard").mkdir(parents=True)
+    for epoch in range(1, 171):
+        for split in ("train", "valid"):
+            (run / f"{split}-epoch-{epoch:04d}.json").write_text(json.dumps(
+                {"epoch": epoch, "losses": {"L_se": -epoch / 10, "SISNRi": epoch / 5},
+                 "seconds": 3.0}))
+    (run / "tensorboard" / "events.out.tfevents.1.host").write_bytes(b"x")
+    return run
+
+
 class ResourceProgressTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1818,6 +1881,252 @@ class ExperimentObservationTest(unittest.TestCase):
             self.assertEqual(recipient_states, {"unavailable", "acked"})
             persisted = progress._read_observation_state(state)
             self.assertEqual(len(persisted["outbox"]), 1)
+
+    @property
+    def tmp(self):
+        if not hasattr(self, "_public_tmp"):
+            self._public_tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(self._public_tmp.cleanup)
+        return self._public_tmp
+
+    def _legacy_record(self, run):
+        """Legacy-shaped record (>= 967,730 B): list-form declarations and a fat row."""
+        files = sorted(str(item) for item in run.glob("*-epoch-*.json"))
+        point = {"epoch": 3, "value": 1.5, "nonfinite": False, "path": files[0]}
+        summary = {"metric": "L_se", "direction": "min", "latest": point, "best": point,
+                   "latest_metrics": {f"k{i}": point for i in range(40)},
+                   "best_metrics": {f"k{i}": point for i in range(40)},
+                   "trend": "개선", "baseline_delta": None, "nonfinite": False}
+        declarations = [{"format": "epoch-json-files", "path": files[:130 + index],
+                         "keys": ["L_se", "SISNRi"]} for index in range(37)]
+        declarations.append({"format": "tfevents", "keys": ["loss"],
+                             "path": [str(run / "tensorboard" / "events.out.tfevents.1.host")]})
+        return {"schema_version": 1, "run_id": "legacy-run", "route_id": "route-a", "node": "train",
+                "campaign_id": "c", "cycle_id": "y", "host": "h1", "output_dir": str(run),
+                "status": "running", "metrics": declarations, "metric_summary": summary,
+                "rows": [{"row_id": "run", "output_dir": str(run), "metrics": declarations[:3],
+                          "sources": declarations[:3], "metric_summary": summary,
+                          "last_checkpoint": {"at": 5.0}, "elapsed_seconds": 5.0,
+                          "observed_counters": [], "started_at": 0.0}]}
+
+    def _write_legacy(self, artifact, record):
+        target = artifact / "resource-runs" / "legacy-run.json"
+        target.parent.mkdir(parents=True)
+        target.write_text(json.dumps(record, sort_keys=True) + "\n")
+        self.assertGreaterEqual(target.stat().st_size, 967730)
+        return target
+
+    def test_oversized_legacy_record_shrinks_after_one_write(self):
+        base = Path(self.tmp.name) / "d1"
+        run = _legacy_epoch_run(base)
+        artifact = base / "artifact"
+        legacy = self._legacy_record(run)
+        target = self._write_legacy(artifact, legacy)
+        state = base / "state.json"
+        runinfo = {"run_id": "legacy-run", "artifact_root": str(artifact),
+                   "route_id": "route-a", "node": "train", "started_at": 0}
+        with mock.patch.object(progress, "_observation_state_path", return_value=state):
+            progress.observe_experiment(runinfo, base / "registry.json", 60, root=str(run),
+                                        row_key="run", started_at=0, notify_events=False)
+        self.assertLessEqual(target.stat().st_size, 16384)
+        record = json.loads(target.read_text())
+        self.assertFalse([item for item in record["metrics"] if isinstance(item["path"], list)])
+        epoch = [item for item in record["metrics"] if item["format"] == "epoch-json-files"]
+        self.assertEqual([(item["path"], item["file_count"] >= 170) for item in epoch],
+                         [(str(run), True)])
+        self.assertTrue({"metrics", "sources"}.isdisjoint(record["rows"][0]))
+        self.assertEqual(record["output_dir_state"], "present")
+        self.assertEqual(_cairn_problems(target), [])
+        # the same legacy file through the writer alone, with a minimal incoming record
+        other = base / "artifact2"
+        target2 = self._write_legacy(other, legacy)
+        self.assertIsNotNone(progress.write_public_run_record(
+            other, "legacy-run", {"run_id": "legacy-run", "status": "running"}))
+        self.assertLessEqual(target2.stat().st_size, 16384)
+        self.assertEqual(_cairn_problems(target2), [])
+        self.assertEqual(json.loads(target2.read_text())["rows"][0]["row_id"], "run")
+
+    def test_public_record_compaction_is_bounded_deterministic_and_idempotent(self):
+        base = Path(self.tmp.name) / "d1b"
+        long = "p" * 90
+
+        def extreme(identity):
+            summary = {"metric": "L_se", "latest_metrics": {f"m{i:03d}": {"epoch": 1, "value": 1.0}
+                                                             for i in range(80)},
+                       "best_metrics": {f"m{i:03d}": {"epoch": 1, "value": 1.0} for i in range(80)}}
+            return {"run_id": "extreme", "status": "running", "output_dir": str(base),
+                    "campaign_id": identity, "host": identity, "node": identity,
+                    "cycle_id": identity, "route_id": identity, "observer_of": identity,
+                    "metrics": [{"format": "epochs-jsonl", "path": f"/{long}/{i}/logs/epochs.jsonl",
+                                 "keys": [f"key-{i}-{n}" for n in range(200)]} for i in range(40)],
+                    "source_warnings": [f"warning-{n:04d}" for n in range(500)],
+                    "metric_summary": summary,
+                    "rows": [{"row_id": f"arm-{n:02d}", "started_at": float(n), "metric_summary": summary,
+                              "admission": {"detail": "a" * 600}, "observed_counters": [{"n": "b" * 300}],
+                              "last_checkpoint": {"at": float(n), "rule_fired": ["r"] * 30}}
+                             for n in range(64)]}
+        for identity, expect_rows in (("short", True), ("i" * 2000, False)):
+            outputs = []
+            for name in ("one", "two"):
+                artifact = base / identity[:1] / name
+                path = progress.write_public_run_record(artifact, "extreme", extreme(identity))
+                self.assertIsNotNone(path)
+                self.assertLessEqual(path.stat().st_size, 16384)
+                outputs.append(path.read_bytes())
+            self.assertEqual(outputs[0], outputs[1])
+            record = json.loads(outputs[0])
+            self.assertLessEqual(len(record["metrics"]), 16)
+            self.assertGreater(record["compaction"]["level"], 0)
+            self.assertEqual(bool(record["rows"]), expect_rows)
+            if expect_rows:
+                self.assertGreaterEqual(record["compaction"]["rows_omitted"], 32)
+            else:
+                self.assertEqual(record["compaction"]["level"], 7)
+                self.assertIn("host", record["compaction"]["oversize_fields"])
+            self.assertEqual(record["compaction"]["budget_bytes"], 16384)
+            # idempotent: writing the compacted record back keeps every byte
+            again = progress.write_public_run_record(artifact, "extreme",
+                progress.read_public_run_record(artifact, "extreme"))
+            self.assertEqual(again.read_bytes(), outputs[1])
+
+    def test_thirty_two_live_arms_fit_and_keep_every_live_row(self):
+        base = Path(self.tmp.name) / "d3arms"
+        artifact = base / "artifact"
+        for index in range(32):
+            output = base / f"row-{index:02d}"
+            (output / "logs").mkdir(parents=True)
+            (output / "logs" / "epochs.jsonl").write_text(json.dumps(
+                {"epoch": 1, "split": "valid", "losses": {"L_se": -1.0 - index, "SISNRi": 1.0 * index}}) + "\n")
+            run = {"run_id": "arms-32", "route_id": "r", "node": "train",
+                   "artifact_root": str(artifact), "started_at": index}
+            with mock.patch.object(progress, "_observation_state_path",
+                                   return_value=base / f"state-{index}.json"):
+                progress.observe_experiment(run, base / "registry.json", index + 7200,
+                    root=str(output), row_key=f"arm-{index:02d}", started_at=index,
+                    notify_events=False)
+        path = artifact / "resource-runs" / "arms-32.json"
+        self.assertLessEqual(path.stat().st_size, 16384)
+        record = json.loads(path.read_text())
+        self.assertEqual({row["row_id"] for row in record["rows"]},
+                         {f"arm-{index:02d}" for index in range(32)})
+        self.assertEqual(len(record["metrics"]), 16)
+        self.assertEqual(record["compaction"]["metrics_omitted"], 16)
+        self.assertEqual(_cairn_problems(path), [])
+
+    def test_output_dir_state_present_none_unknown_with_reason(self):
+        base = Path(self.tmp.name) / "d2"
+        base.mkdir()
+        route = base / "route.json"
+        route.write_text(json.dumps({"nodes": [
+            {"id": "eval-run", "kind": "resource-runner", "outputs": ["run.json", "raw-results/**"]},
+            {"id": "full-run", "kind": "resource-runner",
+             "outputs": ["run.json", "logs/**", "experiment-artifact"]}]}))
+        link = base / "route-link.json"
+        link.symlink_to(route)
+        big = base / "route-big.json"
+        big.write_text(json.dumps({"nodes": [{"id": "eval-run", "kind": "resource-runner",
+                                              "outputs": [], "pad": "x" * (1024 * 1024)}]}))
+        output = base / "out"
+        (output / "logs").mkdir(parents=True)
+        (output / "logs" / "epochs.jsonl").write_text(
+            json.dumps({"epoch": 1, "split": "valid", "losses": {"L_se": -1.0}}) + "\n")
+
+        def observe(name, node, route_file, root):
+            artifact = base / name
+            run = {"run_id": name, "artifact_root": str(artifact), "node": node,
+                   "route_id": "r", "started_at": 0}
+            if route_file:
+                run["route"] = str(route_file)
+            with mock.patch.object(progress, "_observation_state_path",
+                                   return_value=base / (name + ".state")):
+                progress.observe_experiment(run, base / "registry.json", 60, root=root,
+                    row_key="run", started_at=0, notify_events=False)
+            return progress.read_public_run_record(artifact, name), artifact
+
+        cases = {
+            "case-a": ("eval-run", route, None, ("none", "node-declares-no-training-output")),
+            "case-b": ("full-run", route, None, ("unknown", "not-declared")),
+            "case-c": ("missing-node", route, None, ("unknown", "not-declared")),
+            "case-d": ("eval-run", route, str(base / "absent"), ("unknown", "declared-unresolved")),
+            "case-e": ("eval-run", route, str(output), ("present", None)),
+            "case-g1": ("eval-run", link, None, ("unknown", "not-declared")),
+            "case-g2": ("eval-run", big, None, ("unknown", "not-declared")),
+        }
+        for name, (node, route_file, root, expected) in cases.items():
+            record, _artifact = observe(name, node, route_file, root)
+            self.assertEqual((record["output_dir_state"], record["output_dir_reason"]), expected, name)
+            if expected[0] != "present":
+                self.assertIsNone(record["output_dir"], name)
+        # (f) a present folder is carried over a later unknown observation
+        record, artifact = observe("case-e", "eval-run", route, str(output))
+        later = progress.public_run_record({"run_id": "case-e", "node": "eval-run"})
+        self.assertEqual(later["output_dir_state"], "unknown")
+        self.assertIsNotNone(progress.write_public_run_record(artifact, "case-e", later))
+        kept = progress.read_public_run_record(artifact, "case-e")
+        self.assertEqual((kept["output_dir_state"], kept["output_dir"]), ("present", str(output)))
+
+    def test_compacted_record_feeds_resource_wait_note_and_runner_observation(self):
+        import dispatch_resource_wait
+        base = Path(self.tmp.name) / "d3notes"
+        run_dir = _legacy_epoch_run(base)
+        artifact = base / "artifact"
+        self._write_legacy(artifact, self._legacy_record(run_dir))
+        runinfo = {"run_id": "legacy-run", "artifact_root": str(artifact),
+                   "route_id": "route-a", "node": "train", "started_at": 0}
+        with mock.patch.object(progress, "_observation_state_path", return_value=base / "state.json"):
+            progress.observe_experiment(runinfo, base / "registry.json", 60, root=str(run_dir),
+                                        row_key="run", started_at=0, notify_events=False)
+        note = dispatch_resource_wait._experiment_result_note(
+            {"run_id": "legacy-run", "artifact_root": str(artifact)})
+        self.assertNotIn("metrics unavailable", note)
+        for needle in ("row=", "last=", "trend=", "public run record="):
+            self.assertIn(needle, note)
+        # heavily compacted record (rows dropped to the skeleton) still renders
+        skeleton_root = base / "skeleton"
+        self.assertIsNotNone(progress.write_public_run_record(skeleton_root, "legacy-run",
+            {"run_id": "legacy-run", "host": "h" * 2000, "output_dir": str(run_dir),
+             "metric_summary": {"metric": "L_se"}}))
+        self.assertIsInstance(dispatch_resource_wait._experiment_result_note(
+            {"run_id": "legacy-run", "artifact_root": str(skeleton_root)}), str)
+        registry = base / "resource-runs.json"
+        registry.write_text(json.dumps({"runs": {"legacy-run": {
+            "run_id": "legacy-run", "artifact_root": str(artifact)}}}))
+        command = [sys.executable, str(Path(__file__).with_name("resource-runner.py")),
+                   "--registry", str(registry), "observation", "--run-id", "legacy-run", "--json"]
+        result = subprocess.run(command, capture_output=True, text=True, check=False,
+                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": "/tmp"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         progress.read_public_run_record(artifact, "legacy-run"))
+
+    def test_private_observation_state_keeps_four_mib_read_limit(self):
+        self.assertEqual(progress.MAX_PUBLIC_RUN_RECORD_BYTES, 4 * 1024 * 1024)
+        self.assertEqual(progress.MAX_PUBLIC_RUN_RECORD_WRITE_BYTES, 16 * 1024)
+        base = Path(self.tmp.name) / "d4"
+        base.mkdir()
+        medium = base / "medium.json"
+        medium.write_text(json.dumps({"run_id": "r", "pad": "x" * (1024 * 1024)}))
+        self.assertEqual(progress._read_observation_state(medium)["run_id"], "r")
+        huge = base / "huge.json"
+        huge.write_bytes(b" " * (4 * 1024 * 1024 + 1))
+        with self.assertRaises(ValueError):
+            progress._read_observation_state(huge)
+
+    def test_missing_historical_metric_location_is_dropped_not_published(self):
+        base = Path(self.tmp.name) / "t7"
+        first, second = _legacy_epoch_run(base / "a", 5), _legacy_epoch_run(base / "b", 5)
+        artifact = base / "artifact"
+        decl = lambda folder: {"format": "epoch-json-files", "path": str(folder), "file_count": 340}
+        self.assertIsNotNone(progress.write_public_run_record(artifact, "hist",
+            {"output_dir": str(second), "metrics": [decl(first)]}))
+        import shutil
+        shutil.rmtree(first)
+        self.assertIsNotNone(progress.write_public_run_record(artifact, "hist",
+            {"output_dir": str(second), "metrics": [decl(second)]}))
+        record = progress.read_public_run_record(artifact, "hist")
+        self.assertEqual([item["path"] for item in record["metrics"]], [str(second)])
+        self.assertGreaterEqual(record["compaction"]["metrics_omitted"], 1)
+        self.assertEqual(_cairn_problems(artifact / "resource-runs" / "hist.json"), [])
 
 
 if __name__ == "__main__":
