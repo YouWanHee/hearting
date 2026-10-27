@@ -141,7 +141,8 @@ class R14Renderer(unittest.TestCase):
                         self.assertTrue(all(hit.y < footer for hit in compute_hits))
                         self.assertTrue(any(hit.action == ("tab", "COMPUTE") for hit in frame.hits))
                         tree = frame.tree_scroll
-                        self.assertEqual(tree[3], compute_hit.y)
+                        rule = tree[1] < compute_hit.y - 1       # the faint rule row above RESOURCES
+                        self.assertEqual(tree[3], compute_hit.y - 1 if rule else compute_hit.y)
                         tree_hits = [hit for hit in frame.hits
                                      if hit.action[:1] in (("scope",), ("route",))]
                         self.assertTrue(all(tree[1] <= hit.y < tree[3] for hit in tree_hits))

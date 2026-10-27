@@ -612,6 +612,11 @@ def _tree_row_count(vm, sessions):
     return total
 
 
+def _faint_rule(grid, y, width):
+    for xx in range(1, width - 1):
+        grid.put(xx, y, "┈", "line")
+
+
 def draw_explorer(grid: CellGrid, vm, state):
     width, height = min(NAV_WIDTH, grid.cols), grid.rows - 3
     if width <= 0 or height <= 0:
@@ -672,14 +677,17 @@ def draw_explorer(grid: CellGrid, vm, state):
                 grid.cells[y][xx] = (glyph, key, 236)
         x += len(view) + 3
     y += 1
-    # r14 separates the utility tabs from the SESSIONS band with a blank row.
-    y += 1
     sessions = tuple(vm.sessions or ())
     hosts = tuple(vm.compute or ())
     shown_hosts = hosts[:5]
     footer_start = max(0, grid.rows - 4)
     compute_rows = 2 + len(shown_hosts)
     compute_y = max(0, footer_start - compute_rows)
+    # r14's blank row between the utility tabs and the SESSIONS band carries one faint
+    # rule, so the fixed menu reads apart from the scrolling session tree.
+    if y < compute_y:
+        _faint_rule(grid, y, width)
+    y += 1
     working = sum(1 for item in sessions if item.get("state") == "working")
     idle = sum(1 for item in sessions if item.get("state") == "idle")
     blocked = sum(1 for item in sessions if item.get("state") == "blocked")
@@ -701,7 +709,10 @@ def draw_explorer(grid: CellGrid, vm, state):
         # At the shortest usage-open geometry the complete COMPUTE block owns
         # the remaining rows, so the sessions caption and tree yield space.
         tree_top = compute_y
-    tree_bottom = compute_y
+    # A second faint rule closes the tree above the anchored RESOURCES block when a tree
+    # row is left for it; the tree viewport, its wheel region and its hits end above it.
+    rule_y = compute_y - 1 if tree_top < compute_y - 1 else None
+    tree_bottom = compute_y if rule_y is None else rule_y
     tree_total = _tree_row_count(vm, sessions)
     tree_visible = max(0, tree_bottom - tree_top)
     tree_max = max(0, tree_total - tree_visible)
@@ -863,6 +874,10 @@ def draw_explorer(grid: CellGrid, vm, state):
     if y < cut and len(drag) >= 9 and drag[0] == "tree" and drag[8] and drag[7] and drag[6] == "end":
         grid.put(1, y, "↳", "accent", limit=width - 1)
     grid = base_grid
+    if rule_y is not None:
+        _faint_rule(grid, rule_y, width)
+        if tree_offset < tree_max:                  # more session rows wait below the viewport
+            grid.put(width - 9, rule_y, " ↓ more ", "dim", limit=width - 1)
 
     # The whole COMPUTE summary is anchored above the shared footer. The menu tab
     # remains in the VIEWS list; this compact block is a separate destination.

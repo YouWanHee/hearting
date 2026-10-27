@@ -57,6 +57,16 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
     y += 1
     repos = tuple(vm.repos or ())
     sessions = tuple(vm.sessions or ())
+    route_rows = [route for route in vm.routes if route.get("session_tag")]
+    # The ROUTES summary and RECENT stay in view under a long session list: the page
+    # viewport pins them to its bottom edge and only the sessions above them scroll.
+    # A short screen keeps fewer RECENT rows (at least one) before it gives the pin up.
+    room = getattr(grid, "viewport_rows", 0) - OVERVIEW_SCROLL_ROWS
+    recent = sum(1 for repo in repos if repo.get("done") and repo_label(repo.get("name")))
+    recent_rows = min(recent, max(min(1, recent), room - 4 - len(route_rows)))
+    tail_height = 4 + len(route_rows) + recent_rows
+    pin = getattr(grid, "pin_bottom", None)
+    sticky = pin is not None and getattr(state, "scope", "-") == "-" and tail_height <= room
     for repo in repos:
         name = repo_label(repo.get("name", "·"))
         mine = [session for session in sessions
@@ -173,6 +183,11 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
                 _tint_row(grid, row_y, x - 1, right, 236)
                 y = _session_unfold(grid, vm, x, use, y, session, c)
             if y >= grid.rows - 5:
+                if sticky:
+                    pin(None, tail_height, lambda target, top: _draw_overview_tail(
+                        target, vm, state, x, use, right, top, route_rows, repos, recent_rows=recent_rows))
+                    grid.mark_page_incomplete()
+                    return
                 grid.put(right - 18, grid.rows - 5, "↓ more below", "dim", limit=right)
                 return
     sessions_total = len(sessions)
@@ -182,26 +197,14 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
     summary = (f"{count_word(sessions_total, 'session')} · {working_sessions} working · "
                f"{questions} needs answer · {count_word(sum(1 for repo in repos if repo_label(repo.get('name', '·'))), 'project')}")
     grid.put(x + 1, y, summary, "dim")                # the summary runs to the screen edge and is cut there
+    if sticky:
+        pin(y + 1, tail_height, lambda target, top: _draw_overview_tail(
+            target, vm, state, x, use, right, top, route_rows, repos, recent_rows=recent_rows))
+        grid.report_natural_page_end(y + tail_height)
+        return
     y += 2
-    route_rows = [route for route in vm.routes if route.get("session_tag")]
-    open_routes = sum(1 for route in route_rows if route.get("state") != "done")
-    stopped = sum(1 for route in route_rows if route.get("state") == "dead")
-    grid.put(x, y, "── ", "line")
-    label_x = grid.put(x + 3, y, "ROUTES", "head")
+    _draw_overview_routes_rule(grid, vm, state, x, use, right, y, route_rows)
     scoped_page = getattr(state, "scope", "-") != "-"
-    meta = f"  {open_routes} open" + (f" · {stopped} stopped leg{'s' if stopped != 1 else ''}"
-                                      if stopped else "")
-    meta_end = grid.put(label_x, y, meta, "dim", limit=right)
-    grid.put(meta_end, y, " ", "branch_s")
-    for cell_x in range(meta_end + 1, right):
-        grid.put(cell_x, y, "─", "line")
-    mix = _harness_mix(route_rows)
-    mix_width = sum(len(text) for text, _key in mix)
-    mix_x = x + use - 2 - mix_width
-    if mix_x - x >= 40:                      # only where it clears the section's own title
-        cursor = mix_x
-        for text, key in mix:
-            cursor = grid.put(cursor, y, text, key, limit=right)
     y += 1
     if scoped_page:
         from types import SimpleNamespace
@@ -271,6 +274,25 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
                 grid.put(x + c_last, y, "clear " + last_clear, "dim", limit=right)
             y += 1
         return
+    _draw_overview_tail(grid, vm, state, x, use, right, y - 2, route_rows, repos, heading=False,
+                        limit=grid.rows - 5)
+
+
+OVERVIEW_SCROLL_ROWS = 4        # session rows the pinned tail always leaves above itself
+
+
+def _draw_overview_tail(grid, vm, state, x, use, right, y, route_rows, repos, heading=True, limit=None,
+                        recent_rows=None):
+    """The OVERVIEW ROUTES summary and RECENT block, from the blank gap row ``y`` down.
+
+    It is four rows (gap, two rules, the blank between them) plus one per route and
+    per shown RECENT repo; the pinned copy shows ``recent_rows`` of them.
+    """
+    y += 1
+    if heading:
+        _draw_overview_routes_rule(grid, vm, state, x, use, right, y, route_rows)
+    y += 1
+    scoped_page = getattr(state, "scope", "-") != "-"
     repo_order = {repo.get("id", repo.get("name", "")): index for index, repo in enumerate(repos)}
     route_rows.sort(key=lambda route: repo_order.get(route.get("repo"), len(repo_order)))
     for route in route_rows:
@@ -291,11 +313,35 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
     for cell_x in range(recent_title_end + 1, right):
         grid.put(cell_x, y, "─", "line")
     y += 1
+    shown = 0
     for repo in repos:
-        if not repo.get("done") or not repo_label(repo.get("name")) or y >= grid.rows - 5:
+        if not repo.get("done") or not repo_label(repo.get("name")) or (limit is not None and y >= limit):
             continue
+        if recent_rows is not None and shown >= recent_rows:
+            break
         _recent_row(grid, repo, x, use, y)
+        shown += 1
         y += 1
+
+
+def _draw_overview_routes_rule(grid, vm, state, x, use, right, y, route_rows):
+    open_routes = sum(1 for route in route_rows if route.get("state") != "done")
+    stopped = sum(1 for route in route_rows if route.get("state") == "dead")
+    grid.put(x, y, "── ", "line")
+    label_x = grid.put(x + 3, y, "ROUTES", "head")
+    meta = f"  {open_routes} open" + (f" · {stopped} stopped leg{'s' if stopped != 1 else ''}"
+                                      if stopped else "")
+    meta_end = grid.put(label_x, y, meta, "dim", limit=right)
+    grid.put(meta_end, y, " ", "branch_s")
+    for cell_x in range(meta_end + 1, right):
+        grid.put(cell_x, y, "─", "line")
+    mix = _harness_mix(route_rows)
+    mix_width = sum(len(text) for text, _key in mix)
+    mix_x = x + use - 2 - mix_width
+    if mix_x - x >= 40:                      # only where it clears the section's own title
+        cursor = mix_x
+        for text, key in mix:
+            cursor = grid.put(cursor, y, text, key, limit=right)
 
 
 def _recent_row(grid, repo, x, use, y):
