@@ -965,6 +965,21 @@ def draw_questions(grid, vm, state, x=34, y=3):
                         grid.put(x + 10, y, "detail:", "label")
                     grid.put(content_x, y, wrapped, "soft", limit=right)
                     y += 1
+            if envelope.get("source") == "S2" and isinstance(private_detail, Mapping):
+                target = private_detail.get("target")
+                if isinstance(target, Mapping):
+                    parts = ["gate: " + str(target.get("gate") or envelope.get("question_id") or "")]
+                    if target.get("node"):
+                        parts.append("target: " + str(target["node"]))
+                    if private_detail.get("response_mode") == "frame-interview":
+                        parts.append("submit answers to proceed")
+                    else:
+                        parts.append("choose proceed, revise, or stop")
+                    for wrapped in _wrap(" · ".join(parts), max(1, right - content_x)):
+                        if y >= bottom:
+                            break
+                        grid.put(content_x, y, wrapped, "soft", limit=right)
+                        y += 1
             status = str(private.get("status") or private.get("state") or "")
             support = envelope.get("support")
             if (support is False or
@@ -1094,7 +1109,13 @@ def draw_questions(grid, vm, state, x=34, y=3):
                     y += 1
                 elif (complete and can_answer and request_state == "open"
                       and not private.get("pending") and y < bottom):
-                    label = "[ submit answer ]"
+                    response_mode = (envelope.get("detail", {}).get("response_mode")
+                                     if isinstance(envelope.get("detail"), Mapping) else None)
+                    if envelope.get("source") == "S2":
+                        label = ("[ submit answers and proceed ]" if response_mode == "frame-interview"
+                                 else "[ submit gate decision ]")
+                    else:
+                        label = "[ submit answer ]"
                     end = grid.put(x + 10, y, label, "hearting", limit=right)
                     grid.add_hit(y, x + 10, end, ("question.submit",))
                     y += 1
