@@ -154,6 +154,67 @@ class Fleet2DetailReadinessTests(unittest.TestCase):
         self.assertIsNone(retained.snapshot.sessions[0].peer_last_recv)
         self.assertEqual(retained.snapshot.sessions[0].peer_sent_1h, 0)
 
+    def _steward_session(self, *, route_id=None, steward=True):
+        row = self._session(route_id=route_id)
+        row.steward = steward
+        row.steward_targets = ([{"harness": "codex", "session_id": "sid-worker", "source": "watch"}]
+                               if steward else None)
+        row.steward_parents = None
+        return row
+
+    def test_required_pass_keeps_last_judged_steward_role_through_merge(self):
+        # Only the optional pass judges the role; the next required pass carries
+        # the model default False, which must not overwrite a judged steward.
+        previous = LiveSnapshot(sessions=[self._steward_session()],
+                                observations={"optional:steward": {"state": "success",
+                                                                    "observed_at": 10}})
+        required = LiveSnapshot(sessions=[self._session()], observations={})
+        retained = details.retain_optional_last_good(
+            details.DetailSnapshot({}, previous), details.DetailSnapshot({}, required))
+        row = retained.snapshot.sessions[0]
+        self.assertTrue(row.steward)
+        self.assertEqual(row.steward_targets[0]["session_id"], "sid-worker")
+        self.assertEqual(retained.snapshot.observations["optional:steward"]["state"], "success")
+
+        basic = LiveSnapshot(sessions=[self._session()])
+        merged = details.merge(basic, details.DetailSnapshot(details.state_key(basic),
+                                                             retained.snapshot))
+        self.assertTrue(merged.sessions[0].steward)
+        self.assertEqual(merged.sessions[0].steward_targets[0]["session_id"], "sid-worker")
+
+        failed = LiveSnapshot(sessions=[self._session()],
+                              observations={"optional:steward": {"state": "failed",
+                                                                  "observed_at": 11}})
+        kept = details.retain_optional_last_good(
+            details.DetailSnapshot({}, previous), details.DetailSnapshot({}, failed))
+        self.assertTrue(kept.snapshot.sessions[0].steward)
+        self.assertEqual(kept.snapshot.observations["optional:steward"]["state"], "failed")
+        self.assertTrue(kept.snapshot.observations["optional:steward"]["last_good"])
+
+    def test_judged_steward_clear_and_changed_binding_do_not_inherit_role(self):
+        previous = LiveSnapshot(sessions=[self._steward_session(route_id="route-old")],
+                                observations={"optional:steward": {"state": "success"}})
+        cleared = LiveSnapshot(sessions=[self._steward_session(route_id="route-old",
+                                                               steward=False)],
+                               observations={"optional:steward": {"state": "success"}})
+        retained = details.retain_optional_last_good(
+            details.DetailSnapshot({}, previous), details.DetailSnapshot({}, cleared))
+        self.assertFalse(retained.snapshot.sessions[0].steward)
+        self.assertIsNone(retained.snapshot.sessions[0].steward_targets)
+
+        moved = LiveSnapshot(sessions=[self._session(route_id="route-new")], observations={})
+        retained = details.retain_optional_last_good(
+            details.DetailSnapshot({}, previous), details.DetailSnapshot({}, moved))
+        self.assertFalse(retained.snapshot.sessions[0].steward)
+        self.assertIsNone(retained.snapshot.sessions[0].steward_targets)
+
+        never_judged = LiveSnapshot(sessions=[self._steward_session()], observations={})
+        required = LiveSnapshot(sessions=[self._session()], observations={})
+        retained = details.retain_optional_last_good(
+            details.DetailSnapshot({}, never_judged), details.DetailSnapshot({}, required))
+        self.assertFalse(retained.snapshot.sessions[0].steward)
+        self.assertNotIn("optional:steward", retained.snapshot.observations)
+
     def test_required_details_need_success_and_exact_basic_identity(self):
         pending = _basic("basic-1")
         self.assertFalse(pending.required_details_ready)
@@ -240,9 +301,12 @@ class Fleet2DetailReadinessTests(unittest.TestCase):
                 mock.patch("tools.fleet.collectors.dispatch._candidate_jobs_paths",
                            return_value=[]), \
                 mock.patch("tools.fleet.collectors.peer_messages.collect", return_value={}) as peers, \
+                mock.patch("tools.fleet.collectors.steward.enrich") as steward, \
                 mock.patch("tools.fleet.herdr_projection.refresh_observed_tag_metadata") as panes:
             result = details._enrich(source, required=False)
 
+        steward.assert_called_once()
+        self.assertEqual(result.snapshot.observations["optional:steward"]["state"], "success")
         route_enrich.assert_not_called()
         attach.assert_not_called()
         degradations.assert_not_called()
@@ -254,6 +318,25 @@ class Fleet2DetailReadinessTests(unittest.TestCase):
         peers.assert_called_once()
         panes.assert_called_once()
         self.assertTrue(result.snapshot.required_details_ready)
+
+    def test_failed_steward_judgment_is_recorded_not_reported_as_clear(self):
+        source = _basic("basic-steward-failed")
+        set_required_details(source, "ok", all_new=True, observed_at=106.0)
+        with mock.patch("tools.fleet.collectors.dispatch._fill_locations"), \
+                mock.patch("tools.fleet.collectors.dispatch._campaign_labels"), \
+                mock.patch("tools.fleet.collectors._adopt_child_titles"), \
+                mock.patch("tools.fleet.titles.annotate"), \
+                mock.patch("tools.fleet.work_titles.annotate"), \
+                mock.patch("tools.fleet.collectors.dispatch._pending_delivery_counts",
+                           return_value=None), \
+                mock.patch("tools.fleet.collectors.dispatch._candidate_jobs_paths",
+                           return_value=[]), \
+                mock.patch("tools.fleet.collectors.peer_messages.collect", return_value={}), \
+                mock.patch("tools.fleet.collectors.steward.enrich",
+                           side_effect=RuntimeError("marker root unreadable")), \
+                mock.patch("tools.fleet.herdr_projection.refresh_observed_tag_metadata"):
+            result = details._enrich(source, required=False)
+        self.assertEqual(result.snapshot.observations["optional:steward"]["state"], "failed")
 
     def test_required_only_pass_defers_optional_detail_sources(self):
         source = _basic("basic-pending")
@@ -267,14 +350,16 @@ class Fleet2DetailReadinessTests(unittest.TestCase):
                 mock.patch("tools.fleet.work_titles.annotate") as work_titles, \
                 mock.patch("tools.fleet.collectors.dispatch._pending_delivery_counts") as deliveries, \
                 mock.patch("tools.fleet.collectors.peer_messages.collect") as peers, \
+                mock.patch("tools.fleet.collectors.steward.enrich") as steward, \
                 mock.patch("tools.fleet.herdr_projection.refresh_observed_tag_metadata") as panes:
             result = details._enrich(source, required_only=True)
 
         route_enrich.assert_called_once()
         attach.assert_called_once()
         degradations.assert_called_once()
+        self.assertNotIn("optional:steward", result.snapshot.observations)
         for optional in (campaigns, child_titles, title_details, work_titles,
-                         deliveries, peers, panes):
+                         deliveries, peers, steward, panes):
             optional.assert_not_called()
         self.assertTrue(result.snapshot.required_details_ready)
 
