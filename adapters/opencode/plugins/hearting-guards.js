@@ -1389,15 +1389,45 @@ function forgetShownCandidates(sessionID) {
 }
 
 function collectCandidates(args) {
-  const result = spawnSync(preflight, ["candidates", ...args], {
+  const [prompt, cwd, sid, turn] = args
+  const command = [path.join(root, "hooks", "mem-recall-inject.sh"),
+    "--prompt", prompt, "--cwd", cwd, "--session-id", sid,
+    "--runtime", "opencode", "--format", "hook-json"]
+  if (turn) command.push("--turn-id", turn)
+  const result = spawnSync("bash", command, {
     cwd: root,
-    env: { ...process.env, AGENT_HOME: root },
+    env: { ...process.env, AGENT_HOME: root, MEM_CANDIDATE_DEFER_COMMIT: "1" },
     encoding: "utf8",
     timeout: 3000,
     killSignal: "SIGKILL",
   })
-  if (result.error || result.status !== 0) return ""
-  return (result.stdout || "").trim()
+  if (result.error || result.status !== 0) return { text: "", pending: null }
+  try {
+    const value = JSON.parse(result.stdout || "{}")
+    const output = value.hookSpecificOutput || {}
+    return {
+      text: String(output.additionalContext || "").trim(),
+      pending: value.deferredCandidateReceipt || null,
+    }
+  } catch { return { text: "", pending: null } }
+}
+
+// The plugin renders the candidate/card text into the system prompt of a model
+// call; the helper only prepares its receipt. Commit it here, after the block
+// was appended to this call's output, so a lost render leaves the same
+// candidates and card generation due for the next prompt. Fail-open.
+function commitDeferred(helper, command, pending) {
+  if (!pending || isWorkerSession()) return
+  try {
+    spawnSync("python3", [helper, command], {
+      cwd: root,
+      env: { ...process.env, AGENT_HOME: root },
+      input: JSON.stringify(pending),
+      encoding: "utf8",
+      timeout: 3000,
+      killSignal: "SIGKILL",
+    })
+  } catch {}
 }
 
 // Parent completion carrier (`opencode-turn`, utilities/harness_capabilities.py). A parent
@@ -1624,9 +1654,9 @@ function createCompletionCarrier(ctx) {
 // Session card / tidy notice: `session_tidy.py hook` records the event and prints
 // what this session is due, once. Every failure is empty (no card, no throw).
 function collectCard(event, sid, cwd, prompt = "") {
-  if (!sid || isWorkerSession()) return ""
+  if (!sid || isWorkerSession()) return { text: "", pending: null }
   const result = spawnSync("python3", [sessionTidy, "hook", "--harness", "opencode",
-    "--event", event, "--session-id", sid, "--cwd", cwd], {
+    "--event", event, "--session-id", sid, "--cwd", cwd, "--format", "json"], {
     cwd: root,
     env: { ...process.env, AGENT_HOME: root },
     input: JSON.stringify({ prompt }),
@@ -1634,8 +1664,14 @@ function collectCard(event, sid, cwd, prompt = "") {
     timeout: 4000,
     killSignal: "SIGKILL",
   })
-  if (result.error || result.status !== 0) return ""
-  return (result.stdout || "").trim()
+  if (result.error || result.status !== 0) return { text: "", pending: null }
+  try {
+    const value = JSON.parse(result.stdout || "{}")
+    return {
+      text: String(value.additionalContext || "").trim(),
+      pending: value.deferredConsumed || null,
+    }
+  } catch { return { text: "", pending: null } }
 }
 
 function collectCardPayload(event, sid, cwd, prompt = "") {
@@ -2519,9 +2555,10 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
     }
     const cardTurn = turn || prompt
     if (eventSid && (!cardTurn || cardBySession.get(sid)?.turn !== cardTurn)) {
-      const cardText = collectCard("prompt", eventSid, baseDir(ctx), prompt)
+      const cardResult = collectCard("prompt", eventSid, baseDir(ctx), prompt)
       collectHistoryNotice(ctx, eventSid, baseDir(ctx), prompt, true)
-      cardBySession.set(sid, { turn: cardTurn, text: cardText })
+      cardBySession.set(sid, { turn: cardTurn, text: cardResult.text,
+                               pending: cardResult.pending })
     }
   },
   "experimental.chat.messages.transform": async (_input, output) => {
@@ -2573,15 +2610,30 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
     // back to the prompt text itself as the turn key.
     const turnKey = turn || prompt
     if (prompt && (!cached || cached.turn !== turnKey)) {
+      const candidates = collectCandidates([prompt, cwd, sid, turn])
       const blocks = [
-        collectCandidates([prompt, cwd, sid, turn]),
+        candidates.text,
         collectPreflight("prompt-signal", [cwd, sid]),
         collectPreflight("briefing", [cwd]),
       ].filter(Boolean)
-      turnContextBySession.set(sid, { turn: turnKey, blocks })
+      turnContextBySession.set(sid, { turn: turnKey, blocks,
+                                      pending: candidates.pending })
     }
     for (const block of turnContextBySession.get(sid)?.blocks || []) {
       appendContext(output, block)
+    }
+    // Commit only after this call's output exists. A later failure leaves the
+    // same material due next prompt; the helper never wrote it itself.
+    const turnContext = turnContextBySession.get(sid)
+    if (turnContext?.pending) {
+      turnContextBySession.set(sid, { ...turnContext, pending: null })
+      commitDeferred(path.join(root, "tools", "memory", "mem.py"),
+                     "_apply-candidate-receipt", turnContext.pending)
+    }
+    const cardState = cardBySession.get(sid)
+    if (cardState?.pending) {
+      cardBySession.set(sid, { ...cardState, pending: null })
+      commitDeferred(sessionTidy, "_apply-deferred", cardState.pending)
     }
   },
   "experimental.session.compacting": async (input, output) => {

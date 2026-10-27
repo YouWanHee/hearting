@@ -57,8 +57,8 @@ class HistoryChannelTests(unittest.TestCase):
         payload = {"additionalContext": "MODEL-CARD", "humanNotice": "PERSON-NOTICE"}
         result = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
         with patch.object(codex.subprocess, "run", return_value=result):
-            card, human = codex.card_context({"session_id": "sid"}, "/fixture")
-        self.assertEqual((card, human), ("MODEL-CARD", "PERSON-NOTICE"))
+            card, human, deferred = codex.card_context({"session_id": "sid"}, "/fixture")
+        self.assertEqual((card, human, deferred), ("MODEL-CARD", "PERSON-NOTICE", None))
 
     def test_human_only_lookup_leaves_ledger_and_receipts_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
