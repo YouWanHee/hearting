@@ -683,6 +683,8 @@ def _reduce(state, event, frame=None):
             return replace(state, folds=tuple(sorted(folds.items()))), ()
         if action[0] == "models.apply" and len(action) in (5, 7):
             return state, (action,)
+        if action[0] == "alloc.apply" and len(action) == 3:
+            return state, (action,)
         if action[0] == "usage":
             return replace(state, usage_open=not state.usage_open), ()
         if action[0] in ("page", "scope") and len(action) > 1:
