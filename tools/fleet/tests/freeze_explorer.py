@@ -74,6 +74,7 @@ _STYLE_KEYS.update({
     "g_blocked", "g_dead", "grp_live", "grp_hot", "grp_cool", "g_idle", "lvl_y",
     "lvl_y_dim", "lvl_r", "lvl_r_dim", "blocked", "steward", "accent", "hearting",
     "gpu_ada", "eff_medium", "eff_xhigh", "version_release", "fam_gpt", "fam_opus", "code",
+    "fam_sol", "fam_astra", "fam_luna",
     "stg0_on", "stg1_on", "stg2_on", "stg3_on", "stg4_on", "stg0_off", "stg1_off",
     "stg2_off", "stg3_off", "stg4_off", "unknown",
 })
