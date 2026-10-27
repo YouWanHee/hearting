@@ -231,6 +231,34 @@ def resource_key(row):
     return RESUME.row_digest(body)
 
 
+NONTERMINAL_RESOURCE_REASON = "resource-observation-unsettled"
+
+
+def resource_attention_delivery_key(key):
+    """Identify the one advisory receipt for an unsettled execution."""
+    return RESUME.row_digest({"kind": "nonterminal-resource-attention", "resource_key": key})
+
+
+def resource_needs_attention(row, evidence):
+    """Surface failures and uncertain observations without settling execution."""
+    if evidence.get("terminal") is True and evidence.get("quiescent") is True:
+        return False
+    if row.get("cancel_requested") or row.get("status") in {"failed", "cancelled"}:
+        return True
+    if evidence.get("terminal") is True:
+        # A terminal exit whose process group is not quiescent still has cleanup
+        # work outstanding and must not be reported as a settled result.
+        return True
+    liveness = evidence.get("liveness")
+    reason = evidence.get("reason")
+    if liveness == "working":
+        return False
+    if reason == "resource-launching" and liveness in {None, "working"}:
+        return False
+    # Missing or ambiguous liveness is an owner-facing attention condition.
+    return True
+
+
 def context(args, control):
     """Read only exact armed records under the current owner route and registry."""
     import owner_route_binding as OWNER
@@ -455,7 +483,12 @@ def acknowledge(path, parent, receipt_id):
         box = resource.get("outbox")
         if not box or box["receipt_id"] != receipt_id:
             return False
-        resource["delivered"] = resource["delivered"] + [box["key"]]
+        receipt = box["receipt"]
+        delivered_key = (resource_attention_delivery_key(box["key"])
+                         if receipt.get("reason") == NONTERMINAL_RESOURCE_REASON
+                         else box["key"])
+        if delivered_key not in resource["delivered"]:
+            resource["delivered"] = resource["delivered"] + [delivered_key]
         resource["outbox"] = None
         JOIN._write_supervisor_state_unlocked(path, parent, set(state.delivered_attempt_ids),
             phase="running-turn", outbox=state.outbox, resource=resource)
@@ -543,27 +576,38 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
             if key in resource["delivered"]:
                 continue
             evidence = sup.resource_evidence(armed)
-            if not evidence.get("terminal") or evidence.get("quiescent") is not True:
+            settled = evidence.get("terminal") is True and evidence.get("quiescent") is True
+            attention = not settled and resource_needs_attention(row, evidence)
+            if not settled and not attention:
                 continue
-            succeeded = resource_execution_succeeded(row)
-            artifacts = sup.artifact_evidence(armed)
-            outcome = ("cancelled" if row.get("cancel_requested") else
-                       "succeeded" if succeeded else "needs-attention")
-            operation_set = sup.read_resource_watches(ledger, armed["node"])
-            multi_operation = (len(operation_set) > 1
-                               or row.get("resource_operation") is not None)
-            stage_state = ledger.state().get("nodes", {}).get(armed["node"], {}).get("state")
-            reason = (("awaiting-resource-operations" if multi_operation else "awaiting-next-resource")
-                      if succeeded and not artifacts.get("missing") else
-                      "declared-output-pending" if succeeded else
-                      stage_state if stage_state in {"FAILED_RETRYABLE", "FAILED_TERMINAL", "CANCELLED"} else
-                      row.get("failure_class") or row.get("status"))
+            if attention:
+                if resource_attention_delivery_key(key) in resource["delivered"]:
+                    continue
+                outcome = "cancelled" if row.get("cancel_requested") else "needs-attention"
+                reason = NONTERMINAL_RESOURCE_REASON
+                exit_code = None
+            else:
+                succeeded = resource_execution_succeeded(row)
+                artifacts = sup.artifact_evidence(armed)
+                outcome = ("cancelled" if row.get("cancel_requested") else
+                           "succeeded" if succeeded else "needs-attention")
+                operation_set = sup.read_resource_watches(ledger, armed["node"])
+                multi_operation = (len(operation_set) > 1
+                                   or row.get("resource_operation") is not None)
+                stage_state = ledger.state().get("nodes", {}).get(armed["node"], {}).get("state")
+                reason = (("awaiting-resource-operations" if multi_operation else "awaiting-next-resource")
+                          if succeeded and not artifacts.get("missing") else
+                          "declared-output-pending" if succeeded else
+                          stage_state if stage_state in {"FAILED_RETRYABLE", "FAILED_TERMINAL", "CANCELLED"} else
+                          row.get("failure_class") or row.get("status"))
+                exit_code = evidence.get("exit_code")
             receipt = {"type": "resource-completion", "parent_attempt_id": args.parent_attempt_id,
                 "session_id": control.thread_id, "route_id": args.route_id, "route_hash": args.route_hash,
                 "jobs": str(Path(args.jobs).resolve()), "node": armed["node"], "run_id": row["run_id"],
                 "resource_key": key, "resource_sha256": RESUME.row_digest(row),
-                "state": outcome, "exit_code": evidence.get("exit_code"), "reason": reason,
-                **({"launch_error": row["launch_error"]} if row.get("launch_error") else {}),
+                "state": outcome, "exit_code": exit_code, "reason": reason,
+                **({"launch_error": row["launch_error"]}
+                   if outcome == "needs-attention" and row.get("launch_error") else {}),
                 "verification_pass": False, "workflow_complete": False,
                 "experiment_result": _experiment_result_note(row), "successors": []}
             ready.append((str(armed.get("node")), str(row.get("run_id")), key, receipt))

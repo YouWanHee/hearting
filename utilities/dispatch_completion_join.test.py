@@ -1642,7 +1642,9 @@ class DispatchCompletionJoinTest(unittest.TestCase):
             resource_evidence=lambda _: {"terminal":run["status"]=="succeeded",
                                          "quiescent":run["status"]=="succeeded",
                                          "succeeded":run["status"]=="succeeded",
-                                         "liveness":"exited", "exit_code":0},
+                                         "liveness":"exited" if run["status"]=="succeeded" else "working",
+                                         "reason":None if run["status"]=="succeeded" else "resource-still-running",
+                                         "exit_code":0 if run["status"]=="succeeded" else None},
             artifact_evidence=lambda _: {"checked":True,"missing":[]},
             runner=lambda: SimpleNamespace(read_sentinel=lambda _:0))
         ledger = SimpleNamespace(state=lambda: {"nodes":{"full-run":stage}})
@@ -1683,10 +1685,13 @@ class DispatchCompletionJoinTest(unittest.TestCase):
                 row = {"run_id":"run", "pid":123, "starttime":"100", "command":["approved"],
                        "node":"full-run", "owner_wait":{}, "status":"failed", "cancel_requested":reason=="cancelled"}
                 stage = {"state":"RUNNING" if reason=="lostwatch" else "FAILED_RETRYABLE"}
-                sup = SimpleNamespace(poll_once=mock.Mock(), resource_evidence=lambda _: {"terminal":False},
-                    artifact_evidence=lambda _: {"missing":[]},runner=lambda:SimpleNamespace(read_sentinel=lambda _:None))
+                observation = {"terminal":False, "reason":"fixture-observation-unknown", "liveness":"unknown"}
+                armed = {"node":"full-run"}
+                sup = SimpleNamespace(poll_once=mock.Mock(), resource_evidence=lambda _: dict(observation),
+                    artifact_evidence=lambda _: {"missing":[]}, read_resource_watches=lambda *_: [armed],
+                    runner=lambda:SimpleNamespace(read_sentinel=lambda _:None))
                 ledger = SimpleNamespace(state=lambda:{"nodes":{"full-run":stage}})
-                ctx = (sup,{},ledger,[({"node":"full-run","successors":["verify"]},row)])
+                ctx = (sup,{},ledger,[(armed,row)])
                 control = SimpleNamespace(thread_id="same-native", pending=lambda:True)
                 # Normal begin-turn/start_binding precede the resource request.
                 # A pending correction must preserve that already-bound state.
@@ -1706,13 +1711,52 @@ class DispatchCompletionJoinTest(unittest.TestCase):
                     control.pending = lambda:False
                     prompt = RESOURCE.wait(args,path,control,set(),lambda _:None)
                     state = JOIN.read_supervisor_phase_state(path,"att-parent")
+                    key = RESOURCE.resource_key(row)
+                    attention_id = RESOURCE.resource_attention_delivery_key(key)
                     self.assertEqual(state.resource["outbox"]["receipt"]["successors"],[])
                     self.assertFalse(state.resource["outbox"]["receipt"]["verification_pass"])
+                    self.assertEqual(state.resource["outbox"]["receipt"]["resource_key"],key)
+                    self.assertEqual(state.resource["outbox"]["receipt"]["reason"],
+                                     RESOURCE.NONTERMINAL_RESOURCE_REASON)
+                    self.assertIsNone(state.resource["outbox"]["receipt"]["exit_code"])
                     self.assertEqual(state.delivered_attempt_ids,frozenset())
                     self.assertIn('"state":"cancelled"' if reason=="cancelled" else '"state":"needs-attention"',prompt)
+                    receipt_id = state.resource["outbox"]["receipt_id"]
+                    self.assertTrue(RESOURCE.acknowledge(path,"att-parent",receipt_id))
+                    state = JOIN.read_supervisor_phase_state(path,"att-parent")
+                    self.assertEqual(state.resource["delivered"],[attention_id])
+                    self.assertNotIn(key,state.resource["delivered"])
+                    self.assertTrue(JOIN.valid_resource_state(state.resource))
+
+                    class WaitPaused(Exception):
+                        pass
+                    with self.assertRaises(WaitPaused):
+                        RESOURCE.wait(args,path,control,set(),lambda _:None,
+                                      sleep=lambda _:(_ for _ in ()).throw(WaitPaused()))
+                    state = JOIN.read_supervisor_phase_state(path,"att-parent")
+                    self.assertIsNone(state.resource["outbox"])
+                    self.assertEqual(state.resource["delivered"],[attention_id])
+
+                    # The same execution later becomes terminal and quiescent;
+                    # its real result still travels through the resource-key ACK.
+                    observation.update(terminal=True, quiescent=True, liveness="exited", exit_code=1)
+                    with mock.patch.object(RESOURCE,"resource_execution_succeeded",return_value=False):
+                        prompt = RESOURCE.wait(args,path,control,set(),lambda _:None,
+                            sleep=lambda _:self.fail("terminal resource receipt must return immediately"))
+                    state = JOIN.read_supervisor_phase_state(path,"att-parent")
+                    self.assertIn('"state":"cancelled"' if reason=="cancelled" else
+                                  '"state":"needs-attention"',prompt)
+                    self.assertEqual(state.resource["outbox"]["key"],key)
+                    self.assertEqual(state.resource["outbox"]["receipt"]["exit_code"],1)
                     control.thread_id="foreign-native"
                     with self.assertRaisesRegex(JOIN.JoinContractError,"resource-outbox-binding-changed"):
                         RESOURCE.wait(args,path,control,set(),lambda _:None)
+                    control.thread_id="same-native"
+                    self.assertTrue(RESOURCE.acknowledge(path,"att-parent",
+                                                         state.resource["outbox"]["receipt_id"]))
+                    state = JOIN.read_supervisor_phase_state(path,"att-parent")
+                    self.assertIn(attention_id,state.resource["delivered"])
+                    self.assertIn(key,state.resource["delivered"])
 
     def test_resource_context_keeps_owner_session_route_jobs_and_original_body_together(self):
         import copy

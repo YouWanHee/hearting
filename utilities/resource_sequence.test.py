@@ -1785,13 +1785,80 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             route_id=route['route_id'], route_hash=route['route_hash'], jobs=str(jobs))
         pairs = [(armed, json.loads(Path(armed['resource_registry']).read_text())['runs'][armed['predecessor_id']])
                  for armed in current]
-        with mock.patch.object(WAIT, 'context', return_value=(SUP, route, ledger, pairs)):
+        var_armed, var_row = next((armed, row) for armed, row in pairs
+                                  if row['run_id'] == 'var-run')
+        var_key = WAIT.resource_key(var_row)
+        actual_resource_evidence = SUP.resource_evidence
+
+        def temporarily_unknown(armed):
+            if armed['predecessor_id'] == 'var-run':
+                return {'terminal': False, 'reason': 'fixture-observation-unknown',
+                        'liveness': 'unknown'}
+            return actual_resource_evidence(armed)
+
+        with mock.patch.object(WAIT, 'context', return_value=(SUP, route, ledger, pairs)), \
+             mock.patch.object(SUP, 'resource_evidence', side_effect=temporarily_unknown), \
+             mock.patch.object(SUP, 'poll_once'):
             prompt = WAIT.wait(args, phase, control, set(), lambda _event: None,
-                              sleep=lambda _seconds: self.fail('ready var receipt must not wait for fix'))
+                              sleep=lambda _seconds: self.fail('unknown var observation must return attention'))
+        state = WAIT.JOIN.read_supervisor_phase_state(phase, owner_attempt)
+        attention = state.resource['outbox']['receipt']
+        self.assertIn('var-run', prompt)
+        self.assertEqual((attention['run_id'], attention['state']), ('var-run', 'needs-attention'))
+        self.assertEqual(attention['reason'], WAIT.NONTERMINAL_RESOURCE_REASON)
+        self.assertFalse(attention['verification_pass'])
+        attention_id = WAIT.resource_attention_delivery_key(var_key)
+        self.assertTrue(WAIT.acknowledge(phase, owner_attempt, state.resource['outbox']['receipt_id']))
+        state = WAIT.JOIN.read_supervisor_phase_state(phase, owner_attempt)
+        self.assertEqual(state.resource['delivered'], [attention_id])
+        self.assertNotIn(var_key, state.resource['delivered'])
+
+        # ACKing attention leaves the live aggregate closed; it does not consume
+        # this execution's resource_key or claim its successor.
+        with mock.patch.object(SUP, 'resource_evidence', side_effect=temporarily_unknown):
+            with self.assertRaisesRegex(SUP.SupervisorError, 'resource-owner-operation-unsettled'):
+                SUP.admit_owner_successor_start(route, 'run-verify', jobs, owner_attempt, 'same-native')
+        self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'RUNNING')
+        self.assertEqual(ledger.claims(), {})
+
+        class WaitPaused(Exception):
+            pass
+
+        with mock.patch.object(WAIT, 'context', return_value=(SUP, route, ledger, pairs)), \
+             mock.patch.object(SUP, 'resource_evidence', side_effect=temporarily_unknown), \
+             mock.patch.object(SUP, 'poll_once'):
+            with self.assertRaises(WaitPaused):
+                WAIT.wait(args, phase, control, set(), lambda _event: None,
+                          sleep=lambda _seconds: (_ for _ in ()).throw(WaitPaused()))
+        state = WAIT.JOIN.read_supervisor_phase_state(phase, owner_attempt)
+        self.assertIsNone(state.resource['outbox'])
+        self.assertEqual(state.resource['delivered'], [attention_id])
+
+        # The same bound execution later has real terminal/quiescent evidence.
+        terminal_var_evidence = actual_resource_evidence(var_armed)
+        self.assertTrue(terminal_var_evidence['terminal'])
+        self.assertTrue(terminal_var_evidence['quiescent'])
+
+        def restored_observation(armed):
+            if armed['predecessor_id'] == 'var-run':
+                return terminal_var_evidence
+            return actual_resource_evidence(armed)
+
+        with mock.patch.object(WAIT, 'context', return_value=(SUP, route, ledger, pairs)), \
+             mock.patch.object(SUP, 'resource_evidence', side_effect=restored_observation), \
+             mock.patch.object(SUP, 'poll_once'):
+            prompt = WAIT.wait(args, phase, control, set(), lambda _event: None,
+                              sleep=lambda _seconds: self.fail('terminal var receipt must return immediately'))
         receipt = WAIT.JOIN.read_supervisor_phase_state(phase, owner_attempt).resource['outbox']['receipt']
         self.assertIn('var-run', prompt)
         self.assertEqual((receipt['run_id'], receipt['state']), ('var-run', 'succeeded'))
+        self.assertEqual(receipt['resource_key'], var_key)
         self.assertFalse(receipt['verification_pass'])
+        self.assertTrue(WAIT.acknowledge(phase, owner_attempt,
+                                         WAIT.JOIN.read_supervisor_phase_state(phase, owner_attempt)
+                                         .resource['outbox']['receipt_id']))
+        self.assertIn(var_key, WAIT.JOIN.read_supervisor_phase_state(
+            phase, owner_attempt).resource['delivered'])
         with self.assertRaisesRegex(SUP.SupervisorError, 'resource-owner-operation-unsettled'):
             SUP.admit_owner_successor_start(route, 'run-verify', jobs, owner_attempt, 'same-native')
         self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'RUNNING')
