@@ -32,6 +32,7 @@ _COMPACT_SEGMENTS = 128
 _NON_CANONICAL_LINE_SEPARATORS = (b"\r", b"\v", b"\f", b"\x1c", b"\x1d",
                                  b"\x1e", b"\xc2\x85", b"\xe2\x80\xa8",
                                  b"\xe2\x80\xa9")
+_LIVE_STATUSES = frozenset({"open", "running"})
 _LOCK = threading.RLock()
 _CACHE: OrderedDict[str, "RegistryView"] = OrderedDict()
 _READ_SCOPE: contextvars.ContextVar = contextvars.ContextVar("dispatch_registry_read_scope", default=None)
@@ -66,8 +67,7 @@ def _utf8_status(data: bytes) -> tuple[bool, bool]:
     return False, consumed < len(data)
 
 
-@functools.lru_cache(maxsize=8192)
-def _completion_metadata(raw: str) -> tuple[tuple[str, str], ...]:
+def _parse_completion(raw: str) -> tuple[tuple[str, str], ...]:
     values = {}
     for part in raw.split(","):
         if "=" in part:
@@ -76,14 +76,37 @@ def _completion_metadata(raw: str) -> tuple[tuple[str, str], ...]:
     return tuple(values.items())
 
 
-@functools.lru_cache(maxsize=8192)
-def _handover_metadata(raw: str) -> tuple[tuple[str, str], ...]:
+def _parse_handover(raw: str) -> tuple[tuple[str, str], ...]:
     values = {}
     for part in raw.split(","):
         key, separator, value = part.partition("=")
         if separator and key.strip():
             values[key.strip()] = value
     return tuple(values.items())
+
+
+# Terminal rows parse on demand; the small LRU only spares repeated lookups of
+# the same few rows and is cleared whenever a view generation is dropped.
+_LAZY_PARSE_CACHE_SIZE = 256
+_completion_metadata = functools.lru_cache(maxsize=_LAZY_PARSE_CACHE_SIZE)(_parse_completion)
+_handover_metadata = functools.lru_cache(maxsize=_LAZY_PARSE_CACHE_SIZE)(_parse_handover)
+
+
+def _clear_parse_caches() -> None:
+    _completion_metadata.cache_clear()
+    _handover_metadata.cache_clear()
+
+
+def _handover_keys(metadata: dict) -> tuple:
+    """Index keys a handover row contributes: parent, binding, headless-owner flag."""
+    route = metadata.get("owner_route_id") or metadata.get("route_id") or ""
+    digest = metadata.get("owner_route_hash") or metadata.get("route_hash") or ""
+    headless = bool(metadata.get("dispatch_depth") == "1" and metadata.get("worker_type") == "owner"
+                    and metadata.get("harness") == "opencode"
+                    and metadata.get("transport") == "headless"
+                    and metadata.get("registered_worker") == "1"
+                    and metadata.get("execution_surface") == "registered-headless")
+    return (metadata.get("parent_sid"), (route, digest, metadata.get("route_node") or ""), headless)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,8 +148,9 @@ class _RegistrySegment:
                  "headless_owner_rows", "selection_by_parent", "selection_by_slug",
                  "selection_by_attempt", "selection_by_parent_slug")
 
-    def __init__(self, lines: tuple[str, ...], order_base: int):
+    def __init__(self, lines, order_base: int):
         records = []
+        handover_keys = {}
         malformed_lines = []
         completion_latest = {}
         completion_errors = {}
@@ -148,12 +172,16 @@ class _RegistrySegment:
                 self.malformed_rows += 1
                 malformed_lines.append((order_base + relative_order, line))
                 continue
-            completion_pairs = _completion_metadata(fields[5])
+            completion_pairs = _parse_completion(fields[5])
             canonical_keys = all(key and key == key.strip() for key, _value in completion_pairs)
             handover_pairs = (completion_pairs if canonical_keys
-                              else _handover_metadata(fields[5]))
-            record = RegistryRecord(order_base + relative_order, fields,
-                                    completion_pairs, handover_pairs)
+                              else _parse_handover(fields[5]))
+            if fields[1] in _LIVE_STATUSES:
+                record = RegistryRecord(order_base + relative_order, fields,
+                                        completion_pairs, handover_pairs)
+            else:
+                # Terminal rows keep only their text; metadata parses on demand.
+                record = RegistryRecord(order_base + relative_order, fields)
             records.append(record)
             completion_meta = dict(completion_pairs)
             handover_meta = completion_meta if canonical_keys else dict(handover_pairs)
@@ -191,6 +219,7 @@ class _RegistrySegment:
             handover_attempt = handover_meta.get("attempt_id")
             if handover_attempt:
                 handover_latest[handover_attempt] = (fields[1], record)
+                handover_keys[handover_attempt] = _handover_keys(handover_meta)
         self.records = tuple(records)
         self.malformed_lines = tuple(malformed_lines)
         self.completion_latest = completion_latest
@@ -212,27 +241,24 @@ class _RegistrySegment:
         self.selection_by_parent_slug = {
             key: tuple(value) for key, value in selection_by_parent_slug.items()
         }
-        self._index_handover()
+        self._index_handover(handover_keys)
 
-    def _index_handover(self):
+    def _index_handover(self, handover_keys=None):
         self.handover_by_parent = {}
         self.handover_by_binding = {}
         headless = []
         for attempt, (status, record) in self.handover_latest.items():
-            metadata = record.handover_metadata()
-            parent = metadata.get("parent_sid")
+            keys = handover_keys.get(attempt) if handover_keys else None
+            if keys is None:     # merged segments: parse without touching the LRU
+                keys = _handover_keys(dict(record._handover_pairs
+                                           or _parse_handover(record.fields[5])))
+            parent, binding, is_headless = keys
             if parent:
                 self.handover_by_parent.setdefault(parent, {})[attempt] = (status, record)
-            route = metadata.get("owner_route_id") or metadata.get("route_id") or ""
-            digest = metadata.get("owner_route_hash") or metadata.get("route_hash") or ""
-            node = metadata.get("route_node") or ""
+            route, digest, _node = binding
             if route and digest:     # an owner row has no route node: it binds as (route, hash, "")
-                self.handover_by_binding.setdefault((route, digest, node), {})[attempt] = (status, record)
-            if (metadata.get("dispatch_depth") == "1" and metadata.get("worker_type") == "owner"
-                    and metadata.get("harness") == "opencode"
-                    and metadata.get("transport") == "headless"
-                    and metadata.get("registered_worker") == "1"
-                    and metadata.get("execution_surface") == "registered-headless"):
+                self.handover_by_binding.setdefault(binding, {})[attempt] = (status, record)
+            if is_headless:
                 headless.append((status, record))
         self.headless_owner_rows = tuple(headless)
 
@@ -306,6 +332,16 @@ class _RegistrySegment:
         return result
 
 
+def _iter_lf_lines(raw: bytes, boundary: int, counted: list):
+    """Yield the complete LF-terminated rows of ``raw[:boundary]`` like ``splitlines``."""
+    position = 0
+    while position < boundary:
+        end = raw.find(b"\n", position)
+        counted[0] += 1
+        yield raw[position:end].decode("utf-8", errors="replace")
+        position = end + 1
+
+
 class RegistryView:
     """Immutable segmented registry view with incremental append indexes."""
 
@@ -334,12 +370,20 @@ class RegistryView:
                 and not any(separator in raw for separator in _NON_CANONICAL_LINE_SEPARATORS)
             )
             boundary = raw.rfind(b"\n") + 1
-            complete = raw[:boundary].decode("utf-8", errors="replace").splitlines()
             tail = raw[boundary:]
-            segment = _RegistrySegment(tuple(complete), 0)
-            self._segments = (segment,) if complete else ()
+            if self._prefix_reuse_eligible:
+                # LF is the only separator: decode one row at a time so the
+                # whole text and its line list never coexist.
+                counted = [0]
+                segment = _RegistrySegment(_iter_lf_lines(raw, boundary, counted), 0)
+                complete_count = counted[0]
+            else:
+                complete = raw[:boundary].decode("utf-8", errors="replace").splitlines()
+                segment = _RegistrySegment(tuple(complete), 0)
+                complete_count = len(complete)
+            self._segments = (segment,) if complete_count else ()
             self._tail = tail
-            self.line_count = len(complete) + (1 if tail else 0)
+            self.line_count = complete_count + (1 if tail else 0)
         else:
             # The caller supplied only bytes appended to a continuously observed,
             # trusted append-only registry. Rejoin its pending UTF-8 byte tail.
@@ -814,7 +858,8 @@ def registry_scope_active() -> bool:
     return _READ_SCOPE.get() is not None
 
 
-def _pinned_generation(scope: dict, jobs: Path) -> tuple[RegistryView, tuple[str, ...]]:
+def _pinned_generation(scope: dict, jobs: Path) -> list:
+    """The pinned ``[view, lines]`` of one path; ``lines`` stays None until asked."""
     path = Path(jobs)
     key = str(path.absolute())
     held = scope.get(key)
@@ -829,11 +874,13 @@ def _pinned_generation(scope: dict, jobs: Path) -> tuple[RegistryView, tuple[str
     return held
 
 
-def _observe_generation(path: Path) -> tuple[RegistryView, tuple[str, ...]]:
-    """Read one full stable generation into its view and its plain text lines.
+def _observe_generation(path: Path) -> list:
+    """Read one full stable generation into ``[view, lines]``.
 
-    The lines equal ``read_text(errors="replace").splitlines()`` of the same bytes;
-    the view's LF-segmented lines do not promise that for other line separators.
+    ``lines`` is None when the view's own lines already equal
+    ``read_text(errors="replace").splitlines()`` of the same bytes (LF-only
+    registry, valid UTF-8 prefix); otherwise it is those plain text lines, which
+    the LF-segmented view does not promise for other line separators.
     The view is the cached one when that generation is already cached.
     """
     identity = str(path.absolute())
@@ -876,7 +923,7 @@ def _observe_generation(path: Path) -> tuple[RegistryView, tuple[str, ...]]:
             )
             previous = cached if reusable else None
             suffix = raw[previous.signature[2]:] if previous is not None else raw
-            _drop(identity)
+            _drop(identity, keep_parse=previous is not None)
             if previous is None:
                 cached = None
             _METRICS["invalidations"] += 1
@@ -895,10 +942,17 @@ def _observe_generation(path: Path) -> tuple[RegistryView, tuple[str, ...]]:
             os.close(fd)
     if view._prefix_reuse_eligible and not view.has_invalid_utf8:
         # Valid LF-only text: the view's lines are exactly the splitlines() of
-        # these bytes, so skip a second full-size decode of the whole registry.
-        del raw
-        return view, view.lines
-    return view, tuple(raw.decode("utf-8", errors="replace").splitlines())
+        # these bytes, so the scope builds them from the view only on demand
+        # instead of holding a second full-size decode of the whole registry.
+        return [view, None]
+    return [view, tuple(raw.decode("utf-8", errors="replace").splitlines())]
+
+
+def _pinned_lines(entry: list) -> tuple[str, ...]:
+    """Materialize the scope's text lines once, from the view when it is exact."""
+    if entry[1] is None:
+        entry[1] = entry[0].lines
+    return entry[1]
 
 
 def current_registry_view(jobs: Path, *, append_only: bool = False) -> RegistryView:
@@ -914,7 +968,7 @@ def registry_text_lines(jobs: Path) -> tuple[str, ...] | None:
     scope = _READ_SCOPE.get()
     if scope is None:
         return None
-    return _pinned_generation(scope, jobs)[1]
+    return _pinned_lines(_pinned_generation(scope, jobs))
 
 
 def registry_snapshot(jobs: Path) -> RegistrySnapshot:
@@ -930,7 +984,8 @@ def registry_snapshot(jobs: Path) -> RegistrySnapshot:
     if scope is None:
         with registry_read_scope():
             return registry_snapshot(path)
-    view, lines = _pinned_generation(scope, path)
+    entry = _pinned_generation(scope, path)
+    view, lines = entry[0], _pinned_lines(entry)
     reason = ""
     if view.has_invalid_utf8:
         reason = "registry-invalid-utf8"
@@ -1023,7 +1078,7 @@ def _registry_view_fresh(jobs: Path, *, append_only: bool = False) -> RegistryVi
         if previous is None:
             resolved, signature, raw, fd = _stable_read(path, identity)
         else:
-            _drop(identity)
+            _drop(identity, keep_parse=True)
             cached = None
             _METRICS["invalidations"] += 1
         view = RegistryView(identity, resolved, signature, raw, previous=previous, fd=fd)
@@ -1037,25 +1092,32 @@ def _registry_view_fresh(jobs: Path, *, append_only: bool = False) -> RegistryVi
         return view
 
 
-def _drop(identity: str) -> "RegistryView | None":
-    """Forget one cached generation; the caller holds ``_LOCK``."""
+def _drop(identity: str, *, keep_parse: bool = False) -> "RegistryView | None":
+    """Forget one cached generation; the caller holds ``_LOCK``.
+
+    The lazy-parse LRU belongs to the view's lifetime, so it is cleared with the
+    view unless an append successor is about to continue the same generation.
+    """
     global _CACHE_BYTES
     removed = _CACHE.pop(identity, None)
     if removed is not None:
         _CACHE_BYTES -= removed.signature[2]
         _close_view_fd(removed)
+        if not keep_parse:
+            _clear_parse_caches()
     return removed
 
 
 def _remember(identity: str, view: RegistryView) -> None:
-    """Cache one generation within the existing bounds; the caller holds ``_LOCK``."""
+    """Cache one generation within the existing bounds; the caller holds ``_LOCK``.
+
+    The byte bound limits the sum over paths. The generation just remembered is
+    never evicted for its own size, so one large registry still gets reused.
+    """
     global _CACHE_BYTES
-    if view.signature[2] <= _CACHE_MAX_BYTES:
-        _CACHE[identity] = view
-        _CACHE_BYTES += view.signature[2]
-    else:
-        _close_view_fd(view)
-    while (len(_CACHE) > _CACHE_MAX_PATHS or _CACHE_BYTES > _CACHE_MAX_BYTES):
+    _CACHE[identity] = view
+    _CACHE_BYTES += view.signature[2]
+    while len(_CACHE) > 1 and (len(_CACHE) > _CACHE_MAX_PATHS or _CACHE_BYTES > _CACHE_MAX_BYTES):
         _evicted_identity, evicted = _CACHE.popitem(last=False)
         _CACHE_BYTES -= evicted.signature[2]
         _close_view_fd(evicted)
@@ -1088,6 +1150,7 @@ def clear_cache() -> None:
             _close_view_fd(view)
         _CACHE.clear()
         _CACHE_BYTES = 0
+        _clear_parse_caches()
 
 
 atexit.register(clear_cache)
