@@ -1659,6 +1659,196 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
                          state._fleet_cache_path().read_text(encoding="utf-8"))
 
 
+class S3EffectiveParentTest(unittest.TestCase):
+    """Keep S3's original request binding while following confirmed native handover."""
+
+    setUp = WorkflowSelectedResponseTest.setUp
+    _seal_route = WorkflowSelectedResponseTest._seal_route
+    _metadata = WorkflowSelectedResponseTest._metadata
+    _write_owner = WorkflowSelectedResponseTest._write_owner
+    _observe = WorkflowSelectedResponseTest._observe
+    _blocked_owner_wait = WorkflowSelectedResponseTest._blocked_owner_wait
+
+    def _native_caller(self, harness, session_id, extra=None):
+        session_vars = {
+            "claude": "CLAUDE_CODE_SESSION_ID",
+            "codex": "CODEX_THREAD_ID",
+            "opencode": "OPENCODE_SESSION_ID",
+        }
+        values = {
+            "AGENT_DISPATCH_CALLER_HARNESS": harness,
+            "AGENT_DISPATCH_CURRENT_HARNESS": "",
+            "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_ID": "",
+            "CODEX_THREAD_ID": "", "CODEX_SESSION_ID": "",
+            "OPENCODE_SESSION_ID": "",
+            "AGENT_DISPATCH_REGISTERED_WORKER": "",
+            "AGENT_DISPATCH_CHILD": "",
+            "AGENT_DISPATCH_ATTEMPT_ID": "",
+            "AGENT_DISPATCH_DEPTH": "0",
+            "AGENT_DISPATCH_PARENT_SESSION_ID": "",
+            "HERDR_PANE_ID": "",
+        }
+        values[session_vars[harness]] = session_id
+        values.update(extra or {})
+        return mock.patch.dict(os.environ, values, clear=False)
+
+    def _record_handover(self, successor, successor_harness, seat_key):
+        import dispatch_seat_handover
+        import session_tidy
+
+        return dispatch_seat_handover.record_retire_handover(
+            "parent-session", "codex", successor, successor_harness,
+            jobs=self.jobs, now=time.time(),
+            successor_seat=session_tidy.Seat("pane", seat_key, "fixture:pane"))
+
+    def _open_pending_delivery(self, item):
+        import dispatch_pending_delivery
+
+        attempt = item["attempt_id"]
+        receipt = {
+            "schema_version": 2, "state": "delivered",
+            "parent_attempt_id": attempt, "job_registry": str(self.jobs),
+            "delivery_classification": "attention",
+            "children": [{"attempt_id": attempt, "status": "done", "readiness": "ready",
+                          "reason": "terminal-failure-or-unclosed",
+                          "required_action": "inspect-done-failure", "harness": "codex",
+                          "delivery_classification": "attention"}],
+        }
+        dispatch_pending_delivery.create(
+            self.jobs.parent, recipient_kind="codex-native-queue",
+            recipient_key="parent-session", delivery_id="delivery-effective-parent-fixture",
+            session_generation="", session_generation_supported="0", attempt_ids=[attempt],
+            parent_attempt_id=attempt, route_id=item["route_id"], route_node="owner",
+            receipt=receipt,
+            receipt_digest=dispatch_pending_delivery._canonical_receipt_digest(receipt),
+            row_revisions={attempt: item["route_hash"]})
+
+    def test_confirmed_cross_harness_successor_keeps_binding_and_corrects_once(self):
+        import dispatch_completion_join
+        import dispatch_owner_input
+        import dispatch_seat_handover
+
+        item = self._blocked_owner_wait()
+        jobs_before = self.jobs.read_bytes()
+        original = state.read_selected_request({"id": item["id"]})
+        self.assertTrue(original["support"]["supported"])
+        original_draft = state.write_selected_draft(original, "parent's private draft")
+        original_ref = original["native_ref"]
+        metadata = dispatch_completion_join.exact_attempt_row(
+            self.jobs, item["attempt_id"]).metadata
+        self.assertEqual(original_ref["owner_binding"], state._owner_binding(metadata))
+
+        self._open_pending_delivery(item)
+        with mock.patch.object(dispatch_seat_handover, "pane_seat", return_value=None):
+            handover = self._record_handover("successor-session", "claude", "effective-seat")
+            self.assertIsNotNone(handover)
+            self.assertEqual(dispatch_seat_handover.effective_parent(metadata, self.jobs),
+                             "successor-session")
+            self.assertEqual(dispatch_seat_handover.effective_parent_harness(metadata, self.jobs),
+                             "claude")
+
+            observed = self._observe()
+            current_item = next(row for row in observed["items"] if row["id"] == item["id"])
+            self.assertEqual(current_item["owner"], {
+                "harness": "claude", "session_id": "successor-session", "seat_key": None})
+            self.assertEqual(self.jobs.read_bytes(), jobs_before)
+
+            with mock.patch.object(state.subprocess, "run", wraps=state.subprocess.run) as correct:
+                late_parent = state.submit_selected_response(
+                    original_draft,
+                    {"answers": {"owner-correction": [original_draft["draft"]]}},
+                    action_id="late-parent-answer")
+                self.assertFalse(late_parent["support"]["supported"])
+                self.assertEqual(correct.call_count, 0)
+                self.assertEqual(dispatch_owner_input.inspect(
+                    self.jobs, item["attempt_id"])["requests"], [])
+
+                with self._native_caller("claude", "successor-session"):
+                    selected = state.read_selected_request({"id": item["id"]})
+                    self.assertTrue(selected["support"]["supported"], selected["support"])
+                    self.assertEqual(selected["native_ref"], original_ref)
+                    self.assertEqual(selected["native_ref"]["source_id"], item["id"])
+                    self.assertEqual(selected["native_ref"]["attempt_id"], item["attempt_id"])
+                    self.assertEqual(selected["native_ref"]["route_hash"], item["route_hash"])
+                    self.assertEqual(selected["item_id"], item["attempt_id"])
+                    self.assertEqual(selected["route_id"], item["route_id"])
+                    self.assertEqual(selected["request_id"], item["id"])
+                    drafted = state.write_selected_draft(
+                        selected, "successor correction for the original request")
+                    received = state.submit_selected_response(
+                        drafted, {"answers": {"owner-correction": [drafted["draft"]]}},
+                        action_id="successor-owner-answer")
+                    self.assertEqual(received["state"], "received")
+                    duplicate = state.submit_selected_response(
+                        drafted, {"answers": {"owner-correction": [drafted["draft"]]}},
+                        action_id="successor-owner-answer")
+                    self.assertEqual(duplicate["state"], "received")
+
+                correct_calls = [call for call in correct.call_args_list
+                                 if "correct" in call.args[0]]
+                self.assertEqual(len(correct_calls), 1)
+
+        receipt = dispatch_owner_input.inspect(self.jobs, item["attempt_id"])
+        self.assertEqual(len(receipt["requests"]), 1)
+        self.assertEqual(receipt["requests"][0]["id"], "successor-owner-answer")
+        self.assertNotIn("successor correction for the original request", json.dumps(receipt))
+        self.assertEqual(dispatch_completion_join.exact_attempt_row(
+            self.jobs, item["attempt_id"]).metadata["parent_sid"], "parent-session")
+        self.assertEqual(original_ref["owner_binding"], state._owner_binding(
+            dispatch_completion_join.exact_attempt_row(
+                self.jobs, item["attempt_id"]).metadata))
+
+    def test_unconfirmed_forked_different_route_and_worker_contexts_are_refused(self):
+        import dispatch_completion_join
+        import dispatch_seat_handover
+
+        item = self._blocked_owner_wait()
+        metadata = dispatch_completion_join.exact_attempt_row(
+            self.jobs, item["attempt_id"]).metadata
+
+        with mock.patch.object(dispatch_seat_handover, "pane_seat", return_value=None):
+            # Native identity plus a parent alias and pane hint do not create lineage.
+            with self._native_caller("claude", "successor-session", {
+                    "AGENT_DISPATCH_PARENT_SESSION_ID": "successor-session",
+                    "HERDR_PANE_ID": "unconfirmed-seat"}):
+                unconfirmed = state.read_selected_request({"id": item["id"]})
+                self.assertFalse(unconfirmed["support"]["supported"])
+                self.assertEqual(dispatch_seat_handover.effective_parent(metadata, self.jobs),
+                                 "parent-session")
+
+            self._open_pending_delivery(item)
+            handover = self._record_handover("successor-session", "claude", "effective-seat")
+            self.assertIsNotNone(handover)
+            # The old parent cannot fork the same exact route to another seat.
+            fork = self._record_handover("fork-session", "opencode", "fork-seat")
+            self.assertIsNone(fork)
+            self.assertEqual(dispatch_seat_handover.effective_parent(metadata, self.jobs),
+                             "successor-session")
+
+            with self._native_caller("opencode", "fork-session"):
+                forked = state.read_selected_request({"id": item["id"]})
+                self.assertFalse(forked["support"]["supported"])
+            with self._native_caller("opencode", "unrelated-session"):
+                unrelated = state.read_selected_request({"id": item["id"]})
+                self.assertFalse(unrelated["support"]["supported"])
+            with self._native_caller("claude", "successor-session", {
+                    "AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
+                worker = state.read_selected_request({"id": item["id"]})
+                self.assertFalse(worker["support"]["supported"])
+            with self._native_caller("claude", "successor-session"):
+                wrong_route = state.read_selected_request({
+                    "id": item["id"], "route_id": "different-route"})
+                self.assertFalse(wrong_route["support"]["supported"])
+
+            changed_route = dict(metadata)
+            changed_route.update({"route_id": "different-route",
+                                  "owner_route_id": "different-route",
+                                  "route_hash": "f" * 64,
+                                  "owner_route_hash": "f" * 64})
+            self.assertEqual(dispatch_seat_handover.effective_parent(
+                changed_route, self.jobs), "parent-session")
+
+
 class OpenCodeCurrentFormSchemaTest(unittest.TestCase):
     """Focused fixtures for current OpenCode V2 form identity and typed answers."""
 
