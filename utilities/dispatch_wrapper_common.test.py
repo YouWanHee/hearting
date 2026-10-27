@@ -389,7 +389,7 @@ class WrapperCommonTest(unittest.TestCase):
                 route_file=str(route), worktree=temp, artifact_root=temp,
                 capability='autopilot-code', intensity='standard', unit='dev/backend',
                 action='start', model_role='fast implementer', model_profile='balanced',
-                attempt_id=None)
+                attempt_id=None, jobs=str(Path(temp) / 'jobs.log'), agent_home=Path(temp))
             result = subprocess.CompletedProcess([], 65, '',
                 '{"status":"blocked","reason":"unsafe-git-operation","detail":"cherry-pick"}\n')
             out = io.StringIO()
