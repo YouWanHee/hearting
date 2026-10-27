@@ -30,6 +30,7 @@ try:
 except ImportError:  # native Windows without windows-curses: plain --once / --json still work
     curses = None
 import glob
+import json
 import math
 import os
 import re
@@ -680,7 +681,13 @@ def _clean_model(name):
     name = name.split(" (", 1)[0]
     if "/" in name:
         name = name.split("/", 1)[1]
-    return _shorten_model_suffix(_ROLE_MODEL_NAME.get(name.lower(), name))
+    role = _ROLE_MODEL_NAME.get(name.lower())
+    if role:
+        # Only the bare lowercase alias the configs/dispatch env actually export is
+        # resolved against the catalog; a proper-noun value already came from an
+        # observed display name and is not rewritten by today's catalog.
+        name = (_resolved_alias_model(name) if name == name.lower() else None) or role
+    return _shorten_model_suffix(name)
 
 
 # Variant/effort tokens that carry no information: the runtime picked its own default and
@@ -734,10 +741,105 @@ def _short_model_id(name):
     return "%s %s" % (fam, major + ("." + minor if minor else ""))
 
 
+# A bare role alias names a family, not one model. The Claude runtime's own catalog is
+# the checked source for which concrete id this account currently resolves that family
+# to; a version is never written into this file. A missing, malformed, or ambiguous
+# catalog keeps the family word (the honest fallback this table always had).
+_ALIAS_FAMILIES = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku", "fable": "fable"}
+_MODEL_CATALOG_MAX_BYTES = 16 * 1024 * 1024
+_ALIAS_MODEL_CACHE = {"stamp": None, "models": {}}
+
+
+def _claude_catalog_paths():
+    """The runtime's already-written catalog caches, in the same root order the explorer uses."""
+    config = (os.environ.get("HEARTING_MODEL_CONFIG_HOME")
+              or os.environ.get("CLAUDE_CONFIG_DIR")
+              or os.path.join(os.path.expanduser("~"), ".claude"))
+    return tuple(sorted(glob.glob(os.path.join(config, "cache", "model-catalog", "*.json"))))
+
+
+def _catalog_model_records(document):
+    """The model records in the runtime catalogs' bounded public shapes."""
+    if not isinstance(document, dict):
+        return ()
+    catalog = document.get("catalog")
+    config = catalog.get("config") if isinstance(catalog, dict) else None
+    records = config.get("models") if isinstance(config, dict) else None
+    if not isinstance(records, list):
+        records = document.get("models")
+    if not isinstance(records, list):
+        return ()
+    return tuple(item for item in records if isinstance(item, dict))
+
+
+def _resolved_alias_models():
+    """Role family → the one concrete id the account's runtime catalog marks ``main``.
+
+    Reads only the cache files the runtime already wrote. A family with no record,
+    zero ``main`` entries, or two different ``main`` ids across accounts stays
+    unresolved, so display never guesses. Cached by each file's (mtime, size) so a
+    frame never re-reads an unchanged catalog.
+    """
+    paths = _claude_catalog_paths()
+    stamps = []
+    for path in paths:
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        stamps.append((path, info.st_mtime_ns, info.st_size))
+    stamp = tuple(stamps)
+    cached = _ALIAS_MODEL_CACHE
+    if cached["stamp"] == stamp:
+        return cached["models"]
+    found = {}
+    for path, _mtime, size in stamps:
+        if size > _MODEL_CATALOG_MAX_BYTES:
+            continue
+        try:
+            with open(path, encoding="utf-8") as stream:
+                document = json.load(stream)
+        except (OSError, ValueError, UnicodeError, TypeError):
+            continue
+        for item in _catalog_model_records(document):
+            if item.get("section") != "main":
+                continue
+            runtime = item.get("runtime")
+            family = runtime.get("family") if isinstance(runtime, Mapping) else None
+            model_id = item.get("id")
+            if not isinstance(family, str) or not isinstance(model_id, str) or not model_id:
+                continue
+            found.setdefault(family.lower(), []).append(model_id)
+    resolved = {}
+    for family, ids in found.items():
+        distinct = tuple(dict.fromkeys(ids))
+        if family in _ALIAS_FAMILIES.values() and len(distinct) == 1:
+            resolved[family] = distinct[0]
+    cached["stamp"] = stamp
+    cached["models"] = resolved
+    return resolved
+
+
+def _resolved_alias_model(name):
+    """Versioned display for a bare role alias, or None when the catalog cannot confirm it."""
+    family = _ALIAS_FAMILIES.get(str(name).strip().lower())
+    if family is None:
+        return None
+    model_id = _resolved_alias_models().get(family)
+    if not model_id:
+        return None
+    return _short_model_id(model_id)
+
+
 def _dispatch_display_model(name):
     if not name:
         return name
-    return _short_model_id(_ROLE_MODEL_NAME.get(str(name).strip().lower(), name))
+    raw = str(name).strip()
+    token = raw.lower()
+    role = _ROLE_MODEL_NAME.get(token)
+    if role:
+        return (_resolved_alias_model(raw) if raw == token else None) or role
+    return _short_model_id(name)
 
 
 def _job_display_model(job, parent_model=None):
