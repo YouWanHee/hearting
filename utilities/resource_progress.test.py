@@ -2128,6 +2128,42 @@ class ExperimentObservationTest(unittest.TestCase):
         self.assertGreaterEqual(record["compaction"]["metrics_omitted"], 1)
         self.assertEqual(_cairn_problems(artifact / "resource-runs" / "hist.json"), [])
 
+    def test_metrics_omitted_is_stable_under_repeated_and_recompacted_writes(self):
+        base = Path(self.tmp.name) / "omit"
+        artifact = base / "artifact"
+        decls = []
+        for index in range(20):
+            folder = base / f"run-{index:02d}"
+            folder.mkdir(parents=True)
+            decls.append({"format": "epoch-json-files", "path": str(folder), "file_count": 3})
+        record = lambda: {"output_dir": str(base / "run-00"), "metrics": [dict(d) for d in decls]}
+        seen = []
+        for _ in range(4):
+            path = progress.write_public_run_record(artifact, "omit", record())
+            seen.append((json.loads(path.read_text())["compaction"]["metrics_omitted"],
+                         path.read_bytes()))
+        self.assertEqual({item[0] for item in seen}, {4})
+        self.assertEqual(len({item[1] for item in seen}), 1)
+        # read/write idempotence keeps the carried count
+        again = progress.write_public_run_record(artifact, "omit",
+            progress.read_public_run_record(artifact, "omit"))
+        self.assertEqual(again.read_bytes(), seen[-1][1])
+        stored = progress.read_public_run_record(artifact, "omit")
+        self.assertEqual(progress._compact_public_record(stored), stored)
+        self.assertEqual(progress._compact_public_record(stored, stored), stored)
+        # a builder-normalized input already carries its own count; merging stays at 4
+        normalized = progress._compact_public_record(record())
+        self.assertEqual(normalized["compaction"]["metrics_omitted"], 4)
+        merged = progress.write_public_run_record(artifact, "omit", normalized)
+        self.assertEqual(json.loads(merged.read_text())["compaction"]["metrics_omitted"], 4)
+        # a genuinely larger shortfall still raises it
+        extra = base / "run-extra"
+        extra.mkdir()
+        decls.append({"format": "epoch-json-files", "path": str(extra), "file_count": 3})
+        grown = progress.write_public_run_record(artifact, "omit", record())
+        self.assertEqual(json.loads(grown.read_text())["compaction"]["metrics_omitted"], 5)
+        self.assertLessEqual(grown.stat().st_size, 16384)
+
 
 if __name__ == "__main__":
     unittest.main()

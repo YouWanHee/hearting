@@ -60,6 +60,10 @@ separate; `compaction` only says what this file left out.
   string plus `file_count` (`epoch-json-files`: the run folder; `tfevents`: the
   folder holding the event files); per-file path lists are not written.
   `epochs-jsonl` declares a file path string.
+  `compaction.metrics_omitted` counts declarations this file left out: ones pushed
+  out of the existing record (over the 16 limit or a vanished location) add once,
+  while the same input offering the same overflow again does not raise it. It is a
+  bounded count, not a list of omitted identities.
 - **Output folder state.** `output_dir_state` is `present | none | unknown`, with
   `output_dir_reason` attached when it is not `present`. `present`: `output_dir` is
   an existing folder. `none` (`node-declares-no-training-output`): the sealed

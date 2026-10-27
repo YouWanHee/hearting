@@ -458,7 +458,14 @@ def _public_output_state(run, output_dir, *, binding_given):
 
 
 def _public_metric_declarations(incoming, existing=(), *, check_existing=False):
-    """Fold metric declarations to one per (format, location); returns (list, dropped)."""
+    """Fold metric declarations to one per (format, location).
+
+    Returns (list, displaced, never_kept): `displaced` counts declarations that were in
+    the existing record and are now dropped (overflow or vanished location); they leave
+    the record, so they are counted once. `never_kept` counts dropped incoming
+    declarations the existing record did not hold; the same input can offer them again
+    on every update, so callers must not add it up across writes.
+    """
     def fold(items):
         folded = []
         for item in items if isinstance(items, (list, tuple)) else ():
@@ -483,6 +490,7 @@ def _public_metric_declarations(incoming, existing=(), *, check_existing=False):
         return folded
 
     merged, new_keys = {}, set()
+    existing_keys = {(item["format"], item["path"]) for item in fold(existing)}
     for origin, items in (("new", fold(incoming)), ("old", fold(existing))):
         for item in items:
             key = (item["format"], item["path"])
@@ -500,11 +508,14 @@ def _public_metric_declarations(incoming, existing=(), *, check_existing=False):
             if origin == "new":
                 new_keys.add(key)
     ordered = [key for key in merged if key in new_keys] + [key for key in merged if key not in new_keys]
-    kept, dropped = [], 0
+    kept, displaced, never_kept = [], 0, 0
     for key in ordered:
         declaration = merged[key]
         if len(kept) >= MAX_PUBLIC_METRIC_DECLARATIONS:
-            dropped += 1
+            if key in existing_keys:
+                displaced += 1
+            else:
+                never_kept += 1
             continue
         if check_existing and key not in new_keys:
             try:
@@ -513,10 +524,10 @@ def _public_metric_declarations(incoming, existing=(), *, check_existing=False):
                 mode = None
             wanted = stat.S_ISREG if key[0] == "epochs-jsonl" else stat.S_ISDIR
             if mode is None or not wanted(mode):
-                dropped += 1
+                displaced += 1
                 continue
         kept.append(declaration)
-    return sorted(kept, key=lambda item: (item["format"], item["path"])), dropped
+    return sorted(kept, key=lambda item: (item["format"], item["path"])), displaced, never_kept
 
 
 def _public_summary(summary, *, drop_path, max_keys):
@@ -616,10 +627,14 @@ def _compact_public_record(value, existing=None, *, incoming_row_ids=(), check_e
     value["output_dir_state"] = state
     value["output_dir_reason"] = None if state == "present" else reason
 
-    declarations, dropped = _public_metric_declarations(
+    declarations, displaced, never_kept = _public_metric_declarations(
         value.get("metrics"), existing.get("metrics"), check_existing=check_existing)
     value["metrics"] = declarations
-    metrics_omitted = count(own.get("metrics_omitted"), prior.get("metrics_omitted")) + dropped
+    # metrics_omitted: declarations this file has left out. Ones pushed out of the
+    # existing record add once; ones merely offered again by the same input do not grow
+    # it (the carried count is a floor, raised only by a larger current shortfall).
+    carried = count(own.get("metrics_omitted"), prior.get("metrics_omitted"))
+    metrics_omitted = displaced + max(carried, never_kept)
 
     if "source_warnings" in value:
         value["source_warnings"] = sorted(item for item in set(value["source_warnings"] or ())
@@ -719,7 +734,8 @@ def _compact_public_record(value, existing=None, *, incoming_row_ids=(), check_e
         trial = {**skeleton, "metrics": [*skeleton["metrics"], declaration]}
         if _encoded_size(trial) <= MAX_PUBLIC_RUN_RECORD_WRITE_BYTES:
             skeleton = trial
-    skeleton["compaction"]["metrics_omitted"] += len(declarations) - len(skeleton["metrics"])
+    skeleton["compaction"]["metrics_omitted"] = displaced + max(
+        carried, never_kept + len(declarations) - len(skeleton["metrics"]))
     return skeleton
 
 
