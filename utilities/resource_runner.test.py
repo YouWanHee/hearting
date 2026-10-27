@@ -172,6 +172,10 @@ class ComputeRunAdoptionTest(unittest.TestCase):
         import contextlib
         import resource_run_registry as RR
         import dispatch_resource_wait as OWNER_RESOURCE
+        # Current resource bindings retain the digest of the legacy reader's
+        # projection. A placeholder used by the original fixture no longer
+        # represents an armed row and masks the adoption/refusal paths below.
+        self.armed["resource_binding"] = OWNER_RESOURCE.resource_legacy_body_digest(self.original)
         fake_ledger = SimpleNamespace(lock=contextlib.nullcontext,
                                       root=self.workflow,
                                       state=lambda: ({"workflow_state": "CANCELLED",

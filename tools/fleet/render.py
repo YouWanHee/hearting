@@ -7241,7 +7241,8 @@ def _explorer_question_status(value, fallback):
 def _explorer_same_question_request(left, right):
     if not isinstance(left, Mapping) or not isinstance(right, Mapping):
         return False
-    for key in ("id", "harness", "session_id", "request_id", "turn_id", "route_id", "question_id"):
+    for key in ("id", "harness", "session_id", "request_id", "turn_id", "route_id",
+                "question_id", "gate_epoch"):
         a, b = left.get(key), right.get(key)
         if a != b or (key == "request_id" and type(a) is not type(b)):
             return False
@@ -7322,7 +7323,8 @@ def _explorer_question_ref_current(ref):
         return False
     selected_row = ref.get("_fleet_row_ref")
     selected_row = selected_row if isinstance(selected_row, Mapping) else ref
-    for key in ("harness", "session_id", "request_id", "turn_id", "route_id", "question_id"):
+    for key in ("harness", "session_id", "request_id", "turn_id", "route_id",
+                "question_id", "gate_epoch"):
         old, new = selected_row.get(key), current.get(key)
         if ((old is not None or new is not None)
                 and (old != new or (key == "request_id" and type(old) is not type(new)))):
@@ -7359,8 +7361,11 @@ def _explorer_question_has_workflow_binding(ref, envelope):
     if transport == "hearting-human-gate":
         raised = native.get("raised_at")
         return (selected.startswith("S2:")
+                and envelope.get("source") == "S2"
                 and native.get("gate_id") == envelope.get("question_id")
                 and bool(native.get("gate_id"))
+                and type(native.get("gate_epoch")) is int and native["gate_epoch"] > 0
+                and envelope.get("gate_epoch") == native.get("gate_epoch")
                 and type(raised) in (int, float) and math.isfinite(raised))
     return False
 
@@ -7384,7 +7389,7 @@ def _explorer_question_envelope(ref, value):
     if (isinstance(expected_native, Mapping) and actual_native is not None
             and dict(expected_native) != actual_native):
         return None
-    for key in ("request_id", "turn_id", "route_id", "question_id"):
+    for key in ("request_id", "turn_id", "route_id", "question_id", "gate_epoch"):
         expected_value, actual_value = expected.get(key), envelope.get(key)
         if (expected_value is not None and actual_value is not None
                 and (expected_value != actual_value

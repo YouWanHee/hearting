@@ -1583,7 +1583,7 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
         self.assertIsNone(selected["turn_id"])
         self.assertFalse(selected["support"]["supported"])
         self.assertEqual(selected["support"]["reason"],
-                         "workflow-release-missing-expected-raise-binding")
+                         "workflow-gate-artifact-unavailable")
         refused = state.submit_selected_response(
             selected, {"answers": {"frame-review": ["proceed"]}},
             action_id="must-not-release")
