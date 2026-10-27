@@ -86,6 +86,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             'supervisor_lease_file': str(lease), 'supervisor_lease_nonce': nonce,
             'attempt_id': attempt, 'pid': str(identity['pid']), 'pid_start': identity['starttime'],
             'owner_route_file': str(Path(resource_route_file).resolve()),
+            'artifact_root': str(Path(route.get('artifact_root', self.base)).resolve()),
             'owner_route_id': route['route_id'], 'owner_route_hash': route['route_hash'],
             'route_id': route['route_id'], 'route_hash': route['route_hash'],
             'parent_sid': 'fixture-parent-session',
@@ -537,6 +538,88 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             self.assertIsNotNone(operation)
         if operation is not None:
             body['resource_operation'] = operation
+        return body
+
+    def authorized_bridge_body(self, route, path, jobs, registry, owner_attempt,
+                               owner_input, name, output, *, approved_text=None,
+                               payload_path=None):
+        """Build the recorded local-bridge / remote-compute-hosts request shape."""
+        import dispatch_owner_input as INPUT
+        import shlex
+
+        body = self.next_body(registry, name, output)
+        body.update(parent_attempt_id=owner_attempt)
+        body['owner_wait']['launch_scope'] = 'codex-owner-controller'
+        request_path = self.base / f'{name}-request.json'
+        admission_dir = self.base / f'{name}-admission'
+        admission_dir.mkdir(parents=True, exist_ok=True)
+        bridge_path = self.base / f'{name}-remote-production-bridge-var-rir512.py'
+        parser_path = ROOT / 'utilities' / 'compute-hosts.py'
+        bridge_path.write_text(
+            'import importlib.util, json, subprocess, sys\n'
+            f'spec = importlib.util.spec_from_file_location("bridge_compute_hosts", {str(parser_path)!r})\n'
+            'module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)\n'
+            'request = json.load(open(sys.argv[1], encoding="utf-8"))\n'
+            'run = module.parse_run_invocation(request["compute_argv"])\n'
+            'subprocess.run(run.command, cwd=run.cwd, check=True)\n'
+        )
+        config = self.base / f'{name}-config.yaml'
+        data_lock = self.base / f'{name}-data.lock'
+        smoke = self.base / f'{name}-smoke.json'
+        config.write_text('model: approved\n')
+        data_lock.write_text('dataset: approved\n')
+        smoke.write_text('{"smoke": "approved"}\n')
+        input_paths = {'config_sha256': config, 'data_lock_sha256': data_lock,
+                       'gpu_smoke_sha256': smoke}
+        provenance = {field: hashlib.sha256(file.read_bytes()).hexdigest()
+                      for field, file in input_paths.items()}
+        provenance['bridge_sha256'] = hashlib.sha256(bridge_path.read_bytes()).hexdigest()
+        target = Path(payload_path or (self.base / f'{name}-payload-result.json')).resolve()
+        payload_script = (
+            'from pathlib import Path; '
+            f'Path({str(target)!r}).write_text("cpu-bridge-payload-complete\\n")'
+        )
+        remote_payload = ['env', 'REMOTE_TRAINING_ENV=approved', sys.executable,
+                          '-c', payload_script, '--config', str(config),
+                          '--data-lock', str(data_lock), '--smoke', str(smoke)]
+        remote_argv = [str(ROOT / 'utilities' / 'compute-hosts'), 'run', 'gpu-fixture',
+                       '--cwd', str(self.base.resolve()), '--env', 'fixture-env',
+                       '--gpus', '0', '--name', name, '--', 'bash', '-c',
+                       shlex.join(remote_payload)]
+        command = ['env', 'HEARTING_LOCAL_BRIDGE=approved', sys.executable,
+                   str(bridge_path), str(request_path)]
+        request = {
+            'user_direction_id': f'input-{name}', 'parent_attempt_id': owner_attempt,
+            'run_id': name, 'requested_scope': 'run the variable model and preserve the fixed model',
+            'compute_argv': remote_argv, 'config_manifest': None, 'smoke_attestation': None,
+            'Dev_admission_evidence': str(admission_dir / 'admission-evidence.json'),
+            'provenance': provenance,
+        }
+        request_bytes = json.dumps(request, sort_keys=True).encode()
+        request_path.write_bytes(request_bytes)
+        body['command'] = command
+        runner_path = Path('/home/Uihyeop/.local/share/hearting/releases/v3.53.2/utilities/resource-runner.py')
+        argv = ['python3', str(runner_path), '--registry', str(Path(registry).resolve()),
+            'start', '--run-id', name, '--cwd', str(Path(body['cwd']).resolve()),
+            '--log', str(Path(body['log']).resolve()), '--route', str(Path(path).resolve()),
+            '--node', body['node'], '--parent-attempt-id', owner_attempt,
+            '--jobs', str(Path(jobs).resolve()), '--', *command]
+        record_path = admission_dir / f'{name}-resource-start-command.json'
+        record_path.write_text(json.dumps({'argv': argv, 'request_path': str(request_path),
+            'request_sha256': hashlib.sha256(request_bytes).hexdigest()}, sort_keys=True))
+        approved_text = approved_text or 'Run the variable model while preserving the fixed model.'
+        with mock.patch.object(RA, 'correction_source_session', return_value='fixture-user-session'):
+            INPUT.submit(jobs, owner_attempt, approved_text, request_id=f'input-{name}')
+            owner_input.prepare('continue the approved work')
+            turn = f'turn-{name}'
+            owner_input.started(turn)
+            owner_input.completed(turn)
+        operation = SUP.runner().resource_operation_binding(
+            route, path, body['node'], name, command, body['cwd'],
+            dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
+            registry_path=registry, log_path=body['log'])
+        body['resource_operation'] = operation
+        body['launch_state'] = 'queued'
         return body
 
     def arm(self, path, registry, *, node='full-run', run_id='fixture-run', extra=()):
@@ -1869,16 +1952,18 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
             registry_path=registry, log_path=body['log']))
 
-    def test_legacy_freeform_approval_does_not_authorize_parallel_overlap(self):
+    def test_legacy_freeform_approval_is_retained_as_provenance(self):
         route, path, jobs, registry, output, ledger = self.fixture()
         owner_attempt, owner_input = self.live_owner(route, jobs, registry)
         body = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
             'legacy-freeform', output, payload_code='pass',
-            approved_text='Run the variable model while preserving the fixed model.',
-            require_binding=False)
-        self.assertNotIn('resource_operation', body)
+            approved_text='Run the variable model while preserving the fixed model.')
+        self.assertIn('resource_operation', body)
+        self.assertEqual(body['resource_operation']['input']['digest'],
+                         __import__('dispatch_owner_input')._digest(
+                             'Run the variable model while preserving the fixed model.'))
 
-    def test_changed_payload_argv_is_refused_even_with_updated_command_receipt(self):
+    def test_changed_payload_argv_after_selection_changes_the_binding(self):
         route, path, jobs, registry, output, ledger = self.fixture()
         owner_attempt, owner_input = self.live_owner(route, jobs, registry)
         body = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
@@ -1897,16 +1982,19 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         receipt['argv'][separator + 1:] = body['command']
         receipt_path.write_text(json.dumps(receipt, sort_keys=True))
 
-        self.assertIsNone(SUP.runner().resource_operation_binding(
+        changed = SUP.runner().resource_operation_binding(
             route, path, body['node'], body['run_id'], body['command'], body['cwd'],
             dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
-            registry_path=registry, log_path=body['log']))
+            registry_path=registry, log_path=body['log'])
+        self.assertIsNotNone(changed)
+        self.assertNotEqual(changed['operation_id'], body['resource_operation']['operation_id'])
 
-    def test_request_scope_not_exactly_covered_by_accepted_input_is_refused(self):
+    def test_freeform_approval_does_not_need_to_repeat_request_scope_as_json(self):
         route, path, jobs, registry, output, ledger = self.fixture()
         owner_attempt, owner_input = self.live_owner(route, jobs, registry)
         body = self.authorized_body(route, path, jobs, registry, owner_attempt, owner_input,
-                                    'uncovered-scope', output, payload_code='pass')
+            'uncovered-scope', output, payload_code='pass',
+            approved_text='Run the variable model while preserving the fixed model.')
         request_path = Path(body['command'][-1])
         request = json.loads(request_path.read_text())
         request['requested_scope'] = 'different operation scope'
@@ -1918,10 +2006,249 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         receipt['request_sha256'] = hashlib.sha256(request_bytes).hexdigest()
         receipt_path.write_text(json.dumps(receipt, sort_keys=True))
 
+        changed = SUP.runner().resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
+            registry_path=registry, log_path=body['log'])
+        self.assertIsNotNone(changed)
+        self.assertNotEqual(changed['operation_id'], body['resource_operation']['operation_id'])
+
+    def test_freeform_approval_binds_local_bridge_and_remote_compute_hosts_layers(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        approved_text = 'Run the variable model while preserving the fixed model.'
+        body = self.authorized_bridge_body(route, path, jobs, registry, owner_attempt,
+                                           owner_input, 'bridge-var', output,
+                                           approved_text=approved_text)
+        binding = body['resource_operation']
+        self.assertIsNotNone(binding)
+        request_path = Path(body['command'][-1])
+        request = json.loads(request_path.read_text())
+        self.assertNotEqual(request['compute_argv'], body['command'])
+        self.assertEqual(binding['payload']['cwd'], str(self.base.resolve()))
+        self.assertEqual(binding['input']['digest'],
+                         __import__('dispatch_owner_input')._digest(approved_text))
+        hashes = binding['payload']['input_hashes']
+        self.assertEqual(set(hashes), {
+            'config_sha256', 'data_lock_sha256', 'gpu_smoke_sha256', 'bridge_sha256'})
+        self.assertEqual(binding['payload']['environment_sha256'].__len__(), 64)
+
+        bridge = self.base / 'bridge-var-remote-production-bridge-var-rir512.py'
+        bridge_bytes = bridge.read_bytes()
+        bridge.write_text(bridge.read_text() + '# changed after selection\n')
         self.assertIsNone(SUP.runner().resource_operation_binding(
             route, path, body['node'], body['run_id'], body['command'], body['cwd'],
             dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
             registry_path=registry, log_path=body['log']))
+        bridge.write_bytes(bridge_bytes)
+        (self.base / 'bridge-var-config.yaml').write_text('model: changed-after-selection\n')
+        self.assertIsNone(SUP.runner().resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            dict(self.EMPTY_LAUNCH_REQUEST), body['owner_wait'],
+            registry_path=registry, log_path=body['log']))
+
+    def test_bridge_binding_refuses_owner_route_node_and_target_mismatch(self):
+        import dispatch_owner_input as INPUT
+
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        body = self.authorized_bridge_body(route, path, jobs, registry, owner_attempt,
+                                           owner_input, 'bridge-boundaries', output)
+        runner = SUP.runner()
+        launch_request = dict(self.EMPTY_LAUNCH_REQUEST)
+        self.assertIsNotNone(runner.resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            launch_request, body['owner_wait'], registry_path=registry, log_path=body['log']))
+
+        wrong_owner = dict(body['owner_wait'], parent_attempt_id='att-other-owner')
+        self.assertIsNone(runner.resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            launch_request, wrong_owner, registry_path=registry, log_path=body['log']))
+        other_route_path = self.base / 'other-route.json'
+        other_route_path.write_text(json.dumps(route))
+        self.assertIsNone(runner.resource_operation_binding(
+            route, other_route_path, body['node'], body['run_id'], body['command'], body['cwd'],
+            launch_request, body['owner_wait'], registry_path=registry, log_path=body['log']))
+        self.assertIsNone(runner.resource_operation_binding(
+            route, path, 'run-verify', body['run_id'], body['command'], body['cwd'],
+            launch_request, body['owner_wait'], registry_path=registry, log_path=body['log']))
+        parent, _target = INPUT._target(jobs, owner_attempt)
+        with mock.patch.object(INPUT, '_target', return_value=(parent, 'changed-owner-target')):
+            self.assertIsNone(runner.resource_operation_binding(
+                route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+                launch_request, body['owner_wait'], registry_path=registry, log_path=body['log']))
+
+    def test_changed_bridge_request_is_refused_before_resource_reservation(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        body = self.authorized_bridge_body(route, path, jobs, registry, owner_attempt,
+                                           owner_input, 'bridge-mutation', output)
+        original_binding = body['resource_operation']
+        registry_data = json.loads(registry.read_text())
+        registry_data['runs'][body['run_id']] = body
+        registry.write_text(json.dumps(registry_data))
+        self.arm(path, registry, run_id=body['run_id'], extra=("--jobs", str(jobs),
+            "--artifact-base", str(output)))
+
+        request_path = Path(body['command'][-1])
+        request = json.loads(request_path.read_text())
+        request['compute_argv'][-1] += '; true'
+        request_bytes = json.dumps(request, sort_keys=True).encode()
+        request_path.write_bytes(request_bytes)
+        record_path = Path(request['Dev_admission_evidence']).parent / \
+            'bridge-mutation-resource-start-command.json'
+        receipt = json.loads(record_path.read_text())
+        receipt['request_sha256'] = hashlib.sha256(request_bytes).hexdigest()
+        record_path.write_text(json.dumps(receipt, sort_keys=True))
+        before = registry.read_bytes()
+        args = SimpleNamespace(jobs=str(jobs), run_id=body['run_id'], node=body['node'],
+                                smoke_attestation=None, config_manifest=None)
+        with self.assertRaisesRegex(ValueError, 'resource-operation-authorization-changed'):
+            SUP.runner().start_verified(registry, args, route, path, dict(body))
+        self.assertEqual(registry.read_bytes(), before)
+        self.assertEqual(body['resource_operation']['operation_id'], original_binding['operation_id'])
+
+    def test_v3532_context_controller_launch_and_wait_consume_flat_queued_cpu_bridge(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry)
+        data = json.loads(registry.read_text())
+        old_fix = data['runs']['fixture-run']
+        old_fix.update(SUP.RR.proc_identity(os.getpid()), process_group=os.getpgrp(),
+                       pid_namespace=os.readlink('/proc/self/ns/pid'),
+                       status='running', exit_code=None)
+        Path(old_fix['sentinel']).unlink()
+        registry.write_text(json.dumps(data))
+        primary_path = ledger.root / 'armed' / 'full-run.json'
+        original_bytes = primary_path.read_bytes()
+        original_armed = json.loads(original_bytes)
+        body = self.authorized_bridge_body(route, path, jobs, registry, owner_attempt,
+                                           owner_input, 'legacy-var', output)
+        attestation_path = self.base / 'legacy-var-smoke-attestation.json'
+        smoke_spec = importlib.util.spec_from_file_location(
+            'legacy_fixture_smoke_attestation', ROOT / 'tools' / 'smoke-attestation.py')
+        smoke_tool = importlib.util.module_from_spec(smoke_spec)
+        smoke_spec.loader.exec_module(smoke_tool)
+        smoke_inputs = [self.base / 'legacy-var-config.yaml',
+                        self.base / 'legacy-var-data.lock',
+                        self.base / 'legacy-var-smoke.json']
+        attestation = smoke_tool.payload(smoke_inputs, body['command'], body['cwd'])
+        attestation.update(exit_code=0, status='passed')
+        attestation['attestation_hash'] = 'sha256:' + hashlib.sha256(json.dumps(
+            attestation, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        attestation_path.write_text(json.dumps(attestation, sort_keys=True))
+        request_path = Path(body['command'][-1])
+        request = json.loads(request_path.read_text())
+        attestation_hash = hashlib.sha256(attestation_path.read_bytes()).hexdigest()
+        request['smoke_attestation'] = str(attestation_path)
+        request['smoke_attestation_sha256'] = attestation_hash
+        request['provenance']['smoke_attestation_sha256'] = attestation_hash
+        request_bytes = json.dumps(request, sort_keys=True).encode()
+        request_path.write_bytes(request_bytes)
+        record_path = Path(request['Dev_admission_evidence']).parent / \
+            'legacy-var-resource-start-command.json'
+        command_record = json.loads(record_path.read_text())
+        command_record['request_sha256'] = hashlib.sha256(request_bytes).hexdigest()
+        separator = command_record['argv'].index('--')
+        command_record['argv'][separator:separator] = ['--smoke-attestation', str(attestation_path)]
+        record_path.write_text(json.dumps(command_record, sort_keys=True))
+        body['launch_request'] = {
+            'smoke_attestation': str(attestation_path),
+            'smoke_attestation_sha256': attestation_hash,
+            'config_manifest': None, 'config_manifest_sha256': None,
+        }
+        body['resource_operation'] = SUP.runner().resource_operation_binding(
+            route, path, body['node'], body['run_id'], body['command'], body['cwd'],
+            dict(body['launch_request']), body['owner_wait'],
+            registry_path=registry, log_path=body['log'])
+        self.assertIsNotNone(body['resource_operation'])
+        body.pop('launch_state', None)
+        current_runner = SUP.runner()
+        current_args = SimpleNamespace(
+            jobs=str(jobs), run_id=body['run_id'], node=body['node'],
+            smoke_attestation=str(attestation_path), config_manifest=None)
+        import artifact_producer
+        with mock.patch.object(artifact_producer, 'prepare_route_artifact_env',
+                               return_value={'AGENT_ARTIFACT_OUTPUT_DIR': str(output)}), \
+             mock.patch.object(current_runner, 'register_registry'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            current_runner.start_verified(registry, current_args, route, path, dict(body))
+
+        flat = json.loads(primary_path.read_text())
+        self.assertEqual(flat['predecessor_id'], body['run_id'])
+        self.assertEqual(flat['resource_binding'], WAIT.resource_legacy_body_digest(body))
+        self.assertEqual(flat['resource_current_binding'], WAIT.resource_body_digest(body))
+        archived = SUP.resource_watch_storage_path(ledger, original_armed)
+        self.assertEqual(archived.read_bytes(), original_bytes)
+        self.assertEqual({row['predecessor_id'] for row in SUP.read_resource_watches(
+            ledger, 'full-run')}, {'fixture-run', body['run_id']})
+
+        old_path = Path('/home/Uihyeop/.local/share/hearting/releases/v3.53.2/utilities/dispatch_resource_wait.py')
+        legacy_spec = importlib.util.spec_from_file_location('legacy_v3532_resource_wait_fixture', old_path)
+        legacy_wait = importlib.util.module_from_spec(legacy_spec)
+        legacy_spec.loader.exec_module(legacy_wait)
+        phase = self.base / 'legacy-owner-phase.json'
+        control = SimpleNamespace(thread_id='same-native', pending=lambda: False)
+        events = []
+        result_path = self.base / 'legacy-var-payload-result.json'
+        args = SimpleNamespace(
+            parent_attempt_id=owner_attempt, route_file=str(path),
+            route_id=route['route_id'], route_hash=route['route_hash'], jobs=str(jobs),
+            resource_launch_command=lambda row: (row['command'], 'fixture-local-cpu'),
+        )
+        children = []
+        try:
+            with mock.patch.dict(sys.modules, {'dispatch_resource_wait': legacy_wait}):
+                sup, old_route, old_ledger, found = legacy_wait.context(args, control)
+                self.assertEqual(old_route['route_id'], route['route_id'])
+                self.assertEqual([row['run_id'] for _, row in found], [body['run_id']])
+                armed, queued = found[0]
+                old_runner = sup.runner()
+                observer = mock.Mock()
+                observer.poll.return_value = None
+                import artifact_producer
+                with mock.patch.object(artifact_producer, 'prepare_route_artifact_env',
+                                       return_value={'AGENT_ARTIFACT_OUTPUT_DIR': str(output)}), \
+                     mock.patch.object(old_runner.gpu_leases, 'resource_admission',
+                                       return_value=(None, None, {})), \
+                     mock.patch.object(old_runner, 'start_watch', return_value=(
+                        observer, SUP.RR.proc_identity(os.getpid()))):
+                    legacy_wait.admit_controller_launch(args, control, armed, queued, [])
+                launched = json.loads(registry.read_text())['runs'][body['run_id']]
+                children = args.resource_children[legacy_wait.resource_key(launched)]
+                payload_proc, _observer = children
+                self.assertEqual(payload_proc.wait(timeout=10), 0)
+                self.assertEqual(result_path.read_text(), 'cpu-bridge-payload-complete\n')
+
+                sleeps = [0]
+                def bounded_sleep(_seconds):
+                    sleeps[0] += 1
+                    if sleeps[0] > 80:
+                        raise TimeoutError('legacy resource receipt did not become ready')
+                    time.sleep(0.01)
+                prompt = legacy_wait.wait(args, phase, control, set(), events.append,
+                                          sleep=bounded_sleep)
+                state = legacy_wait.JOIN.read_supervisor_phase_state(phase, owner_attempt)
+                receipt = state.resource['outbox']['receipt']
+                self.assertIn(body['run_id'], prompt)
+                self.assertEqual(receipt['run_id'], body['run_id'])
+                self.assertFalse(receipt['verification_pass'])
+                self.assertTrue(legacy_wait.acknowledge(
+                    phase, owner_attempt, state.resource['outbox']['receipt_id']))
+            current = SUP.read_resource_watches(ledger, 'full-run')
+            self.assertEqual({row['predecessor_id'] for row in current},
+                             {'fixture-run', body['run_id']})
+            with self.assertRaisesRegex(SUP.SupervisorError, 'resource-owner-operation-unsettled'):
+                SUP.admit_owner_successor_start(route, 'run-verify', jobs,
+                                                owner_attempt, 'same-native')
+            self.assertEqual(ledger.claims(), {})
+        finally:
+            if children:
+                process, _observer = children
+                if process.poll() is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, 15)
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=5)
 
     def test_payload_input_hash_must_match_the_effective_argv_input(self):
         route, path, jobs, registry, output, ledger = self.fixture()

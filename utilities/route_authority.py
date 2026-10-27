@@ -1946,7 +1946,7 @@ def _same_resource_owner(left, right):
 
 
 def _independent_resource_operations(left, right):
-    """Only exact, separate owner inputs authorize overlapping operation bodies."""
+    """Only distinct exact operations selected under the same live owner may overlap."""
     first, second = _resource_operation(left), _resource_operation(right)
     if not first or not second or not _same_resource_owner(left, right):
         return False
@@ -1971,13 +1971,20 @@ def require_resource_predecessors(rows, candidate, *, observations=None):
         if key not in seen:
             seen.add(key)
             unique_rows.append(row)
+    finished_cache = {}
     def finished(row):
+        marker = id(row)
+        if marker in finished_cache:
+            return finished_cache[marker]
         execution = row.get("execution") if isinstance(row, dict) else None
         captured = observations.get(row.get("run_id"))
         if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
-            return bool(captured and captured.get("row") == row
-                        and resource_predecessor_finished(row, observation=captured))
-        return resource_predecessor_finished(row)
+            result = bool(captured and captured.get("row") == row
+                          and resource_predecessor_finished(row, observation=captured))
+        else:
+            result = resource_predecessor_finished(row)
+        finished_cache[marker] = result
+        return result
 
     active_legacy = [row for row in unique_rows
                      if row.get("resource_policy") == "supervised-owner"

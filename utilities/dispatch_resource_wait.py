@@ -160,6 +160,30 @@ def resource_body_digest(row):
     return RESUME.row_digest(body)
 
 
+def resource_legacy_body_digest(row):
+    """Digest the projection that v3.53.2's flat reader validates."""
+    keys = ("run_id", "cwd", "log", "command", "route", "node", "parent_attempt_id", "jobs",
+            "config_ref", "config_sha256", "source_commit", "source_dirty", "source_git_state", "config_layout",
+            "resource_policy", "owner_wait")
+    body = {key: row.get(key) for key in keys}
+    if "launch_request" in row:
+        body["launch_request"] = row["launch_request"]
+    if "execution" in row:
+        body["execution"] = row["execution"]
+    return RESUME.row_digest(body)
+
+
+def resource_binding_matches(armed, row):
+    """Check the old reader projection and, when present, the full current row."""
+    legacy = resource_legacy_body_digest(row)
+    if armed.get("resource_binding") != legacy:
+        return False
+    current = armed.get("resource_current_binding")
+    if current is not None or row.get("resource_operation") is not None:
+        return current == resource_body_digest(row)
+    return True
+
+
 def resource_execution_finished(row):
     from route_authority import resource_predecessor_finished
     return resource_predecessor_finished(row)
@@ -274,7 +298,7 @@ def context(args, control):
                     row["pid_namespace"] != os.readlink("/proc/self/ns/pid"))
                 or armed.get("route_id") != args.route_id or armed.get("route_hash") != args.route_hash
                 or armed.get("route_file") != binding.route_file or armed.get("jobs") != str(jobs)
-                or armed.get("resource_binding") != resource_body_digest(row)
+                or not resource_binding_matches(armed, row)
                 or armed.get("successor_external") is not True or armed.get("successor_command") is not None):
             raise JOIN.JoinContractError("resource-owner-binding-invalid")
         result.append((armed, row))
@@ -449,6 +473,12 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
     sup, route, ledger, candidates = found
     if control.pending():
         return "Continue the same work using the pending user correction; preserve the resource request."
+    for armed, row in candidates:
+        if (row.get("resource_policy") in {"verified-resume", "supervised-owner"}
+                and row.get("status") == "running"):
+            # The parked owner reuses the existing identity-bound observer
+            # recovery before waiting on the resource receipt or child set.
+            sup.reattach_resource_watch(route, ledger, armed)
     state = JOIN.read_supervisor_phase_state(path, args.parent_attempt_id)
     resource = dict(state.resource or {}) if state else {}
     if resource and resource["session_id"] != control.thread_id:
@@ -485,7 +515,8 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
         return None
     _write(path, args.parent_attempt_id, delivered, resource, "parked")
     emit({"type": "dispatch.supervisor.resource-parked", "parent_attempt_id": args.parent_attempt_id,
-          "route_id": args.route_id, "resource_count": len(candidates)})
+          "route_id": getattr(args, "route_id", route.get("route_id")),
+          "resource_count": len(candidates)})
 
     while True:
         if control.pending():

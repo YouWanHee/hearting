@@ -1105,12 +1105,17 @@ without a fixed elapsed-time ceiling. The existing start/resume can reattach a
 lost or expired watch to the same run without releasing a payload again. Explicit
 parent cancellation still suppresses the preserved resource's successors.
 
-One supervised owner stage may use resources through the existing runner.
-Distinct operations may overlap only when each is bound to its existing
-owner-authorized request and exact route, owner, command, working directory,
-environment, configuration, attestation, and input digests. A route, run name,
-manifest, or completed input-delivery receipt alone does not authorize a second
-operation. A retry of the same operation still waits for its exact prior
+One supervised owner stage may use resources through the existing runner. The
+normal owner selects each semantic operation within the route's approved scope.
+The runtime checks that the sealed route/resource node and existing owner or
+controller authority still match, then binds the selected request and payload
+at their actual layers: exact request bytes, local command record and bridge
+hash; separately parsed remote `compute-hosts run` argv, cwd, explicit
+environment, payload and input hashes. Owner-input id/digest/source/target and
+accepted/completed turns remain provenance; freeform text is not rewritten as
+operation JSON and is not parsed as a new approval condition. A route, run
+name, manifest, or completed input-delivery receipt alone does not authorize a
+second operation. A retry of the same operation still waits for its exact prior
 execution to end and become quiescent. Every execution keeps its own registry
 row, process/compute identity, watch, receipt, output evidence, and settlement
 duty; one execution's PASS or failure cannot replace another's result. The
@@ -1119,11 +1124,14 @@ authorized operation and declared output duty is settled, and claims that
 successor once. Historical records and unacknowledged receipts remain bound to
 their original executions.
 
-The original `<node>.json` armed watch remains readable with its existing bytes
-and meaning. Additional execution watches live outside the legacy flat
-`armed/*.json` view; current consumers enumerate and aggregate them. Keeping the
-original watch readable does not establish that an already-cached older owner
-can launch or admit work through the current consumer path.
+The legacy `<node>.json` armed watch remains readable. Its flat view may expose
+a queued operation during the owner's next normal model turn; parked waits
+leave it unchanged. Prior watch bytes and every execution remain lossless in
+the current index/archive. Current readers validate both the old-readable
+projection and the full current operation binding. Additional execution watches
+remain outside the legacy flat `armed/*.json` view. Cached-consumer support is
+demonstrated by its real launch, result-delivery, and aggregate-admission path;
+additive files alone leave that support unproven.
 
 Human decisions have no elapsed-time default. A question window closing or an
 empty response does not release, reject, or cancel the durable gate. Its owner

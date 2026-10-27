@@ -1564,18 +1564,30 @@ an unacknowledged success or failure remains recoverable from its original bindi
 next registration, with no lifetime receipt-count ceiling.
 The resource that supplies the declared stage outputs can complete the stage. Continuation retains that admitted resource identity and quiescence; it requires no model attempt sidecar for the resource prefix.
 
-Distinct owner-authorized operations for one route/node may have separate live
-resource rows. Admission binds each operation to the existing owner input and
-request lineage plus its exact route, owner, command, cwd, environment,
-configuration, attestation, and input digests. A retry of one
-operation still requires that operation's prior execution to be terminal and
-quiescent; unrelated operations retain independent registry rows, watches,
-results, receipts, and output-settlement duties. Aggregate stage admission waits
-for every current authorized operation and claims the existing successor once.
-The legacy `<node>.json` watch remains the original flat-file view; additive
-execution watches are stored outside `armed/*.json`, and only current readers
-aggregate them. Existing cached consumers are supported only when their current
-launch/admission path is independently available and proven.
+Distinct operations selected by the normal owner within one route/node's
+approved scope may have separate live resource rows. Existing route/resource
+node, registered owner/lifecycle, live parent/controller thread and PID-start,
+input-target, and pending-correction checks remain the execution authority.
+Owner-input id/digest/source/target and accepted/completed turns remain
+provenance; freeform text need not be rewritten as request JSON. The runtime
+binds the exact selected request bytes, local command record and local bridge
+hash, then separately parses the remote `compute-hosts run` argv to validate
+its cwd, explicit environment, payload and input hashes. A route, run name,
+manifest, or completed input-delivery receipt alone does not authorize a
+second operation. A retry of one operation still requires that operation's
+prior execution to be terminal and quiescent; unrelated operations retain
+independent registry rows, watches, results, receipts, and output-settlement
+duties. Aggregate stage admission waits for every current authorized operation
+and claims the existing successor once.
+
+The legacy `<node>.json` watch remains readable. Only the owner's next normal
+model turn may expose a queued operation through its flat launch view; a parked
+wait does not replace that view. Prior watch bytes and all execution records
+remain lossless in the current index/archive. Current readers check both the
+old-readable projection and full current operation binding. Additive execution
+watches remain outside `armed/*.json`. A cached consumer is supported only
+after its actual launch, result-delivery and aggregate admission path has been
+exercised; the file layout alone does not establish that support.
 
 **Registry selection is workflow-ledger authority.** When a supervisor command
 or any adapter launch fence receives an explicit `--jobs`, the ledger is always

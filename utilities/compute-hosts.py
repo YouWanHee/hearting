@@ -3965,7 +3965,8 @@ def build_parser():
     return parser
 
 
-def main(argv=None):
+def parse_argv(argv=None):
+    """Parse one compute-hosts invocation without executing its subcommand."""
     argv = list(sys.argv[1:] if argv is None else argv)
     # Everything after the first bare `--` is the command to run verbatim.
     # argparse.REMAINDER would capture this utility's own options too, so the
@@ -3977,6 +3978,34 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if getattr(args, "command", None) is not None:
         args.command = list(args.command) + trailing
+    return args
+
+
+def parse_run_invocation(argv):
+    """Parse the sealed `compute-hosts run` argv, including its executable."""
+    argv = list(argv)
+    if not argv:
+        raise ValueError("compute-hosts argv is empty")
+    first = Path(argv[0]).name
+    if first in {"compute-hosts", "compute-hosts.py"}:
+        argv = argv[1:]
+    elif (len(argv) >= 2 and first.startswith("python")
+          and Path(argv[1]).name == "compute-hosts.py"):
+        argv = argv[2:]
+    elif first == "run":
+        pass
+    else:
+        raise ValueError("argv does not invoke compute-hosts")
+    args = parse_argv(argv)
+    if (getattr(args, "func", None) is not cmd_run
+            or not isinstance(getattr(args, "command", None), list)
+            or not args.command or getattr(args, "dry_run", False)):
+        raise ValueError("argv is not a payload-bearing compute-hosts run")
+    return args
+
+
+def main(argv=None):
+    args = parse_argv(argv)
     try:
         return args.func(args)
     except ConfigError as exc:

@@ -155,8 +155,8 @@ def resource_watch_key(armed):
             armed.get("predecessor_id"))
 
 
-def resource_watch_path(ledger, record):
-    """Stable additive watch slot; legacy readers still see only `<node>.json`."""
+def resource_watch_legacy_path(ledger, record):
+    """Pre-lineage additive path, retained as a read-compatible location."""
     identity = ((record.get("resource_operation") or {}).get("operation_id")
                 if isinstance(record.get("resource_operation"), dict) else None)
     if not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{64}", identity):
@@ -165,6 +165,67 @@ def resource_watch_path(ledger, record):
             sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     node_dir = hashlib.sha256(str(record.get("node", "")).encode()).hexdigest()[:24]
     return armed_dir(ledger) / "resource-runs" / node_dir / f"{identity}.json"
+
+
+def resource_watch_path(ledger, record):
+    """Current per-execution slot; the old operation-only path remains readable."""
+    operation = record.get("resource_operation")
+    operation_id = operation.get("operation_id") if isinstance(operation, dict) else None
+    if not isinstance(operation_id, str) or not re.fullmatch(r"[0-9a-f]{64}", operation_id):
+        return resource_watch_legacy_path(ledger, record)
+    execution_id = hashlib.sha256(json.dumps(
+        [record.get("resource_registry"), record.get("predecessor_id")],
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+    node_dir = hashlib.sha256(str(record.get("node", "")).encode()).hexdigest()[:24]
+    return armed_dir(ledger) / "resource-runs" / node_dir / f"{operation_id}-{execution_id}.json"
+
+
+def resource_watch_storage_path(ledger, record):
+    """Continue using an existing legacy slot; otherwise choose the run-specific slot."""
+    current = resource_watch_path(ledger, record)
+    legacy = resource_watch_legacy_path(ledger, record)
+    if current.is_file():
+        return current
+    if legacy.is_file():
+        return legacy
+    return current
+
+
+def resource_watch_history_path(ledger, record):
+    node_dir = hashlib.sha256(str(record.get("node", "")).encode()).hexdigest()[:24]
+    execution_id = hashlib.sha256(json.dumps(
+        [record.get("resource_registry"), record.get("predecessor_id")],
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return armed_dir(ledger) / "resource-history" / node_dir / f"{execution_id}.json"
+
+
+def archive_primary_resource_watch(ledger, record, *, current=True):
+    """Copy exact flat-view bytes to the current index or settled-history store."""
+    source = armed_dir(ledger) / f"{record.get('node')}.json"
+    try:
+        if source.is_symlink():
+            raise SupervisorError("resource-watch-primary-unsafe")
+        raw = source.read_bytes()
+        if json.loads(raw.decode("utf-8")) != record:
+            raise SupervisorError("resource-watch-primary-changed")
+        destination = (resource_watch_storage_path(ledger, record) if current
+                       else resource_watch_history_path(ledger, record))
+        if destination == source:
+            return
+        if destination.is_symlink():
+            raise SupervisorError("resource-watch-archive-unsafe")
+        if destination.exists():
+            if destination.read_bytes() != raw:
+                raise SupervisorError("resource-watch-archive-conflict")
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            WS._atomic_write(destination, raw.decode("utf-8"))
+            if destination.read_bytes() != raw:
+                raise SupervisorError("resource-watch-archive-mismatch")
+    except SupervisorError:
+        raise
+    except (OSError, UnicodeError, ValueError) as error:
+        raise SupervisorError("resource-watch-archive-failed") from error
 
 
 def read_resource_watches(ledger, node=None, *, primary=None):
@@ -190,13 +251,15 @@ def read_resource_watches(ledger, node=None, *, primary=None):
                 raise SupervisorError("resource-watch-unreadable") from error
             if not isinstance(row, dict) or row.get("predecessor_kind") != "resource":
                 raise SupervisorError("resource-watch-invalid")
-            if path != resource_watch_path(ledger, row):
+            if path not in {resource_watch_path(ledger, row), resource_watch_legacy_path(ledger, row)}:
                 raise SupervisorError("resource-watch-path-binding-mismatch")
             if node is not None and row.get("node") != node:
                 continue
             key = resource_watch_key(row)
             prior = seen.get(key)
             if prior is not None:
+                if prior == row:
+                    continue
                 raise SupervisorError("resource-watch-duplicate-binding")
             seen[key] = row
     rows.extend(seen.values())
@@ -249,7 +312,7 @@ def reattach_resource_watch(route, ledger, armed):
                     or row.get("cancel_requested") or row.get("parent_close_requested")):
                 return None
             if row.get("resource_policy") == "supervised-owner" and (
-                    armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(row)):
+                    not OWNER_RESOURCE.resource_binding_matches(armed, row)):
                 raise SupervisorError("resource-body-binding-mismatch")
             if row.get("status") != "running" or RR.classify_identity(row)[0] != "working":
                 return None
@@ -386,7 +449,7 @@ def resource_evidence(armed, *, compute_observation=None):
                 or (execution.get("provenance") or {}).get("route_id") != armed.get("route_id")
                 or (execution.get("provenance") or {}).get("route_hash") != armed.get("route_hash")
                 or row.get("status") not in ("succeeded", "failed")
-                or armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(row)):
+                or not OWNER_RESOURCE.resource_binding_matches(armed, row)):
             return {"terminal": False, "reason": "compute-resource-binding-mismatch"}
         observation = compute_observation or RR.compute_execution_observation(row)
         identity = RR.compute_execution_identity(row)
@@ -407,7 +470,7 @@ def resource_evidence(armed, *, compute_observation=None):
                    or row.get("jobs") != armed.get("jobs")):
         return {"terminal": False, "reason": "resource-binding-mismatch"}
     if row.get("resource_policy") == "supervised-owner":
-        if armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(row):
+        if not OWNER_RESOURCE.resource_binding_matches(armed, row):
             return {"terminal": False, "reason": "resource-body-binding-mismatch"}
     if resume and row.get("status") == "launching":
         return {"terminal": False, "reason": "resource-launching"}
@@ -640,9 +703,10 @@ def cmd_arm(args):
             if (resource.get("route") != record["route_file"] or resource.get("node") != args.node
                     or resource.get("jobs") != record["jobs"]):
                 raise SupervisorError("resource-watch-binding-mismatch")
-            record["resource_binding"] = OWNER_RESOURCE.resource_body_digest(resource)
+            record["resource_binding"] = OWNER_RESOURCE.resource_legacy_body_digest(resource)
             if resource.get("resource_operation") is not None:
                 record["resource_operation"] = resource["resource_operation"]
+                record["resource_current_binding"] = OWNER_RESOURCE.resource_body_digest(resource)
     import resource_run_evidence as RUN_EVIDENCE
     output_receipt = RUN_EVIDENCE.paths(record, prepare=True)
     ledger = ledger_for(route, getattr(args, "jobs", None))
@@ -716,9 +780,11 @@ def cmd_arm(args):
                     require_arm_predecessors()
                     replace_resource_predecessor(route, ledger, prior_operation, record, resource,
                                                   preobserved=preobserved)
+                    queued_owner_launch = (resource.get("resource_policy") == "supervised-owner"
+                                           and resource.get("launch_state") == "queued")
                     target = (armed_dir(ledger) / f"{args.node}.json"
-                              if prior_operation == read_armed(ledger).get(args.node)
-                              else resource_watch_path(ledger, prior_operation))
+                              if queued_owner_launch or prior_operation == read_armed(ledger).get(args.node)
+                              else resource_watch_storage_path(ledger, prior_operation))
                 else:
                     if ledger.state().get("nodes", {}).get(args.node, {}).get("state") == "STAGE_SUCCEEDED":
                         primary = read_armed(ledger).get(args.node)
@@ -734,8 +800,11 @@ def cmd_arm(args):
                                 observed_evidence=observed):
                             raise SupervisorError("resource-watch-binding-conflict")
                     require_arm_predecessors()
+                    queued_owner_launch = (resource.get("resource_policy") == "supervised-owner"
+                                           and resource.get("launch_state") == "queued")
                     target = (armed_dir(ledger) / f"{args.node}.json"
-                              if not current else resource_watch_path(ledger, record))
+                              if not current or queued_owner_launch
+                              else resource_watch_storage_path(ledger, record))
             elif current:
                 require_arm_predecessors()
                 prior = read_armed(ledger).get(args.node)
@@ -751,9 +820,22 @@ def cmd_arm(args):
                     replace_resource_predecessor(route, ledger, prior, record, resource,
                                                   preobserved=preobserved)
                 else:
-                    target = resource_watch_path(ledger, record)
+                    target = resource_watch_storage_path(ledger, record)
             else:
                 target = armed_dir(ledger) / f"{args.node}.json"
+        flat_target = armed_dir(ledger) / f"{args.node}.json"
+        if target == flat_target and args.predecessor_kind == "resource":
+            primary = read_armed(ledger).get(args.node)
+            if (primary and primary.get("predecessor_kind") == "resource"
+                    and resource_watch_key(primary) != resource_watch_key(record)):
+                prior_operation = (primary.get("resource_operation") or {}).get("operation_id")
+                next_operation = (resource.get("resource_operation") or {}).get("operation_id")
+                queued_owner_launch = (resource.get("resource_policy") == "supervised-owner"
+                                       and resource.get("launch_state") == "queued"
+                                       and isinstance(resource.get("resource_operation"), dict))
+                archive_primary_resource_watch(
+                    ledger, primary,
+                    current=queued_owner_launch and prior_operation != next_operation)
         target.parent.mkdir(parents=True, exist_ok=True)
         WS._atomic_write(target, json.dumps(record, indent=2, sort_keys=True) + "\n")
         state = ledger.state()
@@ -951,7 +1033,7 @@ def resource_predecessors(ledger, node):
         if (row.get("route") != armed.get("route_file") or row.get("node") != node
                 or row.get("jobs") != armed.get("jobs")
                 or (row.get("resource_policy") == "supervised-owner" and
-                    OWNER_RESOURCE.resource_body_digest(row) != armed.get("resource_binding"))):
+                    not OWNER_RESOURCE.resource_binding_matches(armed, row))):
             raise SupervisorError("resource-history-binding-mismatch")
         result.append((armed, row))
     return result
@@ -1090,7 +1172,7 @@ def _owner_settlement_snapshot(route, ledger, armed, row=None):
             or evidence.get("liveness") != "exited"
             or evidence.get("quiescent") is not True
             or evidence.get("sentinel_present") is not True
-            or armed.get("resource_binding") != resource_binding
+            or not OWNER_RESOURCE.resource_binding_matches(armed, row)
             or row.get("compute_run_id") != execution.get("run_id")
             or provenance.get("route_id") != route.get("route_id")
             or provenance.get("route_hash") != route.get("route_hash")):
@@ -1402,7 +1484,8 @@ def reconcile_legacy_supervised_resource_success(route, ledger, armed, *, candid
 def replace_resource_predecessor(route, ledger, prior, record, resource, *, preobserved=None):
     """Called under the ledger lock, with the old run and journal preserved."""
     import dispatch_resource_wait as OWNER_RESOURCE
-    changing = {"predecessor_id", "resource_registry", "resource_binding", "resource_operation", "armed_at"}
+    changing = {"predecessor_id", "resource_registry", "resource_binding", "resource_current_binding",
+                "resource_operation", "armed_at"}
     comparable = _comparable_armed(prior, record)
     prior_operation = prior.get("resource_operation")
     current_operation = record.get("resource_operation")
@@ -1627,7 +1710,7 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, termi
                     or row.get("jobs") != str(jobs) or armed.get("jobs") != str(jobs)
                     or armed.get("route_id") != route["route_id"]
                     or armed.get("route_hash") != route["route_hash"]
-                    or armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(row)
+                    or not OWNER_RESOURCE.resource_binding_matches(armed, row)
                     or not current_artifacts.get("checked") or current_artifacts.get("missing")):
                 continue
         except (OSError, ValueError, KeyError, TypeError):
@@ -1854,8 +1937,7 @@ def _admit_owner_resource_aggregate(route, ledger, successor, jobs, owner_attemp
                     or armed.get("route_id") != route.get("route_id")
                     or armed.get("route_hash") != route.get("route_hash")
                     or armed.get("jobs") != str(Path(jobs).resolve())
-                    or armed.get("resource_binding") != __import__(
-                        "dispatch_resource_wait").resource_body_digest(resource)
+                    or not __import__("dispatch_resource_wait").resource_binding_matches(armed, resource)
                     or armed.get("successor_external") is not True
                     or armed.get("successor_command") is not None):
                 raise SupervisorError("resource-owner-successor-binding-conflict")
@@ -2209,7 +2291,7 @@ def _poll_compute_evidence(armed, compute_observations):
     if (not identity or evidence.get("identity") != identity
             or captured.get("resource_sha256") != resource_sha256
             or captured.get("resource_binding") != resource_binding
-            or armed.get("resource_binding") != resource_binding
+            or not OWNER_RESOURCE.resource_binding_matches(armed, row)
             or (evidence_sha256 is not None and evidence_sha256 != resource_sha256)
             or (evidence.get("terminal") is True and evidence_sha256 != resource_sha256)):
         return changed
@@ -2263,8 +2345,11 @@ def _poll_once_locked(route, ledger, *, compute_observations=None):
     compute_observations = compute_observations or {}
     primary_watches = read_armed(ledger)
     resource_watches = read_resource_watches(ledger, primary=primary_watches)
-    all_watches = [row for row in primary_watches.values()
-                   if row.get("predecessor_kind") != "resource"] + resource_watches
+    all_watches = [
+        (row if row.get("node") else {**row, "node": node_id})
+        for node_id, row in primary_watches.items()
+        if row.get("predecessor_kind") != "resource"
+    ] + resource_watches
     watches_by_node = {}
     for resource in resource_watches:
         watches_by_node.setdefault(resource["node"], []).append(resource)
@@ -2436,7 +2521,13 @@ def cmd_watch(args):
         if all(row.get("action") in ("advanced", "settled", "halted", "human-gate", "wait-next-resource")
                for row in last) and last:
             break
-        resource_nodes = {row.get("node") for row in read_resource_watches(ledger)}
+        resource_nodes = {
+            row.get("node") or node_id
+            for node_id, row in read_armed(ledger).items()
+            if row.get("predecessor_kind") == "resource"
+        }
+        resource_nodes.update(row.get("node") for row in read_resource_watches(ledger)
+                              if row.get("node"))
         live_resource = any(row.get("node") in resource_nodes
                             and row.get("evidence", {}).get("liveness") == "working"
                             for row in last)
